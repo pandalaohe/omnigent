@@ -4217,6 +4217,7 @@ def test_run_harness_acp_slug_embeds_all_fields(
                             "send_model": True,
                             "model": "qwen-vl-max",
                             "env_passthrough": ["QWEN_API_KEY"],
+                            "init_timeout_s": 120,
                             "slug": "qwen",
                         }
                     ]
@@ -4246,6 +4247,7 @@ def test_run_harness_acp_slug_embeds_all_fields(
     assert acp_agent["send_model"] is True
     assert acp_agent["model"] == "qwen-vl-max"
     assert acp_agent["env_passthrough"] == ["QWEN_API_KEY"]
+    assert acp_agent["init_timeout_s"] == 120
     # Verify spawn env respects the embedded fields
     env = _build_acp_spawn_env(load(generated))
     assert env["HARNESS_ACP_COMMAND"] == "qwen --acp"
@@ -4253,6 +4255,7 @@ def test_run_harness_acp_slug_embeds_all_fields(
     assert env["HARNESS_ACP_SEND_MODEL"] == "1"
     assert env["HARNESS_ACP_MODEL"] == "qwen-vl-max"
     assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "QWEN_API_KEY"
+    assert env["HARNESS_ACP_INIT_TIMEOUT_S"] == "120.0"
 
 
 def _capture_profile_env_at_dispatch(

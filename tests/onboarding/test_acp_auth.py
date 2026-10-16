@@ -9,6 +9,30 @@ from omnigent.onboarding.acp_auth import (
 )
 
 
+@pytest.mark.parametrize("value", [120, 0.5])
+def test_init_timeout_parses_and_round_trips(value: float) -> None:
+    row = {"name": "Slow", "command": "slow acp", "init_timeout_s": value}
+    entries = acp_agents({"acp": {"agents": [row]}})
+    assert entries[0].init_timeout_s == value
+    assert acp_agents_settings(entries) == {"acp": {"agents": [row]}}
+
+
+def test_init_timeout_defaults_to_thirty_seconds() -> None:
+    row = {"name": "Fast", "command": "fast acp"}
+    entries = acp_agents({"acp": {"agents": [row]}})
+    assert entries[0].init_timeout_s == 30.0
+    assert acp_agents_settings(entries) == {"acp": {"agents": [row]}}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, -1, float("inf"), float("-inf"), float("nan"), "120", "bad", None, True, [], {}, 10**400],
+)
+def test_init_timeout_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match="init_timeout_s must be a positive finite number"):
+        acp_agents({"acp": {"agents": [{"name": "A", "command": "a", "init_timeout_s": value}]}})
+
+
 def test_omnigent_mcp_round_trips_only_when_disabled() -> None:
     entries = acp_agents(
         {

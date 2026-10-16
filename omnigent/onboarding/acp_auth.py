@@ -11,6 +11,7 @@ commands in a dedicated top-level ``acp:`` block of ``~/.omnigent/config.yaml``:
         - {name: Claude Code, command: npx -y @zed-industries/claude-code-acp}
         - {name: Goose,       command: goose acp, model: gpt-5.3}
         - {name: Grok Build,  command: grok agent stdio, env_passthrough: [XAI_API_KEY]}
+        - {name: Slow Agent,  command: slow-agent acp, init_timeout_s: 120}
 
 Each agent gets a stable ``slug`` derived from its name; a picked
 ``acp:<slug>`` (carried in the spec, resolved at spawn) looks the command back up
@@ -28,6 +29,7 @@ This module is pure read + settings-builder (mirroring
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 from collections.abc import Iterable
@@ -65,6 +67,8 @@ class AcpAgentEntry:
         authenticates with, so an agent that reads one must name it here or it
         starts unauthenticated. Names only — values are read from the host
         environment at spawn, never stored in the config file.
+    :param init_timeout_s: Positive finite seconds per initialization, authentication
+        or session-setup RPC. Defaults to 30.
     """
 
     slug: str
@@ -76,6 +80,7 @@ class AcpAgentEntry:
     omnigent_mcp: bool = True
     inject_system_prompt: bool = True
     env_passthrough: tuple[str, ...] = ()
+    init_timeout_s: float = 30.0
 
 
 def slugify(name: str) -> str:
@@ -124,11 +129,25 @@ def parse_env_passthrough(raw: object) -> tuple[str, ...]:
     return tuple(names)
 
 
+def parse_init_timeout_s(raw: object) -> float:
+    """Validate the positive finite numeric deadline for ACP session setup."""
+    error = "acp agent init_timeout_s must be a positive finite number of seconds"
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        raise ValueError(error)
+    try:
+        value = float(raw)
+    except OverflowError as exc:
+        raise ValueError(error) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(error)
+    return value
+
+
 def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
     """Return the configured ACP agents, each with a unique derived slug.
 
     Reads the ``acp:`` block's ``agents`` list. Malformed entries (not a dict,
-    or missing ``name`` / ``command``) are skipped. Invalid ``omnigent_mcp``
+    or missing ``name`` / ``command``) are skipped. Invalid ``init_timeout_s`` or ``omnigent_mcp``
     values raise ``ValueError`` instead of being silently coerced. Slugs are
     assigned in list order; a collision (two names slugifying the same) gets a
     ``-2`` / ``-3`` … suffix so every returned entry is uniquely addressable.
@@ -179,6 +198,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 omnigent_mcp=omnigent_mcp,
                 inject_system_prompt=inject_system_prompt,
                 env_passthrough=parse_env_passthrough(raw.get("env_passthrough")),
+                init_timeout_s=parse_init_timeout_s(raw.get("init_timeout_s", 30.0)),
             )
         )
     return entries
@@ -243,6 +263,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["inject_system_prompt"] = False
         if e.env_passthrough:
             item["env_passthrough"] = list(e.env_passthrough)
+        if e.init_timeout_s != 30.0:
+            item["init_timeout_s"] = e.init_timeout_s
         agents.append(item)
     return {ACP_CONFIG_KEY: {_AGENTS_FIELD: agents}}
 

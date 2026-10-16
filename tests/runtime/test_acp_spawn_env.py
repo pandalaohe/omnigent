@@ -93,6 +93,27 @@ def test_other_slug_resolves_independently(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_NAME"] == "Gemini CLI"
 
 
+@pytest.mark.parametrize("source", ["named", "bare", "embedded"])
+@pytest.mark.parametrize("timeout", [None, 120.5])
+def test_init_timeout_reaches_harness_executor(
+    _isolate_config: Path, monkeypatch: pytest.MonkeyPatch, source: str, timeout: float | None
+) -> None:
+    from omnigent.inner.acp_harness import _build_acp_executor
+
+    row: dict[str, object] = {"name": "Slow", "command": "slow acp"}
+    if timeout is not None:
+        row["init_timeout_s"] = timeout
+    _write_acp_config(_isolate_config, agents=[row])
+    spec = _make_spec(
+        harness="acp" if source == "bare" else "acp:slow",
+        acp_agent=row if source == "embedded" else _MISSING,
+    )
+    env = _build_acp_spawn_env(spec)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert _build_acp_executor()._config.init_timeout_s == (timeout or 30.0)
+
+
 def test_bare_acp_falls_back_to_first_agent(_isolate_config: Path) -> None:
     """A bare ``acp`` id (slug lost) still launches the first configured agent."""
     _write_acp_config(_isolate_config)

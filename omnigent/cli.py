@@ -7630,7 +7630,7 @@ def _materialize_harness_launcher_file(
             raise click.ClickException("An ephemeral ACP agent requires the acp harness.")
         # Embed all fields that affect spawn so the remote server sees the same
         # agent config as the client. Preserve session_id_mode, send_model,
-        # omnigent_mcp, env_passthrough, and model.
+        # omnigent_mcp, env_passthrough, init_timeout_s, and model.
         agent_dict: dict[str, object] = {
             "name": acp_agent.name,
             "command": acp_agent.command,
@@ -7645,6 +7645,8 @@ def _materialize_harness_launcher_file(
             agent_dict["omnigent_mcp"] = acp_agent.omnigent_mcp
         if acp_agent.env_passthrough:
             agent_dict["env_passthrough"] = list(acp_agent.env_passthrough)
+        if acp_agent.init_timeout_s != 30.0:
+            agent_dict["init_timeout_s"] = acp_agent.init_timeout_s
         executor["acp_agent"] = agent_dict
 
     raw = {

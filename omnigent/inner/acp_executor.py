@@ -169,7 +169,7 @@ except ValueError as exc:
 if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
     raise ValueError(_PROMPT_TIMEOUT_ERR)
 
-# Idle timeout for the initial ACP handshake (initialize / session setup).
+# Default deadline for each initial ACP handshake / session setup RPC.
 _INIT_TIMEOUT_SECONDS = 30.0
 
 # Agent stderr kept for diagnostics: how many trailing lines to retain, how many
@@ -245,6 +245,8 @@ class AcpAgentConfig:
     :param default_model: Model to restore when a per-turn override is cleared.
         ``None`` preserves the launch-model fallback; an empty string uses the
         model originally reported by the ACP session.
+    :param init_timeout_s: Deadline in seconds per handshake/session-setup RPC.
+        Defaults to 30; slow-starting agents can request a longer deadline.
     """
 
     command: str
@@ -259,6 +261,7 @@ class AcpAgentConfig:
     available_models: tuple[str, ...] = ()
     env_unset: tuple[str, ...] = ()
     default_model: str | None = None
+    init_timeout_s: float = _INIT_TIMEOUT_SECONDS
 
 
 class _AcpModelSwitchError(RuntimeError):
@@ -833,7 +836,7 @@ class AcpExecutor(Executor):
                         "terminal": False,
                     },
                 },
-                timeout=_INIT_TIMEOUT_SECONDS,
+                timeout=self._config.init_timeout_s,
             )
         except Exception as exc:
             # Covers the child dying or timing out before it answers.
@@ -868,7 +871,7 @@ class AcpExecutor(Executor):
         auth_resp = await self._rpc(
             _AGENT_METHOD_AUTHENTICATE,
             {"methodId": method_id},
-            timeout=_INIT_TIMEOUT_SECONDS,
+            timeout=self._config.init_timeout_s,
         )
         if "error" in auth_resp:
             error = auth_resp["error"]
@@ -902,7 +905,9 @@ class AcpExecutor(Executor):
                 )
             return resp
         await self._authenticate(method_id)
-        return await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        return await self._rpc(
+            _AGENT_METHOD_SESSION_NEW, params, timeout=self._config.init_timeout_s
+        )
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning the session id.
@@ -928,7 +933,9 @@ class AcpExecutor(Executor):
         if self._config.send_model_in_session_new and self._config.model:
             params["model"] = self._config.model
 
-        resp = await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        resp = await self._rpc(
+            _AGENT_METHOD_SESSION_NEW, params, timeout=self._config.init_timeout_s
+        )
         if "error" in resp and not self._authenticated and _is_auth_required_error(resp["error"]):
             resp = await self._authenticate_and_retry_session_new(resp, params)
         if "error" in resp:

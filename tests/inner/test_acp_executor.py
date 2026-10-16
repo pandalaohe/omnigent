@@ -2240,21 +2240,21 @@ async def test_handshake_timeout_reports_a_non_blank_error(tmp_path: Path) -> No
     )
     command = shlex.join([sys.executable, str(agent_path)])
 
-    ex = AcpExecutor(AcpAgentConfig(command=command, name="Silent"))
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Silent", init_timeout_s=1.0))
     errors = []
-    with patch.object(acp_executor_module, "_INIT_TIMEOUT_SECONDS", 1.0):
-        try:
-            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
-                if isinstance(ev, ExecutorError):
-                    errors.append(ev)
-        finally:
-            await ex.close()
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+            if isinstance(ev, ExecutorError):
+                errors.append(ev)
+    finally:
+        await ex.close()
 
     assert errors, "a stalled handshake must surface an ExecutorError"
     assert errors[0].message.strip(), "the turn error must never be blank"
     # Names the stalled call, not just the exception type.
     assert "session/new" in errors[0].message
     assert "Silent" in errors[0].message
+    assert "within 1s" in errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -2289,15 +2289,14 @@ async def test_startup_failure_quotes_the_agents_stderr(tmp_path: Path) -> None:
     )
     command = shlex.join([sys.executable, str(agent_path)])
 
-    ex = AcpExecutor(AcpAgentConfig(command=command, name="Grok"))
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Grok", init_timeout_s=1.0))
     errors = []
-    with patch.object(acp_executor_module, "_INIT_TIMEOUT_SECONDS", 1.0):
-        try:
-            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
-                if isinstance(ev, ExecutorError):
-                    errors.append(ev)
-        finally:
-            await ex.close()
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+            if isinstance(ev, ExecutorError):
+                errors.append(ev)
+    finally:
+        await ex.close()
 
     assert errors, "a stalled handshake must surface an ExecutorError"
     assert "XAI_API_KEY not set" in errors[0].message
