@@ -796,6 +796,7 @@ _session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup
 
 
 _model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
+_acp_effort_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
 
 
 _model_options_inflight: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
@@ -1339,6 +1340,7 @@ __all__ = [
     "_RelayHandle",
     "_RelayStatusSnapshot",
     "_RunnerStatusProbeBackoff",
+    "_acp_effort_options_cache",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",

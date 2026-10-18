@@ -226,6 +226,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
+    _acp_effort_options_cache,
     _deferred_elicitation_clear_tasks,
     _detached_elicitation_tasks,
     _intentional_runner_stop_locks,
@@ -13613,6 +13614,9 @@ def _create_session_from_bundle(
         )
     assert spec.name is not None
 
+    if _spec_harness(spec) != "acp":
+        metadata = metadata.model_copy(update={"model_override": None})
+
     from omnigent.server.routes.sandbox_inference import configured_snapshot
 
     if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
@@ -14286,6 +14290,7 @@ async def _fetch_model_options(
         # serves the deployment's curated provider ``models:`` shortlist
         # resolved from the spec instead of a runner-owned catalog.
         if _resolve_harness_impl_is_acp(conv, agent_store):
+            curated = await _load_acp_model_options(session_id, conv, agent_store)
             if runner_client is not None and session_id not in _model_options_inflight:
                 task = asyncio.create_task(
                     _load_model_options(
@@ -14294,11 +14299,14 @@ async def _fetch_model_options(
                         f"/v1/sessions/{session_id}/model-options",
                         publish_on_change_only=True,
                         accept_empty=True,
+                        acp_effort_only=True,
                     )
                 )
                 _model_options_inflight[session_id] = task
                 task.add_done_callback(lambda _task: _model_options_inflight.pop(session_id, None))
-            return await _load_acp_model_options(session_id, conv, agent_store)
+            return _acp_model_options_with_effort(
+                curated, _acp_effort_options_cache.get(session_id, [])
+            )
         from omnigent.harness_aliases import canonicalize_harness
 
         harness = canonicalize_harness(_resolve_harness(conv, agent_store=agent_store))
@@ -14512,6 +14520,41 @@ def _validate_session_model_selection(
         )
     if harness == "acp":
         _validate_acp_spec_models(selection_spec, model, conv.harness_override)
+
+
+def _acp_model_options_with_effort(
+    curated: list[dict[str, Any]], live: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Enrich the shortlist without adopting the agent's model-picker vocabulary."""
+    effort_fields = ("efforts", "supportedReasoningEfforts", "defaultReasoningEffort", "isActive")
+    if not curated:
+        # An effort-only default row carries no selectable model shortlist.
+        active = next((row for row in live if row.get("isActive")), None)
+        active = active or next((row for row in live if row.get("isDefault")), None)
+        if active is None:
+            return []
+        return [
+            {
+                "id": "__default__",
+                "displayName": "Session default",
+                "isDefault": True,
+                **{key: active[key] for key in effort_fields if key in active},
+            }
+        ]
+    by_id = {row["id"]: row for row in live}
+    return [
+        {
+            **row,
+            "efforts": [],
+            "isActive": False,
+            **{
+                key: by_id.get(row["id"], {})[key]
+                for key in effort_fields
+                if key in by_id.get(row["id"], {})
+            },
+        }
+        for row in curated
+    ]
 
 
 async def _load_acp_model_options(

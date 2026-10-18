@@ -1887,7 +1887,8 @@ class SessionCreateMetadata(BaseModel):
     :param labels: Initial guardrails labels to set on the
         session. Empty dict (the default) starts with no labels.
     :param model_override: Optional per-session model override, validated
-        against the uploaded agent's harness before persistence.
+        against the uploaded ACP agent's harness before persistence.
+        Ignored for non-ACP bundles.
     :param reasoning_effort: Optional per-session reasoning-effort
         hint. ACP values come from the session advertisement; other
         harnesses use the shared effort vocabulary. ``None`` clears the

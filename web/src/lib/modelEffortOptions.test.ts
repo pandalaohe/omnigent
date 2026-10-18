@@ -11,6 +11,10 @@ const rows: NativeModelOption[] = [
 ];
 
 describe("effortLevelsFor", () => {
+  it("keeps ACP effort-only data usable without adopting a model shortlist", () => {
+    const models = [{ id: "__default__", isDefault: true, efforts: ["precise"] }];
+    expect(effortLevelsFor("acp:neutral", models, "agent-current-model")).toEqual(["precise"]);
+  });
   it("uses opaque ACP advertised values without guessing a ladder", () => {
     const models = [
       { id: "a", isDefault: true, efforts: ["quick", "deliberate"] },

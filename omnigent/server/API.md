@@ -548,7 +548,13 @@ Request parts:
 
   metadata (JSON string, required)
     Session metadata. Shape matches `SessionCreateMetadata`:
-    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `{title?: string | null, labels?: object, model_override?: string | null, reasoning_effort?: string | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `model_override` selects a model for ACP bundles and is checked against the
+    configured model catalogue; it is ignored for other harnesses. ACP effort
+    values come from the session's advertised `thought_level` option and are
+    confirmed before a turn. Other harnesses accept the shared effort values
+    (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`). Explicit
+    null clears an ACP override rather than selecting a literal `default` value.
     `terminal_launch_args` carries pass-through CLI args for a native
     terminal wrapper, e.g. `["--permission-mode", "bypassPermissions"]`
     (same field as the JSON create path below). Unknown fields fail with 400.

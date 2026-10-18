@@ -1616,6 +1616,10 @@ def register_core_routes(
             bundle_bytes,
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
+        if not (
+            spec.executor.harness_kind == "acp" or spec.executor.harness_kind.startswith("acp:")
+        ):
+            parsed_metadata = parsed_metadata.model_copy(update={"model_override": None})
         _, effort = validate_session_model_metadata(
             model_override=parsed_metadata.model_override,
             reasoning_effort=(

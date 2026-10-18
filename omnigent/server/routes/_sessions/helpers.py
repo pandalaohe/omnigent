@@ -237,6 +237,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
     SUBAGENT_ROUTING_OVERRIDE_VALUES,
+    _acp_effort_options_cache,
     _catalog_prefetch_tasks,
     _logger,
     _managed_launch_tasks,
@@ -6008,6 +6009,7 @@ def _invalidate_runner_backed_snapshot_state(
     invalidate_runner_catalog(session_id)
     if drop_model_options:
         _model_options_cache.pop(session_id, None)
+        _acp_effort_options_cache.pop(session_id, None)
         _model_options_stale.discard(session_id)
     else:
         _model_options_stale.add(session_id)
@@ -13539,6 +13541,7 @@ async def _load_model_options(
     fallback_path: str | None = None,
     publish_on_change_only: bool = False,
     accept_empty: bool = False,
+    acp_effort_only: bool = False,
 ) -> None:
     """
     Background single-flight fetch of a session's native model catalog.
@@ -13597,8 +13600,9 @@ async def _load_model_options(
                 await asyncio.sleep(delays[attempt])
                 continue
             return
-        changed = _model_options_cache.get(session_id) != options
-        _model_options_cache[session_id] = options
+        cache = _acp_effort_options_cache if acp_effort_only else _model_options_cache
+        changed = cache.get(session_id) != options
+        cache[session_id] = options
         _model_options_stale.discard(session_id)
         if changed or not publish_on_change_only:
             _publish_model_options(session_id)

@@ -22,6 +22,7 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 def _clear_model_options_caches() -> None:
     """Model-option caches are module-global; isolate one test from the next."""
     orch._model_options_cache.clear()
+    orch._acp_effort_options_cache.clear()
     orch._model_options_stale.clear()
     orch._model_options_inflight.clear()
     orch._pushed_model_options_cache.clear()
@@ -58,6 +59,59 @@ def test_resolve_harness_is_acp_rejects_other_harnesses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_review_minor4_live_catalog_preserves_curated_model_contract():
+    curated = [
+        {"id": "model-b", "displayName": "Curated B", "isDefault": False},
+        {"id": "model-a", "displayName": "Curated A", "isDefault": True},
+    ]
+    orch._model_options_cache["conv_acp"] = curated
+    live = [
+        {"id": "model-a", "displayName": "Agent A", "isDefault": False, "efforts": ["quick"]},
+        {"id": "model-c", "isDefault": True, "efforts": ["invented"]},
+        {
+            "id": "model-b",
+            "displayName": "Agent B",
+            "isDefault": True,
+            "isActive": True,
+            "efforts": ["precise"],
+        },
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"models": live})),
+        base_url="http://runner",
+    ) as client:
+        conv = _conv(harness_override="acp:neutral", agent_id=None)
+        await orch._fetch_model_options(client, "conv_acp", conv)
+        await asyncio.gather(*list(orch._model_options_inflight.values()))
+        merged = await orch._fetch_model_options(None, "conv_acp", conv)
+    assert [
+        {key: row[key] for key in ("id", "displayName", "isDefault")} for row in merged
+    ] == curated
+    assert [row["efforts"] for row in merged] == [["precise"], ["quick"]]
+    assert await orch._load_acp_model_options("conv_acp", conv, None) == curated
+
+
+@pytest.mark.asyncio
+async def test_review_minor4_uncurated_session_does_not_adopt_live_models():
+    orch._model_options_cache["conv_acp"] = []
+    live = [
+        {"id": "model-a", "isDefault": True, "isActive": True, "efforts": ["quick"]},
+        {"id": "model-b", "efforts": ["precise"]},
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"models": live})),
+        base_url="http://runner",
+    ) as client:
+        conv = _conv(harness_override="acp:neutral", agent_id=None)
+        await orch._fetch_model_options(client, "conv_acp", conv)
+        await asyncio.gather(*list(orch._model_options_inflight.values()))
+        merged = await orch._fetch_model_options(None, "conv_acp", conv)
+    assert [row["id"] for row in merged] == ["__default__"]
+    assert merged[0]["efforts"] == ["quick"]
+    assert await orch._load_acp_model_options("conv_acp", conv, None) == []
+
+
+@pytest.mark.asyncio
 async def test_live_acp_efforts_replace_snapshot_after_model_change():
     rows = [{"id": "model-a", "isDefault": True, "efforts": ["deliberate"]}]
 
@@ -70,15 +124,18 @@ async def test_live_acp_efforts_replace_snapshot_after_model_change():
         conv = _conv(harness_override="acp:neutral", agent_id=None)
         await orch._fetch_model_options(client, "conv_acp", conv)
         await asyncio.gather(*list(orch._model_options_inflight.values()))
-        assert orch._model_options_cache["conv_acp"][0]["efforts"] == ["deliberate"]
+        merged = await orch._fetch_model_options(None, "conv_acp", conv)
+        assert merged[0]["efforts"] == ["deliberate"]
         rows = [{"id": "model-b", "isDefault": True, "efforts": []}]
         await orch._fetch_model_options(client, "conv_acp", conv)
         await asyncio.gather(*list(orch._model_options_inflight.values()))
-        assert orch._model_options_cache["conv_acp"][0]["efforts"] == []
+        merged = await orch._fetch_model_options(None, "conv_acp", conv)
+        assert merged[0]["efforts"] == []
         rows = []
         await orch._fetch_model_options(client, "conv_acp", conv)
         await asyncio.gather(*list(orch._model_options_inflight.values()))
-        assert orch._model_options_cache["conv_acp"] == []
+        assert await orch._load_acp_model_options("conv_acp", conv, None) == []
+        assert await orch._fetch_model_options(None, "conv_acp", conv) == []
 
 
 def test_resolve_harness_is_acp_false_without_override_or_spec() -> None:

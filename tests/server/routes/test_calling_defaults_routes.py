@@ -562,6 +562,19 @@ async def test_non_acp_bundle_still_rejects_opaque_effort(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-sdk", "codex", "pi-native"])
+async def test_review_minor6_non_acp_bundle_ignores_new_model_field(client, harness):
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"model_override": "unoffered-model"})},
+        files={"bundle": ("agent.tar.gz", _bundle(harness), "application/gzip")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    snapshot = await client.get(f"/v1/sessions/{uploaded.json()['session_id']}")
+    assert snapshot.json()["model_override"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "requested,expected_status", [("model-b", 201), (None, 201), ("outside", 400)]
 )
@@ -620,6 +633,7 @@ async def test_bound_acp_bundle_preserves_resolved_model(
     assert response.status_code == expected_status, response.text
     if expected_status == 201:
         saved = conversations.get_conversation(response.json()["session_id"])
+        assert saved is not None
         assert saved.model_override == "model-b"
     else:
         assert "not available" in response.text

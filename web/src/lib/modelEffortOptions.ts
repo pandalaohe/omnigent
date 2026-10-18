@@ -22,7 +22,7 @@ export function effortLevelsFor(
 ): readonly string[] | null {
   if (harness === "acp" || harness?.startsWith("acp:")) {
     const selected = model
-      ? rows.find((row) => row.id === model)
+      ? (rows.find((row) => row.id === model) ?? rows.find((row) => row.id === "__default__"))
       : rows.find((row) => row.isDefault);
     return (
       selected?.efforts ??
