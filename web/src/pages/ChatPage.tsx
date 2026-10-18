@@ -71,10 +71,9 @@ import {
 import { shouldHideNativeServerSwitcher } from "@/lib/sessionNavigationPreferences";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
-import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
-import { resolveUsageContextLimits, usageContextSourceKey } from "@/lib/usageContextPreferences";
+import { usageContextSourceKey } from "@/lib/usageContextPreferences";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -301,6 +300,7 @@ import { buildFusionSections } from "@/components/composer/fusionSections";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
+import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import { composerContextFromLabels } from "@/lib/composerContextAdapters";
 import {
@@ -2238,9 +2238,6 @@ export function buildSlashCommandWithArgsSet(
   return s;
 }
 
-/** Circumference of the progress ring (r=5.5). */
-const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
-
 /** Select and format the active Codex bucket without inventing missing windows. */
 export function formatCodexRateLimits(
   snapshot: CodexRateLimitsSnapshot | null | undefined,
@@ -2264,66 +2261,6 @@ function ProviderUsageLimitsStatus({ value }: { value: FormattedProviderUsageLim
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-56 text-center text-sm">
         <p>{value.scope} usage.</p>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-/** Circular progress ring for either the full context window or the reported compact budget. */
-function ContextRing({
-  contextWindow,
-  autoCompactTokenLimit,
-  tokensUsed,
-}: {
-  contextWindow: number;
-  autoCompactTokenLimit: number | null;
-  tokensUsed: number;
-}) {
-  const mode = useContextIndicatorMode();
-  const compactMode = mode === "compact" && autoCompactTokenLimit != null;
-  const denominator = compactMode ? autoCompactTokenLimit : contextWindow;
-  const pct = Math.min(tokensUsed / denominator, 1);
-  // Arc, %, label, and tooltip all encode context USED: a fresh session
-  // shows an empty ring at 0% and the ring fills as context is consumed.
-  const usedArc = pct * RING_CIRCUMFERENCE;
-  const usedPct = Math.round(pct * 100);
-
-  const accessibleLabel = compactMode
-    ? `${usedPct}% of compact budget used`
-    : `${usedPct}% of context used`;
-  const color =
-    pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className={cn("flex items-center gap-1.5", color)} aria-label={accessibleLabel}>
-          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
-            {/* Track */}
-            <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="2" opacity="0.2" />
-            {/* Used arc — skipped at 0, where round linecaps would still paint a dot. */}
-            {usedArc > 0 && (
-              <circle
-                cx="8"
-                cy="8"
-                r="5.5"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeDasharray={`${usedArc} ${RING_CIRCUMFERENCE}`}
-                transform="rotate(-90 8 8)"
-              />
-            )}
-          </svg>
-          <span className="text-sm tabular-nums" aria-hidden="true">
-            {usedPct}%
-          </span>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">
-          {tokensUsed.toLocaleString()} / {denominator.toLocaleString()} tokens
-        </p>
       </TooltipContent>
     </Tooltip>
   );
@@ -2381,7 +2318,7 @@ export function composerHarnessLabel(
 
 /**
  * Status tray under the composer: plan-mode marker and (fork) the provider
- * usage limits and context ring. Pulled up behind the card so a shelf
+ * usage limits. Pulled up behind the card so a shelf
  * peeks below; skips render when empty. Session cost lives in the header
  * agent-info popover, and the host badge in the composer toolbar.
  */
@@ -2395,10 +2332,7 @@ function ComposerStatusLine({
   // below on it so they never fetch `/v1/sessions/temp:*` during the create
   // window (mirrors ChatPage's top-level `sessionConvId`).
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
-  const contextWindow = useChatStore((s) => s.contextWindow);
-  const autoCompactTokenLimit = useChatStore((s) => s.autoCompactTokenLimit);
   const sessionProviderUsageLimits = useChatStore((s) => s.providerUsageLimits);
-  const tokensUsed = useChatStore((s) => s.tokensUsed);
   const llmModel = useChatStore((s) => s.llmModel);
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
@@ -2424,28 +2358,13 @@ function ComposerStatusLine({
     harness: sessionHarness,
   });
   const formattedRateLimits = formatProviderUsageLimits(stableProviderUsageLimits);
-  const resolvedLimits = resolveUsageContextLimits(
-    usageContextPreferences,
-    usageSourceKey,
-    contextWindow,
-    autoCompactTokenLimit,
-  );
-
-  // The PR link and the goal indicator live in the workspace bar; this line
-  // carries the plan-mode marker and (fork, MOD-s24) the provider usage limits
-  // and the context ring.
+  // The context ring, PR link and goal indicator live in the workspace bar.
   const showPlanMode = !!conversationId && codexPlanMode;
-  // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
-  const showRing =
-    !!conversationId &&
-    resolvedLimits.contextWindow != null &&
-    resolvedLimits.contextWindow > 0 &&
-    tokensUsed != null;
   const showRateLimits =
     !!conversationId &&
     usageContextPreferences.showProviderUsageLimits &&
     formattedRateLimits != null;
-  if (!showPlanMode && !showRing && !showRateLimits) return null;
+  if (!showPlanMode && !showRateLimits) return null;
 
   return (
     <div
@@ -2456,7 +2375,6 @@ function ComposerStatusLine({
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Right: model/effort and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
           <span
@@ -2469,13 +2387,6 @@ function ComposerStatusLine({
         )}
         {showRateLimits && formattedRateLimits && (
           <ProviderUsageLimitsStatus value={formattedRateLimits} />
-        )}
-        {showRing && (
-          <ContextRing
-            contextWindow={resolvedLimits.contextWindow!}
-            autoCompactTokenLimit={resolvedLimits.autoCompactTokenLimit}
-            tokensUsed={tokensUsed}
-          />
         )}
       </div>
     </div>
@@ -2977,6 +2888,10 @@ function ComposerImpl(
   const speedHarness = sessionHarness === "codex" || sessionHarness === "codex-native";
   const sessionModel = useChatStore((s) => s.sessionModelOverride);
   const sessionDefaultModel = useChatStore((s) => s.llmModel);
+  const composerContextWindow = useChatStore((s) => s.contextWindow);
+  const composerTokensUsed = useChatStore((s) => s.tokensUsed);
+  const composerCompactLimit = useChatStore((s) => s.autoCompactTokenLimit);
+  const composerBoundAgentName = useChatStore((s) => s.boundAgentName);
   const speedOptions = speedHarness
     ? speedOptionsForModel(codexModelOptions, sessionModel || sessionDefaultModel)
     : [];
@@ -4349,9 +4264,6 @@ function ComposerImpl(
             onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-            {/* The context ring lives in ComposerStatusLine below: the fork's
-                ring honours the usage-context preferences and the
-                auto-compact budget, which this bar's ring does not read. */}
             <div
               data-testid="composer-task-indicators"
               className="flex items-center gap-0 empty:hidden"
@@ -4365,6 +4277,19 @@ function ComposerImpl(
                 fallbackLabels={runnerLogFallbackLabels}
               />
             </div>
+            {conversationId && (
+              <ComposerContextRing
+                contextWindow={composerContextWindow}
+                tokensUsed={composerTokensUsed}
+                autoCompactTokenLimit={composerCompactLimit}
+                sourceKey={usageContextSourceKey({
+                  hostId: composerSession?.hostId,
+                  agentName: composerBoundAgentName,
+                  harness: sessionHarness,
+                  model: sessionDefaultModel,
+                })}
+              />
+            )}
           </div>
         </ComposerWorkspaceBar>
       </div>

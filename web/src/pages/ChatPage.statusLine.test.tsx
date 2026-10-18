@@ -348,7 +348,7 @@ describe("Composer status line (branch + context ring)", () => {
   it("shows the context ring with the correct used percentage", () => {
     useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer();
-    expect(statusLine()).not.toBeNull();
+    expect(statusLine()).toBeNull();
     // 25k of 100k → 25% used; a wrong value means the ring wired the
     // wrong store fields through its props.
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
@@ -366,7 +366,7 @@ describe("Composer status line (branch + context ring)", () => {
 
     const trigger = screen.getByLabelText("25% of compact budget used");
     expect(trigger).toBeInTheDocument();
-    expect(trigger).toHaveTextContent("25%");
+    expect(trigger).not.toHaveTextContent("25%");
     expect(trigger).not.toHaveTextContent("20k/80k");
     expect(screen.queryByLabelText(/of context used/)).toBeNull();
   });
@@ -407,7 +407,7 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByLabelText("25% of compact budget used")).toBeInTheDocument();
   });
 
-  it("keeps the compact tooltip to token counts without repeating the percentage", async () => {
+  it("shows the compact budget with upstream's compact tooltip layout", async () => {
     localStorage.setItem(CONTEXT_INDICATOR_STORAGE_KEY, "compact");
     useChatStore.setState({
       contextWindow: 100_000,
@@ -419,7 +419,7 @@ describe("Composer status line (branch + context ring)", () => {
     const trigger = screen.getByLabelText("25% of compact budget used");
     fireEvent.pointerMove(trigger, { pointerType: "mouse" });
 
-    await waitFor(() => expect(screen.getByText("20,000 / 80,000 tokens")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("20K / 80K tokens")).toBeInTheDocument());
     expect(screen.queryByText("20,000 / 80,000 tokens · 25%")).toBeNull();
     expect(screen.queryByText(/to Compact/i)).toBeNull();
   });
@@ -518,20 +518,20 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("composer-plan-mode")).toHaveTextContent("Plan mode");
   });
 
-  it("places Plan mode to the left of the context ring", () => {
+  it("keeps Plan mode in the tray and the single context ring in the workspace bar", () => {
     useChatStore.setState({ codexPlanMode: true, contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer({ modelPickerKind: "codex" });
 
     const plan = screen.getByTestId("composer-plan-mode");
     const ring = screen.getByLabelText("25% of context used");
-    expect(ring).toHaveTextContent("25%");
+    expect(ring).not.toHaveTextContent("25%");
     expect(ring).not.toHaveTextContent("25k/100k");
-    expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
+    expect(plan.closest('[data-testid="composer-status-line"]')).not.toBeNull();
+    expect(ring.closest('[data-testid="composer-workspace-controls"]')).not.toBeNull();
+    expect(screen.getAllByTestId("composer-context-ring")).toHaveLength(1);
   });
 
-  it("shows Codex quota usage immediately left of the context percentage", () => {
+  it("keeps Codex quota usage in the tray beside the workspace context controls", () => {
     bindHost("mac-laptop");
     const codexRateLimits: NonNullable<Parameters<typeof Composer>[0]["codexRateLimits"]> = {
       captured_at: Math.floor(Date.now() / 1000),
@@ -558,9 +558,8 @@ describe("Composer status line (branch + context ring)", () => {
     const ring = screen.getByLabelText("25% of context used");
     expect(quota).toHaveTextContent("5h:11% w:6%");
     expect(quota).not.toHaveTextContent("m:");
-    expect(quota.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
+    expect(quota.closest('[data-testid="composer-status-line"]')).not.toBeNull();
+    expect(ring.closest('[data-testid="composer-workspace-controls"]')).not.toBeNull();
   });
 
   it("keeps the last Codex reading when the Host has no fresh measurement", () => {

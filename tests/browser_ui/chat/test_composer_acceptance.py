@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from itertools import pairwise
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.workspace_geometry import workspace_bar_needs_collapse
 from tests.browser_ui.chat.session_contract import ChatSessionContract
@@ -131,9 +133,13 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
             }
         ),
     )
-    page.route(
-        f"**/v1/sessions/{session_id}/child_sessions",
-        lambda route: route.fulfill(
+
+    def child_sessions(route: Route) -> None:
+        assert parse_qs(urlparse(route.request.url).query) == {
+            "zone": ["active"],
+            "limit": ["100"],
+        }
+        route.fulfill(
             json={
                 "data": [
                     {
@@ -146,7 +152,11 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
                     }
                 ]
             }
-        ),
+        )
+
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}/child_sessions(?:\?.*)?$"),
+        child_sessions,
     )
     page.emulate_media(color_scheme=theme)
     page.add_init_script(f"localStorage.setItem('web-theme', '{theme}')")

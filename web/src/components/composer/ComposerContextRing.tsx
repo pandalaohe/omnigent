@@ -1,5 +1,8 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
+import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { formatTokenCount } from "@/lib/formatCost";
+import { resolveUsageContextLimits } from "@/lib/usageContextPreferences";
 import { cn } from "@/lib/utils";
 
 /** Circumference of the progress ring (r=5.5). */
@@ -20,19 +23,42 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
 export function ComposerContextRing({
   contextWindow,
   tokensUsed,
+  autoCompactTokenLimit = null,
+  sourceKey = "",
   className,
 }: {
   contextWindow: number | null;
   tokensUsed: number | null;
+  autoCompactTokenLimit?: number | null;
+  sourceKey?: string;
   className?: string;
 }) {
-  if (contextWindow == null || contextWindow <= 0 || tokensUsed == null) return null;
+  const mode = useContextIndicatorMode();
+  const preferences = useUsageContextPreferences();
+  const limits = resolveUsageContextLimits(
+    preferences,
+    sourceKey,
+    contextWindow,
+    autoCompactTokenLimit,
+  );
+  const compactMode =
+    mode === "compact" && limits.autoCompactTokenLimit != null && limits.autoCompactTokenLimit > 0;
+  const denominator = compactMode ? limits.autoCompactTokenLimit : limits.contextWindow;
+  if (
+    limits.contextWindow == null ||
+    limits.contextWindow <= 0 ||
+    denominator == null ||
+    denominator <= 0 ||
+    tokensUsed == null
+  )
+    return null;
 
-  const pct = Math.min(tokensUsed / contextWindow, 1);
+  const pct = Math.min(tokensUsed / denominator, 1);
   // Arc, %, label, and tooltip all encode context USED: a fresh session
   // shows an empty ring at 0% and the ring fills as context is consumed.
   const usedArc = pct * RING_CIRCUMFERENCE;
   const usedPct = Math.round(pct * 100);
+  const budget = compactMode ? "compact budget" : "context";
 
   return (
     <Tooltip>
@@ -44,7 +70,7 @@ export function ComposerContextRing({
             "flex shrink-0 items-center rounded-full bg-transparent p-0 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
             className,
           )}
-          aria-label={`${usedPct}% of context used`}
+          aria-label={`${usedPct}% of ${budget} used`}
         >
           {/* Tight stroke bounds keep the visible icon-to-label gap consistent. */}
           <svg viewBox="1.5 1.5 13 13" width="13" height="13" fill="none" aria-hidden="true">
@@ -67,9 +93,11 @@ export function ComposerContextRing({
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" className="flex-col items-start gap-0 px-3 py-2 text-left text-sm">
-        <p className="tabular-nums text-ui leading-tight">{usedPct}% context used</p>
+        <p className="tabular-nums text-ui leading-tight">
+          {usedPct}% {budget} used
+        </p>
         <p className="tabular-nums text-neutral-400 leading-tight dark:text-muted-foreground">
-          {formatTokenCount(tokensUsed)} / {formatTokenCount(contextWindow)} tokens
+          {formatTokenCount(tokensUsed)} / {formatTokenCount(denominator)} tokens
         </p>
       </TooltipContent>
     </Tooltip>

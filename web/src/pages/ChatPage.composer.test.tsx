@@ -2838,8 +2838,9 @@ describe("Composer shared visible controls", () => {
     const taskIndicators = within(workspace).getByTestId("composer-task-indicators");
     const background = within(workspace).getByTestId("background-task-pill");
     const subagent = within(workspace).getByTestId("subagent-task-pill");
-    // The context ring lives in the status line below, not the workspace bar.
-    expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
+    const ring = within(workspace).getByLabelText("25% of context used");
+    expect(subagent.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(screen.getAllByTestId("composer-context-ring")).toHaveLength(1);
     expect(
       background.compareDocumentPosition(subagent) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
