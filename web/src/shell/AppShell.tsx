@@ -336,9 +336,12 @@ export function AppShell() {
   // Restore the prior sidebar preference when leaving settings.
   const { inSettings } = useSettingsRoute();
   const mobileViewport = useIsMobileViewport();
+  const previousSettingsMobileRef = useRef(mobileViewport);
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   const settingsLanding = location.pathname.replace(/\/$/, "") === rebasePath("/settings");
   useEffect(() => {
+    const enteringMobile = mobileViewport && !previousSettingsMobileRef.current;
+    previousSettingsMobileRef.current = mobileViewport;
     if (inSettings) {
       // Stash inside the updater so it reads the CURRENT value rather than a
       // closure captured before the pin, and so a re-render while already on
@@ -347,7 +350,8 @@ export function AppShell() {
         if (sidebarOpenBeforeSettingsRef.current === null) {
           sidebarOpenBeforeSettingsRef.current = wasOpen;
         }
-        return !isMobileViewport() || settingsLanding || wasOpen;
+        // A desktop pin is not a user-opened mobile drawer.
+        return !isMobileViewport() || settingsLanding || (!enteringMobile && wasOpen);
       });
       setSidebarPeek(false);
       return;

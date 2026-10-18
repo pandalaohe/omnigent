@@ -2016,6 +2016,49 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(open));
   });
 
+  it.each([
+    ["/settings", true],
+    ["/settings/import", false],
+  ] as const)("releases the desktop settings pin on mobile at %s", (path, staysOpen) => {
+    let mobile = false;
+    const listeners = new Set<() => void>();
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => {
+      const base = baseMatchMedia(query);
+      if (query !== "(min-width: 768px)" && query !== "(max-width: 767.98px)") return base;
+      return {
+        ...base,
+        get matches() {
+          return query.includes("min-width") ? !mobile : mobile;
+        },
+        addEventListener: vi.fn((_type: string, listener: () => void) => listeners.add(listener)),
+        removeEventListener: vi.fn((_type: string, listener: () => void) =>
+          listeners.delete(listener),
+        ),
+      };
+    });
+    onTestFinished(() => matchMedia.mockRestore());
+    mockConversations([]);
+    renderShell(path);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    act(() => {
+      mobile = true;
+      listeners.forEach((listener) => listener());
+    });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(staysOpen));
+    if (!staysOpen) {
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    }
+    act(() => {
+      mobile = false;
+      listeners.forEach((listener) => listener());
+    });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
   it("opens settings navigation on the mobile landing and lets the drawer toggle", () => {
     const realMatchMedia = window.matchMedia;
     window.matchMedia = ((query: string) => ({
