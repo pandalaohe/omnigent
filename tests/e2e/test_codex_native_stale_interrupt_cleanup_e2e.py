@@ -48,6 +48,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CodexNativeBridgeState,
     read_bridge_state,
+    update_active_turn_id,
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
@@ -173,10 +174,12 @@ def _request(text: str) -> CreateResponseRequest:
     return CreateResponseRequest(model="agent", input=text)
 
 
+@pytest.mark.parametrize("publish_new_turn_before_cleanup", [False, True])
 async def test_abnormal_exit_interrupt_tolerates_codex_moving_past_recorded_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    publish_new_turn_before_cleanup: bool,
 ) -> None:
     """The abnormal-exit cleanup must not fail when the recorded turn is stale.
 
@@ -202,6 +205,14 @@ async def test_abnormal_exit_interrupt_tolerates_codex_moving_past_recorded_turn
         )
         executor = CodexNativeExecutor(bridge_dir=tmp_path)
         adapter = ExecutorAdapter(executor_factory=lambda: executor)
+        if publish_new_turn_before_cleanup:
+            interrupt = executor.interrupt_session
+
+            async def cleanup_after_forwarder_update(session_key: str) -> bool:
+                update_active_turn_id(tmp_path, "turn_2")
+                return await interrupt(session_key)
+
+            monkeypatch.setattr(executor, "interrupt_session", cleanup_after_forwarder_update)
 
         with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
             # Web message 1: the real turn/start records turn_1 in bridge state.
@@ -260,8 +271,10 @@ async def test_abnormal_exit_interrupt_tolerates_codex_moving_past_recorded_turn
             f"{failures[0].getMessage()}\n{failures[0].exc_text or ''}"
         )
         state = read_bridge_state(tmp_path)
-        assert state is not None and state.active_turn_id is None, (
-            f"the superseded turn record must be cleared; bridge={state!r}"
+        expected_turn = "turn_2" if publish_new_turn_before_cleanup else None
+        assert state is not None and state.active_turn_id == expected_turn, (
+            f"only the superseded owned turn record may be cleared; bridge={state!r}"
         )
+        assert fake.active_turn == "turn_2", "cleanup must never interrupt the newer native turn"
     finally:
         await fake.stop()

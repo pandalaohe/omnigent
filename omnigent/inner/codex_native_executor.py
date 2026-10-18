@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -333,7 +334,7 @@ async def _start_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+) -> CodexNativeBridgeState | None:
     """Apply optional settings and start one Codex turn on an idle thread."""
     settings_overrides = dict(settings_overrides)
     # Settings applied while their config write failed are recorded beside the config.
@@ -402,6 +403,8 @@ async def _start_codex_turn(
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
+        return replace(state, active_turn_id=turn_id)
+    return None
 
 
 async def _steer_codex_turn(
@@ -438,17 +441,16 @@ async def _inject_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
-    """Steer an active turn or start one, recovering one proven stale steer."""
+) -> CodexNativeBridgeState | None:
+    """Deliver input and return the exact turn state only when this call started it."""
     if state.active_turn_id is None:
-        await _start_codex_turn(
+        return await _start_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
             settings_overrides=settings_overrides,
         )
-        return
 
     expected_turn_id = state.active_turn_id
     try:
@@ -458,7 +460,7 @@ async def _inject_codex_turn(
             state=state,
             input_items=input_items,
         )
-        return
+        return None
     except CodexAppServerResponseError as error:
         if not is_stale_active_turn_error(error):
             raise
@@ -481,9 +483,9 @@ async def _inject_codex_turn(
             state=recovered_state,
             input_items=input_items,
         )
-        return
+        return None
     _logger.info("Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id)
-    await _start_codex_turn(
+    return await _start_codex_turn(
         client,
         bridge_dir=bridge_dir,
         state=recovered_state,
@@ -503,6 +505,8 @@ class CodexNativeExecutor(Executor):
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
+        self._owned_turn_state: CodexNativeBridgeState | None = None
+        self._abandoned_turn_state: CodexNativeBridgeState | None = None
         # Serializes injection into the shared native Codex thread.
         # ``run_turn`` (initiating message) and ``enqueue_session_message``
         # (mid-turn steering) run concurrently against this one cached
@@ -598,7 +602,7 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
-        state = read_bridge_state(self._bridge_dir)
+        state = self._abandoned_turn_state or read_bridge_state(self._bridge_dir)
         if state is None:
             return False
         # Flip the local map first: the cancelled record is what the web
@@ -606,7 +610,11 @@ class CodexNativeExecutor(Executor):
         # Unlike the runner's Stop handler, the flipped map is not
         # published here — the inner process has no server client; web
         # Stop routes through the runner handler, which does publish.
-        pending = cancel_pending_mcp_startup(self._bridge_dir)
+        pending = (
+            []
+            if self._abandoned_turn_state is not None
+            else cancel_pending_mcp_startup(self._bridge_dir)
+        )
         if state.active_turn_id is None and not pending:
             return False
         client = client_for_transport(
@@ -879,13 +887,15 @@ class CodexNativeExecutor(Executor):
                                         "objective": goal_objective,
                                     },
                                 )
-                            await _inject_codex_turn(
+                            started_state = await _inject_codex_turn(
                                 client,
                                 bridge_dir=self._bridge_dir,
                                 state=state,
                                 input_items=input_items,
                                 settings_overrides=settings_overrides,
                             )
+                            if started_state is not None:
+                                self._owned_turn_state = started_state
                     except Exception as exc:
                         if isinstance(exc, _CodexNativeInputUndelivered):
                             startup_failure = exc.failure
@@ -937,6 +947,7 @@ class CodexNativeExecutor(Executor):
                         await client.close()
             break
         if error_msg is not None:
+            self._abandoned_turn_state = self._owned_turn_state
             yield ExecutorError(
                 message=error_msg,
                 code=startup_failure.code if startup_failure is not None else refusal_code,
@@ -945,9 +956,9 @@ class CodexNativeExecutor(Executor):
                 # Transport loss after submission stays ambiguous unless Codex
                 # explicitly rejected the input.
                 undelivered=undelivered,
-                # This bridge does not own the external native turn. An
-                # adapter cleanup interrupt would stop an unrelated turn.
-                preserve_session=True,
+                # Reap only a turn this executor actually started. Steering a
+                # terminal-owned turn never gives us interruption ownership.
+                preserve_session=self._abandoned_turn_state is None,
             )
         else:
             yield TurnComplete(response=None)
