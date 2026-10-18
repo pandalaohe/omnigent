@@ -15,8 +15,6 @@ import time
 from collections import deque
 from typing import Any
 
-from omnigent.server.user_preferences_store import read_collab_settings
-
 # owner → monotonic timestamps of admitted opens inside the window.
 # custom-lint: disable-next=workspace-scoped-cache -- owner-keyed; a collision only shares a window
 _OPEN_TIMESTAMPS: dict[str, deque[float]] = {}
@@ -60,6 +58,8 @@ def admit_open(app_state: Any, owner: str) -> str | None:
     :param owner: Session owner whose window applies.
     :returns: ``None`` when admitted, else the human refusal text.
     """
+    from omnigent.server.user_preferences_store import read_collab_settings
+
     settings = read_collab_settings(getattr(app_state, "user_preferences_store", None), owner)
     count = settings.open_rate_count
     window_s = settings.open_rate_window_s

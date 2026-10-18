@@ -306,8 +306,6 @@ import {
   type ActiveChatOverride,
   clearLegacyPinnedConversationIds,
   computeNextActiveOverride,
-  COLLAPSED_SIDEBAR_SECTION_IDS_STORAGE_KEY,
-  COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   conversationDisplayLabel,
   dedupeConversationsById,
   getConversationAgentType,
@@ -2755,30 +2753,9 @@ function ConversationList({
 
   // Collapsed section ids — device-local (never synced), persisted so the
   // preference survives reloads.
-  const [collapsedSectionIds, setCollapsedSectionIds] = useState<string[]>(() => {
-    let hadIdPreference = false;
-    try {
-      hadIdPreference =
-        window.localStorage.getItem(COLLAPSED_SIDEBAR_SECTION_IDS_STORAGE_KEY) !== null;
-    } catch {
-      // Storage may be unavailable in an embedded shell.
-    }
-    const ids = readCollapsedSidebarSectionIds();
-    if (hadIdPreference) return ids;
-    try {
-      const legacy: unknown = JSON.parse(
-        window.localStorage.getItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY) ?? "[]",
-      );
-      if (!Array.isArray(legacy)) return ids;
-      const merged = [
-        ...new Set([...ids, ...legacy.filter((id): id is string => typeof id === "string")]),
-      ];
-      if (merged.length !== ids.length) writeCollapsedSidebarSectionIds(merged);
-      return merged;
-    } catch {
-      return ids;
-    }
-  });
+  const [collapsedSectionIds, setCollapsedSectionIds] = useState<string[]>(
+    readCollapsedSidebarSectionIds,
+  );
   const toggleSectionCollapsed = useCallback((sectionId: string) => {
     setCollapsedSectionIds((prev) => {
       const next = prev.includes(sectionId)

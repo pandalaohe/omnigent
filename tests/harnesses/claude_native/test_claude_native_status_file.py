@@ -190,7 +190,7 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
     path = _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
-        on_status=lambda status, _reason: published.append(status),
+        on_status=lambda status, _reason, _background_shell_count: published.append(status),
         pane_pid_getter=_StubPidGetter(1),
         session_id_getter=lambda: "s",
         config_dir=tmp_path,

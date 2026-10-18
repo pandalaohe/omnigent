@@ -171,12 +171,12 @@ def test_message_from_web_ui_reaches_scrolled_back_pane(pane: _Pane) -> None:
 
 
 def test_interrupt_reaches_scrolled_back_pane(pane: _Pane) -> None:
-    """The stop button's Escape reaches Claude instead of only closing copy mode."""
+    """The stop button's Ctrl+C reaches Claude after closing copy mode."""
     pane.scroll_back()
 
     bridge.inject_interrupt(pane.bridge_dir, timeout_s=5.0)
 
-    assert _wait_for_bytes(pane.received, b"\x1b") == b"\x1b"
+    assert _wait_for_bytes(pane.received, b"\x03") == b"\x03"
     assert not pane.in_mode(), "The interrupt should return the pane to the live view."
 
 

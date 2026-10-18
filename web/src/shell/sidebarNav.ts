@@ -133,7 +133,7 @@ export function readCollapsedSidebarSectionIds(): string[] {
     // First read on this device: migrate the legacy titles, write the new key
     // (the legacy key stays in place for older clients).
     const ids = readCollapsedSidebarSections()
-      .map((title) => LEGACY_COLLAPSED_SECTION_IDS[title])
+      .map((title) => LEGACY_COLLAPSED_SECTION_IDS[title] ?? title)
       .filter((id): id is string => id !== undefined);
     writeCollapsedSidebarSectionIds(ids);
     return ids;

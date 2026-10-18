@@ -8,6 +8,7 @@ import { testAgent } from "@/test/agentFixtures";
 // stubbed (its filesystem browsing is out of scope here).
 
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 
@@ -49,7 +50,10 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useCreateScheduledTask: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
 }));
-vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof AgentLabelsModule>()),
+  useBrainHarnessLabels: () => ({}),
+}));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
   HostWorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (

@@ -122,8 +122,7 @@ export function supportsEffortControl(
     wrapper === DEVIN_NATIVE_WRAPPER ||
     wrapper === "antigravity-native-ui" ||
     (wrapper == null && session?.harness === "antigravity-native") ||
-    (wrapper == null && session?.harness === "codex-native") ||
-    isSdkHarnessSession(session)
+    (wrapper == null && session?.harness === "codex-native")
   ) {
     return true;
   }
@@ -132,6 +131,7 @@ export function supportsEffortControl(
   return (
     session != null &&
     wrapper == null &&
+    !session.inferenceConfigured &&
     session.parentSessionId == null &&
     effortLevelsForFamily(effortFamily).length > 0
   );

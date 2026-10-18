@@ -747,7 +747,7 @@ async def test_codex_interrupt_defers_to_runner_before_first_native_turn(
     from tests.runner.helpers import NullServerClient
 
     async def idle_bridge(*args, **kwargs):
-        return SimpleNamespace(active_turn_id=None)
+        return SimpleNamespace(active_turn_id=None), tmp_path
 
     monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _id: tmp_path)
     monkeypatch.setattr(bridge, "cancel_pending_mcp_startup", lambda _path: [])

@@ -107,6 +107,7 @@ def orphan_retention_expired(bridge_dir: Path) -> bool:
     """
     cutoff = time.time() - ORPHAN_RETENTION_SECONDS
     scan_failed = False
+    saw_file = False
 
     def _record_scan_failure(_error: OSError) -> None:
         nonlocal scan_failed
@@ -118,11 +119,17 @@ def orphan_retention_expired(bridge_dir: Path) -> bool:
         followlinks=False,
     ):
         for filename in filenames:
+            saw_file = True
             try:
                 if os.lstat(Path(directory) / filename).st_mtime > cutoff:
                     return False
             except OSError:
                 return False
+    if not saw_file:
+        try:
+            return not scan_failed and os.lstat(bridge_dir).st_mtime <= cutoff
+        except OSError:
+            return False
     return not scan_failed
 
 

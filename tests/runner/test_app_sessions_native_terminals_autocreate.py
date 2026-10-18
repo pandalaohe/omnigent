@@ -2784,6 +2784,8 @@ async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
             if external_id:
                 patched_ids.append(external_id)
             return httpx.Response(200, json={})
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": []})
         assert request.url.path == f"/v1/sessions/{session_id}/items"
         history_requests.append(request.url.path)
         return httpx.Response(
@@ -4791,6 +4793,8 @@ async def test_codex_tui_launch_reads_project_config_from_session_workspace(
         codex_path="/opt/codex/bin/codex",
         codex_home=tmp_path / "codex-home",
         env={},
+        agent_pid=None,
+        session_id="conv_codex_cwd_gone",
     )
     await _launch_codex_native_tui(
         "conv_codex_cwd_gone",

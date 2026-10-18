@@ -436,6 +436,14 @@ def build_native_controls(
                 extra={"session_id": conv_id},
             )
             state = None
+        except RuntimeError:
+            _logger.warning(
+                "Codex-native recovery failed before settings update for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+                exc_info=True,
+            )
+            state = None
         if state is None:
             if set(settings) == {"serviceTier"}:
                 return JSONResponse(status_code=202, content={"deferred": True}), settings

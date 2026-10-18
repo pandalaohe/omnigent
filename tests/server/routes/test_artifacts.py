@@ -499,7 +499,7 @@ async def _online_host(
             text = await conn.outbound_queue.get()
             if text is None:
                 return
-            frame = decode_host_frame(text)
+            frame = decode_host_frame(text.data)
             if frames is not None:
                 frames.append(frame)
             if isinstance(frame, HostFsRequestFrame) and reply is not None:

@@ -264,7 +264,13 @@ describe("Custom agents settings", () => {
     failSave = true;
     mount("/settings/custom-agents/new");
     fireEvent.change(screen.getByLabelText(/Name/), { target: { value: "new-agent" } });
-    fireEvent.change(screen.getByLabelText(/Model/), { target: { value: "test-model" } });
+    fireEvent.pointerDown(screen.getByTestId("agent-member-trigger"), {
+      button: 0,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("agent-member-model"));
+    fireEvent.click(await screen.findByTestId("agent-member-model-opus"));
+    fireEvent.keyDown(screen.getByTestId("agent-member-menu"), { key: "Escape" });
     fireEvent.change(screen.getByLabelText("System instructions"), {
       target: { value: "Keep this draft." },
     });

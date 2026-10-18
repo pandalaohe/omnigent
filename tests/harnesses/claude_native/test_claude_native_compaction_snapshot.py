@@ -41,6 +41,7 @@ def _records(
             {
                 "id": "compaction",
                 "type": "compaction",
+                "snapshot_source": "transcript",
                 "token_count": 987,
                 "compacted_messages": compacted_messages,
             }
@@ -224,7 +225,7 @@ def test_retained_turn_and_tool_pair_survive_save_and_resume(
                 "message": {"role": "user", "content": "post-compaction request"},
             }
         )
-    bridge, _ = _write_transcript(tmp_path, monkeypatch, entries)
+    bridge, transcript = _write_transcript(tmp_path, monkeypatch, entries)
     posted: list[dict[str, Any]] = []
     _persist(bridge, posted)
     messages = posted[0]["data"]["compacted_messages"]
@@ -232,6 +233,10 @@ def test_retained_turn_and_tool_pair_survive_save_and_resume(
         entry["uuid"]: entry["message"]["content"] for entry in entries if "message" in entry
     }
     expected = [by_uuid[uid] for uid in ("summary", "request", "call", "result")]
+    _, primary_snapshot = forwarder._read_native_compaction_snapshot(
+        transcript, "summary:0:compact_summary"
+    )
+    assert [message["content"] for message in primary_snapshot] == expected
     if continuation_parent:
         expected.append("post-compaction request")
     assert [message["content"] for message in messages] == expected
@@ -357,21 +362,22 @@ async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks
             )
 
         for attempt in range(3):
-            if completion_path == "transcript" or (
-                completion_path == "alternating" and attempt % 2 == 0
+            if completion_path == "hook" or (
+                completion_path == "alternating" and attempt % 2 == 1
             ):
-                handled = await _handle_compact_summary_item(
-                    client,
-                    session_id="conversation-test",
-                    bridge_dir=bridge,
-                    item=summary_item,
-                    retry_tracker=transcript_tracker,
-                    compaction_retry_tracker=snapshot_tracker,
-                )
-                assert handled is (attempt == 2)
-            else:
+                # Completion hooks acknowledge without blocking later hooks;
+                # the durable transcript owns snapshot retries.
                 hook_state = await poll_hooks()
-                assert (hook_state.event_cursor > 0) is (attempt == 2)
+                assert hook_state.event_cursor > 0
+            handled = await _handle_compact_summary_item(
+                client,
+                session_id="conversation-test",
+                bridge_dir=bridge,
+                item=summary_item,
+                retry_tracker=transcript_tracker,
+                compaction_retry_tracker=snapshot_tracker,
+            )
+            assert handled is (attempt == 2)
             boundaries = [event for event in posted if event["type"] == "compaction"]
             assert len(boundaries) == (1 if attempt == 2 else 0)
         hook_state = await poll_hooks()

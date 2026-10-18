@@ -5326,6 +5326,7 @@ export function effortLevelsForConv(
   currentModel: string | null = null,
   effortFamily: string | null = null,
 ): readonly string[] {
+  if (isSdkHarnessSession(conv) && effortFamily) return effortLevelsForFamily(effortFamily);
   const harness =
     nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness ??
     (isSdkHarnessSession(conv) ? conv?.harness : null);

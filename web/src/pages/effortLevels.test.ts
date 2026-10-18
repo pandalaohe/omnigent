@@ -206,9 +206,9 @@ describe("shouldShowEffortPicker", () => {
     ).toBe(false);
   });
 
-  it("returns true for label-less SDK sessions", () => {
-    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(true);
-    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" })).toBe(true);
+  it("returns true for label-less SDK sessions with a declared effort family", () => {
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" }, "anthropic")).toBe(true);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" }, "openai")).toBe(true);
   });
 
   it("returns false for custom agents and missing labels", () => {

@@ -79,6 +79,8 @@ async def test_persistent_throttling_uses_only_valid_local_history(
 
     def handle(request: httpx.Request) -> httpx.Response:
         nonlocal calls
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": []})
         calls += 1
         return httpx.Response(
             429,

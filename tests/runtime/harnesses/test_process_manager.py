@@ -2253,10 +2253,13 @@ async def test_agent_switch_does_not_overwrite_process_that_survived_teardown(
     class _Process:
         returncode = None
 
+    class _Endpoint:
+        socket_path = None
+
     entry = _SubprocessEntry(
         process=_Process(),  # type: ignore[arg-type]
         client=object(),  # type: ignore[arg-type]
-        endpoint=object(),  # type: ignore[arg-type]
+        endpoint=_Endpoint(),  # type: ignore[arg-type]
         harness="claude-sdk",
     )
     manager = HarnessProcessManager(tmp_parent=short_tmp_parent)

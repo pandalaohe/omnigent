@@ -33,7 +33,6 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
-from omnigent.server.user_preferences_store import validate_preferences_envelope
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -111,6 +110,8 @@ class UserPreferencesEnvelope(BaseModel):
 
     @model_validator(mode="after")
     def _validate_persisted_contract(self) -> Self:
+        from omnigent.server.user_preferences_store import validate_preferences_envelope
+
         validate_preferences_envelope(self.model_dump(mode="python"))
         return self
 

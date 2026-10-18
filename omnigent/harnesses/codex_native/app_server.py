@@ -2731,18 +2731,18 @@ class CodexNativeAppServer:
         group_empty = False
         try:
             if self.proc is not None and self.proc.returncode is None:
+                # A wrapper can replace argv and lose the registry tag while
+                # the directly owned subprocess is still alive.
+                _terminate_process_tree(self.proc)
                 if os.name == "posix":
                     await _reap_process_group_survivors(
                         self.process_group_id, self.process_registry_tag
                     )
-                else:
-                    _terminate_process_tree(self.proc)
                 try:
                     await asyncio.wait_for(self.proc.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    if os.name != "posix":
-                        _kill_process_tree(self.proc)
-                        await self.proc.wait()
+                    _kill_process_tree(self.proc)
+                    await self.proc.wait()
             # The npm wrapper can exit while the tree it started survives, so
             # the recorded group decides when the registry entry is gone.
             group_empty = await _reap_process_group_survivors(

@@ -110,6 +110,15 @@ describe("supportsEffortControl with a declared effort family", () => {
     ).toBe(false);
   });
 
+  it("keeps configured inference outside the SDK effort controls", () => {
+    expect(
+      supportsEffortControl(
+        { labels: {}, harness: "claude-sdk", inferenceConfigured: true },
+        "anthropic",
+      ),
+    ).toBe(false);
+  });
+
   it("leaves the native wrapper-label gate exactly as before", () => {
     expect(supportsEffortControl({ labels: { "omnigent.wrapper": "claude-code-native-ui" } })).toBe(
       true,

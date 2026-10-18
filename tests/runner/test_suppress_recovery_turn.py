@@ -328,8 +328,10 @@ async def test_recovery_turn_drops_forward_of_its_starting_item(
         )
         assert init_resp.status_code == 201, init_resp.text
 
-        # Let the recovery turn run and complete.
-        await asyncio.sleep(0.1)
+        # Wait for actual completion instead of assuming a scheduler delay.
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
 
         # The recovery turn consumed the history message — harness was called once.
         assert len(harness.posted_bodies) == 1, (
@@ -384,7 +386,9 @@ async def test_recovery_turn_drops_forward_when_a_non_input_item_trails() -> Non
             json=_session_init_payload(suppress_recovery_turn=False),
         )
         assert init_resp.status_code == 201, init_resp.text
-        await asyncio.sleep(0.1)
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
         assert len(harness.posted_bodies) == 1, (
             "the trailing converted user message must still start a recovery turn; "
             f"got {len(harness.posted_bodies)} harness call(s)"
@@ -1042,14 +1046,8 @@ async def test_forward_resolution_race_with_catch_up_replay(
 
 
 @pytest.mark.asyncio
-async def test_forward_rechecks_after_cold_history_load() -> None:
-    """A replay starting during the forward's cold history load must still win.
-
-    The forward passes the dedup check, then awaits the cold-branch history
-    load.  In that window create_session's init replay starts a turn from the
-    same persisted item; without a re-check after the load the forward installs
-    history and starts a second turn.
-    """
+async def test_cold_forward_prevents_concurrent_init_replay() -> None:
+    """An in-flight forward owns the turn while its cold history load waits."""
     server_client = _GatedHistoryServerClient()
     app, _pm, harness = _build_sdk_app(server_client)
 
@@ -1076,19 +1074,16 @@ async def test_forward_rechecks_after_cold_history_load() -> None:
             )
             await asyncio.wait_for(server_client.forward_entered.wait(), timeout=5)
 
-            # The init replay starts and records msg_001 while the forward is
-            # parked in its cold history load.
+            # Init observes the in-flight forward and leaves turn ownership to it.
             server_client.release_init.set()
             init_resp = await asyncio.wait_for(init, timeout=5)
             assert init_resp.status_code == 201, init_resp.text
+            assert not harness.posted_bodies
 
             server_client.release_forward.set()
             forward_resp = await asyncio.wait_for(forward, timeout=5)
             assert forward_resp.status_code == 202, forward_resp.text
-            assert forward_resp.json().get("status") == "already_started", (
-                "the forward was not re-checked after its history load and "
-                f"started a second turn; got {forward_resp.json()}"
-            )
+            assert forward_resp.json().get("status") == "accepted"
             assert not app.state.session_message_buffers.get(SESSION_ID)
         finally:
             server_client.release_init.set()

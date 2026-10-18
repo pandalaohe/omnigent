@@ -1802,15 +1802,19 @@ async def test_runner_ingest_accepts_native_mirror_on_restarted_parent(
     rejected = await app.state.runner_event_ingest(
         app=app, headers=Headers({}), owner=None, runner_id="runner-foreign", batch=batch
     )
-    assert rejected.applied == 0
+    assert rejected.applied == 1
+    assert (await client.get(f"/v1/sessions/{child.id}/items")).json()["data"] == []
     accepted = await app.state.runner_event_ingest(
         app=app, headers=Headers({}), owner=None, runner_id="runner-new", batch=batch
     )
     assert accepted.applied == 1, accepted
+    event["data"]["source_id"] = "native:stale-redrive"
+    event["data"]["item_data"]["content"][0]["text"] = "must not persist"
     stale = await app.state.runner_event_ingest(
         app=app, headers=Headers({}), owner=None, runner_id="runner-old", batch=batch
     )
-    assert stale.applied == 0
+    # Superseded runners receive a handled acknowledgement without a write.
+    assert stale.applied == 1
     items = (await client.get(f"/v1/sessions/{child.id}/items")).json()["data"]
     assert [item["content"][0]["text"] for item in items] == ["retained"]
     # An independently dispatched child cannot inherit tunnel authority.
@@ -1818,7 +1822,9 @@ async def test_runner_ingest_accepts_native_mirror_on_restarted_parent(
     ordinary = await app.state.runner_event_ingest(
         app=app, headers=Headers({}), owner=None, runner_id="runner-new", batch=batch
     )
-    assert ordinary.applied == 0
+    assert ordinary.applied == 1
+    items = (await client.get(f"/v1/sessions/{child.id}/items")).json()["data"]
+    assert [item["content"][0]["text"] for item in items] == ["retained"]
 
 
 async def test_runner_batch_reports_prefix_after_unexpected_failure(
@@ -4705,9 +4711,10 @@ async def test_archive_lock_and_delete_are_serialized(
     delete_entered = asyncio.Event()
     allow_delete = asyncio.Event()
 
-    async def _blocking_stop(*_args: object, **_kwargs: object) -> None:
+    async def _blocking_stop(*_args: object, **_kwargs: object) -> list[str]:
         delete_entered.set()
         await allow_delete.wait()
+        return []
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.routes_events._best_effort_stop",
@@ -4736,9 +4743,10 @@ async def test_active_delete_renews_claim_past_stale_window(
     delete_entered = asyncio.Event()
     allow_delete = asyncio.Event()
 
-    async def _blocking_stop(*_args: object, **_kwargs: object) -> None:
+    async def _blocking_stop(*_args: object, **_kwargs: object) -> list[str]:
         delete_entered.set()
         await allow_delete.wait()
+        return []
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.routes_events._best_effort_stop",

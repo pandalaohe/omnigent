@@ -3298,7 +3298,7 @@ export function NewChatLandingScreen() {
   // absolute paths); only fetched when there's no recent to fall back to.
   // A project root must not be replaced by the host's unrelated home directory.
   const needsHomeFallback =
-    (configProjectId === null || projectHostRoots?.default_host_reason === "none") &&
+    configProjectId === null &&
     selectedHostId !== null &&
     lastCreatedWorkspace === null &&
     recent.length === 0;
@@ -3423,7 +3423,7 @@ export function NewChatLandingScreen() {
   // off while a project prefill is deciding on a workspace of its own.
   useEffect(() => {
     if (!prefillSettled) return;
-    if (configProjectId !== null && projectHostRoots?.default_host_reason !== "none") return;
+    if (configProjectId !== null) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
     if (autoSeedCandidate === null) return;

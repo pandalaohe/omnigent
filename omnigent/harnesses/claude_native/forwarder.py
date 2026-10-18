@@ -6442,17 +6442,37 @@ def _compacted_messages_from_summary_chain(
     metadata = boundary.get("compactMetadata")
     preserved = metadata.get("preservedMessages") if isinstance(metadata, dict) else None
     preserved_uuids = preserved.get("uuids") if isinstance(preserved, dict) else None
-    if not isinstance(preserved_uuids, list):
-        return snapshot
-    requested = {value for value in preserved_uuids if isinstance(value, str)}
-    if not requested:
-        return snapshot
-
     by_uuid = {
         record_uuid: record
         for record in records
         if isinstance((record_uuid := record.get("uuid")), str)
     }
+    anchor = preserved.get("anchorUuid") if isinstance(preserved, dict) else None
+    if not isinstance(preserved_uuids, list) or not all(
+        isinstance(value, str) for value in preserved_uuids
+    ):
+        segment = metadata.get("preservedSegment") if isinstance(metadata, dict) else None
+        if not isinstance(segment, dict):
+            return snapshot
+        anchor = segment.get("anchorUuid")
+        head, cursor = segment.get("headUuid"), segment.get("tailUuid")
+        preserved_uuids = []
+        seen: set[str] = set()
+        while isinstance(cursor, str) and cursor not in seen:
+            seen.add(cursor)
+            preserved_uuids.append(cursor)
+            if cursor == head:
+                break
+            record = by_uuid.get(cursor)
+            cursor = record.get("parentUuid") if record is not None else None
+        else:
+            raise _CompactionSnapshotError("Incomplete Claude preserved segment")
+    requested = {value for value in preserved_uuids if isinstance(value, str)}
+    if requested - by_uuid.keys():
+        raise _CompactionSnapshotError("Claude retained message is not durable yet")
+    # New transcripts detach the boundary from its retained chain and identify
+    # that chain through an exact summary anchor instead.
+    detached_chain = boundary.get("parentUuid") is None and anchor == summary.get("uuid")
     ancestor_uuids: set[str] = set()
     parent_uuid = boundary.get("parentUuid")
     while isinstance(parent_uuid, str) and parent_uuid not in ancestor_uuids:
@@ -6467,8 +6487,10 @@ def _compacted_messages_from_summary_chain(
         if (
             not isinstance(record_uuid, str)
             or record_uuid not in requested
-            or record_uuid not in ancestor_uuids
+            or (not detached_chain and record_uuid not in ancestor_uuids)
             or record.get("isSidechain") is True
+            or record.get("isMeta")
+            or record.get("teamName")
         ):
             continue
         message = _native_message_from_transcript_record(record)
@@ -6640,19 +6662,27 @@ async def _handle_compact_summary_item_unlocked(
     snapshot_retry_key = f"compaction-snapshot:{seq}"
     if compaction_retry_tracker.retry_delay_s(snapshot_retry_key) is not None:
         return False
+    degraded = False
     try:
-        durable_summary_id, compacted_messages = await asyncio.to_thread(
-            _read_native_compaction_snapshot,
-            transcript_path,
-            item.source_id,
-        )
+        try:
+            durable_summary_id, compacted_messages = await asyncio.to_thread(
+                _read_native_compaction_snapshot,
+                transcript_path,
+                item.source_id,
+            )
+        except _CompactionSnapshotError:
+            if not compaction_retry_tracker.snapshot_fallback_due(snapshot_retry_key):
+                raise
+            compacted_messages = await _read_sdk_compaction_snapshot(bridge_dir)
+            degraded = True
         await _persist_native_compaction_item(
             client,
             session_id=session_id,
             bridge_dir=bridge_dir,
             summary_override=_compact_summary_text(item),
             compacted_messages_override=compacted_messages,
-            snapshot_source="transcript",
+            snapshot_source="transcript_degraded" if degraded else "transcript",
+            fallback_snapshot_loaded=degraded,
             summary_source_id=item.source_id,
             allow_snapshot_fallback=compaction_retry_tracker.snapshot_fallback_due(
                 snapshot_retry_key
@@ -6806,6 +6836,7 @@ async def _handle_compact_summary_item_unlocked(
         seq,
         expect_completion_ack=True,
         summary_id=durable_summary_id,
+        degraded=degraded,
     )
     return True
 

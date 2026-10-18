@@ -12,8 +12,6 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy.exc import StatementError
-
 from omnigent.entities import (
     Conversation,
     ConversationItem,
@@ -1928,6 +1926,8 @@ class SysSessionGetHistoryTool(Tool):
             not isinstance(before_item, str) or not before_item
         ):
             return json.dumps({"error": "before_item must be a non-empty item id string"})
+        from sqlalchemy.exc import StatementError
+
         try:
             page = resolution.conv_store.list_items(
                 resolution.child.id,

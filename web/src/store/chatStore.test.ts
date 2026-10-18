@@ -12436,6 +12436,13 @@ describe("chatStore — session configuration scope", () => {
   });
 
   it.each(["claude-sdk", "codex"])("PATCHes effort on an active %s session", async (harness) => {
+    client.setQueryData(["harness-labels"], {
+      labels: {},
+      setupSteps: {},
+      acpHarnesses: new Set<string>(),
+      effortFamilies: { [harness]: harness === "claude-sdk" ? "anthropic" : "openai" },
+    });
+    onTestFinished(() => client.clear());
     const id = `conv_${harness}_effort`;
     seedSession(id, []);
     withSnapshot(id, { labels: {}, harness });

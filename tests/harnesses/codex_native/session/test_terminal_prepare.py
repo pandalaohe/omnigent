@@ -176,7 +176,9 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
 
     from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
 
-    server = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 156, 1))
+    server = SimpleNamespace(
+        start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 156, 1), agent_pid=None
+    )
     preload = AsyncMock(side_effect=RuntimeError("stop after resume"))
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(

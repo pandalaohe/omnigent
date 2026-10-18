@@ -12,7 +12,7 @@ import pytest
 
 from omnigent.harnesses.antigravity_native.interactions import bridge_interaction
 from omnigent.harnesses.antigravity_native.reader import _request_agy_elicitation
-from omnigent.harnesses.antigravity_native.steps import pending_interaction
+from omnigent.harnesses.antigravity_native.steps import PendingInteraction, pending_interaction
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from tests.server.helpers import create_test_session, start_session_stream_collector
 
@@ -57,7 +57,8 @@ async def test_permission_consent_through_reader_and_server(
     ) -> None:
         delivered.append(payload)
 
-    async def inject_tui(keys: list[str]) -> None:
+    async def inject_tui(keys: list[str], expected: PendingInteraction) -> None:
+        assert expected == pending_interaction(retry)
         if not changed_command:
             assert delivered == [], "RPC must not close the menu before persistence"
         typed.append(keys)

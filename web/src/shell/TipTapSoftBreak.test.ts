@@ -20,6 +20,7 @@ import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
 import { SOFT_BREAK_NODE, SoftBreak } from "./TipTapSoftBreak";
 import { findMatches } from "./TipTapSearchExtension";
 import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
+import { decodeRenderedTextAnchor } from "./renderedTextAnchor";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -293,7 +294,7 @@ describe("SoftBreak text consumers", () => {
     expect(editor.state.doc.textBetween(matches[0].from, matches[0].to, "\n")).toBe(ACROSS);
   });
 
-  it("anchors a comment spanning the break to the raw file verbatim", () => {
+  it("preserves a comment spanning the break through rendered anchor capture", () => {
     editor = makeEditor(WRAPPED);
     const { doc } = editor.state;
     const start_index = WRAPPED.indexOf(ACROSS);
@@ -306,10 +307,12 @@ describe("SoftBreak text consumers", () => {
     const range = findPmRangeForComment(doc, comment, WRAPPED);
     expect(range).not.toBeNull();
     expect(doc.textBetween(range!.from, range!.to, "\n")).toBe(ACROSS);
-    expect(computeSelectionData(range!.from, range!.to, doc, WRAPPED)).toEqual({
-      start_index,
-      end_index: start_index + ACROSS.length,
-      anchor_content: ACROSS,
+    const selection = computeSelectionData(range!.from, range!.to, doc, WRAPPED);
+    expect(selection).not.toBeNull();
+    expect(decodeRenderedTextAnchor(selection!.anchor_content)).toMatchObject({
+      kind: "markdown",
+      text: ACROSS,
     });
+    expect(findPmRangeForComment(doc, { ...comment, ...selection }, WRAPPED)).toEqual(range);
   });
 });

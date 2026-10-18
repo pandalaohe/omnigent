@@ -16,15 +16,24 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _INHERITED_RUNNER_ENV_NAMES, _INHERITED_RUNNER_ENV_PREFIX
+from tests.conftest import (
+    _INHERITED_RUNNER_ENV_NAMES,
+    _INHERITED_RUNNER_ENV_PREFIX,
+    _TEST_HARNESS_TMP_PARENT,
+)
 
 
 def test_inherited_runner_env_absent() -> None:
     """No inherited runner-session variable survives conftest import."""
     prefix_hits = [name for name in os.environ if name.startswith(_INHERITED_RUNNER_ENV_PREFIX)]
-    name_hits = sorted(name for name in _INHERITED_RUNNER_ENV_NAMES if name in os.environ)
+    name_hits = sorted(
+        name
+        for name in _INHERITED_RUNNER_ENV_NAMES - {"OMNIGENT_HARNESS_TMP_PARENT"}
+        if name in os.environ
+    )
     assert prefix_hits == []
     assert name_hits == []
+    assert os.environ["OMNIGENT_HARNESS_TMP_PARENT"] == str(_TEST_HARNESS_TMP_PARENT)
 
 
 @pytest.mark.timeout(240)
@@ -34,6 +43,7 @@ def test_conftest_drops_inherited_runner_env() -> None:
     env = {
         **os.environ,
         "OMNIGENT_RUNNER_ID": "runner_fake",
+        "OMNIGENT_HARNESS_TMP_PARENT": "/opt/work/omnigent/fork/wt/unsafe-harness",
         "OMNIGENT_RUNNER_PARENT_PID": "1",
         "OMNIGENT_PROCESS_LOG_FILE": "/opt/work/omnigent/fork/wt/runner.log",
         "OMNIGENT_RUNNER_CONNECT_MARKER": "/opt/work/omnigent/fork/wt/runner.connected",

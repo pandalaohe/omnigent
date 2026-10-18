@@ -153,6 +153,18 @@ def test_orphan_retention_expired_uses_newest_nested_file(tmp_path: Path) -> Non
     assert native_bridge_common.orphan_retention_expired(bridge_dir) is True
 
 
+@pytest.mark.parametrize("age_days,expired", [(0, False), (71, True)])
+def test_empty_bridge_retention_uses_directory_age(
+    tmp_path: Path, age_days: int, expired: bool
+) -> None:
+    """A newly prepared empty bridge survives; an old empty bridge expires."""
+    bridge_dir = tmp_path / "empty"
+    bridge_dir.mkdir()
+    modified = time.time() - age_days * 24 * 60 * 60
+    os.utime(bridge_dir, (modified, modified))
+    assert native_bridge_common.orphan_retention_expired(bridge_dir) is expired
+
+
 def test_prune_unmarked_dirs_follow_the_retention_policy(tmp_path: Path) -> None:
     """Without a marker the retention policy alone decides; bad markers stay put."""
     root = tmp_path / "bridge-root"

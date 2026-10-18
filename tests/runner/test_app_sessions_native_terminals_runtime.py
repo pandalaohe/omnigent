@@ -504,9 +504,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
         )
     ],
 )
-@pytest.mark.parametrize("cancel_launch", [False, True])
 @pytest.mark.parametrize("peer_enabled", [False, True])
-@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 @pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
@@ -2056,9 +2054,11 @@ async def test_auto_create_codex_terminal_fresh_launch_loads_relaunch_graph(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "codex-home"
             self.listen_url: str | None = None

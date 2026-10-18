@@ -396,7 +396,35 @@ def test_host_daemon_env_keeps_explicit_pythonutf8(
     env = _build_host_daemon_env(server_url=server_url)
 
     assert env.get("PYTHONUTF8") == "0"
-    # Then
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_claude_telemetry_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The Claude telemetry opt-in travels with the exporter configuration."""
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_TELEMETRY", "1")
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "otlp")
+    env = _build_host_daemon_env(server_url=server_url)
+    assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
+    assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
+    """The daemon-to-runner boundary retains explicit Claude telemetry."""
+    env = _build_runner_env(
+        {
+            "PATH": "/usr/bin",
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+            "OTEL_METRICS_EXPORTER": "otlp",
+        },
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_telemetry",
+        binding_token="binding-telemetry",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
     assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
 
