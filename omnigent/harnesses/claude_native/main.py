@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -5990,6 +5991,14 @@ def _claude_transcript_records_from_session_items(
                         parent_uuid = cm_uuid
                         source_ids = compacted_message.get("forwarded_source_ids")
                         if isinstance(source_ids, list):
+                            # Fork source keys predate upstream's UUID projection.
+                            snapshot_item_ids.update(
+                                hashlib.sha256(
+                                    json.dumps([session_id, f"external:{source_id}"]).encode()
+                                ).hexdigest()[:32]
+                                for source_id in source_ids
+                                if isinstance(source_id, str)
+                            )
                             snapshot_item_ids.update(
                                 uuid.uuid5(
                                     uuid.NAMESPACE_URL,

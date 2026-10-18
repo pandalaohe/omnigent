@@ -250,6 +250,68 @@ async def test_compaction_snapshot_source_survives_server_parse(
     assert boundaries[0]["snapshot_source"] == snapshot_source
 
 
+async def test_compaction_resume_deduplicates_real_external_item_ids(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    from omnigent.harnesses.claude_native.main import _claude_transcript_records_from_session_items
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    source_id = "retained-user:0:message"
+    compacted = [
+        {"type": "message", "role": "user", "content": "retained summary"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": "retained prompt",
+            "forwarded_source_ids": [source_id],
+        },
+    ]
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": "retained summary",
+                "last_item_id": "previous-item",
+                "token_count": 0,
+                "snapshot_source": "transcript",
+                "compacted_messages": compacted,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "source_id": source_id,
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "retained prompt"}],
+                },
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{session['id']}/items?order=asc")).json()["data"]
+    assert len(items) == 2
+    records = _claude_transcript_records_from_session_items(
+        items,
+        session_id=session["id"],
+        external_session_id="00000000-0000-4000-8000-000000000001",
+        cwd=tmp_path,
+        bridge_dir=tmp_path / "bridge",
+    )
+    assert [record["message"]["content"] for record in records if "message" in record] == [
+        "retained summary",
+        "retained prompt",
+    ]
+
+
 def _capture_published(
     monkeypatch: pytest.MonkeyPatch, published: list[tuple[str, dict[str, Any]]]
 ) -> None:

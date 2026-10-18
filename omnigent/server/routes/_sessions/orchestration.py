@@ -4820,7 +4820,11 @@ async def _persist_external_conversation_item_unlocked(
             # A web client that sends stable_id gets store-level idempotency:
             # use it directly as the item id so the append is a no-op on retry.
             # source_id from the forwarder takes precedence when both are set.
-            if drained.stable_id is not None and item.stable_id is None:
+            if (
+                drained.stable_id is not None
+                and item.stable_id is None
+                and item.idempotency_key is None
+            ):
                 item = item.model_copy(update={"stable_id": drained.stable_id})
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
