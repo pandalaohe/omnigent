@@ -7,20 +7,30 @@ import threading
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
 
-from omnigent.policies.types import PolicyAction, PolicyResult
+from omnigent.policies.function import FunctionPolicy
+from omnigent.policies.types import EvaluationContext, PolicyAction, PolicyResult
 from omnigent.runtime import get_conversation_store
+from omnigent.runtime.policies import builder
+from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.server.auth import LEVEL_READ
 from omnigent.server.routes import sessions as sessions_routes
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import routes_hooks
-from omnigent.spec.types import StateUpdate, StateUpdateAction
+from omnigent.spec.types import (
+    FunctionPolicySpec,
+    Phase,
+    StateUpdate,
+    StateUpdateAction,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 pytestmark = pytest.mark.asyncio
@@ -263,3 +273,100 @@ async def test_allow_cancellation_does_not_drop_state_after_label_write(
     conv = await asyncio.to_thread(store.get_conversation, session_id)
     assert conv is not None and conv.labels["checked"] == "yes"
     assert conv.session_state["checked"] == "yes"
+
+
+@pytest.mark.parametrize("scope", ["default", "session"])
+async def test_policy_invalidation_during_read_does_not_cache_stale_specs(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, scope: str
+) -> None:
+    store = SqlAlchemyPolicyStore(db_uri)
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation()
+
+    def create(name: str) -> None:
+        kwargs = {
+            "policy_id": uuid4().hex,
+            "name": name,
+            "type": "python",
+            "handler": "probe.allow",
+        }
+        if scope == "default":
+            store.create_default(**kwargs)
+        else:
+            store.create(session_id=conv.id, **kwargs)
+
+    def load() -> list[Any]:
+        if scope == "default":
+            return builder._load_default_policy_specs(store)
+        return builder._load_session_policy_specs(conv.id, store)
+
+    def invalidate() -> None:
+        if scope == "default":
+            builder.invalidate_default_policy_specs_cache()
+        else:
+            builder.invalidate_session_policy_specs_cache(conv.id)
+
+    create("before")
+    invalidate()
+    entered, release = threading.Event(), threading.Event()
+    method = "list_defaults" if scope == "default" else "list_for_session"
+    original = getattr(store, method)
+    reads = 0
+
+    def paused(*args: Any, **kwargs: Any) -> Any:
+        nonlocal reads
+        rows = original(*args, **kwargs)
+        reads += 1
+        if reads == 1:
+            entered.set()
+            assert release.wait(5), "in-flight policy read was not released"
+        return rows
+
+    monkeypatch.setattr(store, method, paused)
+    pending = asyncio.create_task(asyncio.to_thread(load))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        create("after")
+        invalidate()
+    finally:
+        release.set()
+        stale = await pending
+    try:
+        assert {spec.name for spec in stale} == {"before"}
+        fresh = await asyncio.to_thread(load)
+        assert {spec.name for spec in fresh} == {"before", "after"}
+        assert await asyncio.to_thread(load) is fresh
+        assert reads == 2
+    finally:
+        invalidate()
+
+
+@pytest.mark.parametrize("read_only, with_writes", [(False, False), (True, False), (True, True)])
+async def test_deny_without_persistence_does_not_submit_thread_work(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, read_only: bool, with_writes: bool
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+
+    async def deny(event: dict[str, Any]) -> PolicyResult:
+        return _deny_with_state(event) if with_writes else PolicyResult(action=PolicyAction.DENY)
+
+    engine = PolicyEngine(
+        policies=[FunctionPolicy(FunctionPolicySpec(name="probe", on=None), deny)],
+        label_defs={},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels={},
+        conversation_store=store,
+    )
+
+    async def unexpected_thread(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("DENY without persistence submitted thread work")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(asyncio, "to_thread", unexpected_thread)
+        result = await engine.evaluate(
+            EvaluationContext(phase=Phase.REQUEST, content="probe"), read_only=read_only
+        )
+    assert result.action == PolicyAction.DENY
+    persisted = store.get_conversation(conv.id)
+    assert persisted is not None and not persisted.labels and not persisted.session_state

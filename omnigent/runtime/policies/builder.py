@@ -128,6 +128,7 @@ _SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = Works
 )
 # TTLCache reads can expire entries; protect them as well as writes/evictions.
 _POLICY_SPECS_CACHE_LOCK = threading.Lock()
+_POLICY_SPECS_CACHE_GENERATION = 0
 
 
 def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
@@ -1737,6 +1738,7 @@ def _load_default_policy_specs(
     workspace_id = current_workspace_id()
     with _POLICY_SPECS_CACHE_LOCK:
         cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+        generation = _POLICY_SPECS_CACHE_GENERATION
     if cached is not None:
         return cached
     specs: list[PolicySpec] = []
@@ -1760,7 +1762,9 @@ def _load_default_policy_specs(
             continue
         specs.append(_stored_policy_to_spec(policy))
     with _POLICY_SPECS_CACHE_LOCK:
-        _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
+        # An invalidation during the DB read must also prevent a stale refill.
+        if generation == _POLICY_SPECS_CACHE_GENERATION:
+            _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
     return specs
 
 
@@ -1773,9 +1777,12 @@ def invalidate_default_policy_specs_cache() -> None:
     DB rather than serving a stale TTL entry. Scoped to the current
     workspace context via :func:`~omnigent.db.db_models.current_workspace_id`.
     """
+    global _POLICY_SPECS_CACHE_GENERATION
+
     from omnigent.db.db_models import current_workspace_id
 
     with _POLICY_SPECS_CACHE_LOCK:
+        _POLICY_SPECS_CACHE_GENERATION += 1
         _DEFAULT_POLICY_SPECS_CACHE.pop(current_workspace_id(), None)
 
 
@@ -1790,7 +1797,10 @@ def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
     """
+    global _POLICY_SPECS_CACHE_GENERATION
+
     with _POLICY_SPECS_CACHE_LOCK:
+        _POLICY_SPECS_CACHE_GENERATION += 1
         _SESSION_POLICY_SPECS_CACHE.pop(conversation_id, None)
 
 
@@ -1830,6 +1840,7 @@ def _load_session_policy_specs(
         return []
     with _POLICY_SPECS_CACHE_LOCK:
         cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
+        generation = _POLICY_SPECS_CACHE_GENERATION
     if cached is not None:
         return cached
     stored = policy_store.list_for_session(conversation_id)
@@ -1839,7 +1850,8 @@ def _load_session_policy_specs(
             continue
         specs.append(_stored_policy_to_spec(policy))
     with _POLICY_SPECS_CACHE_LOCK:
-        _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
+        if generation == _POLICY_SPECS_CACHE_GENERATION:
+            _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
     return specs
 
 
