@@ -2594,14 +2594,6 @@ async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
         inputs += [middle, *roots]
         expected.update({middle.id: 0, roots[0].id: None, roots[1].id: None})
     assert harness.sweeper.cold_after_for_many(inputs, OwnerPrefs()) == expected
-    print(
-        {
-            "single_reads": len(single_reads),
-            "batch_reads": len(batch_reads),
-            "grant_reads": len(grant_reads),
-            "settings_reads": len(settings_reads),
-        }
-    )
     assert single_reads == []
     assert batch_reads == ([] if preloaded else [{middle.id, roots[1].id}, {roots[0].id}])
     assert sorted(grant_reads) == sorted(root.id for root in roots)
@@ -2619,7 +2611,11 @@ async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
 
 @pytest.mark.parametrize("failure", ["batch", "ancestor", "grant", "settings", "missing"])
 async def test_cold_after_batch_preserves_fallbacks_and_isolates_failures(
-    harness: _Harness, db_uri: str, monkeypatch: pytest.MonkeyPatch, failure: str
+    harness: _Harness,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
 ) -> None:
     roots = [_parent(harness), _parent(harness)]
     children = [_child(harness, root.id) for root in roots]
@@ -2673,6 +2669,30 @@ async def test_cold_after_batch_preserves_fallbacks_and_isolates_failures(
         children[0].id: expected,
         children[1].id: 900,
     }
+    if failure in {"batch", "ancestor"}:
+        assert "Collaboration ancestor batch read failed" in caplog.text
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, ImportError])
+async def test_cold_after_batch_unexpected_owner_failure_defaults_every_session(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+) -> None:
+    parent = _parent(harness)
+    children = [_child(harness, parent.id, title=f"researcher:child-{i}") for i in range(2)]
+    prefs = _CountingPrefs({"agents": {_CLAUDE_AGENT: {"coldAfterSeconds": 0}}})
+
+    def unavailable(*args: Any, **kwargs: Any) -> Any:
+        raise error_type("owner resolution unavailable")
+
+    monkeypatch.setattr(child_keep_warm, "collab_owners_for", unavailable)
+    assert harness.sweeper.cold_after_for_many(children, prefs) == {
+        child.id: None for child in children
+    }
+    assert prefs.reads == 0
+    assert "Keep-warm cold-after owner batch failed" in caplog.text
 
 
 async def test_cold_after_batch_without_auth_does_not_read_ancestors(
@@ -2691,7 +2711,7 @@ async def test_cold_after_batch_without_auth_does_not_read_ancestors(
     assert prefs.reads == 1
 
 
-@pytest.mark.parametrize("shape", ["deep", "cycle"])
+@pytest.mark.parametrize("shape", ["deep", "cycle", "mixed"])
 async def test_collab_owner_batch_matches_bounded_single_walk(
     harness: _Harness, db_uri: str, monkeypatch: pytest.MonkeyPatch, shape: str
 ) -> None:
@@ -2708,10 +2728,26 @@ async def test_collab_owner_batch_matches_bounded_single_walk(
         )
         for i in range(count)
     }
+    if shape == "mixed":
+        # Two root branches at different depths; the first loses its parent
+        # above an existing middle row, while the other still reaches root 6.
+        parents = {"0": "2", "2": "4", "1": "3", "3": "5", "5": "6", "6": None}
+        rows = {
+            sid: Conversation(
+                id=sid,
+                root_conversation_id="6",
+                created_at=1,
+                updated_at=1,
+                parent_conversation_id=parent_id,
+            )
+            for sid, parent_id in parents.items()
+        }
     permissions = SqlAlchemyPermissionStore(db_uri)
     monkeypatch.setattr(harness.store, "get_conversation", rows.get)
     monkeypatch.setattr(
-        harness.store, "get_conversations", lambda ids: {sid: rows[sid] for sid in ids}
+        harness.store,
+        "get_conversations",
+        lambda ids: {sid: rows[sid] for sid in ids if sid in rows},
     )
     monkeypatch.setattr(
         permissions,
@@ -2730,6 +2766,8 @@ async def test_collab_owner_batch_matches_bounded_single_walk(
             "1": "owner-0",
         }
     )
+    if shape == "mixed":
+        expected = {"0": "owner-2", "1": "owner-6"}
     assert {
         row.id: collab.collab_owner_for(row, harness.store, permissions) for row in inputs
     } == expected

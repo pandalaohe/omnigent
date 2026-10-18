@@ -94,6 +94,10 @@ def collab_owners_for(
                 fetched = conversation_store.get_conversations(missing)
                 rows.update({sid: fetched.get(sid) for sid in missing})
             except Exception:  # noqa: BLE001 — isolate a failed row from healthy branches
+                _logger.warning(
+                    "Collaboration ancestor batch read failed; falling back to individual reads",
+                    exc_info=True,
+                )
                 for sid in missing:
                     try:
                         rows[sid] = conversation_store.get_conversation(sid)
