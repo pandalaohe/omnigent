@@ -286,6 +286,20 @@ async def test_review_major1_new_model_without_effort_refuses_visibly(executor):
 
 
 @pytest.mark.asyncio
+async def test_review_major1_failed_switch_keeps_inactive_model_choices(executor):
+    executor._note_config_options(options("model-b", ("precise",), "precise"))
+    executor._note_config_options(options())
+
+    async def reject_after_notification(*args, **kwargs):
+        executor._note_config_options(options("model-b", ()))
+        return {"error": {"code": -32602, "message": "model refused"}}
+
+    executor._rpc = AsyncMock(side_effect=reject_after_notification)
+    await executor._apply_model_override("fresh-session", "model-b")
+    assert executor.model_options()[1]["efforts"] == ["precise"]
+
+
+@pytest.mark.asyncio
 async def test_review_minor1_clear_does_not_capture_carried_override(executor):
     executor._note_config_options(options("model-b"))
     executor._note_config_options(options())

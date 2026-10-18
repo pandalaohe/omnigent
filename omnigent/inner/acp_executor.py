@@ -492,6 +492,7 @@ class AcpExecutor(Executor):
         self._effort_overridden = False
         self._effort_option_model: str | None = None
         self._effort_after_model_switch = False
+        self._model_selection_pending = False
         self._model_options: list[_AcpJsonObject] = []
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
@@ -593,6 +594,7 @@ class AcpExecutor(Executor):
         self._effort_overridden = False
         self._effort_option_model = None
         self._effort_after_model_switch = False
+        self._model_selection_pending = False
         self._model_options = []
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
@@ -1586,6 +1588,7 @@ class AcpExecutor(Executor):
         self._effort_overridden = False
         self._effort_option_model = None
         self._effort_after_model_switch = False
+        self._model_selection_pending = False
         self._model_options = []
         self._system_prompt_sent = False
         self._tool_names.clear()
@@ -1785,7 +1788,7 @@ class AcpExecutor(Executor):
             initial = self._effort_defaults.get(row["id"] if row["id"] != "__default__" else None)
             if initial is not None:
                 row["defaultReasoningEffort"] = initial
-        if not self._model_options:
+        if not self._model_options or self._model_selection_pending:
             return
         # The host defaults table can reuse the last advertisement without
         # starting or touching a user session. Live sessions use their own rows.
@@ -1874,6 +1877,7 @@ class AcpExecutor(Executor):
         )
         self._active_model = model
         self._effort_after_model_switch = True
+        self._model_selection_pending = True
 
         def restore() -> None:
             (
@@ -1892,6 +1896,8 @@ class AcpExecutor(Executor):
         except (Exception, asyncio.CancelledError):
             restore()
             raise
+        finally:
+            self._model_selection_pending = False
         if "error" in response:
             restore()
         return response
