@@ -42,9 +42,16 @@ def upgrade() -> None:
         sa.Column("provider_usage_limits", sa.LargeBinary(), nullable=True),
     )
     bind = op.get_bind()
+    labels = sa.table(
+        "conversation_labels",
+        sa.column("workspace_id"),
+        sa.column("conversation_id"),
+        sa.column("key"),
+        sa.column("value"),
+    )
     rows = bind.execute(
-        sa.text(
-            "SELECT workspace_id, conversation_id, value FROM conversation_labels WHERE key = :key"
+        sa.select(labels.c.workspace_id, labels.c.conversation_id, labels.c.value).where(
+            labels.c.key == sa.bindparam("key")
         ),
         {"key": _LEGACY_KEY},
     ).fetchall()

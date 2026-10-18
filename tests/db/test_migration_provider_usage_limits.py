@@ -3,17 +3,48 @@
 from __future__ import annotations
 
 import json
+import runpy
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic import op as alembic_op
 from alembic.script import ScriptDirectory
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 
 from omnigent.db.compression import decode
 from omnigent.db.utils import _build_alembic_config, _create_engine, _get_current_db_revision
 
 _PREVIOUS = "f9a1b2c3d4e5"
 _LABEL_KEY = "omnigent.last_provider_usage_limits"
+
+
+@pytest.mark.parametrize("dialect", [mysql.dialect(), postgresql.dialect(), sqlite.dialect()])
+def test_legacy_label_select_quotes_reserved_identifiers(
+    monkeypatch: pytest.MonkeyPatch, dialect: Any
+) -> None:
+    migration = runpy.run_path(
+        str(
+            Path(__file__).parents[2]
+            / "omnigent/db/migrations/versions/fa1b2c3d4e5_add_provider_usage_limits_metadata.py"
+        )
+    )
+    bind = MagicMock()
+    bind.execute.return_value.fetchall.return_value = []
+    monkeypatch.setattr(alembic_op, "get_bind", lambda: bind)
+    monkeypatch.setattr(alembic_op, "add_column", lambda *args, **kwargs: None)
+
+    migration["upgrade"]()
+
+    statement, parameters = bind.execute.call_args.args
+    compiled = statement.compile(dialect=dialect)
+    assert parameters == {"key": _LABEL_KEY}
+    assert set(compiled.params) == {"key"}
+    if dialect.name == "mysql":
+        assert "`key`" in str(compiled)
 
 
 def test_upgrade_recovers_one_character_clipped_provider_snapshot(tmp_path: Path) -> None:
