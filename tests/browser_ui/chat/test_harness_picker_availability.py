@@ -15,6 +15,7 @@ import re
 import time
 from typing import Any
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.picker_routes import OWN_AGENTS
@@ -142,15 +143,21 @@ _ALL_READY = {
 }
 
 
-def test_recent_harness_remains_in_other_group(
-    page: Page, chat_session_contract: ChatSessionContract
+@pytest.mark.parametrize("pi_ready", [True, False, None], ids=["ready", "missing", "unreported"])
+def test_recent_harness_ranking_requires_host_readiness(
+    page: Page, chat_session_contract: ChatSessionContract, pi_ready: bool | None
 ) -> None:
-    """Recent launches do not change the primary harness order."""
+    """Usable recent launches lead; missing or unreported ones stay in Other."""
+    readiness = dict(_ALL_READY)
+    if pi_ready is None:
+        readiness.pop("pi-native")
+    else:
+        readiness["pi-native"] = pi_ready
     _stub_picker(
         page,
         chat_session_contract,
         agents=[_CLAUDE, _CODEX, _CURSOR, _PI],
-        configured_harnesses=_ALL_READY,
+        configured_harnesses=readiness,
     )
     page.add_init_script(
         "localStorage.setItem('omnigent:recent-harnesses', JSON.stringify(['pi-native']))"
@@ -158,10 +165,20 @@ def test_recent_harness_remains_in_other_group(
     _open_landing(page, chat_session_contract)
     _open_picker(page)
 
-    # Recent Pi remains in Other, keeping the primary list stable.
-    expect(_agent_row(page, _PI_AGENT_ID)).to_have_count(0)
-    # Cursor is always primary, independently of launch history.
-    expect(_agent_row(page, _CURSOR_AGENT_ID)).to_be_visible()
+    primary = (
+        [_PI_AGENT_ID, _CLAUDE_AGENT_ID, _CURSOR_AGENT_ID]
+        if pi_ready
+        else [_CLAUDE_AGENT_ID, _CURSOR_AGENT_ID, _CODEX_AGENT_ID]
+    )
+    other = _CODEX_AGENT_ID if pi_ready else _PI_AGENT_ID
+    expect(page.locator('[data-testid^="new-chat-landing-agent-ag_"]')).to_have_count(3)
+    for agent_id in primary:
+        expect(_agent_row(page, agent_id)).to_be_visible()
+    assert _renders_before(page, primary[0], primary[1])
+    assert _renders_before(page, primary[1], primary[2])
+    expect(_agent_row(page, other)).to_have_count(0)
+    page.get_by_test_id("new-chat-landing-harness-more").click()
+    expect(_agent_row(page, other)).to_be_visible()
 
 
 def test_picker_leads_with_primary_harnesses(
