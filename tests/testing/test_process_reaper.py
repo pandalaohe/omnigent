@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import psutil
 import pytest
@@ -66,6 +67,35 @@ def _kill_quietly(proc: subprocess.Popen) -> None:
     if proc.poll() is None:
         proc.kill()
         proc.wait(timeout=10)
+
+
+@pytest.mark.parametrize("cause", [PermissionError(13, "unreadable"), psutil.AccessDenied(12345)])
+def test_permission_wrapped_system_error_does_not_attribute_process(
+    monkeypatch: pytest.MonkeyPatch, data_dir: Path, cause: Exception
+) -> None:
+    proc = Mock(spec=psutil.Process, pid=12345)
+
+    def unreadable() -> list[str]:
+        raise SystemError("proc_cmdline returned with an exception set") from cause
+
+    proc.cmdline.side_effect = unreadable
+    monkeypatch.setattr(psutil, "process_iter", lambda: [proc])
+    assert reap_leaked_omnigent_processes(data_dir) == ([], [])
+    proc.environ.assert_not_called()
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
+
+
+def test_unrelated_system_error_remains_visible(
+    monkeypatch: pytest.MonkeyPatch, data_dir: Path
+) -> None:
+    proc = Mock(spec=psutil.Process, pid=12345)
+    proc.cmdline.side_effect = SystemError("unexpected process inspection failure")
+    monkeypatch.setattr(psutil, "process_iter", lambda: [proc])
+    with pytest.raises(SystemError, match="unexpected process inspection failure"):
+        reap_leaked_omnigent_processes(data_dir)
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
 
 
 def test_matches_by_cmdline_reference(data_dir: Path) -> None:

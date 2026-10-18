@@ -56,6 +56,10 @@ def _proc_argv(proc: psutil.Process) -> list[str]:
         return proc.cmdline()
     except (psutil.Error, OSError):
         return []
+    except SystemError as error:
+        if isinstance(error.__cause__, (PermissionError, psutil.AccessDenied)):
+            return []
+        raise
 
 
 def _proc_environ(proc: psutil.Process) -> dict[str, str]:
