@@ -444,11 +444,9 @@ class ClaudeNativeExecutor(Executor):
             )
             return
         except ClaudeTerminalDialog as exc:
-            # The pane is parked on a surface the person clears from the
-            # embedded terminal; reaping it would destroy that. Both raisers
-            # (the readiness gate, and the slash-command refusal ahead of a
-            # routed /model) fail before the first keystroke, so the sender's
-            # queued copy is the only record of the message.
+            # Preserve a blocking surface for the person to clear. Recovery may
+            # have sent Escapes, but no message or settings command was delivered;
+            # the sender's queued copy is still the only record of that input.
             _logger.warning(
                 "claude-native: terminal surface blocks delivery; message not delivered",
                 extra={"session_id": self._request_session_id},

@@ -4361,6 +4361,9 @@ def inject_user_message(
         :func:`_wait_for_claude_prompt_ready`), so a slow host connect
         delivers the message late instead of dropping it.
     :returns: None.
+    :raises ClaudeTerminalDialog: If a dialog blocks delivery or a side chat
+        cannot be confirmed closed. Dismissal Escapes may have been sent,
+        but the message was not delivered; the terminal remains available.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
@@ -4833,8 +4836,8 @@ def inject_slash_command(
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
     :raises ClaudeTerminalDialog: If a surface still covers the input box
-        after the restore; no keystroke was sent. The person clears it from
-        the embedded terminal and retries.
+        after the restore. Dismissal Escapes may have been sent, but the
+        command was not delivered; the person clears it and retries.
     :raises RuntimeError: If the tmux target is not advertised in
         time, if a ``tmux send-keys`` invocation fails, or if the typed
         command verifiably never left the input box (submit swallowed).
@@ -5017,8 +5020,8 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 #
 # Older overlays have a ``▔`` top rule, 4-space question rows and a 6-space
 # answer. Current unframed panels use 2-space question rows and a 4-space
-# answer. Prior questions stack directly above the current one; a blank
-# separates the answer and the possibly wrapped navigation/close footer.
+# answer. Prior questions stack directly above the current one; an optional
+# blank separates the answer and the possibly wrapped navigation/close footer.
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 _BTW_FOOTER_CLOSE_HINT = "Esc to close"
 # A settled overlay offers copy; older versions also offered fork. While
@@ -6114,8 +6117,8 @@ def _restore_occupied_input(
     the web-UI message wins the pane.
 
     Questions and permission prompts require an explicit answer. A person's
-    ``/btw`` stays open; keep-warm's marked panel uses its guarded dismissal
-    and must reveal an uncovered composer before delivery proceeds.
+    ``/btw`` receives only Escape, preserving its history; keep-warm's panel
+    uses its guarded dismissal. Both must reveal an uncovered composer.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -6141,11 +6144,15 @@ def _restore_occupied_input(
     :returns: ``None`` once the input box is free (or the capture is torn);
         otherwise the :func:`_occupying_surface` description of what is
         still on screen, for the caller to refuse to type into.
+    :raises ClaudeTerminalDialog: If a side chat cannot be confirmed closed
+        within its dismissal bound. Escapes may have been sent, but no
+        message or command was delivered; the terminal remains available.
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
     confirmed = False
     unclearable_seen = False
+    personal_btw_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
@@ -6155,12 +6162,8 @@ def _restore_occupied_input(
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
             )
-        if _btw_overlay_present(pane):
-            if not _keep_warm_btw_overlay_present(pane):
-                raise ClaudeTerminalDialog(
-                    "Close your /btw side chat in the terminal, then resend your message. "
-                    "The message was not delivered."
-                )
+        btw_visible = _btw_overlay_present(pane)
+        if btw_visible and _keep_warm_btw_overlay_present(pane):
             if bridge_dir is None or not _dismiss_keep_warm_btw_overlay(
                 bridge_dir, socket_path, tmux_target
             ):
@@ -6170,20 +6173,33 @@ def _restore_occupied_input(
                     "The message was not delivered."
                 )
             return None
-        if auto_mode_billing_notice_visible(pane):
+        if btw_visible:
+            personal_btw_seen = True
+        if personal_btw_seen and _keep_warm_overlay_closed(pane):
+            return None
+        if not personal_btw_seen and auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
-        surface = _occupying_surface(pane)
+        surface = "the /btw side chat" if personal_btw_seen else _occupying_surface(pane)
         if surface is None:
             return None
         now = time.monotonic()
         if now >= deadline:
+            if personal_btw_seen:
+                raise ClaudeTerminalDialog(
+                    "The /btw side chat could not be confirmed closed. Close it in "
+                    "the terminal, then retry. The message or command was not delivered."
+                )
             _logger.warning(
                 "claude-native: input box still occupied (%s) after %.1fs; proceeding",
                 surface,
                 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
             )
             return surface
+        if personal_btw_seen and not btw_visible:
+            # A torn capture or another surface cannot prove closure or draw keys.
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
         # Nothing an Escape can clear: launcher output before the input box
         # mounts, or a dialog that offers no dismissal.
         unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
