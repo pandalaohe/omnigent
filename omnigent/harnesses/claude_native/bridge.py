@@ -4491,6 +4491,9 @@ def inject_user_message(
         :func:`_wait_for_claude_prompt_ready`), so a slow host connect
         delivers the message late instead of dropping it.
     :returns: None.
+    :raises ClaudeTerminalDialog: If a dialog blocks delivery or a side chat
+        cannot be confirmed closed. Dismissal Escapes may have been sent,
+        but the message was not delivered; the terminal remains available.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
@@ -4988,8 +4991,8 @@ def inject_slash_command(
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
     :raises ClaudeTerminalDialog: If a surface still covers the input box
-        after the restore; no keystroke was sent. The person clears it from
-        the embedded terminal and retries.
+        after the restore. Dismissal Escapes may have been sent, but the
+        command was not delivered; the person clears it and retries.
     :raises RuntimeError: If the tmux target is not advertised in
         time, if a ``tmux send-keys`` invocation fails, or if the typed
         command verifiably never left the input box (submit swallowed).
@@ -5172,11 +5175,10 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 # pane is the only place the answer exists, so the forwarder scrapes it
 # from there (read-only) to mirror the exchange into the managed web UI.
 #
-# The overlay draws a ``▔`` top border, the ``/btw <question>`` line(s)
-# (4-space indent; prior side turns stack above the current one), a
-# blank, the answer (6-space indent), a blank, and a footer pinned to the
-# pane's bottom. The answer is rendered atomically once generation
-# finishes — it does not stream chunk-by-chunk into the pane.
+# Older overlays have a ``▔`` top rule, 4-space question rows and a 6-space
+# answer. Current unframed panels use 2-space question rows and a 4-space
+# answer. Prior questions stack directly above the current one; an optional
+# blank separates the answer and the possibly wrapped navigation/close footer.
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 _BTW_FOOTER_CLOSE_HINT = "Esc to close"
 # A settled overlay offers copy; older versions also offered fork. While
@@ -5210,7 +5212,7 @@ _KEEP_WARM_DISMISS_POLL_INTERVAL_S = 0.25
 _KEEP_WARM_DISMISS_TIMEOUT_S = 3.0
 _KEEP_WARM_HISTORY_TIMEOUT_S = 2.0
 # Read-only capture cannot tell a complete tall answer from one the pane
-# clipped (both end in a blank + footer), so an overlay whose border→footer
+# clipped (both end in a blank + footer), so an overlay whose body→footer
 # span reaches this many rows is flagged possibly-truncated. This
 # over-flags long *complete* answers, which is acceptable for the
 # best-effort relay (the note points the reader at the terminal).
@@ -5296,10 +5298,23 @@ class PaneSignals:
     btw_overlay: BtwOverlay | None = None
 
 
-def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int] | None:
-    """Locate the live overlay's top rule and bottom footer."""
-    footer_idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-    if footer_idx is None or _BTW_FOOTER_CLOSE_HINT not in lines[footer_idx]:
+def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int, str] | None:
+    """Locate the live overlay's body and its possibly wrapped footer."""
+    footer_end = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if footer_end is None:
+        return None
+    footer_idx = footer_end
+    # Wrapped hints remain one paragraph; stop at the navigation row so an
+    # answer immediately above an unwrapped footer stays out of the footer.
+    while footer_idx > 0 and lines[footer_idx - 1].strip():
+        if any(hint in lines[footer_idx] for hint in ("to scroll", "to browse", "to switch")):
+            break
+        footer_idx -= 1
+    footer = " ".join(line.strip() for line in lines[footer_idx : footer_end + 1])
+    if not footer.endswith(_BTW_FOOTER_CLOSE_HINT) or any(
+        _is_box_rule(line) or line.startswith(_CLAUDE_PROMPT_GLYPH)
+        for line in lines[footer_idx : footer_end + 1]
+    ):
         return None
     border_idx = next(
         (
@@ -5309,7 +5324,20 @@ def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int] | None:
         ),
         None,
     )
-    return (border_idx, footer_idx) if border_idx is not None else None
+    if border_idx is not None:
+        return border_idx + 1, footer_idx, footer
+    # Only blank/answer rows may separate the question stack from the footer;
+    # a quoted marker above an unrelated panel must never grant key ownership.
+    question_idx = footer_idx - 1
+    while question_idx >= 0 and (
+        not lines[question_idx].strip() or lines[question_idx].startswith("    ")
+    ):
+        if _is_box_rule(lines[question_idx]):
+            return None
+        question_idx -= 1
+    if question_idx < 0 or not lines[question_idx].startswith("  /btw "):
+        return None
+    return question_idx, footer_idx, footer
 
 
 def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
@@ -5327,24 +5355,27 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     bounds = _btw_overlay_bounds(lines)
     if bounds is None:
         return None
-    border_idx, footer_idx = bounds
-    footer = lines[footer_idx]
+    region_start, footer_idx, footer = bounds
     if _BTW_FOOTER_COMPLETE_HINT not in footer:
         return None
-    region = lines[border_idx + 1 : footer_idx]
+    region = lines[region_start:footer_idx]
     # A ``✻ Answering…`` line means the (current) exchange is still in
     # flight even though a completed footer is on screen — bail.
     if any(_BTW_ANSWERING_HINT in line for line in region):
         return None
     # The current turn's question is the LAST ``/btw`` line; earlier side
     # turns stack above it. Its answer is everything after it.
-    question_idx = next(
-        (
-            i
-            for i in range(len(region) - 1, -1, -1)
-            if region[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
-        ),
-        None,
+    question_idx = (
+        0
+        if region and region[0].startswith("  /btw ")
+        else next(
+            (
+                i
+                for i in range(len(region) - 1, -1, -1)
+                if region[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
+            ),
+            None,
+        )
     )
     if question_idx is None:
         question = None
@@ -5355,7 +5386,7 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     answer = _dedent_overlay_lines(answer_lines)
     if not answer:
         return None
-    truncated = (footer_idx - border_idx) >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    truncated = (footer_idx - region_start + 1) >= _BTW_TRUNCATION_MIN_SPAN_ROWS
     return BtwOverlay(question=question, answer=answer, truncated=truncated)
 
 
@@ -5377,8 +5408,7 @@ def _btw_overlay_present(pane: str) -> bool:
     bounds = _btw_overlay_bounds(lines)
     if bounds is None:
         return False
-    border_idx, footer_idx = bounds
-    footer = lines[footer_idx]
+    region_start, footer_idx, footer = bounds
     # The /btw footer offers copy (settled), switch (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
@@ -5387,7 +5417,7 @@ def _btw_overlay_present(pane: str) -> bool:
         return True
     if "to switch" in footer:
         return True
-    return any(_BTW_ANSWERING_HINT in line for line in lines[border_idx + 1 : footer_idx])
+    return any(_BTW_ANSWERING_HINT in line for line in lines[region_start:footer_idx])
 
 
 def _keep_warm_btw_overlay_present(pane: str) -> bool:
@@ -5410,11 +5440,13 @@ def _keep_warm_btw_overlay_present(pane: str) -> bool:
     bounds = _btw_overlay_bounds(lines)
     if bounds is None:
         return False
-    border_idx, footer_idx = bounds
+    region_start, footer_idx, _footer = bounds
+    if lines[region_start].startswith("  /btw "):
+        return KEEP_WARM_BTW_MARKER in lines[region_start]
     question_idx = next(
         (
             i
-            for i in range(footer_idx - 1, border_idx, -1)
+            for i in range(footer_idx - 1, region_start - 1, -1)
             if lines[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
         ),
         None,
@@ -6273,8 +6305,9 @@ def _restore_occupied_input(
     cancel"), which commits nothing and hands the empty input box back, so
     the web-UI message wins the pane.
 
-    Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer.
+    Questions and permission prompts require an explicit answer. A person's
+    ``/btw`` receives only Escape, preserving its history; keep-warm's panel
+    uses its guarded dismissal. Both must reveal an uncovered composer.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -6300,11 +6333,15 @@ def _restore_occupied_input(
     :returns: ``None`` once the input box is free (or the capture is torn);
         otherwise the :func:`_occupying_surface` description of what is
         still on screen, for the caller to refuse to type into.
+    :raises ClaudeTerminalDialog: If a side chat cannot be confirmed closed
+        within its dismissal bound. Escapes may have been sent, but no
+        message or command was delivered; the terminal remains available.
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
     confirmed = False
     unclearable_seen = False
+    personal_btw_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -6315,20 +6352,44 @@ def _restore_occupied_input(
                 "before sending a message."
             ),
         )
-        if auto_mode_billing_notice_visible(pane):
+        btw_visible = _btw_overlay_present(pane)
+        if btw_visible and _keep_warm_btw_overlay_present(pane):
+            if bridge_dir is None or not _dismiss_keep_warm_btw_overlay(
+                bridge_dir, socket_path, tmux_target
+            ):
+                raise ClaudeTerminalDialog(
+                    "The keep-warm /btw side chat could not be safely closed. "
+                    "Close it in the terminal, then resend your message. "
+                    "The message was not delivered."
+                )
+            return None
+        if btw_visible:
+            personal_btw_seen = True
+        if personal_btw_seen and _keep_warm_overlay_closed(pane):
+            return None
+        if not personal_btw_seen and auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
-        surface = _occupying_surface(pane)
+        surface = "the /btw side chat" if personal_btw_seen else _occupying_surface(pane)
         if surface is None:
             return None
         now = time.monotonic()
         if now >= deadline:
+            if personal_btw_seen:
+                raise ClaudeTerminalDialog(
+                    "The /btw side chat could not be confirmed closed. Close it in "
+                    "the terminal, then retry. The message or command was not delivered."
+                )
             _logger.warning(
                 "claude-native: input box still occupied (%s) after %.1fs; proceeding",
                 surface,
                 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
             )
             return surface
+        if personal_btw_seen and not btw_visible:
+            # A torn capture or another surface cannot prove closure or draw keys.
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
         # Nothing an Escape can clear: launcher output before the input box
         # mounts, or a dialog that offers no dismissal.
         unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
@@ -8582,10 +8643,8 @@ def _clear_keep_warm_btw_history(
     :param pane: The settled marked-overlay capture.
     """
     lines = pane.splitlines()
-    footer = next(
-        (line for line in reversed(lines) if _BTW_FOOTER_CLOSE_HINT in line),
-        "",
-    )
+    bounds = _btw_overlay_bounds(lines)
+    footer = bounds[2] if bounds is not None else ""
     if _BTW_CLEAR_HISTORY_HINT not in footer:
         return
     remaining = _keep_warm_tmux_remaining_s()
@@ -8613,10 +8672,8 @@ def _clear_keep_warm_btw_history(
         if not _keep_warm_btw_overlay_present(pane):
             return
         lines = pane.splitlines()
-        footer = next(
-            (line for line in reversed(lines) if _BTW_FOOTER_CLOSE_HINT in line),
-            "",
-        )
+        bounds = _btw_overlay_bounds(lines)
+        footer = bounds[2] if bounds is not None else ""
         if _BTW_CLEAR_HISTORY_HINT not in footer:
             return
     _logger.info("keep-warm: /btw history hint persisted after x; dismissing anyway")
