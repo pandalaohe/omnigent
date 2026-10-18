@@ -262,6 +262,9 @@ vi.mock("@/pages/PoliciesPage", () => ({
 vi.mock("@/components/McpRegistry", () => ({
   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
 }));
+vi.mock("@/pages/settings/SettingsCustomAgentsSection", () => ({
+  SettingsCustomAgentsSection: () => <div data-testid="custom-agent-settings">Agent settings</div>,
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -432,6 +435,10 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("mounts one custom-agent section even without the installed-agent flags", () => {
+    renderPage("/settings/custom-agents");
+    expect(screen.getAllByTestId("custom-agent-settings")).toHaveLength(1);
+  });
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
   });

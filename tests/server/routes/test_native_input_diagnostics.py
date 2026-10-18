@@ -67,7 +67,8 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
         assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == [first, second]
         monkeypatch.setattr(store, "append", original_append)
 
-    matched_id = await _persist_external_conversation_item(conv.id, conv, body, store)
+    matched_id, replayed = await _persist_external_conversation_item(conv.id, conv, body, store)
+    assert replayed is False
     rows = [
         record_to_row(r, "server")
         for r in caplog.records
@@ -111,7 +112,10 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
     )
 
     newer = pending_inputs.record(conv.id, [{"type": "input_text", "text": "later message"}])
-    assert await _persist_external_conversation_item(conv.id, conv, body, store) == matched_id
+    assert await _persist_external_conversation_item(conv.id, conv, body, store) == (
+        matched_id,
+        True,
+    )
     assert (
         len(
             [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_settled"]
@@ -273,7 +277,7 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
         "normalized_text" if interrupted else "fifo_fallback"
     )
     assert "error_item_id" not in record.attributes
-    later_id = await _persist_external_conversation_item(
+    later_id, replayed = await _persist_external_conversation_item(
         conv.id,
         conv,
         SessionEventInput(
@@ -288,6 +292,7 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
         store,
     )
     expected_outcome = "user_interrupted" if interrupted else "prior_fifo_match_uncertain"
+    assert replayed is False
     [uncertain_record] = [
         r
         for r in caplog.records

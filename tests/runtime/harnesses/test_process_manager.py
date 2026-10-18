@@ -2285,6 +2285,60 @@ async def test_agent_switch_does_not_overwrite_process_that_survived_teardown(
     assert spawned is False
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param("socket-missing", marks=pytest.mark.posix_only),
+        "ACP-config",
+    ],
+)
+async def test_respawn_preserves_surviving_entry_after_failed_close(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    class Process:
+        returncode = None
+        pid = 12345
+
+    class Endpoint:
+        socket_path = None
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._started = True
+    endpoint = Endpoint()
+    if reason == "socket-missing":
+        endpoint.socket_path = manager._instance_dir / "missing.sock"
+    harness = "acp" if reason == "ACP-config" else "claude-sdk"
+    entry = _SubprocessEntry(
+        process=Process(),
+        client=object(),
+        endpoint=endpoint,
+        harness=harness,
+        acp_config={"HARNESS_ACP_COMMAND": "old-command"},
+    )
+    manager._entries["conv_retry"] = entry
+    manager.mark_in_flight("conv_retry", "resp_original")
+
+    async def failed_close(_entry):
+        assert _entry is entry
+        return False
+
+    async def unexpected_spawn(*_args, **_kwargs):
+        pytest.fail("a surviving harness must block successor spawn")
+
+    monkeypatch.setattr(manager, "_close_entry", failed_close)
+    monkeypatch.setattr(manager, "_spawn_entry", unexpected_spawn)
+    with pytest.raises(RuntimeError, match=f"survived {reason} teardown"):
+        await manager.get_client(
+            "conv_retry",
+            harness,
+            env={"HARNESS_ACP_COMMAND": "new-command"},
+        )
+    assert manager._entries["conv_retry"] is entry
+    assert manager.has_active_turn("conv_retry")
+
+
 async def test_failed_retention_close_keeps_activity_token_retryable(
     short_tmp_parent: Path,
     monkeypatch: pytest.MonkeyPatch,

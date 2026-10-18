@@ -30,7 +30,7 @@
  *   Unarchive opens the restored session.
  */
 
-import { AgentBadgeDisplaySetting, AgentsSettings } from "@/components/AgentsSettings";
+import { AgentBadgeDisplaySetting } from "@/components/AgentsSettings";
 import { ChatReserveWidthSetting } from "@/components/ChatReserveWidthSetting";
 import { writePanelSizePreference } from "@/lib/panelSizePreferences";
 import { HelpTip } from "@/components/HelpTip";
@@ -436,7 +436,6 @@ export function SettingsPage() {
       {...pageWrapperSettings}
     >
       {section === "appearance" && <AppearanceSection />}
-      {section === "custom-agents" && <AgentsSettings />}
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "custom-agents" && <SettingsCustomAgentsSection />}

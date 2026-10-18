@@ -482,6 +482,57 @@ async def test_discovery_stop_reaps_before_bounded_stderr_drain(monkeypatch) -> 
 
 
 @pytest.mark.posix_only
+async def test_close_surviving_posix_child_finishes_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as module
+
+    class SurvivingProcess:
+        returncode = None
+        waits = 0
+
+        async def wait(self):
+            self.waits += 1
+            if self.waits == 1:
+                raise asyncio.TimeoutError
+            await asyncio.Event().wait()
+
+    class OwnerLock:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    async def surviving_group(*_args):
+        return False
+
+    monkeypatch.setattr(module, "_reap_process_group_survivors", surviving_group)
+    unregistered: list[str] = []
+    monkeypatch.setattr(module, "unregister_codex_native_process", unregistered.append)
+    monkeypatch.setattr(module, "_kill_process_tree", lambda _proc: pytest.fail("unverified kill"))
+    process, lock = SurvivingProcess(), OwnerLock()
+    server = CodexNativeAppServer(
+        codex_path="/test/codex",
+        socket_path=tmp_path / "server.sock",
+        codex_home=tmp_path / "codex-home",
+        env={},
+        config_overrides=[],
+        cwd=tmp_path,
+        bridge_dir=tmp_path / "bridge",
+        proc=process,
+        process_registry_tag="test-tag",
+        process_group_id=456,
+        process_owner_lock=lock,
+    )
+    await asyncio.wait_for(server.close(), timeout=0.5)
+    assert process.waits == 1
+    assert lock.closed
+    assert server.proc is None
+    assert server.process_owner_lock is None
+    assert unregistered == []
+
+
+@pytest.mark.posix_only
 async def test_close_live_process_uses_verified_group_signal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

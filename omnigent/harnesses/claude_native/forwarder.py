@@ -6416,14 +6416,21 @@ def _native_message_from_transcript_record(
     snapshot: dict[str, object] = {"type": "message", "role": role, "content": content}
     message_id = record.get("uuid")
     if isinstance(message_id, str):
-        _, forwarded_items = _transcript_items_from_entry(
-            {"type": role, "uuid": message_id, "message": message},
-            line_number=0,
-            record_offset=None,
-            agent_name="claude-native",
-            current_response_id=None,
-        )
-        snapshot["forwarded_source_ids"] = [item.source_id for item in forwarded_items]
+        try:
+            _, forwarded_items = _transcript_items_from_entry(
+                {"type": role, "uuid": message_id, "message": message},
+                line_number=0,
+                record_offset=None,
+                agent_name="claude-native",
+                current_response_id=None,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            _logger.warning(
+                "Unable to derive Claude compaction overlap identities; error_type=%s",
+                type(exc).__name__,
+            )
+        else:
+            snapshot["forwarded_source_ids"] = [item.source_id for item in forwarded_items]
     return snapshot
 
 
@@ -6751,7 +6758,8 @@ async def _handle_compact_summary_item_unlocked(
                 bridge_dir,
                 seq,
                 expect_completion_ack=True,
-                summary_id=durable_summary_id,
+                summary_id=durable_summary_id or summary_id,
+                degraded=degraded,
             )
             return True
         decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)

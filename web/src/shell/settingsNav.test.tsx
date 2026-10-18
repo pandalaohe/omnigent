@@ -617,14 +617,15 @@ describe("custom agent settings availability", () => {
     [false, true],
     [true, false],
     [true, true],
-  ])("gates nav and direct routes with flag=%s and API=%s", (flag, api) => {
+  ])("keeps the library reachable with flag=%s and API=%s", (flag, api) => {
     mocks.customAgentsEnabled = flag;
     mocks.agentInstall = api;
     renderBody();
     const enabled = flag === true && api;
-    expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(enabled);
-    expect(!!screen.queryByRole("heading", { name: "Customize" })).toBe(enabled);
-    const group = screen.getByRole("heading", { name: enabled ? "Customize" : "General" });
+    expect(screen.getByTestId("settings-nav-custom-agents")).toHaveTextContent(
+      enabled ? "Custom agents" : "Agent library",
+    );
+    const group = screen.getByRole("heading", { name: "Customize" });
     expect(group.parentElement).toContainElement(screen.getByTestId("settings-nav-harnesses"));
     if (enabled) {
       expect(group.parentElement).toContainElement(
@@ -632,9 +633,7 @@ describe("custom agent settings availability", () => {
       );
     }
     for (const suffix of ["", "/new", "/agent-1"]) {
-      expect(routeHook(`/settings/custom-agents${suffix}`).section).toBe(
-        flag && api ? "custom-agents" : "general",
-      );
+      expect(routeHook(`/settings/custom-agents${suffix}`).section).toBe("custom-agents");
     }
   });
 

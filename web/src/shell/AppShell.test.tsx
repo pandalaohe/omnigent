@@ -2000,7 +2000,7 @@ describe("Workspace rail maximize", () => {
   it.each([
     ["desktop", "/settings", true],
     ["desktop", "/settings/import", true],
-    ["mobile", "/settings", false],
+    ["mobile", "/settings", true],
     ["mobile", "/settings/import", false],
     ["mobile", "/settings/harnesses/codex", false],
   ] as const)("opens the appropriate settings surface on %s at %s", (viewport, path, open) => {
@@ -2016,7 +2016,7 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(open));
   });
 
-  it("starts with the settings drawer closed on mobile so section content is reachable", () => {
+  it("opens settings navigation on the mobile landing and lets the drawer toggle", () => {
     const realMatchMedia = window.matchMedia;
     window.matchMedia = ((query: string) => ({
       matches: query.includes("max-width"),
@@ -2033,11 +2033,11 @@ describe("Workspace rail maximize", () => {
       mockConversations([]);
       renderShell("/settings");
 
-      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
-      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
       expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
       fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
       expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     } finally {
       window.matchMedia = realMatchMedia;
     }

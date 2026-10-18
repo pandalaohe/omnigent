@@ -1382,8 +1382,6 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
   );
 }
 
-export { SelectionPopup } from "@/components/chat/SelectionPopup";
-
 interface MainAgentSurfaceProps {
   onNewSession: () => void;
   /**

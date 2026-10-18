@@ -331,12 +331,13 @@ export function AppShell() {
     if (canvasMode) setSidebarPeek(false);
   }, [canvasMode]);
 
-  // Desktop settings need the sidebar's Back row. Mobile section links keep
-  // the drawer state chosen by navigation; the header can reopen the menu.
+  // Desktop settings and the mobile landing show the settings navigation.
+  // Mobile section links keep the drawer state chosen by navigation.
   // Restore the prior sidebar preference when leaving settings.
   const { inSettings } = useSettingsRoute();
   const mobileViewport = useIsMobileViewport();
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
+  const settingsLanding = location.pathname.replace(/\/$/, "") === rebasePath("/settings");
   useEffect(() => {
     if (inSettings) {
       // Stash inside the updater so it reads the CURRENT value rather than a
@@ -346,7 +347,7 @@ export function AppShell() {
         if (sidebarOpenBeforeSettingsRef.current === null) {
           sidebarOpenBeforeSettingsRef.current = wasOpen;
         }
-        return !isMobileViewport() || wasOpen;
+        return !isMobileViewport() || settingsLanding || wasOpen;
       });
       setSidebarPeek(false);
       return;
@@ -357,7 +358,7 @@ export function AppShell() {
       setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
       sidebarOpenBeforeSettingsRef.current = null;
     }
-  }, [inSettings, location.pathname, rebasePath, setSidebarOpen, mobileViewport]);
+  }, [inSettings, settingsLanding, setSidebarOpen, mobileViewport]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.

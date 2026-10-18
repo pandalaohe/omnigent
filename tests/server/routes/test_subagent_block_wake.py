@@ -212,6 +212,8 @@ async def test_record_publish_delivers_wake_message_to_parent(
         assert call.agent_revision == mcp_selection_revision(
             f"{parent_agent_id}/v2", parent.labels
         )
+        if mcp_selected:
+            assert call.agent_revision != f"{parent_agent_id}/v2"
 
         # Resolving the block sends the woken parent a follow-up through
         # the same wiring, so it stops acting on the stale block notice.

@@ -2742,7 +2742,7 @@ class CodexNativeAppServer:
                 except asyncio.TimeoutError:
                     if os.name != "posix":
                         _kill_process_tree(self.proc)
-                    await self.proc.wait()
+                        await self.proc.wait()
             # The npm wrapper can exit while the tree it started survives, so
             # the recorded group decides when the registry entry is gone.
             group_empty = await _reap_process_group_survivors(

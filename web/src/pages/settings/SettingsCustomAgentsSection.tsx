@@ -8,6 +8,8 @@ import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AgentsSettings } from "@/components/AgentsSettings";
 import {
   Dialog,
   DialogContent,
@@ -41,6 +43,34 @@ const date = (value: number | null) =>
       });
 
 export function SettingsCustomAgentsSection() {
+  const info = useServerInfo();
+  const { agentId } = useSettingsRoute();
+  const navigate = useNavigate();
+  const [selectedView, setSelectedView] = useState("installed");
+  if (!customAgentsSettingsEnabled(info)) return <AgentsSettings />;
+  return (
+    <Tabs
+      value={agentId ? "installed" : selectedView}
+      onValueChange={(value) => {
+        setSelectedView(value);
+        if (agentId) navigate(BASE);
+      }}
+    >
+      <TabsList className="mb-6">
+        <TabsTrigger value="installed">Installed agents</TabsTrigger>
+        <TabsTrigger value="library">Agent library</TabsTrigger>
+      </TabsList>
+      <TabsContent value="installed">
+        <InstalledAgentsSettingsSection />
+      </TabsContent>
+      <TabsContent value="library">
+        <AgentsSettings />
+      </TabsContent>
+    </Tabs>
+  );
+}
+
+function InstalledAgentsSettingsSection() {
   const info = useServerInfo();
   const enabled = customAgentsSettingsEnabled(info);
   const supported = enabled && info !== "loading" && info.agent_detail === true;

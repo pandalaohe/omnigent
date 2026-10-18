@@ -315,8 +315,12 @@ def test_valid_empty_retained_content_is_skipped(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completion_path", ["transcript", "hook", "alternating"])
+@pytest.mark.parametrize("ambiguous_delivery", [False, True])
 async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completion_path: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completion_path: str,
+    ambiguous_delivery: bool,
 ) -> None:
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
@@ -349,7 +353,10 @@ async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks
     def handle(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
             return httpx.Response(200, json={"data": [{"id": "last-item"}]})
-        posted.append(json.loads(request.content))
+        event = json.loads(request.content)
+        posted.append(event)
+        if ambiguous_delivery and event["type"] == "compaction":
+            raise httpx.ReadTimeout("response lost after delivery", request=request)
         return httpx.Response(202, json={})
 
     snapshot_tracker = _PostRetryTracker(base_delay_s=0, max_delay_s=0)
@@ -423,6 +430,23 @@ async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks
     ]
     assert any(event["type"] == "external_session_todos" for event in posted)
     assert not snapshot_tracker.has_retry_state("compaction-snapshot:1")
+
+
+@pytest.mark.parametrize("error", [KeyError, TypeError, ValueError])
+def test_snapshot_keeps_context_when_overlap_conversion_fails(
+    monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+) -> None:
+    def fail(*_args, **_kwargs):
+        raise error("malformed overlap identity")
+
+    monkeypatch.setattr(forwarder, "_transcript_items_from_entry", fail)
+    message = forwarder._native_message_from_transcript_record(
+        {
+            "uuid": "record",
+            "message": {"role": "user", "content": "retained context"},
+        }
+    )
+    assert message == {"type": "message", "role": "user", "content": "retained context"}
 
 
 @pytest.mark.parametrize("invalid_reference", ["nonancestor", "wrong_anchor"])

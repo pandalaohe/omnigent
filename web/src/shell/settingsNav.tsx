@@ -124,7 +124,6 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
-  if (!customAgentsEnabled) general.splice(2, 0, harnesses);
   // Provider credentials and MCP accounts have separate settings pages.
   if (integrationsEnabled) {
     general.splice(general.findIndex((item) => item.id === "git") + 1, 0, {
@@ -142,12 +141,17 @@ export function settingsNavGroups(
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
   const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
-  if (customAgentsEnabled) {
-    groups.push({
-      title: "Customize",
-      items: [harnesses, { id: "custom-agents", label: "Custom agents", icon: BotIcon }],
-    });
-  }
+  groups.push({
+    title: "Customize",
+    items: [
+      harnesses,
+      {
+        id: "custom-agents",
+        label: customAgentsEnabled ? "Custom agents" : "Agent library",
+        icon: BotIcon,
+      },
+    ],
+  });
   // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
     groups.push({
@@ -230,8 +234,7 @@ export function useSettingsRoute(): {
   const singleUser = isSingleUserMode(info);
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
-    !(singleUser && (next === "members" || next === "sharing")) &&
-    !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
+    !(singleUser && (next === "members" || next === "sharing"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
   if (section === "custom-agents" && segments[idx + 2]) {

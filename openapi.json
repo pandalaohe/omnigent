@@ -2430,6 +2430,7 @@
               {
                 "enum": [
                   "transcript",
+                  "transcript_degraded",
                   "hook_fallback"
                 ],
                 "type": "string"

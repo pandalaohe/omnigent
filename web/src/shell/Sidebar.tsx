@@ -328,6 +328,7 @@ import {
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
   sessionBelongsToProject,
+  sessionsListAcceptsDrop,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
@@ -4620,7 +4621,7 @@ function ConversationList({
                                   <ChatsDropZone
                                     active={
                                       activeDrag != null &&
-                                      (activeDrag.project != null || activeDrag.isPinned)
+                                      sessionsListAcceptsDrop(activeDrag, grouped)
                                     }
                                   >
                                     {renderedGroups.map((sessionGroup, groupIndex) => (

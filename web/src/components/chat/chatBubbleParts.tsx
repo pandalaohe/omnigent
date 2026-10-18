@@ -858,12 +858,8 @@ function UserBubble({
                 ))}
               </div>
             )}
-            {/* Preserve the authored text/attachment order after send (MOD-s10).
-                Adjacent text is already coalesced by the composer, so each block
-                can be rendered directly without lifting uploads ahead of prose.
-                A long prompt collapses (upstream #7731): while collapsed only the
-                first COLLAPSE_THRESHOLD characters of text reach the Markdown
-                renderer and the box clips at max-h-64. */}
+            {/* Keep text and attachments in authored order. Collapsed prompts send
+                only COLLAPSE_THRESHOLD text characters to Markdown and clip at max-h-64. */}
             {(() => {
               if (annotation)
                 return (

@@ -30,6 +30,9 @@ vi.mock("@/lib/agentLabels", () => ({
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/lib/agentBundle", () => ({ buildAgentBundle: vi.fn() }));
+vi.mock("@/components/AgentsSettings", () => ({
+  AgentsSettings: () => <div data-testid="agent-library">Agent library controls</div>,
+}));
 
 const agent = (id: string, name = id): ManagedAgent => ({
   id,
@@ -340,7 +343,25 @@ describe("Custom agents settings", () => {
     flags.feature = feature;
     flags.install = install;
     mount();
+    expect(screen.getByTestId("agent-library")).toBeInTheDocument();
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("shows one agent surface at a time and keeps the library available", () => {
+    mount();
+    expect(screen.queryByTestId("agent-library")).toBeNull();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Agent library" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.getByTestId("agent-library")).toBeInTheDocument();
+    expect(screen.queryByRole("searchbox")).toBeNull();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Installed agents" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.queryByTestId("agent-library")).toBeNull();
+    expect(screen.getByRole("searchbox")).toBeInTheDocument();
   });
 });
 

@@ -943,7 +943,11 @@ class HarnessProcessManager:
                         },
                     },
                 )
-                await self._close_entry(entry)
+                if not await self._close_entry(entry):
+                    raise RuntimeError(
+                        f"harness for conversation {conversation_id!r} "
+                        "survived socket-missing teardown"
+                    )
                 self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_socket_missing"
@@ -1017,7 +1021,11 @@ class HarnessProcessManager:
                     conversation_id,
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
-                await self._close_entry(entry)
+                if not await self._close_entry(entry):
+                    raise RuntimeError(
+                        f"harness for conversation {conversation_id!r} "
+                        "survived ACP-config teardown"
+                    )
                 self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
