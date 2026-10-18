@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 from playwright.sync_api import Locator, Page, Request, Route, expect
@@ -169,7 +169,8 @@ def test_continue_missing_workspace_in_another_directory(
     )
 
     def filesystem(route: Route) -> None:
-        path = unquote(urlparse(route.request.url).path).partition("/filesystem")[2]
+        url = urlparse(route.request.url)
+        path = parse_qs(url.query).get("path", [unquote(url.path).partition("/filesystem")[2]])[0]
         path = path or _HOME
         operations.append(("list", path))
         if path in {_MISSING, f"{_HOME}/project-worktrees"}:
@@ -300,7 +301,13 @@ def test_continue_missing_workspace_in_another_directory(
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible()
     activate(picker.get_by_role("button", name="project", exact=True))
-    expect(picker.get_by_role("textbox", name="Current folder path")).to_have_value(_DESTINATION)
+    expect(
+        picker.get_by_role(
+            "textbox",
+            name="Folder path. Type an absolute path and press Enter to open it.",
+            exact=True,
+        )
+    ).to_have_value(_DESTINATION)
     activate(picker.get_by_test_id("workspace-picker-select"))
     expect(picker).not_to_be_visible()
     expect(directory).to_have_value(_DESTINATION)
