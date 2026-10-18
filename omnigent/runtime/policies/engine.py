@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 from omnigent.llms.context_window import ModelPricing, compute_llm_cost
@@ -395,7 +396,7 @@ class PolicyEngine:
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
             if result.action == PolicyAction.DENY:
-                return await asyncio.to_thread(
+                compose_deny = partial(
                     self._compose_deny,
                     policy.spec.name,
                     result.reason,
@@ -404,6 +405,9 @@ class PolicyEngine:
                     deciding_policy_workspace_id=getattr(policy.spec, "workspace_id", None),
                     read_only=read_only,
                 )
+                if not read_only and (accumulated or accumulated_state):
+                    return await asyncio.to_thread(compose_deny)
+                return compose_deny()
             if result.data is not None:
                 composed_data = result.data
                 # Feed the transformed payload forward so the next policy
@@ -432,11 +436,8 @@ class PolicyEngine:
                 deciding_policy_workspace_id=first_ask_workspace_id,
                 data=composed_data,
             )
-        if not read_only:
-            if accumulated:
-                await asyncio.to_thread(self.apply_label_writes, accumulated)
-            if accumulated_state:
-                await asyncio.to_thread(self.apply_state_updates, accumulated_state)
+        if not read_only and (accumulated or accumulated_state):
+            await asyncio.to_thread(self._apply_allow_writes, accumulated, accumulated_state)
         return PolicyResult(
             action=PolicyAction.ALLOW,
             reason=None,
@@ -444,6 +445,13 @@ class PolicyEngine:
             state_updates=list(accumulated_state) if accumulated_state else None,
             data=composed_data,
         )
+
+    def _apply_allow_writes(
+        self, labels: dict[str, str], state_updates: list[StateUpdate]
+    ) -> None:
+        """Keep label-then-state writes together if the awaiting task is cancelled."""
+        self.apply_label_writes(labels)
+        self.apply_state_updates(state_updates)
 
     def _compose_deny(
         self,

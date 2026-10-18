@@ -18,6 +18,7 @@ will start instantiating them as those phases ship.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -125,6 +126,8 @@ _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachet
 _SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = WorkspaceScopedCache(
     lambda: cachetools.TTLCache(maxsize=4096, ttl=30)
 )
+# TTLCache reads can expire entries; protect them as well as writes/evictions.
+_POLICY_SPECS_CACHE_LOCK = threading.Lock()
 
 
 def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
@@ -1732,7 +1735,8 @@ def _load_default_policy_specs(
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
-    cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+    with _POLICY_SPECS_CACHE_LOCK:
+        cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
     if cached is not None:
         return cached
     specs: list[PolicySpec] = []
@@ -1755,7 +1759,8 @@ def _load_default_policy_specs(
             )
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
+    with _POLICY_SPECS_CACHE_LOCK:
+        _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
     return specs
 
 
@@ -1770,7 +1775,8 @@ def invalidate_default_policy_specs_cache() -> None:
     """
     from omnigent.db.db_models import current_workspace_id
 
-    _DEFAULT_POLICY_SPECS_CACHE.pop(current_workspace_id(), None)
+    with _POLICY_SPECS_CACHE_LOCK:
+        _DEFAULT_POLICY_SPECS_CACHE.pop(current_workspace_id(), None)
 
 
 def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
@@ -1784,7 +1790,8 @@ def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
     """
-    _SESSION_POLICY_SPECS_CACHE.pop(conversation_id, None)
+    with _POLICY_SPECS_CACHE_LOCK:
+        _SESSION_POLICY_SPECS_CACHE.pop(conversation_id, None)
 
 
 def _load_session_policy_specs(
@@ -1821,7 +1828,8 @@ def _load_session_policy_specs(
     """
     if policy_store is None:
         return []
-    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
+    with _POLICY_SPECS_CACHE_LOCK:
+        cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
     if cached is not None:
         return cached
     stored = policy_store.list_for_session(conversation_id)
@@ -1830,7 +1838,8 @@ def _load_session_policy_specs(
         if not policy.enabled:
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
+    with _POLICY_SPECS_CACHE_LOCK:
+        _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
     return specs
 
 

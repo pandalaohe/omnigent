@@ -4354,11 +4354,15 @@ async def _hold_native_ask_gate_impl(
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
         # land only on approve.
-        if result.set_labels:
-            engine.apply_label_writes(result.set_labels)
-        if result.state_updates:
-            with contextlib.suppress(ConversationNotFoundError):
-                engine.apply_state_updates(result.state_updates)
+        def apply_approved_writes() -> None:
+            if result.set_labels:
+                engine.apply_label_writes(result.set_labels)
+            if result.state_updates:
+                with contextlib.suppress(ConversationNotFoundError):
+                    engine.apply_state_updates(result.state_updates)
+
+        if result.set_labels or result.state_updates:
+            await asyncio.to_thread(apply_approved_writes)
     return approved
 
 

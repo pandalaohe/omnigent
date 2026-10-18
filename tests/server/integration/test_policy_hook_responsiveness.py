@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -12,10 +13,14 @@ import pytest
 
 from omnigent.policies.types import PolicyAction, PolicyResult
 from omnigent.runtime import get_conversation_store
+from omnigent.server.auth import LEVEL_READ
 from omnigent.server.routes import sessions as sessions_routes
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import routes_hooks
+from omnigent.spec.types import StateUpdate, StateUpdateAction
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 pytestmark = pytest.mark.asyncio
@@ -34,9 +39,37 @@ def _deny_with_label(event: dict[str, Any]) -> PolicyResult:
     return PolicyResult(action=PolicyAction.DENY, set_labels={"checked": "yes"})
 
 
+def _allow_with_state(event: dict[str, Any]) -> PolicyResult:
+    return PolicyResult(
+        action=PolicyAction.ALLOW,
+        set_labels={"checked": "yes"},
+        state_updates=[StateUpdate(key="checked", action=StateUpdateAction.SET, value="yes")],
+    )
+
+
+def _deny_with_state(event: dict[str, Any]) -> PolicyResult:
+    return replace(_allow_with_state(event), action=PolicyAction.DENY)
+
+
+def _ask_with_state(event: dict[str, Any]) -> PolicyResult:
+    return replace(_allow_with_state(event), action=PolicyAction.ASK)
+
+
 @pytest.mark.parametrize(
     "stage",
-    ["agent", "presence", "initial_tree", "ask_tree", "allow_label", "deny_label", "route_label"],
+    [
+        "agent",
+        "presence",
+        "initial_tree",
+        "ask_tree",
+        "allow_label",
+        "deny_label",
+        "route_label",
+        "allow_state",
+        "deny_state",
+        "ask_label",
+        "ask_state",
+    ],
 )
 async def test_policy_hook_storage_waits_leave_health_responsive(
     client: httpx.AsyncClient,
@@ -47,6 +80,18 @@ async def test_policy_hook_storage_waits_leave_health_responsive(
     handler = "_deny_with_label" if stage == "deny_label" else "_write_label"
     if stage in {"agent", "presence", "initial_tree"}:
         handler = "_allow"
+    if stage.endswith("state"):
+        handler = "_deny_with_state" if stage == "deny_state" else "_allow_with_state"
+    if stage in {"ask_label", "ask_state"}:
+        handler = "_ask_with_state"
+
+        async def accept(*args: Any, **kwargs: Any) -> orchestration.ElicitationResult:
+            return orchestration.ElicitationResult(action="accept")
+
+        monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", accept)
+        monkeypatch.setattr(
+            orchestration, "_spawn_native_approval_popup_forward", lambda *args: None
+        )
     function: dict[str, Any] = {"path": f"{__name__}.{handler}"}
     if stage == "ask_tree":
         function = {
@@ -79,6 +124,8 @@ async def test_policy_hook_storage_waits_leave_health_responsive(
         owner, method = routes_hooks, "any_policies_apply"
     elif stage.endswith("tree"):
         owner, method = SqlAlchemyConversationStore, "list_conversations"
+    elif stage.endswith("state"):
+        owner, method = SqlAlchemyConversationStore, "set_session_state"
     else:
         owner, method = SqlAlchemyConversationStore, "set_labels"
     original = getattr(owner, method)
@@ -117,8 +164,102 @@ async def test_policy_hook_storage_waits_leave_health_responsive(
 
     response = request.result()
     assert response.status_code == 200, response.text
-    expected = "POLICY_ACTION_DENY" if stage == "deny_label" else "POLICY_ACTION_ALLOW"
+    expected = "POLICY_ACTION_DENY" if stage.startswith("deny") else "POLICY_ACTION_ALLOW"
     assert response.json()["result"] == expected
-    if stage.endswith("label"):
+    if stage.endswith(("label", "state")):
         conv = await asyncio.to_thread(store.get_conversation, session_id)
         assert conv is not None and conv.labels["checked"] == "yes"
+        if stage.endswith("state"):
+            assert conv.session_state["checked"] == "yes"
+
+
+@pytest.mark.parametrize("action", ["allow", "deny", "ask"])
+async def test_read_only_hook_withholds_label_and_state_writes(
+    auth_client: httpx.AsyncClient, db_uri: str, action: str
+) -> None:
+    agent = await create_test_agent(
+        auth_client,
+        user="owner@example.com",
+        guardrails={
+            "policies": {
+                "probe": {
+                    "type": "function",
+                    "function": {
+                        "path": f"{__name__}._{action}_with_state",
+                    },
+                }
+            }
+        },
+    )
+    session_id = agent["_session_id"]
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("reader@example.com")
+    permissions.grant("reader@example.com", session_id, LEVEL_READ)
+    store = get_conversation_store()
+    before = await asyncio.to_thread(store.get_conversation, session_id)
+    assert before is not None
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=policy_tool_call_request("Read"),
+        headers={"X-Forwarded-Email": "reader@example.com"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == f"POLICY_ACTION_{action.upper()}"
+    after = await asyncio.to_thread(store.get_conversation, session_id)
+    assert after is not None
+    assert after.labels == before.labels
+    assert after.session_state == before.session_state
+
+
+async def test_allow_cancellation_does_not_drop_state_after_label_write(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = await create_test_agent(
+        client,
+        guardrails={
+            "policies": {
+                "probe": {
+                    "type": "function",
+                    "function": {
+                        "path": f"{__name__}._allow_with_state",
+                    },
+                }
+            }
+        },
+    )
+    session_id = agent["_session_id"]
+    store = get_conversation_store()
+    loop = asyncio.get_running_loop()
+    cancelled = threading.Event()
+    state_written = threading.Event()
+    original_labels = SqlAlchemyConversationStore.set_labels
+    original_state = SqlAlchemyConversationStore.set_session_state
+
+    def cancel_after_labels(*args: Any, **kwargs: Any) -> Any:
+        result = original_labels(*args, **kwargs)
+        loop.call_soon_threadsafe(request.cancel)
+        assert cancelled.wait(5), "request did not observe cancellation"
+        return result
+
+    def write_state(*args: Any, **kwargs: Any) -> Any:
+        result = original_state(*args, **kwargs)
+        state_written.set()
+        return result
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", cancel_after_labels)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_session_state", write_state)
+    request = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=policy_tool_call_request("Read"),
+        )
+    )
+    request.add_done_callback(lambda _: cancelled.set())
+    await asyncio.gather(request, return_exceptions=True)
+    assert request.cancelled()
+    assert await asyncio.to_thread(state_written.wait, 5), (
+        "cancelled hook dropped its state update"
+    )
+    conv = await asyncio.to_thread(store.get_conversation, session_id)
+    assert conv is not None and conv.labels["checked"] == "yes"
+    assert conv.session_state["checked"] == "yes"
