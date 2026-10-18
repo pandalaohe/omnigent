@@ -14228,6 +14228,45 @@ def test_keep_warm_btw_borderless_api_error_dismisses(
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "  Foreign panel\n  Select an item\n\n  c to copy · Esc to close",
+        "    ok\n\n  ↑/↓ to scroll · c to copy · Esc to close\n  Foreign panel actions",
+    ],
+    ids=["foreign-body", "stale-close-hint"],
+)
+def test_keep_warm_btw_borderless_marker_above_foreign_panel_sends_no_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None, body: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = f"  {_KEEP_WARM_TEXT}\n\n{body}\n"
+    sends = _fake_tmux(monkeypatch, [pane])
+    assert not claude_native_bridge._dismiss_keep_warm_btw_overlay(
+        bridge_dir, "/tmp/s.sock", "claude:0.0"
+    )
+    assert not claude_native_bridge.dismiss_btw_overlay(bridge_dir)
+    assert sends == []
+
+
+@pytest.mark.parametrize("answer", ["ok", _KEEP_WARM_TEXT], ids=["plain", "quoted-marker"])
+def test_keep_warm_btw_borderless_older_marker_does_not_own_persons_side_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None, answer: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BTW_BORDERLESS_HISTORY_PANE.replace("/btw seed-0 reply with only: ok", _KEEP_WARM_TEXT)
+    pane = pane.replace("    ok", f"    {answer}")
+    sends = _fake_tmux(monkeypatch, [pane])
+    assert claude_native_bridge._btw_overlay_present(pane)
+    assert not claude_native_bridge._keep_warm_btw_overlay_present(pane)
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None and overlay.question == "/btw seed-2 reply with only: ok"
+    assert not claude_native_bridge._dismiss_keep_warm_btw_overlay(
+        bridge_dir, "/tmp/s.sock", "claude:0.0"
+    )
+    assert sends == []
+
+
 def test_keep_warm_btw_foreign_panel_after_settle_does_not_prove_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
 ) -> None:

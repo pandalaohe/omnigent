@@ -5015,11 +5015,10 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 # pane is the only place the answer exists, so the forwarder scrapes it
 # from there (read-only) to mirror the exchange into the managed web UI.
 #
-# The overlay draws a ``▔`` top border, the ``/btw <question>`` line(s)
-# (4-space indent; prior side turns stack above the current one), a
-# blank, the answer (6-space indent), a blank, and a footer pinned to the
-# pane's bottom. The answer is rendered atomically once generation
-# finishes — it does not stream chunk-by-chunk into the pane.
+# Older overlays have a ``▔`` top rule, 4-space question rows and a 6-space
+# answer. Current unframed panels use 2-space question rows and a 4-space
+# answer. Prior questions stack directly above the current one; a blank
+# separates the answer and the possibly wrapped navigation/close footer.
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 _BTW_FOOTER_CLOSE_HINT = "Esc to close"
 # A settled overlay offers copy; older versions also offered fork. While
@@ -5053,7 +5052,7 @@ _KEEP_WARM_DISMISS_POLL_INTERVAL_S = 0.25
 _KEEP_WARM_DISMISS_TIMEOUT_S = 3.0
 _KEEP_WARM_HISTORY_TIMEOUT_S = 2.0
 # Read-only capture cannot tell a complete tall answer from one the pane
-# clipped (both end in a blank + footer), so an overlay whose border→footer
+# clipped (both end in a blank + footer), so an overlay whose body→footer
 # span reaches this many rows is flagged possibly-truncated. This
 # over-flags long *complete* answers, which is acceptable for the
 # best-effort relay (the note points the reader at the terminal).
@@ -5142,7 +5141,7 @@ class PaneSignals:
 def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int, str] | None:
     """Locate the live overlay's body and its possibly wrapped footer."""
     footer_end = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-    if footer_end is None:
+    if footer_end is None or _BTW_FOOTER_CLOSE_HINT not in lines[footer_end]:
         return None
     footer_idx = footer_end
     # Wrapped hints remain one paragraph; stop at the navigation row so an
@@ -5167,15 +5166,16 @@ def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int, str] | None:
     )
     if border_idx is not None:
         return border_idx + 1, footer_idx, footer
-    # Newer Claude renders an unframed panel with two-space question rows.
-    question_idx = next(
-        (i for i in range(footer_idx - 1, -1, -1) if lines[i].startswith("  /btw ")),
-        None,
-    )
-    if question_idx is None or any(
-        _is_box_rule(line) or line.startswith(_CLAUDE_PROMPT_GLYPH)
-        for line in lines[question_idx + 1 : footer_idx]
+    # Only blank/answer rows may separate the question stack from the footer;
+    # a quoted marker above an unrelated panel must never grant key ownership.
+    question_idx = footer_idx - 1
+    while question_idx >= 0 and (
+        not lines[question_idx].strip() or lines[question_idx].startswith("    ")
     ):
+        if _is_box_rule(lines[question_idx]):
+            return None
+        question_idx -= 1
+    if question_idx < 0 or not lines[question_idx].startswith("  /btw "):
         return None
     return question_idx, footer_idx, footer
 
@@ -5205,13 +5205,17 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
         return None
     # The current turn's question is the LAST ``/btw`` line; earlier side
     # turns stack above it. Its answer is everything after it.
-    question_idx = next(
-        (
-            i
-            for i in range(len(region) - 1, -1, -1)
-            if region[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
-        ),
-        None,
+    question_idx = (
+        0
+        if region and region[0].startswith("  /btw ")
+        else next(
+            (
+                i
+                for i in range(len(region) - 1, -1, -1)
+                if region[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
+            ),
+            None,
+        )
     )
     if question_idx is None:
         question = None
@@ -5277,6 +5281,8 @@ def _keep_warm_btw_overlay_present(pane: str) -> bool:
     if bounds is None:
         return False
     region_start, footer_idx, _footer = bounds
+    if lines[region_start].startswith("  /btw "):
+        return KEEP_WARM_BTW_MARKER in lines[region_start]
     question_idx = next(
         (
             i
