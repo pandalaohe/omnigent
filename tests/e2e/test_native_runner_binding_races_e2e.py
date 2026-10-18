@@ -215,7 +215,11 @@ def test_native_send_rechecks_binding_after_runner_miss(
             ),
             flush=True,
         )
-        assert not errors, f"A real live replacement was incorrectly failed: {errors}"
+        assert not errors, (
+            f"A real live replacement was incorrectly failed: {errors}\n"
+            f"Pre-send item types: {[item.get('type') for item in before_release]}\n"
+            f"{owner.log_tail()}"
+        )
         if owner is sibling:
             assert response.status_code == 400, response.text
             assert response.json()["error"]["code"] == "wrong_replica", response.text

@@ -6321,19 +6321,45 @@ async def test_wrong_workspace_artifact_is_backed_up_then_synthesized(
 
 
 @pytest.mark.asyncio
-async def test_nonempty_unconvertible_history_refuses_blank_launch(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+async def test_resource_only_history_allows_fresh_claude_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Non-empty history that converts to nothing is a user-visible error."""
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json=_items_response_body(
-                [{"id": "opaque_1", "type": "unknown", "content": "opaque"}]
-            ),
+            json=_items_response_body([{"id": "resource_1", "type": "resource_event"}]),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resolved = await claude_native._ensure_local_claude_resume_transcript(
+            client, session_id="conv", external_session_id="sid", workspace=tmp_path / "workspace"
+        )
+    assert resolved.path is None
+    assert not resolved.reused_local and not resolved.synthesized
+    assert not list((tmp_path / "projects").rglob("*.jsonl"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_resource_event", [False, True])
+async def test_nonempty_unconvertible_history_refuses_blank_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    with_resource_event: bool,
+) -> None:
+    """Non-empty history that converts to nothing is a user-visible error."""
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        items = [{"id": "opaque_1", "type": "unknown", "content": "opaque"}]
+        if with_resource_event:
+            items.append({"id": "resource_1", "type": "resource_event"})
+        return httpx.Response(
+            200,
+            json=_items_response_body(items),
         )
 
     async with httpx.AsyncClient(

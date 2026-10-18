@@ -5574,7 +5574,9 @@ async def _ensure_local_claude_resume_transcript(
         cwd=current,
         bridge_dir=bridge_dir or bridge_dir_for_conversation_id(session_id),
     )
-    if not items:
+    # Runner binding records resource lifecycle before a fresh session has any
+    # transcript. Those events alone do not require a Claude resume artifact.
+    if not items or all(item.get("type") == "resource_event" for item in items):
         return ClaudeResumeTranscriptResolution(None, reused_local=False, synthesized=False)
     if not records:
         raise click.ClickException(
