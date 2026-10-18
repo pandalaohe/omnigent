@@ -838,8 +838,12 @@ def _legacy_hidden_message_blocks(dialect_name: str) -> Any:
         blocks = func.json_each(data, "$.content").table_valued("value")
         block_type = func.json_extract(blocks.c.value, "$.type")
         block_text = func.json_extract(blocks.c.value, "$.text")
-    elif dialect_name == "postgresql":
-        blocks = func.json_array_elements(sql_cast(data, JSON)["content"]).table_valued("value")
+    elif dialect_name in {"postgresql", "cockroachdb"}:
+        blocks = (
+            func.json_array_elements(sql_cast(data, JSON)["content"])
+            .table_valued("value")
+            .render_derived()
+        )
         block_type = func.json_extract_path_text(blocks.c.value, "type")
         block_text = func.json_extract_path_text(blocks.c.value, "text")
     else:
@@ -861,7 +865,7 @@ def _legacy_hidden_message_blocks(dialect_name: str) -> Any:
         if dialect_name == "mysql"
         else func.ltrim(block_text, whitespace)
     )
-    contains = func.strpos if dialect_name == "postgresql" else func.instr
+    contains = func.strpos if dialect_name in {"postgresql", "cockroachdb"} else func.instr
     prefix = CLAUDE_TASK_NOTIFICATION_MARKERS[0]
     hidden = or_(
         func.substr(block_text, 1, len(CLAUDE_COMPACTION_SUMMARY_PREFIX))

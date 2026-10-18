@@ -8837,7 +8837,11 @@ def test_archive_search_excludes_legacy_hidden_rows_before_limit(
 
 @pytest.mark.parametrize(
     "dialect_name,dialect,operator",
-    [("mysql", mysql.dialect(), " LIKE "), ("postgresql", postgresql.dialect(), " ILIKE ")],
+    [
+        ("mysql", mysql.dialect(), " LIKE "),
+        ("postgresql", postgresql.dialect(), " ILIKE "),
+        ("cockroachdb", postgresql.dialect(), " ILIKE "),
+    ],
 )
 def test_archive_search_uses_native_case_insensitive_operator(
     dialect_name: str, dialect: Any, operator: str
@@ -8850,6 +8854,14 @@ def test_archive_search_uses_native_case_insensitive_operator(
     assert operator in str(compiled)
     assert "lower(conversation_items.search_text)" not in str(compiled).lower()
     assert pattern in compiled.params.values()
+    if dialect_name in {"postgresql", "cockroachdb"}:
+        sql = str(compiled).lower()
+        assert "json_array_elements(" in sql
+        assert "json_extract_path_text(" in sql
+        assert "anon_1(value)" in sql
+        assert "strpos(" in sql
+        assert "json_table(" not in sql
+        assert "instr(" not in sql
 
 
 @pytest.mark.parametrize(
