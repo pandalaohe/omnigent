@@ -38,6 +38,9 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     encoded_state = json.dumps(json.dumps(state))
     page.add_init_script(
         f"localStorage.setItem('omnigent:session-workspace-state', {encoded_state});"
+        "localStorage.setItem('omnigent:workspace-panel-widen-for-content', '0');"
+        "localStorage.setItem('omnigent:panel-size-preferences', "
+        f"JSON.stringify({{inlinePanelWidthPx: {width}}}));"
     )
     page.set_viewport_size({"width": 1800, "height": 1000})
     page.goto(f"{seeded_session.contract.base_url}/c/{seeded_session.session_id}")
@@ -129,3 +132,43 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     toolbar.get_by_role("button", name="Full screen", exact=True).click()
     expect(toolbar.get_by_role("button", name="Scroll tabs right")).to_have_count(0)
     expect(toolbar.get_by_role("button", name="Scroll tabs left")).to_have_count(0)
+
+
+@pytest.mark.parametrize("widen", [False, True], ids=["normal-width", "file-width"])
+def test_workspace_file_width_respects_content_preference(
+    page: Page, seeded_session: BrowserSession, widen: bool
+) -> None:
+    path = "src/panel.md"
+    _mock_markdown_files(page, seeded_session, {path: "# File width"})
+    state = [
+        {
+            "id": seeded_session.session_id,
+            "state": {
+                "open": True,
+                "rightRailTab": "files",
+                "openFiles": [path],
+                "selectedFilePath": path,
+            },
+        }
+    ]
+    page.add_init_script(
+        "localStorage.setItem('omnigent:session-workspace-state', "
+        f"{json.dumps(json.dumps(state))});"
+        "localStorage.setItem('omnigent:workspace-panel-widen-for-content', "
+        f"{json.dumps('1' if widen else '0')});"
+        "localStorage.setItem('omnigent:panel-size-preferences', "
+        "JSON.stringify({inlinePanelWidthPx: 360, inlinePanelWideWidthPx: 760}));"
+    )
+    page.set_viewport_size({"width": 1800, "height": 1000})
+    page.goto(f"{seeded_session.contract.base_url}/c/{seeded_session.session_id}")
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text("File width")
+    panel = page.get_by_role("complementary", name="Workspace")
+    expected = 760 if widen else 360
+    expect(panel).to_have_css("width", f"{expected}px")
+    page.get_by_role("separator", name="Resize panel", exact=True).press("ArrowLeft")
+    expect(panel).to_have_css("width", f"{expected + 20}px")
+    preferences = page.evaluate(
+        "JSON.parse(localStorage.getItem('omnigent:panel-size-preferences'))"
+    )
+    assert preferences["inlinePanelWidthPx"] == (360 if widen else 380)
+    assert preferences["inlinePanelWideWidthPx"] == (780 if widen else 760)
