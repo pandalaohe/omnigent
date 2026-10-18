@@ -1379,6 +1379,19 @@ def _bridge_port_pool() -> tuple[int, ...]:
     return tuple(ports) if ports else DEFAULT_BRIDGE_PORT_POOL
 
 
+class _BridgeHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        if IS_WINDOWS:
+            # Winsock SO_REUSEADDR lets other processes share a listener's port.
+            self.allow_reuse_address = False
+            self.socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,  # pyrefly: ignore[missing-attribute]
+                1,
+            )
+        super().server_bind()
+
+
 def _start_bridge_http_server(
     handler_cls: type[BaseHTTPRequestHandler],
 ) -> tuple[ThreadingHTTPServer, str]:
@@ -1393,12 +1406,12 @@ def _start_bridge_http_server(
     httpd: ThreadingHTTPServer | None = None
     for port in _bridge_port_pool():
         try:
-            httpd = ThreadingHTTPServer((bind_host, port), handler_cls)
+            httpd = _BridgeHTTPServer((bind_host, port), handler_cls)
         except OSError:
             continue
         break
     if httpd is None:
-        httpd = ThreadingHTTPServer((bind_host, 0), handler_cls)
+        httpd = _BridgeHTTPServer((bind_host, 0), handler_cls)
     _, port = _http_server_host_port(httpd)
     return httpd, f"http://{advertised_host}:{port}"
 
