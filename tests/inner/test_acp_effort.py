@@ -82,7 +82,7 @@ async def test_model_change_replaces_effort_and_drops_absent_option(executor, ca
     executor._note_config_options(options())
     executor._rpc = AsyncMock(return_value={"result": {"configOptions": options("model-b", ())}})
     await executor._apply_model_override("fresh-session", "model-b")
-    with caplog.at_level("INFO"):
+    with pytest.raises(RuntimeError, match="not advertised"):
         await executor._apply_effort_override("fresh-session", "deliberate")
     assert executor._rpc.await_count == 1
     assert executor.model_options()[1]["efforts"] == []
@@ -92,6 +92,7 @@ async def test_model_change_replaces_effort_and_drops_absent_option(executor, ca
 
 @pytest.mark.asyncio
 async def test_model_default_stays_stable_after_switch(executor):
+    executor._config = replace(executor._config, default_model="")
     executor._note_config_options(options())
     executor._rpc = AsyncMock(return_value={"result": {"configOptions": options("model-b")}})
     await executor._apply_model_override("fresh-session", "model-b")
@@ -132,6 +133,7 @@ async def test_legacy_models_and_effort_only_options_keep_initial_reset(executor
     ]
     await executor._apply_effort_override("fresh-session", "deliberate")
     await executor._apply_effort_override("fresh-session", None)
+    assert executor._rpc.await_args is not None
     assert executor._rpc.await_args.args[1]["value"] == "quick"
 
 
@@ -189,6 +191,7 @@ async def test_turn_transports_effort_before_prompt_and_blocks_refusal(executor)
     ]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+    assert events[0].retryable is False
     assert "No prompt was sent" in events[0].message
     assert not any(isinstance(event, TurnComplete) for event in events)
     assert executor._rpc.await_args is not None
@@ -224,3 +227,115 @@ async def test_successful_turn_confirms_effort_before_prompt(executor):
     ]
     assert isinstance(events[-1], TurnComplete)
     executor._send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("catalog", [False, True])
+async def test_review_major1_switch_without_echo_still_applies_effort(executor, catalog):
+    executor._note_config_options(options())
+    if catalog:
+        executor._session_model_ids = {"model-a", "model-b"}
+    executor._rpc = AsyncMock(
+        side_effect=[
+            {"result": {}},
+            {"result": {"configOptions": options("model-b", ("precise",), "precise")}},
+        ]
+    )
+    await executor._apply_model_override("fresh-session", "model-b")
+    await executor._apply_effort_override("fresh-session", "precise")
+    assert executor._rpc.await_count == 2
+    assert executor._rpc.await_args is not None
+    assert executor._rpc.await_args.args[1]["configId"] == "thinking-budget"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("catalog", [False, True])
+@pytest.mark.parametrize("failure", ["error", "transport"])
+async def test_review_major1_failed_switch_keeps_advertisement(executor, catalog, failure):
+    executor._note_config_options(options())
+    if catalog:
+        executor._session_model_ids = {"model-a", "model-b"}
+    original = executor._effort_option
+
+    async def rpc(*args, **kwargs):
+        # Even a notification arriving during the refused RPC must roll back.
+        executor._note_config_options(options("model-b", ()))
+        if failure == "transport":
+            raise ConnectionError("neutral disconnected")
+        return {"error": {"code": -32602, "message": "model refused"}}
+
+    executor._rpc = AsyncMock(side_effect=rpc)
+    if failure == "transport":
+        with pytest.raises(ConnectionError):
+            await executor._apply_model_override("fresh-session", "model-b")
+    else:
+        await executor._apply_model_override("fresh-session", "model-b")
+    assert executor._active_model == "model-a"
+    assert executor._effort_option == original
+    assert executor.model_options()[0]["efforts"] == ["quick", "deliberate"]
+
+
+@pytest.mark.asyncio
+async def test_review_major1_new_model_without_effort_refuses_visibly(executor):
+    executor._note_config_options(options())
+    executor._rpc = AsyncMock(return_value={"result": {"configOptions": options("model-b", ())}})
+    await executor._apply_model_override("fresh-session", "model-b")
+    with pytest.raises(RuntimeError, match="not advertised"):
+        await executor._apply_effort_override("fresh-session", "deliberate")
+    assert executor._rpc.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_review_minor1_clear_does_not_capture_carried_override(executor):
+    executor._note_config_options(options("model-b"))
+    executor._note_config_options(options())
+    executor._rpc = AsyncMock(
+        side_effect=[
+            {"result": {"configOptions": options(current="deliberate")}},
+            {"result": {"configOptions": options("model-b", current="deliberate")}},
+            {"result": {"configOptions": options("model-b")}},
+        ]
+    )
+    await executor._apply_effort_override("fresh-session", "deliberate")
+    await executor._apply_model_override("fresh-session", "model-b")
+    await executor._apply_effort_override("fresh-session", None)
+    assert executor._rpc.await_args is not None
+    assert executor._rpc.await_args.args[1]["value"] == "quick"
+
+
+@pytest.mark.asyncio
+async def test_review_minor1_unknown_default_is_not_invented_from_override(executor):
+    executor._note_config_options(options())
+    executor._effort_overridden = True
+    executor._rpc = AsyncMock(
+        return_value={"result": {"configOptions": options("model-b", current="deliberate")}}
+    )
+    await executor._apply_model_override("fresh-session", "model-b")
+    with pytest.raises(RuntimeError, match="no advertised initial value"):
+        await executor._apply_effort_override("fresh-session", None)
+    assert executor._rpc.await_count == 1
+
+
+def test_review_minor2_inactive_models_keep_last_advertisement(executor):
+    executor._note_config_options(options("model-b", ("precise",), "precise"))
+    executor._note_config_options(options())
+    assert executor.model_options()[1]["efforts"] == ["precise"]
+
+
+def test_review_nit_b_full_config_state_replaces_removed_ids(executor):
+    executor._note_config_options(options())
+    executor._note_config_options(options()[1:])
+    assert executor._config_option_ids == {"thinking-budget"}
+    executor._note_config_options([])
+    assert executor._config_option_ids == set()
+    assert executor._effort_option is None
+
+
+@pytest.mark.asyncio
+async def test_review_nit_c_no_configured_default_keeps_previous_model(executor):
+    executor._note_config_options(options())
+    executor._rpc = AsyncMock(return_value={"result": {"configOptions": options("model-b")}})
+    await executor._apply_model_override("fresh-session", "model-b")
+    await executor._apply_model_override("fresh-session", None)
+    assert executor._active_model == "model-b"
+    assert executor._rpc.await_count == 1

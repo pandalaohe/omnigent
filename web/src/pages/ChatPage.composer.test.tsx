@@ -6056,6 +6056,45 @@ describe("Composer config gear", () => {
     },
   );
 
+  it.each([true, false])(
+    "reconciles advertised ACP model B effort (offered=%s)",
+    async (offered) => {
+      const options = [
+        { id: "model-a", isDefault: true, isActive: true, efforts: ["deliberate"] },
+        { id: "model-b", efforts: offered ? ["deliberate"] : ["quick"] },
+      ];
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      const setEffort = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({
+        sessionHarness: "acp:neutral",
+        sessionModelOverride: "model-a",
+        llmModel: "model-a",
+        sessionReasoningEffort: "deliberate",
+        setModel,
+        setEffort,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            modelPickerKind: "acp",
+            showModels: true,
+            showEffort: true,
+            selectedEffort: "deliberate",
+            effortLevels: ["deliberate"],
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      fireEvent.click(screen.getByTestId("composer-agent-model-model-b"));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("model-b", { expectConfirmation: false }),
+      );
+      if (offered) expect(setEffort).not.toHaveBeenCalled();
+      else await waitFor(() => expect(setEffort).toHaveBeenCalledWith(null));
+    },
+  );
+
   it("serializes immediate model and effort changes", async () => {
     // Claude-native types /model and /effort as separate terminal commands, so
     // Save must await the model PATCH before firing effort — otherwise the two

@@ -5708,7 +5708,7 @@ function SessionHarnessPicker({
         reconcileEffortOnModelChange(
           modelPickerKind === "codex"
             ? "codex-native"
-            : modelPickerKind === "sdk"
+            : modelPickerKind === "sdk" || modelPickerKind === "acp"
               ? sessionHarness
               : null,
           codexModelOptions,
