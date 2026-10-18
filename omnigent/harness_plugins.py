@@ -660,7 +660,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _IM.ACP_SUBPROCESS,
         _EL.SSE_PERMISSION,
         _RS.COLD_ONLY,
-        _EF.NONE,
+        _EF.DYNAMIC,
         _MF.MULTI,
         _AU.OWN_AUTH,
         subagents=False,

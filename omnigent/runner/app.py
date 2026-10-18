@@ -10326,11 +10326,22 @@ def create_runner_app(
     _opencode_native_model_options = _native_controls.opencode_native_model_options
     _teardown_session_terminals = _native_controls.teardown_session_terminals
 
+    async def _acp_model_options(session_id: str) -> list[_JsonObject]:
+        # "any" reads an existing harness and cannot launch a new one.
+        if process_manager is None:
+            raise RuntimeError("ACP harness process manager is not ready")
+        client = await process_manager.get_client(session_id, "any")
+        response = await client.get("/v1/model-options", timeout=5.0)
+        response.raise_for_status()
+        rows = response.json().get("models", [])
+        return [row for row in rows if isinstance(row, dict)]
+
     register_model_option_routes(
         app,
         _claude_model_options_rows=_claude_model_options_rows,
         _codex_native_model_options=_codex_native_model_options,
         _opencode_native_model_options=_opencode_native_model_options,
+        _acp_model_options=_acp_model_options,
         _resolve_session_agent_spec=_resolve_session_agent_spec,
         _resolve_session_claude_launch_config=_resolve_session_claude_launch_config,
         _resolve_session_skills=_resolve_session_skills,

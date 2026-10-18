@@ -11,6 +11,16 @@ const rows: NativeModelOption[] = [
 ];
 
 describe("effortLevelsFor", () => {
+  it("uses opaque ACP advertised values without guessing a ladder", () => {
+    const models = [
+      { id: "a", isDefault: true, efforts: ["quick", "deliberate"] },
+      { id: "b", efforts: [] },
+    ];
+    expect(effortLevelsFor("acp:neutral", models, "a")).toEqual(["quick", "deliberate"]);
+    expect(effortLevelsFor("acp:neutral", models, "b")).toEqual([]);
+    expect(effortLevelsFor("acp:neutral", models, null)).toEqual(["quick", "deliberate"]);
+    expect(effortLevelsFor("acp:neutral", [], null)).toEqual([]);
+  });
   it.each([
     ["claude-native", ["low", "medium", "high", "xhigh", "max"]],
     ["codex-native", ["low", "high"]],

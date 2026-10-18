@@ -1,4 +1,6 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
+import { effortLevelsFor } from "./modelEffortOptions";
+import type { NativeModelOption } from "./types";
 
 const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
 const CODEX_NATIVE_WRAPPER = "codex-native-ui";
@@ -38,10 +40,17 @@ export function supportsEffortControl(
         labels?: Record<string, string | null> | null;
         harness?: string | null;
         inferenceConfigured?: boolean;
+        codexModelOptions?: readonly NativeModelOption[];
       }
     | null
     | undefined,
+  models?: readonly NativeModelOption[],
 ): boolean {
+  if (session?.harness === "acp" || session?.harness?.startsWith("acp:")) {
+    const rows = models ?? session.codexModelOptions ?? [];
+    const active = rows.find((row) => row.isActive);
+    return (effortLevelsFor(session.harness, rows, active?.id)?.length ?? 0) > 0;
+  }
   const wrapper = session?.labels?.["omnigent.wrapper"];
   return (
     wrapper === CLAUDE_NATIVE_WRAPPER ||

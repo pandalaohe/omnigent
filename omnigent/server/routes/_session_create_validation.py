@@ -566,6 +566,7 @@ def validate_session_model_metadata(
     *,
     model_override: str | None,
     reasoning_effort: str | None,
+    harness: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Validate persisted model metadata shared by sessions and schedules."""
     # The persisted override reaches native CLIs as a ``--model`` argv element
@@ -592,7 +593,9 @@ def validate_session_model_metadata(
             validated_effort = validate_effort(
                 reasoning_effort,
                 "session metadata",
-                EFFORT_VALUES,
+                None
+                if harness == "acp" or (harness and harness.startswith("acp:"))
+                else EFFORT_VALUES,
             )
         except ValueError as exc:
             raise OmnigentError(

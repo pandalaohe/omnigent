@@ -52,6 +52,7 @@ const HARNESS_LABELS: Record<string, string> = {
 
 /** Display label for a canonical harness id; unknown ids render as-is. */
 export function callingHarnessLabel(harness: string): string {
+  if (harness.startsWith("acp:")) return `ACP · ${harness.slice(4)}`;
   return HARNESS_LABELS[harness] ?? harness;
 }
 
@@ -61,6 +62,12 @@ const CLEAR_VALUES = new Set(["default", "off", "reset", "__default__", "__none_
 
 function isClearValue(value: string): boolean {
   return CLEAR_VALUES.has(value.trim().toLowerCase());
+}
+
+function isClearEffort(value: string, harness: string): boolean {
+  return harness === "acp" || harness.startsWith("acp:")
+    ? ["__none__", "__default__"].includes(value)
+    : isClearValue(value);
 }
 
 function readStoredObject(storageKey: string): Record<string, unknown> {
@@ -157,7 +164,8 @@ function sanitizeEntry(value: unknown, harness: string): CallingDefaultEntry | n
   const entry: CallingDefaultEntry = {};
   const { model, effort } = value;
   if (typeof model === "string" && model && !isClearValue(model)) entry.model = model;
-  if (typeof effort === "string" && effort && !isClearValue(effort)) entry.effort = effort;
+  if (typeof effort === "string" && effort && !isClearEffort(effort, harness))
+    entry.effort = effort;
   for (const field of ["speed", "permission"] as const) {
     const setting =
       harness === "antigravity-native" && field === "permission"
@@ -224,7 +232,11 @@ export function setCallingDefaultField(
   const table = readCallingDefaults();
   const hostTable = { ...(table[hostId] ?? {}) };
   const entry: CallingDefaultEntry = { ...(hostTable[harness] ?? {}) };
-  if (value === null || value === "" || isClearValue(value)) {
+  if (
+    value === null ||
+    value === "" ||
+    (field === "effort" ? isClearEffort(value, harness) : isClearValue(value))
+  ) {
     Reflect.deleteProperty(entry, field);
   } else {
     entry[field] = value;
@@ -264,7 +276,8 @@ function sanitizeAgentEntry(value: unknown): CallingLastAgentEntry | null {
     at: typeof at === "number" && Number.isFinite(at) ? at : 0,
   };
   if (typeof model === "string" && model && !isClearValue(model)) entry.model = model;
-  if (typeof effort === "string" && effort && !isClearValue(effort)) entry.effort = effort;
+  if (typeof effort === "string" && effort && !isClearEffort(effort, harness))
+    entry.effort = effort;
   if (typeof speed === "string" && speed && !isClearValue(speed)) entry.speed = speed;
   return entry;
 }
@@ -338,7 +351,7 @@ export function recordCallingLast(
   if (typeof value.model === "string" && value.model && !isClearValue(value.model)) {
     agentEntry.model = value.model;
   }
-  if (typeof value.effort === "string" && value.effort && !isClearValue(value.effort)) {
+  if (typeof value.effort === "string" && value.effort && !isClearEffort(value.effort, harness)) {
     agentEntry.effort = value.effort;
   }
   if (typeof value.speed === "string" && value.speed && !isClearValue(value.speed)) {

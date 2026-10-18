@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import yaml
 
@@ -53,6 +55,30 @@ def test_resolve_harness_is_acp_detects_canonical_acp() -> None:
 def test_resolve_harness_is_acp_rejects_other_harnesses() -> None:
     conv = _conv(harness_override="claude-native")
     assert orch._resolve_harness_impl_is_acp(conv, None) is False
+
+
+@pytest.mark.asyncio
+async def test_live_acp_efforts_replace_snapshot_after_model_change():
+    rows = [{"id": "model-a", "isDefault": True, "efforts": ["deliberate"]}]
+
+    async def handle(request):
+        return httpx.Response(200, json={"models": rows})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as client:
+        conv = _conv(harness_override="acp:neutral", agent_id=None)
+        await orch._fetch_model_options(client, "conv_acp", conv)
+        await asyncio.gather(*list(orch._model_options_inflight.values()))
+        assert orch._model_options_cache["conv_acp"][0]["efforts"] == ["deliberate"]
+        rows = [{"id": "model-b", "isDefault": True, "efforts": []}]
+        await orch._fetch_model_options(client, "conv_acp", conv)
+        await asyncio.gather(*list(orch._model_options_inflight.values()))
+        assert orch._model_options_cache["conv_acp"][0]["efforts"] == []
+        rows = []
+        await orch._fetch_model_options(client, "conv_acp", conv)
+        await asyncio.gather(*list(orch._model_options_inflight.values()))
+        assert orch._model_options_cache["conv_acp"] == []
 
 
 def test_resolve_harness_is_acp_false_without_override_or_spec() -> None:

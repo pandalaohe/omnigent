@@ -85,6 +85,12 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
+from omnigent.models.model_catalog_store import (
+    binary_identity,
+    fingerprint_of,
+    read_catalog,
+    write_catalog,
+)
 from omnigent.process_logging import current_process_log_path, display_log_path
 
 logger = logging.getLogger(__name__)
@@ -480,6 +486,10 @@ class AcpExecutor(Executor):
         self._config_option_ids: set[str] = set()
         self._active_model: str | None = None
         self._initial_model: str | None = None
+        self._effort_option: _AcpJsonObject | None = None
+        self._effort_defaults: dict[str | None, str] = {}
+        self._effort_overridden = False
+        self._model_options: list[_AcpJsonObject] = []
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
         self._model_switch_supported: bool = True
@@ -575,6 +585,10 @@ class AcpExecutor(Executor):
         self._image_supported = False
         self._authenticated = False
         self._auth_advertisement = {}
+        self._effort_option = None
+        self._effort_defaults.clear()
+        self._effort_overridden = False
+        self._model_options = []
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
@@ -727,6 +741,15 @@ class AcpExecutor(Executor):
                     if not fut.done():
                         fut.set_result(msg)
                 else:
+                    params = msg.get("params", {})
+                    update = params.get("update", {}) if isinstance(params, dict) else {}
+                    if (
+                        msg.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE
+                        and isinstance(update, dict)
+                        and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                    ):
+                        self._note_config_options(update.get("configOptions"))
+                        continue
                     await self._queue.put(msg)
         except (asyncio.CancelledError, EOFError):
             # Expected during shutdown / after the subprocess closes stdout.
@@ -955,9 +978,10 @@ class AcpExecutor(Executor):
         # otherwise leave it unknown until a later config_option_update, leaving the
         # server unable to attribute per-model token usage for the turn.
         if isinstance(result, dict):
-            self._note_config_options(result.get("configOptions"))
             self._note_session_models(result.get("models"))
+            self._note_config_options(result.get("configOptions"))
         self._initial_model = self._active_model
+        self._update_effort_catalog()
         return self._session_id
 
     def _note_session_models(self, models: object) -> None:
@@ -984,6 +1008,13 @@ class AcpExecutor(Executor):
         current = models.get("currentModelId")
         if isinstance(current, str) and current:
             self._active_model = current
+            if self._initial_model is None:
+                self._initial_model = current
+        if self._session_model_ids and not any(
+            row["id"] != "__default__" for row in self._model_options
+        ):
+            self._model_options = [{"id": mid} for mid in sorted(self._session_model_ids)]
+            self._update_effort_catalog()
 
     def _session_mcp_servers(self) -> list[_AcpJsonObject]:
         """Build ``session/new.mcpServers`` and snapshot the bridge aliases.
@@ -1542,6 +1573,13 @@ class AcpExecutor(Executor):
         """Forget state that is only valid for the current ACP session."""
         self._session_id = None
         self._initial_model = None
+        self._active_model = None
+        self._config_option_ids.clear()
+        self._session_model_ids.clear()
+        self._effort_option = None
+        self._effort_defaults.clear()
+        self._effort_overridden = False
+        self._model_options = []
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
@@ -1658,6 +1696,8 @@ class AcpExecutor(Executor):
         """
         if not isinstance(options, list):
             return None
+        self._config_option_ids = set()
+        self._effort_option = None
         model_value: str | None = None
         for opt in options:
             if not isinstance(opt, dict):
@@ -1666,12 +1706,134 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
+            if opt.get("category") == "thought_level" and opt.get("type") == "select":
+                self._effort_option = opt
             if opt_id == _CONFIG_OPTION_MODEL:
                 current = opt.get("currentValue")
                 if isinstance(current, str) and current:
                     self._active_model = current
+                    if self._initial_model is None:
+                        self._initial_model = current
                     model_value = current
+                choices = self._select_choices(opt.get("options"))
+                if choices:
+                    self._model_options = [
+                        {"id": choice["value"], "displayName": choice.get("name", choice["value"])}
+                        for choice in choices
+                    ]
+        self._update_effort_catalog()
         return model_value
+
+    @staticmethod
+    def _select_choices(options: object) -> list[_AcpJsonObject]:
+        """Flatten ACP select groups, retaining only string-valued options."""
+        if not isinstance(options, list):
+            return []
+        choices: list[_AcpJsonObject] = []
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            if isinstance(option.get("value"), str) and option["value"]:
+                choices.append(option)
+            else:
+                choices.extend(AcpExecutor._select_choices(option.get("options")))
+        return choices
+
+    def _update_effort_catalog(self) -> None:
+        option = self._effort_option or {}
+        choices = self._select_choices(option.get("options"))
+        current = option.get("currentValue")
+        if isinstance(current, str):
+            self._effort_defaults.setdefault(self._active_model, current)
+        active_id = self._active_model or "__default__"
+        default_id = self._config.default_model
+        if default_id is None:
+            default_id = self._config.model
+        default_id = default_id or self._initial_model or active_id
+        if (self._active_model or self._effort_option) and not any(
+            row["id"] == active_id for row in self._model_options
+        ):
+            self._model_options.append(
+                {"id": active_id, "displayName": self._active_model or "Session default"}
+            )
+        for row in self._model_options:
+            active = row["id"] == active_id
+            row["isDefault"] = row["id"] == default_id
+            row["isActive"] = active
+            row["efforts"] = [choice["value"] for choice in choices] if active else []
+            row.pop("defaultReasoningEffort", None)
+            if active and isinstance(current, str):
+                row["defaultReasoningEffort"] = current
+        if not self._model_options:
+            return
+        # The host defaults table can reuse the last advertisement without
+        # starting or touching a user session. Live sessions use their own rows.
+        key = fingerprint_of(self._config.command, binary_identity(self._argv[0]))
+        previous = {row["id"]: row for row in (read_catalog("acp", key) or [])}
+        merged = []
+        for row in self._model_options:
+            if row["id"] != active_id and row["id"] in previous:
+                row = {**previous[row["id"]], "isDefault": row["isDefault"], "isActive": False}
+            merged.append(dict(row))
+        write_catalog("acp", key, merged)
+
+    def model_options(self) -> list[_AcpJsonObject]:
+        """Return this session's advertised catalog, never another session's effort."""
+        return [
+            dict(row)
+            for row in self._model_options
+            if not self._config.available_models or row["id"] in self._config.available_models
+        ]
+
+    @property
+    def model_options_ready(self) -> bool:
+        """An initialized session's empty advertisement is authoritative."""
+        return self._session_id is not None
+
+    async def _apply_effort_override(self, session_id: str, effort: str | None) -> None:
+        option = self._effort_option
+        if option is None:
+            if effort is not None or self._effort_overridden:
+                logger.info(
+                    "acp[%s] effort %r skipped: thought_level not advertised for model %s",
+                    self._config.name,
+                    effort,
+                    self._active_model,
+                )
+            self._effort_overridden = False
+            return
+        if effort is None:
+            if not self._effort_overridden:
+                return
+            effort = self._effort_defaults.get(self._active_model)
+            if effort is None:
+                raise RuntimeError("ACP effort reset has no advertised initial value")
+            overridden = False
+        else:
+            overridden = True
+        offered = [choice["value"] for choice in self._select_choices(option.get("options"))]
+        if effort not in offered:
+            raise RuntimeError(
+                f"ACP effort {effort!r} is not advertised for model "
+                f"{self._active_model!r}; offered: {offered}"
+            )
+        self._effort_overridden = True
+        response = await self._rpc(
+            _AGENT_METHOD_SET_CONFIG_OPTION,
+            {"sessionId": session_id, "configId": option["id"], "value": effort},
+        )
+        if "error" in response:
+            raise RuntimeError(f"ACP agent rejected effort {effort!r}: {response['error']}")
+        result = response.get("result")
+        echoed = result.get("configOptions") if isinstance(result, dict) else None
+        self._note_config_options(echoed)
+        confirmed = self._effort_option.get("currentValue") if self._effort_option else None
+        if not isinstance(echoed, list) or confirmed != effort:
+            raise RuntimeError(
+                f"ACP effort {effort!r} was not confirmed (currentValue={confirmed!r})"
+            )
+        self._effort_overridden = overridden
+        logger.info("acp[%s] effort applied and confirmed: %s", self._config.name, confirmed)
 
     async def _apply_model_override(self, session_id: str, model: str | None) -> None:
         """Warm-switch the agent's model via ACP ``session/set_config_option``.
@@ -1691,7 +1853,7 @@ class AcpExecutor(Executor):
         # A launch override must not replace the default restored by later turns.
         default_model = self._config.default_model
         if default_model is None:
-            default_model = self._config.model
+            default_model = self._config.model or self._initial_model
         elif not default_model:
             default_model = self._initial_model
         model = model or default_model
@@ -1729,6 +1891,8 @@ class AcpExecutor(Executor):
             )
             return
 
+        self._effort_defaults.pop(model, None)
+        self._effort_option = None
         response = await self._rpc(
             _AGENT_METHOD_SET_CONFIG_OPTION,
             {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
@@ -1765,6 +1929,7 @@ class AcpExecutor(Executor):
             raise _AcpModelSwitchError(
                 f"ACP agent selected {echoed_model!r} instead of requested model {model!r}."
             )
+        self._update_effort_catalog()
         logger.info(
             "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
         )
@@ -1786,6 +1951,8 @@ class AcpExecutor(Executor):
         :param session_id: The live ACP session to reconfigure.
         :param model: Requested model id.
         """
+        self._effort_defaults.pop(model, None)
+        self._effort_option = None
         response = await self._rpc(
             _AGENT_METHOD_SET_MODEL, {"sessionId": session_id, "modelId": model}
         )
@@ -1805,6 +1972,11 @@ class AcpExecutor(Executor):
             )
             return
         self._active_model = model
+        result = response.get("result")
+        self._note_config_options(
+            result.get("configOptions") if isinstance(result, dict) else None
+        )
+        self._update_effort_catalog()
         logger.info(
             "acp[%s] model set to %s via %s (transcript kept)",
             self._config.name,
@@ -1869,6 +2041,23 @@ class AcpExecutor(Executor):
                 return
             self._model_switch_supported = False
             logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
+
+        try:
+            effort = config.extra.get("reasoning_effort") if config is not None else None
+            await self._apply_effort_override(session_id, effort)
+        except Exception as exc:  # noqa: BLE001
+            yield ExecutorError(
+                message=f"ACP effort selection failed: {describe_exception(exc)}. "
+                "No prompt was sent; select an advertised effort or clear the override.",
+                retryable=True,
+                preserve_session=(
+                    self._proc is not None
+                    and self._proc.returncode is None
+                    and self._reader_task is not None
+                    and not self._reader_task.done()
+                ),
+            )
+            return
 
         # A fresh ACP session holds no prior context. Captured before the latch
         # flips so we know whether to replay history into this turn.

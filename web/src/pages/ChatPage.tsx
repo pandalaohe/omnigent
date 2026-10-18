@@ -1174,7 +1174,8 @@ export function ChatPage() {
       ),
     [capabilitySource, codexModelOptions, llmModel, modelPickerKind, sessionModelOverrideForEffort],
   );
-  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
+  const showEffort =
+    shouldShowEffortPicker(capabilitySource, codexModelOptions) && effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -5261,7 +5262,9 @@ export function effortLevelsForConv(
 ): readonly string[] {
   const harness =
     nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness ??
-    (isSdkHarnessSession(conv) ? conv?.harness : null);
+    (isSdkHarnessSession(conv) || conv?.harness === "acp" || conv?.harness?.startsWith("acp:")
+      ? conv?.harness
+      : null);
   return effortLevelsFor(harness, codexModelOptions, currentModel) ?? EFFORT_LEVELS;
 }
 
@@ -5353,8 +5356,9 @@ export function shouldShowEffortPicker(
       }
     | null
     | undefined,
+  models?: readonly NativeModelOption[],
 ): boolean {
-  return supportsEffortControl(conv);
+  return supportsEffortControl(conv, models);
 }
 
 export function shouldShowCodexPlanModeControl(
@@ -5632,7 +5636,7 @@ function SessionHarnessPicker({
         ? "codex-native"
         : modelPickerKind === "antigravity"
           ? "antigravity-native"
-          : modelPickerKind === "sdk"
+          : modelPickerKind === "sdk" || modelPickerKind === "acp"
             ? sessionHarness
             : null,
       codexModelOptions,

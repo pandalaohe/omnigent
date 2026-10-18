@@ -1125,6 +1125,7 @@ export async function launchRunner(
  * "off" is a real value, so explicit null (not an alias) is the server's
  * clear signal. Clearing sub-agent routing lands the session on Default,
  * the same place ``"off"`` does.
+ * `literalEffort` preserves agent-advertised strings and uses JSON null to reset.
  *
  * `silent: true` persists without forwarding a live command into a native
  * harness. Use it only for persistence-only updates, such as detaching a
@@ -1169,10 +1170,13 @@ export async function updateSession(
     silent?: boolean;
     labels?: Record<string, string>;
   },
+  options?: { literalEffort?: boolean },
 ): Promise<Session> {
   const body: Record<string, string | boolean | null | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
-    body.reasoning_effort = updates.reasoningEffort ?? "default";
+    body.reasoning_effort = options?.literalEffort
+      ? (updates.reasoningEffort ?? null)
+      : (updates.reasoningEffort ?? "default");
   }
   if ("modelOverride" in updates) {
     body.model_override = updates.modelOverride ?? "default";

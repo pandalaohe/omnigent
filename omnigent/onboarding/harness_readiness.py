@@ -1083,7 +1083,12 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
         }
         availability_cache = {cache_key: future.result() for cache_key, future in futures.items()}
 
-    return {
+    result = {
         spelling: availability_cache[cache_key]
         for spelling, cache_key in cache_key_by_spelling.items()
     }
+    from omnigent.onboarding.acp_auth import acp_agents
+
+    for agent in acp_agents():
+        result[f"acp:{agent.slug}"] = result.get("acp", False)
+    return result

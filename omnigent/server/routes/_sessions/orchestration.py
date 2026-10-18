@@ -11947,7 +11947,11 @@ def _create_resolved_harness(
     if native_agent is not None:
         return native_agent.harness
     if harness_override:
-        return canonicalize_harness(harness_override) or harness_override
+        return (
+            harness_override
+            if harness_override.startswith("acp:")
+            else canonicalize_harness(harness_override) or harness_override
+        )
     if agent_cache is None:
         return None
     try:
@@ -11959,7 +11963,8 @@ def _create_resolved_harness(
         # validation reports it.
         _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
         return None
-    return canonicalize_harness(_spec_harness(loaded.spec)) or None
+    raw = loaded.spec.executor.config.get("harness") or loaded.spec.executor.type
+    return raw if raw.startswith("acp:") else canonicalize_harness(raw) or None
 
 
 def _fixed_native_routing_harness(
@@ -12517,6 +12522,9 @@ async def _create_session_from_existing_agent(
     # element at terminal launch, so reject shell-/flag-shaped values
     # before any row or worktree exists.
     model_override, reasoning_effort = validate_session_model_metadata(
+        harness=await asyncio.to_thread(
+            _create_resolved_harness, agent, body.harness_override, agent_cache
+        ),
         # Native Smart Routing bakes the routed model into the terminal launch;
         # the client sends none of its own on that path. A fixed-harness routed
         # create does the same, and only ever ran because the client sent none.
@@ -13146,6 +13154,7 @@ async def _create_session_from_existing_agent(
             _, reasoning_effort = validate_session_model_metadata(
                 model_override=None,
                 reasoning_effort=spec_effort,
+                harness=_spec_harness(effort_spec) if effort_spec is not None else None,
             )
 
     selected_spec = sub_spec if sub_spec is not None else own_spec
@@ -13607,13 +13616,17 @@ def _create_session_from_bundle(
     from omnigent.server.routes.sandbox_inference import configured_snapshot
 
     if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
-        _validate_acp_spec_models(spec)
+        _validate_acp_spec_models(spec, metadata.model_override)
 
-    if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
-        _, seeded_effort = validate_session_model_metadata(
-            model_override=None,
-            reasoning_effort=spec.executor.reasoning_effort,
-        )
+    effort = metadata.reasoning_effort
+    if "reasoning_effort" not in metadata.model_fields_set:
+        effort = spec.executor.reasoning_effort
+    _, seeded_effort = validate_session_model_metadata(
+        model_override=metadata.model_override,
+        reasoning_effort=effort,
+        harness=spec.executor.harness_kind,
+    )
+    if seeded_effort != metadata.reasoning_effort:
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
     if metadata.parent_session_id is not None:
@@ -14273,6 +14286,18 @@ async def _fetch_model_options(
         # serves the deployment's curated provider ``models:`` shortlist
         # resolved from the spec instead of a runner-owned catalog.
         if _resolve_harness_impl_is_acp(conv, agent_store):
+            if runner_client is not None and session_id not in _model_options_inflight:
+                task = asyncio.create_task(
+                    _load_model_options(
+                        runner_client,
+                        session_id,
+                        f"/v1/sessions/{session_id}/model-options",
+                        publish_on_change_only=True,
+                        accept_empty=True,
+                    )
+                )
+                _model_options_inflight[session_id] = task
+                task.add_done_callback(lambda _task: _model_options_inflight.pop(session_id, None))
             return await _load_acp_model_options(session_id, conv, agent_store)
         from omnigent.harness_aliases import canonicalize_harness
 

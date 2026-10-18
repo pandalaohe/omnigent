@@ -24,6 +24,18 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 )
 
 
+def test_acp_metadata_accepts_an_opaque_effort_but_other_harnesses_do_not():
+    from omnigent.server.routes._session_create_validation import validate_session_model_metadata
+
+    assert validate_session_model_metadata(
+        model_override=None, reasoning_effort="deliberate", harness="acp:neutral"
+    ) == (None, "deliberate")
+    with pytest.raises(OmnigentError):
+        validate_session_model_metadata(
+            model_override=None, reasoning_effort="deliberate", harness="claude-sdk"
+        )
+
+
 @pytest.fixture()
 def agent_store(db_uri: str) -> SqlAlchemyAgentStore:
     return SqlAlchemyAgentStore(db_uri)

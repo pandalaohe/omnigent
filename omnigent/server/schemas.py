@@ -1886,12 +1886,12 @@ class SessionCreateMetadata(BaseModel):
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the
         session. Empty dict (the default) starts with no labels.
+    :param model_override: Optional per-session model override, validated
+        against the uploaded agent's harness before persistence.
     :param reasoning_effort: Optional per-session reasoning-effort
-        hint. Accepted metadata values are ``"none"``,
-        ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
-        ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
-        validated when a turn executes. ``None`` means use the agent
-        default.
+        hint. ACP values come from the session advertisement; other
+        harnesses use the shared effort vocabulary. ``None`` clears the
+        override. Provider-specific support is checked before the turn.
     :param host_id: Optional host to launch the runner on, e.g.
         ``"host_a1b2c3d4..."``. When set, the server generates a
         binding token, writes the expected runner_id to the session
@@ -1933,6 +1933,7 @@ class SessionCreateMetadata(BaseModel):
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
+    model_override: str | None = None
     reasoning_effort: str | None = None
     host_id: str | None = None
     workspace: str | None = None
