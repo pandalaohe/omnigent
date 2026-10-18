@@ -116,14 +116,17 @@ def test_native_picker_label_and_wrapper_payload(
     assert body["agent_id"] == f"ag_{harness}_browser", body
     assert body["host_id"] == chat.host_id, body
     assert body["workspace"] == "/work/repo", body
-    assert body.get("labels") == {
+    expected_labels = {
         "omnigent.ui": "terminal",
         "omnigent.wrapper": f"{harness}-ui",
         "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
         "omnigent.composer_context.v1.0": (
             '{"version":1,"working_directory":{"path":"/work/repo"},"worktree":{"mode":"none"}}'
         ),
-    }, body
+    }
+    if harness == "antigravity-native":
+        expected_labels["omnigent.antigravity_native.permission_tier"] = "auto-relaxed"
+    assert body.get("labels") == expected_labels, body
     assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
 
 
