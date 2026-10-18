@@ -548,17 +548,8 @@ export function TerminalView({
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
-      // React 18 ignores the cleanup this callback returns and calls the
-      // ref with null on unmount instead, so the attach is retired here.
-      if (node === null) {
-        attachGenerationRef.current += 1;
-        upgradeCtlRef.current?.abort();
-        disposeActiveSession();
-        terminalNodeRef.current = null;
-        onStateChangeRef.current?.(null);
-        return;
-      }
       terminalNodeRef.current = node;
+      if (node === null) return;
       // React re-runs a ref callback for the *same* node whenever the
       // callback's identity changes — here, when the runner's
       // direct-attach advert lands after mount. Retire the previous

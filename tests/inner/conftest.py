@@ -73,7 +73,6 @@ def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 # silently disappears. Route worker dumps to a file in
 # PYTEST_PROGRESS_LOG_DIR (uploaded as an artifact by integration.yml)
 # so each gw{N}'s stack frames are recoverable post-mortem.
-# The Python-thread stack dumper below keeps frame access under the GIL.
 _worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
 _log_dir_env = os.environ.get("PYTEST_PROGRESS_LOG_DIR")
 _stack_dump_file: TextIO
