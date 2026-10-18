@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
+from omnigent.db.utils import _supports_fts5
 from omnigent.entities import MessageData, NewConversationItem, ReasoningData
 from omnigent.stores.conversation_store import (
     NativeRecoveryItemSkipped,
@@ -48,13 +49,24 @@ def _recovery(item: NewConversationItem, after: str | None = None) -> NewConvers
 def _snapshot(
     store: SqlAlchemyConversationStore, conversation_id: str
 ) -> tuple[tuple[tuple[object, ...], ...], ...]:
+    uses_fts = _supports_fts5(store._conv_engine.dialect.name)
+    search_sql = (
+        "SELECT * FROM conversation_items_fts WHERE conversation_id = :cid ORDER BY rowid"
+        if uses_fts
+        else "SELECT id, search_text FROM conversation_items "
+        "WHERE conversation_id = :cid ORDER BY position, id"
+    )
     with store._conv_session("test_history_snapshot") as session:
         return tuple(
             tuple(
                 tuple(row)
                 for row in session.execute(
                     text(sql),
-                    {"cid": conversation_id if index == 2 else bytes.fromhex(conversation_id)},
+                    {
+                        "cid": conversation_id
+                        if index == 2 and uses_fts
+                        else bytes.fromhex(conversation_id)
+                    },
                 )
             )
             for index, sql in enumerate(
@@ -62,8 +74,7 @@ def _snapshot(
                     "SELECT * FROM conversations WHERE id = :cid",
                     "SELECT * FROM conversation_items "
                     "WHERE conversation_id = :cid ORDER BY position",
-                    "SELECT * FROM conversation_items_fts "
-                    "WHERE conversation_id = :cid ORDER BY rowid",
+                    search_sql,
                 )
             )
         )
