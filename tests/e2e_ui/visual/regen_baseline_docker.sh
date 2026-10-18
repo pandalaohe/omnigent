@@ -9,7 +9,7 @@
 #
 # Only a container runtime is required (no local Node/Python/uv).  Set
 # OMNIGENT_CONTAINER_RUNTIME=podman to use Podman instead of Docker.  It:
-#   1. builds the web SPA and static Storybook in a Node 20 container, then
+#   1. builds the web SPA and static Storybook in a Node 22 container, then
 #   2. compares the whole visual suite in the pinned Playwright image and
 #      rewrites only the baselines that drift (or are missing) -- baselines that
 #      already match are left byte-for-byte untouched, mirroring the label-driven
@@ -26,7 +26,7 @@ set -euo pipefail
 
 # Keep these in lockstep with ui-snapshot.yml / ui-snapshot-update.yml.
 PW_IMAGE="mcr.microsoft.com/playwright/python:v1.60.0-noble@sha256:8ff591d613b01c884cc488339ed4318b4513eaf0c57a164a878ba49e70e3f384"
-NODE_IMAGE="node:20-bookworm"
+NODE_IMAGE="node:22-bookworm"
 # The pinned digest is a multi-arch manifest, and CI renders the linux/amd64
 # variant. Force it here too so an arm64 host (e.g. Apple Silicon) renders the
 # same Chromium build -- otherwise the local PNG diverges from the gate. On
