@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tomllib
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosedError, InvalidMessage
 
@@ -1970,6 +1971,34 @@ def test_web_model_pick_applied_via_thread_settings_update(
             },
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    "tier,expected", [("fast", "priority"), ("standard", "default"), ("flex", "flex")]
+)
+def test_web_service_tier_applies_before_turn_and_mirrors_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tier: str, expected: str
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    config = home / "config.toml"
+    config.write_text('service_tier = "default"\n')
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    _run_turn_with_config(executor, "hello", ExecutorConfig(service_tier=tier))
+    assert _FakeCodexNativeClient.requests[0] == (
+        "thread/settings/update",
+        {"threadId": "thread_123", "serviceTier": expected},
+    )
+    assert _FakeCodexNativeClient.requests[1][0] == "turn/start"
+    assert tomllib.loads(config.read_text())["service_tier"] == expected
 
 
 def test_model_settings_update_mirrors_model_into_config_toml(

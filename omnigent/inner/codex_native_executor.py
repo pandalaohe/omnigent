@@ -339,6 +339,8 @@ async def _start_codex_turn(
     settings_overrides = dict(settings_overrides)
     # Settings applied while their config write failed are recorded beside the config.
     unmirrored = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
+    if isinstance(tier := unmirrored.get("service_tier"), str):
+        settings_overrides.setdefault("serviceTier", tier)
     model = (
         settings_overrides.get("model")
         or unmirrored.get("model")
@@ -378,6 +380,8 @@ async def _start_codex_turn(
             for key in ("model", "effort")
             if isinstance(value := settings_overrides.get(key), str) and value
         }
+        if isinstance(tier := settings_overrides.get("serviceTier"), str):
+            switched["service_tier"] = tier
         failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
         for key, value in failed.items():
             _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
@@ -597,6 +601,9 @@ class CodexNativeExecutor(Executor):
         no recorded turn cancels just the startup; no pending startup
         interrupts just the turn.
 
+        Abandoned-executor cleanup uses its acknowledged owned turn snapshot
+        and leaves shared startup state untouched.
+
         :param session_key: Adapter session key. Unused because the
             bridge is per conversation.
         :returns: ``True`` when an interrupt or a startup cancel was sent.
@@ -728,11 +735,9 @@ class CodexNativeExecutor(Executor):
             native Codex owns its own tool surface.
         :param system_prompt: System prompt from the agent spec. Native
             startup instructions are configured before the app-server launches.
-        :param config: Per-turn executor config. Its ``model`` and
-            ``extra["reasoning_effort"]`` (carrying the Omnigent web
-            ``/model`` pick) are applied via a ``thread/settings/update``
-            request ahead of ``turn/start``; everything else is ignored
-            by this bridge.
+        :param config: Per-turn executor config. Model, reasoning effort and
+            service tier apply via ``thread/settings/update`` before starting
+            the turn, and successful updates mirror into the private config.
         :returns: Async iterator yielding one terminal event.
         """
         del tools, system_prompt
@@ -966,25 +971,13 @@ class CodexNativeExecutor(Executor):
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
     """
-    Build Codex ``thread/settings/update`` model / reasoning-effort overrides.
+    Build the model, effort and service-tier settings for the next web turn.
 
-    A model or reasoning-effort change selected in the Omnigent web UI is
-    applied to the running native thread via a ``thread/settings/update``
-    request (whose ``ThreadSettingsUpdateParams`` carries ``model`` and
-    ``effort``); the change persists to this and later turns. ``turn/start``
-    itself takes no model/effort — its params are input/context only — which
-    is why the picker was previously a no-op. The runner threads the web
-    ``/model`` pick into ``config.model`` and the effort into
-    ``config.extra["reasoning_effort"]`` (see
-    :class:`~omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`).
-    When neither is pinned the override dict is empty and the native
-    thread keeps its launch-pinned model — so this is a no-op for
-    sessions that never touch the web picker.
+    Explicit per-turn selections apply via ``thread/settings/update`` before
+    ``turn/start``. Missing selections retain the native thread's settings.
 
     :param config: Per-turn executor config, or ``None``.
-    :returns: Override dict for ``thread/settings/update`` params, e.g.
-        ``{"model": "gpt-5.3-codex", "effort": "high"}``. Empty when
-        nothing is pinned.
+    :returns: Settings overrides, empty when nothing is pinned.
     """
     if config is None:
         return {}
@@ -1008,6 +1001,10 @@ def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
     effort = effort_for_model_switch(effort, model_str)
     if effort:
         overrides["effort"] = effort
+    if config.service_tier is not None:
+        from omnigent.session_default_modes import codex_service_tier
+
+        overrides["serviceTier"] = codex_service_tier(config.service_tier)
     return overrides
 
 

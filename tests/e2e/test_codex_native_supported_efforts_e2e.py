@@ -413,9 +413,15 @@ def test_codex_live_speed_reaches_the_next_web_and_terminal_turn(
     codex_effort_rig: _Rig, asleep: bool
 ) -> None:
     rig = codex_effort_rig
-    with _session(
-        rig, "gpt-6-sol", "medium", speed_before_launch="fast" if asleep else None
-    ) as session:
+    fast_models = [
+        row["slug"]
+        for row in rig.catalog["models"]
+        if any(tier.get("id") == "priority" for tier in row.get("service_tiers", []))
+        and "medium" in {level["effort"] for level in row["supported_reasoning_levels"]}
+    ]
+    assert fast_models, "The pinned Codex catalog must advertise a priority-capable model"
+    model = _STANDARD_MODEL if _STANDARD_MODEL in fast_models else fast_models[0]
+    with _session(rig, model, "medium", speed_before_launch="fast" if asleep else None) as session:
         for speed, tier, terminal in (("fast", "priority", True), ("standard", "default", False)):
             if asleep and speed == "fast":
                 changed = _json(rig.api.get(f"/v1/sessions/{session.id}"))
@@ -428,7 +434,7 @@ def test_codex_live_speed_reaches_the_next_web_and_terminal_turn(
             assert state is not None
             config = tomllib.loads((Path(state.codex_home) / "config.toml").read_text())
             assert config["service_tier"] == tier
-            _assert_turn(rig, session, "gpt-6-sol", "medium", terminal=terminal, service_tier=tier)
+            _assert_turn(rig, session, model, "medium", terminal=terminal, service_tier=tier)
 
 
 @pytest.mark.parametrize("entry_point", ["launch", "inherited", "existing"])
