@@ -13160,6 +13160,85 @@ _BTW_BORDERLESS_SINGLE_PANE = """\
   ↑/↓ to scroll · c to copy · f to fork · Esc to close
 """
 
+# Runner failure capture, with the unrelated transcript omitted.
+_BTW_BORDERLESS_SPLIT_CLOSE_PANE = """\
+✻ Baked for 2m 3s · done 8:37 PM
+❯ /btw [omnigent keep-warm] reply with only: ok
+  /btw [omnigent keep-warm] reply with only: ok
+    ok
+  ↑/↓ to scroll · c to copy · f to fork · Esc to
+  close
+"""
+
+
+def test_btw_overlay_borderless_split_close_capture() -> None:
+    pane = _BTW_BORDERLESS_SPLIT_CLOSE_PANE
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.question == "/btw [omnigent keep-warm] reply with only: ok"
+    assert overlay.answer == "ok"
+    assert claude_native_bridge._keep_warm_btw_overlay_present(pane)
+
+
+def test_inject_user_message_recovers_keep_warm_btw_before_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BTW_BORDERLESS_SPLIT_CLOSE_PANE
+    sends = _fake_tmux(monkeypatch, [pane, pane, _IDLE_PANE, _IDLE_PANE])
+    delivered: list[str] = []
+
+    def paste(*_args: object, text: str, needle: str) -> None:
+        del needle
+        delivered.append(text)
+        assert sends == [["send-keys", "-t", "claude:0.0", "Escape"]]
+
+    monkeypatch.setattr(claude_native_bridge, "_paste_and_submit", paste)
+    inject_user_message(bridge_dir, content="real message")
+    assert delivered == ["real message"]
+
+
+@pytest.mark.parametrize("covered_composer", [False, True])
+def test_inject_user_message_leaves_persons_btw_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, covered_composer: bool
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BTW_BORDERLESS_SPLIT_CLOSE_PANE.replace(
+        "[omnigent keep-warm] reply with only: ok", "my own question"
+    )
+    if covered_composer:
+        pane = _IDLE_PANE + pane
+    sends = _fake_tmux(monkeypatch, [pane])
+    monkeypatch.setattr(
+        claude_native_bridge, "_paste_and_submit", lambda *_a, **_k: pytest.fail("pasted")
+    )
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="your /btw"):
+        inject_user_message(bridge_dir, content="real message", timeout_s=0.1)
+    assert sends == []
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "busy", "foreign", "stays-open"])
+def test_inject_user_message_requires_keep_warm_btw_close_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None, failure: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BTW_BORDERLESS_SPLIT_CLOSE_PANE
+    frames = [pane, pane]
+    if failure == "unreadable":
+        frames += [""]
+    elif failure == "foreign":
+        frames += [pane.replace("[omnigent keep-warm]", "my own question")]
+    elif failure == "busy":
+        monkeypatch.setattr(claude_native_bridge, "_claude_session_status", lambda *_: None)
+    sends = _fake_tmux(monkeypatch, frames)
+    monkeypatch.setattr(
+        claude_native_bridge, "_paste_and_submit", lambda *_a, **_k: pytest.fail("pasted")
+    )
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="keep-warm /btw"):
+        inject_user_message(bridge_dir, content="real message", timeout_s=0.1)
+    assert len(sends) == (0 if failure == "busy" else 2 if failure == "stays-open" else 1)
+    assert all(args[-1] == "Escape" for args in sends)
+
 
 @pytest.mark.parametrize(
     "pane",

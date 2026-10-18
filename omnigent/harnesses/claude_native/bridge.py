@@ -5141,7 +5141,7 @@ class PaneSignals:
 def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int, str] | None:
     """Locate the live overlay's body and its possibly wrapped footer."""
     footer_end = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-    if footer_end is None or _BTW_FOOTER_CLOSE_HINT not in lines[footer_end]:
+    if footer_end is None:
         return None
     footer_idx = footer_end
     # Wrapped hints remain one paragraph; stop at the navigation row so an
@@ -5151,7 +5151,7 @@ def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int, str] | None:
             break
         footer_idx -= 1
     footer = " ".join(line.strip() for line in lines[footer_idx : footer_end + 1])
-    if _BTW_FOOTER_CLOSE_HINT not in footer or any(
+    if not footer.endswith(_BTW_FOOTER_CLOSE_HINT) or any(
         _is_box_rule(line) or line.startswith(_CLAUDE_PROMPT_GLYPH)
         for line in lines[footer_idx : footer_end + 1]
     ):
@@ -6113,8 +6113,9 @@ def _restore_occupied_input(
     cancel"), which commits nothing and hands the empty input box back, so
     the web-UI message wins the pane.
 
-    Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer.
+    Questions and permission prompts require an explicit answer. A person's
+    ``/btw`` stays open; keep-warm's marked panel uses its guarded dismissal
+    and must reveal an uncovered composer before delivery proceeds.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -6154,6 +6155,21 @@ def _restore_occupied_input(
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
             )
+        if _btw_overlay_present(pane):
+            if not _keep_warm_btw_overlay_present(pane):
+                raise ClaudeTerminalDialog(
+                    "Close your /btw side chat in the terminal, then resend your message. "
+                    "The message was not delivered."
+                )
+            if bridge_dir is None or not _dismiss_keep_warm_btw_overlay(
+                bridge_dir, socket_path, tmux_target
+            ):
+                raise ClaudeTerminalDialog(
+                    "The keep-warm /btw side chat could not be safely closed. "
+                    "Close it in the terminal, then resend your message. "
+                    "The message was not delivered."
+                )
+            return None
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
