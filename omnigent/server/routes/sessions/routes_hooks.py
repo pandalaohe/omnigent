@@ -1995,7 +1995,7 @@ def register_hooks_routes(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
             )
-        agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(
@@ -2019,7 +2019,8 @@ def register_hooks_routes(
         # LRU-cached so this check is cheap after the first call per session.
         # Users can add policies mid-session — the cache is invalidated on
         # mutation, so newly added policies are visible on the very next call.
-        if not any_policies_apply(
+        if not await asyncio.to_thread(
+            any_policies_apply,
             spec=loaded.spec,
             conversation_id=session_id,
             default_policies=_caps.default_policies,
@@ -2070,7 +2071,9 @@ def register_hooks_routes(
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine(conv)
+        # Both builds read the conversation tree and policy state from storage.
+        # Keep those reads off the loop shared by every request on this worker.
+        engine = await asyncio.to_thread(_build_engine, conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -2124,7 +2127,7 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
-                    engine = _build_engine()
+                    engine = await asyncio.to_thread(_build_engine)
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
@@ -2194,7 +2197,7 @@ def register_hooks_routes(
                 # below with the rebuilt engine and updated result.
 
         if result.set_labels and not is_read_only:
-            engine.apply_label_writes(result.set_labels)
+            await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
 
         resp_body: dict[str, Any] = {
             "result": _PHASE_TO_PROTO_ACTION.get(result.action, "POLICY_ACTION_UNSPECIFIED"),

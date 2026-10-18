@@ -59,6 +59,80 @@ def collab_owner_for(
     return effective_owner_id(conv, conversation_store, permission_store) or RESERVED_USER_LOCAL
 
 
+def collab_owners_for(
+    convs: list[Conversation],
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> dict[str, str | None]:
+    """Resolve owners within one read batch, sharing ancestor rows and root grants.
+
+    Missing parents stop the walk at the last existing row, as in
+    :func:`collab_owner_for`. A failed read returns ``None`` only for the
+    affected branch; no owner or row cache survives this call.
+    """
+    if permission_store is None:
+        return {conv.id: RESERVED_USER_LOCAL for conv in convs}
+    from omnigent.server.routes._auth_helpers import get_session_owner_id
+    from omnigent.server.routes.sessions.routes_peer import _OWNER_CHAIN_MAX_HOPS
+
+    rows: dict[str, Conversation | None] = {conv.id: conv for conv in convs}
+    tops = {conv.id: conv for conv in convs}
+    failed_rows: set[str] = set()
+    failed_sessions: set[str] = set()
+    active = set(tops)
+    for _ in range(_OWNER_CHAIN_MAX_HOPS):
+        parents = {
+            sid: parent_id
+            for sid in active
+            if (parent_id := tops[sid].parent_conversation_id) is not None
+        }
+        if not parents:
+            break
+        missing = sorted(set(parents.values()) - rows.keys())
+        if missing:
+            try:
+                fetched = conversation_store.get_conversations(missing)
+                rows.update({sid: fetched.get(sid) for sid in missing})
+            except Exception:  # noqa: BLE001 — isolate a failed row from healthy branches
+                _logger.warning(
+                    "Collaboration ancestor batch read failed; falling back to individual reads",
+                    exc_info=True,
+                )
+                for sid in missing:
+                    try:
+                        rows[sid] = conversation_store.get_conversation(sid)
+                    except Exception:  # noqa: BLE001
+                        rows[sid] = None
+                        failed_rows.add(sid)
+                        _logger.warning(
+                            "Collaboration ancestor read failed for %s", sid, exc_info=True
+                        )
+        active = set()
+        for sid, parent_id in parents.items():
+            if parent_id in failed_rows:
+                failed_sessions.add(sid)
+            elif (parent := rows[parent_id]) is not None:
+                tops[sid] = parent
+                active.add(sid)
+
+    owner_by_root: dict[str, str | None] = {}
+    owners: dict[str, str | None] = {}
+    for sid, top in tops.items():
+        if sid in failed_sessions:
+            owners[sid] = None
+            continue
+        if top.id not in owner_by_root:
+            try:
+                owner_by_root[top.id] = (
+                    get_session_owner_id(top.id, permission_store) or RESERVED_USER_LOCAL
+                )
+            except Exception:  # noqa: BLE001 — keep the other roots usable
+                owner_by_root[top.id] = None
+                _logger.warning("Collaboration owner read failed for %s", top.id, exc_info=True)
+        owners[sid] = owner_by_root[top.id]
+    return owners
+
+
 def session_peer_enabled(
     conv: Conversation,
     *,

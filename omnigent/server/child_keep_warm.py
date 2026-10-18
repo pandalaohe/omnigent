@@ -75,7 +75,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
     effective_host_id,
 )
-from omnigent.server.session_collab import collab_owner_for
+from omnigent.server.session_collab import collab_owner_for, collab_owners_for
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
 from omnigent.server.user_preferences_store import (
     KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S,
@@ -1208,12 +1208,14 @@ class ChildKeepWarmSweeper:
         self, convs: list[Conversation], preferences_store: Any
     ) -> dict[str, int | None]:
         """
-        Batch :meth:`cold_after_for`: one settings read per distinct owner.
+        Batch :meth:`cold_after_for`: share ancestor reads by parent layer,
+        root grants by resolved root, and settings by distinct owner.
 
         Blocking: callers run it in a thread. Never raises: one owner's read
         failure logs and leaves that owner's rows at ``None`` (the per-family
         rule), and an owner-resolution failure leaves only that conversation
-        at ``None``.
+        at ``None``. An unexpected batch-resolution failure logs and leaves
+        every conversation at ``None``.
 
         :param convs: Session rows whose agent settings apply.
         :param preferences_store: Preferences store, or ``None``.
@@ -1221,18 +1223,17 @@ class ChildKeepWarmSweeper:
             (``0`` = never cold), or ``None``.
         """
         by_session: dict[str, int | None] = {}
-        owner_by_session: dict[str, str] = {}
+        try:
+            owner_by_session = collab_owners_for(
+                convs, self._conversation_store, self._permission_store
+            )
+        except Exception:  # noqa: BLE001 — owner lookup must not fail session lists
+            _logger.warning("Keep-warm cold-after owner batch failed", exc_info=True)
+            return {conv.id: None for conv in convs}
         settings_by_owner: dict[str, KeepWarmSettings | None] = {}
         for conv in convs:
-            try:
-                owner = owner_by_session.get(conv.id)
-                if owner is None:
-                    owner = collab_owner_for(
-                        conv, self._conversation_store, self._permission_store
-                    )
-                    owner_by_session[conv.id] = owner
-            except Exception:  # noqa: BLE001 — this lookup must never fail a snapshot
-                _logger.warning("Keep-warm cold-after read failed for %s", conv.id, exc_info=True)
+            owner = owner_by_session.get(conv.id)
+            if owner is None:
                 by_session[conv.id] = None
                 continue
             if owner not in settings_by_owner:

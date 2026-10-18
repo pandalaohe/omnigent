@@ -24,7 +24,8 @@ from omnigent.entities import Conversation
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime import session_stream as runtime_session_stream
 from omnigent.server import child_keep_warm, session_live_state
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server import session_collab as collab
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.child_keep_warm import (
     ARCHIVE_EXEMPT_SINCE_LABEL,
     ARCHIVE_REASON_LABEL,
@@ -44,6 +45,7 @@ from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
 from omnigent.server.user_preferences_store import read_keep_warm_settings
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import Host
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 pytestmark = pytest.mark.asyncio
@@ -2535,6 +2537,241 @@ async def test_cold_after_for_many_reads_settings_once_per_owner(harness: _Harne
     assert harness.sweeper.cold_after_for_many([claude_child], _RaisingPrefs()) == {
         claude_child.id: None
     }
+
+
+@pytest.mark.parametrize("preloaded", [False, True])
+async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
+    harness: _Harness, db_uri: str, monkeypatch: pytest.MonkeyPatch, preloaded: bool
+) -> None:
+    roots = [_parent(harness), _parent(harness)]
+    middle = _child(harness, roots[0].id)
+    children = [_child(harness, middle.id, title=f"researcher:child-{i}") for i in range(12)]
+    other = _child(harness, roots[1].id)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for owner, root in zip(["alice", "bob"], roots, strict=True):
+        permissions.ensure_user(owner)
+        permissions.grant(owner, root.id, LEVEL_OWNER)
+    harness.sweeper._permission_store = permissions
+    single_reads: list[str] = []
+    batch_reads: list[set[str]] = []
+    grant_reads: list[str] = []
+    settings_reads: list[str] = []
+    get_one = harness.store.get_conversation
+    get_many = harness.store.get_conversations
+    get_grants = permissions.list_for_session
+
+    def single(session_id: str) -> Conversation | None:
+        single_reads.append(session_id)
+        return get_one(session_id)
+
+    def batch(session_ids: list[str]) -> dict[str, Conversation]:
+        batch_reads.append(set(session_ids))
+        return get_many(session_ids)
+
+    def grants(session_id: str, **kwargs: Any) -> Any:
+        grant_reads.append(session_id)
+        return get_grants(session_id, **kwargs)
+
+    class OwnerPrefs:
+        def get(self, owner: str) -> dict[str, Any]:
+            settings_reads.append(owner)
+            return {
+                "settings": {
+                    "keep_warm": {
+                        "agents": {
+                            _CLAUDE_AGENT: {"coldAfterSeconds": 0 if owner == "alice" else 900},
+                        }
+                    }
+                }
+            }
+
+    monkeypatch.setattr(harness.store, "get_conversation", single)
+    monkeypatch.setattr(harness.store, "get_conversations", batch)
+    monkeypatch.setattr(permissions, "list_for_session", grants)
+    inputs = [*children, other]
+    expected: dict[str, int | None] = {**{child.id: 0 for child in children}, other.id: 900}
+    if preloaded:
+        inputs += [middle, *roots]
+        expected.update({middle.id: 0, roots[0].id: None, roots[1].id: None})
+    assert harness.sweeper.cold_after_for_many(inputs, OwnerPrefs()) == expected
+    assert single_reads == []
+    assert batch_reads == ([] if preloaded else [{middle.id, roots[1].id}, {roots[0].id}])
+    assert sorted(grant_reads) == sorted(root.id for root in roots)
+    assert sorted(settings_reads) == ["alice", "bob"]
+
+    # The next read batch must see a changed root grant, even with the same rows.
+    permissions.revoke("alice", roots[0].id)
+    permissions.grant("bob", roots[0].id, LEVEL_OWNER)
+    assert harness.sweeper.cold_after_for_many([*children, other], OwnerPrefs()) == {
+        child.id: 900 for child in [*children, other]
+    }
+    assert settings_reads[-1] == "bob" and len(settings_reads) == 3
+    assert len(grant_reads) == 4
+
+
+@pytest.mark.parametrize("failure", ["batch", "ancestor", "grant", "settings", "missing"])
+async def test_cold_after_batch_preserves_fallbacks_and_isolates_failures(
+    harness: _Harness,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    roots = [_parent(harness), _parent(harness)]
+    children = [_child(harness, root.id) for root in roots]
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for owner, root in zip(["alice", "bob"], roots, strict=True):
+        permissions.ensure_user(owner)
+        permissions.grant(owner, root.id, LEVEL_OWNER)
+    harness.sweeper._permission_store = permissions
+    get_one = harness.store.get_conversation
+    get_many = harness.store.get_conversations
+    get_grants = permissions.list_for_session
+
+    def single(sid: str) -> Conversation | None:
+        if failure == "ancestor" and sid == roots[0].id:
+            raise RuntimeError("ancestor unavailable")
+        return get_one(sid)
+
+    def batch(sids: list[str]) -> dict[str, Conversation]:
+        if failure in {"batch", "ancestor"}:
+            raise RuntimeError("batch unavailable")
+        rows = get_many(sids)
+        if failure == "missing":
+            rows.pop(roots[0].id, None)
+        return rows
+
+    def grants(sid: str, **kwargs: Any) -> Any:
+        if failure == "grant" and sid == roots[0].id:
+            raise RuntimeError("grants unavailable")
+        return get_grants(sid, **kwargs)
+
+    class OwnerPrefs:
+        def get(self, owner: str) -> dict[str, Any]:
+            if failure == "settings" and owner == "alice":
+                raise RuntimeError("preferences unavailable")
+            seconds = {"alice": 0, "bob": 900, RESERVED_USER_LOCAL: 600}[owner]
+            return {
+                "settings": {
+                    "keep_warm": {
+                        "agents": {
+                            _CLAUDE_AGENT: {"coldAfterSeconds": seconds},
+                        }
+                    }
+                }
+            }
+
+    monkeypatch.setattr(harness.store, "get_conversation", single)
+    monkeypatch.setattr(harness.store, "get_conversations", batch)
+    monkeypatch.setattr(permissions, "list_for_session", grants)
+    expected = 0 if failure == "batch" else 600 if failure == "missing" else None
+    assert harness.sweeper.cold_after_for_many(children, OwnerPrefs()) == {
+        children[0].id: expected,
+        children[1].id: 900,
+    }
+    if failure in {"batch", "ancestor"}:
+        assert "Collaboration ancestor batch read failed" in caplog.text
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, ImportError])
+async def test_cold_after_batch_unexpected_owner_failure_defaults_every_session(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+) -> None:
+    parent = _parent(harness)
+    children = [_child(harness, parent.id, title=f"researcher:child-{i}") for i in range(2)]
+    prefs = _CountingPrefs({"agents": {_CLAUDE_AGENT: {"coldAfterSeconds": 0}}})
+
+    def unavailable(*args: Any, **kwargs: Any) -> Any:
+        raise error_type("owner resolution unavailable")
+
+    monkeypatch.setattr(child_keep_warm, "collab_owners_for", unavailable)
+    assert harness.sweeper.cold_after_for_many(children, prefs) == {
+        child.id: None for child in children
+    }
+    assert prefs.reads == 0
+    assert "Keep-warm cold-after owner batch failed" in caplog.text
+
+
+async def test_cold_after_batch_without_auth_does_not_read_ancestors(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = _parent(harness)
+    child = _child(harness, parent.id)
+    prefs = _CountingPrefs({"agents": {_CLAUDE_AGENT: {"coldAfterSeconds": 0}}})
+
+    def unexpected(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("auth-off owner resolution read an ancestor")
+
+    monkeypatch.setattr(harness.store, "get_conversation", unexpected)
+    monkeypatch.setattr(harness.store, "get_conversations", unexpected)
+    assert harness.sweeper.cold_after_for_many([child, child], prefs) == {child.id: 0}
+    assert prefs.reads == 1
+
+
+@pytest.mark.parametrize("shape", ["deep", "cycle", "mixed"])
+async def test_collab_owner_batch_matches_bounded_single_walk(
+    harness: _Harness, db_uri: str, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    count = 35 if shape == "deep" else 3
+    rows = {
+        str(i): Conversation(
+            id=str(i),
+            root_conversation_id=str(count - 1),
+            created_at=1,
+            updated_at=1,
+            parent_conversation_id=(
+                str(i + 1) if i + 1 < count else "0" if shape == "cycle" else None
+            ),
+        )
+        for i in range(count)
+    }
+    if shape == "mixed":
+        # Two root branches at different depths; the first loses its parent
+        # above an existing middle row, while the other still reaches root 6.
+        parents = {"0": "2", "2": "4", "1": "3", "3": "5", "5": "6", "6": None}
+        rows = {
+            sid: Conversation(
+                id=sid,
+                root_conversation_id="6",
+                created_at=1,
+                updated_at=1,
+                parent_conversation_id=parent_id,
+            )
+            for sid, parent_id in parents.items()
+        }
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    monkeypatch.setattr(harness.store, "get_conversation", rows.get)
+    monkeypatch.setattr(
+        harness.store,
+        "get_conversations",
+        lambda ids: {sid: rows[sid] for sid in ids if sid in rows},
+    )
+    monkeypatch.setattr(
+        permissions,
+        "list_for_session",
+        lambda sid, **kwargs: (
+            [SimpleNamespace(user_id=f"owner-{sid}", level=LEVEL_OWNER)],
+            None,
+        ),
+    )
+    inputs = [rows["0"], rows["1"]]
+    expected = (
+        {"0": "owner-32", "1": "owner-33"}
+        if shape == "deep"
+        else {
+            "0": "owner-2",
+            "1": "owner-0",
+        }
+    )
+    if shape == "mixed":
+        expected = {"0": "owner-2", "1": "owner-6"}
+    assert {
+        row.id: collab.collab_owner_for(row, harness.store, permissions) for row in inputs
+    } == expected
+    assert collab.collab_owners_for(inputs, harness.store, permissions) == expected
 
 
 async def test_cold_after_edge_publishes_once_without_a_label_write(harness: _Harness) -> None:
