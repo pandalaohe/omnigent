@@ -59,7 +59,7 @@ def upgrade() -> None:
         sa.Column("target_session_id", Uuid16(), nullable=False),
         sa.Column("host_id", sa.String(length=128), nullable=True),
         sa.Column("runner_id", sa.String(length=128), nullable=True),
-        sa.Column("family", sa.String(length=64), nullable=True),
+        sa.Column("family", sa.String(length=64), nullable=True, quote=True),
         sa.Column("policy_revision", sa.Integer(), nullable=True),
         sa.Column("archive_revision", sa.Integer(), nullable=True),
         sa.Column("runtime_generation", sa.String(length=128), nullable=True),

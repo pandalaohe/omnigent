@@ -50,6 +50,12 @@ def test_title_trigram_metadata_index_created_on_cockroachdb() -> None:
     assert any(
         _TITLE_INDEX in statement and "gin_trgm_ops" in statement for statement in cockroachdb_ddl
     )
+    [release_table] = [
+        statement
+        for statement in cockroachdb_ddl
+        if "CREATE TABLE cli_release_intents" in statement
+    ]
+    assert '"family" VARCHAR(64)' in release_table
 
 
 def test_postgres_split_schema_does_not_require_pg_trgm() -> None:

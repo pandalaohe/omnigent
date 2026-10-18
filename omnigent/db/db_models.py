@@ -857,7 +857,7 @@ class SqlCliReleaseIntent(ConversationBase):
     target_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     host_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     runner_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    family: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    family: Mapped[str | None] = mapped_column("family", String(64), nullable=True, quote=True)
     policy_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     archive_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     runtime_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)

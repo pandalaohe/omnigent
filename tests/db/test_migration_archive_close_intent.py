@@ -14,6 +14,33 @@ _PREVIOUS = "fe1b2c3d4e5"
 _MIGRATION = "ff1b2c3d4e5"
 
 
+@pytest.mark.parametrize("dialect_name", ["postgresql", "sqlite"])
+def test_release_family_column_keeps_name_and_quotes_ddl(dialect_name: str) -> None:
+    from importlib import import_module
+    from io import StringIO
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy.dialects import registry
+    from sqlalchemy.schema import CreateTable
+
+    from omnigent.db.db_models import SqlCliReleaseIntent
+
+    dialect = registry.load(dialect_name)()
+    ddl = str(CreateTable(SqlCliReleaseIntent.__table__).compile(dialect=dialect))
+    assert '"family" VARCHAR(64)' in ddl
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect=dialect, opts={"as_sql": True, "output_buffer": output}
+    )
+    migration = import_module(
+        "omnigent.db.migrations.versions.ff1b2c3d4e5_add_archive_close_intent"
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    assert '"family" VARCHAR(64)' in output.getvalue()
+
+
 def test_upgrade_adds_archive_state_release_queue_and_host_lease(tmp_path: Path) -> None:
     uri = f"sqlite:///{tmp_path / 'chat.db'}"
     engine = _create_engine(uri)
@@ -36,6 +63,7 @@ def test_upgrade_adds_archive_state_release_queue_and_host_lease(tmp_path: Path)
     host_columns = {column["name"] for column in inspector.get_columns("hosts")}
     assert {"cli_retention_claim_token", "cli_retention_claimed_at"} <= host_columns
     assert "cli_release_intents" in inspector.get_table_names()
+    assert "family" in {column["name"] for column in inspector.get_columns("cli_release_intents")}
     assert {
         "ix_cli_release_intents_due",
         "ix_cli_release_intents_host",
