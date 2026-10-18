@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import replace
 from typing import Any
@@ -394,7 +395,8 @@ class PolicyEngine:
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
             if result.action == PolicyAction.DENY:
-                return self._compose_deny(
+                return await asyncio.to_thread(
+                    self._compose_deny,
                     policy.spec.name,
                     result.reason,
                     accumulated,
@@ -431,8 +433,10 @@ class PolicyEngine:
                 data=composed_data,
             )
         if not read_only:
-            self.apply_label_writes(accumulated)
-            self.apply_state_updates(accumulated_state)
+            if accumulated:
+                await asyncio.to_thread(self.apply_label_writes, accumulated)
+            if accumulated_state:
+                await asyncio.to_thread(self.apply_state_updates, accumulated_state)
         return PolicyResult(
             action=PolicyAction.ALLOW,
             reason=None,
