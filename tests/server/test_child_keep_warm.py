@@ -994,6 +994,20 @@ async def test_unverified_overlay_close_pauses_after_one_receipt(harness: _Harne
     assert paused.k == "dismiss_failed" and paused.a is None
     assert len(harness.notices.lines) == 1
 
+    for _ in range(2):
+        harness.clock.now += _CLAUDE_INTERVAL_S
+        await _tick(harness)
+        assert len(harness.forward.pings()) == 1
+        assert len(harness.notices.lines) == 1
+
+    _set_running_since(harness, child.id, harness.clock.now)
+    await _tick(harness)
+    rearmed = _read_label(harness, child.id)
+    assert rearmed is not None and rearmed.s == "w" and rearmed.f == 0
+    harness.clock.now += _CLAUDE_INTERVAL_S
+    await _tick(harness)
+    assert len(harness.forward.pings()) == 2
+
 
 async def test_claude_two_measured_misses_pause_warming(harness: _Harness) -> None:
     """Scenario 15: two receipts with ``cache_write > cache_read`` → sticky pause."""

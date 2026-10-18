@@ -5139,10 +5139,23 @@ class PaneSignals:
     btw_overlay: BtwOverlay | None = None
 
 
-def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int] | None:
-    """Locate the live overlay's top rule and bottom footer."""
-    footer_idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-    if footer_idx is None or _BTW_FOOTER_CLOSE_HINT not in lines[footer_idx]:
+def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int, str] | None:
+    """Locate the live overlay's body and its possibly wrapped footer."""
+    footer_end = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if footer_end is None:
+        return None
+    footer_idx = footer_end
+    # Wrapped hints remain one paragraph; stop at the navigation row so an
+    # answer immediately above an unwrapped footer stays out of the footer.
+    while footer_idx > 0 and lines[footer_idx - 1].strip():
+        if any(hint in lines[footer_idx] for hint in ("to scroll", "to browse", "to switch")):
+            break
+        footer_idx -= 1
+    footer = " ".join(line.strip() for line in lines[footer_idx : footer_end + 1])
+    if _BTW_FOOTER_CLOSE_HINT not in footer or any(
+        _is_box_rule(line) or line.startswith(_CLAUDE_PROMPT_GLYPH)
+        for line in lines[footer_idx : footer_end + 1]
+    ):
         return None
     border_idx = next(
         (
@@ -5152,7 +5165,19 @@ def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int] | None:
         ),
         None,
     )
-    return (border_idx, footer_idx) if border_idx is not None else None
+    if border_idx is not None:
+        return border_idx + 1, footer_idx, footer
+    # Newer Claude renders an unframed panel with two-space question rows.
+    question_idx = next(
+        (i for i in range(footer_idx - 1, -1, -1) if lines[i].startswith("  /btw ")),
+        None,
+    )
+    if question_idx is None or any(
+        _is_box_rule(line) or line.startswith(_CLAUDE_PROMPT_GLYPH)
+        for line in lines[question_idx + 1 : footer_idx]
+    ):
+        return None
+    return question_idx, footer_idx, footer
 
 
 def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
@@ -5170,11 +5195,10 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     bounds = _btw_overlay_bounds(lines)
     if bounds is None:
         return None
-    border_idx, footer_idx = bounds
-    footer = lines[footer_idx]
+    region_start, footer_idx, footer = bounds
     if _BTW_FOOTER_COMPLETE_HINT not in footer:
         return None
-    region = lines[border_idx + 1 : footer_idx]
+    region = lines[region_start:footer_idx]
     # A ``✻ Answering…`` line means the (current) exchange is still in
     # flight even though a completed footer is on screen — bail.
     if any(_BTW_ANSWERING_HINT in line for line in region):
@@ -5198,7 +5222,7 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     answer = _dedent_overlay_lines(answer_lines)
     if not answer:
         return None
-    truncated = (footer_idx - border_idx) >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    truncated = (footer_idx - region_start + 1) >= _BTW_TRUNCATION_MIN_SPAN_ROWS
     return BtwOverlay(question=question, answer=answer, truncated=truncated)
 
 
@@ -5220,8 +5244,7 @@ def _btw_overlay_present(pane: str) -> bool:
     bounds = _btw_overlay_bounds(lines)
     if bounds is None:
         return False
-    border_idx, footer_idx = bounds
-    footer = lines[footer_idx]
+    region_start, footer_idx, footer = bounds
     # The /btw footer offers copy (settled), switch (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
@@ -5230,7 +5253,7 @@ def _btw_overlay_present(pane: str) -> bool:
         return True
     if "to switch" in footer:
         return True
-    return any(_BTW_ANSWERING_HINT in line for line in lines[border_idx + 1 : footer_idx])
+    return any(_BTW_ANSWERING_HINT in line for line in lines[region_start:footer_idx])
 
 
 def _keep_warm_btw_overlay_present(pane: str) -> bool:
@@ -5253,11 +5276,11 @@ def _keep_warm_btw_overlay_present(pane: str) -> bool:
     bounds = _btw_overlay_bounds(lines)
     if bounds is None:
         return False
-    border_idx, footer_idx = bounds
+    region_start, footer_idx, _footer = bounds
     question_idx = next(
         (
             i
-            for i in range(footer_idx - 1, border_idx, -1)
+            for i in range(footer_idx - 1, region_start - 1, -1)
             if lines[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
         ),
         None,
@@ -8363,10 +8386,8 @@ def _clear_keep_warm_btw_history(
     :param pane: The settled marked-overlay capture.
     """
     lines = pane.splitlines()
-    footer = next(
-        (line for line in reversed(lines) if _BTW_FOOTER_CLOSE_HINT in line),
-        "",
-    )
+    bounds = _btw_overlay_bounds(lines)
+    footer = bounds[2] if bounds is not None else ""
     if _BTW_CLEAR_HISTORY_HINT not in footer:
         return
     remaining = _keep_warm_tmux_remaining_s()
@@ -8394,10 +8415,8 @@ def _clear_keep_warm_btw_history(
         if not _keep_warm_btw_overlay_present(pane):
             return
         lines = pane.splitlines()
-        footer = next(
-            (line for line in reversed(lines) if _BTW_FOOTER_CLOSE_HINT in line),
-            "",
-        )
+        bounds = _btw_overlay_bounds(lines)
+        footer = bounds[2] if bounds is not None else ""
         if _BTW_CLEAR_HISTORY_HINT not in footer:
             return
     _logger.info("keep-warm: /btw history hint persisted after x; dismissing anyway")

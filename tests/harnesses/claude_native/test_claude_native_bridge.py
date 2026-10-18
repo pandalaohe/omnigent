@@ -13122,6 +13122,68 @@ def _btw_pane(*body_lines: str) -> str:
     return "\n".join([*prefix, *body_lines])
 
 
+# Claude Code 2.1.296 capture: the panel has no top rule. Only the path is redacted.
+_BTW_BORDERLESS_HISTORY_PANE = """\
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝   /opt/work/project
+
+
+❯ /btw seed-2 reply with only: ok
+
+  /btw reply with only: ok
+  /btw seed-0 reply with only: ok
+  /btw seed-1 reply with only: ok
+  /btw seed-2 reply with only: ok
+
+    ok
+
+  ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close
+"""
+
+_BTW_BORDERLESS_BROWSE_PANE = _BTW_BORDERLESS_HISTORY_PANE.replace(" · f to fork", "")
+_BTW_BORDERLESS_WRAPPED_PANE = _BTW_BORDERLESS_HISTORY_PANE.replace(
+    "x to clear history", "x to clear\n  history"
+)
+_BTW_BORDERLESS_SINGLE_PANE = """\
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝   /opt/work/project
+
+
+❯ /btw reply with only: ok
+
+  /btw reply with only: ok
+
+    ok
+
+  ↑/↓ to scroll · c to copy · f to fork · Esc to close
+"""
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [_BTW_BORDERLESS_HISTORY_PANE, _BTW_BORDERLESS_BROWSE_PANE, _BTW_BORDERLESS_WRAPPED_PANE],
+    ids=["history", "browse", "wrapped"],
+)
+def test_btw_overlay_borderless_history_capture(pane: str) -> None:
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.question == "/btw seed-2 reply with only: ok"
+    assert overlay.answer == "ok"
+    assert claude_native_bridge._btw_overlay_present(pane)
+    assert not claude_native_bridge._keep_warm_btw_overlay_present(pane)
+
+
+@pytest.mark.parametrize(
+    "suffix", [_MODEL_PICKER_PANE, _IDLE_PANE], ids=["model-picker", "composer"]
+)
+def test_btw_overlay_borderless_scrollback_is_not_a_live_panel(suffix: str) -> None:
+    pane = _BTW_BORDERLESS_HISTORY_PANE + "\n" + suffix
+    assert not claude_native_bridge._btw_overlay_present(pane)
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
 def test_btw_overlay_parses_completed_single_turn() -> None:
     """A settled single-turn overlay yields its question and answer."""
     pane = _btw_pane(
@@ -14103,6 +14165,66 @@ def test_keep_warm_btw_current_overlay_dismisses(
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
     assert result == claude_native_bridge.KeepWarmBtwResult("ok")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
+
+
+@pytest.mark.parametrize(
+    "history_pane",
+    [_BTW_BORDERLESS_HISTORY_PANE, _BTW_BORDERLESS_WRAPPED_PANE],
+    ids=["wide", "wrapped"],
+)
+def test_keep_warm_btw_repeated_borderless_history_pings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None, history_pane: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    marked_history = history_pane.replace("/btw seed-2 reply with only: ok", _KEEP_WARM_TEXT)
+    marked_single = _BTW_BORDERLESS_SINGLE_PANE.replace(
+        "/btw reply with only: ok", _KEEP_WARM_TEXT
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            marked_history,
+            marked_single,
+            marked_single,
+            _IDLE_PANE,
+        ]
+        * 2,
+    )
+    for _ in range(2):
+        assert claude_native_bridge.run_keep_warm_btw(bridge_dir) == (
+            claude_native_bridge.KeepWarmBtwResult("ok")
+        )
+    keys = [args[-1] for args in sends if args[0] == "send-keys"]
+    assert keys == ["Enter", "x", "Escape"] * 2
+
+
+def test_keep_warm_btw_borderless_history_browse_blocks_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    sends = _fake_tmux(monkeypatch, [_BTW_BORDERLESS_BROWSE_PANE])
+    assert claude_native_bridge.run_keep_warm_btw(_picker_bridge_dir(tmp_path)) == (
+        claude_native_bridge.KeepWarmBtwResult("skipped", "busy")
+    )
+    assert sends == []
+
+
+def test_keep_warm_btw_borderless_api_error_dismisses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    pane = _BTW_BORDERLESS_SINGLE_PANE.replace("/btw reply with only: ok", _KEEP_WARM_TEXT)
+    pane = pane.replace("    ok", "    (API error: Login expired · Please run /login)").replace(
+        " · f to fork", ""
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT), pane, pane, _IDLE_PANE],
+    )
+    assert claude_native_bridge.run_keep_warm_btw(_picker_bridge_dir(tmp_path)) == (
+        claude_native_bridge.KeepWarmBtwResult("failed", "harness_error")
+    )
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
 
 
