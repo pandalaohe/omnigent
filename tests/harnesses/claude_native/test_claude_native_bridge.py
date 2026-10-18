@@ -14031,7 +14031,7 @@ def test_injection_closes_persons_btw_before_delivery(
         assert len(sends) == 1
     else:
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
-        assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+        assert [args[-1] for args in sends] == ["Escape", "Space", "C-u", "/effort high", "Enter"]
     assert sends[0] == ["send-keys", "-t", "claude:0.0", "Escape"]
     assert all(args[-1] != "x" for args in sends)
 
