@@ -3068,16 +3068,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 if conversation_id is not None:
                     stmt = stmt.where(SqlConversationItem.conversation_id == conversation_id)
-            params: dict[str, str | int | bytes] = {
-                "query": query,
-                "limit": limit,
-                "ws": current_workspace_id(),
-            }
-            if conversation_id is not None:
-                # Raw SQL bypasses Uuid16: the FTS mirror stores hex text, but
-                # conversation_items.conversation_id is 16 raw bytes — bind the
-                # form each branch actually compares against.
-                params["cid"] = conversation_id if use_fts else uuid_to_bytes(conversation_id)
+            params: dict[str, str | int | bytes] = {}
+            if use_fts:
+                params = {"query": query, "limit": limit}
+                if conversation_id is not None:
+                    # Only the raw FTS branch binds a text ID; the ORM branch
+                    # above lets Uuid16 encode its conversation filter.
+                    params["cid"] = conversation_id
             item_ids = [
                 item_id.hex() if isinstance(item_id, (bytes, memoryview)) else item_id
                 for item_id in (row[0] for row in session.execute(stmt, params).fetchall())
