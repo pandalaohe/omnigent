@@ -510,6 +510,7 @@ class CodexNativeExecutor(Executor):
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
         self._owned_turn_state: CodexNativeBridgeState | None = None
+        self._owned_socket_identity: tuple[int, int] | None = None
         self._abandoned_turn_state: CodexNativeBridgeState | None = None
         # Serializes injection into the shared native Codex thread.
         # ``run_turn`` (initiating message) and ``enqueue_session_message``
@@ -558,13 +559,15 @@ class CodexNativeExecutor(Executor):
             if client is None:
                 return False
             try:
-                await _inject_codex_turn(
+                started_state = await _inject_codex_turn(
                     client,
                     bridge_dir=self._bridge_dir,
                     state=state,
                     input_items=input_items,
                     settings_overrides={},
                 )
+                if started_state is not None:
+                    self._record_owned_turn(started_state)
             except Exception as exc:  # noqa: BLE001 - steering is best-effort from the runner facade.
                 _logger.warning(
                     "Codex native turn/steer failed",
@@ -609,7 +612,12 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
-        state = self._abandoned_turn_state or read_bridge_state(self._bridge_dir)
+        if self._abandoned_turn_state is not None:
+            state = self._current_owned_turn()
+            if state != self._abandoned_turn_state:
+                return False
+        else:
+            state = read_bridge_state(self._bridge_dir)
         if state is None:
             return False
         # Flip the local map first: the cancelled record is what the web
@@ -735,9 +743,8 @@ class CodexNativeExecutor(Executor):
             native Codex owns its own tool surface.
         :param system_prompt: System prompt from the agent spec. Native
             startup instructions are configured before the app-server launches.
-        :param config: Per-turn executor config. Model, reasoning effort and
-            service tier apply via ``thread/settings/update`` before starting
-            the turn, and successful updates mirror into the private config.
+        :param config: Per-turn executor config. Model and reasoning effort
+            apply via ``thread/settings/update`` before starting the turn.
         :returns: Async iterator yielding one terminal event.
         """
         del tools, system_prompt
@@ -900,7 +907,7 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                             if started_state is not None:
-                                self._owned_turn_state = started_state
+                                self._record_owned_turn(started_state)
                     except Exception as exc:
                         if isinstance(exc, _CodexNativeInputUndelivered):
                             startup_failure = exc.failure
@@ -952,7 +959,7 @@ class CodexNativeExecutor(Executor):
                         await client.close()
             break
         if error_msg is not None:
-            self._abandoned_turn_state = self._owned_turn_state
+            self._abandoned_turn_state = self._current_owned_turn()
             yield ExecutorError(
                 message=error_msg,
                 code=startup_failure.code if startup_failure is not None else refusal_code,
@@ -968,10 +975,40 @@ class CodexNativeExecutor(Executor):
         else:
             yield TurnComplete(response=None)
 
+    def _record_owned_turn(self, state: CodexNativeBridgeState) -> None:
+        self._owned_turn_state = state
+        self._owned_socket_identity = _socket_identity(state.socket_path)
+
+    def _current_owned_turn(self) -> CodexNativeBridgeState | None:
+        """Retain acknowledged ownership only within the live app-server transport."""
+        owned = self._owned_turn_state
+        current = read_bridge_state(self._bridge_dir)
+        if owned is not None and (
+            current is None
+            or current.active_turn_id is None
+            or (current.session_id, current.thread_id, current.socket_path, current.codex_home)
+            != (owned.session_id, owned.thread_id, owned.socket_path, owned.codex_home)
+            or _socket_identity(owned.socket_path) != self._owned_socket_identity
+        ):
+            self._owned_turn_state = None
+            self._owned_socket_identity = None
+        return self._owned_turn_state
+
+
+def _socket_identity(transport: str) -> tuple[int, int] | None:
+    """Detect a replaced Unix socket even when its published path is reused."""
+    if transport.startswith(("ws://", "wss://")):
+        return None
+    try:
+        stat = Path(transport).stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
+
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
     """
-    Build the model, effort and service-tier settings for the next web turn.
+    Build the model and effort settings for the next web turn.
 
     Explicit per-turn selections apply via ``thread/settings/update`` before
     ``turn/start``. Missing selections retain the native thread's settings.
@@ -1001,10 +1038,6 @@ def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
     effort = effort_for_model_switch(effort, model_str)
     if effort:
         overrides["effort"] = effort
-    if config.service_tier is not None:
-        from omnigent.session_default_modes import codex_service_tier
-
-        overrides["serviceTier"] = codex_service_tier(config.service_tier)
     return overrides
 
 

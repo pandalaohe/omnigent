@@ -1973,12 +1973,12 @@ def test_web_model_pick_applied_via_thread_settings_update(
     ]
 
 
-@pytest.mark.parametrize(
-    "tier,expected", [("fast", "priority"), ("standard", "default"), ("flex", "flex")]
-)
-def test_web_service_tier_applies_before_turn_and_mirrors_config(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tier: str, expected: str
+@pytest.mark.parametrize("scenario", ["reapply", "mirror-retry", "unset"])
+def test_unmirrored_service_tier_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str
 ) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
     _FakeCodexNativeClient.requests = []
     _FakeCodexNativeClient.created = []
     _FakeCodexNativeClient.next_turn = 1
@@ -1991,14 +1991,102 @@ def test_web_service_tier_applies_before_turn_and_mirrors_config(
     home.mkdir()
     config = home / "config.toml"
     config.write_text('service_tier = "default"\n')
+    if scenario != "unset":
+        bridge.write_unmirrored_codex_settings(tmp_path, {"service_tier": "priority"})
+    real_write = bridge._upsert_top_level_config_key
+    if scenario == "mirror-retry":
+        monkeypatch.setattr(bridge, "_upsert_top_level_config_key", lambda *a, **kw: False)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
-    _run_turn_with_config(executor, "hello", ExecutorConfig(service_tier=tier))
-    assert _FakeCodexNativeClient.requests[0] == (
-        "thread/settings/update",
-        {"threadId": "thread_123", "serviceTier": expected},
+    _run_turn_with_config(executor, "hello", ExecutorConfig())
+    if scenario == "unset":
+        assert [method for method, _ in _FakeCodexNativeClient.requests] == ["turn/start"]
+        assert tomllib.loads(config.read_text())["service_tier"] == "default"
+    else:
+        assert _FakeCodexNativeClient.requests[0] == (
+            "thread/settings/update",
+            {"threadId": "thread_123", "serviceTier": "priority"},
+        )
+        assert _FakeCodexNativeClient.requests[1][0] == "turn/start"
+        if scenario == "mirror-retry":
+            assert bridge.read_unmirrored_codex_settings(tmp_path) == {"service_tier": "priority"}
+            assert tomllib.loads(config.read_text())["service_tier"] == "default"
+            monkeypatch.setattr(bridge, "_upsert_top_level_config_key", real_write)
+            _start_state(tmp_path)
+            _run_turn_with_config(executor, "retry", ExecutorConfig())
+            assert [
+                params
+                for method, params in _FakeCodexNativeClient.requests
+                if method == "thread/settings/update"
+            ] == [{"threadId": "thread_123", "serviceTier": "priority"}] * 2
+        assert tomllib.loads(config.read_text())["service_tier"] == "priority"
+    assert bridge.read_unmirrored_codex_settings(tmp_path) == {}
+
+
+@pytest.mark.parametrize("restart", ["bridge", "socket", "finished"])
+def test_abandoned_turn_does_not_interrupt_stale_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    restart: str,
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
     )
-    assert _FakeCodexNativeClient.requests[1][0] == "turn/start"
-    assert tomllib.loads(config.read_text())["service_tier"] == expected
+    _start_state(tmp_path)
+    socket = tmp_path / "app-server.sock"
+    socket.touch()
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    _collect_turn_events(executor, "owned turn")
+    owned = executor._owned_turn_state
+    assert owned is not None
+    executor._abandoned_turn_state = owned
+    if restart == "bridge":
+        write_bridge_state(tmp_path, replace(owned, socket_path=str(tmp_path / "new.sock")))
+    elif restart == "socket":
+        socket.rename(tmp_path / "old.sock")
+        socket.touch()
+    else:
+        write_bridge_state(tmp_path, replace(owned, active_turn_id=None))
+    _FakeCodexNativeClient.requests = []
+    caplog.clear()
+    assert asyncio.run(executor.interrupt_session("main")) is False
+    assert _FakeCodexNativeClient.requests == []
+    assert executor._owned_turn_state is None
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_enqueue_stale_steer_recovery_records_owned_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class RecoveringClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/steer":
+                raise CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to steer"}
+                )
+            return await super().request(method, params)
+
+    RecoveringClient.requests = []
+    RecoveringClient.created = []
+    RecoveringClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", RecoveringClient
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_old")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    assert asyncio.run(executor.enqueue_session_message("main", "recover"))
+    assert executor._owned_turn_state is not None
+    assert executor._owned_turn_state.active_turn_id == "turn_1"
+    executor._abandoned_turn_state = executor._owned_turn_state
+    assert asyncio.run(executor.interrupt_session("main"))
+    assert RecoveringClient.requests[-1] == (
+        "turn/interrupt",
+        {"threadId": "thread_123", "turnId": "turn_1"},
+    )
 
 
 def test_model_settings_update_mirrors_model_into_config_toml(
