@@ -3032,10 +3032,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             objects in relevance order.
         """
         with self._conv_session("search_conversations") as session:
-            # Dialect-specific search: the SQLite family (SQLite + D1) has
-            # FTS5 virtual tables (MATCH + rank); PostgreSQL doesn't. ILIKE on
-            # the JSON data column is a functional fallback there. Proper
-            # tsvector indexing is a future optimization (tracked in GAPS.md).
+            # SQLite's FTS mirror and other backends' search_text column carry
+            # the same extracted transcript text, without JSON quote escaping.
             use_fts = _supports_fts5(self._conv_engine.dialect.name)
             if use_fts:
                 # MATCH parses operators and quotes. Archive search is literal
@@ -3055,34 +3053,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "ORDER BY rank LIMIT :limit"
                     )
             else:
-                # Non-SQLite fallback: LIKE/ILIKE on the data column.
-                # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
-                # MySQL: CONVERT(data USING utf8mb4) + LIKE (case-insensitive
-                #        by default with utf8mb4_unicode_ci collation).
-                like_pattern = f"%{query}%"
-                is_mysql = self._conv_engine.dialect.name == "mysql"
-                if is_mysql:
-                    data_expr = "CONVERT(ci.data USING utf8mb4)"
-                    like_op = "LIKE"
-                else:
-                    data_expr = "ci.data::text"
-                    like_op = "ILIKE"
+                pattern = _literal_like_pattern(query)
+                search_text = SqlConversationItem.search_text
+                match = (
+                    search_text.like(pattern, escape="\\")
+                    if self._conv_engine.dialect.name == "mysql"
+                    else search_text.ilike(pattern, escape="\\")
+                )
+                stmt = (
+                    select(SqlConversationItem.id)
+                    .where(SqlConversationItem.workspace_id == current_workspace_id(), match)
+                    .order_by(SqlConversationItem.created_at.desc())
+                    .limit(limit)
+                )
                 if conversation_id is not None:
-                    stmt = text(
-                        f"SELECT ci.id FROM conversation_items ci "
-                        f"WHERE ci.workspace_id = :ws "
-                        f"AND ci.conversation_id = :cid "
-                        f"AND {data_expr} {like_op} :query "
-                        f"ORDER BY ci.created_at DESC LIMIT :limit"
-                    )
-                else:
-                    stmt = text(
-                        f"SELECT ci.id FROM conversation_items ci "
-                        f"WHERE ci.workspace_id = :ws "
-                        f"AND {data_expr} {like_op} :query "
-                        f"ORDER BY ci.created_at DESC LIMIT :limit"
-                    )
-                query = like_pattern
+                    stmt = stmt.where(SqlConversationItem.conversation_id == conversation_id)
             params: dict[str, str | int | bytes] = {
                 "query": query,
                 "limit": limit,
