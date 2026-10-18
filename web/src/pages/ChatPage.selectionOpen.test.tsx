@@ -29,7 +29,7 @@ vi.mock("@/hooks/useSelectionFileMatch", () => ({
   },
 }));
 
-import { SelectionPopup } from "./ChatPage";
+import { SelectionPopup } from "@/components/chat/SelectionPopup";
 
 const openFile = vi.fn();
 
@@ -108,6 +108,8 @@ describe("selection Open in panel", () => {
     // The popup appears immediately, but the lookup text waits for the debounce.
     expect(hookState.texts).not.toContain("report/page2.html");
     const button = await screen.findByRole("button", { name: /open in panel/i });
+    expect(document.body).toContainElement(button);
+    expect(screen.getByTestId("selection-surface").parentElement).not.toContainElement(button);
     expect(hookState.texts).toContain("report/page2.html");
 
     fireEvent.click(button);

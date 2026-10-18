@@ -973,12 +973,23 @@ async def test_compact_summary_first_claims_generation_from_artifact(tmp_path: P
     assert handled is True
     assert persist.call_args.kwargs["snapshot_source"] == "transcript"
     assert persist.call_args.kwargs["compacted_messages_override"] == [
-        {"type": "message", "role": "user", "content": "compaction summary text"},
-        {"type": "message", "role": "user", "content": "preserved question"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": "compaction summary text",
+            "forwarded_source_ids": ["summary-uuid:0:message"],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": "preserved question",
+            "forwarded_source_ids": ["preserved-user:0:message"],
+        },
         {
             "type": "message",
             "role": "assistant",
             "content": [{"type": "text", "text": "preserved answer"}],
+            "forwarded_source_ids": ["preserved-assistant:0:message"],
         },
     ]
 
@@ -1171,8 +1182,18 @@ def test_compaction_snapshot_walks_through_interleaved_attachment(tmp_path: Path
 
     assert summary_id == "summary"
     assert snapshot == [
-        {"type": "message", "role": "user", "content": "summary context"},
-        {"type": "message", "role": "user", "content": "preserved question"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": "summary context",
+            "forwarded_source_ids": ["summary:0:message"],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": "preserved question",
+            "forwarded_source_ids": ["preserved-user:0:message"],
+        },
     ]
 
 
@@ -1196,8 +1217,18 @@ def test_compaction_snapshot_walks_through_multiple_intermediate_records(
 
     assert summary_id == "summary"
     assert snapshot == [
-        {"type": "message", "role": "user", "content": "summary context"},
-        {"type": "message", "role": "user", "content": "preserved question"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": "summary context",
+            "forwarded_source_ids": ["summary:0:message"],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": "preserved question",
+            "forwarded_source_ids": ["preserved-user:0:message"],
+        },
     ]
 
 
@@ -1234,7 +1265,14 @@ def test_compaction_snapshot_without_boundary_returns_summary_only(tmp_path: Pat
     )
 
     assert summary_id == "summary"
-    assert snapshot == [{"type": "message", "role": "user", "content": "summary context"}]
+    assert snapshot == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": "summary context",
+            "forwarded_source_ids": ["summary:0:message"],
+        }
+    ]
 
 
 def test_compaction_snapshot_cyclic_parent_chain_terminates(tmp_path: Path) -> None:
@@ -1269,7 +1307,14 @@ def test_compaction_snapshot_cyclic_parent_chain_terminates(tmp_path: Path) -> N
     )
 
     assert summary_id == "summary"
-    assert snapshot == [{"type": "message", "role": "user", "content": "summary context"}]
+    assert snapshot == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": "summary context",
+            "forwarded_source_ids": ["summary:0:message"],
+        }
+    ]
 
 
 def test_compaction_snapshot_depth_limit_exceeded_terminates(
@@ -1290,7 +1335,14 @@ def test_compaction_snapshot_depth_limit_exceeded_terminates(
     )
 
     assert summary_id == "summary"
-    assert snapshot == [{"type": "message", "role": "user", "content": "summary context"}]
+    assert snapshot == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": "summary context",
+            "forwarded_source_ids": ["summary:0:message"],
+        }
+    ]
 
 
 def test_compaction_snapshot_direct_boundary_parent_regression(tmp_path: Path) -> None:
@@ -1305,8 +1357,18 @@ def test_compaction_snapshot_direct_boundary_parent_regression(tmp_path: Path) -
 
     assert summary_id == "summary"
     assert snapshot == [
-        {"type": "message", "role": "user", "content": "summary context"},
-        {"type": "message", "role": "user", "content": "preserved question"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": "summary context",
+            "forwarded_source_ids": ["summary:0:message"],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": "preserved question",
+            "forwarded_source_ids": ["preserved-user:0:message"],
+        },
     ]
 
 

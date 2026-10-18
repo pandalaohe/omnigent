@@ -99,7 +99,8 @@ def orphan_retention_expired(bridge_dir: Path) -> bool:
     Return whether a dead-owner bridge dir is past the 70-day retention.
 
     True only when every file under *bridge_dir* was last modified at or
-    before the cutoff. Symlinks are lstat'ed, never followed. Fails closed
+    before the cutoff; an empty directory uses its own modification time.
+    Symlinks are lstat'ed, never followed. Fails closed
     (keeps the directory) whenever a file's activity cannot be established.
 
     :param bridge_dir: Per-session bridge directory to evaluate.

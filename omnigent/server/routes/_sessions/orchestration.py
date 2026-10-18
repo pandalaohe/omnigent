@@ -12016,7 +12016,11 @@ async def _post_system_message(
             file_store=file_store,
             artifact_store=artifact_store,
             runner_router=runner_router,
-            agent_revision=agent.bundle_location if agent is not None else None,
+            agent_revision=(
+                mcp_selection_revision(agent.bundle_location, conv.labels)
+                if agent is not None
+                else None
+            ),
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(

@@ -18,7 +18,7 @@ def _records(items):
     )
 
 
-@pytest.mark.parametrize("source", [None, "hook_fallback"])
+@pytest.mark.parametrize("source", [None, "hook_fallback", "transcript_degraded"])
 def test_legacy_hook_snapshot_keeps_context_without_false_boundary(source):
     snapshot = {
         "type": "compaction",

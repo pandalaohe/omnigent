@@ -1524,7 +1524,7 @@ sys.exit(7)
     path = next((tmp_path / "execution").glob("*/attempt.json"))
     record = json.loads(path.read_text())
     assert record["artifacts_complete"]
-    assert record["capture_complete"] == (kind == "none"), record["collection_errors"]
+    assert record["capture_complete"] == (kind == "none")
     assert bool(record["collection_errors"]) == (kind != "none")
     assert (path.parent / "useful.png").read_bytes() == b"retained"
 

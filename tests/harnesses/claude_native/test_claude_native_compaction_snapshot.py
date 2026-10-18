@@ -237,6 +237,21 @@ def test_retained_turn_and_tool_pair_survive_save_and_resume(
         transcript, "summary:0:compact_summary"
     )
     assert [message["content"] for message in primary_snapshot] == expected
+    overlap_items = [
+        {
+            "id": uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"omnigent-external-item:conversation-test:{source_id}",
+            ).hex,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "overlap must not replay"}],
+        }
+        for message in primary_snapshot
+        for source_id in message["forwarded_source_ids"]
+    ]
+    resumed_primary = _records(primary_snapshot, overlap_items)
+    assert [record["message"]["content"] for record in resumed_primary[1:]] == expected
     if continuation_parent:
         expected.append("post-compaction request")
     assert [message["content"] for message in messages] == expected
@@ -284,13 +299,18 @@ def test_valid_empty_retained_content_is_skipped(
     next(entry for entry in entries if entry["uuid"] == "request")["message"]["content"] = (
         empty_content
     )
-    bridge, _ = _write_transcript(tmp_path, monkeypatch, entries)
+    bridge, transcript = _write_transcript(tmp_path, monkeypatch, entries)
     posted: list[dict[str, Any]] = []
 
     _persist(bridge, posted)
 
     assert len(posted[0]["data"]["compacted_messages"]) == 3
     assert all(message["content"] for message in posted[0]["data"]["compacted_messages"])
+    _, native_messages = forwarder._read_native_compaction_snapshot(
+        transcript, "summary:0:compact_summary"
+    )
+    assert len(native_messages) == 3
+    assert all(message["content"] for message in native_messages)
 
 
 @pytest.mark.asyncio
@@ -382,6 +402,17 @@ async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks
             assert len(boundaries) == (1 if attempt == 2 else 0)
         hook_state = await poll_hooks()
         assert hook_state.event_cursor > 0
+        state = forwarder._read_compaction_state(bridge)
+        assert "summary" in state.persisted_summary_ids
+        assert "summary" in state.degraded_summary_ids
+        assert await _handle_compact_summary_item(
+            client,
+            session_id="conversation-test",
+            bridge_dir=bridge,
+            item=summary_item,
+            retry_tracker=transcript_tracker,
+            compaction_retry_tracker=snapshot_tracker,
+        )
 
     assert forwarder._read_compaction_state(bridge).persisted_seqs == (1,)
     assert forwarder._read_compaction_state(bridge).pending is None
@@ -392,6 +423,22 @@ async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks
     ]
     assert any(event["type"] == "external_session_todos" for event in posted)
     assert not snapshot_tracker.has_retry_state("compaction-snapshot:1")
+
+
+@pytest.mark.parametrize("invalid_reference", ["nonancestor", "wrong_anchor"])
+def test_native_snapshot_rejects_invalid_retained_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_reference: str
+) -> None:
+    entries = _transcript()
+    boundary = next(entry for entry in entries if entry.get("subtype") == "compact_boundary")
+    if invalid_reference == "nonancestor":
+        boundary["parentUuid"] = None
+        boundary["compactMetadata"]["preservedMessages"].pop("anchorUuid", None)
+    else:
+        boundary["compactMetadata"]["preservedMessages"]["anchorUuid"] = "other-summary"
+    _, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+    with pytest.raises(_CompactionSnapshotError):
+        forwarder._read_native_compaction_snapshot(transcript, "summary:0:compact_summary")
 
 
 @pytest.mark.parametrize("failure", ["missing_file", "invalid_utf8", "sdk_error", "mismatch"])

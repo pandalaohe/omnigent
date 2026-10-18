@@ -1046,6 +1046,65 @@ async def test_forward_resolution_race_with_catch_up_replay(
 
 
 @pytest.mark.asyncio
+async def test_cold_forward_rechecks_item_after_catch_up_replay() -> None:
+    """Catch-up can finish the same item while a cold forward awaits history."""
+    from omnigent.runner.app import _session_histories_ref
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class GatedCatchUpClient(_CatchUpServerClient):
+        hold_next = False
+
+        async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+            if self.hold_next and url.rstrip("/").endswith(f"/sessions/{SESSION_ID}/items"):
+                self.hold_next = False
+                entered.set()
+                await release.wait()
+            return await super().get(url, **kwargs)
+
+    server_client = GatedCatchUpClient()
+    app, _pm, harness = _build_sdk_app(server_client)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True)
+        )
+        assert response.status_code == 201, response.text
+        _session_histories_ref.pop(SESSION_ID, None)
+        server_client.hold_next = True
+        forward = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello from history"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            _session_histories_ref[SESSION_ID] = []
+            server_client.expose_item = True
+            await app.state.catch_up_scan()
+            turn = app.state.active_turns.get(SESSION_ID)
+            if turn is not None:
+                await asyncio.wait_for(turn, timeout=5)
+            assert len(harness.posted_bodies) == 1
+            release.set()
+            response = await asyncio.wait_for(forward, timeout=5)
+            assert response.status_code == 202, response.text
+            assert response.json()["status"] == "already_started"
+            assert not app.state.session_message_buffers.get(SESSION_ID)
+        finally:
+            release.set()
+            await asyncio.wait_for(forward, timeout=5)
+            _session_histories_ref.pop(SESSION_ID, None)
+    assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
 async def test_cold_forward_prevents_concurrent_init_replay() -> None:
     """An in-flight forward owns the turn while its cold history load waits."""
     server_client = _GatedHistoryServerClient()

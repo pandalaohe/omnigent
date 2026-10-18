@@ -30,6 +30,7 @@ import pytest
 import pytest_asyncio
 
 from omnigent.entities.conversation import Conversation
+from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.runtime import pending_elicitations, subagent_block_notifier
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions.helpers import _SessionEventDispatchResult
@@ -117,9 +118,11 @@ def _request_event(elicitation_id: str, message: str) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("mcp_selected", [False, True])
 async def test_record_publish_delivers_wake_message_to_parent(
     conv_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
+    mcp_selected: bool,
 ) -> None:
     """
     A child block delivers a ``[System: …]`` wake to its parent session.
@@ -131,7 +134,10 @@ async def test_record_publish_delivers_wake_message_to_parent(
     """
     parent_agent_id = "0123456789abcdef0123456789abcdef"
     parent = conv_store.create_conversation(
-        kind="default", title="parent", agent_id=parent_agent_id
+        kind="default",
+        title="parent",
+        agent_id=parent_agent_id,
+        labels={"omnigent.mcp_service.files": "1"} if mcp_selected else {},
     )
     child = conv_store.create_conversation(
         kind="sub_agent", title="codex:demo", parent_conversation_id=parent.id
@@ -203,7 +209,9 @@ async def test_record_publish_delivers_wake_message_to_parent(
         assert "git fetch" in call.text
         # The wake names the parent's current bundle, so its runner drops a
         # spec cached before the reinstall.
-        assert call.agent_revision == f"{parent_agent_id}/v2"
+        assert call.agent_revision == mcp_selection_revision(
+            f"{parent_agent_id}/v2", parent.labels
+        )
 
         # Resolving the block sends the woken parent a follow-up through
         # the same wiring, so it stops acting on the stale block notice.

@@ -5831,7 +5831,7 @@ def _is_authoritative_claude_compaction(item: _JsonObject) -> bool:
     source = item.get("snapshot_source")
     if source == "transcript":
         return True
-    if source == "hook_fallback":
+    if source in {"hook_fallback", "transcript_degraded"}:
         return False
     summary = item.get("summary")
     if (

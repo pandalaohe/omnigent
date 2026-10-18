@@ -344,6 +344,13 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_paginates`
 - **`archive-worktree-safety`, settings and UI marks:**
+  The upstream worktree prompt is also covered by
+  `tests/server/integration/test_sessions_archive.py::test_archive_stop_removes_worktree_when_requested`
+  and `::test_delete_worktree_requires_archive` (plain `uv run pytest`),
+  `web/src/shell/Sidebar.archive.test.tsx` and
+  `web/src/shell/HeaderConversationMenu.test.tsx`. They cover opt-in removal
+  with the branch kept, rejected removal without archive, remembered choices,
+  and archive-only fallback when cleanup is unavailable.
   `tests/e2e_ui/sessions/test_worktree_safe_archive_ui.py` drives real preference
   and archive requests with injected host-status responses for dark/light
   sidebar, header, Agents/Past rows, blocking-child hover, details and mobile
@@ -724,6 +731,10 @@ plain `uv run pytest`, which starts a private server for the test.
   that the undo toast restores the session.
 - The header menu of an archived session must offer Unarchive, not Archive.
   Open an archived session directly to see it.
+- Re-enable the worktree prompt in Settings → Git before testing
+  a remembered choice; archive from the row, bulk selection and header menu.
+  The prompt requires server cleanup support and a worktree in the session tree.
+  A session tree without worktrees archives silently.
 - Safe worktree deletion also applies to tool archive, keep-warm auto archive
   and session rotation. The host checks cleanliness again before removing a
   linked worktree without force. Source changes never qualify under any tier.

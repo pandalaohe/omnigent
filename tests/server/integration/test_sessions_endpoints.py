@@ -224,6 +224,32 @@ async def test_authored_framework_notice_is_rejected(
     assert snapshot["pending_inputs"] == []
 
 
+@pytest.mark.parametrize("snapshot_source", ["transcript", "transcript_degraded", "hook_fallback"])
+async def test_compaction_snapshot_source_survives_server_parse(
+    client: httpx.AsyncClient, snapshot_source: str
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": "retained summary",
+                "last_item_id": "previous-item",
+                "token_count": 0,
+                "snapshot_source": snapshot_source,
+                "compacted_messages": [{"role": "user", "content": "retained summary"}],
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    boundaries = [item for item in items if item["type"] == "compaction"]
+    assert len(boundaries) == 1
+    assert boundaries[0]["snapshot_source"] == snapshot_source
+
+
 def _capture_published(
     monkeypatch: pytest.MonkeyPatch, published: list[tuple[str, dict[str, Any]]]
 ) -> None:

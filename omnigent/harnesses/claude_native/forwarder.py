@@ -6413,7 +6413,18 @@ def _native_message_from_transcript_record(
     content = message.get("content")
     if role not in {"user", "assistant"} or not isinstance(content, (str, list)):
         return None
-    return {"type": "message", "role": role, "content": content}
+    snapshot: dict[str, object] = {"type": "message", "role": role, "content": content}
+    message_id = record.get("uuid")
+    if isinstance(message_id, str):
+        _, forwarded_items = _transcript_items_from_entry(
+            {"type": role, "uuid": message_id, "message": message},
+            line_number=0,
+            record_offset=None,
+            agent_name="claude-native",
+            current_response_id=None,
+        )
+        snapshot["forwarded_source_ids"] = [item.source_id for item in forwarded_items]
+    return snapshot
 
 
 def _compacted_messages_from_summary_chain(
@@ -6428,9 +6439,9 @@ def _compacted_messages_from_summary_chain(
     ``preservedMessages.uuids`` is membership metadata, not an ordering
     contract. Preserved records are copied from the pre-boundary main chain,
     so order them by their durable transcript position after proving that
-    each record is an ancestor of the boundary. This excludes sidechains even
-    when their UUIDs appear in malformed metadata and keeps assistant
-    ``tool_use`` records ahead of their user ``tool_result`` children.
+    each visible record is an ancestor of the boundary, or belongs to a
+    detached segment anchored to this exact summary. Sidechains are excluded;
+    invalid visible references fail rather than persist a partial snapshot.
     """
     summary_message = _native_message_from_transcript_record(summary)
     if summary_message is None:
@@ -6470,6 +6481,8 @@ def _compacted_messages_from_summary_chain(
     requested = {value for value in preserved_uuids if isinstance(value, str)}
     if requested - by_uuid.keys():
         raise _CompactionSnapshotError("Claude retained message is not durable yet")
+    if anchor is not None and anchor != summary.get("uuid"):
+        raise _CompactionSnapshotError("Claude retained segment has a different summary anchor")
     # New transcripts detach the boundary from its retained chain and identify
     # that chain through an exact summary anchor instead.
     detached_chain = boundary.get("parentUuid") is None and anchor == summary.get("uuid")
@@ -6487,14 +6500,15 @@ def _compacted_messages_from_summary_chain(
         if (
             not isinstance(record_uuid, str)
             or record_uuid not in requested
-            or (not detached_chain and record_uuid not in ancestor_uuids)
             or record.get("isSidechain") is True
             or record.get("isMeta")
             or record.get("teamName")
         ):
             continue
+        if not detached_chain and record_uuid not in ancestor_uuids:
+            raise _CompactionSnapshotError("Claude retained message is outside the boundary chain")
         message = _native_message_from_transcript_record(record)
-        if message is not None:
+        if message is not None and message["content"]:
             snapshot.append(message)
     return snapshot
 
@@ -6835,7 +6849,7 @@ async def _handle_compact_summary_item_unlocked(
         bridge_dir,
         seq,
         expect_completion_ack=True,
-        summary_id=durable_summary_id,
+        summary_id=durable_summary_id or summary_id,
         degraded=degraded,
     )
     return True
@@ -8984,6 +8998,10 @@ async def _persist_native_compaction_item(
             transcript_path is not None,
             extra={"session_id": session_id},
         )
+    if compacted_messages == []:
+        if not allow_snapshot_fallback:
+            raise _CompactionSnapshotError("Claude compaction snapshot is empty")
+        compacted_messages = None
     if compacted_messages is None and fallback_snapshot_loaded and not allow_snapshot_fallback:
         raise _CompactionSnapshotError("Claude SDK fallback snapshot is unavailable")
 
@@ -9024,15 +9042,25 @@ async def _read_sdk_compaction_snapshot(
             claude_sid = read_claude_session_id(bridge_dir)
             if not claude_sid:
                 return None
-            return [
-                {
-                    "type": "message",
-                    "role": message.type,
-                    "content": message.message.get("content", []),
-                }
+            messages = [
+                (message.uuid, {"role": message.type, **message.message})
                 for message in get_session_messages(claude_sid)
                 if isinstance(message.message, dict)
             ]
+            transcript_path = read_transcript_path(bridge_dir)
+            if transcript_path is not None:
+                try:
+                    messages = _restore_preserved_compaction_messages(transcript_path, messages)
+                except ValueError:
+                    # The fallback also serves permanently incomplete transcripts.
+                    _logger.warning(
+                        "Claude SDK fallback could not restore retained transcript records"
+                    )
+            snapshots = [
+                _native_message_from_transcript_record({"uuid": uid, "message": message})
+                for uid, message in messages
+            ]
+            return [message for message in snapshots if message is not None and message["content"]]
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Failed to read Claude session messages for compaction fallback",

@@ -146,11 +146,12 @@ def startup_failure_server(
     monkeypatch.setattr(
         module,
         "_build_native_codex_app_server_argv",
-        lambda **_kwargs: [
+        lambda **kwargs: [
             sys.executable,
             "-c",
             "import time; time.sleep(60)",
             "startup-argv-marker",
+            f"omnigent_crash_teardown_tag={kwargs['session_tag']}",
         ],
     )
     server = _test_app_server(tmp_path, tmp_path / "private", tmp_path / "bridge", tmp_path)
@@ -611,7 +612,7 @@ async def test_start_reports_a_removed_workspace_before_any_setup(
 _NEVER_READY_CODEX = """#!/bin/sh
 case "$1" in
   --version) echo "codex-cli 0.158.0" ;;
-  app-server) echo $$ > "$(dirname "$0")/app-server.pid"; exec sleep 600 ;;
+  app-server) echo $$ > "$(dirname "$0")/app-server.pid"; sleep 600 & wait ;;
 esac
 """
 

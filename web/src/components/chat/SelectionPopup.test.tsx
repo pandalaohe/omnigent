@@ -1,4 +1,5 @@
 import { createRef } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
@@ -14,10 +15,10 @@ it.each([true, false])("portals outside the transcript (embedded: %s)", (embedde
   const containerRef = createRef<HTMLDivElement>();
   const onReply = vi.fn();
   const { container } = render(
-    <>
+    <QueryClientProvider client={new QueryClient()}>
       <div ref={containerRef}>Selected message</div>
       <SelectionPopup containerRef={containerRef} onReply={onReply} />
-    </>,
+    </QueryClientProvider>,
   );
   if (embedded) setEmbedRoot(container);
 
@@ -28,8 +29,9 @@ it.each([true, false])("portals outside the transcript (embedded: %s)", (embedde
   fireEvent(document, new Event("selectionchange"));
 
   const reply = screen.getByRole("button", { name: "Reply ↵" });
-  expect(reply.parentElement?.parentElement).toBe(embedded ? container : document.body);
-  expect(reply.parentElement).toHaveStyle({ position: "fixed", left: "50px", top: "30px" });
+  const popup = reply.closest("[style]");
+  expect(popup?.parentElement).toBe(embedded ? container : document.body);
+  expect(popup).toHaveStyle({ position: "fixed", left: "50px", top: "30px" });
   fireEvent.click(reply);
   expect(onReply).toHaveBeenCalledExactlyOnceWith("Selected message");
   expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
