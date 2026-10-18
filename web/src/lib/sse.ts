@@ -77,6 +77,7 @@ import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import type {
+  AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ElicitationSource,
@@ -831,6 +832,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       stage,
       error: typeof data.error === "string" ? data.error : null,
+      provider: typeof data.provider === "string" ? data.provider : undefined,
     } satisfies SessionSandboxStatusEvent;
   }
   if (eventType === "session.mcp_startup") {
@@ -1123,6 +1125,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 : undefined,
           }
         : null;
+    // The agy permission mapper stamps the action description and, when agy's
+    // prompt offers an always-allow choice, the advertised persist pattern.
+    // Surface both so the card shows agy's full prompt, not a bare Approve/Reject.
+    const actionDescriptionRaw = p.action_description;
+    const alwaysAllowPatternRaw = p.always_allow_pattern;
+    const agyPermission: AgyPermission | null =
+      phase === "agy_permission"
+        ? {
+            actionDescription:
+              typeof actionDescriptionRaw === "string" && actionDescriptionRaw
+                ? actionDescriptionRaw
+                : null,
+            alwaysAllowPattern:
+              typeof alwaysAllowPatternRaw === "string" && alwaysAllowPatternRaw
+                ? alwaysAllowPatternRaw
+                : null,
+          }
+        : null;
     const codexMetaRaw = p["_meta"];
     const codexMeta =
       codexMetaRaw && typeof codexMetaRaw === "object" && !Array.isArray(codexMetaRaw)
@@ -1189,6 +1209,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       source,
       toolName,
       cwd: typeof cwd === "string" && cwd ? cwd : null,
+      agyPermission,
     } satisfies ElicitationRequest;
   }
 
@@ -1344,15 +1365,13 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   }
 
   if (itemType === "error") {
+    // Same parse as `response.error`, so a classified item's title / cause /
+    // remediation render live exactly as they do after a reload.
     return {
       type: "error",
       source: String(rec.source ?? ""),
       toolName: null,
-      error: {
-        code: String(rec.code ?? ""),
-        message: String(rec.message ?? ""),
-        ...(rec.level === "info" ? { level: "info" as const } : {}),
-      },
+      error: parseErrorInfo(rec),
       itemId,
       responseId,
     } satisfies ErrorEvent;

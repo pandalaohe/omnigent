@@ -111,6 +111,22 @@ describe("useResizableInlinePanel persistence", () => {
 });
 
 describe("useResizableInlinePanel reserved width (sidebar)", () => {
+  it("fits beside a Canvas conversation without losing the preferred panel width", () => {
+    setInnerWidth(1440);
+    const { result, rerender } = renderHook(
+      ({ reserved }) =>
+        useResizableInlinePanel(SESSION, undefined, reserved, true, false, undefined, 380),
+      { initialProps: { reserved: 0 } },
+    );
+    const preferred = nudgeWiderOnce(result);
+    rerender({ reserved: 750 });
+    expect(result.current.panelWidth).toBe(302);
+    expect(result.current.preferredContentWidth).toBe(preferred + 380 + 8);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBe(preferred);
+    rerender({ reserved: 0 });
+    expect(result.current.panelWidth).toBe(preferred);
+  });
+
   // `reservedPx` is the open sidebar's width. It must tighten the ceiling
   // (keeping the chat at its 480px minimum) without overwriting the user's
   // preferred width, so collapsing the sidebar gives the width straight back.

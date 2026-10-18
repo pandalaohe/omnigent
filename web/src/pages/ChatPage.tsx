@@ -1,4 +1,7 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useConversationRedirect } from "@/hooks/useConversationRedirect";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
@@ -38,7 +41,7 @@ import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
-import { useNavigate, useParams } from "@/lib/routing";
+import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -80,6 +83,7 @@ import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import {
@@ -104,11 +108,14 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import {
+  ApiError,
   createSideChat,
   refreshSessionModelOptions,
   retrySession,
   updateSession,
 } from "@/lib/sessionsApi";
+import { getProject } from "@/lib/projectsApi";
+import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { defaultSpeedForModel, reconcileSpeed, speedOptionsForModel } from "@/lib/speedTiers";
 import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
@@ -308,6 +315,7 @@ import {
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
+  nativeModelTooltip,
 } from "@/lib/composerModelLabel";
 import {
   formatProviderUsageLimits,
@@ -324,7 +332,11 @@ import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { isSdkHarnessSession, supportsEffortControl } from "@/lib/sessionCapabilities";
+import {
+  isSdkHarnessSession,
+  effortLevelsForFamily,
+  supportsEffortControl,
+} from "@/lib/sessionCapabilities";
 import { sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
@@ -458,6 +470,8 @@ export function ChatPage() {
   // the session exists. `switchTo` still gets the raw `urlConvId`.
   const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
   const navigate = useNavigate();
+  const { pathname, search } = useLocation();
+  const rebasePath = useRebasePath();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
@@ -523,32 +537,22 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
-    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
-    // conversation is gone) has no forward path: landing is URL-keyed, so the
-    // page would sit on a permanently read-only phantom chat. Redirect to
-    // landing instead of binding a nonexistent session.
+    // A temporary route has no client session after a reload. Return to its
+    // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
-      navigate("/", { replace: true });
+      const canvas = isCanvasPathname(pathname, rebasePath("/canvas"));
+      navigate(
+        canvas
+          ? canvasLocation(new URLSearchParams(search).get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID)
+          : "/",
+        { replace: true },
+      );
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate]);
+  }, [urlConvId, navigate, pathname, search, rebasePath]);
 
-  // Server-driven redirect: when the active conversation is superseded
-  // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
-  // away), the store records the follow-to target in
-  // `redirectToConversationId`. Perform the router navigation here (the
-  // store can't), replacing history so Back doesn't return to the
-  // cleared session, then clear the flag so it fires exactly once. Skip
-  // when we're already on the target URL.
-  const redirectToConversationId = useChatStore((s) => s.redirectToConversationId);
-  useEffect(() => {
-    if (!redirectToConversationId) return;
-    if (redirectToConversationId !== urlConvId) {
-      navigate(`/c/${redirectToConversationId}`, { replace: true });
-    }
-    useChatStore.setState({ redirectToConversationId: null });
-  }, [redirectToConversationId, urlConvId, navigate]);
+  useConversationRedirect(urlConvId);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay
@@ -1163,6 +1167,14 @@ export function ChatPage() {
   // returns a fresh array each call; a new identity here would defeat the memo()
   // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
   // codexModelOptions rationale).
+  const harnessEffortFamilies = useHarnessEffortFamilies();
+  // Declared effort family for a non-native harness (claude-sdk, codex, …), whose
+  // effort rides ``reasoning_effort`` into the SDK executor. Native harnesses keep
+  // their label-driven ladders, so a label-less native row never reads this.
+  const sdkEffortFamily =
+    capabilitySource.harness && !nativeCodingAgentForHarness(capabilitySource.harness)
+      ? (harnessEffortFamilies[capabilitySource.harness] ?? null)
+      : null;
   const effortLevels = useMemo(
     () =>
       effortLevelsForConv(
@@ -1171,10 +1183,19 @@ export function ChatPage() {
         modelPickerKind === "sdk"
           ? (sessionModelOverrideForEffort ?? llmModel)
           : (llmModel ?? sessionModelOverrideForEffort),
+        sdkEffortFamily,
       ),
-    [capabilitySource, codexModelOptions, llmModel, modelPickerKind, sessionModelOverrideForEffort],
+    [
+      capabilitySource,
+      codexModelOptions,
+      llmModel,
+      modelPickerKind,
+      sessionModelOverrideForEffort,
+      sdkEffortFamily,
+    ],
   );
-  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
+  const showEffort =
+    shouldShowEffortPicker(capabilitySource, sdkEffortFamily) && effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -1200,6 +1221,24 @@ export function ChatPage() {
     if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
     else void reconnect();
   }, [isUnboundFork, canResumeOnLocalHost, reconnect]);
+
+  const newSessionProjectId =
+    activeConv?.project_id !== undefined ? activeConv.project_id : activeSession?.projectId;
+  const newSessionProjectLabel = (activeConv?.labels ?? activeSession?.labels)?.[PROJECT_LABEL_KEY];
+  const openNewSession = useCallback(async () => {
+    try {
+      const projectName = newSessionProjectId
+        ? (await getProject(newSessionProjectId)).name
+        : newSessionProjectLabel;
+      navigate(projectName ? `/?project=${encodeURIComponent(projectName)}` : "/");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        navigate("/");
+        return;
+      }
+      toast.error("Couldn't open a new session in this project. Please try again.");
+    }
+  }, [newSessionProjectId, newSessionProjectLabel, navigate]);
 
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
@@ -1227,6 +1266,7 @@ export function ChatPage() {
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
       onSend={onSend}
+      onNewSession={openNewSession}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
@@ -1552,6 +1592,7 @@ export function SelectionPopup({
 }
 
 interface MainAgentSurfaceProps {
+  onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
    * to MainTerminalView so the inline terminal can target the right
@@ -1757,6 +1798,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   disabled,
   onSend,
   onSendSlashCommand,
+  onNewSession,
   onStop,
   onShowReconnectHelp,
   agents,
@@ -2098,6 +2140,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             status={status}
             isWorking={isWorking}
             onSend={handleSend}
+            onNewSession={onNewSession}
             onSendSlashCommand={handleSendSlashCommand}
             onStop={onStop}
             agents={agents}
@@ -2201,6 +2244,7 @@ interface ComposerHandle {
 }
 
 interface ComposerProps {
+  onNewSession: () => void;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
@@ -2874,6 +2918,7 @@ function ComposerImpl(
     disabled,
     onSend,
     onSendSlashCommand,
+    onNewSession,
     onStop,
     agents,
     selectedAgentId,
@@ -3693,6 +3738,17 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
+      case "/new": {
+        if (arg) {
+          setCommandError("/new does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        onNewSession();
+        return true;
+      }
       case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
@@ -3940,13 +3996,22 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     startSideChat(selectedText) {
-      // Open an empty side-chat rail tab right away with the selection quoted in
-      // its composer; the fork is created when the user sends from that tab.
+      // Quote in the visible side chat, or open a pending tab immediately.
+      // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
         return;
       }
-      useChatStore.getState().openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
+      const store = useChatStore.getState();
+      const target = store.sideChatSelectionTarget;
+      if (target?.parentId === sourceId) {
+        store.updateSideChatComposer(target.childId, (current) => ({
+          ...current,
+          quotes: [...(current.quotes ?? []), selectedText],
+        }));
+      } else {
+        store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
+      }
     },
     sendText(text) {
       const trimmed = text.trim();
@@ -4193,7 +4258,8 @@ function ComposerImpl(
     // interrupts.
     if (trimmed) appendEntry(fullText, storedReplyDraft);
     // Each attachment binds to the FIRST occurrence of its token; none → upstream send.
-    const plan = planComposerSend(draft, files, mentionPreamble, trimmed);
+    const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+    const plan = planComposerSend(draft, files, mentionPreamble, message);
     if (draft.quotes.length > 0) {
       sendWithParts(plan.text, plan.sendFiles, plan.replyDraft, plan.parts);
     } else {
@@ -5258,11 +5324,15 @@ export function effortLevelsForConv(
     | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
+  effortFamily: string | null = null,
 ): readonly string[] {
   const harness =
     nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness ??
     (isSdkHarnessSession(conv) ? conv?.harness : null);
-  return effortLevelsFor(harness, codexModelOptions, currentModel) ?? EFFORT_LEVELS;
+  return (
+    effortLevelsFor(harness, codexModelOptions, currentModel) ??
+    (effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS)
+  );
 }
 
 /**
@@ -5350,11 +5420,16 @@ export function shouldShowEffortPicker(
         labels?: Record<string, string | null> | null;
         harness?: string | null;
         inferenceConfigured?: boolean;
+        parentSessionId?: string | null;
       }
     | null
     | undefined,
+  effortFamily: string | null = null,
 ): boolean {
-  return supportsEffortControl(conv);
+  if (isSdkHarnessSession(conv)) {
+    return conv?.parentSessionId == null && effortLevelsForFamily(effortFamily).length > 0;
+  }
+  return supportsEffortControl(conv, effortFamily);
 }
 
 export function shouldShowCodexPlanModeControl(
@@ -5820,6 +5895,7 @@ function SessionHarnessPicker({
                               : model.id,
                           ),
                     testId: `composer-agent-model-${model.id}`,
+                    title: nativeModelTooltip(model),
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
                   })),

@@ -1898,7 +1898,7 @@ class ClaudeSDKExecutor(Executor):
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
         # listing instead of the auto-derived tmpdir basename.
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             try:
                 ensure_bundle_plugin_manifest(self._bundle_dir, self._agent_name)
             except OSError as exc:
@@ -1999,6 +1999,8 @@ class ClaudeSDKExecutor(Executor):
                 )
             self._extra_env.update(gateway_env)
         self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
+        if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
+            self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -3214,6 +3216,13 @@ class ClaudeSDKExecutor(Executor):
         from claude_agent_sdk.types import StreamEvent as _StreamEvent
 
         cfg = config or ExecutorConfig()
+        try:
+            reasoning_effort = validate_effort(
+                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
+            )
+        except ValueError as exc:
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
+            return
 
         session_key = self._session_key(messages)
         crashed_reason = self._crashed_sessions.get(session_key)
@@ -3225,20 +3234,18 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
-        try:
-            reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
-            )
-        except ValueError as exc:
-            yield ExecutorError(message=describe_exception(exc), retryable=False)
-            return
         await self._evict_terminated_client(session_key)
         permission_mode = (
             cfg.permission_mode if cfg.permission_mode is not None else self._permission_mode
         )
         state = self._clients.get(session_key)
         if state is not None and (
-            state.effort != reasoning_effort or state.permission_mode != permission_mode
+            state.permission_mode != permission_mode
+            or (
+                state.effort != reasoning_effort
+                and (next_input := self._extract_trailing_user_content(messages))
+                and next_input != "/compact"
+            )
         ):
             await self._close_live_client(session_key)
         resume_session = session_key in self._clients
@@ -3385,7 +3392,7 @@ class ClaudeSDKExecutor(Executor):
         # ``name`` (and thus the skill-listing prefix) comes from
         # the manifest written at construction time.
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
@@ -3933,6 +3940,10 @@ class ClaudeSDKExecutor(Executor):
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
+                        logger.info(
+                            "Claude CLI result received (is_error=%s)",
+                            getattr(result_msg, "is_error", None),
+                        )
                         if getattr(result_msg, "is_error", None):
                             # Harness-level failure (e.g. expired login). Surface
                             # as an executor error rather than assistant content.
@@ -4172,6 +4183,7 @@ class ClaudeSDKExecutor(Executor):
             if compaction_event is not None:
                 yield compaction_event
 
+        logger.info("ClaudeSDKExecutor: turn complete")
         yield TurnComplete(response=response_text, usage=turn_usage)
 
     @staticmethod

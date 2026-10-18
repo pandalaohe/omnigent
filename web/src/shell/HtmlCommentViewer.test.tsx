@@ -30,6 +30,7 @@ import {
 import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
 import { ANNOTATE_SOURCE } from "./htmlAnnotateBridge";
 import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
+import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
@@ -314,6 +315,7 @@ function annotateIds(message: Record<string, unknown> | undefined): string[] {
 }
 
 beforeEach(() => {
+  setOmnigentHostConfig({});
   vi.clearAllMocks();
   fetchMock.mockReset();
   fetchMock.mockImplementation(defaultArtifactFetch);
@@ -328,10 +330,77 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setOmnigentHostConfig({});
   vi.useRealTimers();
   cleanup();
   vi.unstubAllGlobals();
   delete window.__OMNIGENT_BASE_PATH__;
+});
+
+function HostPreviewFrame({ htmlContent, iframeRef, onLoad }: HtmlPreviewFrameProps) {
+  return (
+    <iframe
+      title="Host preview"
+      srcDoc={htmlContent}
+      ref={iframeRef}
+      onLoad={onLoad}
+      sandbox="allow-scripts"
+    />
+  );
+}
+
+describe("HtmlCommentViewer embedded host frame", () => {
+  it("warns when the host frame omits its iframe ref", () => {
+    vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const FrameWithoutRef = ({ htmlContent, onLoad }: HtmlPreviewFrameProps) => (
+        <iframe
+          title="Host preview without ref"
+          srcDoc={htmlContent}
+          onLoad={onLoad}
+          sandbox="allow-scripts"
+        />
+      );
+      setOmnigentHostConfig({ htmlPreviewFrame: FrameWithoutRef });
+      renderViewer({ content: "<p>Host artifact</p>", embedded: true });
+      fireEvent.load(screen.getByTitle("Host preview without ref"));
+      expect(warn).toHaveBeenCalledWith(
+        "HTML comment bridge cannot connect: preview frame did not expose its content window.",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("prepares HTML and connects the bridge through the supplied iframe", () => {
+    vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
+    setOmnigentHostConfig({ htmlPreviewFrame: HostPreviewFrame });
+    renderViewer({
+      content: "<html><head></head><body><p>Host artifact</p></body></html>",
+      embedded: true,
+    });
+    const iframe = screen.getByTitle<HTMLIFrameElement>("Host preview");
+    const srcDoc = iframe.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("<p>Host artifact</p>");
+    expect(srcDoc).toContain("data-omni-nonce=");
+    expect(srcDoc).not.toContain("htmlCommentBridgeRuntime.js");
+    const postMessage = vi.spyOn(iframe.contentWindow!, "postMessage");
+    fireEvent.load(iframe);
+    expect(postMessage).toHaveBeenCalledWith(
+      { source: BRIDGE_SOURCE, nonce: expect.any(String), type: BRIDGE_MSG.init },
+      "*",
+      [expect.anything()],
+    );
+  });
+
+  it("keeps the default embedded preview on an opaque origin", () => {
+    vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
+    renderViewer({ content: "<p>doc</p>", embedded: true });
+    const iframe = screen.getByTitle("HTML preview");
+    expect(iframe.getAttribute("sandbox")).toContain("allow-scripts");
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin");
+  });
 });
 
 describe("HtmlCommentViewer standalone (artifact URL)", () => {
@@ -1334,6 +1403,8 @@ describe("HtmlCommentViewer embed mode", () => {
 
     const iframe = screen.getByTitle("HTML preview");
     const srcDoc = iframe.getAttribute("srcdoc") ?? "";
+    expect(iframe.getAttribute("sandbox")).toContain("allow-scripts");
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin");
     expect(srcDoc).toContain("<script src=");
     expect(srcDoc).toContain("omni-html-bridge");
     expect(srcDoc).toContain("data-omni-nonce=");

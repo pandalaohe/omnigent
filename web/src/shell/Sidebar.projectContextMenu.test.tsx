@@ -345,9 +345,13 @@ describe("project folder header context menu", () => {
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
   });
 
-  it("selects on the first keyboard activation after dismissal", async () => {
+  it("restores focus and selects on the first keyboard activation after dismissal", async () => {
     renderSidebar();
     const header = folderHeader();
+    fireEvent.contextMenu(header);
+    fireEvent.click(screen.getByTestId("rename-project"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     header.focus();
 
     fireEvent.contextMenu(header, { detail: 0 });

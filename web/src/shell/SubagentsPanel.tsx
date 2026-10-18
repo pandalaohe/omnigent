@@ -69,6 +69,8 @@ import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
 import { useSession } from "@/hooks/useSession";
 import { hostColor, hostColorStyle, hostDisplayName } from "@/lib/hostColors";
 import {
+  ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER,
+  CODEX_NATIVE_SUBAGENT_WRAPPER,
   nativeCodingAgentForSubagentWrapper,
   nativeCodingAgentForWrapper,
   WRAPPER_LABEL_KEY,
@@ -94,8 +96,6 @@ const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
 
-const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
-const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
 const CODEX_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.codex_native.agent_role";
 const ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.antigravity_native.agent_role";
 

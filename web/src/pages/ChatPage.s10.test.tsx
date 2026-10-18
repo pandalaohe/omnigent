@@ -107,6 +107,7 @@ function composerProps(overrides: ComposerOverrides = {}) {
     disabled: false,
     onSend: vi.fn(),
     onStop: vi.fn(),
+    onNewSession: vi.fn(),
     agents: undefined,
     selectedAgentId: null,
     permissionLevel: null,

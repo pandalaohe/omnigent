@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
@@ -102,6 +103,7 @@ interface HeaderConversationMenuProps {
   currentProject: string | null;
   canShare: boolean;
   canFork: boolean;
+  forkDisabledReason?: string;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   onShare: () => void;
@@ -134,6 +136,7 @@ export function HeaderConversationMenu({
   currentProject,
   canShare,
   canFork,
+  forkDisabledReason,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
@@ -419,14 +422,15 @@ export function HeaderConversationMenu({
         </DropdownMenuItem>
       )}
       {canFork && (
-        <DropdownMenuItem
+        <SessionActionMenuItem
           data-testid="header-fork-conversation"
+          disabledReason={forkDisabledReason}
           className={itemClass}
           onSelect={onFork}
         >
           <GitForkIcon className="size-3.5" />
           Fork
-        </DropdownMenuItem>
+        </SessionActionMenuItem>
       )}
       <DropdownMenuItem
         data-testid="header-export-conversation"

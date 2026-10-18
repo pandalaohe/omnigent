@@ -387,6 +387,19 @@ describe("HeaderConversationMenu", () => {
     fireEvent.click(screen.getByTestId("header-toggle-session-sounds"));
     expect(readSoundAlertPreferences().mutedSessionIds).toEqual(["conv_child"]);
   });
+  it("keeps an unsupported Fork visible without opening its dialog", () => {
+    renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
+    openMenu();
+    const fork = screen.getByTestId("header-fork-conversation");
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    expect(fork).toHaveAttribute("aria-describedby");
+    expect(fork).toHaveAccessibleDescription("Forking this sandbox session is not supported yet.");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(mocks.fork).not.toHaveBeenCalled();
+    expect(fork).toBeInTheDocument();
+  });
+
   it("exposes an accessible trigger and the established action order", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });

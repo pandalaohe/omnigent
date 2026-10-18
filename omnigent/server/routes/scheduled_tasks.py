@@ -225,10 +225,10 @@ def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
     }
 
 
-def _validate_rrule_or_400(rrule: str) -> None:
+async def _validate_rrule_or_400(rrule: str) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
-        validate_rrule(rrule)
+        await asyncio.to_thread(validate_rrule, rrule)
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
@@ -530,7 +530,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
-        _validate_rrule_or_400(body.rrule)
+        await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         project_id = await _resolve_create_project(
             owner=owner,
@@ -739,7 +739,7 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
         if body.rrule is not None:
-            _validate_rrule_or_400(body.rrule)
+            await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         # A non-null project must be the caller's; an explicit null clears the

@@ -494,7 +494,7 @@ class SessionResourceRegistry:
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
-        self._is_alive_cache: TTLCache[str, bool] = TTLCache(
+        self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
             ttl=_IS_ALIVE_CACHE_TTL_S,
         )
@@ -679,9 +679,14 @@ class SessionResourceRegistry:
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
-        """Adopt an externally-published *status* as the dedup baseline."""
+        """Adopt an external status and re-arm its file poller after idle."""
         with self._lock:
             self._published_session_status[session_id] = (status, None, None)
+            poller = self._status_pollers.get(session_id)
+        # A queued turn can hide the idle file edge. Re-arm only for idle so a
+        # stale busy file cannot clear a forwarded failure.
+        if status == "idle" and poller is not None:
+            poller.resync()
 
     def resync_session_statuses(self) -> None:
         """Re-arm every status source so it republishes what it already sent.
@@ -772,11 +777,10 @@ class SessionResourceRegistry:
         clean shutdown, while ``running`` / ``waiting`` still classify a later
         exit as mid-turn.
 
-        Also adopts *status* as the watcher's dedup baseline. The forwarder
-        publishes these edges directly to the server, so without this the
-        watcher would still believe its own last edge is live and swallow the
-        next turn's ``running`` as a duplicate — leaving the session stuck on
-        the hook's ``idle`` with no working indicator for the whole turn.
+        Also adopts *status* as the watcher's dedup baseline and re-arms its
+        status-file poller after ``idle``. The forwarder publishes directly
+        to the server, so both caches must catch up or they can swallow the
+        next turn's ``running`` as a duplicate, leaving it on the hook's ``idle``.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
@@ -800,16 +804,6 @@ class SessionResourceRegistry:
                     else None,
                 )
         self._sync_status_edge(session_id, status)
-        if status == "idle":
-            # Hook delivery and file polling run independently. A delayed Stop
-            # can arrive after the next turn already wrote busy; resetting only
-            # the registry edge leaves the poller's unchanged-mtime gate silent.
-            # Recheck the authoritative current file on its next normal tick.
-            # Explicit failure/termination must not be reset by a stale file.
-            with self._lock:
-                poller = self._status_pollers.get(session_id)
-            if poller is not None:
-                poller.resync()
         self._note_terminal_status(session_id, status, "forwarded_status")
 
     def _note_terminal_status(self, session_id: str, status: str, source: str) -> None:
@@ -954,7 +948,8 @@ class SessionResourceRegistry:
 
         The ``is_alive()`` subprocess probe is cached for a short TTL
         so rapid polling from web clients does not fork a ``tmux
-        has-session`` process on every request.
+        has-session`` process on every request. The result belongs to the
+        probed instance; a replacement at the same resource id needs its own probe.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id,
@@ -975,12 +970,12 @@ class SessionResourceRegistry:
 
             cache_key = f"{session_id}:{terminal_id}"
             cached = self._is_alive_cache.get(cache_key)
-            if cached is not None:
-                return terminal_resource_view(session_id, entry) if cached else None
+            if cached is entry.instance:
+                return terminal_resource_view(session_id, entry)
 
             alive = await entry.instance.is_alive()
             if alive:
-                self._is_alive_cache[cache_key] = True
+                self._is_alive_cache[cache_key] = entry.instance
             else:
                 self._is_alive_cache.pop(cache_key, None)
                 return None

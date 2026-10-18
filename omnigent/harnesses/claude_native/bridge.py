@@ -52,10 +52,11 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -83,7 +84,11 @@ from omnigent.harnesses.claude_native.status_file import (
     read_session_status,
     resolve_status_file,
 )
-from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+from omnigent.harnesses.diagnostics import (
+    detect_sign_in_prompt,
+    sign_in_next_step,
+    sign_in_running_elsewhere,
+)
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
@@ -392,14 +397,19 @@ _PERMISSION_MODE_FOOTERS: dict[str, str] = {
     "acceptEdits": "accept edits on",
     "plan": "plan mode on",
     "auto": "auto mode on",
-    # Launch-only, but readable: a pane launched into bypass must report
-    # its own mode so the cycler has a starting point to leave it from.
+    # Launch-only, but readable: a pane launched into bypass or don't-ask
+    # must report its own mode so the cycler has a starting point to leave
+    # it from.
     "bypassPermissions": "bypass permissions on",
+    "dontAsk": "don't ask on",
 }
 # Modes shift+tab can reach from any session. ``dontAsk`` is never in the
 # cycle and ``bypassPermissions`` only joins it when launched into, so
 # neither is a switch target.
-CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {"bypassPermissions"}
+CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {
+    "bypassPermissions",
+    "dontAsk",
+}
 # Cap on shift+tab presses. The cycle is 3-5 modes wide depending on which
 # optional modes are enabled, so a full lap plus slack proves the target is
 # unreachable rather than slow.
@@ -425,10 +435,12 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
 # The dismissal every surface drawn over the input box advertises in its
-# footer ("Esc to cancel", "Esc to clear"). A screen without a composer that
-# lacks it is not such a surface — e.g. a launch wrapper's output before
-# Claude Code has drawn its input box — and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
+# footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
+# an action with "/", so the task details panels print "Esc/Enter/Space to
+# close". A screen without a composer that lacks it is not such a surface —
+# e.g. a launch wrapper's output before Claude Code has drawn its input box —
+# and an Escape cannot clear it.
+_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -439,7 +451,7 @@ EFFORT_DIALOG_HINT = "Change effort level?"
 _CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
 # Only this informational notice is acknowledged automatically. The gateway
 # varies; all decision text and the continuation footer must match exactly.
-_AUTO_MODE_BILLING_NOTICE = re.compile(
+_AUTO_MODE_BILLING_BODY_PATTERN = (
     re.escape(
         (
             "We're changing auto mode to no longer charge for classifier requests "
@@ -455,9 +467,14 @@ _AUTO_MODE_BILLING_NOTICE = re.compile(
             "are billed as before. To fix it and access the new version of auto mode, "
             "ask your gateway to implement: "
             "https://code.claude.com/docs/en/auto-mode-classifier-billing "
-            "Enter to continue · Esc to cancel"
         ).replace(" ", "")
     )
+)
+_AUTO_MODE_BILLING_NOTICE = re.compile(
+    _AUTO_MODE_BILLING_BODY_PATTERN + re.escape("Entertocontinue·Esctocancel")
+)
+_AUTO_MODE_BILLING_CONSENT = re.compile(
+    _AUTO_MODE_BILLING_BODY_PATTERN + re.escape("ytocontinue·ntocancel")
 )
 # Footer rows the ctrl+r prompt-history search renders directly under the
 # input box's closing rule since Claude Code 2.1.212, where the search rides
@@ -643,6 +660,10 @@ class ClaudeInjectionCancelled(RuntimeError):
 
 class ClaudeUserPromptPending(RuntimeError):
     """A native question or permission prompt must be answered before injection."""
+
+
+class ClaudeMessageNotAccepted(RuntimeError):
+    """The submitted draft remained in Claude's input box until the deadline."""
 
 
 @contextlib.contextmanager
@@ -1090,9 +1111,9 @@ class ClaudeHookRecord:
         absent, or when no counted entry carried a usable field.
     :param failure_category: ``StopFailure`` error category, e.g.
         ``"rate_limit"``. ``None`` for other events or when absent.
-    :param failure_message: ``StopFailure`` error text Claude Code rendered
-        for the turn (the payload's ``last_assistant_message``), e.g.
-        ``"API Error: 500 Internal server error"``. ``None`` when absent.
+    :param failure_message: ``StopFailure`` raw API error detail from the
+        payload's ``error_details`` field, e.g.
+        ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
     """
 
@@ -1405,7 +1426,13 @@ class ClaudeNativeToolRelay:
     """
 
     def __init__(
-        self, *, bridge_dir: Path, httpd: ThreadingHTTPServer, advertised_url: str
+        self,
+        *,
+        bridge_dir: Path,
+        httpd: ThreadingHTTPServer,
+        advertised_url: str,
+        relay_info: _JsonObject,
+        tool_executor: ToolExecutor,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1414,11 +1441,30 @@ class ClaudeNativeToolRelay:
             advertisement, e.g. ``Path("/tmp/omnigent/...")``.
         :param httpd: Started HTTP server for tool calls.
         :param advertised_url: Base URL advertised in ``tool_relay.json``.
+        :param relay_info: Current relay advertisement, including its stable token.
+        :param tool_executor: Callback for the current tool surface.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
         self._httpd = httpd
         self._advertised_url = advertised_url
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
+
+    def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
+        """Refresh tools on the owning event loop without changing cached relay credentials.
+
+        :param tools: Replacement tool schemas.
+        :param tool_executor: Callback dispatching against the updated spec.
+        """
+        relay_info = {
+            **self._relay_info,
+            "tools": _normalize_relay_tool_specs(tools),
+            "updated_at": time.time(),
+        }
+        _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
 
     def close(self) -> None:
         """
@@ -1764,26 +1810,10 @@ def build_claude_native_spawn_env(
 
 
 def _bridge_sandbox_payload(sandbox: OSEnvSandboxSpec) -> dict[str, Any]:
-    """
-    Build the JSON-safe sandbox payload persisted into the bridge config.
+    """Persist sandbox settings without parent-only credential sources."""
+    from omnigent.inner.os_env_serialization import encode_sandbox_spec
 
-    ``dataclasses.asdict`` flattens ``credential_proxy`` (a nested
-    ``CredentialProxySpec``) to a plain dict with no way to tell it apart
-    from a real one on read, so a naive ``OSEnvSandboxSpec(**payload)``
-    round-trip silently stores a ``dict`` where a ``CredentialProxySpec``
-    is expected — a real crash the first time sandboxed code dereferences
-    ``.entries`` / ``.databricks`` on it. ``credential_proxy`` is resolved
-    parent-side only and is never meant to cross a serialization boundary
-    in the first place — :func:`omnigent.inner.sandbox.SandboxPolicy.to_jsonable`
-    excludes it for the same reason (it can carry a credential *source*,
-    e.g. an env var name or a shell command, that has no business landing
-    in a file on disk). Dropping it here matches that existing convention
-    instead of inventing a new one.
-
-    :param sandbox: Resolved sandbox spec to serialize.
-    :returns: JSON-safe dict with ``credential_proxy`` omitted.
-    """
-    payload = asdict(sandbox)
+    payload = encode_sandbox_spec(sandbox)
     payload.pop("credential_proxy", None)
     return payload
 
@@ -1902,23 +1932,101 @@ def prune_orphaned_bridge_dirs() -> int:
     return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
 
 
-def ensure_claude_workspace_trusted(workspace: Path) -> None:
+def claude_global_config_path(
+    cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """
+    Return Claude's global config path for its launch env and working directory.
+
+    Claude prefers an existing legacy ``.config.json`` in its config dir
+    (``$CLAUDE_CONFIG_DIR``, else ``~/.claude``), then ``.claude.json`` (or
+    ``.claude-custom-oauth.json`` with ``CLAUDE_CODE_CUSTOM_OAUTH_URL``) under
+    ``$CLAUDE_CONFIG_DIR``, else ``$HOME``. A relative ``CLAUDE_CONFIG_DIR`` is
+    relative to its working directory; an empty one moves only the legacy
+    lookup there.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+        ``None`` uses this process's environment.
+    :returns: The config file path, e.g. ``Path("/home/user/.claude.json")``.
+    """
+    env = os.environ if env is None else env
+    base = cwd if cwd is not None else Path.cwd()
+    # Claude builds these with ``path.join``: no ``~`` expansion, ``..`` removed
+    # lexically, and relative results resolved against its cwd.
+    home_value = env.get("HOME") or str(_account_home_dir())
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    # Claude NFC-normalizes the config dir for the legacy lookup only.
+    if config_dir is None:
+        legacy_dir = unicodedata.normalize("NFC", os.path.join(home_value, ".claude"))
+        legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
+    elif not config_dir:
+        legacy_path = base / ".config.json"
+    else:
+        legacy_dir = unicodedata.normalize("NFC", config_dir)
+        legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
+    if legacy_path.exists():
+        return legacy_path
+    suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
+    return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
+
+
+def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
+    """
+    Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
+
+    ``path.join`` removes ``.`` and ``..`` lexically, without following
+    symlinks, before the filesystem resolves a relative result against
+    Claude's working directory.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+    :param directory: The joined directory value, e.g. ``"x/../cfg"``.
+    :param name: The config file name, e.g. ``".claude.json"``.
+    :returns: The file path, e.g. ``Path("/home/user/repo/cfg/.claude.json")``.
+    """
+    joined = os.path.normpath(os.path.join(directory, name))
+    return Path(joined) if os.path.isabs(joined) else cwd / joined
+
+
+def _account_home_dir() -> Path:
+    """
+    Return the account's home directory, as Claude's runtime does without ``HOME``.
+
+    Claude Code's runtime ignores an unset or empty ``HOME`` and reads the
+    password database, so the runner's own ``HOME`` is not a substitute.
+
+    :returns: The passwd home directory, e.g. ``Path("/home/user")``, or
+        :meth:`Path.home` where no password database exists.
+    """
+    try:
+        import pwd  # POSIX-only module
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return Path.home()
+
+
+def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
     """
     Pre-accept Claude Code's first-run trust + onboarding prompts.
 
     Claude Code blocks on two TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
-    top-level ``hasCompletedOnboarding`` key in ``~/.claude.json``, and a
+    top-level ``hasCompletedOnboarding`` key in its global config
+    (:func:`claude_global_config_path`, usually ``~/.claude.json``), and a
     per-directory "Do you trust the files in this folder?" dialog gated
     by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
-    therefore untrusted — directory on every session.
+    therefore untrusted — directory on every session, and for sessions
+    rooted at the home directory, whose interactively accepted trust
+    Claude keeps for that session only.
 
     Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other ``~/.claude.json`` state (the
+    those two keys are written; all other global config state (the
     user's own onboarding choices, project history, MCP config, OAuth
     account) is preserved, and the file is left untouched when both keys
     are already set. This deliberately does NOT skip per-tool permission
@@ -1936,17 +2044,31 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     :param workspace: The runner workspace Claude will launch in, e.g.
         ``Path("/home/user/repo-worktrees/feature-x")``. Resolved to an
         absolute path to match Claude's ``projects`` key convention.
+    :param env: Environment the Claude terminal is launched with, used to
+        find the config file Claude will load. ``None`` uses this process's
+        environment.
     :returns: None.
-    :raises ValueError: If an existing ``~/.claude.json`` (or its
-        ``projects`` map / target project entry) is not a JSON object.
+    :raises ValueError: If the existing global config is not a regular
+        file or is a broken or looping symlink, or it (or its ``projects`` map /
+        target project entry) is not a JSON object. A symlinked config is
+        updated at its target.
         Surfaced rather than silently overwritten so a corrupt or
         unexpected user config is never clobbered (fail loud).
-    :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is
+    :raises json.JSONDecodeError: If the existing global config is
         not valid JSON, for the same reason.
     """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_path = (Path(config_dir).expanduser() if config_dir else Path.home()) / ".claude.json"
+    config_path = claude_global_config_path(workspace, env)
+    if config_path.is_symlink():
+        # Keep a symlinked (e.g. dotfile-managed) config; update its target.
+        try:
+            config_path = config_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"{config_path} is a broken or looping symlink; refusing to overwrite."
+            ) from exc
     if config_path.exists():
+        if not config_path.is_file():
+            raise ValueError(f"{config_path} is not a regular file; refusing to overwrite.")
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError(f"{config_path} is not a JSON object; refusing to overwrite.")
@@ -1987,7 +2109,7 @@ def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
 
     Unlike :func:`_write_json_file` (which targets the owner-only bridge
     tree under ``/tmp`` and enforces secure-directory ownership on the
-    parent), this writes the user's own ``~/.claude.json`` in their home
+    parent), this writes the user's own Claude global config in their home
     directory: it must not re-permission the home directory, but it does
     pin the result to owner-only ``0o600`` because the file holds the
     Claude OAuth account block.
@@ -2127,7 +2249,7 @@ def record_model_vocabulary(
     # vocabulary refresh (e.g. serving model options) can never replace a
     # concurrent bridge preparation's config — sandbox settings included —
     # with its own stale read.
-    with _bridge_config_write_lock(bridge_dir):
+    with _bridge_metadata_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
         if not isinstance(config, dict) or not config:
             # No prepared bridge config yet (missing/malformed reads as {}):
@@ -2154,18 +2276,13 @@ def record_model_vocabulary(
 
 
 @contextlib.contextmanager
-def _bridge_config_write_lock(bridge_dir: Path) -> Iterator[None]:
-    """Cross-process mutual exclusion for bridge-config read-modify-writes.
+def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for bridge metadata read-modify-writes.
 
-    Uses the same on-disk lock file as bridge-dir preparation
-    (``<bridge root>/.locks/<bridge dir>.lock``), so config rewrites and
+    Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    from filelock import FileLock
-
-    lock_dir = bridge_dir.parent / ".locks"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with FileLock(str(lock_dir / f"{bridge_dir.name}.lock"), mode=0o600):
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
         yield
 
 
@@ -2194,13 +2311,14 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     :returns: None.
     :raises RuntimeError: If the bridge config does not exist.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not config:
-        raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
-    config["active_session_id"] = session_id
-    config["conversation_id"] = session_id
-    config["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not config:
+            raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        config["active_session_id"] = session_id
+        config["conversation_id"] = session_id
+        config["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
 def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
@@ -2946,50 +3064,49 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
-    envelope = {
-        "recorded_at": time.time(),
-        "payload": payload,
-    }
-    with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
+    with _bridge_metadata_write_lock(bridge_dir):
+        envelope = {
+            "recorded_at": time.time(),
+            "payload": payload,
+        }
+        with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
 
-    state = _read_json_file(bridge_dir / _STATE_FILE)
-    if not isinstance(state, dict):
-        state = {}
-    event_name = payload.get("hook_event_name")
-    if isinstance(event_name, str) and event_name:
-        state["last_hook_event_name"] = event_name
-    claude_session_id = payload.get("session_id")
-    pinned = state.get("claude_session_id")
-    # Identity pin: the transcript path and session identity may change only
-    # via a SessionStart announcement (startup / clear / resume / compact all
-    # fire one) or an event from the already-pinned session. A side-channel
-    # event carrying another session's identity (e.g. a background Task
-    # agent's edge) must not re-aim the forwarder at a foreign transcript.
-    identity_allowed = event_name == "SessionStart" or (
-        isinstance(claude_session_id, str)
-        and claude_session_id != ""
-        and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
-    )
-    if identity_allowed:
-        transcript_path = payload.get("transcript_path")
-        if isinstance(transcript_path, str) and transcript_path:
-            state["transcript_path"] = transcript_path
-        if isinstance(claude_session_id, str) and claude_session_id:
-            state["claude_session_id"] = claude_session_id
-            seen = read_seen_claude_session_ids(bridge_dir)
-            seen.add(claude_session_id)
-            state["seen_claude_session_ids"] = sorted(seen)
-    else:
-        _logger.debug(
-            "Ignoring identity fields from side-channel hook event; "
-            "event=%s session_id=%s pinned=%s",
-            event_name,
-            claude_session_id,
-            pinned,
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+        event_name = payload.get("hook_event_name")
+        if isinstance(event_name, str) and event_name:
+            state["last_hook_event_name"] = event_name
+        claude_session_id = payload.get("session_id")
+        pinned = state.get("claude_session_id")
+        # Identity pin: only a SessionStart or an event from the already-pinned
+        # session may change transcript/session identity; a side-channel event
+        # (e.g. a background Task agent's edge) must not re-aim the forwarder.
+        identity_allowed = event_name == "SessionStart" or (
+            isinstance(claude_session_id, str)
+            and claude_session_id != ""
+            and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
         )
-    state["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _STATE_FILE, state)
+        if identity_allowed:
+            transcript_path = payload.get("transcript_path")
+            if isinstance(transcript_path, str) and transcript_path:
+                state["transcript_path"] = transcript_path
+            if isinstance(claude_session_id, str) and claude_session_id:
+                state["claude_session_id"] = claude_session_id
+                seen = read_seen_claude_session_ids(bridge_dir)
+                seen.add(claude_session_id)
+                state["seen_claude_session_ids"] = sorted(seen)
+        else:
+            _logger.debug(
+                "Ignoring identity fields from side-channel hook event; "
+                "event=%s session_id=%s pinned=%s",
+                event_name,
+                claude_session_id,
+                pinned,
+            )
+        state["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _STATE_FILE, state)
 
 
 def read_transcript_path(bridge_dir: Path) -> Path | None:
@@ -3614,15 +3731,18 @@ class TranscriptCostLedger:
 
     The forwarder keeps one ledger per transcript and folds appended bytes
     into it (see :func:`accumulate_transcript_cost`), so a growing file is
-    never re-parsed in full. Usage is kept per ``requestId`` (last priceable
-    record per id wins) so a re-price after a provider-config change can
-    recompute without the file.
+    never re-parsed in full. Message ids identify responses, with request ids
+    linking fragments that omit a message id. Usage remains available for a
+    re-price after a provider-config change without reading the file again.
     """
 
-    usage_by_request: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
-    cost_by_request: dict[str, float] = field(default_factory=dict)
+    usage_by_response: dict[tuple[str, str | int], list[tuple[int, str, dict[str, int]]]] = field(
+        default_factory=dict
+    )
+    cost_by_response: dict[tuple[str, str | int], float] = field(default_factory=dict)
+    message_keys_by_request: dict[str, tuple[str, str | int]] = field(default_factory=dict)
     pricing_fingerprint: bytes | None = None
-    unkeyed_records: int = 0
+    next_record_index: int = 0
 
 
 def accumulate_transcript_cost(
@@ -3638,8 +3758,8 @@ def accumulate_transcript_cost(
 
     Applies the same record filters as
     :func:`compute_transcript_cumulative_cost` and stores each record's
-    usage under its ``requestId``, keyed by model. The last priceable
-    record per id wins; a repeated key drops any cost computed for it.
+    usage under its response identity. The last priceable record per response
+    wins; a repeated key drops any cost computed for it.
 
     :param transcript_path: Path to a Claude transcript JSONL.
     :param ledger: Ledger to update in place.
@@ -3671,14 +3791,32 @@ def accumulate_transcript_cost(
         model = _model_from_transcript_entry(entry)
         if model is None:
             continue
+        message = entry.get("message")
+        message_id = message.get("id") if isinstance(message, dict) else None
+        if not isinstance(message_id, str) or not message_id:
+            message_id = None
         request_id = entry.get("requestId")
         if not isinstance(request_id, str) or not request_id:
-            request_id = f"__no_request_id_{ledger.unkeyed_records}"
-            ledger.unkeyed_records += 1
-        models = ledger.usage_by_request.setdefault(request_id, {})
-        models.pop(model, None)
-        models[model] = usage
-        ledger.cost_by_request.pop(request_id, None)
+            request_id = None
+        if message_id is not None:
+            key: tuple[str, str | int] = ("message", message_id)
+            if request_id is not None:
+                request_key = ("request", request_id)
+                prior = ledger.usage_by_response.pop(request_key, [])
+                if prior:
+                    ledger.usage_by_response.setdefault(key, []).extend(prior)
+                    ledger.usage_by_response[key].sort(key=lambda item: item[0])
+                    ledger.cost_by_response.pop(request_key, None)
+                ledger.message_keys_by_request[request_id] = key
+        elif request_id is not None:
+            key = ledger.message_keys_by_request.get(request_id, ("request", request_id))
+        else:
+            key = ("record", ledger.next_record_index)
+        ledger.usage_by_response.setdefault(key, []).append(
+            (ledger.next_record_index, model, usage)
+        )
+        ledger.next_record_index += 1
+        ledger.cost_by_response.pop(key, None)
     return (read_result.byte_offset, read_result.line_cursor)
 
 
@@ -3700,18 +3838,18 @@ def price_transcript_cost_ledger(ledger: TranscriptCostLedger) -> float | None:
     provider_config = load_config()
     provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
     if ledger.pricing_fingerprint != provider_config_fingerprint:
-        ledger.cost_by_request.clear()
+        ledger.cost_by_response.clear()
         ledger.pricing_fingerprint = provider_config_fingerprint
     pricing_by_model: dict[str, ModelPricing | None] = {}
     total_cost = 0.0
     priced_any = False
-    for request_id, models in ledger.usage_by_request.items():
-        stored_cost = ledger.cost_by_request.get(request_id)
+    for response_key, records in ledger.usage_by_response.items():
+        stored_cost = ledger.cost_by_response.get(response_key)
         if stored_cost is not None:
             total_cost += stored_cost
             priced_any = True
             continue
-        for position, (model, usage) in enumerate(reversed(models.items())):
+        for position, (_, model, usage) in enumerate(reversed(records)):
             if model not in pricing_by_model:
                 pricing_by_model[model] = _transcript_model_pricing(
                     model,
@@ -3725,7 +3863,7 @@ def price_transcript_cost_ledger(ledger: TranscriptCostLedger) -> float | None:
             # Only the newest model's cost is stored; an older fallback is
             # recomputed next call so a newly priced newest model wins then.
             if position == 0:
-                ledger.cost_by_request[request_id] = cost
+                ledger.cost_by_response[response_key] = cost
             total_cost += cost
             priced_any = True
             break
@@ -3755,18 +3893,12 @@ def compute_transcript_cumulative_cost(
     pricing the token totals — but per-message pricing also stays correct
     across a model switch within one transcript.
 
-    **Deduplicated by ``requestId``.** Claude writes more than one
-    transcript record for a single API response (a streamed partial plus
-    the final record, retries, etc.), and those records share one
-    ``requestId`` while each carries that response's full ``message.usage``
-    (not an increment). Summing every record would bill the same response
-    two-plus times — observed ~2x inflation, with the parent badge and the
-    cost-budget gate both reading the doubled figure. So records are keyed
-    by ``requestId`` (last priceable record per id wins, as its usage is
-    the authoritative final figure) and each billed response is counted
-    exactly once. A record with no ``requestId`` (rare non-API assistant
-    entry) gets a per-record unique key so it is never collapsed with
-    another.
+    Claude can write several records per API response, each repeating its
+    usage. ``requestId`` may be absent without an Anthropic ``request-id``
+    response header. Deduplicate by ``message.id``, falling back to
+    ``requestId`` for records without one. Priceable records carrying both IDs
+    link request-only fragments to the same response. The last priceable record
+    wins; records with neither ID remain separate.
 
     :param transcript_path: Path to a Claude transcript JSONL, e.g.
         ``".../<session>.jsonl"`` (parent) or
@@ -4100,18 +4232,16 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_context: FailureContext | None = None
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
-        # The CLI renders this text for its own error, so it reads like the
-        # mirrored API-error message.
-        raw_message = _bounded_hook_text(
-            payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
-        )
-        original_message = payload.get("last_assistant_message")
+        # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
+        # can hold prior-turn prose when the failure fires before any new output.
+        raw_details = _bounded_hook_text(payload.get("error_details"), _FAILURE_MESSAGE_MAX_CHARS)
+        original_details = payload.get("error_details")
         failure_context = claude_failure_context(
             payload,
-            error_text=original_message if isinstance(original_message, str) else None,
+            error_text=original_details if isinstance(original_details, str) else None,
         )
         failure_message = (
-            _display_text(raw_message, is_api_error=True) if raw_message is not None else None
+            _display_text(raw_details, is_api_error=True) if raw_details is not None else None
         )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
@@ -4348,7 +4478,7 @@ def inject_user_message(
     rejects that guess ("Unknown command: /<name>") it drops the whole
     message without calling the model, so after such a submit the pane
     is watched briefly for the rejection and the message is re-delivered
-    escaped (zero-width prefix) as plain user text — the message is never
+    escaped (space prefix) as plain user text — the message is never
     silently swallowed. A recognized skill prints no rejection and runs
     exactly as before.
 
@@ -4365,6 +4495,8 @@ def inject_user_message(
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
+    :raises ClaudeTerminalDialog: If the input box stays in shell mode or the
+        prompt-history search after the reclaim; nothing was typed.
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
@@ -4372,7 +4504,16 @@ def inject_user_message(
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
-    _restore_occupied_input(info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir)
+    surface = _restore_occupied_input(
+        info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
+    )
+    if surface is not None and surface != _OVERLAY_SURFACE:
+        # An overlay may be launcher output the readiness gate waits through; a
+        # box held in another mode never frees itself, and timing out reaps the pane.
+        raise ClaudeTerminalDialog(
+            f"Claude Code's input box is occupied by {surface}, so the message was not "
+            "delivered. Open the terminal, dismiss it, then resend your message."
+        )
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
@@ -4459,8 +4600,11 @@ def _paste_and_submit(
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
     :returns: None.
-    :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
-        never leaves the input box after repeated submit Enters.
+    :raises ClaudeUserPromptPending: If a question or permission prompt is
+        pending before the submit Enter; the message was not sent.
+    :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
+        never leaves the input box after repeated submit Enters, or if a
+        prompt appears after the submit Enter.
     """
     delivery_diagnostics.start_attempt()
     delivery_diagnostics.set_stage("checking_pending_prompt")
@@ -4469,6 +4613,9 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
+    # Space returns focus to the input box if the footer (shells item or agent
+    # list) holds it. Either way it types a space, which the clear removes.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     # Clear stale text first: raw controls can otherwise become pasted text.
     # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
@@ -4555,15 +4702,23 @@ def _paste_and_submit(
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
     delivery_diagnostics.set_stage("verifying_submit")
-    if _verify_submit_accepted(
-        socket_path,
-        tmux_target,
-        needle=needle,
-        what="submitted message",
-        bridge_dir=bridge_dir,
-    ):
+    try:
+        accepted = _verify_submit_accepted(
+            socket_path,
+            tmux_target,
+            needle=needle,
+            what="submitted message",
+            bridge_dir=bridge_dir,
+        )
+    except ClaudeUserPromptPending as exc:
+        # The Enter already went out, so the prompt may belong to this message's own turn.
+        raise RuntimeError(
+            "Claude is waiting for an explicit answer after the message was submitted; "
+            "it may already have been delivered."
+        ) from exc
+    if accepted:
         return
-    raise RuntimeError(
+    raise ClaudeMessageNotAccepted(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
@@ -4867,7 +5022,9 @@ def inject_slash_command(
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # not interrupt an in-flight generation. Space first refocuses the input
+    # box from the footer, as in :func:`_paste_and_submit`; C-u clears its space.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
@@ -5643,6 +5800,11 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
 
+    A ``send-keys`` first leaves any pane mode (``copy-mode -q``, tmux
+    3.1a+), so keys reach the application instead of the copy mode a
+    scrolled-back pane is in. Both run in one tmux invocation, so the pane
+    cannot enter a mode between the exit and the send.
+
     :param socket_path: Absolute path to the tmux socket the terminal
         was launched on, e.g. ``"/tmp/.../tmux.sock"``.
     :param args: Arguments after ``tmux -S <socket_path>``, e.g.
@@ -5658,6 +5820,10 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     if timeout <= 0.0:
         # Past the bound keep-warm deadline: no key may go out after it.
         raise RuntimeError(f"tmux command timed out after {timeout}s")
+    operation = args[0] if args else ""
+    if operation == "send-keys" and "-t" in args:
+        target = args[args.index("-t") + 1]
+        args = ("copy-mode", "-q", "-t", target, ";", *args)
     cmd = ["tmux", "-S", socket_path, *args]
     try:
         proc = subprocess.run(
@@ -5668,8 +5834,13 @@ def _run_tmux(socket_path: str, *args: str) -> None:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
+        delivery_diagnostics.record_tmux_failure(operation, timeout_s=timeout)
         raise RuntimeError(f"tmux command timed out after {timeout}s") from exc
+    except OSError as exc:
+        delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
+        raise
     if proc.returncode != 0:
+        delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
@@ -5942,7 +6113,8 @@ def _user_prompt_visible(pane: str) -> bool:
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
     return (
-        "Do you want to " in region
+        _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
+        or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
             any(hint in region for hint in ("Enter to select", "Enter to submit"))
@@ -5956,10 +6128,21 @@ def _has_approval_wait(bridge_dir: Path) -> bool:
     return session_id is not None and approval_wait_is_fresh(session_id, bridge_dir=bridge_dir)
 
 
-def _raise_if_user_prompt_pending(bridge_dir: Path | None, pane: str) -> None:
+def _raise_if_user_prompt_pending(
+    bridge_dir: Path | None,
+    pane: str,
+    *,
+    message: str = "Claude is waiting for an explicit answer; input not sent.",
+) -> None:
     """Protect live hook waits even when a captured pane is torn or stale."""
+    if _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT):
+        raise ClaudeUserPromptPending(
+            "Claude Code is waiting for your auto-mode classifier billing choice. "
+            "The message was not delivered. Open the terminal, answer the prompt, "
+            "then resend your message."
+        )
     if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(pane):
-        raise ClaudeUserPromptPending("Claude is waiting for an explicit answer; input not sent.")
+        raise ClaudeUserPromptPending(message)
 
 
 def has_pending_user_prompt(bridge_dir: Path) -> bool:
@@ -5981,6 +6164,11 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
     """Recognize the exact informational notice below the live pane's last rule."""
+    return _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_NOTICE)
+
+
+def _auto_mode_billing_prompt_matches(pane: str, pattern: re.Pattern[str]) -> bool:
+    """Match only the live billing prompt, excluding transcript and composer text."""
     if _composer_row(pane) is not None:
         return False
     lines = pane.splitlines()
@@ -5990,7 +6178,7 @@ def auto_mode_billing_notice_visible(pane: str) -> bool:
     # Ignore transcript text above the dialog; tolerate terminal line wrapping,
     # including wraps within the gateway hostname and documentation URL.
     body = "".join("".join(lines[rules[-1] + 1 :]).split())
-    return _AUTO_MODE_BILLING_NOTICE.fullmatch(body) is not None
+    return pattern.fullmatch(body) is not None
 
 
 def _acknowledge_auto_mode_billing_notice(socket_path: str, tmux_target: str) -> bool:
@@ -6075,8 +6263,9 @@ def _restore_occupied_input(
     in two shapes, both reported by :func:`_occupying_surface`: an overlay
     drawn where the input box was (the ctrl+r prompt-history search, a
     hand-opened ``/model`` picker, the double-Escape rewind dialog, a
-    ``/config`` or ``/resume`` panel), or the box itself switched to
-    another input mode (``!`` shell mode). Keystrokes injected into either
+    ``/config`` or ``/resume`` panel, a background task's details panel),
+    or the box itself switched to another input mode (``!`` shell mode).
+    Keystrokes injected into either
     do not become a chat message: the history search filters on the pasted
     text and its Enter replays an old prompt, the rewind dialog's Enter
     restores a checkpoint, and shell mode runs the message as a bash
@@ -6118,13 +6307,14 @@ def _restore_occupied_input(
     unclearable_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
-        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
-            pane
-        ):
-            raise ClaudeUserPromptPending(
+        _raise_if_user_prompt_pending(
+            bridge_dir,
+            pane,
+            message=(
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
-            )
+            ),
+        )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
@@ -6494,8 +6684,8 @@ def _wait_for_claude_prompt_ready(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
         unanswered liveness probe extends the wait to
-        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
-        query ends the wait at the next liveness check.
+        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`. Liveness checks start within
+        one second; a dead pane or rejected query ends the wait.
     :param bridge_dir: Protect live permission-hook waits when delivering a message.
     :returns: None.
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
@@ -6510,6 +6700,8 @@ def _wait_for_claude_prompt_ready(
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
         card can offer it; the pane is left alive for the sign-in to finish.
+        Also raised when the launcher waits on two consecutive polls for a
+        sign-in that another process started.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -6520,7 +6712,7 @@ def _wait_for_claude_prompt_ready(
         a box that never appeared — is diagnosable from the error alone.
     """
     started = time.monotonic()
-    next_liveness_probe = started + timeout_s
+    next_liveness_probe = started + min(timeout_s, _CLAUDE_LIVENESS_POLL_INTERVAL_S)
     hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
@@ -6535,17 +6727,17 @@ def _wait_for_claude_prompt_ready(
     pane_exited = False
     dialog_headline: str | None = None
     sign_in_url: str | None = None
+    waited_on_sign_in = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
         _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
-        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
-            pane
-        ):
-            raise ClaudeUserPromptPending(
-                "Claude is waiting for an explicit answer; message not sent."
-            )
+        _raise_if_user_prompt_pending(
+            bridge_dir,
+            pane,
+            message="Claude is waiting for an explicit answer; message not sent.",
+        )
         polls += 1
         if pane.strip():
             last_nonempty = pane
@@ -6584,9 +6776,22 @@ def _wait_for_claude_prompt_ready(
                 remediation=sign_in_next_step("Claude Code"),
             )
         sign_in_url = sign_in.url if sign_in is not None else None
+        # Another launch's sign-in holds the launcher's lock. Reaping the pane at
+        # the budget would kill this wait, so report the sign-in instead.
+        waiting_on_sign_in = sign_in is None and sign_in_running_elsewhere(pane)
+        if waiting_on_sign_in and waited_on_sign_in:
+            raise ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in that another session started, "
+                "so the message was not delivered.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation=(
+                    "Finish the sign-in that another session opened, in your browser or in "
+                    "that session's terminal. Claude Code continues on its own once it "
+                    "completes; then send your message again."
+                ),
+            )
+        waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
-        if now >= hard_deadline:
-            break
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
@@ -6594,6 +6799,8 @@ def _wait_for_claude_prompt_ready(
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+        if time.monotonic() >= hard_deadline:
+            break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
@@ -6725,9 +6932,13 @@ def start_tool_relay(
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
+
+    async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
+        return await relay._tool_executor(name, arguments)
+
     handler_cls = _tool_relay_handler_factory(
         token,
-        tool_executor,
+        _execute_current_tool,
         loop,
         policy_client=policy_client,
         session_id=session_id,
@@ -6752,13 +6963,20 @@ def start_tool_relay(
         encoding="utf-8",
     )
     os.chmod(env_path, 0o600)
+    relay = ClaudeNativeToolRelay(
+        bridge_dir=bridge_dir,
+        httpd=httpd,
+        advertised_url=advertised_url,
+        relay_info=relay_info,
+        tool_executor=tool_executor,
+    )
     thread = threading.Thread(
         target=httpd.serve_forever,
         name="claude-native-tool-relay",
         daemon=True,
     )
     thread.start()
-    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd, advertised_url=advertised_url)
+    return relay
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -7949,6 +8167,7 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     # Only the bridge MCP server (launch path) ever builds these tools.
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.os_env import create_os_environment
+    from omnigent.inner.os_env_serialization import decode_sandbox_spec
     from omnigent.tools.builtins.os_env import build_os_env_tools
 
     workspace_raw = config.get("workspace")
@@ -7957,7 +8176,7 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     if workspace is not None:
         sandbox_payload = config.get("sandbox")
         sandbox = (
-            OSEnvSandboxSpec(**sandbox_payload)
+            decode_sandbox_spec(sandbox_payload)
             if isinstance(sandbox_payload, dict)
             else OSEnvSandboxSpec(type="none")
         )
@@ -8875,6 +9094,12 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    # Only ``user``/``assistant`` records are conversation turns. Other typed
+    # records can carry a ``message`` too, e.g. ``api-request-blob`` copies of
+    # API requests that include injected ``<system-reminder>`` context.
+    entry_type = entry.get("type")
+    if isinstance(entry_type, str) and entry_type not in ("user", "assistant"):
+        return current_response_id, []
     message = entry.get("message")
     if not isinstance(message, dict):
         return current_response_id, []
@@ -9227,15 +9452,16 @@ def _escape_slash_command_text(content: str) -> str:
     """
     Return *content* escaped so it is treated as plain user text.
 
-    Inserts a zero-width no-break space (U+FEFF) immediately before the
-    leading slash. Claude Code sees a non-slash first character, so the
-    input is submitted as a regular message, while the user still sees
-    their original slash.
+    Inserts a space immediately before the leading slash. Claude Code sees
+    a non-slash first character, so the input is submitted as a regular
+    message, while the user still sees their original slash. An invisible
+    prefix does not work: Claude Code strips invisible characters before
+    it parses the command.
     """
     match = re.match(r"^(\s*)(/)(.*)$", content, re.DOTALL)
     if not match:
         return content
-    return f"{match.group(1)}\ufeff{match.group(2)}{match.group(3)}"
+    return f"{match.group(1)} {match.group(2)}{match.group(3)}"
 
 
 def _escape_unsupported_slash_command(content: str) -> str:
@@ -9345,6 +9571,57 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     stdout_match = _COMMAND_STDOUT_RE.search(content)
     output = stdout_match.group(1) if stdout_match else None
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
+
+
+def _is_slash_command_echo(content: str) -> bool:
+    """
+    Whether *content* is Claude Code's own slash-command echo markup.
+
+    Claude writes the echo with ``<command-name>`` first, or with
+    ``<command-message>`` first for skills invoked with arguments. Command
+    tags appearing later — inside shell output, command stdout, or user
+    prose — are not an echo.
+
+    :param content: Raw transcript record content.
+    :returns: ``True`` when the content begins with a command tag.
+    """
+    return content.lstrip().startswith(("<command-name>", "<command-message>"))
+
+
+def _slash_command_item_from_echo(
+    content: str,
+    *,
+    source_key: str,
+    agent_name: str,
+    response_id: str,
+) -> ClaudeTranscriptItem | None:
+    """
+    Build the ``slash_command`` item for a Claude slash-command echo.
+
+    :param content: Echo markup accepted by :func:`_is_slash_command_echo`.
+    :param source_key: Base transcript record key used for the source id.
+    :param agent_name: Agent/model name attributed to the invocation.
+    :param response_id: Response id that opens the command's turn.
+    :returns: The item, or ``None`` for unparseable markup and UI-only
+        built-ins that are never surfaced.
+    """
+    payload = _parse_slash_command_record(content)
+    if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
+        return None
+    data: _JsonObject = {
+        "agent": agent_name,
+        "kind": "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill",
+        "name": payload.name,
+        "arguments": payload.arguments,
+    }
+    if payload.output is not None:
+        data["output"] = payload.output
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "slash_command"),
+        item_type="slash_command",
+        data=data,
+        response_id=response_id,
+    )
 
 
 def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
@@ -9657,12 +9934,12 @@ def _local_command_transcript_items_from_entry(
     """
     Parse a top-level Claude ``local_command`` transcript entry.
 
-    Newer Claude Code builds can record shell-mode ``!cmd`` activity
-    as top-level transcript records with ``subtype="local_command"``
-    and a string ``content`` field instead of wrapping the same markup
-    inside ``message.role=user``. Only ``<bash-*>`` records are
-    conversation-visible here; slash-command local records are still
-    handled by hook/fork detection and otherwise ignored.
+    Newer Claude Code builds can record shell-mode ``!cmd`` activity and
+    slash-command echoes (e.g. ``/model``) as top-level transcript records
+    with ``subtype="local_command"`` and a string ``content`` field instead
+    of wrapping the same markup inside ``message.role=user``. Both are
+    parsed exactly as their ``role=user`` counterparts; command stdout
+    records stay hidden apart from the ``/compact`` refusal.
 
     :param entry: Decoded Claude transcript record.
     :param line_number: One-based transcript line number.
@@ -9672,8 +9949,8 @@ def _local_command_transcript_items_from_entry(
     :param current_response_id: Response id for an in-progress shell
         command group, if the input record was parsed in an earlier
         line.
-    :returns: Updated active response id and parsed terminal-command
-        items.
+    :returns: Updated active response id and parsed slash-command or
+        terminal-command items.
     """
     content = entry.get("content")
     if not isinstance(content, str) or not content:
@@ -9703,6 +9980,16 @@ def _local_command_transcript_items_from_entry(
             )
         ]
     fallback_response_id = _response_id_from_source(source_key)
+    if _is_slash_command_echo(content):
+        item = _slash_command_item_from_echo(
+            content,
+            source_key=source_key,
+            agent_name=agent_name,
+            response_id=fallback_response_id,
+        )
+        if item is None:
+            return current_response_id, []
+        return fallback_response_id, [item]
     response_id = (
         fallback_response_id
         if _BASH_INPUT_RE.search(content) is not None
@@ -9962,38 +10249,22 @@ def _user_transcript_items_from_entry(
                 items,
             )
         stripped = content.lstrip()
-        # Skill invocations with args ship the tag order
-        # ``<command-message>…<command-name>…<command-args>…`` — i.e.
-        # ``<command-name>`` is NOT the first tag. Detect it anywhere
-        # in the content, not just at the start.
-        if "<command-name>" in stripped:
-            payload = _parse_slash_command_record(content)
+        if _is_slash_command_echo(content):
             # Drop unparseable markup rather than letting it fall through
             # to the user-bubble path — that rendered the markup verbatim
             # in the original bug.
-            if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
-                return current_response_id, []
-            kind = "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
-            data: _JsonObject = {
-                "agent": agent_name,
-                "kind": kind,
-                "name": payload.name,
-                "arguments": payload.arguments,
-            }
-            if payload.output is not None:
-                data["output"] = payload.output
-            items.append(
-                ClaudeTranscriptItem(
-                    source_id=_source_id(source_key, 0, "slash_command"),
-                    item_type="slash_command",
-                    data=data,
-                    response_id=fallback_response_id,
-                )
+            item = _slash_command_item_from_echo(
+                content,
+                source_key=source_key,
+                agent_name=agent_name,
+                response_id=fallback_response_id,
             )
+            if item is None:
+                return current_response_id, []
             # Slash command opens a new logical turn; subsequent
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
-            return fallback_response_id, items
+            return fallback_response_id, [item]
         # ``!cmd`` terminal commands may arrive here in older Claude
         # builds; newer builds use top-level ``local_command`` records.
         # In both shapes, surface the command and result as their own

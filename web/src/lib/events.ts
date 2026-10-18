@@ -11,6 +11,7 @@
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 import type {
+  AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ElicitationSource,
@@ -306,6 +307,8 @@ export interface ElicitationRequest {
   toolName?: string | null;
   /** Working directory the gated action would run in, when known. */
   cwd?: string | null;
+  /** Optional Antigravity action description and advertised persist pattern. */
+  agyPermission?: AgyPermission | null;
 }
 
 /**
@@ -751,6 +754,8 @@ export interface SessionSandboxStatusEvent {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`, when the server reports it. */
+  provider?: string;
 }
 
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */

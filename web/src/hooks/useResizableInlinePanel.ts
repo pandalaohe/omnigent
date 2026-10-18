@@ -210,6 +210,7 @@ function getServerSnapshot(): number | null {
  *
  * `showsWideContent` is true while the rail shows a browser tab or an opened file.
  * `browser` identifies a browser tab and whether the panel is open or maximized.
+ * `chatMinWidthPx` lets a nested Canvas conversation use its own width floor.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
@@ -224,6 +225,7 @@ export function useResizableInlinePanel(
     open: boolean;
     maximized: boolean;
   } | null = null,
+  chatMinWidthPx = CHAT_MIN_WIDTH_PX,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const rawWide = useSyncExternalStore(subscribe, getWideSnapshot, getServerSnapshot);
@@ -264,7 +266,7 @@ export function useResizableInlinePanel(
       contentWidth = clamp(
         Math.max(
           previousWidth.current === null
-            ? clamp(normalWidth, minWidthPx, reservedPx)
+            ? clamp(normalWidth, minWidthPx, reservedPx, chatMinWidthPx)
             : opening
               ? 0
               : previousWidth.current,
@@ -278,12 +280,14 @@ export function useResizableInlinePanel(
       contentWidth = savedWidth ?? previousWidth.current ?? normalWidth;
     }
   }
+  const preferredPanelWidth = Math.max(minWidthPx, contentWidth);
   // Clamped at render time only — the stores keep the user's preferred widths,
   // so a temporary squeeze (sidebar opening) is undone when the space returns.
   const resolvedWidth = clamp(
     contentWidth,
     browserId !== null && contentWidth < MIN_WIDTH_PX ? contentWidth : minWidthPx,
     reservedPx,
+    chatMinWidthPx,
   );
   // Drives the drag listeners' lifecycle: they mount only while a drag is
   // live, so there's no idle window-level mousemove handler firing during
@@ -336,6 +340,8 @@ export function useResizableInlinePanel(
   minWidthRef.current = minWidthPx;
   const reservedRef = useRef(reservedPx);
   reservedRef.current = reservedPx;
+  const chatMinRef = useRef(chatMinWidthPx);
+  chatMinRef.current = chatMinWidthPx;
   const persistEnabledRef = useRef(persistEnabled);
   persistEnabledRef.current = persistEnabled;
   // Frozen at mousedown so a mode switch mid-drag (rail content changing
@@ -377,7 +383,9 @@ export function useResizableInlinePanel(
     function onResize() {
       setStoredWidth((prev) => {
         const base = preferredWidth ?? prev;
-        return base !== null ? clamp(base, minWidthRef.current) : defaultWidthPx();
+        return base !== null
+          ? clamp(base, minWidthRef.current, 0, chatMinRef.current)
+          : defaultWidthPx();
       });
       // Force a re-render even when the stored width is unchanged, so the
       // render-time reserve clamp re-runs against the new viewport.
@@ -414,6 +422,7 @@ export function useResizableInlinePanel(
           resolvedWidth + (e.key === "ArrowLeft" ? step : -step),
           minWidthRef.current,
           reservedRef.current,
+          chatMinRef.current,
         );
         setBrowserWidth(browserId, next);
         persistBrowserTarget(next);
@@ -422,26 +431,46 @@ export function useResizableInlinePanel(
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         if (wide) {
-          const next = clamp(resolvedWidth + step, minWidthRef.current, reservedRef.current);
+          const next = clamp(
+            resolvedWidth + step,
+            minWidthRef.current,
+            reservedRef.current,
+            chatMinRef.current,
+          );
           setWideWidth(next);
           writePanelSizePreference("inlinePanelWideWidthPx", next);
         } else {
           setStoredWidth(
             (prev) =>
-              clamp((prev ?? resolvedWidth) + step, minWidthRef.current, reservedRef.current),
+              clamp(
+                (prev ?? resolvedWidth) + step,
+                minWidthRef.current,
+                reservedRef.current,
+                chatMinRef.current,
+              ),
             true,
           );
         }
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
         if (wide) {
-          const next = clamp(resolvedWidth - step, minWidthRef.current, reservedRef.current);
+          const next = clamp(
+            resolvedWidth - step,
+            minWidthRef.current,
+            reservedRef.current,
+            chatMinRef.current,
+          );
           setWideWidth(next);
           writePanelSizePreference("inlinePanelWideWidthPx", next);
         } else {
           setStoredWidth(
             (prev) =>
-              clamp((prev ?? resolvedWidth) - step, minWidthRef.current, reservedRef.current),
+              clamp(
+                (prev ?? resolvedWidth) - step,
+                minWidthRef.current,
+                reservedRef.current,
+                chatMinRef.current,
+              ),
             true,
           );
         }
@@ -465,12 +494,14 @@ export function useResizableInlinePanel(
       if (dragBrowserRef.current !== null) {
         setBrowserWidth(
           dragBrowserRef.current,
-          clamp(pending, minWidthRef.current, reservedRef.current),
+          clamp(pending, minWidthRef.current, reservedRef.current, chatMinRef.current),
         );
       } else if (dragWideRef.current) {
-        setWideWidth(clamp(pending, minWidthRef.current, reservedRef.current));
+        setWideWidth(clamp(pending, minWidthRef.current, reservedRef.current, chatMinRef.current));
       } else {
-        setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
+        setStoredWidth(
+          clamp(pending, minWidthRef.current, reservedRef.current, chatMinRef.current),
+        );
       }
       pending = null;
     }
@@ -528,5 +559,10 @@ export function useResizableInlinePanel(
     [onMouseDown, onKeyDown, persistEnabled],
   );
 
-  return { panelWidth: resolvedWidth, handleProps, isDragging };
+  return {
+    panelWidth: resolvedWidth,
+    preferredContentWidth: preferredPanelWidth + chatMinWidthPx + GAP_PX,
+    handleProps,
+    isDragging,
+  };
 }

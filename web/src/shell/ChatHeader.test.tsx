@@ -94,6 +94,7 @@ function renderHeader(props: {
   wrapperLabel?: string | null;
   canShare?: boolean;
   canFork?: boolean;
+  forkDisabledReason?: string;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
@@ -132,6 +133,7 @@ function renderHeader(props: {
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
             canFork={props.canFork ?? false}
+            forkDisabledReason={props.forkDisabledReason}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
@@ -1010,6 +1012,28 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
 
     expect(onFork).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("disables the fallback Fork menu (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      actionConversation: null,
+      canFork: true,
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      onFork,
+    });
+    fireEvent.pointerDown(
+      screen.getByTestId(mobile ? "session-actions-menu" : "desktop-fork-actions-menu"),
+      { button: 0 },
+    );
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(onFork).not.toHaveBeenCalled();
   });
 
   it("folds the workspace-rail entries into the one mobile kebab", () => {

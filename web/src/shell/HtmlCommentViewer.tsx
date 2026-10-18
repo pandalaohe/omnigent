@@ -13,8 +13,10 @@
 // and in-bundle links resolve inside the bundle and the server inlines the
 // bridge into every panel page. Embed mode (a host fetcher is configured, which
 // cannot carry an iframe `src`) keeps the client-injected srcdoc.
+// Embedded hosts may supply their own isolated frame.
 
 import { createPortal } from "react-dom";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon, MousePointerClickIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
@@ -28,7 +30,7 @@ import {
 } from "@/hooks/useArtifactLink";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { useIsEmbedded } from "@/lib/embedded";
-import { getEmbedRoot, hasOmnigentHostFetcher } from "@/lib/host";
+import { getEmbedRoot, getOmnigentHtmlPreviewFrame, hasOmnigentHostFetcher } from "@/lib/host";
 import { withBasePath } from "@/lib/basePath";
 import { randomUUID } from "@/lib/randomUUID";
 import { showToast } from "@/components/ui/toast";
@@ -337,9 +339,10 @@ export function HtmlCommentViewer({
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const isEmbed = hasOmnigentHostFetcher();
+  const HtmlPreviewFrame = isEmbed ? getOmnigentHtmlPreviewFrame() : null;
   const openFile = useFileViewer();
   const { root: workspaceRoot, home: workspaceHome } = useWorkspacePaths();
-  const loadBridgeExternally = useIsEmbedded();
+  const loadBridgeExternally = useIsEmbedded() && !HtmlPreviewFrame;
 
   // Embed mode cannot carry an iframe `src` through the host fetcher: it keeps
   // the client-injected srcdoc (bridge + fresh nonce per content load, which
@@ -405,6 +408,16 @@ export function HtmlCommentViewer({
   const setIframeNode = useCallback((el: HTMLIFrameElement | null) => {
     iframeRef.current = el;
     setIframeEl(el);
+  }, []);
+  const loadHandlerRef = useRef<(() => void) | null>(null);
+  const handlePreviewLoad = useCallback(() => {
+    if (!iframeRef.current) {
+      console.warn(
+        "HTML comment bridge cannot connect: preview frame did not expose its content window.",
+      );
+      return;
+    }
+    loadHandlerRef.current?.();
   }, []);
   const portRef = useRef<MessagePort | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
@@ -686,7 +699,12 @@ export function HtmlCommentViewer({
         entryDocumentLoadedRef.current = true;
       }
       const win = iframe.contentWindow;
-      if (!win) return;
+      if (!win) {
+        console.warn(
+          "HTML comment bridge cannot connect: preview frame did not expose its content window.",
+        );
+        return;
+      }
       channel?.port1.close();
       channel = new MessageChannel();
       channel.port1.onmessage = (ev) => handleInbound(ev.data);
@@ -706,15 +724,15 @@ export function HtmlCommentViewer({
       }, BRIDGE_READY_TIMEOUT_MS);
     };
 
-    iframe.addEventListener("load", onLoad);
+    loadHandlerRef.current = onLoad;
     return () => {
       navGenRef.current += 1;
-      iframe.removeEventListener("load", onLoad);
+      loadHandlerRef.current = null;
       clearReadyTimer();
       channel?.port1.close();
       portRef.current = null;
     };
-  }, [nonce, isEmbed, path, entry, showPage, frameVisible]);
+  }, [nonce, isEmbed, path, entry, showPage, frameVisible, iframeEl]);
 
   // Push comment-list changes into the frame.
   useEffect(() => {
@@ -794,14 +812,24 @@ export function HtmlCommentViewer({
     entry && !refreshError ? (
       <iframe
         ref={setIframeNode}
+        onLoad={handlePreviewLoad}
         src={withBasePath(entry.url)}
         sandbox={HTML_PANEL_SANDBOX}
         title="HTML preview"
         className="w-full h-full border-0"
       />
+    ) : embedDoc && HtmlPreviewFrame ? (
+      <HtmlPreviewFrame
+        key={embedDoc.nonce}
+        htmlContent={embedDoc.srcDoc}
+        iframeRef={setIframeNode}
+        onLoad={handlePreviewLoad}
+      />
     ) : embedDoc ? (
       <iframe
+        key={embedDoc.nonce}
         ref={setIframeNode}
+        onLoad={handlePreviewLoad}
         srcDoc={embedDoc.srcDoc}
         sandbox={HTML_PREVIEW_SANDBOX}
         title="HTML preview"
@@ -857,7 +885,7 @@ export function HtmlCommentViewer({
           <button
             data-add-comment-btn
             type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            className={`fixed z-50 ${ADD_COMMENT_BUTTON_CLASS_NAME}`}
             style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
             onClick={() => {
               onSetActiveSelection({

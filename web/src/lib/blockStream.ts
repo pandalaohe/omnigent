@@ -936,6 +936,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         source: event.source,
         toolName: event.toolName,
         cwd: event.cwd,
+        agyPermission: event.agyPermission,
       } satisfies ElicitationBlock;
       return;
     }

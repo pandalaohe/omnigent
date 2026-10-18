@@ -113,7 +113,7 @@ export async function listProjects(): Promise<Project[]> {
 /** Fetch a single project (including its `config`) by id. 404s if not owned. */
 export async function getProject(id: string): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`);
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 

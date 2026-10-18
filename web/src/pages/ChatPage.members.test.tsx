@@ -141,6 +141,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     disabled: false,
     onSend: vi.fn(),
     onStop: vi.fn(),
+    onNewSession: vi.fn(),
     agents: undefined,
     agentsLoading: false,
     selectedAgentId: null,

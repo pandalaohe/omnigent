@@ -52,6 +52,20 @@ export interface ElicitationSource {
 }
 
 /**
+ * Antigravity (agy) permission-prompt details the approval card must
+ * surface to match agy's own TUI prompt. ``actionDescription`` is what
+ * agy says it wants to do (e.g. "Running pwd command");
+ * ``alwaysAllowPattern`` is the persist pattern agy's prompt offers to
+ * always-allow, when it offers one. Shared by the elicitation event
+ * (`events.ts`), the reduced block (`blocks.ts`), and the ApprovalCard
+ * that renders the description and the "Always allow" button.
+ */
+export interface AgyPermission {
+  actionDescription: string | null;
+  alwaysAllowPattern: string | null;
+}
+
+/**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
  * POST time (the transcript forwarder is the single writer), so the
@@ -619,6 +633,8 @@ export interface SandboxStatus {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error?: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`; absent from older servers. */
+  provider?: string | null;
 }
 
 /** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */

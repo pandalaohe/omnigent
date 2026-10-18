@@ -16,19 +16,21 @@ from omnigent.server.feature_flags import (
 
 
 @pytest.mark.parametrize("environ", [{}, {FEATURES_ENV_VAR: ""}])
-def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
+def test_unset_or_empty_disables_every_feature(environ: dict[str, str]) -> None:
     flags = resolve_feature_flags(environ)
 
-    assert flags.enabled_features == frozenset({Feature.HARNESS_SETTINGS_UI})
+    assert flags.enabled_features == frozenset()
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
         "arca_shutdown_warnings": False,
-        "harness_settings_ui": True,
         # Deprecated no-op: always true for old clients that gate the tab on it.
         "project_assignments": True,
         "session_peer_messaging": False,
+        "import_review": False,
+        "custom_agents_settings_ui": False,
+        "sidebar_grouping_ui": False,
     }
 
 
@@ -43,20 +45,12 @@ def test_project_assignments_is_accepted_as_a_deprecated_no_op() -> None:
     assert "0.17.0" in definition.description
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        " usage_page, harness_install,usage_page ",
-        "usage_page,harness_install,harness_settings_ui",
-    ],
-)
-def test_resolves_comma_separated_enabled_set(raw: str) -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: raw})
+def test_resolves_comma_separated_enabled_set() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: " usage_page, harness_install,usage_page "})
 
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
-    assert flags.frontend_dict()["harness_settings_ui"] is True
-    assert flags.enabled_names() == ("harness_install", "harness_settings_ui", "usage_page")
+    assert flags.enabled_names() == ("harness_install", "usage_page")
 
 
 def test_empty_entries_are_ignored() -> None:
@@ -79,7 +73,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
 
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
-    assert flags.enabled_names() == ("canvas", "harness_settings_ui")
+    assert flags.enabled_names() == ("canvas",)
 
 
 def test_arca_shutdown_warnings_are_frontend_visible() -> None:
@@ -115,7 +109,7 @@ def test_session_peer_messaging_flag_resolves() -> None:
 
     assert flags.enabled(Feature.SESSION_PEER_MESSAGING)
     assert flags.frontend_dict()["session_peer_messaging"] is True
-    assert flags.enabled_names() == ("harness_settings_ui", "session_peer_messaging")
+    assert flags.enabled_names() == ("session_peer_messaging",)
 
 
 def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
@@ -123,6 +117,4 @@ def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
     for definition in FEATURE_DEFINITIONS:
         assert definition.owner
         assert definition.review_by_release
-        assert FeatureFlags().enabled(definition.feature) == (
-            definition.feature is Feature.HARNESS_SETTINGS_UI
-        )
+        assert not FeatureFlags().enabled(definition.feature)

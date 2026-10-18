@@ -582,7 +582,15 @@ def register_resource_routes(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi", "devin", "kiro", "goose", "qwen", "hermes"):
+            elif terminal_name in (
+                "cursor",
+                "kimi",
+                "devin",
+                "goose",
+                "hermes",
+                "kiro",
+                "qwen",
+            ):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -1665,7 +1673,7 @@ def register_resource_routes(
         )
         fs = CallerProcessFilesystem(env)
         result = await fs.delete(relative_path, recursive=recursive)
-        if filesystem_registry is not None and result.type == "file":
+        if filesystem_registry is not None and result.type in ("file", "symlink"):
             filesystem_registry.record_change(relative_path, "deleted", session_id)
         return JSONResponse(
             status_code=200,

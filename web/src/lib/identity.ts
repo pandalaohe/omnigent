@@ -23,6 +23,7 @@ import {
   getOmnigentServerIdentity,
   hostFetch,
   isDatabricksWorkspace,
+  isHostRoutingEnabled,
 } from "./host";
 import {
   clearHostKeyless,
@@ -167,9 +168,9 @@ const SESSION_SUBPATH_RE = /\/v1\/sessions\/([^/?#]+)\/[^?#]/;
  * keys correctly on the first attempt. Returns the in-flight resolve to await,
  * or `null` when there's nothing to do — callers only await a non-null result.
  *
- * Normal lookups require an embedded fetcher and run once per session/page.
- * A routing miss may force a fresh hostless lookup, including workspace dev
- * mode. Known hosts are reused; resolver failures remain best-effort.
+ * Normal lookups require an embedded fetcher or OSS host routing and run once
+ * per session/page. A routing miss may force a fresh hostless lookup, including
+ * workspace dev mode. Known hosts are reused; resolver failures are ignored.
  *
  * Concurrent callers in one tick share ONE resolve: the first creates the
  * promise synchronously through the `.set()`, the rest read and await it. Both
@@ -181,11 +182,10 @@ export function resolveSessionHost(
   sessionId: string,
   options: SessionHostResolveOptions = {},
 ): Promise<void> | null {
-  if (
-    _sessionHostResolver === null ||
-    (!getOmnigentHostConfig().fetcher && !(options.force && isDatabricksWorkspace()))
-  )
-    return null;
+  const canResolve =
+    getOmnigentHostConfig().fetcher != null ||
+    (isDatabricksWorkspace() ? options.force === true : isHostRoutingEnabled());
+  if (_sessionHostResolver === null || !canResolve) return null;
   if (getSessionHost(sessionId) !== null) return null;
   const refresh = _hostRefreshInFlight.get(sessionId);
   if (refresh !== undefined) return refresh;
@@ -202,11 +202,17 @@ export function resolveSessionHost(
         )
       : resolver(sessionId);
     inFlight = lookup
+      .then(() => {
+        _hostResolveAttempted.add(sessionId);
+      })
       .catch(() => {
         // Best-effort — leave the map unseeded and fall through to modal/keyless.
+        // Keep managed lookups one-shot; OSS retries on the next request.
+        if (isDatabricksWorkspace()) {
+          _hostResolveAttempted.add(sessionId);
+        }
       })
       .finally(() => {
-        _hostResolveAttempted.add(sessionId);
         pending.delete(sessionId);
       });
     pending.set(sessionId, inFlight);
@@ -237,10 +243,23 @@ function beginSessionHostResolve(url: string): Promise<void> | null {
 // {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
 // and the host-mediated local import (POST /v1/imports/local[/stream]).
 const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
+// A managed fork keys like a managed create: its launch must run where its own
+// new host connects, never on the source session's replica.
+const FORK_RE = /\/v1\/sessions\/[^/?#]+\/fork(?:\?|$)/;
+
+function isManagedForkRequest(url: string, body: BodyInit | null | undefined): boolean {
+  if (typeof body !== "string" || !FORK_RE.test(url)) return false;
+  try {
+    return (JSON.parse(body) as { host_type?: unknown }).host_type === "managed";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Recover the target host_id from a JSON request body for a body-host-keyed
- * request ({@link isBodyHostKeyedRequest}), or null when the body names none.
+ * request ({@link isBodyHostKeyedRequest}) or a managed fork, or null when the
+ * body names none.
  *
  * These requests carry the host in the body, not the URL, so left unkeyed they
  * round-robin and can miss the replica holding that host's runner tunnel. A
@@ -248,13 +267,16 @@ const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/
  * inline over its pod-local tunnel); an import fails "host is not connected"
  * (the import reads the host's transcripts over that same tunnel). Keying by the
  * body host_id pins both to the right replica like every other host-scoped
- * request. Bundled (multipart) creates are hostless here (non-string body) and a
- * managed-sandbox create carries ``host_type`` but no ``host_id``; both yield
- * null → unkeyed (see {@link isBodyHostKeyedRequest}).
+ * request. A managed-sandbox create's ``host_id`` is the id it chose for its
+ * new sandbox host, so the launch runs where that host's tunnel will land.
+ * A managed fork's ``host_id`` is the same choice. Bundled (multipart) creates
+ * are hostless here (non-string body), as is a managed create or fork without
+ * one; all yield null → unkeyed (see
+ * {@link isBodyHostKeyedRequest}).
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
   if (typeof body !== "string") return null;
-  if (!BODY_HOST_KEYED_RE.test(url)) return null;
+  if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url)) return null;
   try {
     const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
@@ -269,9 +291,10 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  * The modal host is a cache-affinity hint for reads, but these requests have a
  * side effect pinned to a replica and must key by their OWN target host:
  *
- * - A managed create has no host_id yet and stays unkeyed. If the new host
- *   connects elsewhere, its first message must resolve the assigned host and
- *   re-address after wrong_replica. A create that names a host keeps that key.
+ * - A managed create keys by the host_id it chose for its sandbox host. One
+ *   without a host_id stays unkeyed: if the new host connects elsewhere, its
+ *   first message must resolve the assigned host and re-address after
+ *   wrong_replica. A create that names a host keeps that key.
  * - A local import reads the chosen host's transcripts over its tunnel, which is
  *   registered on the replica keyed by that host_id — never the importing user's
  *   modal host (null / a different host for a fresh user), which is why an
@@ -299,6 +322,15 @@ let identityConnectionId: string | null = null;
 // Bumped when resolveIdentity sees a new Server connection, so a lookup or header
 // from before an A->B->A round trip is never taken for the current one.
 let identityEpoch = 0;
+// A `/v1/me` that fails in transit says nothing about the viewer, so it is
+// retried rather than cached. Retries run only while `subscribeIdentity` has
+// listeners, so an unwatched probe never leaves a timer behind.
+const IDENTITY_RETRY_INITIAL_MS = 1_000;
+const IDENTITY_RETRY_MAX_MS = 30_000;
+const identityListeners = new Set<() => void>();
+let identityRetryPending = false;
+let identityRetryDelayMs = IDENTITY_RETRY_INITIAL_MS;
+let identityRetryTimer: ReturnType<typeof setTimeout> | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
 // path per provider — "/login" for accounts, "/auth/login" for OIDC.
@@ -375,8 +407,101 @@ function isOnLoginPath(): boolean {
 }
 
 /**
+ * Whether a non-2xx `/v1/me` status may change on retry. A 401 or another
+ * 4xx is the server's answer (signed out, route missing); 5xx, 408, and 429
+ * come from an overloaded server or the gateway in front of it.
+ */
+function isTransientIdentityStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429;
+}
+
+/**
+ * Probe ``GET /v1/me`` once and record the identity it reports.
+ *
+ * :returns: True when the outcome is final, False when the request failed
+ *     in a way a retry can fix.
+ */
+async function probeIdentity(
+  epoch: number,
+  connectionId: string,
+  stablePreferenceServerId: string,
+): Promise<boolean | null> {
+  try {
+    const res = await hostFetch("/v1/me");
+    if (!identityIsCurrent(epoch, connectionId)) return null;
+    if (res.status === 401) {
+      // OIDC / accounts mode: server requires authentication.
+      // Redirect to the login URL provided in the response body —
+      // unless we're already there (avoid an infinite reload loop
+      // when the LoginPage itself calls resolveIdentity).
+      try {
+        const data = (await res.json()) as {
+          user_id: null;
+          login_url?: string;
+        };
+        if (!identityIsCurrent(epoch, connectionId)) return null;
+        if (data.login_url) {
+          serverLoginUrl = data.login_url;
+          if (!isOnLoginPath()) {
+            redirectToLogin(data.login_url);
+          }
+        }
+      } catch {
+        // Response body was not JSON — still a signed-out answer.
+      }
+      return true;
+    }
+    if (res.ok) {
+      const data = (await res.json()) as {
+        user_id: string | null;
+        is_admin?: boolean;
+        preferences?: unknown | null;
+      };
+      if (!identityIsCurrent(epoch, connectionId)) return null;
+      currentUserId = data.user_id;
+      currentIsAdmin = data.is_admin ?? false;
+      await initializeUserPreferencesSync(
+        data.preferences,
+        authenticatedFetch,
+        data.user_id,
+        stablePreferenceServerId,
+        connectionId,
+        () => identityIsCurrent(epoch, connectionId),
+      );
+      if (!identityIsCurrent(epoch, connectionId)) return null;
+      return true;
+    }
+    return !isTransientIdentityStatus(res.status);
+  } catch {
+    // Server unreachable, connection dropped, or the body was cut off.
+    return false;
+  }
+}
+
+function cancelIdentityRetry(): void {
+  if (identityRetryTimer === null) return;
+  clearTimeout(identityRetryTimer);
+  identityRetryTimer = null;
+}
+
+function scheduleIdentityRetry(): void {
+  if (!identityRetryPending || identityRetryTimer !== null || identityListeners.size === 0) {
+    return;
+  }
+  identityRetryTimer = setTimeout(() => {
+    identityRetryTimer = null;
+    // Grow the delay only when a retry runs; a cancelled timer made no request.
+    identityRetryDelayMs = Math.min(identityRetryDelayMs * 2, IDENTITY_RETRY_MAX_MS);
+    void resolveIdentity();
+  }, identityRetryDelayMs);
+}
+
+/**
  * Fetch the current user identity from the server.
  * Called once on app load; subsequent calls return the cached value.
+ * A transient failure resolves to null without being cached: the next
+ * call probes again, and while {@link subscribeIdentity} has listeners
+ * the probe is retried with backoff.
  *
  * When the server returns 401 with a ``login_url`` (OIDC mode),
  * redirects the browser to the login page.
@@ -393,71 +518,53 @@ export async function resolveIdentity(): Promise<string | null> {
     currentIsAdmin = false;
     serverLoginUrl = null;
     deactivateUserPreferencesSync();
+    identityRetryPending = false;
+    identityRetryDelayMs = IDENTITY_RETRY_INITIAL_MS;
+    cancelIdentityRetry();
   }
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
   const epoch = identityEpoch;
-  // A lookup whose connection was replaced writes nothing. If no newer lookup
-  // replaced it, the next resolve starts a fresh lookup instead of reusing this null.
-  const discardStale = (): null => {
-    if (epoch === identityEpoch) identityPromise = null;
-    return null;
+  const attempt = probeIdentity(epoch, preferenceConnectionId, stablePreferenceServerId).then(
+    (final) => {
+      // A lookup from an earlier Server connection must not complete the current
+      // promise, schedule retries, or notify the new connection's subscribers.
+      if (!identityIsCurrent(epoch, preferenceConnectionId)) {
+        if (epoch === identityEpoch) identityPromise = null;
+        return null;
+      }
+      identityPromise = null;
+      if (final) {
+        identityResolved = true;
+        identityRetryPending = false;
+        cancelIdentityRetry();
+      } else {
+        identityRetryPending = true;
+        scheduleIdentityRetry();
+      }
+      for (const listener of identityListeners) listener();
+      return currentUserId;
+    },
+  );
+  identityPromise = attempt;
+  return attempt;
+}
+
+/**
+ * Watch the viewer identity. The listener runs after each ``/v1/me`` probe
+ * settles; while any listener is attached, a transient failure is retried
+ * with backoff.
+ *
+ * :param listener: Called with no arguments; read {@link getCurrentUserId}.
+ * :returns: A function that detaches the listener.
+ */
+export function subscribeIdentity(listener: () => void): () => void {
+  identityListeners.add(listener);
+  scheduleIdentityRetry();
+  return () => {
+    identityListeners.delete(listener);
+    if (identityListeners.size === 0) cancelIdentityRetry();
   };
-  identityPromise = (async () => {
-    try {
-      const res = await hostFetch("/v1/me");
-      if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
-      if (res.status === 401) {
-        // OIDC / accounts mode: server requires authentication.
-        // Redirect to the login URL provided in the response body —
-        // unless we're already there (avoid an infinite reload loop
-        // when the LoginPage itself calls resolveIdentity).
-        try {
-          const data = (await res.json()) as {
-            user_id: null;
-            login_url?: string;
-          };
-          if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
-          if (data.login_url) {
-            serverLoginUrl = data.login_url;
-            if (!isOnLoginPath()) {
-              redirectToLogin(data.login_url);
-              return null;
-            }
-          }
-        } catch {
-          // Response body was not JSON — fall through.
-        }
-      }
-      if (res.ok) {
-        const data = (await res.json()) as {
-          user_id: string | null;
-          is_admin?: boolean;
-          preferences?: unknown | null;
-        };
-        if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
-        currentUserId = data.user_id;
-        currentIsAdmin = data.is_admin ?? false;
-        await initializeUserPreferencesSync(
-          data.preferences,
-          authenticatedFetch,
-          data.user_id,
-          stablePreferenceServerId,
-          preferenceConnectionId,
-          () => identityIsCurrent(epoch, preferenceConnectionId),
-        );
-        // The preference initialization above awaits network work; the Server
-        // may have switched while it was in flight.
-        if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
-      }
-    } catch {
-      // Server unreachable — leave as null.
-    }
-    if (!identityIsCurrent(epoch, preferenceConnectionId)) return discardStale();
-    identityResolved = true;
-    return currentUserId;
-  })();
-  return identityPromise;
 }
 
 /** Return the cached user ID (null before resolveIdentity completes). */
@@ -574,13 +681,9 @@ export async function authenticatedFetch(
     headers.set("X-Forwarded-Email", currentUserId);
     stampedUser = true;
   }
-  // Pin host- and session-scoped requests to the replica holding that host's
-  // runner tunnel (key = host_id). Derived centrally so no call site has to
-  // thread it; a caller that set the header explicitly wins, and non-host-scoped
-  // requests get no key (any replica). Only against a Databricks workspace-hosted
-  // server — the embedded (managed) UI, or `npm run dev` pointed at a workspace URL.
-  // A standalone/self-hosted server has no Dicer, so the key would just dirty
-  // its logs (see isDatabricksWorkspace).
+  // Route host-scoped requests with that host's key; other requests may use
+  // the modal host for cache affinity. An explicit caller header wins.
+  // OSS ingress deployments opt in to this routing.
   const url = typeof input === "string" ? input : input.toString();
   // Resolve this session's host BEFORE deriving the slice key below, so a fresh
   // session sub-path request keys to the right replica on the first attempt
@@ -596,7 +699,7 @@ export async function authenticatedFetch(
   // The host this request is FOR, even when we deliberately send it keyless
   // (demoted). Lets the retry logic below demote/un-demote the right host.
   let derivedHostId: string | null = null;
-  if (!headers.has(SLICE_KEY_HEADER) && isDatabricksWorkspace()) {
+  if (!headers.has(SLICE_KEY_HEADER) && isHostRoutingEnabled()) {
     // Key by the request's OWN host when it's host-scoped; otherwise (a
     // cross-host / DB-backed read) fall back to the modal host as a
     // cache-affinity hint. The distinction matters: a host-scoped request whose
@@ -608,7 +711,9 @@ export async function authenticatedFetch(
     // it is keyable ONLY by that body host_id (a managed create with none stays
     // unkeyed).
     const scope = hostScopeForUrl(url);
-    if (scope.scoped) {
+    if (isManagedForkRequest(url, init?.body)) {
+      derivedHostId = hostIdFromBody(url, init?.body);
+    } else if (scope.scoped) {
       derivedHostId = scope.hostId;
     } else if (isBodyHostKeyedRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
@@ -621,7 +726,7 @@ export async function authenticatedFetch(
     // server-side wrong-replica guard: once demoted, every request for this host
     // goes keyless from the start and reaches the tunnel first try. A demoted
     // host that still returns wrong_replica keyless is un-demoted below.
-    if (derivedHostId && !isHostKeyless(derivedHostId)) {
+    if (derivedHostId && (!isDatabricksWorkspace() || !isHostKeyless(derivedHostId))) {
       headers.set(SLICE_KEY_HEADER, derivedHostId);
       stampedSliceKey = true;
     }
@@ -650,7 +755,7 @@ export async function authenticatedFetch(
   // the host registered under, so we can't know up front — try keyed, then fall
   // back). Only when WE stamped the key; a genuinely-offline runner returns
   // runner_unavailable and is not re-addressed here.
-  if (stampedSliceKey && (await _isWrongReplica(res))) {
+  if (isDatabricksWorkspace() && stampedSliceKey && (await _isWrongReplica(res))) {
     // A retry after a Server switch would reach the new Server with the old
     // request, so it is skipped.
     if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
@@ -700,6 +805,7 @@ export async function authenticatedFetch(
       }
     }
   } else if (
+    isDatabricksWorkspace() &&
     derivedHostId &&
     !stampedSliceKey &&
     isHostKeyless(derivedHostId) &&

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -141,6 +142,9 @@ from omnigent.native.native_terminal import (
 )
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.native.native_terminal import (
+    request_with_429_retry as _request_with_429_retry,
 )
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
@@ -5712,7 +5716,7 @@ def _is_resumable_claude_transcript(
 
 
 class _ResumeHistoryUnavailableError(click.ClickException):
-    """Server history stayed unreachable after every page-size retry.
+    """Server history stayed unreachable after every page-size or 429 retry.
 
     Distinct from a plain :class:`click.ClickException` so callers can tell
     "the backend cannot serve the rows right now" (a local-transcript
@@ -5745,9 +5749,12 @@ async def _fetch_all_session_items_for_claude_resume(
         if after is not None:
             params["after"] = after
         try:
-            resp = await client.get(
-                f"/v1/sessions/{url_component(session_id)}/items",
-                params=params,
+            resp = await _request_with_429_retry(
+                functools.partial(
+                    client.get,
+                    f"/v1/sessions/{url_component(session_id)}/items",
+                    params=params,
+                )
             )
         except httpx.TransportError as exc:
             # A backend choking on one oversized page can also drop the
@@ -5782,7 +5789,9 @@ async def _fetch_all_session_items_for_claude_resume(
                 limit,
             )
             continue
-        if resp.status_code >= 500:
+        if resp.status_code >= 500 or resp.status_code == 429:
+            # Throttling that outlasts the retries is the server being busy,
+            # not a rejection, so the local-transcript fallback still applies.
             raise _ResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r} "
                 f"({resp.status_code}): {error_text(resp)}"
@@ -5875,8 +5884,17 @@ def _claude_transcript_records_from_session_items(
     tool_parent_by_call_id: dict[str, str] = {}
     tool_names_by_call_id: dict[str, str] = {}
     terminal_tasks: dict[str, _JsonObject] = {}
+    snapshot_item_ids: set[str] = set()
     previous_item: _JsonObject | None = None
     for index, item in enumerate(items):
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id in snapshot_item_ids:
+            continue
+        # A forwarder retry that slipped past idempotency persists as an
+        # adjacent row identical in everything but the store envelope
+        # (id/created_at). Drop it so store duplicates don't become
+        # duplicated model context on every resume; genuine adjacent
+        # repeats differ in payload or response_id and survive.
         if previous_item is not None and _transcript_items_equal_ignoring_envelope(
             item,
             previous_item,
@@ -5913,6 +5931,7 @@ def _claude_transcript_records_from_session_items(
                 records.clear()
                 parent_uuid = None
                 tool_parent_by_call_id.clear()
+                snapshot_item_ids.clear()
                 authoritative = _is_authoritative_claude_compaction(item)
                 if authoritative:
                     # Emit a compact_boundary system record so Claude
@@ -5969,6 +5988,16 @@ def _claude_transcript_records_from_session_items(
                     if cm_record is not None:
                         records.append(cm_record)
                         parent_uuid = cm_uuid
+                        source_ids = compacted_message.get("forwarded_source_ids")
+                        if isinstance(source_ids, list):
+                            snapshot_item_ids.update(
+                                uuid.uuid5(
+                                    uuid.NAMESPACE_URL,
+                                    f"omnigent-external-item:{session_id}:{source_id}",
+                                ).hex
+                                for source_id in source_ids
+                                if isinstance(source_id, str)
+                            )
             continue
         record_uuid = _synthetic_claude_transcript_uuid(
             session_id=session_id,

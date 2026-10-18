@@ -57,7 +57,7 @@ describe("CreateAgentDialog", () => {
     // full-width fields need horizontal padding or their 3px focus ring is
     // chopped at the container's left/right edges. Negative margins keep the fields
     // visually aligned with the dialog header/footer.
-    expect(scrollRegion).toHaveClass("px-3", "-mx-3", "py-2", "-my-2");
+    expect(scrollRegion).toHaveClass("px-1", "-mx-1", "overflow-y-auto");
     expect(scrollRegion).toContainElement(screen.getByTestId("badge-fields"));
     expect(scrollRegion).not.toContainElement(screen.getByTestId("create-agent-submit"));
   });
@@ -203,11 +203,47 @@ describe("CreateAgentDialog", () => {
     );
     expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
 
-    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "agent-1" } });
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: " agent-1 " } });
     expect(screen.queryByTestId("create-agent-name-error")).toBeNull();
     fireEvent.click(screen.getByTestId("create-agent-submit"));
     expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ name: "agent-1" }));
+    await waitFor(() => expect(screen.getByTestId("create-agent-name")).toHaveValue(""));
+    expect(screen.getByTestId("agent-member-agent-model-value")).toHaveTextContent("Default");
   });
+
+  it("only creates on an explicit click, not Enter in a field", async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn();
+    renderDialog({ onCreate });
+    await user.type(screen.getByTestId("create-agent-name"), "agent-1");
+    await choose("agent-member-model", "agent-member-model-opus");
+    await user.type(screen.getByTestId("create-agent-name"), "{Enter}");
+    expect(onCreate).not.toHaveBeenCalled();
+    await user.click(screen.getByTestId("create-agent-submit"));
+    expect(onCreate).toHaveBeenCalledOnce();
+  });
+
+  it.each(["Cancel", "Close"])(
+    "resets the draft on %s without relying on unmount",
+    async (action) => {
+      const onOpenChange = vi.fn();
+      renderDialog({ onOpenChange });
+      for (const field of ["name", "description", "instructions"]) {
+        fireEvent.change(screen.getByTestId(`create-agent-${field}`), {
+          target: { value: "draft" },
+        });
+      }
+      await choose("agent-member-model", "agent-member-model-opus");
+      fireEvent.click(screen.getByTestId("create-agent-add-mcp"));
+      fireEvent.click(screen.getByRole("button", { name: action }));
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+      for (const field of ["name", "description", "instructions"]) {
+        expect(screen.getByTestId(`create-agent-${field}`)).toHaveValue("");
+      }
+      expect(screen.getByTestId("agent-member-agent-model-value")).toHaveTextContent("Default");
+      expect(screen.queryByTestId("create-agent-mcp-entry")).toBeNull();
+    },
+  );
 
   it("hides Import bundle without an import handler", () => {
     renderDialog();
@@ -243,7 +279,7 @@ describe("CreateAgentDialog", () => {
     expect(screen.getByTestId("create-agent-import")).not.toBeDisabled();
   });
 
-  it("locks Cancel and Create while an import is in flight", async () => {
+  it("locks dismissal and Create while an import is in flight", async () => {
     let finish: () => void = () => {};
     const onImport = vi.fn(
       () =>
@@ -251,7 +287,8 @@ describe("CreateAgentDialog", () => {
           finish = resolve;
         }),
     );
-    renderDialog({ onImport });
+    const onOpenChange = vi.fn();
+    renderDialog({ onImport, onOpenChange });
 
     fireEvent.change(screen.getByTestId("create-agent-import-input"), {
       target: { files: [bundle] },
@@ -259,7 +296,15 @@ describe("CreateAgentDialog", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled());
     expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
+    expect(screen.getByTestId("create-agent-name")).toBeEnabled();
+    expect(screen.getByTestId("create-agent-add-mcp")).toBeEnabled();
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "draft" } });
+    expect(screen.getByTestId("create-agent-name")).toHaveValue("draft");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onOpenChange).not.toHaveBeenCalled();
     finish();
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
     await waitFor(() => expect(screen.getByTestId("create-agent-import")).not.toBeDisabled());
+    expect(screen.getByTestId("create-agent-name")).toHaveValue("");
   });
 });

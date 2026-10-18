@@ -24,6 +24,7 @@ import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nat
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
+  isEmbedded: false,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
   bulkArchiveMutate: vi.fn(),
@@ -33,6 +34,7 @@ const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   worktreeStatusEnabled: false,
   importSessionsPanel: vi.fn(() => null),
+  enabledConnections: [] as string[],
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -65,13 +67,14 @@ const mocks = vi.hoisted(() => ({
 vi.mock("next-themes", () => ({
   useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
 }));
-vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => false }));
+vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
     worktree_status: mocks.worktreeStatusEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    enabled_connections: mocks.enabledConnections,
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
@@ -86,6 +89,7 @@ vi.mock("@/lib/identity", () => ({
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
   authenticatedFetch: mocks.authenticatedFetch,
+  subscribeIdentity: () => () => {},
 }));
 vi.mock("@/hooks/useConversations", async () => {
   return {
@@ -255,6 +259,9 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/components/McpRegistry", () => ({
+  McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -321,9 +328,11 @@ beforeEach(() => {
   mocks.bulkLockMutate.mockReset();
   mocks.bulkDeleteMutate.mockReset();
   mocks.theme = "system";
+  mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
   mocks.worktreeStatusEnabled = false;
   mocks.importSessionsPanel.mockClear();
+  mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -365,6 +374,21 @@ describe("Import sessions", () => {
     expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
     expect(mocks.importSessionsPanel).toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
+});
+
+describe("MCP settings", () => {
+  it("renders configured MCP accounts at their own URL", () => {
+    mocks.enabledConnections = ["mcp"];
+    renderPage("/settings/mcp");
+    expect(screen.getByText("mcp-accounts-stub")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "MCP" })).toBeInTheDocument();
+  });
+
+  it("explains a deep link when MCP is not configured", () => {
+    renderPage("/settings/mcp");
+    expect(screen.getByText("MCP services are not configured on this server.")).toBeInTheDocument();
+    expect(screen.queryByText("mcp-accounts-stub")).not.toBeInTheDocument();
   });
 });
 
@@ -637,6 +661,24 @@ describe("SettingsPage", () => {
     renderPage("/settings/mobile-controls");
     expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeInTheDocument();
     expect(screen.getByLabelText("Enable mobile floating assistant")).toBeInTheDocument();
+  });
+
+  it("opens the embedded host's theme settings in a new tab", () => {
+    mocks.isEmbedded = true;
+    const url = "https://workspace.example.com/settings/user/preferences";
+    vi.spyOn(host, "getOmnigentThemeSettingsUrl").mockReturnValue(url);
+    renderPage("/settings/appearance");
+
+    expect(screen.queryByTestId("theme-system")).not.toBeInTheDocument();
+    for (const name of [
+      "Click to open Databricks user preferences page.",
+      "Open Databricks preferences",
+    ]) {
+      const link = screen.getByRole("link", { name });
+      expect(link).toHaveAttribute("href", url);
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noreferrer");
+    }
   });
 
   it("renders the Terminal theme radiogroup with auto selected by default", () => {

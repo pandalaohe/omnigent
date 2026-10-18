@@ -222,6 +222,21 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def _process_start_stamp(proc: psutil.Process) -> float:
+    """Return ``proc``'s creation time on a clock that wall-clock steps can't move.
+
+    Linux ``create_time()`` adds ``/proc/stat`` btime, which shifts when NTP or a
+    hypervisor steps the clock; psutil 7 exposes the boot-relative start instead.
+    """
+    platform_create_time = getattr(getattr(proc, "_proc", None), "create_time", None)
+    if callable(platform_create_time):
+        with suppress(TypeError):  # psutil < 7 and non-Linux take no monotonic flag
+            stamp = platform_create_time(monotonic=True)
+            if isinstance(stamp, float):
+                return stamp
+    return proc.create_time()
+
+
 def native_server_pid(root_pid: int | None, subcommand: str) -> int | None:
     """Return the innermost native server pid under ``root_pid``, else None.
 
@@ -263,7 +278,7 @@ def _snapshot_identities(pid: int) -> dict[int, float]:
         if proc.pid <= 1 or proc.pid == os.getpid():
             continue
         with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            identities[proc.pid] = proc.create_time()
+            identities[proc.pid] = _process_start_stamp(proc)
     return identities
 
 
@@ -293,7 +308,7 @@ def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
             continue
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() != create_time:
+            if _process_start_stamp(proc) != create_time:
                 continue
             if force:
                 proc.kill()
@@ -310,7 +325,7 @@ def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
     for pid, create_time in identities.items():
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() != create_time:
+            if _process_start_stamp(proc) != create_time:
                 continue
             # An unreaped leader still reserves its PID/group on macOS even
             # though getpgid can no longer resolve the zombie.

@@ -429,8 +429,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         :param server_client: Omnigent server client (unused).
         :param ensure_comment_relay: Comment relay hook threaded by the
             recreate path (unused by the stub).
-        :param agent_spec: Resolved agent spec threaded by the recreate
-            path (unused by the stub; see the dedicated wiring test below).
+        :param agent_spec: Session agent spec threaded by the recreate path so
+            the pane inherits its ``os_env`` (unused by the stub).
         :param global_instructions: Server-held global instructions text
             threaded by the recreate path (unused by the stub).
         :returns: Terminal resource view for the fresh pane.

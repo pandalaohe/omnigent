@@ -1,4 +1,10 @@
-import { useInfiniteQuery, useQuery, type QueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { NATIVE_SUBAGENT_WRAPPER_LABELS, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { setSessionParent } from "@/lib/sessionHost";
@@ -190,6 +196,11 @@ export function childSessionsQueryKey(conversationId: string): readonly unknown[
   return ["conversation", conversationId, "child_sessions"];
 }
 
+/** True for any key built by ``childSessionsQueryKey``. */
+function isChildSessionsQueryKey(key: readonly unknown[]): boolean {
+  return key.length === 3 && key[0] === "conversation" && key[2] === "child_sessions";
+}
+
 /**
  * Walk the cached child-session lists to test whether ``targetId`` is
  * a known descendant of ``rootId``.
@@ -214,6 +225,26 @@ export function cachedTreeContains(
   targetId: string,
   maxDepth: number,
 ): boolean {
+  return findCachedDescendant(queryClient, rootId, targetId, maxDepth) !== null;
+}
+
+/**
+ * Find ``targetId``'s summary in the cached child-session lists under
+ * ``rootId``. Synchronous and cache-only, like ``cachedTreeContains``.
+ *
+ * @param queryClient - The app QueryClient holding child-session caches.
+ * @param rootId - Root session whose cached tree to walk, e.g. ``"conv_root"``.
+ * @param targetId - Session to look for, e.g. ``"conv_grandchild"``.
+ * @param maxDepth - Levels below the root to examine, e.g. ``MAX_TREE_DEPTH``.
+ * @returns The cached summary, or ``null`` when no cached list holds it.
+ */
+export function findCachedDescendant(
+  queryClient: QueryClient,
+  rootId: string,
+  targetId: string,
+  maxDepth: number,
+): ChildSessionInfo | null {
+  const visited = new Set([rootId]);
   let frontier = [rootId];
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
     const next: string[] = [];
@@ -225,13 +256,15 @@ export function cachedTreeContains(
       ]);
       const children = [...active, ...(past?.pages.flatMap((page) => page.data) ?? [])];
       for (const child of children) {
-        if (child.id === targetId) return true;
+        if (child.id === targetId) return child;
+        if (visited.has(child.id)) continue;
+        visited.add(child.id);
         next.push(child.id);
       }
     }
     frontier = next;
   }
-  return false;
+  return null;
 }
 
 /**
@@ -432,4 +465,38 @@ export function usePastChildSessions(
       void query.fetchNextPage();
     },
   };
+}
+
+/**
+ * Summary of ``targetId`` as listed under ``ancestorId``'s spawn tree.
+ *
+ * Direct children come from ``useChildSessions`` (fetched when not yet
+ * cached); deeper descendants are read from lists the Agents rail has
+ * cached. Re-renders when any cached child-session list changes.
+ *
+ * @param ancestorId - Session whose tree to search, e.g. ``"conv_root"``;
+ *   ``null`` disables the lookup.
+ * @param targetId - Descendant to find, e.g. ``"conv_child123"``.
+ * @returns The descendant's summary, or ``null`` while unknown.
+ */
+export function useDescendantSession(
+  ancestorId: string | null,
+  targetId: string,
+): ChildSessionInfo | null {
+  const queryClient = useQueryClient();
+  useChildSessions(ancestorId);
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      queryClient.getQueryCache().subscribe((event) => {
+        if (event.type === "updated" && isChildSessionsQueryKey(event.query.queryKey)) onChange();
+      }),
+    [queryClient],
+  );
+  // Cached rows keep their identity until their list changes, so the
+  // snapshot is stable between unrelated cache events.
+  return useSyncExternalStore(subscribe, () =>
+    ancestorId === null
+      ? null
+      : findCachedDescendant(queryClient, ancestorId, targetId, MAX_TREE_DEPTH),
+  );
 }

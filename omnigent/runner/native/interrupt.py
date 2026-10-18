@@ -41,7 +41,6 @@ from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.native.orchestration import (
     _cancel_auto_forwarder_task,
     _claude_native_bridge_id_for_session,
-    _session_labels_for_runner_spawn,
 )
 from omnigent.runner.resource_registry import (
     _STATUS_EMITTING_TERMINAL_ROLES,
@@ -49,6 +48,8 @@ from omnigent.runner.resource_registry import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from omnigent.harness_plugins import NativeCodingAgent
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLock
@@ -99,7 +100,12 @@ class SubagentWorkIdForSession(Protocol):
 
 
 class CodexBridgeStateForSession(Protocol):
-    """Resolve a live Codex app-server bridge state for a session."""
+    """Resolve a Codex app-server bridge state and its directory for a session.
+
+    Returns the state (or ``None``) together with the bridge directory it was
+    read from, resolved from a single label lookup so a caller that then clears
+    the turn or publishes against the directory acts on the same bridge.
+    """
 
     async def __call__(
         self,
@@ -107,7 +113,7 @@ class CodexBridgeStateForSession(Protocol):
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> CodexNativeBridgeState | None:
+    ) -> tuple[CodexNativeBridgeState | None, Path]:
         raise NotImplementedError
 
 
@@ -831,24 +837,21 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response | None:
-        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.app_server import (
+            CodexAppServerResponseError,
+            client_for_transport,
+            is_no_active_turn_error,
+            is_stale_active_turn_error,
+        )
         from omnigent.harnesses.codex_native.bridge import (
-            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-            bridge_dir_for_bridge_id,
             cancel_pending_mcp_startup,
+            clear_active_turn_id_if_matches,
             read_mcp_startup,
         )
 
-        state = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
+        state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
             return None
-        labels = await _session_labels_for_runner_spawn(
-            server_client=self._server_client,
-            session_id=conv_id,
-        )
-        bridge_dir = bridge_dir_for_bridge_id(
-            labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
-        )
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
         if state.active_turn_id is None and not pending_mcp:
             self._logger.info(
@@ -897,13 +900,67 @@ class NativeInterruptRunner:
                         exc_info=True,
                     )
             if state.active_turn_id is not None:
-                await codex_client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
-                )
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                        },
+                    )
+                except CodexAppServerResponseError as exc:
+                    if not is_stale_active_turn_error(exc):
+                        raise
+
+                    if is_no_active_turn_error(exc):
+                        # The turn ended and no idle edge is coming. Clear it only
+                        # if still recorded and publish idle under the bridge lock,
+                        # so a turn starting mid-interrupt is not masked by this idle.
+                        def _publish_idle() -> None:
+                            # Runs under the bridge state lock: stay quick, do not
+                            # touch bridge state, and never raise (the clear is done).
+                            try:
+                                self._publish_event(
+                                    conv_id, {"type": "session.status", "status": "idle"}
+                                )
+                                self._resource_registry.note_external_session_status(
+                                    conv_id, "idle"
+                                )
+                            except Exception:  # noqa: BLE001 - the clear already succeeded.
+                                self._logger.warning(
+                                    "Codex-native idle publish failed for session=%s",
+                                    conv_id,
+                                    exc_info=True,
+                                )
+
+                        cleared = clear_active_turn_id_if_matches(
+                            bridge_dir, state.active_turn_id, on_cleared=_publish_idle
+                        )
+                        self._logger.info(
+                            "Codex-native interrupt reconciled an already-ended turn "
+                            "for session=%s thread=%s turn=%s cleared=%s: %s",
+                            conv_id,
+                            state.thread_id,
+                            state.active_turn_id,
+                            cleared,
+                            exc.message,
+                        )
+                    else:
+                        # A newer turn replaced the one we targeted and is still
+                        # live, so leave its recorded id in place and publish no
+                        # idle; the forwarder owns the newer turn's lifecycle.
+                        self._logger.info(
+                            "Codex-native interrupt targeted a superseded turn for "
+                            "session=%s thread=%s turn=%s; a newer turn is live: %s",
+                            conv_id,
+                            state.thread_id,
+                            state.active_turn_id,
+                            exc.message,
+                        )
+                    # The targeted turn ended or was superseded, so skip the
+                    # deferred parent-wake cancel. A dropped sub-agent completion
+                    # can still leave its parent waiting; reconciled separately.
+                    return Response(status_code=204)
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures.
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",

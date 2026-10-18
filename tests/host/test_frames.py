@@ -694,6 +694,7 @@ def test_hello_frame_round_trip() -> None:
         runners=["runner_token_aaa", "runner_token_bbb"],
         filesystem_roots=True,
         interactive_shells=["zsh", "bash"],
+        connection_id="host-connection-1",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -703,6 +704,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.filesystem_roots is True
     assert decoded.interactive_shells == ["zsh", "bash"]
+    assert decoded.connection_id == "host-connection-1"
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -722,6 +724,7 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     # An older host advertises no capabilities — the server must read this as an
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
+    assert decoded.connection_id is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:
@@ -1283,7 +1286,8 @@ def test_stop_runner_result_frame_round_trip() -> None:
     assert decoded.error is None
 
 
-def test_runner_exited_frame_round_trip() -> None:
+@pytest.mark.parametrize("had_connected", [None, False, True])
+def test_runner_exited_frame_round_trip(had_connected: bool | None) -> None:
     """
     Verify HostRunnerExitedFrame survives encode → decode.
 
@@ -1294,6 +1298,7 @@ def test_runner_exited_frame_round_trip() -> None:
     """
     original = HostRunnerExitedFrame(
         runner_id="runner_abc123",
+        had_connected=had_connected,
         error=(
             "runner process exited with code 1 (log on host: ~/x.log)\n"
             "--- runner log tail ---\nRuntimeError: boom"
@@ -1304,6 +1309,7 @@ def test_runner_exited_frame_round_trip() -> None:
     assert decoded.runner_id == "runner_abc123"
     # The multi-line error (including the log tail) must survive intact.
     assert decoded.error == original.error
+    assert decoded.had_connected is had_connected
 
 
 def test_runner_exited_frame_missing_error_raises() -> None:
@@ -3122,3 +3128,28 @@ def test_hello_frame_omitted_project_code_is_legacy_false() -> None:
     )
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.project_code is False
+
+
+def test_legacy_runner_exit_has_unknown_connection_history() -> None:
+    """An old host's exit report remains valid without connection evidence."""
+    frame = decode_host_frame(
+        '{"kind":"host.runner_exited","runner_id":"runner_old","error":"exited"}'
+    )
+    assert isinstance(frame, HostRunnerExitedFrame)
+    assert frame.had_connected is None
+
+
+@pytest.mark.parametrize("invalid", ["true", "false", 0, 1, [], {}])
+def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) -> None:
+    """Malformed evidence cannot turn a failed launch into a harmless idle exit."""
+    with pytest.raises(ValueError, match="required bool field"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.runner_exited",
+                    "runner_id": "runner_bad",
+                    "error": "exited",
+                    "had_connected": invalid,
+                }
+            )
+        )

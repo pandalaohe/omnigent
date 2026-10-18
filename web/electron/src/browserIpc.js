@@ -8,6 +8,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { buildBrowserActionScriptForExecution } = require("./browserActionScript.mjs");
+const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
 
 // Max age of a real native input event for a design-mode submit marker to be
@@ -266,6 +268,7 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
+  recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
   confirmAgentNavigation = async () => null,
 }) {
@@ -313,18 +316,20 @@ function registerBrowserIpc({
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, url, bounds, opts } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const agent = !!opts?.agent;
+    const agent = true;
+    // Renderer flags do not establish user intent.
     // The first-party renderer supplies the source-session host; main owns
     // the target and eligibility. Caller exception flags never establish identity.
-    const agentContext = agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null;
+    let agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
     const options = { force: !!opts?.force, agent, agentContext };
+    let activeRegistry = g.registry;
 
     const finish = (r) => {
       // On first creation, wire nav listeners here (not in the registry factory,
@@ -337,7 +342,16 @@ function registerBrowserIpc({
         });
       }
       // Strip the non-serializable `entry` before it crosses the IPC boundary.
-      const hint = !r.ok && agent ? getAgentNavigationHintForEvent(event, url) : null;
+      const hint =
+        !r.ok && agent
+          ? getAgentNavigationHintForEvent(
+              event,
+              url,
+              opts?.sourceHostId,
+              opts?.rememberedArcaHostId,
+              opts?.sourceIsArcaHost,
+            )
+          : null;
       return {
         ok: r.ok,
         created: r.created ?? false,
@@ -345,12 +359,37 @@ function registerBrowserIpc({
       };
     };
 
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, options);
+    let r = activeRegistry.openOrNavigate(conversationId, url, bounds, options);
+    // A promptable private-address refusal goes straight to the permission
+    // dialog; Arca recovery applies only to other loopback denials.
+    if (!r.ok && agent && !r.grant) {
+      let recovered;
+      try {
+        recovered = await recoverAgentNavigationForEvent(
+          event,
+          url,
+          opts?.sourceHostId,
+          opts?.rememberedArcaHostId,
+          opts?.sourceIsArcaHost,
+        );
+      } catch {
+        recovered = false;
+      }
+      if (recovered) {
+        const refreshed = gateRegistry(event);
+        if (!refreshed.error) {
+          activeRegistry = refreshed.registry;
+          agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+          options.agentContext = agentContext;
+          r = activeRegistry.openOrNavigate(conversationId, url, bounds, options);
+        }
+      }
+    }
     // Only an internal-class refusal on an agent call is promptable; every
     // other outcome returns synchronously, exactly as before.
     if (r.ok || !agent || !r.grant) return finish(r);
     const grant = r.grant;
-    const pending = pendingFor(g.registry, conversationId);
+    const pending = pendingFor(activeRegistry, conversationId);
     const request = { cancelled: false };
     pending.add(request);
     return (async () => {
@@ -369,7 +408,7 @@ function registerBrowserIpc({
           const serverOrigin = getAgentContextForEvent(event, opts?.sourceHostId)?.serverOrigin;
           if (
             regate.error ||
-            regate.registry !== g.registry ||
+            regate.registry !== activeRegistry ||
             serverOrigin !== agentContext?.serverOrigin
           ) {
             return finish({
@@ -391,7 +430,8 @@ function registerBrowserIpc({
         return finish({ ok: false, error: `${r.error} The user did not allow this address.` });
       } finally {
         pending.delete(request);
-        if (pending.size === 0) pendingPromptNavigations.get(g.registry)?.delete(conversationId);
+        if (pending.size === 0)
+          pendingPromptNavigations.get(activeRegistry)?.delete(conversationId);
       }
     })();
   });
@@ -473,25 +513,28 @@ function registerBrowserIpc({
     }
   });
 
-  // Run relay-template JS in the conversation's view. PRIVATE to the relay's
-  // fixed templates (snapshot / click / type) — NOT an agent-facing generic
-  // `evaluate` (trust boundary; see README).
-  ipcMain.handle("omnigent:browser-execute", async (event, args) => {
+  // Both transports converge on main-owned scripts and the same sender gate.
+  async function performBrowserAction(event, args, legacy = false) {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId, js } = args ?? {};
-    if (typeof js !== "string") return { ok: false, error: "js must be a string" };
+    const { conversationId } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
-      // `true` = user gesture, so the page can call gesture-gated APIs.
-      const result = await entry.view.webContents.executeJavaScript(js, true);
-      // Normalize to a string — the relay JSON.parses snapshot/upload results.
+      const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
+      const js = buildBrowserActionScriptForExecution(action, params);
+      const result = await entry.view.webContents.executeJavaScript(js, false);
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
-  });
+  }
+  ipcMain.handle("omnigent:browser-perform-action", (event, args) =>
+    performBrowserAction(event, args),
+  );
+  ipcMain.handle("omnigent:browser-execute", (event, args) =>
+    performBrowserAction(event, args, true),
+  );
 
   // Whether a view currently exists for a conversation. Lets a (re)mounting
   // pane re-attach an already-created view without waiting for a create event.

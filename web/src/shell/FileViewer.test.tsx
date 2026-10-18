@@ -149,6 +149,7 @@ vi.mock("./CommentsPanel", () => ({
 }));
 
 vi.mock("./MonacoDiffViewer", () => ({
+  prepareDiffEditor: vi.fn(() => Promise.resolve()),
   // Surface the toggle-driven props as data attributes so tests can assert the
   // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
   MonacoDiffViewer: ({
@@ -260,6 +261,7 @@ import { useComments } from "@/hooks/useComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
+import { prepareDiffEditor } from "./MonacoDiffViewer";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
@@ -745,13 +747,15 @@ describe("FileViewer URL sync — diff param", () => {
           expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
           fireEvent.click(second.getByRole("button", { name: "Show diff" }));
           expect(await second.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(first.queryByTestId("diff-viewer")).toBeNull();
           expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
           fireEvent.click(second.getByRole("button", { name: "Exit diff view" }));
           expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
-          expect(first.getByTestId("diff-viewer")).toBeInTheDocument();
+          expect(first.queryByTestId("diff-viewer")).toBeNull();
 
           vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
           rerender(<Viewers />);
+          expect(await first.findByTestId("diff-viewer")).toBeInTheDocument();
           expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
           fireEvent.click(first.getByRole("button", { name: "Exit diff view" }));
           expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
@@ -814,6 +818,45 @@ describe("FileViewer URL sync — diff param", () => {
     expect(diff).toHaveAttribute("data-comment-ids", "source");
     expect(diff).toHaveAttribute("data-active-anchor", "");
   });
+  it("prepares a linked diff during discovery and scopes the early request to that file", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () => ({ data: undefined }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        const { rerender } = render(viewerTree({ open: true, initialSearch: "diff=1" }));
+        await waitFor(() => expect(prepareDiffEditor).toHaveBeenCalledWith("python"));
+        expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "file1.py", { requested: true });
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+
+        rerender(viewerTree({ open: true, path: "other.py", initialSearch: "diff=1" }));
+        expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "other.py", { requested: false });
+      },
+    );
+  });
+
+  it("does not prepare a linked diff when changed-file discovery has already failed", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () => ({ data: undefined, isError: true }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        renderViewer({ open: true, initialSearch: "diff=1" });
+        await act(async () => {});
+        expect(prepareDiffEditor).not.toHaveBeenCalled();
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      },
+    );
+  });
+
+  it.each(["image.png", "document.pdf", "model.stl"])(
+    "does not prepare a diff for %s even with an explicit link",
+    async (path) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({ open: true, path, initialSearch: "diff=1" });
+      await act(async () => {});
+      expect(prepareDiffEditor).not.toHaveBeenCalled();
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", path, { requested: false });
+    },
+  );
 
   it("writes ?diff=1 to the URL when the diff toggle button is clicked", async () => {
     // Start with no URL params and diff inactive.

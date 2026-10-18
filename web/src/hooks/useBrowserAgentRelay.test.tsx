@@ -20,12 +20,15 @@ vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { browserViewId, useBrowserTabs } from "./useBrowserTabs";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
+import { buildBrowserActionScriptForExecution } from "../../electron/src/browserActionScript.mjs";
+import legacyActions from "../../electron/test/fixtures/browserActions-v0.18.json";
 
 const CONV = "conv_relay";
 const renderRelay = (visibleId: string | null | undefined = CONV, client = new QueryClient()) => {
@@ -65,10 +68,15 @@ function installBridge(overrides: Record<string, unknown> = {}) {
     browserExecute: vi.fn().mockResolvedValue({ ok: true, result: "ok" }),
     browserHasView: vi.fn().mockResolvedValue({ exists: false }),
     browserClose: vi.fn().mockResolvedValue({ ok: true }),
+    browserPerformAction: undefined,
     ...overrides,
   };
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = bridge;
   return bridge;
+}
+
+function executedJs(bridge: ReturnType<typeof installBridge>): string {
+  return String(bridge.browserExecute.mock.lastCall?.[1] ?? "");
 }
 
 /** Mount the relay and dispatch one action through the bus, then wait for the
@@ -77,10 +85,10 @@ function installBridge(overrides: Record<string, unknown> = {}) {
  *  single claim fetch to have fired. */
 async function runAction(
   evt: BrowserActionRequestEvent,
-  opts: { expectResult?: boolean; source?: string } = {},
+  opts: { client?: QueryClient; expectResult?: boolean; source?: string } = {},
 ): Promise<void> {
-  const { expectResult = true, source = CONV } = opts;
-  renderRelay();
+  const { client = new QueryClient(), expectResult = true, source = CONV } = opts;
+  renderRelay(CONV, client);
   emitBrowserActionRequest(evt, source);
   if (expectResult) {
     await vi.waitFor(() => {
@@ -98,11 +106,6 @@ async function runAction(
 
 /** The claim_token the winning-claim response carries in most tests. */
 const WON = jsonResponse({ claimed: true, claim_token: "tok_1" });
-
-/** Parse the JS string passed to browserExecute for the Nth call. */
-function executedJs(bridge: { browserExecute: ReturnType<typeof vi.fn> }, n = 0): string {
-  return bridge.browserExecute.mock.calls[n][1] as string;
-}
 
 /** Read the result body POSTed back for the last action_result call. */
 function postedResult(): Record<string, unknown> {
@@ -124,6 +127,7 @@ async function sendClaimed(action: string, args: Record<string, unknown>, count:
 }
 
 beforeEach(() => {
+  writeArcaHostId(null);
   authenticatedFetch.mockReset();
   getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
     id,
@@ -922,6 +926,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
   });
   it("derives inherited provenance from the source session, never model args or visible host", async () => {
     const bridge = installBridge();
+    writeArcaHostId("arca-host");
     setSessionHost(CONV, "local-host");
     setSessionHost("parent", "arca-host");
     setSessionParent("conv_background_A", "parent");
@@ -942,9 +947,56 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "arca-host" },
+      {
+        force: true,
+        agent: true,
+        sourceHostId: "arca-host",
+        rememberedArcaHostId: "arca-host",
+      },
     );
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
+  });
+
+  it("corrects a mismatched remembered Arca host after an authorized preview retry", async () => {
+    const bridge = installBridge();
+    const client = new QueryClient();
+    client.setQueryData(
+      ["hosts", { includeSandbox: false }],
+      [
+        {
+          host_id: "actual-arca-host-b",
+          name: "Jackson's arca",
+          owner: "jackson",
+          status: "online",
+        },
+      ],
+    );
+    writeArcaHostId("remembered-host-a");
+    setSessionHost("conv_background_A", "actual-arca-host-b");
+    getSessionSlim.mockResolvedValue({
+      id: "conv_background_A",
+      hostId: "actual-arca-host-b",
+      parentSessionId: null,
+    });
+
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173" }), {
+      client,
+      source: "conv_background_A",
+    });
+
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      {
+        force: true,
+        agent: true,
+        sourceHostId: "actual-arca-host-b",
+        rememberedArcaHostId: "remembered-host-a",
+        sourceIsArcaHost: true,
+      },
+    );
+    expect(readArcaHostId()).toBe("actual-arca-host-b");
   });
 
   it("loads a child's own host before granting eligibility from a parent-list hint", async () => {
@@ -1238,35 +1290,78 @@ describe("useBrowserAgentRelay — action dispatch", () => {
 
   it("snapshot: parses the executed JSON tree", async () => {
     const bridge = installBridge({
-      browserExecute: vi
+      browserPerformAction: vi
         .fn()
         .mockResolvedValue({ ok: true, result: JSON.stringify({ snapshot_id: "s1", tree: "x" }) }),
     });
     await runAction(actionEvent("snapshot"));
-    // The snapshot JS is the fixed SNAPSHOT_JS constant (walks the DOM).
-    expect(executedJs(bridge)).toContain("__omni_refs__");
+    expect(bridge.browserPerformAction).toHaveBeenCalledWith("conv_relay", "snapshot", undefined);
     expect((postedResult().result as { data: { snapshot_id: string } }).data.snapshot_id).toBe(
       "s1",
     );
   });
 
   it("snapshot: reports a parse error on non-JSON output", async () => {
-    installBridge({ browserExecute: vi.fn().mockResolvedValue({ ok: true, result: "not json" }) });
+    installBridge({
+      browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "not json" }),
+    });
     await runAction(actionEvent("snapshot"));
     expect((postedResult().result as { error: string }).error).toMatch(/snapshot parse failed/);
   });
 
-  it("click by ref: validates snapshot_id and clicks the resolved element", async () => {
-    const bridge = installBridge();
-    await runAction(actionEvent("click", { ref: 7, snapshot_id: "snap-9" }));
-    const js = executedJs(bridge);
-    expect(js).toContain('__omni_snapshot_id__ !== "snap-9"');
-    expect(js).toContain("__omni_refs__");
-    expect(js).toContain("el.click()");
+  it.each(
+    legacyActions.requests.filter(({ args }) => !("ref" in args && !("snapshot_id" in args))),
+  )(
+    "supports an older desktop's $action transport with its main-owned template",
+    async ({ action, args }) => {
+      const browserExecute = vi.fn().mockResolvedValue({ ok: true, result: "{}" });
+      installBridge({ browserPerformAction: undefined, browserExecute });
+      await runAction(actionEvent(action, args));
+      expect(browserExecute).toHaveBeenCalledWith(
+        CONV,
+        buildBrowserActionScriptForExecution(action as "snapshot" | "click" | "type", args),
+      );
+      expect(postedResult().result).toMatchObject({ ok: true });
+    },
+  );
+
+  it.each(legacyActions.requests.filter(({ args }) => "ref" in args && !("snapshot_id" in args)))(
+    "rejects a numeric $action ref from an older caller without snapshot identity",
+    async ({ action, args }) => {
+      const browserExecute = vi.fn();
+      installBridge({ browserPerformAction: undefined, browserExecute });
+      await runAction(actionEvent(action, args));
+      expect(browserExecute).not.toHaveBeenCalled();
+      expect((postedResult().result as { error: string }).error).toMatch(/snapshot_id is required/);
+    },
+  );
+
+  it("prefers typed actions when a desktop also offers legacy compatibility", async () => {
+    const browserExecute = vi.fn();
+    const browserPerformAction = vi.fn().mockResolvedValue({ ok: true, result: "ok" });
+    const bridge = installBridge({ browserExecute, browserPerformAction });
+    await runAction(actionEvent("click", { ref: 1, snapshot_id: "snap-1" }));
+    expect(bridge.browserPerformAction).toHaveBeenCalledWith(CONV, "click", {
+      ref: 1,
+      snapshot_id: "snap-1",
+    });
+    expect(browserExecute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { action: "click", args: { ref: 7, snapshot_id: "snap-9" } },
+    { action: "click", args: { selector: "button.submit" } },
+    { action: "type", args: { ref: 3, snapshot_id: "snap-3", text: "hello" } },
+  ])("forwards $action with $args and returns its result", async ({ action, args }) => {
+    const bridge = installBridge({
+      browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "ok" }),
+    });
+    await runAction(actionEvent(action, args));
+    expect(bridge.browserPerformAction).toHaveBeenCalledWith("conv_relay", action, args);
     expect((postedResult().result as { ok: boolean }).ok).toBe(true);
   });
 
-  it("click by selector: resolves via querySelector (neutral selector, JSON-escaped)", async () => {
+  it("click: passes the selector to the legacy main-owned script", async () => {
     const bridge = installBridge();
     await runAction(actionEvent("click", { selector: "button.submit" }));
     const js = executedJs(bridge);
@@ -1285,7 +1380,9 @@ describe("useBrowserAgentRelay — action dispatch", () => {
 
   it("click: surfaces the in-page execute error", async () => {
     installBridge({
-      browserExecute: vi.fn().mockResolvedValue({ ok: false, error: "selector not found: x" }),
+      browserPerformAction: vi
+        .fn()
+        .mockResolvedValue({ ok: false, error: "selector not found: x" }),
     });
     await runAction(actionEvent("click", { selector: "x" }));
     expect((postedResult().result as { error: string }).error).toBe("selector not found: x");
@@ -1299,17 +1396,9 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     );
   });
 
-  it("missing bridge method → 'does not support the browser pane'", async () => {
-    installBridge({ browserExecute: undefined });
-    await runAction(actionEvent("snapshot"));
-    expect((postedResult().result as { error: string }).error).toMatch(
-      /does not support the browser pane/,
-    );
-  });
-
-  it("type: missing execute bridge → 'does not support the browser pane'", async () => {
-    installBridge({ browserExecute: undefined });
-    await runAction(actionEvent("type", { ref: 1, snapshot_id: "snap-1", text: "x" }));
+  it.each(["snapshot", "click", "type"])("%s: missing browser action bridge", async (action) => {
+    installBridge({ browserPerformAction: undefined, browserExecute: undefined });
+    await runAction(actionEvent(action, { ref: 1, snapshot_id: "snap-1", text: "x" }));
     expect((postedResult().result as { error: string }).error).toMatch(
       /does not support the browser pane/,
     );
@@ -1325,7 +1414,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
 
   it("dispatch surfaces a thrown in-page/IPC error as {ok:false} (outer catch)", async () => {
     installBridge({
-      browserExecute: vi.fn().mockRejectedValue(new Error("execute blew up")),
+      browserPerformAction: vi.fn().mockRejectedValue(new Error("execute blew up")),
     });
     await runAction(actionEvent("click", { selector: "x" }));
     expect((postedResult().result as { ok: boolean; error: string }).error).toBe("execute blew up");

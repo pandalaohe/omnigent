@@ -50,6 +50,10 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
+# tail, whose last line the server keeps when it shortens the report for storage.
+RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the
@@ -62,6 +66,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_MCP_REGISTRY = "mcp_registry"
 
 # The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
 CAP_FS_READ_RAW = "fs_read_raw"
@@ -89,6 +94,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_RESOURCE_SNAPSHOT,
     CAP_HARNESS_STARTUP,
@@ -250,6 +256,8 @@ class HostHelloFrame:
         (see ``HOST_CAPABILITIES`` / ``CAP_*``). Empty from an older host that
         predates a given capability, so the server treats absence as "not
         supported" without a version check.
+    :param connection_id: Host-minted identifier for this socket, shared with
+        server diagnostics. Absent from older hosts.
     """
 
     version: str
@@ -267,6 +275,7 @@ class HostHelloFrame:
     post_bind_hook: bool = False
     project_code: bool = False
     capabilities: list[str] = field(default_factory=list)
+    connection_id: str | None = None
 
 
 @dataclass
@@ -414,11 +423,15 @@ class HostRunnerExitedFrame:
         ``"runner_abc123..."``.
     :param error: Human-readable cause, e.g.
         ``"runner process exited with code 1 (log: ~/...) ..."``,
-        including the trailing lines of the runner's log.
+        followed by :data:`RUNNER_LOG_TAIL_HEADING` and the trailing
+        lines of the runner's log.
+    :param had_connected: Whether the runner touched its first-connect marker.
+        ``None`` when unavailable or reported by an older host.
     """
 
     runner_id: str
     error: str
+    had_connected: bool | None = None
 
 
 @dataclass
@@ -481,6 +494,8 @@ class HostRunnerStatusResultFrame:
 
         * ``"alive"`` — the host has this runner and its process is
           running (booting or serving). The runner is coming; wait.
+        * ``"sign_in_pending"`` — this live, unconnected runner is waiting
+          within its bounded host sign-in window. Keep the original input.
         * ``"dead"`` — the host has this runner but its process has
           exited. It will never connect; relaunch now.
         * ``"unknown"`` — the host has no record of this runner (it was
@@ -1700,6 +1715,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "post_bind_hook": frame.post_bind_hook,
                 "project_code": frame.project_code,
                 "capabilities": list(frame.capabilities),
+                "connection_id": frame.connection_id,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1772,6 +1788,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+                "had_connected": frame.had_connected,
             }
         )
     if isinstance(frame, HostRunnerLogRunawayFrame):
@@ -2734,6 +2751,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         ),
         project_code=_required_bool(msg, "project_code") if "project_code" in msg else False,
         capabilities=_optional_str_list(msg, "capabilities"),
+        connection_id=_optional_nullable_str(msg, "connection_id"),
     )
 
 
@@ -2835,6 +2853,9 @@ def _decode_runner_exited(msg: _JsonObject) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+        had_connected=(
+            _required_bool(msg, "had_connected") if msg.get("had_connected") is not None else None
+        ),
     )
 
 

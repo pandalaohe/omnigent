@@ -35,7 +35,7 @@ import {
   routingExtras,
 } from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
-import type { CodexPersistMode, ElicitationSource, RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, ElicitationSource, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -165,6 +165,7 @@ export type RenderItem =
       source?: ElicitationSource | null;
       toolName?: string | null;
       cwd?: string | null;
+      agyPermission?: AgyPermission | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -174,6 +175,8 @@ export type Bubble =
       itemId: string;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
+      /** Pending input sent mid-turn that the agent hasn't read yet. */
+      awaitingAgent?: boolean;
       content: MessageContentBlock[];
       /** Shell input is literal command text, not Markdown or attachment markers. */
       shellCommand?: string;
@@ -1690,6 +1693,7 @@ function buildAssistantItems(
         source: b.source,
         toolName: b.toolName,
         cwd: b.cwd,
+        agyPermission: b.agyPermission,
       });
       i += 1;
       continue;
@@ -1874,6 +1878,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
+      Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||

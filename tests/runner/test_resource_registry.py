@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -639,6 +639,40 @@ async def test_claude_native_pane_probe_interval_follows_file_status(tmp_path: P
     assert interval() is None
 
 
+async def _observe_native_with_real_poller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+) -> tuple[Callable[[], None], list[str], list[int | None], SessionResourceRegistry, Path]:
+    """Observe a Claude terminal with a real poller and caller-written status file."""
+    config_dir = tmp_path / "claude"
+    status_file = config_dir / "sessions" / "123.json"
+    status_file.parent.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
+    watcher = Mock()
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
+    monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
+    statuses: list[str] = []
+    counts: list[int | None] = []
+
+    def publish(_sid, status, _reason=None, count=None, _tasks=None):
+        statuses.append(status)
+        counts.append(count)
+
+    registry.set_session_status_publisher(publish)
+    await registry.observe_required_terminal(
+        session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    return watcher.call_args.kwargs["on_tick"], statuses, counts, registry, status_file
+
+
 @pytest.mark.asyncio
 async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     """The claude-native watcher is wired with an ``on_tick`` that drives
@@ -822,6 +856,97 @@ async def test_delayed_stop_rechecks_unchanged_busy_status_file(tmp_path: Path) 
     poller.tick()
     await asyncio.sleep(0)
     assert statuses == ["running", "running", "idle"]
+
+
+@pytest.mark.parametrize(
+    "poll_before_stop", [False, True], ids=["busy-read-after-stop", "busy-read-before-stop"]
+)
+async def test_queued_turn_republishes_running_after_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poll_before_stop: bool
+) -> None:
+    """A prior turn's Stop must not leave a queued turn reported as idle."""
+    session_id = "conv_queued_status"
+    on_tick, statuses, counts, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    record = {
+        "pid": 123,
+        "sessionId": "claude-queued-status",
+        "kind": "interactive",
+        "status": "busy",
+        "statusUpdatedAt": 1000,
+    }
+    status_file.write_text(json.dumps(record), encoding="utf-8")
+    initial_mtime_ns = status_file.stat().st_mtime_ns
+
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert registry.session_turn_is_active(session_id)
+
+    # The queued turn overwrites idle before the real poller gets another tick.
+    for status, updated_at in [("idle", 2000), ("busy", 3000)]:
+        status_file.write_text(
+            json.dumps({**record, "status": status, "statusUpdatedAt": updated_at}),
+            encoding="utf-8",
+        )
+    next_mtime_ns = initial_mtime_ns + 1_000_000_000
+    os.utime(status_file, ns=(next_mtime_ns, next_mtime_ns))
+    if poll_before_stop:
+        on_tick()
+        await asyncio.sleep(0)
+        assert statuses == ["running"]
+
+    # The forwarder posts the previous turn's Stop directly to the server.
+    registry.note_external_session_status(session_id, "idle")
+    assert not registry.session_turn_is_active(session_id)
+
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+    assert registry.session_turn_is_active(session_id)
+
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+
+    # The idle file also clears the background-shell tally that Stop left unknown.
+    registry.note_external_session_status(session_id, "idle")
+    status_file.write_text(
+        json.dumps({**record, "status": "idle", "statusUpdatedAt": 4000}),
+        encoding="utf-8",
+    )
+    final_mtime_ns = next_mtime_ns + 1_000_000_000
+    os.utime(status_file, ns=(final_mtime_ns, final_mtime_ns))
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running", "idle"]
+    assert counts == [None, None, 0]
+    assert not registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_failed_hook_does_not_republish_stale_running_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed turn stays failed while its busy status file catches up."""
+    session_id = "conv_failed_status"
+    on_tick, statuses, _counts, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    status_file.write_text(
+        json.dumps({"kind": "interactive", "sessionId": "claude-failed-status", "status": "busy"}),
+        encoding="utf-8",
+    )
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    registry.note_external_session_status(session_id, "failed")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert not registry.session_turn_is_active(session_id)
 
 
 @pytest.mark.asyncio

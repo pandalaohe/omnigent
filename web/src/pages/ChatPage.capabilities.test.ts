@@ -183,7 +183,9 @@ describe("shouldShowModelPicker", () => {
       ).toBeNull();
       const child = { labels: {}, harness, parentSessionId: "parent" };
       expect(modelPickerKindForConv(child)).toBe("sdk");
-      expect(shouldShowEffortPicker(child)).toBe(true);
+      expect(shouldShowEffortPicker(child, harness === "codex" ? "openai" : "anthropic")).toBe(
+        false,
+      );
     }
   });
 
@@ -228,9 +230,11 @@ describe("shouldShowModelPicker", () => {
 });
 
 describe("shouldShowEffortPicker", () => {
-  it("shows effort controls for unlabelled SDK sessions only", () => {
+  it("shows effort controls for unlabelled SDK sessions with a declared family only", () => {
     for (const harness of ["claude-sdk", "codex"]) {
-      expect(shouldShowEffortPicker({ labels: {}, harness })).toBe(true);
+      const effortFamily = harness === "codex" ? "openai" : "anthropic";
+      expect(shouldShowEffortPicker({ labels: {}, harness })).toBe(false);
+      expect(shouldShowEffortPicker({ labels: {}, harness }, effortFamily)).toBe(true);
       expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "other" }, harness })).toBe(
         false,
       );
@@ -345,4 +349,24 @@ it("enables Antigravity model, effort and permission controls", () => {
   expect(effortLevelsForConv(session, [{ id: "gpt-oss", efforts: ["medium"] }], "gpt-oss")).toEqual(
     ["medium"],
   );
+});
+
+describe("shouldShowEffortPicker for SDK harnesses (declared effort family)", () => {
+  it("opens the picker for a label-less claude-sdk / codex session with a family", () => {
+    // WHY: the SDK executors already honor the session's reasoning_effort;
+    // only the label-only gate kept the control hidden.
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" }, "anthropic")).toBe(true);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" }, "openai")).toBe(true);
+  });
+
+  it("stays closed with no family, a ladder-less family, or on a sub-agent child", () => {
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "openai-agents" }, "none")).toBe(false);
+    expect(
+      shouldShowEffortPicker(
+        { labels: {}, harness: "claude-sdk", parentSessionId: "parent" },
+        "anthropic",
+      ),
+    ).toBe(false);
+  });
 });

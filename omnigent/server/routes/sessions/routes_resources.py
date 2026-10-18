@@ -1682,6 +1682,9 @@ def register_resources_routes(
             runner_router=runner_router or get_server_runner_router(),
         )
         path = f"/v1/sessions/{session_id}/resources/terminals"
+        router = runner_router or get_server_runner_router()
+        if router is not None:
+            await asyncio.to_thread(router.require_mcp_registry_support, conv)
         status, payload = await _proxy_post_to_runner(
             session_id,
             path,
@@ -1800,9 +1803,12 @@ def register_resources_routes(
             )
         if status == 409:
             error = payload.get("error", {})
+            # The target session already owns a terminal under this name, which
+            # is a state conflict and not a malformed request: INVALID_INPUT
+            # would surface it as a 400 and tell the caller to fix its input.
             raise OmnigentError(
                 error.get("message", "Terminal transfer conflict"),
-                code=ErrorCode.INVALID_INPUT,
+                code=ErrorCode.CONFLICT,
             )
         if status >= 400:
             error = payload.get("error", {})

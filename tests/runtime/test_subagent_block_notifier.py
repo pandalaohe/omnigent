@@ -398,6 +398,50 @@ async def test_observe_re_arms_after_resolved_event(
     assert len(resolution_notices) == 1
 
 
+@pytest.mark.asyncio
+async def test_resolution_requires_the_arming_conversation(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        notifier.observe(child.id, _request_event("elicit_one"))
+        await _wait_for_calls(dispatch, expected=1)
+
+        notifier.observe(parent.id, _resolved_event("elicit_one", "accept"))
+        assert elicitation_armed(notifier, "elicit_one")
+        assert not notifier._resolution_signals["elicit_one"].is_set()
+
+        notifier.observe(child.id, _resolved_event("elicit_one", "decline"))
+        await _wait_for_calls(dispatch, expected=2)
+        assert not elicitation_armed(notifier, "elicit_one")
+        assert "action: decline" in dispatch.calls[-1].notice
+        assert dispatch.calls[-1].parent_id == parent.id
+    finally:
+        notifier.close()
+
+
+@pytest.mark.asyncio
+async def test_resolution_without_an_armed_request_is_ignored(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_running_loop(),
+    )
+    notifier.observe("conversation", _resolved_event("elicit_unarmed", "accept"))
+    assert not elicitation_armed(notifier, "elicit_unarmed")
+    assert dispatch.calls == []
+
+
 class _GatedEscalation:
     """
     Escalation-sleep stand-in the test opens explicitly.
@@ -585,6 +629,11 @@ async def test_stale_discard_after_delivered_wake_sends_no_resolution_notice(
 
     pending_elicitations.record_publish(child.id, event)
     await _wait_for_calls(dispatch, expected=1)
+    notifier.observe(
+        "unrelated-session",
+        {"type": "response.elicitation_stale", "elicitation_id": "elicit_stale"},
+    )
+    assert elicitation_armed(notifier, "elicit_stale")
     assert pending_elicitations.discard_stale(child.id, event) is True
     for _ in range(10):
         await asyncio.sleep(0)

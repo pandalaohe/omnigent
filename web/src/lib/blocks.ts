@@ -12,7 +12,13 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { CodexPersistMode, ElicitationSource, RememberScope, Response } from "./types";
+import type {
+  AgyPermission,
+  CodexPersistMode,
+  ElicitationSource,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -727,6 +733,12 @@ export interface ElicitationBlock {
   toolName?: string | null;
   /** Working directory the gated action would run in, when known. */
   cwd?: string | null;
+  /**
+   * Agy-native permission prompts only: the action description and
+   * advertised always-allow persist pattern agy's own prompt shows, so
+   * the card can render them. Null for every other elicitation.
+   */
+  agyPermission?: AgyPermission | null;
 }
 
 /** Union of all block types. */
