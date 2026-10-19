@@ -8700,11 +8700,23 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
         captured.update(kwargs)
         raise _Sentinel
 
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12401)
     monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
     monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
     monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
     monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda: SimpleNamespace(host_id="host_test_codex"),
+    )
+    fetch_kwargs: list[dict[str, Any]] = []
+
+    def fake_fetch(**kwargs: Any) -> str:
+        fetch_kwargs.append(kwargs)
+        return "Mother route instruction."
+
+    monkeypatch.setattr(codex_native, "_fetch_global_instructions", fake_fetch)
     monkeypatch.setattr(codex_native, "_resolve_session_id_for_resume", lambda **kwargs: None)
     monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
     monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
@@ -8723,6 +8735,16 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
 
     assert captured.get("developer_instructions") is not None
     assert "Codex is running in the session terminal" in captured["developer_instructions"]
+    assert fetch_kwargs == [
+        {
+            "base_url": "http://127.0.0.1:12401",
+            "headers": {},
+            "host_id": "host_test_codex",
+            "agent": "codex",
+            "spawn": True,
+        }
+    ]
+    assert captured["developer_instructions"].count("Mother route instruction.") == 1
 
 
 def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
@@ -8768,10 +8790,18 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
         captured.update(kwargs)
         raise _Sentinel
 
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12402)
     monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
     monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
     monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    fetch_kwargs: list[dict[str, Any]] = []
+
+    def fake_fetch(**kwargs: Any) -> str:
+        fetch_kwargs.append(kwargs)
+        return "Child route instruction."
+
+    monkeypatch.setattr(codex_native, "_fetch_global_instructions", fake_fetch)
     monkeypatch.setattr(
         codex_native,
         "_resolve_session_id_for_resume",
@@ -8805,6 +8835,14 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
 
     assert captured.get("developer_instructions") is not None
     assert "Codex is running in the session terminal" in captured["developer_instructions"]
+    assert fetch_kwargs == [
+        {
+            "base_url": "http://127.0.0.1:12402",
+            "headers": {},
+            "session_id": "conv_resume_wiring",
+        }
+    ]
+    assert captured["developer_instructions"].count("Child route instruction.") == 1
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ import {
   CircleStopIcon,
   CopyIcon,
   DownloadIcon,
+  FileTextIcon,
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
@@ -439,6 +440,16 @@ export function HeaderConversationMenu({
       >
         <DownloadIcon className="size-3.5" />
         Export
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        data-testid="header-view-instructions"
+        className={itemClass}
+        onSelect={() =>
+          navigate(`/settings/instructions?session=${encodeURIComponent(conversation.id)}`)
+        }
+      >
+        <FileTextIcon className="size-3.5" />
+        View instructions
       </DropdownMenuItem>
       {showPeerMessages && onPeerMessages && (
         <DropdownMenuItem

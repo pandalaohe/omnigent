@@ -53,7 +53,7 @@ export type SettingsSectionId =
   | "account"
   | "members"
   | "policies"
-  | "global-instructions"
+  | "instructions"
   | "sharing"
   | "system-status"
   | "archived"
@@ -73,7 +73,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "account",
   "members",
   "policies",
-  "global-instructions",
+  "instructions",
   "sharing",
   "system-status",
   "archived",
@@ -178,8 +178,8 @@ export function settingsNavGroups(
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
     adminItems.push({
-      id: "global-instructions",
-      label: "Global instructions",
+      id: "instructions",
+      label: "Instructions",
       icon: FileTextIcon,
     });
     adminItems.push({ id: "system-status", label: "System status", icon: ActivityIcon });
@@ -249,6 +249,7 @@ export function useSettingsRoute(): {
 }
 
 const LEGACY_SETTINGS_SECTIONS: Record<string, { section: SettingsSectionId; anchor?: string }> = {
+  "global-instructions": { section: "instructions" },
   agents: { section: "custom-agents" },
   "keep-warm": { section: "general", anchor: "keep-warm" },
   "calling-defaults": { section: "harnesses", anchor: "calling-defaults" },

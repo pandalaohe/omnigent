@@ -226,12 +226,10 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
-    PEER_SESSION_GRANT,
     build_instructions,
     build_instructions_nullable,
-    child_session_framework_instructions,
     raw_author_instructions,
-    session_startup_extras,
+    session_instruction_parts,
 )
 from omnigent.sdk_peer_delivery import (
     SDK_PEER_RECEIPT_EVENT,
@@ -3187,27 +3185,18 @@ def create_runner_app(
             snapshot.peer_messaging_enabled and snapshot.parent_session_id is None
         )
         _session_project_code.setdefault(session_id, snapshot.project_code)
-        _session_global_instructions[session_id] = session_startup_extras(
-            snapshot.global_instructions,
-            workspace=snapshot.workspace,
-            worktree=snapshot.worktree,
-            project_code=_session_project_code.get(session_id),
-        )
-        # A peer-enabled session carries the reply grant, and a child session
-        # also carries the quiet-result rule (D9); the per-session text channel
-        # feeds both native startup and the per-turn framework instructions.
-        child_instructions = child_session_framework_instructions(
-            has_parent=snapshot.parent_session_id is not None
-        )
         _session_global_instructions[session_id] = (
             "\n\n".join(
-                part
-                for part in [
-                    _session_global_instructions[session_id],
-                    PEER_SESSION_GRANT if snapshot.peer_messaging_enabled else None,
-                    *child_instructions,
-                ]
-                if part and part.strip()
+                part.text
+                for part in session_instruction_parts(
+                    snapshot.global_instructions,
+                    workspace=snapshot.workspace,
+                    worktree=snapshot.worktree,
+                    project_code=_session_project_code.get(session_id),
+                    peer_messaging_enabled=snapshot.peer_messaging_enabled,
+                    has_parent=snapshot.parent_session_id is not None,
+                )
+                if part.text is not None
             )
             or None
         )

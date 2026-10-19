@@ -3653,6 +3653,10 @@ def _fetch_global_instructions(
     *,
     base_url: str,
     headers: dict[str, str],
+    host_id: str | None = None,
+    agent: str | None = None,
+    session_id: str | None = None,
+    spawn: bool = False,
 ) -> str | None:
     """Fetch the server-held global instructions for a local CLI launch.
 
@@ -3664,11 +3668,25 @@ def _fetch_global_instructions(
 
     :param base_url: Omnigent server base URL.
     :param headers: HTTP auth headers for *base_url*.
+    :param host_id: Existing local host identity for a fresh launch.
+    :param agent: Coding-agent product for a fresh launch.
+    :param session_id: Resolved session to resume with its own route and role.
+    :param spawn: Whether the fresh launch's agent spec can open children.
     :returns: The global instructions text, or ``None`` when unset or
         unavailable.
     """
     failure: str | None = None
     text: str | None = None
+    params: dict[str, str] = {}
+    if session_id is not None:
+        params["session_id"] = session_id
+    else:
+        if host_id is not None:
+            params["host_id"] = host_id
+        if agent is not None:
+            params["agent"] = agent
+        if spawn:
+            params["spawn"] = "true"
     try:
         with httpx.Client(
             base_url=base_url,
@@ -3676,7 +3694,7 @@ def _fetch_global_instructions(
             timeout=_GLOBAL_INSTRUCTIONS_FETCH_TIMEOUT_S,
             trust_env=not is_loopback_url(base_url),
         ) as client:
-            response = client.get("/v1/global-instructions")
+            response = client.get("/v1/global-instructions", params=params)
         if response.status_code != 200:
             failure = f"HTTP {response.status_code}"
         else:
@@ -3744,7 +3762,6 @@ def _run_with_local_server(
     try:
         _wait_for_server(port, server_handle)
         startup_profiler.mark("local server healthy")
-        global_instructions = _fetch_global_instructions(base_url=base_url, headers={})
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
             headers={},
@@ -3771,6 +3788,25 @@ def _run_with_local_server(
                 headers={},
             )
             startup_profiler.mark("resume workspace aligned")
+            global_instructions = _fetch_global_instructions(
+                base_url=base_url, headers={}, session_id=resolved_session_id
+            )
+        else:
+            from omnigent.host.identity import load_host_identity_if_present
+            from omnigent.spec import load as load_agent_spec
+
+            identity = load_host_identity_if_present()
+            try:
+                spawn = bool(load_agent_spec(spec_path, expand_env=False).spawn)
+            except Exception:  # noqa: BLE001
+                spawn = False
+            global_instructions = _fetch_global_instructions(
+                base_url=base_url,
+                headers={},
+                host_id=identity.host_id if identity is not None else None,
+                agent="claude",
+                spawn=spawn,
+            )
         with runner_startup_progress(initial_message="Preparing Claude...") as progress:
             _mark_startup_step(
                 startup_profiler,

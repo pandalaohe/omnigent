@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from omnigent.entities import (
@@ -215,19 +216,30 @@ def append_framework_instructions(
     return "\n\n".join(parts) if parts else None
 
 
-def _assemble_instruction_parts(
+@dataclass(frozen=True)
+class InstructionPart:
+    """One delivery-ordered section; ``None`` marks text resolved only on the host."""
+
+    kind: str
+    text: str | None
+
+
+def instruction_parts(
     spec: AgentSpec,
     per_request_instructions: str | None,
     tool_schemas: list[dict[str, Any]],
-) -> list[str]:
-    """Collect the author/per-request/skills-hint parts, before framework text."""
-    parts: list[str] = []
+    *,
+    framework_instructions: Sequence[str | InstructionPart] = (),
+    fallback: bool = True,
+) -> list[InstructionPart]:
+    """Build the same labelled sections consumed by per-turn delivery and preview."""
+    parts: list[InstructionPart] = []
 
     if spec.instructions and spec.instructions.strip():
-        parts.append(spec.instructions)
+        parts.append(InstructionPart("author", spec.instructions))
 
     if per_request_instructions and per_request_instructions.strip():
-        parts.append(per_request_instructions)
+        parts.append(InstructionPart("per_request", per_request_instructions))
 
     # Only mention skills in the system prompt when load_skill is
     # available as a tool. Executors that handle skills natively
@@ -240,8 +252,21 @@ def _assemble_instruction_parts(
         skill_lines = ["Available skills (use the load_skill tool to load one):"]
         for skill in spec.skills:
             skill_lines.append(f"- {skill.name}: {skill.description}")
-        parts.append("\n".join(skill_lines))
+        parts.append(InstructionPart("skills_hint", "\n".join(skill_lines)))
 
+    if not parts and fallback:
+        parts.append(InstructionPart("author", "You are a helpful assistant."))
+    for part in [
+        *(InstructionPart("framework", text) for text in _framework_instructions_for(spec)),
+        *(
+            part if isinstance(part, InstructionPart) else InstructionPart("framework", part)
+            for part in framework_instructions
+        ),
+    ]:
+        if part.text is None:
+            parts.append(part)
+        elif part.text.strip():
+            parts.append(InstructionPart(part.kind, part.text.strip()))
     return parts
 
 
@@ -272,14 +297,15 @@ def build_instructions(
         wake-notice announcement for agents that can dispatch sub-agents).
     :returns: The assembled instructions string.
     """
-    parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
-    base_instructions = "\n\n".join(parts) if parts else "You are a helpful assistant."
-    return (
-        append_framework_instructions(
-            base_instructions,
-            [*_framework_instructions_for(spec), *framework_instructions],
+    return "\n\n".join(
+        part.text
+        for part in instruction_parts(
+            spec,
+            per_request_instructions,
+            tool_schemas,
+            framework_instructions=framework_instructions,
         )
-        or base_instructions
+        if part.text is not None
     )
 
 
@@ -307,11 +333,19 @@ def build_instructions_nullable(
 
     :returns: The composed text, or ``None`` when nothing applies.
     """
-    parts = _assemble_instruction_parts(spec, per_request_instructions, tool_schemas)
-    base_instructions = "\n\n".join(parts) if parts else None
-    return append_framework_instructions(
-        base_instructions,
-        [*_framework_instructions_for(spec), *framework_instructions],
+    return (
+        "\n\n".join(
+            part.text
+            for part in instruction_parts(
+                spec,
+                per_request_instructions,
+                tool_schemas,
+                framework_instructions=framework_instructions,
+                fallback=False,
+            )
+            if part.text is not None
+        )
+        or None
     )
 
 
@@ -422,16 +456,60 @@ def session_startup_extras(
         snapshot, or ``None``/empty when the project has none here.
     :returns: The composed text, or ``None`` when no part applies.
     """
-    parts: list[str] = []
-    worktree_line = worktree_instruction(workspace, worktree)
-    if worktree_line:
-        parts.append(worktree_line)
-    code_block = project_code_instruction(project_code)
-    if code_block:
-        parts.append(code_block)
-    if global_instructions and global_instructions.strip():
-        parts.append(global_instructions)
-    return "\n\n".join(parts) if parts else None
+    return (
+        "\n\n".join(
+            part.text
+            for part in session_instruction_parts(
+                global_instructions,
+                workspace=workspace,
+                worktree=worktree,
+                project_code=project_code,
+                peer_messaging_enabled=False,
+                has_parent=False,
+            )
+            if part.text is not None
+        )
+        or None
+    )
+
+
+def session_instruction_parts(
+    global_instructions: str | None,
+    *,
+    workspace: str | None,
+    worktree: str | None,
+    project_code: Sequence[ProjectCodeLocation] | None = None,
+    peer_messaging_enabled: bool,
+    has_parent: bool,
+) -> list[InstructionPart]:
+    """Build the runner's shared native/per-turn session instruction channel."""
+    parts = [
+        InstructionPart("worktree", worktree_instruction(workspace, worktree)),
+        InstructionPart("project_code", project_code_instruction(project_code)),
+        InstructionPart("user_layers", global_instructions),
+        InstructionPart("peer_grant", PEER_SESSION_GRANT if peer_messaging_enabled else None),
+        *(
+            InstructionPart("child_rule", text)
+            for text in child_session_framework_instructions(has_parent=has_parent)
+        ),
+    ]
+    return [part for part in parts if part.text and part.text.strip()]
+
+
+def native_startup_instruction_parts(
+    spec: AgentSpec | None, session_parts: Sequence[InstructionPart]
+) -> list[InstructionPart]:
+    """Keep native startup whitespace and framework ordering for delivery and preview."""
+    parts: list[InstructionPart] = []
+    if spec is not None:
+        author = raw_author_instructions(spec)
+        if author:
+            parts.append(InstructionPart("author", author))
+        parts.extend(
+            InstructionPart("framework", text) for text in _framework_instructions_for(spec)
+        )
+    parts.extend(part for part in session_parts if part.text is None or part.text.strip())
+    return parts
 
 
 def native_startup_instructions(
@@ -455,15 +533,16 @@ def native_startup_instructions(
         ``None``/blank when the admin has none set.
     :returns: The composed text, or ``None`` when there is nothing to send.
     """
-    parts: list[str] = []
-    if spec is not None:
-        author_instructions = raw_author_instructions(spec)
-        if author_instructions:
-            parts.append(author_instructions)
-        parts.extend(_framework_instructions_for(spec))
-    if global_instructions and global_instructions.strip():
-        parts.append(global_instructions)
-    return "\n\n".join(parts) if parts else None
+    return (
+        "\n\n".join(
+            part.text
+            for part in native_startup_instruction_parts(
+                spec, [InstructionPart("user_layers", global_instructions)]
+            )
+            if part.text is not None
+        )
+        or None
+    )
 
 
 def _strip_output_annotations(

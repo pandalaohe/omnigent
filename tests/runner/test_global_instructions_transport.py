@@ -25,7 +25,6 @@ from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     PEER_SESSION_GRANT,
     WORKTREE_INSTRUCTION,
-    session_startup_extras,
 )
 from omnigent.spec.types import AgentSpec
 from tests.runner.conftest import (
@@ -207,41 +206,11 @@ async def test_turn_composes_the_text_after_the_envelope_cache_expires(
     assert composed.endswith("SURVIVOR-TEXT")
 
 
-def _spy_on_startup_extras(
-    monkeypatch: pytest.MonkeyPatch,
-) -> list[str | None]:
-    """Record every extras value the runner writes into its per-session map."""
-    recorded: list[str | None] = []
-    real_extras = session_startup_extras
-
-    def _spy(
-        global_instructions: str | None,
-        *,
-        workspace: str | None,
-        worktree: str | None,
-        project_code: list[Any] | None = None,
-    ) -> str | None:
-        value = real_extras(
-            global_instructions,
-            workspace=workspace,
-            worktree=worktree,
-            project_code=project_code,
-        )
-        recorded.append(value)
-        return value
-
-    monkeypatch.setattr("omnigent.runner.app.session_startup_extras", _spy)
-    return recorded
-
-
 @pytest.mark.asyncio
-async def test_worktree_line_recorded_before_the_global_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_worktree_line_recorded_before_the_global_text() -> None:
     """A session-init envelope with distinct workspace and worktree records the
     worktree line ahead of the global text, and the next turn composes them
     after the framework instructions."""
-    recorded = _spy_on_startup_extras(monkeypatch)
     app, harness_client = _build_turn_app()
     session_id, agent_id = _ids()
     async with _runner_client(app) as client:
@@ -259,18 +228,14 @@ async def test_worktree_line_recorded_before_the_global_text(
         workspace=json.dumps("/entry"),
         worktree=json.dumps("/entry/.worktrees/repo/topic"),
     )
-    assert recorded == [f"{line}\n\nGLOBAL-MARKER"]
     assert composed.endswith(f"{line}\n\nGLOBAL-MARKER")
     assert composed.index(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION) < composed.index(line)
 
 
 @pytest.mark.asyncio
-async def test_without_a_worktree_the_recorded_value_is_the_global_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_without_a_worktree_the_recorded_value_is_the_global_text() -> None:
     """A session without a worktree records the global text exactly — the
     unchanged path — and composes no worktree line."""
-    recorded = _spy_on_startup_extras(monkeypatch)
     app, harness_client = _build_turn_app()
     session_id, agent_id = _ids()
     async with _runner_client(app) as client:
@@ -283,7 +248,6 @@ async def test_without_a_worktree_the_recorded_value_is_the_global_text(
         )
         composed = await _turn_instructions(client, harness_client, session_id)
 
-    assert recorded == ["GLOBAL-MARKER"]
     assert composed.endswith("GLOBAL-MARKER")
     assert "Your git working tree is" not in composed
 

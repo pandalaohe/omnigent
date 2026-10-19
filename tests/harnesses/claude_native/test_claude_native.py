@@ -1660,6 +1660,17 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
     monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
     monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
     monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda: SimpleNamespace(host_id="host_test_claude"),
+    )
+    fetch_kwargs: list[dict[str, Any]] = []
+
+    def fake_fetch(**kwargs: Any) -> str:
+        fetch_kwargs.append(kwargs)
+        return "Mother route instruction."
+
+    monkeypatch.setattr(claude_native, "_fetch_global_instructions", fake_fetch)
     monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
     monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
@@ -1682,6 +1693,16 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
     assert (
         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
     )
+    assert fetch_kwargs == [
+        {
+            "base_url": "http://127.0.0.1:12346",
+            "headers": {},
+            "host_id": "host_test_claude",
+            "agent": "claude",
+            "spawn": True,
+        }
+    ]
+    assert launch_kwargs["append_system_prompt"].count("Mother route instruction.") == 1
 
 
 def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
@@ -1755,6 +1776,13 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
     monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
     monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
     monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    fetch_kwargs: list[dict[str, Any]] = []
+
+    def fake_fetch(**kwargs: Any) -> str:
+        fetch_kwargs.append(kwargs)
+        return "Child route instruction."
+
+    monkeypatch.setattr(claude_native, "_fetch_global_instructions", fake_fetch)
     monkeypatch.setattr(claude_native, "_find_running_claude_terminal", _fake_find_running)
     monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", _fake_fetch_labels)
     monkeypatch.setattr(claude_native, "_resolve_cold_resume_args", _fake_resolve_cold_resume_args)
@@ -1778,6 +1806,14 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
     assert (
         "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
     )
+    assert fetch_kwargs == [
+        {
+            "base_url": "http://127.0.0.1:12347",
+            "headers": {},
+            "session_id": "conv_cold_resume_raw",
+        }
+    ]
+    assert launch_kwargs["append_system_prompt"].count("Child route instruction.") == 1
 
 
 def test_local_resume_does_not_print_redundant_resume_hint(
@@ -6970,18 +7006,42 @@ def _mock_sync_httpx_client(
     monkeypatch.setattr(claude_native.httpx, "Client", _client)
 
 
+@pytest.mark.parametrize(
+    ("route", "expected_query"),
+    [
+        ({}, {}),
+        (
+            {"host_id": "host_test_claude", "agent": "claude", "spawn": True},
+            {"host_id": "host_test_claude", "agent": "claude", "spawn": "true"},
+        ),
+        (
+            {
+                "host_id": "host_test_claude",
+                "agent": "claude",
+                "session_id": "conv_child_test",
+                "spawn": True,
+            },
+            {"session_id": "conv_child_test"},
+        ),
+    ],
+)
 def test_fetch_global_instructions_returns_text_on_200(
     monkeypatch: pytest.MonkeyPatch,
+    route: dict[str, Any],
+    expected_query: dict[str, str],
 ) -> None:
     """The helper returns the server-held text that later rides the launch."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/global-instructions"
+        assert dict(request.url.params) == expected_query
         return httpx.Response(200, json={"text": "Prefer minimal diffs."})
 
     _mock_sync_httpx_client(monkeypatch, handler)
 
-    result = claude_native._fetch_global_instructions(base_url="http://127.0.0.1:1", headers={})
+    result = claude_native._fetch_global_instructions(
+        base_url="http://127.0.0.1:1", headers={}, **route
+    )
 
     assert result == "Prefer minimal diffs."
 
