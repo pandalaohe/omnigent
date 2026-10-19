@@ -3,6 +3,7 @@ import type { OmnigentHostConfig } from "./host";
 
 const fetchMock = vi.fn();
 const getHostConfig = vi.fn<() => OmnigentHostConfig>();
+const getServerIdentity = vi.fn(() => "server");
 const isWorkspace = vi.fn(() => true);
 const SLICE_KEY = "X-Databricks-Omnigent-Slice-Key";
 const SESSION_ID = "managed-session";
@@ -20,12 +21,13 @@ beforeEach(() => {
   vi.resetModules();
   fetchMock.mockReset();
   getHostConfig.mockReset().mockReturnValue({ fetcher: fetchMock });
+  getServerIdentity.mockReset().mockReturnValue("server");
   isWorkspace.mockReturnValue(true);
   vi.doUnmock("./sessionHost");
   vi.doMock("./host", () => ({
     getOmnigentHostConfig: getHostConfig,
     getOmnigentHostGeneration: vi.fn(() => 0),
-    getOmnigentServerIdentity: vi.fn(() => "server"),
+    getOmnigentServerIdentity: getServerIdentity,
     hostFetch: fetchMock,
     isDatabricksWorkspace: isWorkspace,
     isHostRoutingEnabled: isWorkspace,
@@ -219,19 +221,10 @@ describe("managed first-message routing", () => {
   });
 
   it("does not replay on a new Server reached during the forced refresh", async () => {
-    let server = "server";
-    vi.doMock("./host", () => ({
-      getOmnigentHostConfig: () => ({ fetcher: fetchMock }),
-      getOmnigentHostGeneration: vi.fn(() => 0),
-      getOmnigentServerIdentity: vi.fn(() => server),
-      hostFetch: fetchMock,
-      isDatabricksWorkspace: isWorkspace,
-      isHostRoutingEnabled: isWorkspace,
-    }));
     const { authenticatedFetch, resolve, setSessionHost } = await setup();
     resolve.mockImplementation(async (sessionId, options) => {
       if (!options?.force) return;
-      server = "other-server";
+      getServerIdentity.mockReturnValue("other-server");
       setSessionHost(sessionId, "new-host");
     });
     const original = wrongReplica();
