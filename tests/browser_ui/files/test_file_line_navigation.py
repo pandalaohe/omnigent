@@ -826,8 +826,11 @@ def test_markdown_comment_draft_survives_responsive_layouts(
     editor = viewer.locator(".tiptap")
     expect(editor).to_be_visible()
     editor.click()
-    page.keyboard.press("Control+Home")
-    page.keyboard.press("Control+Shift+ArrowRight")
+    is_mac = page.evaluate(
+        "/Mac|iPhone|iPad|iPod/i.test(navigator.userAgentData?.platform ?? navigator.platform)"
+    )
+    page.keyboard.press("Meta+ArrowUp" if is_mac else "Control+Home")
+    page.keyboard.press("Alt+Shift+ArrowRight" if is_mac else "Control+Shift+ArrowRight")
     page.get_by_role("button", name="Add comment", exact=True).click()
     draft = viewer.get_by_placeholder("Add a comment", exact=False)
     draft.fill("Keep this unsubmitted review")

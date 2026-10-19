@@ -81,7 +81,7 @@ def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSessi
     page.reload()
     expect(editor.locator("pre").last).to_contain_text("journey edit")
     editor.locator("pre").last.click()
-    page.keyboard.press("Control+f")
+    page.keyboard.press("ControlOrMeta+f")
     search = viewer.get_by_placeholder(re.compile(r"^Find"))
     expect(search).to_be_focused()
     search.fill("journey edit")
