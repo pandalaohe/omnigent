@@ -224,6 +224,7 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
             agent_id = next(agent["id"] for agent in agents if agent["name"] == "routing_probe")
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
             await page.get_by_test_id("new-chat-landing-input").fill(_PROMPT)
             await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
@@ -405,6 +406,7 @@ async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -
             agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
             agent_id = next(agent["id"] for agent in agents if agent["name"] == "routing_probe")
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
             await page.get_by_test_id("new-chat-landing-input").fill(_SHARDED_PROMPT)
             await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
