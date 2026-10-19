@@ -2144,9 +2144,76 @@ def register_peer_routes(
         host_ok=_keep_warm_host_ok,
         notify_line=sweeper.notify_line if sweeper is not None else None,
     )
+
+    from omnigent.server.child_idle import (
+        ChildIdleSweeper,
+        NoticeOutcome,
+        batch_claim_valid,
+        has_pending_card,
+    )
+
+    def _owns_idle_parent(conv: Conversation) -> bool:
+        return bool(
+            runner_router is not None
+            and conv.runner_id is not None
+            and runner_router.runner_is_online(conv.runner_id)
+        )
+
+    def _idle_notice_eligible(parent: Conversation | None, claim: str) -> bool:
+        return bool(
+            parent is not None
+            and not parent.archived
+            and not is_session_closed(parent.labels, parent.title)
+            and parent.live_status == "idle"
+            and _session_status_from_cache(parent.id, parent.live_status) == "idle"
+            and _owns_idle_parent(parent)
+            and not has_pending_card(parent)
+            and batch_claim_valid(parent, claim, int(time.time()))
+        )
+
+    async def _post_idle_notice(parent_id: str, text: str, claim: str) -> NoticeOutcome:
+        from omnigent.server.peer_sweeper import PeerSweeper
+
+        parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+        if parent is None or not _idle_notice_eligible(parent, claim):
+            return "deferred"
+        state, _online = await _true_state(parent)
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+        if (
+            state != "idle"
+            or fresh is None
+            or fresh.runner_id != parent.runner_id
+            or fresh.archive_revision != parent.archive_revision
+            or not _idle_notice_eligible(fresh, claim)
+        ):
+            return "deferred"
+        try:
+            result = await post_event_impl(
+                PeerSweeper._synthetic_request(parent_id, child_idle._app),
+                parent_id,
+                SessionEventInput(
+                    type="message",
+                    data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+                ),
+                acting_user_id=effective_owner_id(fresh, conversation_store, permission_store),
+            )
+        except Exception:
+            _logger.warning("Idle-child notice acceptance uncertain", exc_info=True)
+            return "uncertain"
+        if isinstance(result, dict) and result.get("forwarded") is False:
+            return "rejected"
+        return "accepted"
+
+    child_idle = ChildIdleSweeper(
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        owns_parent=_owns_idle_parent,
+        post_notice=_post_idle_notice,
+    )
     if app_state is not None:
         app_state.peer_sweeper = sweeper
         app_state.child_keep_warm = child_keep_warm
+        app_state.child_idle = child_idle
     return PeerRoutes(peer_send, _true_state)
 
 

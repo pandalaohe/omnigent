@@ -90,13 +90,17 @@ def test_flag_off_still_starts_the_keep_warm_sweeper(
     """SCC28 A1: keep-warm runs whether or not peer messaging is on."""
     app = _build_app(db_uri, tmp_path, flag_on=False, with_store=True)
     keep_warm = app.state.child_keep_warm
+    idle_reminders = app.state.child_idle
     assert isinstance(keep_warm, ChildKeepWarmSweeper)
     assert keep_warm._notify_line is None
     assert keep_warm._task is None
     with TestClient(app):
         assert keep_warm._task is not None
         assert not keep_warm._task.done()
+        assert idle_reminders._task is not None
+        assert not idle_reminders._task.done()
     assert keep_warm._task is None
+    assert idle_reminders._task is None
 
 
 _HOST_ID = "6f6e1d2c3b4a5968778899aabbccddee"

@@ -432,6 +432,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
         "omnigent.goal_state",
+        "omnigent.child_idle",
+        "omnigent.child_idle_batch",
         "omnigent.last_provider_usage_limits",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         ARTIFACT_LINK_KEY_LABEL,
@@ -1785,6 +1787,17 @@ class ConversationStore(ABC):
             audit trails aligned with the enforcement site
             rather than wall-clock drift between evaluate()
             and the actual DB write.
+        """
+        ...
+
+    @abstractmethod
+    def compare_and_set_label(
+        self, conversation_id: str, key: str, expected: str, value: str | None
+    ) -> bool:
+        """Replace or delete an existing label only while its value matches.
+
+        Returns whether this writer won the conditional change. A missing
+        label never matches; use ``insert_label_if_absent`` to seed it.
         """
         ...
 

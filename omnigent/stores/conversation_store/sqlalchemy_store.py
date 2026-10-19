@@ -1937,6 +1937,32 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._conv_session_immediate, "set_labels", write)
 
+    def compare_and_set_label(
+        self, conversation_id: str, key: str, expected: str, value: str | None
+    ) -> bool:
+        """Fence a label transition against concurrent observers and stale retries."""
+        if value is not None and len(value) > LABEL_VALUE_MAX_LEN:
+            raise ValueError("label value exceeds its storage limit")
+
+        def write(session: Session) -> bool:
+            conditions = (
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == key,
+                SqlConversationLabel.value == expected,
+            )
+            statement = (
+                delete(SqlConversationLabel).where(*conditions)
+                if value is None
+                else update(SqlConversationLabel)
+                .where(*conditions)
+                .values(value=value, updated_at=now_epoch())
+            )
+            result = cast(_RowCountResult, session.execute(statement))
+            return result.rowcount == 1
+
+        return run_write_transaction(self._conv_session_immediate, "compare_and_set_label", write)
+
     def insert_label_if_absent(
         self,
         conversation_id: str,

@@ -24,6 +24,20 @@ beforeEach(() => {
 });
 
 describe("user preference synchronization", () => {
+  it("syncs idle reminders independently and clears them on an owner switch", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { child_idle: { enabled: true } } },
+      fetcher,
+      "alice",
+    );
+    expect(JSON.parse(localStorage.getItem("omnigent:child-idle") ?? "null")).toEqual({
+      enabled: true,
+    });
+    expect(localStorage.getItem("omnigent:keep-warm")).toBeNull();
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "bob");
+    expect(localStorage.getItem("omnigent:child-idle")).toBeNull();
+  });
   it("retains a legacy worktree opt-in on an older server until migration", async () => {
     localStorage.setItem("omnigent:always-use-worktree", "true");
     await initializeUserPreferencesSync(undefined, vi.fn(), "alice");

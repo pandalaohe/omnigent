@@ -13,6 +13,7 @@ export type UserPreferenceNamespace =
   | "session_collab"
   | "host_colors"
   | "keep_warm"
+  | "child_idle"
   | "runner_log_warnings"
   | "sidebar_layout"
   | "sound_alerts"
@@ -92,6 +93,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     keep_warm: {
       storageKey: "omnigent:keep-warm",
       eventName: "omnigent:keep-warm-changed",
+    },
+    child_idle: {
+      storageKey: "omnigent:child-idle",
+      eventName: "omnigent:child-idle-changed",
     },
     runner_log_warnings: {
       storageKey: "omnigent:runner-log-warnings",

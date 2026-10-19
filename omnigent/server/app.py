@@ -2111,9 +2111,15 @@ def create_app(
         if child_keep_warm is not None:
             await child_keep_warm.start(app_inst)
 
+        child_idle = getattr(app_inst.state, "child_idle", None)
+        if child_idle is not None:
+            await child_idle.start(app_inst)
+
         try:
             yield
         finally:
+            if child_idle is not None:
+                await child_idle.shutdown()
             # Keep-warm stops first: its notices post through the peer
             # sweeper, so that sweeper must still be alive while it drains.
             if child_keep_warm is not None:

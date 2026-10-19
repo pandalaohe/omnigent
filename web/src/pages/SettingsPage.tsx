@@ -133,6 +133,7 @@ import { ApprovalTimeoutSettings } from "@/components/ApprovalTimeoutSettings";
 import { ArtifactSharingSettings } from "@/components/ArtifactSharingSettings";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
 import { KeepWarmSettings } from "@/components/KeepWarmSettings";
+import { ChildIdleSettings } from "@/components/ChildIdleSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import { HostColorsSettings, SessionCollabSettings } from "@/components/SessionCollabSettings";
@@ -2455,6 +2456,9 @@ function GeneralSection() {
           <Link to="#keep-warm" className="text-primary underline underline-offset-2">
             Keep-warm
           </Link>
+          <Link to="#child-idle" className="text-primary underline underline-offset-2">
+            Idle child reminders
+          </Link>
           {sessionCollabEnabled && (
             <Link to="#session-collab" className="text-primary underline underline-offset-2">
               Session collaboration
@@ -2481,6 +2485,13 @@ function GeneralSection() {
             className="mt-4 border-t border-border pt-4"
           >
             <KeepWarmSettings />
+          </ExpandableSettings>
+          <ExpandableSettings
+            id="child-idle"
+            title="Idle child reminders"
+            className="mt-4 border-t border-border pt-4"
+          >
+            <ChildIdleSettings />
           </ExpandableSettings>
           {sessionCollabEnabled && (
             <ExpandableSettings
