@@ -39,6 +39,17 @@ import {
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 import { getSessionHost, setSessionHost } from "./sessionHost";
 
+it("encodes an opaque effort reset as JSON null", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(mockJsonResponse({ id: "conv_abc", labels: {} })),
+  );
+  await updateSession("conv_abc", { reasoningEffort: null }, { literalEffort: true });
+  expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string)).toEqual({
+    reasoning_effort: null,
+  });
+});
+
 function mockJsonResponse(
   body: unknown,
   init?: { ok?: boolean; status?: number; statusText?: string },

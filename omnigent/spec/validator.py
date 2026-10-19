@@ -237,7 +237,13 @@ def _validate_reasoning_effort(spec: AgentSpec, result: ValidationResult) -> Non
     if spec.executor.reasoning_effort is None:
         return
     try:
-        validate_effort(spec.executor.reasoning_effort, "reasoning_effort", EFFORT_VALUES)
+        validate_effort(
+            spec.executor.reasoning_effort,
+            "reasoning_effort",
+            None
+            if spec.executor.harness_kind == "acp" or spec.executor.harness_kind.startswith("acp:")
+            else EFFORT_VALUES,
+        )
     except ValueError as exc:
         result.add("executor.reasoning_effort", str(exc))
 

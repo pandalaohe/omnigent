@@ -20,6 +20,16 @@ export function effortLevelsFor(
   rows: readonly NativeModelOption[],
   model: string | null | undefined,
 ): readonly string[] | null {
+  if (harness === "acp" || harness?.startsWith("acp:")) {
+    const selected = model
+      ? (rows.find((row) => row.id === model) ?? rows.find((row) => row.id === "__default__"))
+      : rows.find((row) => row.isDefault);
+    return (
+      selected?.efforts ??
+      selected?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ??
+      []
+    );
+  }
   switch (harness) {
     case "claude-native":
     case "claude-sdk":
@@ -55,7 +65,11 @@ export function reconcileEffortOnModelChange(
 ): string | null {
   // Devin's model switch keeps the selected effort even if the new model omits it.
   if (
-    (harness === "codex-native" || harness === "codex" || harness === "antigravity-native") &&
+    (harness === "codex-native" ||
+      harness === "codex" ||
+      harness === "antigravity-native" ||
+      harness === "acp" ||
+      harness?.startsWith("acp:")) &&
     effort !== null
   ) {
     return effortLevelsFor(harness, rows, model)?.includes(effort) ? effort : null;

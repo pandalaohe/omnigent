@@ -106,6 +106,15 @@ def _build_blocking_app(
     return app, pm, harness_client
 
 
+@pytest.fixture(autouse=True)
+def _isolate_runtime_skill_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forwarding tests use spec skills; ambient CLI discovery is tested separately."""
+    monkeypatch.setattr(
+        "omnigent.runner.tool_dispatch.session_skill_registry",
+        lambda spec, *args: list(spec.skills),
+    )
+
+
 @pytest.mark.asyncio
 async def test_proxy_stream_relays_non_json_sse_frame() -> None:
     """A non-data SSE frame is relayed without entering JSON event handling."""
@@ -915,7 +924,12 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
 
 
 @pytest.mark.asyncio
-async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
+@pytest.mark.parametrize(
+    "harness,initial,changed", [("pi", "high", "low"), ("acp", "deliberate", "quick")]
+)
+async def test_forwarded_reasoning_effort_reaches_the_harness(
+    harness: str, initial: str, changed: str
+) -> None:
     """The turn's reasoning effort rides the forwarded message to the harness.
 
     ``_run_turn_bg`` builds the harness body field by field, so an effort that
@@ -946,8 +960,8 @@ async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
                 "role": "user",
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "hi"}],
-                "harness": "pi",
-                "reasoning": {"effort": "high"},
+                "harness": harness,
+                "reasoning": {"effort": initial},
             },
         )
         assert resp.status_code == 202
@@ -957,7 +971,7 @@ async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
             await asyncio.sleep(0.01)
 
         assert hc.posted_bodies, "harness never received a turn"
-        assert hc.posted_bodies[0].get("reasoning") == {"effort": "high"}, (
+        assert hc.posted_bodies[0].get("reasoning") == {"effort": initial}, (
             "the effort was dropped between the runner's message intake and the "
             f"harness body: {hc.posted_bodies[0].keys()}"
         )
@@ -966,7 +980,7 @@ async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
         # it without the client repeating it in-band.
         effort_resp = await client.post(
             f"/v1/sessions/{session}/events",
-            json={"type": "effort_change", "effort": "low"},
+            json={"type": "effort_change", "effort": changed},
         )
         assert effort_resp.status_code == 204
         hc.posted_bodies.clear()
@@ -977,7 +991,7 @@ async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
                 "role": "user",
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "again"}],
-                "harness": "pi",
+                "harness": harness,
             },
         )
         assert resp.status_code == 202
@@ -987,7 +1001,7 @@ async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
             await asyncio.sleep(0.01)
 
     assert hc.posted_bodies, "harness never received the second turn"
-    assert hc.posted_bodies[0].get("reasoning") == {"effort": "low"}
+    assert hc.posted_bodies[0].get("reasoning") == {"effort": changed}
 
 
 @pytest.mark.asyncio

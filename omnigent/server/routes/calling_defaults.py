@@ -175,7 +175,11 @@ def create_calling_defaults_router(
             hosts = await asyncio.to_thread(host_store.list_hosts, owner)
 
         harness_filter = (
-            canonicalize_harness(body.harness) or body.harness if body.harness else None
+            body.harness
+            if body.harness and body.harness.startswith("acp:")
+            else canonicalize_harness(body.harness) or body.harness
+            if body.harness
+            else None
         )
         semaphore = asyncio.Semaphore(_SYNC_CONCURRENCY)
         syncs = []
@@ -183,7 +187,16 @@ def create_calling_defaults_router(
             conn = host_registry.get(host.host_id)
             if conn is None:
                 continue
-            for harness in MODEL_OPTION_HARNESSES:
+            acp_harnesses = [
+                key for key in (host.configured_harnesses or {}) if key.startswith("acp:")
+            ]
+            if (
+                harness_filter
+                and harness_filter.startswith("acp:")
+                and harness_filter not in acp_harnesses
+            ):
+                acp_harnesses.append(harness_filter)
+            for harness in (*MODEL_OPTION_HARNESSES, *acp_harnesses):
                 if harness_filter is not None and harness != harness_filter:
                     continue
                 if not _harness_configured(host, harness):
@@ -269,7 +282,9 @@ def create_calling_defaults_router(
             explicit["agent_id"] = agent_id
             explicit_fields.add("agent_id")
         if harness is not None:
-            explicit["harness_override"] = canonicalize_harness(harness) or harness
+            explicit["harness_override"] = (
+                harness if harness.startswith("acp:") else canonicalize_harness(harness) or harness
+            )
             explicit_fields.add("harness_override")
 
         def agent_row(effective_agent_id: str) -> Any | None:

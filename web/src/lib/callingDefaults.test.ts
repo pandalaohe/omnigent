@@ -25,6 +25,14 @@ afterEach(() => {
 });
 
 describe("calling_defaults master table", () => {
+  it("preserves opaque ACP effort values that other harnesses reserve for clearing", () => {
+    for (const effort of ["default", "off", "deliberate"]) {
+      setCallingDefaultField("h1", "acp:neutral", "effort", effort);
+      expect(readCallingDefaults().h1["acp:neutral"].effort).toBe(effort);
+    }
+    setCallingDefaultField("h1", "acp:neutral", "effort", null);
+    expect(readCallingDefaults().h1["acp:neutral"].effort).toBeUndefined();
+  });
   it("resolves legacy model and SDK Native fallback with their real sources", () => {
     const master = {
       h1: {

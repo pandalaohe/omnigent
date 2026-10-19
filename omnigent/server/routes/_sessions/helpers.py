@@ -244,6 +244,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
     SUBAGENT_ROUTING_OVERRIDE_VALUES,
+    _acp_effort_options_cache,
     _catalog_prefetch_tasks,
     _logger,
     _managed_launch_tasks,
@@ -6103,6 +6104,7 @@ def _invalidate_runner_backed_snapshot_state(
     invalidate_runner_catalog(session_id)
     if drop_model_options:
         _model_options_cache.pop(session_id, None)
+        _acp_effort_options_cache.pop(session_id, None)
         _model_options_stale.discard(session_id)
     else:
         _model_options_stale.add(session_id)
@@ -10366,15 +10368,15 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     try:
         parsed = SessionCreateMetadata.model_validate_json(metadata)
-        reasoning_effort = validate_effort(
+        validate_effort(
             parsed.reasoning_effort,
             "session metadata",
-            EFFORT_VALUES,
+            None,  # The bundle's harness supplies the vocabulary after parsing.
         )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -12252,6 +12254,8 @@ def _persist_stored_session_bundle(
         inference_kwargs["inference_snapshot"] = inference_snapshot
     if inference_model is not None:
         inference_kwargs["model_override"] = inference_model
+    elif metadata.model_override is not None:
+        inference_kwargs["model_override"] = metadata.model_override
     try:
         created = conversation_store.create_session_with_agent(
             agent_id=agent_id,
@@ -12355,7 +12359,9 @@ def _persist_session_for_uploaded_agent(
             inference_snapshot=inference_snapshot,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
-            model_override=inference_model,
+            model_override=inference_model
+            if inference_model is not None
+            else metadata.model_override,
         )
     except IntegrityError as exc:
         raise OmnigentError(
@@ -13644,6 +13650,9 @@ async def _load_model_options(
     session_id: str,
     path: str,
     fallback_path: str | None = None,
+    publish_on_change_only: bool = False,
+    accept_empty: bool = False,
+    acp_effort_only: bool = False,
 ) -> None:
     """
     Background single-flight fetch of a session's native model catalog.
@@ -13694,7 +13703,7 @@ async def _load_model_options(
                 extra={"session_id": session_id},
             )
             return
-        if not options:
+        if not options and not accept_empty:
             # Older runners returned 200 + [] for the same not-ready window.
             # Do not cache that empty catalog; retry, then leave the cache
             # cold so a later snapshot can try again.
@@ -13702,9 +13711,12 @@ async def _load_model_options(
                 await asyncio.sleep(delays[attempt])
                 continue
             return
-        _model_options_cache[session_id] = options
+        cache = _acp_effort_options_cache if acp_effort_only else _model_options_cache
+        changed = cache.get(session_id) != options
+        cache[session_id] = options
         _model_options_stale.discard(session_id)
-        _publish_model_options(session_id)
+        if changed or not publish_on_change_only:
+            _publish_model_options(session_id)
         return
 
 

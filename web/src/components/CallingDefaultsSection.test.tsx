@@ -105,6 +105,50 @@ afterEach(() => {
 });
 
 describe("CallingDefaultsSection", () => {
+  it("adds a configured ACP row using only its advertised effort choices", async () => {
+    mocks.hosts = [{ ...HOST, configured_harnesses: { "acp:neutral": true } }];
+    mocks.listCatalogs.mockResolvedValue([
+      {
+        host_id: "host-a",
+        harness: "acp:neutral",
+        fetched_at: 1,
+        stale: false,
+        error: null,
+        models: [{ id: "model-a", isDefault: true, efforts: ["quick", "deliberate"] }],
+      },
+    ]);
+    render(<CallingDefaultsSection />);
+    fireEvent.click(screen.getByTestId("calling-defaults-add-row"));
+    await pickOption("calling-defaults-add-harness", "ACP · neutral");
+    expect(await screen.findByTestId("calling-defaults-row-acp:neutral")).toBeInTheDocument();
+    fireEvent.click(await screen.findByTestId("calling-defaults-effort-acp:neutral"));
+    expect(screen.getByRole("option", { name: /deliberate/i })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: /deliberate/i }));
+    expect(readMaster()["host-a"]["acp:neutral"]).toEqual({ effort: "deliberate" });
+  });
+
+  it("hides the ACP effort control when the selected model advertises none", async () => {
+    localStorage.setItem(
+      DEFAULTS_KEY,
+      JSON.stringify({ "host-a": { "acp:neutral": { model: "model-b", effort: "high" } } }),
+    );
+    mocks.listCatalogs.mockResolvedValue([
+      {
+        host_id: "host-a",
+        harness: "acp:neutral",
+        fetched_at: 1,
+        stale: false,
+        error: null,
+        models: [{ id: "model-b", isDefault: true, efforts: [] }],
+      },
+    ]);
+    render(<CallingDefaultsSection />);
+    expect(
+      await screen.findByTestId("calling-defaults-effort-unavailable-acp:neutral"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("calling-defaults-effort-acp:neutral")).not.toBeInTheDocument();
+  });
   it("offers library agents only when all member targets are ready", async () => {
     const member = {
       name: "Lead",

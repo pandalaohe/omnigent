@@ -1675,6 +1675,7 @@ def register_core_routes(
         )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
+            validate_session_model_metadata,
         )
 
         request_fields_set = parsed_metadata.model_fields_set
@@ -1687,6 +1688,21 @@ def register_core_routes(
             bundle_bytes,
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
+        if not (
+            spec.executor.harness_kind == "acp" or spec.executor.harness_kind.startswith("acp:")
+        ):
+            parsed_metadata = parsed_metadata.model_copy(update={"model_override": None})
+        _, effort = validate_session_model_metadata(
+            model_override=parsed_metadata.model_override,
+            reasoning_effort=(
+                parsed_metadata.reasoning_effort
+                if "reasoning_effort" in request_fields_set
+                else spec.executor.reasoning_effort
+            ),
+            harness=spec.executor.harness_kind,
+        )
+        if effort != parsed_metadata.reasoning_effort:
+            parsed_metadata = parsed_metadata.model_copy(update={"reasoning_effort": effort})
         spec_speed = spec.executor.config.get("service_tier")
         if SPEED_TIER_LABEL_KEY not in parsed_metadata.labels and valid_speed_tier(
             spec_speed, spec.executor.harness_kind
@@ -1844,12 +1860,51 @@ def register_core_routes(
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
+        if spec.executor.harness_kind == "acp" or spec.executor.harness_kind.startswith("acp:"):
+            from omnigent.server.routes._session_create_validation import resolve_create_calling
+
+            project = None
+            if parsed_metadata.project_id is not None and project_store is not None:
+                project = await asyncio.to_thread(
+                    project_store.get, parsed_metadata.project_id, user_id=user_id
+                )
+            # The uploaded bundle is the explicit agent; only its omitted
+            # model/effort fields inherit the matching ACP row.
+            explicit = {
+                **parsed_metadata.model_dump(),
+                "agent_id": None,
+                "harness_override": spec.executor.harness_kind,
+            }
+            explicit_fields = request_fields_set | {"agent_id", "harness_override"}
+            if spec.executor.model is not None:
+                explicit_fields.add("model_override")
+            if spec.executor.reasoning_effort is not None:
+                explicit_fields.add("reasoning_effort")
+            resolution = await resolve_create_calling(
+                request=request,
+                user_id=user_id,
+                project=project,
+                host_id=parsed_metadata.host_id or (parent_conv.host_id if parent_conv else None),
+                explicit=explicit,
+                explicit_fields=explicit_fields,
+                path_label="POST /v1/sessions (bundle)",
+                parent_session_id=parsed_metadata.parent_session_id,
+            )
+            updates = {}
+            if "model_override" not in explicit_fields and resolution.model is not None:
+                updates["model_override"] = resolution.model
+            if "reasoning_effort" not in explicit_fields and resolution.effort is not None:
+                updates["reasoning_effort"] = resolution.effort
+            if updates:
+                parsed_metadata = parsed_metadata.model_copy(update=updates)
+
         inference_snapshot, inference_model = await prepare_create_inference(
             request,
             parsed_metadata,
             spec,
             user_id,
             conversation_store,
+            model_override=parsed_metadata.model_override,
         )
         from omnigent.models.model_catalog import spec_harness
         from omnigent.server.routes._session_harness_readiness import (
@@ -3985,13 +4040,28 @@ def register_core_routes(
                 requested_codex_collaboration_mode
             )
         effort = body.reasoning_effort
-        clear_effort = effort in EFFORT_CLEAR_VALUES
+        dynamic_effort = False
+        if "reasoning_effort" in body.model_fields_set:
+            effort_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if effort_conv is None:
+                raise _session_not_found()
+            effort_harness = _resolve_harness(
+                effort_conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            dynamic_effort = effort_harness == "acp" or bool(
+                effort_harness and effort_harness.startswith("acp:")
+            )
+        clear_effort = (
+            (effort is None and "reasoning_effort" in body.model_fields_set)
+            if dynamic_effort
+            else effort in EFFORT_CLEAR_VALUES
+        )
         if effort is not None and not clear_effort:
             try:
                 effort = validate_effort(
                     effort,
                     "session metadata",
-                    EFFORT_VALUES,
+                    None if dynamic_effort else EFFORT_VALUES,
                 )
             except ValueError as exc:
                 raise OmnigentError(

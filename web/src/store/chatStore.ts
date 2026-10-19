@@ -3437,7 +3437,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           setterFor(conversationId)({ sessionReasoningEffort: null });
           return;
         }
-        updated = await updateSession(conversationId, { reasoningEffort: effort });
+        updated =
+          session.harness === "acp" || session.harness?.startsWith("acp:")
+            ? await updateSession(
+                conversationId,
+                { reasoningEffort: effort },
+                { literalEffort: true },
+              )
+            : await updateSession(conversationId, { reasoningEffort: effort });
         pick.confirm(effort);
       } catch (err) {
         // Adopt the server's settled effort, not an earlier unconfirmed pick; keep a newer pick.

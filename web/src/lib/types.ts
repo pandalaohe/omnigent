@@ -724,6 +724,8 @@ export interface NativeModelOption {
   defaultServiceTier?: string | null;
   /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
+  /** Model currently selected by this ACP session. */
+  isActive?: boolean;
   /** Configuration that supplies this model; never includes credentials. */
   source?: ModelConfigurationSource;
   /** Present only on Devin's Fusion option: its lead/sidekick combo table. */

@@ -1,4 +1,6 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
+import { effortLevelsFor } from "./modelEffortOptions";
+import type { NativeModelOption } from "./types";
 
 export const SANDBOX_FORK_UNSUPPORTED = "Forking this sandbox session is not supported yet.";
 export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
@@ -107,11 +109,18 @@ export function supportsEffortControl(
         harness?: string | null;
         inferenceConfigured?: boolean;
         parentSessionId?: string | null;
+        codexModelOptions?: readonly NativeModelOption[];
       }
     | null
     | undefined,
   effortFamily: string | null = null,
+  models?: readonly NativeModelOption[],
 ): boolean {
+  if (session?.harness === "acp" || session?.harness?.startsWith("acp:")) {
+    const rows = models ?? session.codexModelOptions ?? [];
+    const active = rows.find((row) => row.isActive);
+    return (effortLevelsFor(session.harness, rows, active?.id)?.length ?? 0) > 0;
+  }
   const wrapper = session?.labels?.["omnigent.wrapper"];
   if (
     wrapper === CLAUDE_NATIVE_WRAPPER ||

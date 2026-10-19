@@ -38,6 +38,45 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 
 
+@pytest.mark.parametrize(
+    "advertised,usable", [({"acp": True}, True), ({"acp": True, "acp:neutral": False}, False)]
+)
+async def test_review_minor5_acp_template_accepts_legacy_host_map(
+    db_uri, tmp_path, advertised, usable
+):
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from tests.server.routes.test_calling_defaults_routes import AGENT_ID, _bundle
+
+    app = _build_app(db_uri, tmp_path, preferences=True)
+    LocalArtifactStore(str(tmp_path / "artifacts")).put("template/bundle", _bundle("acp:neutral"))
+    app.state.agent_store.create(AGENT_ID, "ACP template", "template/bundle")
+    app.state.host_store.upsert_on_connect(_HOST_OFFLINE, "neutral-host", "local")
+    app.state.host_store.update_harness_readiness(_HOST_OFFLINE, advertised)
+    app.state.host_store.set_offline(_HOST_OFFLINE)
+    app.state.user_preferences_store.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "project_host_agents",
+        {_HOST_OFFLINE: AGENT_ID},
+        create_if_missing=True,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        project_id = (await client.post("/v1/projects", json={"name": "Neutral project"})).json()[
+            "id"
+        ]
+        response = await client.put(
+            f"/v1/projects/{project_id}/entries/{_HOST_OFFLINE}",
+            json={"workspace": "/neutral/project"},
+        )
+        assert response.status_code == 200, response.text
+        config = (await client.get(f"/v1/projects/{project_id}")).json()["config"]
+        assert (
+            config.get("calling_defaults", {}).get(_HOST_OFFLINE, {}).get("agent_id") == AGENT_ID
+        ) is usable
+
+
 @pytest.mark.parametrize("state", ["owned", "foreign", "deleted", "member-unready"])
 async def test_library_template_respects_owner_and_member_readiness(
     db_uri: str, tmp_path: Path, state: str

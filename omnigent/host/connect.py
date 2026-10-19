@@ -3670,8 +3670,35 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        harness = canonicalize_harness(frame.harness) or frame.harness
+        harness = (
+            frame.harness
+            if frame.harness.startswith("acp:")
+            else canonicalize_harness(frame.harness) or frame.harness
+        )
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
+        if harness == "acp" or harness.startswith("acp:"):
+            import shlex
+
+            from omnigent.models.model_catalog_store import (
+                binary_identity,
+                fingerprint_of,
+                read_catalog,
+            )
+            from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
+
+            entries = acp_agents()
+            entry = (
+                resolve_acp_agent(harness[4:])
+                if harness.startswith("acp:")
+                else next(iter(entries), None)
+            )
+            rows = []
+            if entry is not None:
+                key = fingerprint_of(entry.command, binary_identity(shlex.split(entry.command)[0]))
+                rows = read_catalog("acp", key) or []
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id, status="ok", models=rows
+            )
         if harness in ("codex-native", "codex"):
             # Harness-truth lane: every launch shape is answered from the
             # shared catalog, probed from the configured Codex binary itself.

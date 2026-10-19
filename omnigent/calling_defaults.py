@@ -25,7 +25,7 @@ from omnigent.session_default_modes import (
     PERMISSION_DEFAULT_VALUES,
     valid_speed_tier,
 )
-from omnigent.util.reasoning_effort import EFFORT_VALUES, efforts_for_harness
+from omnigent.util.reasoning_effort import EFFORT_VALUES, efforts_for_harness, validate_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -396,7 +396,7 @@ def _catalog_efforts(rows: list[Mapping[str, Any]], model: str | None) -> set[st
     for row in rows:
         if row.get("id") != model and row.get("model") != model:
             continue
-        raw = row.get("supportedReasoningEfforts")
+        raw = row.get("efforts", row.get("supportedReasoningEfforts"))
         if not isinstance(raw, list):
             return None
         values: set[str] = set()
@@ -723,8 +723,18 @@ def validate_project_calling_defaults(value: object) -> dict:
                     clean_entry["model"] = _require_model(entry["model"], f"{base}.model")
                 if "effort" in entry:
                     effort = entry["effort"]
-                    if not isinstance(effort, str) or effort not in EFFORT_VALUES:
-                        raise _invalid(f"{base}.effort must be one of {sorted(EFFORT_VALUES)}")
+                    try:
+                        validate_effort(
+                            effort,
+                            base,
+                            None
+                            if harness == "acp" or harness.startswith("acp:")
+                            else EFFORT_VALUES,
+                        )
+                    except ValueError as exc:
+                        raise _invalid(f"{base}.effort: {exc}") from exc
+                    if not isinstance(effort, str) or not effort:
+                        raise _invalid(f"{base}.effort must be non-empty")
                     clean_entry["effort"] = effort
                 if "speed" in entry:
                     speed = entry["speed"]

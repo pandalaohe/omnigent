@@ -62,6 +62,7 @@ def register_model_option_routes(
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],
     server_client: httpx.AsyncClient,
+    _acp_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]] | None = None,
 ) -> None:
     """Register the ``/models``, ``/*-model-options``, and ``/skills/resolve`` routes on *app*.
 
@@ -393,6 +394,13 @@ def register_model_option_routes(
         for older servers (deprecated; remove in 0.11.0).
         """
         harness = _session_harness_name(session_id)
+        from omnigent.harness_aliases import canonicalize_harness
+
+        if canonicalize_harness(harness) == "acp" and _acp_model_options is not None:
+            try:
+                return JSONResponse(content={"models": await _acp_model_options(session_id)})
+            except (httpx.HTTPError, RuntimeError):
+                return JSONResponse(status_code=503, content={"models": []})
         if harness == "claude-native":
             return await get_session_claude_model_options(session_id)
         if harness in ("codex-native", "opencode-native"):

@@ -1190,7 +1190,8 @@ export function ChatPage() {
     ],
   );
   const showEffort =
-    shouldShowEffortPicker(capabilitySource, sdkEffortFamily) && effortLevels.length > 0;
+    shouldShowEffortPicker(capabilitySource, sdkEffortFamily, codexModelOptions) &&
+    effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -5047,7 +5048,9 @@ export function effortLevelsForConv(
   if (isSdkHarnessSession(conv) && effortFamily) return effortLevelsForFamily(effortFamily);
   const harness =
     nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness ??
-    (isSdkHarnessSession(conv) ? conv?.harness : null);
+    (isSdkHarnessSession(conv) || conv?.harness === "acp" || conv?.harness?.startsWith("acp:")
+      ? conv?.harness
+      : null);
   return (
     effortLevelsFor(harness, codexModelOptions, currentModel) ??
     (effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS)
@@ -5144,11 +5147,12 @@ export function shouldShowEffortPicker(
     | null
     | undefined,
   effortFamily: string | null = null,
+  models?: readonly NativeModelOption[],
 ): boolean {
   if (isSdkHarnessSession(conv)) {
     return conv?.parentSessionId == null && effortLevelsForFamily(effortFamily).length > 0;
   }
-  return supportsEffortControl(conv, effortFamily);
+  return supportsEffortControl(conv, effortFamily, models);
 }
 
 export function shouldShowCodexPlanModeControl(
@@ -5426,7 +5430,7 @@ function SessionHarnessPicker({
         ? "codex-native"
         : modelPickerKind === "antigravity"
           ? "antigravity-native"
-          : modelPickerKind === "sdk"
+          : modelPickerKind === "sdk" || modelPickerKind === "acp"
             ? sessionHarness
             : null,
       codexModelOptions,
@@ -5498,7 +5502,7 @@ function SessionHarnessPicker({
         reconcileEffortOnModelChange(
           modelPickerKind === "codex"
             ? "codex-native"
-            : modelPickerKind === "sdk"
+            : modelPickerKind === "sdk" || modelPickerKind === "acp"
               ? sessionHarness
               : null,
           codexModelOptions,

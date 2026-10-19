@@ -54,6 +54,7 @@ class EffortFamily(str, Enum):
 
     NONE = "none"
     ANTHROPIC = "anthropic"
+    DYNAMIC = "dynamic"  # the session advertisement, not a static vocabulary, decides support
     OPENAI = "openai"
     GEMINI = "gemini"
     COPILOT = "copilot"

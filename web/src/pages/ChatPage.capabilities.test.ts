@@ -56,6 +56,13 @@ describe("permission controls", () => {
 });
 
 describe("effortLevelsForConv", () => {
+  it("shows ACP effort without inventing selectable models for an uncurated session", () => {
+    const conv = { labels: {}, harness: "acp" };
+    const rows = [{ id: "__default__", isDefault: true, isActive: true, efforts: ["precise"] }];
+    expect(shouldShowModelPicker(conv, rows)).toBe(false);
+    expect(shouldShowEffortPicker(conv, null, rows)).toBe(true);
+    expect(effortLevelsForConv(conv, rows, "agent-current-model")).toEqual(["precise"]);
+  });
   it("returns the extended ladder (xhigh, max) for claude-code-native-ui", () => {
     // WHY: claude-native exposes the full reasoning ladder; dropping xhigh/max
     // here would silently cap those sessions at "high".

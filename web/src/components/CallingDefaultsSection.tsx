@@ -190,7 +190,18 @@ function EffortSettingSelect({
 }) {
   const label = callingHarnessLabel(harness);
   const levels = Array.from(new Set(effortLevelsFor(harness, models, model ?? null) ?? []));
-  if (value && !levels.includes(value)) levels.unshift(value);
+  const acp = harness === "acp" || harness.startsWith("acp:");
+  if (acp && levels.length === 0) {
+    return (
+      <span
+        className="text-sm text-muted-foreground"
+        data-testid={`calling-defaults-effort-unavailable-${harness}`}
+      >
+        No advertised effort options
+      </span>
+    );
+  }
+  if (!acp && value && !levels.includes(value)) levels.unshift(value);
   return (
     <Select
       value={value ?? EFFORT_SELECT_NONE}
@@ -207,7 +218,12 @@ function EffortSettingSelect({
         <SelectValue />
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+        <SelectItem value={EFFORT_SELECT_NONE}>{acp ? "No override" : "Default"}</SelectItem>
+        {acp && value && !levels.includes(value) && (
+          <SelectItem value={value} disabled>
+            {value} (unavailable)
+          </SelectItem>
+        )}
         {levels.map((level) => (
           <SelectItem key={level} value={level}>
             {normalizeEffortLabel(level)}
@@ -300,10 +316,14 @@ function HostDefaultsTable({
 }) {
   const hostId = host.host_id;
   const hostTable = master[hostId] ?? {};
+  const harnesses = [
+    ...CALLING_DEFAULT_HARNESSES,
+    ...Object.keys(host.configured_harnesses ?? {}).filter((harness) => harness.startsWith("acp:")),
+  ];
 
   const entryRows: { harness: string; entry: CallingDefaultEntry }[] = [];
   const known = new Set<string>();
-  for (const harness of CALLING_DEFAULT_HARNESSES) {
+  for (const harness of harnesses) {
     const entry = hostTable[harness];
     if (entry) {
       entryRows.push({ harness, entry });
@@ -316,7 +336,7 @@ function HostDefaultsTable({
   const followsRows = Object.entries(SDK_NATIVE_PARENT)
     .filter(([sdk]) => !(sdk in hostTable))
     .map(([sdk, native]) => ({ sdk, native }));
-  const candidates = CALLING_DEFAULT_HARNESSES.filter(
+  const candidates = harnesses.filter(
     (harness) =>
       !(harness in hostTable) && !(harness in SDK_NATIVE_PARENT) && harnessOnHost(host, harness),
   );

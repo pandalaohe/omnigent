@@ -1293,7 +1293,9 @@ def create_hosts_router(
         result = await _proxy_model_options(
             host_registry=host_registry,
             host_conn=conn,
-            harness=canonicalize_harness(harness) or harness,
+            harness=harness
+            if harness.startswith("acp:")
+            else canonicalize_harness(harness) or harness,
             refresh=refresh,
         )
         if result.get("status") != "ok":

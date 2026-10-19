@@ -74,7 +74,11 @@ async def resolve_project_host_template(
             not host
             or host.user_id != owner
             or not host.configured_harnesses
-            or host.configured_harnesses.get(harness) is not True
+            or host.configured_harnesses.get(
+                harness,
+                host.configured_harnesses.get("acp") if harness.startswith("acp:") else None,
+            )
+            is not True
         ):
             usable = False
     if usable:

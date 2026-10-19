@@ -130,6 +130,8 @@ def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
     capabilities = harness_capabilities().get(canonical)
     if capabilities is None:
         return None
+    if capabilities.effort is EffortFamily.DYNAMIC:
+        return None
     # Every family that has a vocabulary must be listed: an unmapped family
     # falls through to the empty set, which callers read as "known harness with
     # no effort plumbing" and silently drop the effort. A new EffortFamily
@@ -280,7 +282,7 @@ def effort_for_model_switch(
     return model_effort_caps(caps).fallback.get(_bare_model(model))
 
 
-def validate_effort(effort: object, provider: str, supported: Iterable[str]) -> str | None:
+def validate_effort(effort: object, provider: str, supported: Iterable[str] | None) -> str | None:
     """Validate *effort* against *supported*, returning a string or None.
 
     A deprecated alias (see :data:`EFFORT_ALIASES`) is coerced to its
@@ -290,6 +292,18 @@ def validate_effort(effort: object, provider: str, supported: Iterable[str]) -> 
     """
     if effort is None or effort == "":
         return None
+    if supported is None:
+        if (
+            not isinstance(effort, str)
+            or not effort.strip()
+            or len(effort) > 128
+            or any(ord(char) < 32 for char in effort)
+        ):
+            raise ValueError(
+                "effort must be a non-empty string of at most 128 characters "
+                "without control characters"
+            )
+        return effort
     effort_str = str(effort)
     supported_set = set(supported)
     if effort_str not in supported_set:

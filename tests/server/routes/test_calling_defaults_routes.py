@@ -9,10 +9,12 @@ statuses the route must record (ok / failed / offline) without a tunnel.
 from __future__ import annotations
 
 import io
+import json
 import tarfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -50,13 +52,17 @@ def _as_user(user: str) -> dict[str, str]:
     return {"X-Forwarded-Email": user}
 
 
-def _bundle(harness: str) -> bytes:
+def _bundle(harness: str, effort: str | None = None) -> bytes:
     """A minimal valid agent bundle whose executor declares *harness*."""
     config = yaml.safe_dump(
         {
             "spec_version": 1,
             "name": "calling-defaults-agent",
-            "executor": {"type": "omnigent", "config": {"harness": harness}},
+            "executor": {
+                "type": "omnigent",
+                "config": {"harness": harness},
+                **({"reasoning_effort": effort} if effort else {}),
+            },
             "prompt": "hi",
         }
     )
@@ -458,3 +464,176 @@ async def test_resolve_reports_default_agent_readiness_and_library_problems(
     assert "ca_polly" in problem["message"]
     assert "saved joint agent" in problem["message"]
     assert "server-side creates" in problem["message"]
+
+
+@pytest.mark.asyncio
+async def test_acp_defaults_keep_agent_namespace_and_literal_effort(
+    client: httpx.AsyncClient, stores: _Stores
+) -> None:
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {HOST_A: {"acp:neutral": {"effort": "default"}}}
+    )
+    response = await client.get(
+        "/v1/calling-defaults/resolve", params={"host_id": HOST_A, "harness": "acp:neutral"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["harness"] == "acp:neutral"
+    assert response.json()["effort"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_acp_session_patch_preserves_literal_values_and_null_reset(
+    client: httpx.AsyncClient, stores: _Stores
+) -> None:
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    created = await client.post("/v1/sessions", json={"agent_id": AGENT_ID})
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+    for effort in ("default", "off", "deliberate", None):
+        response = await client.patch(
+            f"/v1/sessions/{sid}", json={"reasoning_effort": effort, "silent": True}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["reasoning_effort"] == effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["default", "deliberate"])
+async def test_acp_json_and_multipart_create_accept_literal_efforts(client, stores, effort):
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": AGENT_ID, "reasoning_effort": effort}
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["reasoning_effort"] == effort
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"reasoning_effort": effort})},
+        files={"bundle": ("agent.tar.gz", _bundle("acp:neutral"), "application/gzip")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    snapshot = await client.get(f"/v1/sessions/{uploaded.json()['session_id']}")
+    assert snapshot.json()["reasoning_effort"] == effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seeded,explicit,expected",
+    [(None, False, "deliberate"), ("default", False, "default"), ("default", True, None)],
+)
+async def test_acp_bundle_inherits_its_row_without_overwriting_explicit_values(
+    client, stores, seeded, explicit, expected
+):
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.prefs.patch_namespace(
+        "local",
+        "calling_defaults",
+        {HOST_A: {"acp:neutral": {"model": "model-b", "effort": "deliberate"}}},
+    )
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    parent = await client.post("/v1/sessions", json={"agent_id": AGENT_ID})
+    assert parent.status_code == 201, parent.text
+    SqlAlchemyConversationStore(stores.agent_store.storage_location).set_host_id(
+        parent.json()["id"], HOST_A, workspace="/neutral/project"
+    )
+    metadata = {"parent_session_id": parent.json()["id"]}
+    if explicit:
+        metadata["reasoning_effort"] = None
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={"bundle": ("agent.tar.gz", _bundle("acp:neutral", seeded), "application/gzip")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    snapshot = await client.get(f"/v1/sessions/{uploaded.json()['session_id']}")
+    assert snapshot.json()["reasoning_effort"] == expected
+    assert snapshot.json()["model_override"] == "model-b"
+
+
+@pytest.mark.asyncio
+async def test_non_acp_bundle_still_rejects_opaque_effort(client):
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"reasoning_effort": "deliberate"})},
+        files={"bundle": ("agent.tar.gz", _bundle("claude-sdk"), "application/gzip")},
+    )
+    assert uploaded.status_code == 400, uploaded.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-sdk", "codex", "pi-native"])
+async def test_review_minor6_non_acp_bundle_ignores_new_model_field(client, harness):
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"model_override": "unoffered-model"})},
+        files={"bundle": ("agent.tar.gz", _bundle(harness), "application/gzip")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    snapshot = await client.get(f"/v1/sessions/{uploaded.json()['session_id']}")
+    assert snapshot.json()["model_override"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested,expected_status", [("model-b", 201), (None, 201), ("outside", 400)]
+)
+async def test_bound_acp_bundle_preserves_resolved_model(
+    app, client, stores, requested, expected_status
+):
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {HOST_A: {"acp:neutral": {"model": "model-b"}}}
+    )
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    catalog = {
+        "status": "ready",
+        "default_model": "model-a",
+        "models": [{"id": "model-a"}, {"id": "model-b"}],
+    }
+    snapshot = {
+        "harness": "acp:neutral",
+        "runtime_config": {
+            "providers": {
+                "neutral": {
+                    "kind": "gateway",
+                    "openai": {
+                        "base_url": "https://gateway.example.invalid/v1",
+                        "api_key_ref": "env:NEUTRAL_TEST_TOKEN",
+                    },
+                }
+            },
+            "inference": {
+                "harnesses": {
+                    "acp:neutral": {
+                        "provider": "neutral",
+                        "default_model": "model-a",
+                        "model_allowlist": ["model-a", "model-b"],
+                    }
+                }
+            },
+        },
+    }
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID,
+        inference_snapshot=snapshot,
+        host_id=HOST_A,
+        workspace="/neutral/project",
+    )
+    app.state.inference_catalog = SimpleNamespace(catalog=AsyncMock(return_value=catalog))
+    metadata = {"parent_session_id": parent.id}
+    if requested is not None:
+        metadata["model_override"] = requested
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={"bundle": ("agent.tar.gz", _bundle("acp:neutral"), "application/gzip")},
+    )
+    assert response.status_code == expected_status, response.text
+    if expected_status == 201:
+        saved = conversations.get_conversation(response.json()["session_id"])
+        assert saved is not None
+        assert saved.model_override == "model-b"
+    else:
+        assert "not available" in response.text

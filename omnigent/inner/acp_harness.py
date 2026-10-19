@@ -61,7 +61,8 @@ import json
 import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
@@ -153,7 +154,7 @@ def _resolve_os_env() -> OSEnvSpec:
     )
 
 
-def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
+def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> AcpExecutor:
     """Construct an :class:`AcpExecutor` from env-var config (lazily, on first turn).
 
     :param extension: Vendor behavior to inject, from the calling wrap. Defaults
@@ -209,7 +210,22 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
     :returns: The app the runner serves.
     """
     label = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
-    adapter = ExecutorAdapter(
-        executor_factory=lambda: _build_acp_executor(extension), harness_label=label
-    )
-    return adapter.build()
+    executor: AcpExecutor | None = None
+
+    def factory() -> Executor:
+        nonlocal executor
+        executor = _build_acp_executor(extension)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=factory, harness_label=label)
+    app = adapter.build()
+
+    @app.get("/v1/model-options")
+    async def model_options(request: Request) -> Response:
+        if (denied := adapter._check_auth(request)) is not None:
+            return denied
+        if executor is None or not executor.model_options_ready:
+            return JSONResponse({"models": []}, status_code=503)
+        return JSONResponse({"models": executor.model_options()})
+
+    return app
