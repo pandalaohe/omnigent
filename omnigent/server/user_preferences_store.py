@@ -60,6 +60,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "session_collab",
         "host_colors",
         "keep_warm",
+        "child_idle",
         "worktree_location",
         "worktree_archive",
         "runner_log_warnings",
@@ -144,6 +145,60 @@ class UserPreferencesValidationError(ValueError):
 
 class UserPreferencesUserNotFoundError(LookupError):
     """The authenticated account no longer has a backing user row."""
+
+
+CHILD_IDLE_NAMESPACE = "child_idle"
+
+
+@dataclass(frozen=True)
+class ChildIdleSettings:
+    """Owner-wide idle-child reminders, independent of provider cache warming."""
+
+    enabled: bool = False
+    idle_threshold_s: int = 3600
+    merge_window_s: int = 1800
+    repeat_s: int = 14400
+
+
+def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
+    """Validate a partial namespace and apply the reminder defaults."""
+    if not isinstance(value, dict):
+        raise UserPreferencesValidationError("child_idle must be an object")
+    enabled = value.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise UserPreferencesValidationError("child_idle.enabled must be a boolean")
+    numbers: list[int] = []
+    for key, default, minimum, maximum in (
+        ("idleThresholdSeconds", 3600, 60, 604800),
+        ("mergeWindowSeconds", 1800, 0, 86400),
+        ("repeatSeconds", 14400, 0, 604800),
+    ):
+        number = value.get(key, default)
+        if type(number) is not int or not minimum <= number <= maximum:
+            raise UserPreferencesValidationError(
+                f"child_idle.{key} must be an integer between {minimum} and {maximum}"
+            )
+        if key == "repeatSeconds" and 0 < number < 60:
+            raise UserPreferencesValidationError(
+                "child_idle.repeatSeconds must be 0 or at least 60"
+            )
+        numbers.append(number)
+    return ChildIdleSettings(enabled, *numbers)
+
+
+def read_child_idle_settings(
+    store: SqlAlchemyUserPreferencesStore | None, owner: str
+) -> ChildIdleSettings:
+    """Disable reminders when preferences are missing, malformed or unreadable."""
+    if store is None:
+        return ChildIdleSettings()
+    try:
+        envelope = store.get(owner)
+        settings = envelope.get("settings", {}) if isinstance(envelope, dict) else {}
+        return parse_child_idle_settings(settings.get(CHILD_IDLE_NAMESPACE, {}))
+    except (SQLAlchemyError, ValueError, AttributeError, TypeError):
+        logger.warning("Could not read child-idle preferences", exc_info=True)
+        return ChildIdleSettings()
 
 
 APPROVAL_TIMEOUT_NAMESPACE = "approval_timeout"
@@ -919,6 +974,8 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         _validate_json(value)
     if WORKTREE_ARCHIVE_NAMESPACE in settings:
         _validate_worktree_archive(settings[WORKTREE_ARCHIVE_NAMESPACE])
+    if CHILD_IDLE_NAMESPACE in settings:
+        parse_child_idle_settings(settings[CHILD_IDLE_NAMESPACE])
 
     copied: PreferencesEnvelope = {
         "version": USER_PREFERENCE_VERSION,
