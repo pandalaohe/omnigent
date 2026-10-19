@@ -15265,6 +15265,7 @@
                         "approval_timeout",
                         "calling_defaults",
                         "calling_last",
+                        "child_idle",
                         "context_indicator",
                         "host_colors",
                         "keep_warm",

@@ -1058,10 +1058,12 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
     # Include configured ACP slugs because the picker uses their full IDs.
+    acp_slugs: list[str] = []
     try:
         from omnigent.onboarding.acp_auth import acp_agents
 
-        spellings.update(f"acp:{agent.slug}" for agent in acp_agents())
+        acp_slugs = [f"acp:{agent.slug}" for agent in acp_agents()]
+        spellings.update(acp_slugs)
     except Exception as exc:
         _logger.debug("readiness: acp agent slug enumeration failed (%s)", type(exc).__name__)
     canonical_by_cache_key: dict[tuple[str, ...], str] = {}
@@ -1092,8 +1094,6 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
         spelling: availability_cache[cache_key]
         for spelling, cache_key in cache_key_by_spelling.items()
     }
-    from omnigent.onboarding.acp_auth import acp_agents
-
-    for agent in acp_agents():
-        result[f"acp:{agent.slug}"] = result.get("acp", False)
+    for slug in acp_slugs:
+        result[slug] = result.get("acp", False)
     return result

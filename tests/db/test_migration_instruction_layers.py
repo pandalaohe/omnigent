@@ -1,13 +1,13 @@
 """Legacy history remains byte-identical when instruction scopes are added."""
 
-from pathlib import Path
-
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.script import ScriptDirectory
 
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import CompressedText, Uuid16
-from omnigent.db.utils import _build_alembic_config, clear_engine_cache
+from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 from omnigent.stores.global_instructions_store.sqlalchemy_store import (
     SqlAlchemyGlobalInstructionsStore,
 )
@@ -23,15 +23,18 @@ def test_instruction_layers_migration_is_only_head():
     assert script.get_revision(_MIGRATION).down_revision == _PREVIOUS
 
 
-def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(tmp_path: Path):
-    uri = f"sqlite:///{tmp_path / 'instruction-layers.db'}"
-    engine = sa.create_engine(uri)
+def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(db_uri: str):
+    uri = db_uri
+    engine = get_or_create_engine(uri)
     config = _build_alembic_config(uri)
 
     def run(action, revision):
-        with engine.begin() as connection:
+        with engine.connect() as connection:
+            if engine.dialect.name == "cockroachdb":
+                _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
             config.attributes["connection"] = connection
             getattr(command, action)(config, revision)
+            connection.commit()
 
     legacy = sa.table(
         _TABLE,
@@ -65,7 +68,7 @@ def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(tmp_pat
         },
     ]
     try:
-        run("upgrade", _PREVIOUS)
+        run("downgrade", _PREVIOUS)
         with engine.begin() as connection:
             connection.execute(legacy.insert(), history)
             before = connection.execute(sa.text(f"SELECT * FROM {_TABLE} ORDER BY id")).all()
@@ -109,7 +112,34 @@ def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(tmp_pat
         )
         store.save("mother", created_by=None, scope="mother")
         store.save("child", created_by=None, scope="child")
-        run("downgrade", _PREVIOUS)
+        if engine.dialect.name == "cockroachdb":
+
+            def interrupt_older_downgrade(
+                conn, cursor, statement, parameters, context, executemany
+            ):
+                if "DROP INDEX ix_session_peer_messages_pair_sequence" in statement:
+                    raise RuntimeError("injected older downgrade failure")
+
+            sa.event.listen(engine, "before_cursor_execute", interrupt_older_downgrade)
+            try:
+                with pytest.raises(RuntimeError, match="injected older downgrade failure"):
+                    run("downgrade", "a29c20261010")
+            finally:
+                sa.event.remove(engine, "before_cursor_execute", interrupt_older_downgrade)
+            with engine.connect() as connection:
+                assert (
+                    connection.execute(
+                        sa.text("SELECT version_num FROM alembic_version")
+                    ).scalar_one()
+                    == _MIGRATION
+                )
+            assert "scope" not in {
+                column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
+            }
+            run("downgrade", "a29c20261010")
+            run("upgrade", _PREVIOUS)
+        else:
+            run("downgrade", _PREVIOUS)
         with engine.connect() as connection:
             assert (
                 connection.execute(sa.text(f"SELECT * FROM {_TABLE} ORDER BY id")).all() == before
@@ -125,5 +155,6 @@ def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(tmp_pat
             "ix_global_instruction_revisions_latest"
         }
     finally:
+        run("upgrade", _MIGRATION)
         engine.dispose()
         clear_engine_cache()

@@ -34,6 +34,15 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Discard scoped history for dev rollback; shared history stays intact."""
+    bind = op.get_bind()
+    if bind.dialect.name == "cockroachdb":
+        inspector = sa.inspect(bind)
+        columns = {column["name"] for column in inspector.get_columns(_TABLE)}
+        if {"scope", "agent_key", "host_id"}.isdisjoint(columns) and any(
+            index["name"] == _OLD_INDEX for index in inspector.get_indexes(_TABLE)
+        ):
+            # A later downgrade failed after this schema was already published.
+            return
     table = sa.table(_TABLE, sa.column("scope", sa.String(16)))
     op.execute(table.delete().where(table.c.scope != "shared"))
     op.drop_index(_INDEX, table_name=_TABLE)
@@ -42,3 +51,7 @@ def downgrade() -> None:
         batch.drop_column("agent_key")
         batch.drop_column("scope")
     op.create_index(_OLD_INDEX, _TABLE, ["workspace_id", "created_us", "id"])
+    if bind.dialect.name == "cockroachdb":
+        # Older downgrades may drop this index; publish it before their DDL.
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))

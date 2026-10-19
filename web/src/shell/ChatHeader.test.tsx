@@ -1057,6 +1057,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Export",
+      "View instructions",
       "Worktree details",
       "Rename",
       "Mark as unread",
