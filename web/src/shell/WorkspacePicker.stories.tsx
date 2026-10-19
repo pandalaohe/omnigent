@@ -49,15 +49,18 @@ const meta = {
             storyDirectory(`${workspaceStoryHome}/projects`),
             storyDirectory(`${workspaceStoryHome}/Downloads`),
           ]);
-          queryClient.setQueryData<Host[]>(["hosts", { includeSandbox: false }], [
-            {
-              host_id: workspaceStoryHost,
-              name: "MacBook Pro",
-              owner: "story",
-              status: "online",
-              default_workspace: workspaceStoryProjects,
-            },
-          ]);
+          queryClient.setQueryData<Host[]>(
+            ["hosts", { includeSandbox: false }],
+            [
+              {
+                host_id: workspaceStoryHost,
+                name: "MacBook Pro",
+                owner: "story",
+                status: "online",
+                default_workspace: workspaceStoryProjects,
+              },
+            ],
+          );
           queryClient.setQueryData(
             ["host-worktrees", workspaceStoryHost, workspaceStoryProjects],
             context.name === "Full Single Pane"

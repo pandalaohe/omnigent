@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import { CodeBlockSendContext } from "@/components/ai-elements/message";
@@ -236,6 +237,7 @@ const pendingElicitation: ElicitationBlock = {
 };
 
 function renderTranscript(blocks: ElicitationBlock[]) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   useChatStore.setState({ blocks, conversationId: "conv-test", sessionStatus: "running" });
   return render(
     <MemoryRouter>
@@ -258,6 +260,11 @@ function renderTranscript(blocks: ElicitationBlock[]) {
         spacerMeasureRef={{ current: null }}
       />
     </MemoryRouter>,
+    {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    },
   );
 }
 
@@ -330,6 +337,7 @@ function renderSettledTurn(opts: {
   sessionStatus: "idle" | "running" | "waiting";
   status: "idle" | "streaming";
 }) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   useChatStore.setState({
     blocks: settledTurnBlocks,
     conversationId: "conv-test",
@@ -360,6 +368,11 @@ function renderSettledTurn(opts: {
         />
       </CodeBlockSendContext.Provider>
     </MemoryRouter>,
+    {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    },
   );
   // Native find disables virtualization, so every bubble mounts for inspection.
   fireEvent.keyDown(window, { key: "f", metaKey: true });
