@@ -30,10 +30,14 @@ def _uid(seed: str) -> str:
 def _raw_binding(db_uri: str, task_id: str) -> tuple[object, object]:
     """Read a task's ``(agent_id, custom_agent_id)`` columns, bypassing the entity map."""
     engine = get_or_create_engine(db_uri)
+    tasks = sa.table(
+        "scheduled_tasks", sa.column("id"), sa.column("agent_id"), sa.column("custom_agent_id")
+    )
     with engine.connect() as conn:
         return conn.execute(
-            sa.text('SELECT "agent_id", "custom_agent_id" FROM "scheduled_tasks" WHERE id = :id'),
-            {"id": uuid_to_bytes(task_id)},
+            sa.select(tasks.c.agent_id, tasks.c.custom_agent_id).where(
+                tasks.c.id == uuid_to_bytes(task_id)
+            )
         ).one()
 
 
