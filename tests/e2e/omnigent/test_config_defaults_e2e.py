@@ -204,6 +204,7 @@ def test_global_config_default_agent_drives_bare_omnigent(
     home.mkdir()
     env = dict(mock_credentials_env)
     env["HOME"] = str(home)
+    env["OMNIGENT_CONFIG_HOME"] = str(home / ".omnigent")
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
     write = _run_omnigent(

@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # How long the user may reasonably stare at a silent terminal before the
@@ -128,14 +130,9 @@ def unreachable_start_run(tmp_path_factory: pytest.TempPathFactory) -> _StartRun
         elapsed = time.monotonic() - start
         # The failed `start` is expected to reap its own daemon; sweep any
         # leftover so a bug in that cleanup can't leak into other tests.
-        subprocess.run(
-            [sys.executable, "-m", "omnigent", "stop", "--force"],
-            env=env,
-            cwd=str(home),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-            check=False,
+        _, survivors = reap_leaked_omnigent_processes(data_dir)
+        assert not survivors, (
+            f"{len(survivors)} owned processes survived unreachable-start cleanup"
         )
     return _StartRun(port=port, lines=lines, returncode=proc.returncode, elapsed_s=elapsed)
 
