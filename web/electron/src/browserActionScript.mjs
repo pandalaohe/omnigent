@@ -168,14 +168,21 @@ function findElJs(args, structuredErrors) {
       `if (!window.__omni_refs__) ` +
       actionErrorJs("'no snapshot in this page — call browser_snapshot first'", structuredErrors) +
       `if (!window.__omni_refs__.has(${jsNumber(ref)})) ` +
-      actionErrorJs(`'ref ' + ${jsNumber(ref)} + ' not in snapshot — call browser_snapshot again'`, structuredErrors) +
+      actionErrorJs(
+        `'ref ' + ${jsNumber(ref)} + ' not in snapshot — call browser_snapshot again'`,
+        structuredErrors,
+      ) +
       `if (!el) ` +
-      actionErrorJs(`'ref ' + ${jsNumber(ref)} + ' was garbage-collected — call browser_snapshot again'`, structuredErrors)
+      actionErrorJs(
+        `'ref ' + ${jsNumber(ref)} + ' was garbage-collected — call browser_snapshot again'`,
+        structuredErrors,
+      )
     );
   }
   return (
     `const el = document.querySelector(${jsString(selector)}); ` +
-    `if (!el) ` + actionErrorJs(`'selector not found: ' + ${jsString(selector)}`, structuredErrors)
+    `if (!el) ` +
+    actionErrorJs(`'selector not found: ' + ${jsString(selector)}`, structuredErrors)
   );
 }
 
