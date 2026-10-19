@@ -112,7 +112,6 @@ from omnigent.runner.subagent_routing import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
-    current_global_instructions_text,
     disconnect_outcome,
     get_policy_store,
     inflight_text,
@@ -174,6 +173,7 @@ from omnigent.server.child_keep_warm import (
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.instruction_layers import session_instructions_text
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -7411,7 +7411,7 @@ async def _ensure_runner_session_initialized(
             from omnigent.server.feature_flags import Feature, resolve_feature_flags
             from omnigent.version import VERSION
 
-            global_instructions = await asyncio.to_thread(current_global_instructions_text)
+            global_instructions = await session_instructions_text(conv)
             resp = await runner_client.post(
                 "/v1/sessions",
                 json=build_runner_session_init_payload(
