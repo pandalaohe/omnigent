@@ -1503,10 +1503,8 @@ class SqlGlobalInstructionRevision(OmnigentBase):
     """
     SQLAlchemy model for the ``global_instruction_revisions`` table.
 
-    Append-only history of the server-wide global instructions text: one
-    row per save, the newest row in a workspace is the live value that
-    session initialization reads. Saves are rare and rows small, so there
-    is no pruning.
+    Append-only history per workspace and instruction layer. The newest
+    row for a scope and its keys is live, including an empty text value.
 
     :param id: Opaque PK, e.g. ``"a1b2c3..."`` (bare 32-char hex uuid).
     :param text: The instruction text. Empty is a valid save and means
@@ -1532,13 +1530,17 @@ class SqlGlobalInstructionRevision(OmnigentBase):
     text: Mapped[str] = mapped_column(CompressedText)
     created_us: Mapped[int] = mapped_column(BigInteger)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scope: Mapped[str] = mapped_column(String(16), server_default="shared", default="shared")
+    agent_key: Mapped[str] = mapped_column(String(64), server_default="", default="")
+    host_id: Mapped[str] = mapped_column(String(64), server_default="", default="")
 
     __table_args__ = (
-        # Backs the store's "latest in workspace" read: created_us then id,
-        # both descending, so a backward index seek answers it.
         Index(
-            "ix_global_instruction_revisions_latest",
+            "ix_global_instruction_revisions_layer_latest",
             "workspace_id",
+            "scope",
+            "agent_key",
+            "host_id",
             "created_us",
             "id",
         ),

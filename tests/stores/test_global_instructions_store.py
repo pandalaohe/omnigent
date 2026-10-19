@@ -10,6 +10,8 @@ import time
 
 import pytest
 
+from omnigent.db.db_models import workspace_scope
+from omnigent.runtime.instruction_layers import compose_route
 from omnigent.stores.global_instructions_store.sqlalchemy_store import (
     SqlAlchemyGlobalInstructionsStore,
 )
@@ -75,3 +77,114 @@ def test_list_revisions_newest_first_with_limit(
 
     assert [r.text for r in store.list_revisions()] == ["third", "second", "first"]
     assert [r.text for r in store.list_revisions(limit=2)] == ["third", "second"]
+
+
+@pytest.mark.parametrize(
+    ("scope", "agent", "host"),
+    [
+        ("agent", "codex", ""),
+        ("host", "", "host-a"),
+        ("independent", "codex", "host-a"),
+        ("mother", "", ""),
+        ("child", "", ""),
+    ],
+)
+def test_layer_history_and_blank_latest_are_isolated(store, scope, agent, host):
+    shared = store.save("shared", created_by=None)
+    key = {"scope": scope, "agent_key": agent, "host_id": host}
+    first = store.save("scoped", created_by="admin@example.test", **key)
+    cleared = store.save("", created_by=None, **key)
+    assert store.current(**key) == cleared
+    assert store.list_revisions(**key) == [cleared, first]
+    assert store.current() == shared
+    assert store.list_revisions() == [shared]
+    assert {r.id for r in store.list_layers()} == {shared.id, cleared.id}
+    assert first.created_us >= first.created_at * 1_000_000
+
+
+def test_routes_skip_missing_keys_and_restore_stack_after_clearing_independent(store):
+    store.save("shared", created_by=None)
+    store.save("agent", created_by=None, scope="agent", agent_key="codex")
+    store.save("host", created_by=None, scope="host", host_id="host-a")
+    store.save("other host", created_by=None, scope="host", host_id="host-b")
+    store.save("other agent", created_by=None, scope="agent", agent_key="claude")
+    key = {"scope": "independent", "agent_key": "codex", "host_id": "host-a"}
+    store.save("only this route", created_by=None, **key)
+    assert compose_route(store.latest_layers("host-a", "codex")).text == "only this route"
+    assert (
+        compose_route(store.latest_layers("host-b", "claude")).text
+        == "shared\n\nother agent\n\nother host"
+    )
+    store.save(" \n", created_by=None, **key)
+    assert compose_route(store.latest_layers("host-a", "codex")).text == "shared\n\nagent\n\nhost"
+    assert compose_route(store.latest_layers(None, "codex")).text == "shared\n\nagent"
+    assert compose_route(store.latest_layers("host-a", None)).text == "shared\n\nhost"
+    assert compose_route(store.latest_layers(None, None)).text == "shared"
+
+
+def test_layer_reads_and_writes_are_workspace_scoped(store):
+    with workspace_scope(11):
+        first = store.save("workspace 11", created_by=None)
+        store.save(
+            "private route",
+            created_by=None,
+            scope="independent",
+            agent_key="codex",
+            host_id="host-a",
+        )
+    with workspace_scope(22):
+        assert store.current() is None
+        assert store.list_layers() == []
+        assert store.latest_layers("host-a", "codex") == []
+        second = store.save("workspace 22", created_by=None)
+        assert store.list_revisions() == [second]
+    with workspace_scope(11):
+        assert store.current() == first
+        assert store.list_revisions() == [first]
+        assert {r.text for r in store.list_layers()} == {"workspace 11", "private route"}
+
+
+@pytest.mark.parametrize(
+    ("scope", "agent", "host"),
+    [
+        ("unknown", "", ""),
+        ("shared", "codex", ""),
+        ("shared", "", "host-a"),
+        ("agent", "", ""),
+        ("agent", "codex", "host-a"),
+        ("host", "", ""),
+        ("host", "codex", "host-a"),
+        ("independent", "codex", ""),
+        ("independent", "", "host-a"),
+        ("mother", "codex", ""),
+        ("child", "", "host-a"),
+        ("agent", "  codex", ""),
+        ("host", "", " "),
+        ("agent", "a" * 65, ""),
+    ],
+)
+def test_invalid_layer_keys_reject_every_scoped_operation(store, scope, agent, host):
+    key = {"scope": scope, "agent_key": agent, "host_id": host}
+    with pytest.raises(ValueError):
+        store.current(**key)
+    with pytest.raises(ValueError):
+        store.list_revisions(**key)
+    with pytest.raises(ValueError):
+        store.save("invalid", created_by=None, **key)
+    assert store.list_layers() == []
+
+
+def test_created_us_orders_layers_even_within_same_second(store, monkeypatch):
+    ticks = iter([1_000_001, 1_000_002, 1_000_003])
+    monkeypatch.setattr(
+        "omnigent.stores.global_instructions_store.sqlalchemy_store.now_epoch_us",
+        lambda: next(ticks),
+    )
+    shared = store.save("shared", created_by=None)
+    independent = store.save(
+        "independent", created_by=None, scope="independent", agent_key="codex", host_id="host-a"
+    )
+    changed = store.save("new shared", created_by=None)
+    assert shared.created_at == independent.created_at == changed.created_at
+    assert shared.created_us < independent.created_us < changed.created_us
+    assert {r.id for r in store.list_layers()} == {independent.id, changed.id}
