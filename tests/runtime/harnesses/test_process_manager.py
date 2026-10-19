@@ -2198,6 +2198,67 @@ async def test_release_invalidates_queued_get_client(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize("release_kind", ["explicit", "idle", "retention"])
+async def test_new_consumer_during_release_can_reacquire(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    release_kind: str,
+) -> None:
+    """An acquisition arriving after close starts belongs to the next generation."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    release_task = consumer_task = None
+    close_entered, allow_close, consumer_waiting = (asyncio.Event() for _ in range(3))
+    conversation_id = "conv_acquire_during_release"
+    original_close = manager._close_entry
+    original_lock = manager._get_spawn_lock
+
+    async def gated_close(entry: _SubprocessEntry) -> bool:
+        close_entered.set()
+        await allow_close.wait()
+        return await original_close(entry)
+
+    async def observed_lock(conv_id: str) -> asyncio.Lock:
+        consumer_waiting.set()
+        return await original_lock(conv_id)
+
+    try:
+        await manager.get_client(conversation_id, _TEST_HARNESS_NAME)
+        monkeypatch.setattr(manager, "_close_entry", gated_close)
+        if release_kind == "retention":
+            monkeypatch.setattr(
+                pm_mod, "cli_family_for_resident_harness", lambda _harness: "codex"
+            )
+            token = manager._retention_activity_token(
+                conversation_id, manager._entries[conversation_id]
+            )
+            release = manager.release_if_retention_idle(
+                conversation_id, idle_threshold_s=0, expected_activity_token=token
+            )
+        else:
+            release = manager.release(
+                conversation_id,
+                only_if_idle_cutoff=time.monotonic() if release_kind == "idle" else None,
+            )
+        release_task = asyncio.create_task(release)
+        await asyncio.wait_for(close_entered.wait(), timeout=10)
+        monkeypatch.setattr(manager, "_get_spawn_lock", observed_lock)
+        consumer_task = asyncio.create_task(
+            manager.get_client(conversation_id, _TEST_HARNESS_NAME)
+        )
+        await asyncio.wait_for(consumer_waiting.wait(), timeout=10)
+        allow_close.set()
+        assert await asyncio.wait_for(release_task, timeout=20) in (True, "released")
+        client = await asyncio.wait_for(consumer_task, timeout=20)
+        assert manager.has_session(conversation_id)
+        await _ping_health(client)
+    finally:
+        allow_close.set()
+        await _cancel_pending(consumer_task, release_task)
+        await manager.shutdown()
+
+
 async def test_release_keeps_unconfirmed_process_registered_for_retry(
     short_tmp_parent: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2431,6 +2492,7 @@ async def test_failed_harness_release_preserves_concurrent_renewal(
     assert renewed_expiry > saved_expiry
     assert manager._entries["conv_renew"] is entry
     assert manager._retention_managed["conv_renew"] == renewed_expiry
+    assert manager._retention_activity_token("conv_renew", entry) == activity_token
 
 
 async def test_expired_harness_lease_returns_to_sdk_idle_reaper(
@@ -2476,9 +2538,13 @@ async def test_expired_harness_lease_returns_to_sdk_idle_reaper(
     assert sum("retention lease expired" in row.message for row in caplog.records) == 1
 
 
+@pytest.mark.parametrize("release_kind", ["explicit", "retention"])
+@pytest.mark.parametrize("cancel_during_close", [False, True])
 async def test_release_reaps_zygote_harness_with_cancelled_exit_poller(
     short_tmp_parent: Path,
     monkeypatch: pytest.MonkeyPatch,
+    release_kind: str,
+    cancel_during_close: bool,
 ) -> None:
     """A cancelled zygote exit-poller must not strand its entry forever.
 
@@ -2509,9 +2575,29 @@ async def test_release_reaps_zygote_harness_with_cancelled_exit_poller(
     # The harness pid is gone: the process has actually exited.
     monkeypatch.setattr(pm_mod._proc, "process_alive", lambda _pid: False)
 
-    assert await manager.release(conversation_id) is True
+    if cancel_during_close:
+
+        async def cancelled_close() -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(entry.client, "aclose", cancelled_close)
+    if release_kind == "retention":
+        release = manager.release_if_retention_idle(
+            conversation_id,
+            idle_threshold_s=0,
+            expected_activity_token=manager._retention_activity_token(conversation_id, entry),
+        )
+    else:
+        release = manager.release(conversation_id)
+    if cancel_during_close:
+        with pytest.raises(asyncio.CancelledError):
+            await release
+    else:
+        assert await release in (True, "released")
     assert conversation_id not in manager._entries
     assert endpoint.cleanup_calls == 1
+    assert process.returncode is None
+    assert manager._release_generations[conversation_id] == 1
 
     # A second release must not find a re-registered entry.
     assert await manager.release(conversation_id) is True

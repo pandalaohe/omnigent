@@ -484,6 +484,7 @@ class _SubprocessEntry:
         self.model = model
         self.acp_config = acp_config or {}
         self.last_used_at: float = 0.0
+        self.exit_confirmed = False
 
 
 def _model_env_key(harness: str) -> str:
@@ -605,9 +606,9 @@ class HarnessProcessManager:
         self._spawn_locks: dict[str, asyncio.Lock] = {}
         # Per-conversation release generation. ``get_client`` samples this
         # before waiting on the spawn lock; ``release`` bumps it under that
-        # lock. Waiters queued behind a release see a mismatch and fail
-        # instead of respawning after teardown, while a fresh ``get_client``
-        # started after release samples the new generation and may respawn.
+        # lock before close. Older waiters fail instead of respawning after
+        # teardown; acquisitions arriving during close sample the new generation.
+        # Failed teardown restores the old generation with the retained handle.
         self._release_generations: dict[str, int] = {}
         # Sessions governed by the Server's idle-CLI pool keep their harness
         # subprocess until an explicit overflow/archive release arrives.
@@ -737,11 +738,14 @@ class HarnessProcessManager:
                 released = self._entries.pop(conversation_id)
                 saved_expiry = self._retention_expiry(conversation_id)
                 self._retention_managed.pop(conversation_id, None)
+                previous_generation = self._release_generations.get(conversation_id, 0)
+                self._release_generations[conversation_id] = previous_generation + 1
             try:
                 closed = await self._close_entry(released)
             except BaseException:
                 async with self._registry_lock:
-                    if released.process.returncode is None:
+                    if released.process.returncode is None and not released.exit_confirmed:
+                        self._release_generations[conversation_id] = previous_generation
                         if conversation_id not in self._entries:
                             self._entries[conversation_id] = released
                             if saved_expiry is not None:
@@ -749,18 +753,11 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
-                    else:
-                        self._release_generations[conversation_id] = (
-                            self._release_generations.get(conversation_id, 0) + 1
-                        )
                 raise
             if closed:
-                async with self._registry_lock:
-                    self._release_generations[conversation_id] = (
-                        self._release_generations.get(conversation_id, 0) + 1
-                    )
                 return "released"
             async with self._registry_lock:
+                self._release_generations[conversation_id] = previous_generation
                 if conversation_id not in self._entries:
                     self._entries[conversation_id] = released
                     if saved_expiry is not None:
@@ -888,7 +885,7 @@ class HarnessProcessManager:
         # Sample before waiting so a ``release`` that runs while we are
         # queued (behind the holder or behind that release) invalidates
         # this call. A later ``get_client`` after release samples the
-        # bumped generation and is allowed to respawn.
+        # bumped generation, including while close is in progress, and may respawn.
         async with self._registry_lock:
             start_generation = self._release_generations.get(conversation_id, 0)
         # Non-None only for a deliberate replacement of an in-flight entry
@@ -1306,10 +1303,11 @@ class HarnessProcessManager:
         ``_entries`` so a ``release`` that arrives while ``get_client``
         is still awaiting readiness cannot return early (no entry yet)
         and then lose to a late registration. Bumps the per-conversation
-        release generation under that lock so waiters queued behind this
-        release fail instead of respawning after teardown; a fresh
-        ``get_client`` started after release samples the new generation
-        and may respawn. Lock order is spawn lock then ``_registry_lock``
+        release generation before closing so older waiters fail while a
+        ``get_client`` arriving during close may acquire the successor.
+        An unconfirmed teardown restores the original generation with the
+        retained process so its activity token remains retryable.
+        Lock order is spawn lock then ``_registry_lock``
         — never the reverse while holding both — so this cannot deadlock
         with ``_get_spawn_lock`` (registry only, briefly, before the
         spawn lock is acquired).
@@ -1340,10 +1338,8 @@ class HarnessProcessManager:
                 self._retention_managed.pop(conversation_id, None)
                 entry = self._entries.pop(conversation_id, None)
                 self._in_flight_response_ids.pop(conversation_id, None)
-                if entry is None:
-                    self._release_generations[conversation_id] = (
-                        self._release_generations.get(conversation_id, 0) + 1
-                    )
+                previous_generation = self._release_generations.get(conversation_id, 0)
+                self._release_generations[conversation_id] = previous_generation + 1
                 # NOTE: ``_spawn_locks[conversation_id]`` intentionally
                 # NOT popped — see this method's docstring for the
                 # per-conv lock-identity invariant rationale.
@@ -1353,7 +1349,8 @@ class HarnessProcessManager:
                 closed = await self._close_entry(entry)
             except BaseException:
                 async with self._registry_lock:
-                    if entry.process.returncode is None:
+                    if entry.process.returncode is None and not entry.exit_confirmed:
+                        self._release_generations[conversation_id] = previous_generation
                         if conversation_id not in self._entries:
                             self._entries[conversation_id] = entry
                             if saved_expiry is not None:
@@ -1361,20 +1358,13 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
-                    else:
-                        self._release_generations[conversation_id] = (
-                            self._release_generations.get(conversation_id, 0) + 1
-                        )
                 raise
             if closed:
-                async with self._registry_lock:
-                    self._release_generations[conversation_id] = (
-                        self._release_generations.get(conversation_id, 0) + 1
-                    )
                 return True
             # The process is still alive. Keep the exact handle retryable while
             # the spawn lock prevents a successor from taking this key.
             async with self._registry_lock:
+                self._release_generations[conversation_id] = previous_generation
                 if conversation_id not in self._entries:
                     self._entries[conversation_id] = entry
                     if saved_expiry is not None:
@@ -1735,6 +1725,7 @@ class HarnessProcessManager:
             closed = entry.process.returncode is not None or pid_reaped
         finally:
             if closed:
+                entry.exit_confirmed = True
                 with contextlib.suppress(Exception):
                     close_subprocess_transport(entry.process)
                 # Best-effort socket cleanup. uvicorn's atexit usually
