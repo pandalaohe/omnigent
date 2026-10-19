@@ -33,6 +33,7 @@ from omnigent.db.account_authority import require_active_account, session_accoun
 from omnigent.db.db_models import (
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlGlobalInstructionRevision,
     SqlHost,
     SqlSessionPermission,
     current_workspace_id,
@@ -737,6 +738,15 @@ class HostStore:
                 .values(host_id=new_host_id)
             )
             session.flush()
+
+        session.execute(
+            update(SqlGlobalInstructionRevision)
+            .where(
+                SqlGlobalInstructionRevision.workspace_id == current_workspace_id(),
+                SqlGlobalInstructionRevision.host_id == old_host_id,
+            )
+            .values(host_id=new_host_id)
+        )
 
         return new_row
 

@@ -157,7 +157,7 @@ describe("settingsNavGroups", () => {
     expect(accountsAdmin?.items.map((i) => i.id)).toEqual([
       "members",
       "policies",
-      "global-instructions",
+      "instructions",
       "system-status",
       "sharing",
     ]);
@@ -167,7 +167,7 @@ describe("settingsNavGroups", () => {
     expect(oidcAdmin?.items.map((i) => i.id)).toEqual([
       "members",
       "policies",
-      "global-instructions",
+      "instructions",
       "system-status",
       "sharing",
     ]);
@@ -183,7 +183,7 @@ describe("settingsNavGroups", () => {
     );
     expect(singleUserAdmin?.items.map((i) => i.id)).toEqual([
       "policies",
-      "global-instructions",
+      "instructions",
       "system-status",
     ]);
   });
@@ -356,10 +356,10 @@ describe("SettingsSidebarBody", () => {
     renderBody();
     const members = screen.getByTestId("settings-nav-members");
     const policies = screen.getByTestId("settings-nav-policies");
-    const globalInstructions = screen.getByTestId("settings-nav-global-instructions");
+    const globalInstructions = screen.getByTestId("settings-nav-instructions");
     expect(members).toHaveAttribute("href", "/settings/members");
     expect(policies).toHaveAttribute("href", "/settings/policies");
-    expect(globalInstructions).toHaveAttribute("href", "/settings/global-instructions");
+    expect(globalInstructions).toHaveAttribute("href", "/settings/instructions");
   });
 
   it("renders the admin sub-categories for an admin under OIDC (accounts off)", () => {
@@ -392,9 +392,9 @@ describe("SettingsSidebarBody", () => {
       "href",
       "/settings/policies",
     );
-    expect(screen.getByTestId("settings-nav-global-instructions")).toHaveAttribute(
+    expect(screen.getByTestId("settings-nav-instructions")).toHaveAttribute(
       "href",
-      "/settings/global-instructions",
+      "/settings/instructions",
     );
   });
 
@@ -404,7 +404,7 @@ describe("SettingsSidebarBody", () => {
     renderBody();
     expect(screen.queryByTestId("settings-nav-members")).toBeNull();
     expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
-    expect(screen.queryByTestId("settings-nav-global-instructions")).toBeNull();
+    expect(screen.queryByTestId("settings-nav-instructions")).toBeNull();
   });
 
   it("keeps collaboration in General and the Custom agents library in Customize", () => {
@@ -471,7 +471,7 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
     expect(routeHook("/settings/global-instructions")).toEqual({
       inSettings: true,
-      section: "global-instructions",
+      section: "instructions",
     });
   });
 
@@ -505,7 +505,7 @@ describe("useSettingsRoute", () => {
     });
     expect(routeHook("/settings/global-instructions")).toEqual({
       inSettings: true,
-      section: "global-instructions",
+      section: "instructions",
     });
     expect(routeHook("/settings")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/not-a-section")).toEqual({
@@ -543,6 +543,9 @@ describe("useSettingsRoute", () => {
     );
     expect(settingsLegacyDestination("/settings/context-usage", false)).toBe(
       "/settings/general#context-usage",
+    );
+    expect(settingsLegacyDestination("/settings/global-instructions", false)).toBe(
+      "/settings/instructions",
     );
   });
 

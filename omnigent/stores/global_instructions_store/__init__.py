@@ -1,12 +1,35 @@
-"""Global instructions store — the server-wide instruction text.
-
-One append-only revision per save; the newest revision in a workspace is
-the live value. Session initialization reads it and appends it to every
-Omnigent-started session's instructions.
-"""
+"""Append-only instruction revisions, scoped by workspace and layer."""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class InstructionLayerKey:
+    """Identify a shared, product, host, independent or session-role layer."""
+
+    scope: str = "shared"
+    agent_key: str = ""
+    host_id: str = ""
+
+    def __post_init__(self) -> None:
+        expected = {
+            "shared": (False, False),
+            "agent": (True, False),
+            "host": (False, True),
+            "independent": (True, True),
+            "mother": (False, False),
+            "child": (False, False),
+        }
+        if self.scope not in expected or expected[self.scope] != (
+            bool(self.agent_key.strip()),
+            bool(self.host_id.strip()),
+        ):
+            raise ValueError("Invalid instruction layer scope or keys")
+        if self.agent_key != self.agent_key.strip() or self.host_id != self.host_id.strip():
+            raise ValueError("Instruction layer keys must not contain surrounding whitespace")
+        if len(self.agent_key) > 64 or len(self.host_id) > 64:
+            raise ValueError("Instruction layer keys must be at most 64 characters")
 
 
 @dataclass(frozen=True)
@@ -24,6 +47,10 @@ class GlobalInstructionRevision:
     text: str
     created_at: int
     created_by: str | None
+    scope: str = "shared"
+    agent_key: str = ""
+    host_id: str = ""
+    created_us: int = 0
 
 
 class GlobalInstructionsStore(ABC):
@@ -39,7 +66,9 @@ class GlobalInstructionsStore(ABC):
         self.storage_location = storage_location
 
     @abstractmethod
-    def current(self) -> GlobalInstructionRevision | None:
+    def current(
+        self, *, scope: str = "shared", agent_key: str = "", host_id: str = ""
+    ) -> GlobalInstructionRevision | None:
         """
         Return the newest revision, or ``None`` when nothing was saved.
 
@@ -48,7 +77,15 @@ class GlobalInstructionsStore(ABC):
         ...
 
     @abstractmethod
-    def save(self, text: str, *, created_by: str | None) -> GlobalInstructionRevision:
+    def save(
+        self,
+        text: str,
+        *,
+        created_by: str | None,
+        scope: str = "shared",
+        agent_key: str = "",
+        host_id: str = "",
+    ) -> GlobalInstructionRevision:
         """
         Append a revision and return it.
 
@@ -60,7 +97,14 @@ class GlobalInstructionsStore(ABC):
         ...
 
     @abstractmethod
-    def list_revisions(self, *, limit: int = 50) -> list[GlobalInstructionRevision]:
+    def list_revisions(
+        self,
+        *,
+        limit: int = 50,
+        scope: str = "shared",
+        agent_key: str = "",
+        host_id: str = "",
+    ) -> list[GlobalInstructionRevision]:
         """
         List revisions newest first.
 
@@ -68,4 +112,16 @@ class GlobalInstructionsStore(ABC):
         :returns: Revisions ordered by ``created_at`` then ``id``,
             descending.
         """
+        ...
+
+    @abstractmethod
+    def list_layers(self) -> list[GlobalInstructionRevision]:
+        """Return the latest revision of every layer, including disabled layers."""
+        ...
+
+    @abstractmethod
+    def latest_layers(
+        self, host_id: str | None, agent_key: str | None
+    ) -> list[GlobalInstructionRevision]:
+        """Read the independent setting, or shared → agent → host for a route."""
         ...

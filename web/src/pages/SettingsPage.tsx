@@ -340,9 +340,9 @@ const MembersPage = lazy(() =>
 const PoliciesPage = lazy(() =>
   import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
 );
-const GlobalInstructionsPage = lazy(() =>
-  import("@/pages/GlobalInstructionsPage").then((m) => ({
-    default: m.GlobalInstructionsPage,
+const InstructionsPage = lazy(() =>
+  import("@/pages/InstructionsPage").then((m) => ({
+    default: m.InstructionsPage,
   })),
 );
 const SharingPage = lazy(() =>
@@ -404,7 +404,7 @@ export function SettingsPage() {
   if (
     section === "members" ||
     section === "policies" ||
-    section === "global-instructions" ||
+    section === "instructions" ||
     section === "system-status" ||
     section === "sharing"
   ) {
@@ -414,8 +414,8 @@ export function SettingsPage() {
           <MembersPage />
         ) : section === "policies" ? (
           <PoliciesPage />
-        ) : section === "global-instructions" ? (
-          <GlobalInstructionsPage />
+        ) : section === "instructions" ? (
+          <InstructionsPage />
         ) : section === "system-status" ? (
           <SystemStatusSettingsSection />
         ) : (

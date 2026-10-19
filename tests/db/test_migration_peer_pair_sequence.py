@@ -22,9 +22,9 @@ def _run(uri: str, engine: sa.Engine, action: str, revision: str) -> None:
         getattr(command, action)(config, revision)
 
 
-def test_pair_sequence_migration_is_only_head() -> None:
+def test_pair_sequence_migration_remains_in_history() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
-    assert script.get_heads() == [_MIGRATION]
+    assert _MIGRATION in {revision.revision for revision in script.walk_revisions()}
     assert script.get_revision(_MIGRATION).down_revision == _PREVIOUS
 
 

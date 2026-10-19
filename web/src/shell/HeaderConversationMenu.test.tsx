@@ -155,7 +155,13 @@ const SECOND_CONVERSATION: Conversation = {
 };
 
 function LocationProbe() {
-  return <output data-testid="location-probe">{useLocation().pathname}</output>;
+  const location = useLocation();
+  return (
+    <>
+      <output data-testid="location-probe">{location.pathname}</output>
+      <output data-testid="query-probe">{location.search}</output>
+    </>
+  );
 }
 
 function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
@@ -418,6 +424,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "View instructions",
       "Worktree details",
       "Rename",
       "Mark as unread",
@@ -495,6 +502,16 @@ describe("HeaderConversationMenu", () => {
       pinned: true,
       pinnedAt: 1700000000123,
     });
+  });
+
+  it("opens the new-session instruction preview for this session", async () => {
+    renderMenu();
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "View instructions" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/settings/instructions"),
+    );
+    expect(screen.getByTestId("query-probe")).toHaveTextContent("?session=conv-1");
   });
 
   it("downloads the transcript as <session-id>.jsonl from Export", async () => {
@@ -862,6 +879,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "View instructions",
       "Worktree details",
       "Rename",
       "Mark as unread",
@@ -885,6 +903,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "View instructions",
       "Worktree details",
       "Rename",
       "Mark as unread",

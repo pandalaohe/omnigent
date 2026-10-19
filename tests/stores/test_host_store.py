@@ -424,6 +424,23 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
 
     conversations = SqlAlchemyConversationStore(db_uri)
 
+    from omnigent.stores.global_instructions_store.sqlalchemy_store import (
+        SqlAlchemyGlobalInstructionsStore,
+    )
+
+    instructions = SqlAlchemyGlobalInstructionsStore(db_uri)
+    old_host = "a1ed1ab71de2311e20488a989e61701c"
+    new_host = "b1b5efd7dfc33b5a6241f1866ffb00e6"
+    shared = instructions.save("shared", created_by=None)
+    host_revision = instructions.save("host", created_by=None, scope="host", host_id=old_host)
+    independent = instructions.save(
+        "independent", created_by=None, scope="independent", agent_key="codex", host_id=old_host
+    )
+    with workspace_scope(current_workspace_id() + 1):
+        other_workspace = instructions.save(
+            "other workspace", created_by=None, scope="host", host_id=old_host
+        )
+
     host_store.upsert_on_connect(
         host_id="a1ed1ab71de2311e20488a989e61701c",
         name="dev-laptop",
@@ -464,6 +481,15 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     assert rotated is not None
     assert rotated.default_workspace == "D:\\AIProgram\\Projects"
     assert rotated.platform == "darwin"
+    assert instructions.current() == shared
+    assert instructions.current(scope="host", host_id=old_host) is None
+    assert instructions.current(scope="host", host_id=new_host).id == host_revision.id
+    assert (
+        instructions.current(scope="independent", agent_key="codex", host_id=new_host).id
+        == independent.id
+    )
+    with workspace_scope(current_workspace_id() + 1):
+        assert instructions.current(scope="host", host_id=old_host) == other_workspace
 
 
 def test_host_id_rotation_waits_for_old_worktree_admission_lease(

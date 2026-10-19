@@ -65,7 +65,6 @@ from omnigent.runner.identity import (
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
-    current_global_instructions_text,
     get_runner_client,
     pending_elicitations,
     user_session_stream,
@@ -107,6 +106,7 @@ from omnigent.server.child_keep_warm import (
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.instruction_layers import session_instructions_text
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -1269,7 +1269,7 @@ def register_core_routes(
             try:
                 # Blocking store read; inside the try so a read failure still
                 # falls back to the id-only body.
-                global_instructions = await asyncio.to_thread(current_global_instructions_text)
+                global_instructions = await session_instructions_text(conv)
                 # Prefer the initializer's owner-aware snapshot; embedded
                 # builds without one keep the deployment flag.
                 initializer = getattr(request.app.state, "runner_session_initializer", None)

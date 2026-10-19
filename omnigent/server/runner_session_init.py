@@ -20,7 +20,7 @@ from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
     runner_archive_state,
 )
-from omnigent.runtime import current_global_instructions_text
+from omnigent.server.instruction_layers import session_instructions_text
 from omnigent.server.project_placement import project_code_locations
 
 if TYPE_CHECKING:
@@ -446,7 +446,7 @@ class RunnerSessionInitializer:
             # and awaiting between the single-flight lookup and the task
             # registration would let a second caller start its own init.
             async with store_slots or nullcontext():
-                global_instructions = await asyncio.to_thread(current_global_instructions_text)
+                global_instructions = await session_instructions_text(conversation)
                 project_code = await self.resolve_project_code(conversation)
             payload = build_runner_session_init_payload(
                 conversation,

@@ -720,7 +720,6 @@ def _run_with_local_server(
     base_url = f"http://127.0.0.1:{port}"
     try:
         _wait_for_server(port, server_handle)
-        global_instructions = _fetch_global_instructions(base_url=base_url, headers={})
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
             headers={},
@@ -731,6 +730,25 @@ def _run_with_local_server(
             return
         if resolved_session_id is not None:
             _align_working_directory_with_session(resolved_session_id)
+            global_instructions = _fetch_global_instructions(
+                base_url=base_url, headers={}, session_id=resolved_session_id
+            )
+        else:
+            from omnigent.host.identity import load_host_identity_if_present
+            from omnigent.spec import load as load_agent_spec
+
+            identity = load_host_identity_if_present()
+            try:
+                spawn = bool(load_agent_spec(spec_path, expand_env=False).spawn)
+            except Exception:  # noqa: BLE001
+                spawn = False
+            global_instructions = _fetch_global_instructions(
+                base_url=base_url,
+                headers={},
+                host_id=identity.host_id if identity is not None else None,
+                agent="codex",
+                spawn=spawn,
+            )
 
         async def _drive() -> None:
             """
