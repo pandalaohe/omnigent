@@ -4927,6 +4927,7 @@ async def _launch_codex_native_tui(
         ),
         agent_pid=app_server.agent_pid,
         session_id=session_id,
+        cwd=launch_config.workspace,
     )
     # Apply configured wrappers to both cold start and recovery.
     from omnigent.config import load_effective_config

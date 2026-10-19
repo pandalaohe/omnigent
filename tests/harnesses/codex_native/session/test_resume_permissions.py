@@ -20,6 +20,12 @@ from tests.harnesses.codex_native.session._support import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _non_git_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Permission transport tests must not inherit a real linked checkout's gitdir.
+    monkeypatch.chdir(tmp_path)
+
+
 def test_clear_bridge_state_removes_stale_runtime_state(tmp_path: Path) -> None:
     """
     Clearing bridge state removes the stale runtime pointer.

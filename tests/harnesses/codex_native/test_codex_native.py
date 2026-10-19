@@ -36,6 +36,13 @@ from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.inner.native_attachments import session_attachment_dir
 from omnigent.spec import load
 
+
+@pytest.fixture(autouse=True)
+def _non_git_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Permission transport tests must not inherit a real linked checkout's gitdir.
+    monkeypatch.chdir(tmp_path)
+
+
 # The default-stance auto-review override normalize_codex_permission_launch_args
 # adds when no explicit approval/sandbox/reviewer/profile choice is present.
 _AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']

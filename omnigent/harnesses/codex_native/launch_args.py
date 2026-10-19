@@ -16,6 +16,7 @@ import tomlkit
 from tomlkit.exceptions import ParseError, TOMLKitError
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime.filesystem_registry import linked_worktree_git_dir
 
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
@@ -354,11 +355,11 @@ def codex_launch_args_set_permission(args: Sequence[str]) -> bool:
 
 
 def codex_workspace_roots(args: Sequence[str], cwd: Path) -> tuple[Path, list[str]]:
-    """Resolve the working directory and ``--add-dir`` roots Codex derives from *args*.
+    """Resolve the working directory, ``--add-dir`` roots and linked-worktree gitdir.
 
     :param args: Codex CLI args, e.g. ``["--cd", "app", "--add-dir", "../shared"]``.
     :param cwd: Directory the launch starts in.
-    :returns: The effective working directory and the absolute ``--add-dir`` roots.
+    :returns: The effective working directory and absolute additional writable roots.
     :raises ValueError: When ``--add-dir``, ``--cd`` or ``-C`` has no directory.
     """
     canonical = canonical_codex_launch_args(args)
@@ -379,7 +380,11 @@ def codex_workspace_roots(args: Sequence[str], cwd: Path) -> tuple[Path, list[st
         if arg in _CODEX_VALUE_FLAGS:
             index += 1
         index += 1
-    return effective_cwd, [absolute_codex_path(root, effective_cwd) for root in roots]
+    resolved_roots = [absolute_codex_path(root, effective_cwd) for root in roots]
+    git_dir = linked_worktree_git_dir(effective_cwd)
+    if git_dir is not None:
+        resolved_roots.append(str(git_dir))
+    return effective_cwd, list(dict.fromkeys(resolved_roots))
 
 
 def without_codex_add_dirs(args: Sequence[str]) -> list[str]:

@@ -300,6 +300,21 @@ def detect_git_root(path: Path) -> Path | None:
         return None
 
 
+def linked_worktree_git_dir(workspace: Path) -> Path | None:
+    """Return only a linked worktree's own metadata directory, never its common directory."""
+    try:
+        git_entry = workspace / ".git"
+        git_dir = _resolve_gitfile(git_entry)
+        if git_dir is None or not (git_dir / "commondir").is_file():
+            return None
+        backlink = (git_dir / "gitdir").read_text(encoding="utf-8").strip()
+        if not backlink or (git_dir / backlink).resolve() != git_entry.resolve():
+            return None
+        return git_dir
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        return None
+
+
 def _is_git_repo(git_root: Path) -> bool:
     """Return True when *git_root*'s ``.git`` entry forms a working repository.
 
