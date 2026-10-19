@@ -445,6 +445,90 @@ async def test_remote_resume_add_dir_preserves_configured_roots(
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
 
 
+@pytest.mark.parametrize("relative", [False, True])
+async def test_worktree_gitdir_is_carried_to_native_launch_and_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, relative: bool
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    gitdir = tmp_path / "repo" / ".git" / "worktrees" / "feature"
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../..\n")
+    backlink = "../../../../workspace/.git" if relative else str(workspace / ".git")
+    (gitdir / "gitdir").write_text(backlink)
+    target = "../repo/.git/worktrees/feature" if relative else str(gitdir)
+    (workspace / ".git").write_text(f"gitdir: {target}\n")
+    args = ("--cd", "workspace", "--add-dir", "notes")
+    assert launch_args.codex_workspace_roots(args, tmp_path) == (
+        workspace,
+        [str(workspace / "notes"), str(gitdir)],
+    )
+    server = app_server.build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+        terminal_launch_args=args,
+    )
+    assert server.writable_roots == (str(workspace / "notes"), str(gitdir))
+    for override in (
+        'sandbox_workspace_write.writable_roots=["/opt/work/shared"]',
+        'sandbox_workspace_write={writable_roots=["/opt/work/shared"],network_access=false}',
+    ):
+        remote_args = app_server.build_codex_remote_args(
+            codex_args=(*args, "-c", override),
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+            cwd=tmp_path,
+        )
+        effective_config = app_server._codex_resume_permission_params(remote_args)["config"]
+        effective_roots = effective_config.get("sandbox_workspace_write", {}).get(
+            "writable_roots", effective_config.get("sandbox_workspace_write.writable_roots")
+        )
+        assert effective_roots == ["/opt/work/shared", str(workspace / "notes"), str(gitdir)]
+    client = AsyncMock()
+    client.request.return_value = {"result": {"config": {}}}
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+    await app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876", "thread-test", terminal_launch_args=args, cwd=tmp_path
+    )
+    assert client.request.call_args_list[-1].args[1]["runtimeWorkspaceRoots"] == [
+        str(workspace),
+        str(workspace / "notes"),
+        str(gitdir),
+    ]
+
+
+@pytest.mark.parametrize(
+    "marker", [None, "directory", "invalid", "gitdir: ", "gitdir: missing", "gitdir: ../unrelated"]
+)
+def test_workspace_roots_ignore_non_worktree_git_entries(
+    tmp_path: Path, marker: str | None
+) -> None:
+    (tmp_path.parent / "unrelated").mkdir(exist_ok=True)
+    if marker == "directory":
+        (tmp_path / ".git").mkdir()
+    elif marker is not None:
+        (tmp_path / ".git").write_text(marker)
+    assert launch_args.codex_workspace_roots((), tmp_path) == (tmp_path, [])
+
+
+@pytest.mark.parametrize("backlink", [None, "", "/opt/work/another/.git", "invalid-encoding"])
+def test_workspace_roots_require_worktree_backlink(tmp_path: Path, backlink: str | None) -> None:
+    gitdir = tmp_path / "metadata"
+    gitdir.mkdir()
+    (tmp_path / ".git").write_text(f"gitdir: {gitdir}")
+    (gitdir / "commondir").write_text("../common")
+    if backlink == "invalid-encoding":
+        (gitdir / "gitdir").write_bytes(b"\xff")
+    elif backlink is not None:
+        (gitdir / "gitdir").write_text(backlink)
+    assert launch_args.codex_workspace_roots((), tmp_path) == (tmp_path, [])
+
+
 def test_fresh_remote_tui_leaves_add_dir_to_the_app_server(tmp_path: Path) -> None:
     """Codex exits on ``--add-dir`` with ``--remote``, so only the server sees the roots."""
     args = (

@@ -7391,6 +7391,7 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
     "service_tier,expected_tier",
     [(None, None), ("fast", "priority"), ("standard", "default"), ("ultrafast", "ultrafast")],
 )
+@pytest.mark.parametrize("configured_network", [None, False, True])
 async def test_codex_turn_start_applies_approval_mode(
     approval_mode: str | None,
     approval_policy: str | None,
@@ -7398,14 +7399,41 @@ async def test_codex_turn_start_applies_approval_mode(
     sandbox_type: str | None,
     service_tier: str | None,
     expected_tier: str | None,
+    tmp_path: Path,
+    configured_network: bool | None,
 ) -> None:
+    gitdir = tmp_path / "repo" / ".git" / "worktrees" / "feature"
+    gitdir.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if configured_network is not None:
+        (workspace / ".git").write_text(f"gitdir: {gitdir}\n")
+    (gitdir / "commondir").write_text("../..\n")
+    (gitdir / "gitdir").write_text(str(workspace / ".git"))
     session = _CodexAppServerSession(
         codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
     )
     session.start = AsyncMock()
     session.__dict__["_proc"] = _FakeProcess()
     session.thread_id = "thread-1"
-    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+    session._request = AsyncMock(
+        side_effect=lambda method, params: (
+            {
+                "result": {
+                    "config": {
+                        "sandbox_workspace_write": None
+                        if configured_network is None
+                        else {
+                            "writable_roots": ["/opt/work/shared"],
+                            "network_access": configured_network,
+                        }
+                    }
+                }
+            }
+            if method == "config/read"
+            else {"result": {"turn": {"id": "turn-1"}}}
+        )
+    )
 
     async def _complete() -> None:
         await asyncio.sleep(0.01)
@@ -7421,7 +7449,7 @@ async def test_codex_turn_start_applies_approval_mode(
             tools=[],
             system_prompt="",
             model="gpt-5.4-mini",
-            cwd=".",
+            cwd=str(workspace),
             sandbox="workspace-write",
             approval_mode=approval_mode,
             service_tier=service_tier,
@@ -7442,7 +7470,19 @@ async def test_codex_turn_start_applies_approval_mode(
     else:
         assert turn_params["approvalPolicy"] == approval_policy
         assert turn_params["approvalsReviewer"] == approvals_reviewer
-        assert turn_params["sandboxPolicy"] == {"type": sandbox_type}
+        expected_sandbox = {"type": sandbox_type}
+        if sandbox_type == "workspaceWrite":
+            expected_sandbox["writableRoots"] = [str(workspace)]
+            if configured_network is not None:
+                expected_sandbox.update(
+                    writableRoots=[str(workspace), "/opt/work/shared", str(gitdir)],
+                    networkAccess=configured_network,
+                )
+        assert turn_params["sandboxPolicy"] == expected_sandbox
+    config_reads = [
+        call for call in session._request.await_args_list if call.args[0] == "config/read"
+    ]
+    assert len(config_reads) == (1 if sandbox_type == "workspaceWrite" else 0)
 
 
 async def test_codex_turn_start_ignores_unknown_approval_mode(

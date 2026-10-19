@@ -3048,6 +3048,7 @@ async def _launch_codex_terminal(
         codex_cli_version=codex_cli_version,
         agent_pid=agent_pid,
         session_id=session_id,
+        cwd=Path.cwd(),
     )
     body = {
         "terminal": _TERMINAL_NAME,

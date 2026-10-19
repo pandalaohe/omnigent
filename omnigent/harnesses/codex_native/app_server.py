@@ -5081,6 +5081,7 @@ def build_codex_remote_args(
     bypass_hook_trust: bool = False,
     agent_pid: int | None = None,
     session_id: str | None = None,
+    cwd: Path | None = None,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -5149,6 +5150,7 @@ def build_codex_remote_args(
     :param agent_pid: Native app-server pid to expose to the TUI's shell
         tools, or ``None``. The TUI forwards its own ``-c`` overrides in
         the thread calls it sends, so the key travels with the attach.
+    :param cwd: Launch directory used to retain automatic worktree roots after CLI overrides.
     :returns: Codex argv tail after the executable.
     """
     # The runner owns the app-server and the TUI ``--remote`` attach it appends
@@ -5190,6 +5192,36 @@ def build_codex_remote_args(
     if thread_id is None:
         # Codex refuses --add-dir with --remote; app-server startup writes
         # those roots into the private config.
+        if cwd is not None:
+            effective_cwd, additional_roots = codex_workspace_roots(codex_args, cwd)
+            if additional_roots:
+                permission_params = _codex_resume_permission_params((*override_args, *passthrough))
+                config = cast(CodexParams, permission_params.get("config", {}))
+                sandbox_config = config.get("sandbox_workspace_write", {})
+                if not isinstance(sandbox_config, dict):
+                    raise ValueError("sandbox_workspace_write must be a table")
+                roots = config.get(
+                    "sandbox_workspace_write.writable_roots",
+                    sandbox_config.get("writable_roots"),
+                )
+                if roots is not None:
+                    if not isinstance(roots, list) or not all(
+                        isinstance(root, str) for root in roots
+                    ):
+                        raise ValueError(
+                            "sandbox_workspace_write.writable_roots must be an array of paths"
+                        )
+                    roots = list(
+                        dict.fromkeys(
+                            [
+                                *(absolute_codex_path(root, effective_cwd) for root in roots),
+                                *additional_roots,
+                            ]
+                        )
+                    )
+                    agent_pid_args.extend(
+                        ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"]
+                    )
         return [
             *override_args,
             *without_codex_add_dirs(passthrough),

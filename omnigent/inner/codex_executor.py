@@ -60,6 +60,7 @@ from omnigent.harnesses.codex_native.keep_warm import (
     keep_warm_receipt,
     keep_warm_result_receipt,
 )
+from omnigent.harnesses.codex_native.launch_args import absolute_codex_path
 from omnigent.harnesses.codex_native.side_chat import (
     is_keep_warm_fork as _is_keep_warm_fork,
 )
@@ -73,6 +74,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runtime.filesystem_registry import linked_worktree_git_dir
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_peer_delivery import PeerOutcome, ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
@@ -4198,7 +4200,36 @@ class _CodexAppServerSession:
                 approval_policy, approvals_reviewer, sandbox_type = policy
                 turn_params["approvalPolicy"] = approval_policy
                 turn_params["approvalsReviewer"] = approvals_reviewer
-                turn_params["sandboxPolicy"] = {"type": sandbox_type}
+                sandbox_policy: CodexParams = {"type": sandbox_type}
+                turn_params["sandboxPolicy"] = sandbox_policy
+                if sandbox_type == "workspaceWrite":
+                    response = await self._request(
+                        "config/read", {"includeLayers": False, "cwd": cwd}
+                    )
+                    config = response.get("result", {}).get("config", {})
+                    workspace_config = config.get("sandbox_workspace_write") or {}
+                    roots = workspace_config.get("writable_roots") or []
+                    if not isinstance(roots, list) or not all(
+                        isinstance(root, str) for root in roots
+                    ):
+                        raise ValueError(
+                            "sandbox_workspace_write.writable_roots must be an array of paths"
+                        )
+                    workspace = Path(absolute_codex_path(cwd, Path(self._cwd or os.getcwd())))
+                    writable_roots = [str(workspace)] + [
+                        absolute_codex_path(root, workspace) for root in roots
+                    ]
+                    git_dir = linked_worktree_git_dir(workspace)
+                    if git_dir is not None:
+                        writable_roots.append(str(git_dir))
+                    sandbox_policy["writableRoots"] = list(dict.fromkeys(writable_roots))
+                    if "network_access" in workspace_config:
+                        network_access = workspace_config["network_access"]
+                        if not isinstance(network_access, bool):
+                            raise ValueError(
+                                "sandbox_workspace_write.network_access must be a boolean"
+                            )
+                        sandbox_policy["networkAccess"] = network_access
         start_response = await self._request(
             "turn/start",
             turn_params,
