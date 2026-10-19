@@ -4892,6 +4892,7 @@ function registerIpc() {
     return {
       databricksInternalFeatures: enabled,
       canExtendArca: enabled,
+      canRefreshDbcert: enabled,
       arcaPreviewRecovery: true,
     };
   });
@@ -4969,6 +4970,23 @@ function registerIpc() {
     } finally {
       arcaExtendInFlight = false;
     }
+  });
+
+  // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
+  // Companion then copies it to the user's boxes. Same gates as arca-extend.
+  // Clicks from several windows share one sign-in.
+  let dbcertRefresh = null;
+  ipcMain.handle("omnigent:dbcert-refresh", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("dbcert-refresh is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "dbcert refresh is not enabled for this server." };
+    }
+    dbcertRefresh ??= arca.runDbcertRefresh().finally(() => {
+      dbcertRefresh = null;
+    });
+    return dbcertRefresh;
   });
 
   // Push a status ping when a host child connects or exits on its own (no

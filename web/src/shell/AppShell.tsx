@@ -113,7 +113,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
-import { isTempConvId, useChatStore } from "@/store/chatStore";
+import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
 import {
   STARTING_GRACE_S,
@@ -126,7 +126,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ChatHeader } from "./ChatHeader";
 import type { ChildSessionLike } from "./subagentRailGroups";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
-import { FileViewer } from "./FileViewer";
 import {
   FileViewerContext,
   type FilePosition,
@@ -302,6 +301,7 @@ export function AppShell() {
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const pendingConversation = conversationId != null && serverConversationId == null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
+  const [mobileFileTarget, setMobileFileTarget] = useState<HTMLDivElement | null>(null);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() => {
     if (!conversationId) return "files";
     const persistedTab = readSessionWorkspaceState(conversationId).rightRailTab;
@@ -1141,6 +1141,8 @@ export function AppShell() {
             chat.sessionStatus,
             chat.queuedMessages,
             readAlwaysSteer(),
+            false,
+            holdsInitialDraft(chat),
           )
         ) {
           chat.enqueueMessage(text, files);
@@ -1511,7 +1513,6 @@ export function AppShell() {
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId, setRightPanelOpenAnimated],
   );
 
-  // Desktop and mobile viewers can both be mounted; each may own a draft.
   const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
   const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
     fileNavigationGuardsRef.current.add(guard);
@@ -2711,7 +2712,7 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && hasRailContent && (
+                {conversationId && (hasRailContent || selectedFilePath !== null) && (
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
@@ -2737,6 +2738,8 @@ export function AppShell() {
                     rootSessionId={rootSessionId}
                     selectedFilePath={selectedFilePath}
                     filePosition={filePosition}
+                    mobileFileTarget={mobileFileTarget}
+                    onMobileFileClose={closeFileViewer}
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
@@ -2869,22 +2872,7 @@ export function AppShell() {
                   <PullRequestPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
-              {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-              {serverConversationId && selectedFilePath !== null && (
-                <div className="md:hidden">
-                  <FileViewer
-                    viewport="mobile"
-                    open
-                    conversationId={serverConversationId}
-                    path={selectedFilePath}
-                    position={filePosition}
-                    onClose={closeFileViewer}
-                    onNavigateTo={openFileViewer}
-                    permissionLevel={permissionLevel}
-                    sort={filesPanelSort}
-                  />
-                </div>
-              )}
+              <div ref={setMobileFileTarget} className="md:hidden" />
             </CanvasWorkspace>
           </div>
           {conversationId && (

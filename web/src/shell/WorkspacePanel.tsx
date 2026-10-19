@@ -76,6 +76,7 @@ import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./
 import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
+import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -708,6 +709,8 @@ interface WorkspacePanelProps {
   /** Active file path, or null when the Files tab shows a scope view. */
   selectedFilePath: string | null;
   filePosition?: FilePosition;
+  mobileFileTarget?: HTMLElement | null;
+  onMobileFileClose?: () => void;
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
   /** Open a file in the inline viewer (adds/activates its tab). */
@@ -817,6 +820,8 @@ function WorkspacePanelImpl({
   rootSessionId,
   selectedFilePath,
   filePosition,
+  mobileFileTarget = null,
+  onMobileFileClose,
   openFiles,
   openFileViewer,
   onCloseFile,
@@ -1596,20 +1601,22 @@ function WorkspacePanelImpl({
               autoFocus={autoFocusSelectedTerminal}
             />
           ) : selectedFilePath !== null ? (
-            <FileViewer
-              viewport="desktop"
-              frameless
-              open
-              conversationId={conversationId}
-              path={selectedFilePath}
-              position={filePosition}
-              onClose={onShowScopeView}
-              onCloseTab={handleCloseTab}
-              onNavigateTo={openFileViewer}
-              permissionLevel={permissionLevel}
-              onCommentsOpenChange={onCommentsOpenChange}
-              sort={filesPanelSort}
-            />
+            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
+              <FileViewer
+                mobileOverlay={isMobile}
+                frameless
+                open
+                conversationId={conversationId}
+                path={selectedFilePath}
+                position={filePosition}
+                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
+                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                onNavigateTo={openFileViewer}
+                permissionLevel={permissionLevel}
+                onCommentsOpenChange={onCommentsOpenChange}
+                sort={filesPanelSort}
+              />
+            </ResponsiveViewerSlot>
           ) : rightRailTab === "archive" ? (
             <ArchiveLibraryRail
               activeConversationId={conversationId}

@@ -121,6 +121,7 @@ import {
   committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  holdsInitialDraft,
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
@@ -1046,6 +1047,7 @@ export function ChatPage() {
           chat.queuedMessages,
           readAlwaysSteer(),
           opensSideChat,
+          holdsInitialDraft(chat),
         )
       ) {
         chat.enqueueMessage(text, files, composerParts, replyDraft);
