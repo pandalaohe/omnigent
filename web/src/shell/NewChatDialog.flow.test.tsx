@@ -543,6 +543,7 @@ describe("NewChatLandingScreen create flow", () => {
     async ({ query, canvasId, project }) => {
       searchParams = new URLSearchParams(query);
       projects = project ? [project] : [];
+      projectConfig = project ? { host_id: "host_1", workspace: SEEDED_WORKSPACE } : null;
       const tempConvId = "temp:1234567890abcdef1234567890abcdef";
       beginLocalConversationMock.mockReturnValue({
         tempConvId,
@@ -588,6 +589,7 @@ describe("NewChatLandingScreen create flow", () => {
   it("returns a server-first Canvas create to its project", async () => {
     searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
+    projectConfig = { host_id: "host_1", workspace: SEEDED_WORKSPACE };
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -620,6 +622,7 @@ describe("NewChatLandingScreen create flow", () => {
   it("keeps the Canvas project and draft when a temporary create fails", async () => {
     searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
+    projectConfig = { host_id: "host_1", workspace: SEEDED_WORKSPACE };
     const previousUrl = window.location.href;
     navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
       window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
