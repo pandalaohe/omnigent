@@ -275,6 +275,10 @@ class _AcpModelSwitchError(RuntimeError):
     """A rejected model selection, before the ACP prompt is sent."""
 
 
+class _AcpEffortSelectionError(RuntimeError):
+    """An effort refusal or unconfirmed selection that retrying cannot resolve."""
+
+
 class _AcpRequestError(Exception):
     """A handler failure to return as a JSON-RPC error on a server request.
 
@@ -490,6 +494,7 @@ class AcpExecutor(Executor):
         self._effort_option: _AcpJsonObject | None = None
         self._effort_defaults: dict[str | None, str] = {}
         self._effort_overridden = False
+        self._effort_override_value: str | None = None
         self._effort_option_model: str | None = None
         self._effort_after_model_switch = False
         self._model_selection_pending = False
@@ -592,6 +597,7 @@ class AcpExecutor(Executor):
         self._effort_option = None
         self._effort_defaults.clear()
         self._effort_overridden = False
+        self._effort_override_value = None
         self._effort_option_model = None
         self._effort_after_model_switch = False
         self._model_selection_pending = False
@@ -1586,6 +1592,7 @@ class AcpExecutor(Executor):
         self._effort_option = None
         self._effort_defaults.clear()
         self._effort_overridden = False
+        self._effort_override_value = None
         self._effort_option_model = None
         self._effort_after_model_switch = False
         self._model_selection_pending = False
@@ -1691,7 +1698,7 @@ class AcpExecutor(Executor):
 
         return events
 
-    def _note_config_options(self, options: object) -> str | None:
+    def _note_config_options(self, options: object, *, model_switch: bool = False) -> str | None:
         """Record which session config options the agent exposes, and their values.
 
         ACP agents advertise settable options (``mode``, ``model``, …) via
@@ -1703,6 +1710,7 @@ class AcpExecutor(Executor):
         :returns: The echoed ``model`` ``currentValue`` when the payload carried a
             model option, else ``None`` — lets a caller distinguish "the agent
             reported its model" from "no model option present".
+        :param model_switch: Whether this is the reply to a model selection RPC.
         """
         if not isinstance(options, list):
             return None
@@ -1733,6 +1741,17 @@ class AcpExecutor(Executor):
                         for choice in choices
                     ]
         self._effort_option_model = self._active_model
+        current = (self._effort_option or {}).get("currentValue")
+        if (
+            (model_switch or self._model_selection_pending)
+            and self._effort_overridden
+            and self._effort_override_value is not None
+            and isinstance(current, str)
+            and current
+            and current != self._effort_override_value
+        ):
+            # A differing switch echo proves the agent did not carry the override.
+            self._effort_defaults[self._active_model] = current
         self._update_effort_catalog()
         return model_value
 
@@ -1786,7 +1805,9 @@ class AcpExecutor(Executor):
             )
             row.pop("defaultReasoningEffort", None)
             initial = self._effort_defaults.get(row["id"] if row["id"] != "__default__" else None)
-            if initial is not None:
+            if initial is None:
+                initial = previous.get(row["id"], {}).get("defaultReasoningEffort")
+            if isinstance(initial, str) and initial:
                 row["defaultReasoningEffort"] = initial
         if not self._model_options or self._model_selection_pending:
             return
@@ -1816,7 +1837,7 @@ class AcpExecutor(Executor):
         option = self._effort_option
         if option is None:
             if effort is not None and self._effort_after_model_switch:
-                raise RuntimeError(
+                raise _AcpEffortSelectionError(
                     f"ACP effort {effort!r} is not advertised for model {self._active_model!r}"
                 )
             if effort is not None or self._effort_overridden:
@@ -1827,38 +1848,54 @@ class AcpExecutor(Executor):
                     self._active_model,
                 )
             self._effort_overridden = False
+            self._effort_override_value = None
             return
         if effort is None:
             if not self._effort_overridden:
                 return
             effort = self._effort_defaults.get(self._active_model)
             if effort is None:
-                raise RuntimeError("ACP effort reset has no advertised initial value")
+                active_id = self._active_model or "__default__"
+                effort = next(
+                    (
+                        row.get("defaultReasoningEffort")
+                        for row in self._model_options
+                        if row["id"] == active_id
+                    ),
+                    None,
+                )
+            if effort is None:
+                raise _AcpEffortSelectionError("ACP effort reset has no advertised initial value")
             overridden = False
         else:
             overridden = True
         offered = [choice["value"] for choice in self._select_choices(option.get("options"))]
         if self._effort_option_model == self._active_model and effort not in offered:
-            raise RuntimeError(
+            raise _AcpEffortSelectionError(
                 f"ACP effort {effort!r} is not advertised for model "
                 f"{self._active_model!r}; offered: {offered}"
             )
         self._effort_overridden = True
+        # A failed call leaves the applied value uncertain until a confirmed retry.
+        self._effort_override_value = None
         response = await self._rpc(
             _AGENT_METHOD_SET_CONFIG_OPTION,
             {"sessionId": session_id, "configId": option["id"], "value": effort},
         )
         if "error" in response:
-            raise RuntimeError(f"ACP agent rejected effort {effort!r}: {response['error']}")
+            raise _AcpEffortSelectionError(
+                f"ACP agent rejected effort {effort!r}: {response['error']}"
+            )
         result = response.get("result")
         echoed = result.get("configOptions") if isinstance(result, dict) else None
         self._note_config_options(echoed)
         confirmed = self._effort_option.get("currentValue") if self._effort_option else None
         if not isinstance(echoed, list) or confirmed != effort:
-            raise RuntimeError(
+            raise _AcpEffortSelectionError(
                 f"ACP effort {effort!r} was not confirmed (currentValue={confirmed!r})"
             )
         self._effort_overridden = overridden
+        self._effort_override_value = effort if overridden else None
         self._effort_after_model_switch = False
         logger.info("acp[%s] effort applied and confirmed: %s", self._config.name, confirmed)
 
@@ -1985,7 +2022,7 @@ class AcpExecutor(Executor):
         # switch it should retry.
         result = response.get("result")
         echoed_model = (
-            self._note_config_options(result.get("configOptions"))
+            self._note_config_options(result.get("configOptions"), model_switch=True)
             if isinstance(result, dict)
             else None
         )
@@ -2038,7 +2075,8 @@ class AcpExecutor(Executor):
         self._active_model = model
         result = response.get("result")
         self._note_config_options(
-            result.get("configOptions") if isinstance(result, dict) else None
+            result.get("configOptions") if isinstance(result, dict) else None,
+            model_switch=True,
         )
         self._update_effort_catalog()
         logger.info(
@@ -2110,10 +2148,14 @@ class AcpExecutor(Executor):
             effort = config.extra.get("reasoning_effort") if config is not None else None
             await self._apply_effort_override(session_id, effort)
         except Exception as exc:  # noqa: BLE001
+            retryable = not isinstance(exc, _AcpEffortSelectionError)
+            recovery = (
+                "retry." if retryable else "select an explicit effort, or start a new session."
+            )
             yield ExecutorError(
                 message=f"ACP effort selection failed: {describe_exception(exc)}. "
-                "No prompt was sent; select an advertised effort or clear the override.",
-                retryable=False,
+                f"No prompt was sent; {recovery}",
+                retryable=retryable,
                 preserve_session=(
                     self._proc is not None
                     and self._proc.returncode is None

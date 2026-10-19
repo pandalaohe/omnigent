@@ -7,6 +7,7 @@ import pytest
 
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.models.model_catalog_store import binary_identity, fingerprint_of, write_catalog
 from omnigent.util.reasoning_effort import efforts_for_harness
 
 
@@ -169,7 +170,15 @@ async def test_clear_restores_agent_initial_effort(executor):
 
 
 @pytest.mark.asyncio
-async def test_turn_transports_effort_before_prompt_and_blocks_refusal(executor):
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"error": {"code": -32602, "message": "not available"}},
+        {"result": {"configOptions": options(current="quick")}},
+        {"result": {}},
+    ],
+)
+async def test_turn_transports_effort_before_prompt_and_blocks_refusal(executor, response):
     executor._proc = type("Running", (), {"returncode": None})()
     executor._ensure_initialized = AsyncMock()
     executor._ensure_session = AsyncMock(return_value="fresh-session")
@@ -179,7 +188,7 @@ async def test_turn_transports_effort_before_prompt_and_blocks_refusal(executor)
 
     executor._send = AsyncMock(side_effect=finish_prompt)
     executor._note_config_options(options())
-    executor._rpc = AsyncMock(return_value={"error": {"code": -32602, "message": "not available"}})
+    executor._rpc = AsyncMock(return_value=response)
     events = [
         event
         async for event in executor.run_turn(
@@ -317,17 +326,157 @@ async def test_review_minor1_clear_does_not_capture_carried_override(executor):
     assert executor._rpc.await_args.args[1]["value"] == "quick"
 
 
+@pytest.fixture
+def turn_executor(executor):
+    executor._proc = type("Running", (), {"returncode": None})()
+    executor._ensure_initialized = AsyncMock()
+    executor._ensure_session = AsyncMock(return_value="fresh-session")
+
+    async def finish_prompt(message):
+        assert message["method"] == "session/prompt"
+        executor._pending.pop(message["id"]).set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = AsyncMock(side_effect=finish_prompt)
+    return executor
+
+
 @pytest.mark.asyncio
-async def test_review_minor1_unknown_default_is_not_invented_from_override(executor):
+@pytest.mark.parametrize("catalog", [False, True])
+@pytest.mark.parametrize("source", ["echo", "catalogue", "unknown"])
+@pytest.mark.parametrize("notification", [False, True])
+async def test_review_minor1_unseen_model_clear_uses_evidence_or_actionable_refusal(
+    turn_executor, catalog, source, notification
+):
+    executor = turn_executor
     executor._note_config_options(options())
-    executor._effort_overridden = True
     executor._rpc = AsyncMock(
-        return_value={"result": {"configOptions": options("model-b", current="deliberate")}}
+        return_value={"result": {"configOptions": options(current="deliberate")}}
     )
-    await executor._apply_model_override("fresh-session", "model-b")
-    with pytest.raises(RuntimeError, match="no advertised initial value"):
-        await executor._apply_effort_override("fresh-session", None)
-    assert executor._rpc.await_count == 1
+    await executor._apply_effort_override("fresh-session", "deliberate")
+    assert "model-b" not in executor._effort_defaults
+    if catalog:
+        executor._session_model_ids = {"model-a", "model-b"}
+    if source != "unknown":
+        key = fingerprint_of(executor._config.command, binary_identity(executor._argv[0]))
+        write_catalog(
+            "acp",
+            key,
+            [{"id": "model-b", "defaultReasoningEffort": "quick"}],
+        )
+    # A different live echo outranks the previous host advertisement.
+    current = "precise" if source == "echo" else "deliberate"
+    values = ("quick", "deliberate", "precise")
+    expected = "precise" if source == "echo" else "quick"
+    executor._rpc.reset_mock()
+
+    async def select(method, params):
+        if params.get("configId") == "thinking-budget":
+            return {"result": {"configOptions": options("model-b", values, expected)}}
+        echoed = options("model-b", values, current)
+        if notification:
+            executor._handle_session_update(
+                {"sessionUpdate": "config_option_update", "configOptions": echoed}
+            )
+            return {"result": {}}
+        return {"result": {"configOptions": echoed}}
+
+    executor._rpc.side_effect = select
+
+    async def send(effort=None):
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "neutral input"}],
+                [],
+                "",
+                ExecutorConfig(model="model-b", extra={"reasoning_effort": effort}),
+            )
+        ]
+
+    events = await send()
+    if source == "unknown":
+        for attempt in (events, await send()):
+            assert len(attempt) == 1 and isinstance(attempt[0], ExecutorError)
+            assert "select an explicit effort, or start a new session" in attempt[0].message
+            assert "clear the override" not in attempt[0].message
+            assert attempt[0].retryable is False
+        executor._send.assert_not_awaited()
+        executor._rpc.assert_awaited_once()
+        assert executor._effort_overridden
+        assert "model-b" not in executor._effort_defaults
+        # Following the advice must unblock the same session, without a restart.
+        events = await send("quick")
+        assert executor._effort_overridden
+    else:
+        assert not executor._effort_overridden
+    assert isinstance(events[-1], TurnComplete)
+    assert executor._rpc.await_count == 2
+    assert executor._rpc.await_args is not None
+    assert executor._rpc.await_args.args[1]["value"] == expected
+    executor._send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["refusal", "transport"])
+async def test_review_minor1_failed_switch_rolls_back_echo_default(executor, failure):
+    executor._note_config_options(options())
+    executor._rpc = AsyncMock(
+        return_value={"result": {"configOptions": options(current="deliberate")}}
+    )
+    await executor._apply_effort_override("fresh-session", "deliberate")
+
+    async def reject_switch(*args, **kwargs):
+        executor._handle_session_update(
+            {"sessionUpdate": "config_option_update", "configOptions": options("model-b")}
+        )
+        assert executor._effort_defaults["model-b"] == "quick"
+        if failure == "transport":
+            raise ConnectionError("neutral transport failure")
+        return {"error": {"code": -32602, "message": "model refused"}}
+
+    executor._rpc = AsyncMock(side_effect=reject_switch)
+    if failure == "transport":
+        with pytest.raises(ConnectionError):
+            await executor._apply_model_override("fresh-session", "model-b")
+    else:
+        await executor._apply_model_override("fresh-session", "model-b")
+    assert executor._active_model == "model-a"
+    assert executor._effort_defaults == {"model-a": "quick"}
+    assert executor._effort_overridden
+    assert executor._effort_override_value == "deliberate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [TimeoutError, ConnectionError, EOFError, RuntimeError])
+async def test_review_n3_transient_effort_failure_can_retry(turn_executor, failure):
+    executor = turn_executor
+    executor._note_config_options(options())
+    executor._rpc = AsyncMock(
+        side_effect=[
+            failure("neutral transport failure"),
+            {"result": {"configOptions": options(current="deliberate")}},
+        ]
+    )
+    config = ExecutorConfig(extra={"reasoning_effort": "deliberate"})
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "neutral input"}], [], "", config
+        )
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].retryable is True
+    assert "No prompt was sent; retry" in events[0].message
+    assert executor._effort_override_value is None
+    executor._send.assert_not_awaited()
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "neutral input"}], [], "", config
+        )
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    executor._send.assert_awaited_once()
 
 
 def test_review_minor2_inactive_models_keep_last_advertisement(executor):
