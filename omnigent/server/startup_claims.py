@@ -2,6 +2,8 @@
 
 import asyncio
 
+from omnigent.db.account_authority import AccountAuthority
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostStartupClaimFrame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.stores.conversation_store import ConversationStore
@@ -17,6 +19,11 @@ async def authorize_host_startup_claim(
     startups: SessionStartupStore,
 ) -> bool:
     ref = frame.attempt
+    account = (
+        AccountAuthority(conn.owner, conn.account_generation, conn.workspace_id)
+        if conn.owner is not None
+        else None
+    )
     if (
         registry.get(conn.host_id) is not conn
         or ref.host_generation != conn.startup_generation
@@ -45,14 +52,20 @@ async def authorize_host_startup_claim(
         or conv.runner_id != frame.runner_id
     ):
         return False
-    granted = await asyncio.to_thread(
-        startups.claim_boundary,
-        ref.startup_id,
-        ref.attempt_id,
-        runtime_id=ref.runtime_id,
-        host_generation=ref.host_generation,
-        boundary=frame.boundary,
-        claim_id=frame.request_id,
-        expected_runner_id=frame.runner_id,
-    )
+    try:
+        granted = await asyncio.to_thread(
+            startups.claim_boundary,
+            ref.startup_id,
+            ref.attempt_id,
+            runtime_id=ref.runtime_id,
+            host_generation=ref.host_generation,
+            boundary=frame.boundary,
+            claim_id=frame.request_id,
+            expected_runner_id=frame.runner_id,
+            account=account,
+        )
+    except OmnigentError as exc:
+        if exc.code == ErrorCode.UNAUTHORIZED:
+            return False
+        raise
     return granted and registry.get(conn.host_id) is conn

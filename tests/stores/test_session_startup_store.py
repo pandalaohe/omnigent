@@ -4,11 +4,18 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id, workspace_scope
+from omnigent.db.account_authority import AccountAuthority
+from omnigent.db.db_models import (
+    SqlConversationMetadata,
+    SqlUser,
+    current_workspace_id,
+    workspace_scope,
+)
 from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
 from omnigent.entities.session_startup import StartupReceipt
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.session_startup_store import SessionStartupStore
 
 
@@ -34,6 +41,74 @@ def test_two_replicas_reserve_only_two_and_restart_retains_permits(db_uri):
     assert len([start for start in starts if start is not None]) == 2
     assert SessionStartupStore(db_uri).reserve(host) is None
     assert stores[0].reserve(uuid4().hex) is None
+
+
+def test_receipt_writes_refuse_rotated_account_in_same_transaction(db_uri):
+    store = SessionStartupStore(db_uri)
+    host = uuid4().hex
+    store.configure(host, host_resident_limit=2, deployment_resident_limit=2)
+    queued = enqueue(store, host)
+    attempt = store.reserve(host)
+    assert attempt is not None
+    assert store.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="generation",
+        boundary="runner_prepare",
+        claim_id="claim",
+    )
+    with store._session("seed_receipt_owner") as db:
+        db.add(SqlUser(id="alice", account_generation="old-generation"))
+    stale = AccountAuthority("alice", "old-generation", current_workspace_id())
+    with store._session("rotate_receipt_owner") as db:
+        db.execute(
+            update(SqlUser)
+            .where(SqlUser.workspace_id == current_workspace_id(), SqlUser.id == "alice")
+            .values(account_generation="new-generation")
+        )
+    with pytest.raises(OmnigentError) as claim_error:
+        store.claim_boundary(
+            queued.id,
+            attempt.attempt_id,
+            runtime_id="runtime",
+            host_generation="generation",
+            boundary="runner_spawn",
+            claim_id="spawn",
+            account=stale,
+        )
+    assert claim_error.value.code == ErrorCode.UNAUTHORIZED
+    with pytest.raises(OmnigentError) as bind_error:
+        store.bind_dispatch(
+            queued.id,
+            attempt.attempt_id,
+            runtime_id="runtime",
+            source="codex",
+            vendor_session_id="thread",
+            vendor_turn_id="turn",
+            account_authority=stale,
+        )
+    assert bind_error.value.code == ErrorCode.UNAUTHORIZED
+    with pytest.raises(OmnigentError) as observe_error:
+        store.observe(
+            StartupReceipt(
+                startup_id=queued.id,
+                attempt_id=attempt.attempt_id,
+                input_id=queued.input_id,
+                runtime_id="runtime",
+                source="runner",
+                phase="runtime_ready",
+            ),
+            account_authority=stale,
+        )
+    assert observe_error.value.code == ErrorCode.UNAUTHORIZED
+    snapshot = store.get(queued.id)
+    assert snapshot.proof_source is None
+    assert snapshot.first_dispatch_at is None
+    assert snapshot.occupied
+    with store._session("check_rejected_claim") as db:
+        row = db.get(SqlSessionStartup, (current_workspace_id(), queued.id))
+        assert "runner_spawn" not in row.cold_claims
 
 
 def test_operation_replay_conflict_and_tenant_partition(db_uri):

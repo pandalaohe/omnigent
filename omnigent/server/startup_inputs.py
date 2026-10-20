@@ -132,7 +132,26 @@ class StartupInputContext:
         # Leave the row queued throughout launch, authorization and policy checks.
         # A submitted native input is never replayed without its transcript receipt.
         if self.startup is not None:
+            from omnigent.db.account_authority import AccountAuthority
+            from omnigent.db.db_models import current_workspace_id
+
             admission = self.app.state.startup_store
+            startup = await asyncio.to_thread(admission.get, self.startup.startup_id)
+            service = getattr(self.app.state, "startup_admission", None)
+            conn = service.hosts.get(startup.host_id) if service and startup else None
+            if (
+                conn is None
+                or conn.startup_generation != self.startup.host_generation
+                or startup is None
+                or startup.input_id != self.input_id
+                or startup.attempt_id != self.startup.attempt_id
+            ):
+                return False
+            account = (
+                AccountAuthority(conn.owner, conn.account_generation, current_workspace_id())
+                if conn.owner is not None
+                else None
+            )
             if not await asyncio.to_thread(
                 admission.claim_boundary,
                 self.startup.startup_id,
@@ -141,6 +160,7 @@ class StartupInputContext:
                 host_generation=self.startup.host_generation,
                 boundary="input_dispatch",
                 claim_id=self.input_id,
+                account=account,
             ):
                 return False
         self.submitted = await asyncio.to_thread(
@@ -364,7 +384,7 @@ class ManagedStartupInputs:
                 try:
                     admission = getattr(app.state, "startup_admission", None)
                     if admission is not None:
-                        await admission.coordinator.advance(host_id)
+                        await admission.advance(host_id)
                     ids = await asyncio.to_thread(
                         self.conversations.list_host_conversation_ids, host_id, after=after
                     )
@@ -373,7 +393,8 @@ class ManagedStartupInputs:
                             return
                         busy |= await self._recover_session(app, session_id, connection)
                     after = ids[-1] if len(ids) == 32 else None
-                    delay = 0.25 if busy or after else min(delay * 2, 30.0)
+                    idle_limit = 10.0 if admission is not None else 30.0
+                    delay = 0.25 if busy or after else min(delay * 2, idle_limit)
                 except Exception:
                     _logger.exception("Unable to recover startup messages on host %s", host_id)
                     after = None
@@ -396,6 +417,16 @@ class ManagedStartupInputs:
         """Advance one session's startup here; return whether work is in flight."""
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.host_id != connection.host_id:
+            return False
+        from omnigent.server.startup_registration import (
+            STARTUP_CREATE_PREPARATION_LABEL_KEY,
+            STARTUP_CREATE_PREPARATION_PENDING,
+        )
+
+        if (
+            conv.labels.get(STARTUP_CREATE_PREPARATION_LABEL_KEY)
+            == STARTUP_CREATE_PREPARATION_PENDING
+        ):
             return False
         admission = getattr(app.state, "startup_admission", None)
         if admission is not None:

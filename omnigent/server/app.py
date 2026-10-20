@@ -1745,6 +1745,15 @@ def create_app(
     agent_quota_service = AgentQuotaService(
         conversation_store, permission_store, user_preferences_store, host_registry, host_store
     )
+    from omnigent.entities import Conversation
+    from omnigent.server.startup_admission import active_startup_attempt
+    from omnigent.startup_protocol import StartupAttemptRef
+
+    async def _startup_recovery_attempt(conversation: Conversation) -> StartupAttemptRef | None:
+        if startup_admission is None:
+            return None
+        return await startup_admission.initialization_attempt(conversation)
+
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
@@ -1757,6 +1766,11 @@ def create_app(
             permission_store=permission_store,
             prefs_store=user_preferences_store,
         ),
+        startup_control_resolver=lambda conversation: (
+            startup_policy is not None,
+            active_startup_attempt(conversation.id) if startup_policy is not None else None,
+        ),
+        startup_recovery_resolver=_startup_recovery_attempt,
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,

@@ -10681,6 +10681,19 @@
       "SessionStartupStatus": {
         "description": "Permission-filtered presentation carries no provider identity or input payload.",
         "properties": {
+          "admitted_elapsed_seconds": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admitted Elapsed Seconds"
+          },
           "attempt_id": {
             "anyOf": [
               {
@@ -10709,6 +10722,19 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "input_elapsed_seconds": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Elapsed Seconds"
           },
           "input_id": {
             "anyOf": [
@@ -10754,6 +10780,7 @@
               "blocked",
               "cancelling",
               "ready_empty",
+              "waiting_input",
               "working",
               "cancelled",
               "stopped",
@@ -10761,6 +10788,13 @@
             ],
             "title": "State",
             "type": "string"
+          },
+          "unconfirmed_startups": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Unconfirmed Startups",
+            "type": "integer"
           }
         },
         "required": [

@@ -270,6 +270,7 @@ from omnigent.server.schemas import (
     SessionCreateRequest,
     SessionEventInput,
     SessionForkRequest,
+    SessionGitOptions,
     SessionLabelsResponse,
     SessionList,
     SessionListItem,
@@ -532,6 +533,37 @@ def register_core_routes(
     )
     child_cap_locks = ChildCapLocks()
     from omnigent.server.routes.sessions.routes_startup import register_startup_routes
+
+    @router.post("/sessions/{session_id}/startup/registered", include_in_schema=False)
+    async def register_created_child(request: Request, session_id: str) -> dict[str, str]:
+        """Release a new child after its parent runner registered its work entry."""
+        from omnigent.server.startup_registration import (
+            STARTUP_REGISTRATION_LABEL_KEY,
+            STARTUP_REGISTRATION_PENDING,
+            require_parent_runner,
+        )
+
+        user_id = _require_user(request, auth_provider)
+        child = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if child is None or child.parent_conversation_id is None:
+            raise _session_not_found()
+        await _require_access(user_id, child.id, LEVEL_READ, permission_store, conversation_store)
+        parent = await asyncio.to_thread(
+            conversation_store.get_conversation, child.parent_conversation_id
+        )
+        if parent is None:
+            raise _session_not_found()
+        await _require_access(user_id, parent.id, LEVEL_READ, permission_store, conversation_store)
+        require_parent_runner(request, parent)
+        if child.labels.get(STARTUP_REGISTRATION_LABEL_KEY) == STARTUP_REGISTRATION_PENDING:
+            await asyncio.to_thread(
+                conversation_store.delete_label, child.id, STARTUP_REGISTRATION_LABEL_KEY
+            )
+            inputs = getattr(request.app.state, "startup_inputs", None)
+            host_id = child.host_id or parent.host_id
+            if inputs is not None and host_id is not None:
+                inputs.host_changed(request.app, host_id)
+        return {"status": "registered"}
 
     register_startup_routes(
         router,
@@ -1432,6 +1464,82 @@ def register_core_routes(
             )
         return runner_id, launch_failed
 
+    async def _queue_caller_host_preparation(
+        request: Request,
+        *,
+        user_id: str | None,
+        session_id: str,
+        host_id: str,
+        workspace: str,
+        git: SessionGitOptions | None = None,
+    ) -> None:
+        """Persist a create's host work for the admitted preparation callback."""
+        from omnigent.server.routes._host_launch import resolve_host_launch
+        from omnigent.server.startup_registration import STARTUP_CREATE_PREPARATION_LABEL_KEY
+
+        registry = request.app.state.host_registry
+        try:
+            target = await asyncio.to_thread(
+                resolve_host_launch,
+                user_id=user_id,
+                host_id=host_id,
+                session_id=session_id,
+                host_store=request.app.state.host_store,
+                host_registry=registry,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+            )
+            admission = request.app.state.startup_admission
+            await admission.queue_preparation(
+                target.conn,
+                session_id,
+                {
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "git": git.model_dump(mode="json") if git is not None else None,
+                    "user_id": user_id,
+                    "account_generation": target.conn.account_generation,
+                    "previous_host_id": target.conv.host_id,
+                    "previous_runner_id": target.conv.runner_id,
+                },
+            )
+            await asyncio.to_thread(
+                conversation_store.delete_label,
+                session_id,
+                STARTUP_CREATE_PREPARATION_LABEL_KEY,
+            )
+        except Exception:
+            # No startup record means the new row has never been issued to a
+            # host. Remove it so a refused create cannot return an orphan.
+            startup_store = getattr(request.app.state, "startup_store", None)
+            startup = (
+                await asyncio.to_thread(startup_store.for_session, session_id)
+                if startup_store is not None
+                else None
+            )
+            if (
+                startup_store is not None
+                and startup is not None
+                and startup.state == "queued"
+                and startup.runtime_id is None
+                and await asyncio.to_thread(
+                    startup_store.cancel_unissued, startup.id, startup.attempt_id
+                )
+            ):
+                startup = None
+            if startup is None:
+                if file_store is not None:
+                    blob_keys = await asyncio.to_thread(
+                        file_store.delete_all_for_session, session_id
+                    )
+                    if artifact_store is not None:
+                        for blob_key in blob_keys:
+                            with contextlib.suppress(Exception):
+                                await asyncio.to_thread(artifact_store.delete, blob_key)
+                await conversation_store.delete_conversation(session_id)
+            raise
+        request.app.state.startup_inputs.host_changed(request.app, host_id)
+
     async def _session_init_notify_body(
         conv: Conversation,
         request: Request,
@@ -1720,7 +1828,14 @@ def register_core_routes(
             runner_router,
             conversation=conv,
         )
-        if _rc is not None and conv is not None:
+        if (
+            _rc is not None
+            and conv is not None
+            and not (
+                getattr(request.app.state, "startup_admission", None) is not None
+                and body.parent_session_id is not None
+            )
+        ):
             # Full envelope so the runner seeds the first spawn from
             # current session state; older runners ignore the extra key.
             # ``initial_items`` are already persisted and forwarded by now, so
@@ -1785,7 +1900,16 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
-        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
+        deferred_initial_item = (
+            body.initial_items[0]
+            if getattr(request.app.state, "startup_admission", None) is not None
+            and body.initial_items
+            and (resp.host_id is not None or body.parent_session_id is not None)
+            else None
+        )
+        await _accept_initial_input(
+            request, resp.id, deferred_initial_item or body.initial_input, user_id
+        )
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
         # tens of seconds and must not block the create POST. The
@@ -1820,28 +1944,46 @@ def register_core_routes(
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
         if launch_host_id is not None and resp.runner_id is None:
-            launched = await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=resp.id,
-                host_id=launch_host_id,
-                # Already written by _create_session_from_existing_agent;
-                # only runner_id still needs the atomic set inside.
-                workspace=resp.workspace,
-                # Already canonical (see _resolve_harness).
-                harness=resp.harness,
-                conversation=conv,
-            )
-            if launched is not None:
-                runner_id, launch_failed = launched
-                if launch_failed and _terminal_first_create:
-                    # The runner never booted, so its pending=False clear
-                    # will never fire. Clear the spin-up flag here so a
-                    # failed launch doesn't strand the Terminal-pill
-                    # spinner. No-op when we never set it.
-                    _publish_terminal_pending(resp.id, False)
-                resp.runner_id = runner_id
-                resp.host_id = launch_host_id
+            if getattr(request.app.state, "startup_admission", None) is not None:
+                assert resp.workspace is not None
+                await _queue_caller_host_preparation(
+                    request,
+                    user_id=user_id,
+                    session_id=resp.id,
+                    host_id=launch_host_id,
+                    workspace=resp.workspace,
+                    git=body.git,
+                )
+                from omnigent.server.startup_registration import (
+                    STARTUP_CREATE_PREPARATION_LABEL_KEY,
+                )
+
+                resp.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
+            else:
+                launched = await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=resp.id,
+                    host_id=launch_host_id,
+                    # Already written by _create_session_from_existing_agent;
+                    # only runner_id still needs the atomic set inside.
+                    workspace=resp.workspace,
+                    # Already canonical (see _resolve_harness).
+                    harness=resp.harness,
+                    conversation=conv,
+                )
+                if launched is not None:
+                    runner_id, launch_failed = launched
+                    if launch_failed and _terminal_first_create:
+                        # The runner never booted, so its pending=False clear
+                        # will never fire. Clear the spin-up flag here so a
+                        # failed launch doesn't strand the Terminal-pill
+                        # spinner. No-op when we never set it.
+                        _publish_terminal_pending(resp.id, False)
+                    resp.runner_id = runner_id
+                    resp.host_id = launch_host_id
+        elif deferred_initial_item is not None and resp.host_id is not None:
+            request.app.state.startup_inputs.host_changed(request.app, resp.host_id)
 
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
@@ -1978,6 +2120,38 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
+            if (
+                getattr(request.app.state, "startup_admission", None) is not None
+                and parsed_metadata.host_id is None
+                and parent_conv is not None
+            ):
+                inherited_host_id = effective_host_id(conversation_store, parent_conv)
+                if inherited_host_id is not None:
+                    inherited_fields: dict[str, Any] = {"host_id": inherited_host_id}
+                    if "workspace" not in request_fields_set:
+                        inherited_fields["workspace"] = parent_conv.workspace
+                    parsed_metadata = parsed_metadata.model_copy(update=inherited_fields)
+            if (
+                getattr(request.app.state, "startup_admission", None) is not None
+                and "workspace" in request_fields_set
+            ):
+                # An explicit placement is prepared under a new runner's permit.
+                inherited_runner_id = None
+            from omnigent.server.startup_registration import (
+                STARTUP_REGISTRATION_LABEL_KEY,
+                STARTUP_REGISTRATION_PENDING,
+                registration_pending_for_create,
+            )
+
+            if registration_pending_for_create(request, parent_conv):
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={
+                        "labels": {
+                            **parsed_metadata.labels,
+                            STARTUP_REGISTRATION_LABEL_KEY: STARTUP_REGISTRATION_PENDING,
+                        }
+                    }
+                )
             if "project_id" not in request_fields_set and project_store is not None:
                 parent_project_id = parent_conv.project_id if parent_conv is not None else None
                 if (
@@ -2015,14 +2189,34 @@ def register_core_routes(
                 validate_uploaded_bundle_host_workspace,
             )
 
-            canonical_workspace = await validate_uploaded_bundle_host_workspace(
-                user_id=user_id,
-                host_id=parsed_metadata.host_id,
-                workspace=parsed_metadata.workspace,
-                spec_cwd=spec_cwd,
-                host_store=getattr(request.app.state, "host_store", None),
-                host_registry=getattr(request.app.state, "host_registry", None),
-            )
+            if getattr(request.app.state, "startup_admission", None) is not None:
+                from omnigent.server.routes._session_create_validation import (
+                    _authorize_host_for_workspace,
+                    _require_absolute_host_workspace,
+                )
+
+                canonical_workspace = _require_absolute_host_workspace(parsed_metadata.workspace)
+                registry = getattr(request.app.state, "host_registry", None)
+                if registry is None:
+                    raise OmnigentError(
+                        "host registry is not configured on this server",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    )
+                await _authorize_host_for_workspace(
+                    user_id=user_id,
+                    host_id=parsed_metadata.host_id,
+                    host_store=getattr(request.app.state, "host_store", None),
+                    host_registry=registry,
+                )
+            else:
+                canonical_workspace = await validate_uploaded_bundle_host_workspace(
+                    user_id=user_id,
+                    host_id=parsed_metadata.host_id,
+                    workspace=parsed_metadata.workspace,
+                    spec_cwd=spec_cwd,
+                    host_store=getattr(request.app.state, "host_store", None),
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
 
         # Shared with the JSON create: a child created without an explicit
@@ -2041,7 +2235,11 @@ def register_core_routes(
             parent=inherit_parent,
         )
         bound_branch: str | None = None
-        if inherit_parent is None and parsed_metadata.host_id is not None:
+        if (
+            inherit_parent is None
+            and parsed_metadata.host_id is not None
+            and getattr(request.app.state, "startup_admission", None) is None
+        ):
             from omnigent.server.routes._host_worktree import (
                 WORKTREE_ROOT_LABEL_KEY,
                 existing_linked_worktree,
@@ -2175,16 +2373,28 @@ def register_core_routes(
             else:
                 if member_project is not None:
                     member_project_config = member_project.config
+        member_hosts = await _member_hosts_from_library_agent(
+            template_id=(parsed_metadata.labels or {}).get("omnigent:agent-template-id"),
+            owner=user_id,
+            custom_agents_store=getattr(request.app.state, "custom_agents_store", None),
+        )
+        if getattr(request.app.state, "startup_admission", None) is not None:
+            from omnigent.server.custom_agent_bundles import project_members
+
+            if len(project_members(spec)) >= 2 and (
+                parsed_metadata.host_id is not None or member_hosts
+            ):
+                raise OmnigentError(
+                    "Joint-agent host catalog cannot be read before startup admission; "
+                    "create this session without a host-bound member",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         member_labels = await _member_snapshot_labels(
             spec,
             host_id=parsed_metadata.host_id,
             host_store=getattr(request.app.state, "host_store", None),
             locked=launched_from_library_agent(parsed_metadata.labels),
-            member_hosts=await _member_hosts_from_library_agent(
-                template_id=(parsed_metadata.labels or {}).get("omnigent:agent-template-id"),
-                owner=user_id,
-                custom_agents_store=getattr(request.app.state, "custom_agents_store", None),
-            ),
+            member_hosts=member_hosts,
             project_config=member_project_config,
             master=await load_master(
                 user_id, getattr(request.app.state, "user_preferences_store", None)
@@ -2222,6 +2432,24 @@ def register_core_routes(
                 inherited=inherited_tier,
             )
             parsed_metadata = parsed_metadata.model_copy(update={"permission_tier": tier})
+        if (
+            getattr(request.app.state, "startup_admission", None) is not None
+            and parsed_metadata.host_id is not None
+            and inherited_runner_id is None
+        ):
+            from omnigent.server.startup_registration import (
+                STARTUP_CREATE_PREPARATION_LABEL_KEY,
+                STARTUP_CREATE_PREPARATION_PENDING,
+            )
+
+            parsed_metadata = parsed_metadata.model_copy(
+                update={
+                    "labels": {
+                        **parsed_metadata.labels,
+                        STARTUP_CREATE_PREPARATION_LABEL_KEY: STARTUP_CREATE_PREPARATION_PENDING,
+                    }
+                }
+            )
         # The parent was authorized above; hold its check through the bundle
         # and conversation write, after other request validation completes.
         async with _admit_child_create(
@@ -2255,9 +2483,17 @@ def register_core_routes(
             agent_id=result.agent_id,
             harness=spec_harness(spec),
         )
+        created_conversation = await asyncio.to_thread(
+            conversation_store.get_conversation, result.session_id
+        )
+        if created_conversation is not None:
+            result = result.model_copy(update={"labels": dict(created_conversation.labels or {})})
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
-        if inherited_runner_id is not None:
+        if inherited_runner_id is not None and not (
+            getattr(request.app.state, "startup_admission", None) is not None
+            and parsed_metadata.parent_session_id is not None
+        ):
             # Full session-init envelope, not the legacy id-only body, so the
             # runner stores the global instructions and the rest of the
             # session state the child's terminal launch reads.
@@ -2321,14 +2557,29 @@ def register_core_routes(
             from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
-            await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=result.session_id,
-                host_id=parsed_metadata.host_id,
-                workspace=parsed_metadata.workspace,
-                harness=canonicalize_harness(raw_harness) or raw_harness,
-            )
+            if getattr(request.app.state, "startup_admission", None) is not None:
+                assert parsed_metadata.workspace is not None
+                await _queue_caller_host_preparation(
+                    request,
+                    user_id=user_id,
+                    session_id=result.session_id,
+                    host_id=parsed_metadata.host_id,
+                    workspace=parsed_metadata.workspace,
+                )
+                from omnigent.server.startup_registration import (
+                    STARTUP_CREATE_PREPARATION_LABEL_KEY,
+                )
+
+                result.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
+            else:
+                await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=result.session_id,
+                    host_id=parsed_metadata.host_id,
+                    workspace=parsed_metadata.workspace,
+                    harness=canonicalize_harness(raw_harness) or raw_harness,
+                )
         # Default-public grant only after the launch steps were accepted (see the
         # JSON path). Sub-agent children follow their parent's grants, whether or
         # not they inherited its runner.

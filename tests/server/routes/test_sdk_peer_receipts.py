@@ -84,6 +84,8 @@ def test_sdk_receipt_requires_bound_runner_and_current_attempt(outcome, state):
 @pytest.mark.parametrize(
     "payload",
     [
+        {"type": "message", "data": {"role": "user", "content": [], "startup_attempt": {}}},
+        {"type": "message", "data": {"role": "user", "content": [], "startup_required": False}},
         {"type": "message", "data": {"role": "user", "content": [], "peer_delivery": {}}},
         {"type": "message", "data": {"role": "user", "content": [], "peer_message_id": "a" * 32}},
         {

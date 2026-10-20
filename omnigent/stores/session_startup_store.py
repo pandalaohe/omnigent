@@ -7,6 +7,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
 from omnigent.db.utils import (
@@ -17,6 +18,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities.host_recovery import HostRecoveryPlan
 from omnigent.entities.session_startup import SessionStartupStatus, StartupReceipt
+from omnigent.errors import ErrorCode, OmnigentError
 
 
 @dataclass(frozen=True)
@@ -873,6 +875,7 @@ class SessionStartupStore:
         boundary: str,
         claim_id: str,
         expected_runner_id: str | None = None,
+        account: AccountAuthority | None = None,
     ) -> bool:
         """A lost grant response is ambiguous; never grant the same physical start twice."""
         if boundary not in (
@@ -889,6 +892,12 @@ class SessionStartupStore:
             raise ValueError("Invalid cold startup identity")
 
         def write(db: Session) -> bool:
+            if account is not None:
+                if account.workspace_id != current_workspace_id():
+                    raise OmnigentError(
+                        "account authority has been revoked", code=ErrorCode.UNAUTHORIZED
+                    )
+                require_active_account(db, account.user_id, generation=account.generation)
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             if row is None:
                 return False
@@ -1158,6 +1167,7 @@ class SessionStartupStore:
         vendor_turn_id: str,
         expected_runner_id: str | None = None,
         host_generation: str | None = None,
+        account_authority: AccountAuthority | None = None,
     ) -> bool:
         """Bind vendor identities from the owning adapter before accepting its proof."""
         if not (
@@ -1168,6 +1178,14 @@ class SessionStartupStore:
             raise ValueError("Invalid startup dispatch identity")
 
         def write(db: Session) -> bool:
+            if account_authority is not None:
+                if account_authority.workspace_id != current_workspace_id():
+                    raise OmnigentError(
+                        "account authority has been revoked", code=ErrorCode.UNAUTHORIZED
+                    )
+                require_active_account(
+                    db, account_authority.user_id, generation=account_authority.generation
+                )
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             if row is None:
                 return False
@@ -1260,10 +1278,19 @@ class SessionStartupStore:
         *,
         expected_runner_id: str | None = None,
         host_generation: str | None = None,
+        account_authority: AccountAuthority | None = None,
     ) -> bool:
         """The caller must authenticate the runner/session before supplying a receipt."""
 
         def write(db: Session) -> bool:
+            if account_authority is not None:
+                if account_authority.workspace_id != current_workspace_id():
+                    raise OmnigentError(
+                        "account authority has been revoked", code=ErrorCode.UNAUTHORIZED
+                    )
+                require_active_account(
+                    db, account_authority.user_id, generation=account_authority.generation
+                )
             row = db.get(SqlSessionStartup, (current_workspace_id(), receipt.startup_id))
             if row is None:
                 return False

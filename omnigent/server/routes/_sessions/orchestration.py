@@ -460,11 +460,13 @@ from omnigent.spec.types import (
     Phase,
     PolicyAction,
 )
+from omnigent.startup_protocol import StartupAttemptRef
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
@@ -8638,6 +8640,8 @@ async def _forward_event_to_runner(
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
     startup_input_id: str | None = None,
+    startup_attempt: StartupAttemptRef | None = None,
+    startup_required: bool = False,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8680,7 +8684,23 @@ async def _forward_event_to_runner(
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
     sdk_peer = body.data.get("peer_delivery") is not None
-    if sdk_peer:
+    if startup_attempt is not None:
+        canonical = (
+            await asyncio.to_thread(
+                conversation_store.get_item, session_id, startup_attempt.input_id
+            )
+            if startup_attempt.input_id is not None
+            else None
+        )
+        if (
+            canonical is None
+            or canonical.id != startup_input_id
+            or canonical.response_id != PENDING_INPUT_RESPONSE_ID
+            or canonical.status != "incomplete"
+        ):
+            raise HTTPException(409, "Startup input owner changed")
+        persisted_items = [canonical]
+    elif sdk_peer:
         # The peer store owns undelivered input. Only an SDK accepted receipt
         # may put it in conversation history, where recovery could replay it.
         persisted_items = [
@@ -8800,6 +8820,12 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    runner_body.pop("startup_attempt", None)
+    runner_body.pop("startup_required", None)
+    if startup_required or startup_attempt is not None:
+        runner_body["startup_required"] = True
+    if startup_attempt is not None:
+        runner_body["startup_attempt"] = startup_attempt.model_dump(mode="json")
     if sdk_peer:
         runner_body.pop("persisted_item_id")
     if runner_body["type"] == "message" and runner_body.get("role") == "user":
@@ -9163,7 +9189,7 @@ async def _forward_event_to_runner(
         # status rather than via ``raise_for_status`` so the runner-client fakes
         # that only expose ``status_code`` behave as they do in production.
         if _forward_resp.status_code >= 400:
-            if sdk_peer:
+            if sdk_peer or startup_attempt is not None:
                 raise HTTPException(status_code=502, detail="SDK peer forward has no receipt")
             # The live runner took nothing, so ``idle`` would read as a finished
             # turn that never ran. Persist the reason: the status edge is
@@ -9207,7 +9233,7 @@ async def _forward_event_to_runner(
             )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
-        if not sdk_peer:
+        if not sdk_peer and startup_attempt is None:
             _publish_input_consumed(session_id, persisted_items[0])
         _logger.info(
             "turn dispatched to runner for session=%s",
@@ -9303,7 +9329,7 @@ async def _forward_event_to_runner(
                     attempted_override=_overridden,
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
-        if sdk_peer:
+        if sdk_peer or startup_attempt is not None:
             raise HTTPException(status_code=502, detail="SDK peer forward has no receipt") from exc
         # Transport failure — the runner never answered. The message is already
         # persisted (invariant I1), and a trailing user item is what
@@ -10001,6 +10027,8 @@ async def _dispatch_session_event_to_runner_impl(
         host_store=host_store,
         agent_revision=agent_revision,
         startup_input_id=startup_input.input_id if startup_input is not None else None,
+        startup_attempt=startup_input.startup if startup_input is not None else None,
+        startup_required=host_registry is not None and host_registry.startup_admitter is not None,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -13205,6 +13233,7 @@ async def _create_session_from_existing_agent(
     )
 
     request_fields_set = body.model_fields_set
+    admission_enabled = getattr(request.app.state, "startup_admission", None) is not None
     # The owner-checked project / host lookup feeds a child's calling defaults,
     # so it runs before the resolver; a child naming a workspace takes the
     # project owning that directory instead. The parent row is reused below.
@@ -13212,9 +13241,33 @@ async def _create_session_from_existing_agent(
     parent_project: Project | None = None
     parent_host_id: str | None = None
     if body.parent_session_id is not None:
+        if admission_enabled:
+            await _require_access(
+                user_id,
+                body.parent_session_id,
+                LEVEL_READ,
+                permission_store,
+                conversation_store,
+            )
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
-            parent_host_id = parent_conv.host_id
+            parent_host_id = (
+                effective_host_id(conversation_store, parent_conv)
+                if admission_enabled
+                else parent_conv.host_id
+            )
+            if admission_enabled and parent_host_id is not None:
+                inherited_fields: dict[str, Any] = {}
+                if body.host_id is None:
+                    inherited_fields["host_id"] = parent_host_id
+                if (
+                    "workspace" not in request_fields_set
+                    and body.workspace is None
+                    and body.host_id in (None, parent_host_id)
+                ):
+                    inherited_fields["workspace"] = parent_conv.workspace
+                if inherited_fields:
+                    body = body.model_copy(update=inherited_fields)
             if (
                 "project_id" not in request_fields_set
                 and parent_conv.project_id is not None
@@ -13251,13 +13304,22 @@ async def _create_session_from_existing_agent(
                         pass
                     else:
                         try:
-                            canonical_owning_workspace = await validate_workspace(
-                                host_registry=host_registry,
-                                host_id=owning_host_id,
-                                workspace=body.workspace,
-                                spec_cwd=None,
-                                host_name_for_errors=None,
-                            )
+                            if admission_enabled:
+                                from omnigent.server.routes._session_create_validation import (
+                                    _require_absolute_host_workspace,
+                                )
+
+                                canonical_owning_workspace = _require_absolute_host_workspace(
+                                    body.workspace
+                                )
+                            else:
+                                canonical_owning_workspace = await validate_workspace(
+                                    host_registry=host_registry,
+                                    host_id=owning_host_id,
+                                    workspace=body.workspace,
+                                    spec_cwd=None,
+                                    host_name_for_errors=None,
+                                )
                             owning = await project_owning_workspace(
                                 project_store=project_store,
                                 binding_store=getattr(
@@ -13323,6 +13385,12 @@ async def _create_session_from_existing_agent(
     _native_routing_verdict: dict[str, Any] | None = None
     _native_routing_error: str | None = None
     if _native_smart_routing:
+        if admission_enabled and body.host_id is not None:
+            raise OmnigentError(
+                "Host model catalog cannot be read before startup admission; "
+                "turn off Smart Routing or choose a model",
+                code=ErrorCode.INVALID_INPUT,
+            )
         (
             _routed_agent_name,
             _native_routed_model,
@@ -13376,6 +13444,12 @@ async def _create_session_from_existing_agent(
     _fixed_routing_verdict: dict[str, Any] | None = None
     _fixed_routing_error: str | None = None
     if _fixed_native_harness is not None:
+        if admission_enabled and body.host_id is not None:
+            raise OmnigentError(
+                "Host model catalog cannot be read before startup admission; "
+                "turn off Smart Routing or choose a model",
+                code=ErrorCode.INVALID_INPUT,
+            )
         (
             _fixed_routed_model,
             _fixed_routing_verdict,
@@ -13469,10 +13543,14 @@ async def _create_session_from_existing_agent(
     # children route in their own family instead.
     _force_auto_for_child = False
     _parent_for_routing: Conversation | None = None
+    _registration_pending = False
     if body.parent_session_id is not None:
         _parent_for_routing = await asyncio.to_thread(
             conversation_store.get_conversation, body.parent_session_id
         )
+        from omnigent.server.startup_registration import registration_pending_for_create
+
+        _registration_pending = registration_pending_for_create(request, _parent_for_routing)
         if (
             _parent_for_routing is not None
             and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
@@ -13677,6 +13755,31 @@ async def _create_session_from_existing_agent(
             runner_owner = runner_router.runner_owner(inherited_runner_id)
             if runner_owner is not None and runner_owner != user_id:
                 inherited_runner_id = None
+        if admission_enabled and ("workspace" in request_fields_set or body.git is not None):
+            # A new placement needs admitted host preparation and its own runner.
+            inherited_runner_id = None
+
+    defer_host_preparation = admission_enabled and body.host_id is not None
+    defer_initial_items = admission_enabled and (
+        body.host_id is not None or body.parent_session_id is not None
+    )
+    if defer_initial_items and body.initial_items:
+        from omnigent.server.schemas import SessionStartupInput
+
+        if len(body.initial_items) != 1:
+            raise OmnigentError(
+                "Queued session create accepts one initial user input",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            SessionStartupInput.model_validate(body.initial_items[0].model_dump())
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if body.host_id is None:
+            raise OmnigentError(
+                "Queued child input requires a host binding",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     registry_labels: dict[str, str] = {}
     if body.mcp_registry_services:
@@ -13699,14 +13802,37 @@ async def _create_session_from_existing_agent(
     # Validate the host workspace before creating a session or worktree.
     canonical_workspace: str | None = body.workspace
     if body.host_id is not None:
-        canonical_workspace = await _validate_session_workspace(
-            user_id=user_id,
-            host_id=body.host_id,
-            workspace=body.workspace,
-            agent=agent,
-            agent_cache=agent_cache,
-            request=request,
-        )
+        if defer_host_preparation:
+            from omnigent.server.routes._session_create_validation import (
+                _require_absolute_host_workspace,
+            )
+
+            canonical_workspace = _require_absolute_host_workspace(body.workspace)
+            if agent_cache is None:
+                raise OmnigentError(
+                    "workspace validation requires an agent cache",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            if getattr(request.app.state, "host_registry", None) is None:
+                raise OmnigentError(
+                    "host registry is not configured on this server",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            await _authorize_host_for_workspace(
+                user_id=user_id,
+                host_id=body.host_id,
+                host_store=getattr(request.app.state, "host_store", None),
+                host_registry=request.app.state.host_registry,
+            )
+        else:
+            canonical_workspace = await _validate_session_workspace(
+                user_id=user_id,
+                host_id=body.host_id,
+                workspace=body.workspace,
+                agent=agent,
+                agent_cache=agent_cache,
+                request=request,
+            )
 
     from omnigent.server.routes._session_harness_readiness import (
         validate_create_harness_readiness,
@@ -13760,7 +13886,14 @@ async def _create_session_from_existing_agent(
     # Canonical root of a just-created worktree, recorded as the session
     # worktree; ``None`` unless Omnigent created one above.
     canonical_worktree_root: str | None = None
-    if body.git is not None:
+    if body.git is not None and defer_host_preparation:
+        from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+
+        try:
+            validate_branch_name(body.git.branch_name)
+        except WorktreeError as exc:
+            raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+    elif body.git is not None:
         if body.git.existing_worktree:
             # Starting in a pre-existing worktree: no worktree is created, but
             # record its branch so the sidebar shows it and the opt-in delete
@@ -13907,7 +14040,12 @@ async def _create_session_from_existing_agent(
     ):
         inherit_parent = parent_conv
 
-    if body.git is None and inherit_parent is None and body.host_id is not None:
+    if (
+        body.git is None
+        and inherit_parent is None
+        and body.host_id is not None
+        and not defer_host_preparation
+    ):
         from omnigent.server.routes._host_worktree import (
             existing_linked_worktree,
             refresh_worktree_admission_fence,
@@ -13932,7 +14070,7 @@ async def _create_session_from_existing_agent(
 
     workspace, worktree = _place_project_session(
         target=canonical_workspace,
-        git_used=body.git is not None or git_branch is not None,
+        git_used=(body.git is not None and not defer_host_preparation) or git_branch is not None,
         parent=inherit_parent,
         worktree_root=canonical_worktree_root,
     )
@@ -14094,6 +14232,20 @@ async def _create_session_from_existing_agent(
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
     initial_labels.update(registry_labels)
+    if defer_host_preparation and inherited_runner_id is None:
+        from omnigent.server.startup_registration import (
+            STARTUP_CREATE_PREPARATION_LABEL_KEY,
+            STARTUP_CREATE_PREPARATION_PENDING,
+        )
+
+        initial_labels[STARTUP_CREATE_PREPARATION_LABEL_KEY] = STARTUP_CREATE_PREPARATION_PENDING
+    if body.parent_session_id is not None and _registration_pending:
+        from omnigent.server.startup_registration import (
+            STARTUP_REGISTRATION_LABEL_KEY,
+            STARTUP_REGISTRATION_PENDING,
+        )
+
+        initial_labels[STARTUP_REGISTRATION_LABEL_KEY] = STARTUP_REGISTRATION_PENDING
     if canonical_worktree_root is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
@@ -14409,7 +14561,7 @@ async def _create_session_from_existing_agent(
     except Exception:  # noqa: BLE001
         pass
 
-    if body.initial_items:
+    if body.initial_items and not defer_initial_items:
         runner_client = await _get_runner_client(
             conv.id,
             runner_router,

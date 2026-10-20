@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
@@ -33,6 +33,7 @@ from omnigent.server.permission_tiers import (
     legacy_permission_tier,
 )
 from omnigent.server.project_placement import project_code_locations
+from omnigent.startup_protocol import StartupAttemptRef
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -137,6 +138,8 @@ _SessionInitKey = tuple[
     str | None,
     str | None,
     str | None,
+    bool,
+    StartupAttemptRef | None,
 ]
 _BODY_SNIPPET_MAX = 500
 
@@ -194,6 +197,12 @@ class RunnerSessionInitializer:
         server_version: str,
         peer_messaging_enabled: bool = False,
         peer_messaging_resolver: Callable[[Conversation], bool] | None = None,
+        startup_control_resolver: (
+            Callable[[Conversation], tuple[bool, StartupAttemptRef | None]] | None
+        ) = None,
+        startup_recovery_resolver: (
+            Callable[[Conversation], Awaitable[StartupAttemptRef | None]] | None
+        ) = None,
         quota_resolver: Callable[[Conversation], str] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
@@ -206,6 +215,8 @@ class RunnerSessionInitializer:
         self._server_version = server_version
         self._peer_messaging_enabled = peer_messaging_enabled
         self._peer_messaging_resolver = peer_messaging_resolver
+        self._startup_control_resolver = startup_control_resolver
+        self._startup_recovery_resolver = startup_recovery_resolver
         self._quota_resolver = quota_resolver
         self._conversation_store = conversation_store
         self._file_store = file_store
@@ -227,6 +238,14 @@ class RunnerSessionInitializer:
             tuple[str, int, str],
             tuple[asyncio.Task[httpx.Response], bool],
         ] = {}
+
+    def _startup_control(
+        self, conversation: Conversation
+    ) -> tuple[bool, StartupAttemptRef | None]:
+        if self._startup_control_resolver is None:
+            return False, None
+        required, attempt = self._startup_control_resolver(conversation)
+        return required, attempt if required else None
 
     async def resolve_peer_messaging(self, conversation: Conversation) -> bool:
         """Resolve the peer-messaging snapshot for one session.
@@ -354,6 +373,7 @@ class RunnerSessionInitializer:
         )
         state = runner_archive_state(conversation)
         current_archive = (state.scope_id, state.revision, state.archived)
+        startup_control = self._startup_control(conversation)
         for key, task in self._tasks.items():
             if (
                 key[:5] != session_key
@@ -364,6 +384,7 @@ class RunnerSessionInitializer:
                     conversation.labels.get(PERMISSION_RUNTIME_ID_LABEL_KEY),
                     conversation.host_id,
                     conversation.worktree or conversation.workspace,
+                    *startup_control,
                 )
             ):
                 continue
@@ -401,6 +422,7 @@ class RunnerSessionInitializer:
         conversation = await self._migrate_legacy_permission_state(
             conversation, store_slots=store_slots
         )
+        startup_control = self._startup_control(conversation)
         async with store_slots or nullcontext():
             peer = await self.resolve_peer_messaging(conversation)
         pkey = (runner_id, generation, conversation.id)
@@ -438,6 +460,7 @@ class RunnerSessionInitializer:
             conversation.labels.get(PERMISSION_RUNTIME_ID_LABEL_KEY),
             conversation.host_id,
             conversation.worktree or conversation.workspace,
+            *startup_control,
         )
         task = self._tasks.get(key)
         if (
@@ -729,7 +752,7 @@ class RunnerSessionInitializer:
             self.require_generation(runner_id, runner_client, generation)
             response = await self._post_initialize(
                 runner_client,
-                session_id=conversation.id,
+                conversation=conversation,
                 runner_id=runner_id,
                 payload=payload,
                 timeout=timeout,
@@ -756,7 +779,7 @@ class RunnerSessionInitializer:
                 )
                 response = await self._post_initialize(
                     runner_client,
-                    session_id=refreshed.id,
+                    conversation=refreshed,
                     runner_id=runner_id,
                     payload=refreshed_payload,
                     timeout=timeout,
@@ -891,7 +914,7 @@ class RunnerSessionInitializer:
         self,
         runner_client: httpx.AsyncClient,
         *,
-        session_id: str,
+        conversation: Conversation,
         runner_id: str,
         payload: dict[str, object],
         timeout: float,
@@ -900,6 +923,7 @@ class RunnerSessionInitializer:
         recovery_id: str | None,
         generation: int,
     ) -> httpx.Response:
+        session_id = conversation.id
         with runner_log_scope(session_id, runner_id):
             # The flags name the caller: neither set is the tunnel-reconnect
             # hook, resume is a sub-agent restore, suppress is a message forward.
@@ -914,6 +938,13 @@ class RunnerSessionInitializer:
                 ),
             )
             try:
+                required, attempt = self._startup_control(conversation)
+                if required and attempt is None and self._startup_recovery_resolver is not None:
+                    attempt = await self._startup_recovery_resolver(conversation)
+                if required:
+                    payload["startup_required"] = True
+                    if attempt is not None:
+                        payload["startup_attempt"] = attempt.model_dump()
                 response = await runner_client.post(
                     "/v1/sessions",
                     json=payload,

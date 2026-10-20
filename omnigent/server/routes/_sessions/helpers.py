@@ -11619,6 +11619,24 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.server.startup_registration import (
+        STARTUP_CREATE_PREPARATION_LABEL_KEY,
+        STARTUP_REGISTRATION_LABEL_KEY,
+    )
+
+    reserved_startup_key = next(
+        (
+            key
+            for key in (STARTUP_REGISTRATION_LABEL_KEY, STARTUP_CREATE_PREPARATION_LABEL_KEY)
+            if key in labels
+        ),
+        None,
+    )
+    if reserved_startup_key is not None:
+        raise OmnigentError(
+            f"label {reserved_startup_key!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     from omnigent.server.permission_tiers import is_permission_label_key
 
     permission_key = next((key for key in labels if is_permission_label_key(key)), None)

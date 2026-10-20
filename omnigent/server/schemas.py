@@ -2225,6 +2225,7 @@ class CreatedSessionResponse(BaseModel):
     agent_name: str
     project_id: str | None = None
     worktree: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
 
 
 class SessionLabelsResponse(BaseModel):

@@ -2,11 +2,15 @@
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
+from omnigent.entities import Conversation
 from omnigent.runner import create_runner_app
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
 from tests.runner.conftest import (
@@ -258,6 +262,32 @@ async def test_failed_receipt_can_be_requeried_only_for_current_attempt():
         assert cached.json() == {
             "observations": [observation.model_copy(update={"reason": None}).model_dump()]
         }
+        # A reconnect init has no dispatch ContextVar. Its verified saved ref
+        # must preserve already observed proof instead of resetting the cache.
+        client.headers.update(headers)
+        initializer = RunnerSessionInitializer(
+            TunnelRegistry(),
+            server_version="0.6.0.dev0",
+            startup_control_resolver=lambda _conversation: (True, None),
+            startup_recovery_resolver=AsyncMock(return_value=ref),
+        )
+        initialized = await initializer.initialize(
+            Conversation(
+                id=SESSION,
+                agent_id=AGENT,
+                runner_id="runner",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id=SESSION,
+                workspace="/Users/sample/project",
+            ),
+            client,
+            timeout=2,
+        )
+        assert initialized.status_code == 201
+        assert (
+            await client.post(route, json=ref.model_dump(), headers=headers)
+        ).json() == cached.json()
         next_ref = ref.model_copy(update={"attempt_id": "d" * 32})
         app.state.startup_admission.register(SESSION, next_ref)
         assert (

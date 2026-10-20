@@ -39,6 +39,8 @@ from omnigent.server.runner_session_init import (
     runner_archive_states_for_conversation,
     runner_permission_verified,
 )
+from omnigent.server.startup_admission import _dispatch, active_startup_attempt
+from omnigent.startup_protocol import StartupAttemptRef
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
     ARTIFACT_LINK_KEY_LABEL,
@@ -159,6 +161,179 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     conversation.agent_id = "agent_init"
     conversation.sub_agent_name = "different_child"
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_initialization_recovers_a_verified_attempt_without_dispatch_scope():
+    registry, client = _Registry(), _Client()
+    client.release.set()
+    attempt = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="runtime",
+        host_generation="generation",
+    )
+    recovery = AsyncMock(return_value=attempt)
+    initializer = RunnerSessionInitializer(
+        registry,
+        server_version="0.6.0.dev0",
+        startup_control_resolver=lambda _conversation: (True, None),
+        startup_recovery_resolver=recovery,
+    )
+    conversation = _conversation()
+    await initializer.initialize(conversation, client, timeout=10)
+    assert client.calls[0]["startup_attempt"] == attempt.model_dump()
+    recovery.assert_awaited_once_with(conversation)
+
+
+@pytest.mark.asyncio
+async def test_initializer_reposts_when_startup_attempt_changes() -> None:
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    attempt = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="runtime",
+        host_generation="generation",
+    )
+    control: list[tuple[bool, StartupAttemptRef | None]] = [(False, None)]
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+        startup_control_resolver=lambda _conversation: control[0],
+    )
+    conversation = _conversation()
+
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert "startup_required" not in client.calls[0]
+    assert "startup_attempt" not in client.calls[0]
+    assert initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+
+    control[0] = (True, None)
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert client.calls[1]["startup_required"] is True
+    assert "startup_attempt" not in client.calls[1]
+    assert len(client.calls) == 2
+
+    control[0] = (True, attempt)
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert client.calls[2]["startup_required"] is True
+    assert client.calls[2]["startup_attempt"] == attempt.model_dump()
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 3
+
+    next_attempt = attempt.model_copy(update={"attempt_id": "c" * 32})
+    control[0] = (True, next_attempt)
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert client.calls[3]["startup_attempt"] == next_attempt.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_initializer_rechecks_startup_control_before_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server import runner_session_init
+
+    client = _Client()
+    client.release.set()
+    control: list[tuple[bool, StartupAttemptRef | None]] = [(True, None)]
+    attempt = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="runtime",
+        host_generation="generation",
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = runner_session_init.session_instructions_text
+
+    async def pause_instructions(*args: Any, **kwargs: Any) -> str:
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_session_init, "session_instructions_text", pause_instructions)
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(),
+        server_version="0.6.0.dev0",
+        startup_control_resolver=lambda _conversation: control[0],
+    )
+    conversation = _conversation()
+    pending = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    await entered.wait()
+    control[0] = (True, attempt)
+    release.set()
+    await pending
+
+    assert client.calls[0]["startup_attempt"] == attempt.model_dump()
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_initializer_permission_epoch_retry_preserves_startup_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _Registry()
+
+    class EpochClient(_Client):
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            response = await super().post(path, **kwargs)
+            if len(self.calls) == 1:
+                return httpx.Response(409, json={"error": "permission_tier_epoch_changed"})
+            return response
+
+    client = EpochClient()
+    client.release.set()
+    attempt = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="runtime",
+        host_generation="generation",
+    )
+    conversation = _conversation()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+        startup_control_resolver=lambda _conversation: (True, attempt),
+    )
+    monkeypatch.setattr(
+        initializer,
+        "_advance_permission_epoch",
+        AsyncMock(return_value=dataclasses.replace(conversation)),
+    )
+
+    response = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert response.status_code == 201
+    assert len(client.calls) == 2
+    assert [call["startup_attempt"] for call in client.calls] == [
+        attempt.model_dump(),
+        attempt.model_dump(),
+    ]
+
+
+def test_active_startup_attempt_is_scoped_to_exact_session() -> None:
+    attempt = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="runtime",
+        host_generation="generation",
+    )
+    token = _dispatch.set(("parent", attempt))
+    try:
+        assert active_startup_attempt("parent") == attempt
+        assert active_startup_attempt("child") is None
+    finally:
+        _dispatch.reset(token)
 
 
 @pytest.mark.asyncio

@@ -4,14 +4,15 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException, Request
 
+from omnigent.db.account_authority import AccountAuthority
 from omnigent.entities.session_startup import SessionStartupStatus
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import session_stream
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.schemas import CancelStartupRequest, SessionStartupEvent
-from omnigent.server.startup_inputs import reconcile_accepted_startup_input
+from omnigent.server.startup_observations import accept_observation
 from omnigent.startup_protocol import StartupBoundaryClaim, StartupObservation
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -58,6 +59,11 @@ def register_startup_routes(
             or hosts.launch_authorizer is None
         ):
             return {"granted": False}
+        account = (
+            AccountAuthority(conn.owner, conn.account_generation, conn.workspace_id)
+            if conn.owner is not None
+            else None
+        )
         try:
             await hosts.authorize_launch(conn, session_id)
         except (OmnigentError, HTTPException):
@@ -71,16 +77,22 @@ def register_startup_routes(
             or conv_after.runner_id != conv.runner_id
         ):
             return {"granted": False}
-        granted = await asyncio.to_thread(
-            store.claim_boundary,
-            current.id,
-            body.attempt.attempt_id,
-            runtime_id=body.attempt.runtime_id,
-            host_generation=body.attempt.host_generation,
-            boundary=body.boundary,
-            claim_id=body.claim_id,
-            expected_runner_id=conv.runner_id,
-        )
+        try:
+            granted = await asyncio.to_thread(
+                store.claim_boundary,
+                current.id,
+                body.attempt.attempt_id,
+                runtime_id=body.attempt.runtime_id,
+                host_generation=body.attempt.host_generation,
+                boundary=body.boundary,
+                claim_id=body.claim_id,
+                expected_runner_id=conv.runner_id,
+                account=account,
+            )
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.UNAUTHORIZED:
+                return {"granted": False}
+            raise
         return {"granted": granted and hosts.get(current.host_id) is conn}
 
     @router.post("/sessions/{session_id}/startup/receipts", include_in_schema=False)
@@ -96,64 +108,11 @@ def register_startup_routes(
             or token_bound_runner_id(token) != conv.runner_id
         ):
             raise HTTPException(403, "Startup receipts require the bound runner")
-        store: SessionStartupStore | None = getattr(request.app.state, "startup_store", None)
-        hosts = getattr(request.app.state, "host_registry", None)
-        conn = hosts.get(conv.host_id) if hosts is not None and conv.host_id else None
-        current = await asyncio.to_thread(store.get, body.attempt.startup_id) if store else None
-        if (
-            store is None
-            or conn is None
-            or current is None
-            or conv.archived
-            or current.session_id != session_id
-            or current.host_id != conv.host_id
-            or current.attempt_id != body.attempt.attempt_id
-            or current.runtime_id != body.attempt.runtime_id
-            or current.input_id != body.attempt.input_id
-            or conn.startup_generation != body.attempt.host_generation
-            or "startup_admission_v1" not in conn.hello.capabilities
-            or (
-                body.source != "runner"
-                and f"startup_receipts:{body.source}" not in conn.hello.capabilities
+        return {
+            "accepted": await accept_observation(
+                request.app, conversation_store, session_id, conv.runner_id, body
             )
-        ):
-            return {"accepted": False}
-        if body.phase in ("input_accepted", "work_started"):
-            assert body.vendor_session_id and body.vendor_turn_id
-            await asyncio.to_thread(
-                store.bind_dispatch,
-                current.id,
-                body.attempt.attempt_id,
-                runtime_id=body.attempt.runtime_id,
-                source=body.source,
-                vendor_session_id=body.vendor_session_id,
-                vendor_turn_id=body.vendor_turn_id,
-                expected_runner_id=conv.runner_id,
-                host_generation=body.attempt.host_generation,
-            )
-        accepted = await asyncio.to_thread(
-            store.observe,
-            body.receipt(),
-            expected_runner_id=conv.runner_id,
-            host_generation=body.attempt.host_generation,
-        )
-        if accepted:
-            confirmed = await asyncio.to_thread(store.get, current.id)
-            if confirmed is not None:
-                await reconcile_accepted_startup_input(conversation_store, confirmed)
-            status = await asyncio.to_thread(store.presentation, session_id)
-            session_stream.publish(
-                session_id,
-                SessionStartupEvent(
-                    type="session.startup",
-                    conversation_id=session_id,
-                    startup=status,
-                ).model_dump(),
-            )
-            admission = getattr(request.app.state, "startup_admission", None)
-            if admission is not None:
-                await admission.coordinator.advance(current.host_id)
-        return {"accepted": accepted}
+        }
 
     @router.post(
         "/sessions/{session_id}/startup/cancel",
