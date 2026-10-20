@@ -15,6 +15,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.entities.session_startup import StartupReceipt
 
 
 @dataclass(frozen=True)
@@ -144,7 +145,14 @@ class SessionStartupStore:
                         scope,
                         predicate,
                         SqlSessionStartup.state.in_(
-                            ("queued", "starting", "verifying", "uncertain", "cancelling")
+                            (
+                                "queued",
+                                "starting",
+                                "verifying",
+                                "uncertain",
+                                "blocked",
+                                "cancelling",
+                            )
                         ),
                     )
                 )
@@ -269,12 +277,14 @@ class SessionStartupStore:
             if (
                 host.fenced
                 or row.cancel_requested
+                or row.state == "blocked"
                 or row.attempt_id != attempt_id
                 or not row.occupied
                 or row.runtime_id not in (None, runtime_id)
             ):
                 return False
-            row.runtime_id, row.state, row.updated_at = runtime_id, "verifying", now_epoch()
+            if row.runtime_id is None:
+                row.runtime_id, row.state, row.updated_at = runtime_id, "verifying", now_epoch()
             return True
 
         return run_write_transaction(self._session, "claim_startup", write)
@@ -310,3 +320,97 @@ class SessionStartupStore:
             return True
 
         return run_write_transaction(self._session, "settle_stopped_startup", write)
+
+    def bind_dispatch(
+        self,
+        startup_id: str,
+        attempt_id: str,
+        *,
+        runtime_id: str,
+        source: str,
+        vendor_session_id: str,
+        vendor_turn_id: str,
+    ) -> bool:
+        """Bind vendor identities from the owning adapter before accepting its proof."""
+        if not (
+            0 < len(source) <= 64
+            and 0 < len(vendor_session_id) <= 256
+            and 0 < len(vendor_turn_id) <= 256
+        ):
+            raise ValueError("Invalid startup dispatch identity")
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if (
+                not row.occupied
+                or row.cancel_requested
+                or row.state == "blocked"
+                or row.attempt_id != attempt_id
+                or row.runtime_id != runtime_id
+                or row.input_id is None
+            ):
+                return False
+            identity = (source, vendor_session_id, vendor_turn_id)
+            if row.proof_source is not None:
+                return (row.proof_source, row.vendor_session_id, row.vendor_turn_id) == identity
+            row.proof_source, row.vendor_session_id, row.vendor_turn_id = identity
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "bind_startup_dispatch", write)
+
+    def observe(self, receipt: StartupReceipt) -> bool:
+        """The caller must authenticate the runner/session before supplying a receipt."""
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), receipt.startup_id))
+            if row is None:
+                return False
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if (
+                row.attempt_id != receipt.attempt_id
+                or row.runtime_id != receipt.runtime_id
+                or row.input_id != receipt.input_id
+            ):
+                return False
+            if receipt.phase == "stopped":
+                row.occupied = row.resident = False
+                row.state = "cancelled" if row.cancel_requested else "stopped"
+                row.updated_at = now_epoch()
+                return True
+            if row.cancel_requested:
+                return False
+            if receipt.phase in ("input_accepted", "work_started"):
+                if row.proof_source is None or (
+                    row.proof_source,
+                    row.vendor_session_id,
+                    row.vendor_turn_id,
+                ) != (receipt.source, receipt.vendor_session_id, receipt.vendor_turn_id):
+                    return False
+            elif receipt.source not in ("runner", row.proof_source):
+                return False
+            if not row.occupied:
+                return row.state in ("working", "ready_empty") and receipt.phase in (
+                    "runtime_ready",
+                    "tools_ready",
+                    "input_accepted",
+                    "work_started",
+                )
+            if receipt.phase in ("blocked", "uncertain") and row.state != "blocked":
+                row.state, row.reason = receipt.phase, receipt.reason
+            elif receipt.phase not in ("blocked", "uncertain"):
+                setattr(row, receipt.phase, True)
+                if row.state != "blocked" and row.runtime_ready and row.tools_ready:
+                    if row.input_id is None:
+                        row.state, row.occupied, row.reason = "ready_empty", False, None
+                    elif row.input_accepted and row.work_started:
+                        row.state, row.occupied, row.reason = "working", False, None
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "observe_startup_receipt", write)
