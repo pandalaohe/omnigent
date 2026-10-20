@@ -333,6 +333,13 @@ class SessionStatusPoller:
         self._resync_requested = False
 
     @property
+    def background_task_count(self) -> int | None:
+        """The readable file's authoritative shell-finished zero, when present."""
+        if not self.active or self._last_status is None:
+            return None
+        return 0 if self._last_status.raw_status == "idle" else None
+
+    @property
     def active(self) -> bool:
         """Whether a resolved file is still being read.
 

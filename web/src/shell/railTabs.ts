@@ -9,7 +9,14 @@
  *  tab is selected), not fixed nav tabs — the nav strip renders the first four.
  *  "github" is a stable stored id for the Pull Requests tab; renaming it drops saved choices. */
 export type RightRailTab =
-  "files" | "changes" | "github" | "subagents" | "archive" | "browser" | "sidechat";
+  | "files"
+  | "changes"
+  | "github"
+  | "subagents"
+  | "archive"
+  | "browser"
+  | "sidechat"
+  | "content-search";
 
 /**
  * Count/status badge geometry. Fixed height with min-width == height keeps a

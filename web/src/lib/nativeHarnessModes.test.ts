@@ -7,6 +7,7 @@ import {
   normalizeAgyPermissionTier,
   CODEX_NATIVE_APPROVAL_MODES,
   permissionModeConcept,
+  canonicalNativeHarness,
 } from "./nativeHarnessModes";
 import { CODEX_APPROVAL_PRESETS, CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS } from "./codexApprovalMode";
 import { sdkPermissionOptions } from "./sdkPermissionModes";
@@ -54,6 +55,13 @@ describe("permissionModeConcept", () => {
   it("supports native harness aliases", () => {
     expect(permissionModeConcept("native-codex", "read-only")).toBe("read-only");
     expect(permissionModeConcept("native-agy", "skip")).toBe("full-access");
+  });
+
+  it("canonicalizes reversed native harness aliases", () => {
+    expect(canonicalNativeHarness("native-claude")).toBe("claude-native");
+    expect(canonicalNativeHarness("native-codex")).toBe("codex-native");
+    expect(canonicalNativeHarness("native-pi")).toBe("pi-native");
+    expect(canonicalNativeHarness("opencode-native")).toBe("opencode-native");
   });
 
   it("falls back safely for missing or future values", () => {

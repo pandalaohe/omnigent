@@ -113,16 +113,16 @@ describe("keyboardShortcutPreferences", () => {
 
   it("matches default primary shortcuts only on the selected platform", () => {
     const commandN = new KeyboardEvent("keydown", {
-      code: "KeyN",
-      key: "n",
+      code: "KeyO",
+      key: "O",
       metaKey: true,
-      altKey: true,
+      shiftKey: true,
     });
     const controlN = new KeyboardEvent("keydown", {
-      code: "KeyN",
-      key: "n",
+      code: "KeyO",
+      key: "O",
       ctrlKey: true,
-      altKey: true,
+      shiftKey: true,
     });
 
     expect(eventMatchesShortcutAction(commandN, "newSession", "macos")).toBe(true);
@@ -215,6 +215,7 @@ describe("keyboardShortcutPreferences", () => {
       ["selectWorkspaceTab4", []],
       ["newBrowserTab", [{ code: "KeyB", modifiers: ["primary", "alt"] }]],
       ["newShell", [{ code: "KeyT", modifiers: ["primary", "alt"] }]],
+      ["searchWorkspaceContents", [{ code: "KeyF", modifiers: ["primary", "shift"] }]],
       ["toggleAnnotationMode", [{ code: "Period", modifiers: ["primary", "shift"] }]],
     ];
 
@@ -237,7 +238,7 @@ describe("keyboardShortcutPreferences", () => {
 
   it("registers the question-card action defaults", () => {
     const expected: [ShortcutActionId, ShortcutChord[]][] = [
-      ["focusQuestionCard", [{ code: "KeyF", modifiers: ["control", "shift"] }]],
+      ["focusQuestionCard", [{ code: "KeyG", modifiers: ["alt", "shift"] }]],
       ["questionCardPreviousOption", [{ code: "ArrowUp", modifiers: [] }]],
       ["questionCardNextOption", [{ code: "ArrowDown", modifiers: [] }]],
       ["questionCardSelectOption", [{ code: "Space", modifiers: [] }]],
@@ -254,8 +255,13 @@ describe("keyboardShortcutPreferences", () => {
       expect(DEFAULT_SHORTCUT_DEFINITIONS[actionId].scope).toBe(
         actionId === "focusQuestionCard" ? "global" : "questionCard",
       );
-      expect(resolveShortcutBindings(actionId, "macos")).toEqual(bindings);
+      expect(resolveShortcutBindings(actionId, "macos")).toEqual(
+        actionId === "focusQuestionCard"
+          ? [{ code: "KeyG", modifiers: ["meta", "shift"] }]
+          : bindings,
+      );
       expect(resolveShortcutBindings(actionId, "windows")).toEqual(bindings);
+      expect(resolveShortcutBindings(actionId, "linux")).toEqual(bindings);
     }
   });
 
@@ -283,7 +289,7 @@ describe("keyboardShortcutPreferences", () => {
   it("still rejects card collisions with globals and other card actions", () => {
     expect(
       findShortcutConflicts("questionCardSelectOption", [
-        { code: "KeyN", modifiers: ["primary", "alt"] },
+        { code: "KeyO", modifiers: ["primary", "shift"] },
       ]),
     ).toContain("newSession");
     // Recording ⌘K for a card action collides with the command palette.
@@ -341,7 +347,9 @@ describe("keyboardShortcutPreferences", () => {
       for (const actionId of SHORTCUT_ACTION_IDS) {
         for (const platform of ALL_PLATFORMS) {
           expect(resolveShortcutBindings(actionId, platform)).toEqual(
-            DEFAULT_SHORTCUT_DEFINITIONS[actionId].defaultBindings,
+            actionId === "focusQuestionCard" && platform === "macos"
+              ? [{ code: "KeyG", modifiers: ["meta", "shift"] }]
+              : DEFAULT_SHORTCUT_DEFINITIONS[actionId].defaultBindings,
           );
         }
       }
@@ -371,7 +379,7 @@ describe("keyboardShortcutPreferences", () => {
         { code: "Enter", modifiers: ["alt"] },
       ]);
       expect(resolveShortcutBindings("newSession", "macos")).toEqual([
-        { code: "KeyN", modifiers: ["control", "meta"] },
+        { code: "KeyO", modifiers: ["control", "shift"] },
       ]);
       expect(resolveShortcutBindings("pinnedSession", "macos")).toEqual([
         { code: "Digit*", modifiers: ["control", "meta"] },
@@ -396,7 +404,7 @@ describe("keyboardShortcutPreferences", () => {
       ).toEqual(["⌘", "~"]);
       expect(
         shortcutBindingLabels(resolveShortcutBindings("newSession", "macos")[0], "macos"),
-      ).toEqual(["⌃", "⌘", "N"]);
+      ).toEqual(["⌃", "⇧", "O"]);
     });
 
     it("leaves Windows and Linux defaults unchanged while enabled", () => {

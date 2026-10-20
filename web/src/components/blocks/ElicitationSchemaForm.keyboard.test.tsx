@@ -58,7 +58,7 @@ function card(): HTMLElement {
 
 function enterCard(): void {
   screen.getByTestId("composer").focus();
-  fireEvent.keyDown(window, { key: "F", code: "KeyF", ctrlKey: true, shiftKey: true });
+  fireEvent.keyDown(window, { key: "G", code: "KeyG", altKey: true, shiftKey: true });
 }
 
 function answerRequiredFields(): void {

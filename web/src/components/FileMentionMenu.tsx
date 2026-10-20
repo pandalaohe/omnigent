@@ -61,7 +61,10 @@ export function FileMentionMenu({
 
   return (
     <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
-      <div className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu">
+      <div
+        data-testid="file-mention-menu"
+        className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      >
         {/* One scroll container over both sections so the arrow-keyed row —
             member or file — is scrolled into view either way. */}
         <div ref={listRef} className="max-h-80 overflow-y-auto">

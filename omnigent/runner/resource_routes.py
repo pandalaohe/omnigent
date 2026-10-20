@@ -180,6 +180,7 @@ def register_resource_routes(
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock],
+    _rebind_claude_bridge: Callable[[str, str], Coroutine[Any, Any, None]],
     _record_session_claude_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None],
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock],
     _repop_pending_cost_popup_on_attach: Callable[[str, str, str], Coroutine[Any, Any, None]],
@@ -492,6 +493,7 @@ def register_resource_routes(
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
                 session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
+                rebind_bridge=_rebind_claude_bridge,
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
@@ -1135,6 +1137,26 @@ def register_resource_routes(
             before=before,
             order=order,
         )
+
+    @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search")
+    async def search_environment_content(
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
+        case_sensitive: bool = False,
+        regex: bool = False,
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> JSONResponse:
+        """Search live file contents inside the session's environment."""
+        from omnigent.runner.content_search import search_content
+
+        agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        result = await search_content(
+            env, q, case_sensitive=case_sensitive, regex=regex, limit=limit
+        )
+        return JSONResponse(result)
 
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/search")
     async def search_environment_files(

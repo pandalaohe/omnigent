@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.harnesses.claude_native import forwarder
 
 
 @pytest.fixture(autouse=True)
@@ -48,3 +48,17 @@ def _isolate_auto_compact_window(monkeypatch: pytest.MonkeyPatch) -> None:
     :returns: None.
     """
     monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_forward_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Start each test with healthy process-wide forward-sync tracking.
+
+    A test that leaves sync degraded would otherwise make the next test's
+    first delivery log a stray recovery line.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(forwarder, "_forward_health", forwarder._ForwardHealth())

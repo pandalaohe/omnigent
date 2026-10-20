@@ -30,6 +30,8 @@ import {
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   currentShortcutPlatform,
@@ -111,6 +113,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Toggle conversations sidebar", keys: [], actionId: "toggleConversationsSidebar" },
       { label: "Focus or close workspace sidebar", keys: [], actionId: "toggleWorkspaceSidebar" },
       { label: "Toggle annotation mode", keys: [], actionId: "toggleAnnotationMode" },
+      { label: "Search workspace contents", keys: [], actionId: "searchWorkspaceContents" },
       {
         label: "Select a workspace tab",
         keys: [],
@@ -169,6 +172,7 @@ function shortcutGroupsFor(
   browser: boolean,
   submitWithModEnter: boolean,
   preventsKeyboardSubmit: boolean,
+  contentSearch: boolean,
 ): ShortcutGroup[] {
   return SHORTCUT_GROUPS.map((group) => {
     if (group.title === "In chats" && !preventsKeyboardSubmit) {
@@ -242,10 +246,17 @@ function shortcutGroupsFor(
       return {
         ...group,
         items: group.items
-          .filter((item) => browser || item.label !== "Open a new browser tab")
+          .filter(
+            (item) =>
+              (browser || item.label !== "Open a new browser tab") &&
+              (contentSearch || item.label !== "Search workspace contents"),
+          )
           .map((item) =>
             item.label === "Select a workspace tab"
-              ? { ...item, keys: [...shortcutKeys("toggleWorkspaceSidebar"), "1…4"] }
+              ? {
+                  ...item,
+                  keys: [...shortcutKeys("toggleWorkspaceSidebar"), contentSearch ? "1…5" : "1…4"],
+                }
               : item,
           ),
       };
@@ -269,12 +280,14 @@ export function KeyboardShortcutsList({
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
   const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const serverInfo = useServerInfo();
   const groups = shortcutGroupsFor(
     isNativeShell(),
     isElectronShell(),
     supportsBrowser(),
     readSubmitWithModEnter(),
     preventsKeyboardSubmit,
+    !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
   );
   const settings = variant === "settings";
   return (

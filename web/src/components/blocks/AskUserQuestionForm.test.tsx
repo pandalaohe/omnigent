@@ -313,7 +313,7 @@ describe("AskUserQuestionForm — keyboard", () => {
     renderKeyboardForm(questionsOf(TWO_QUESTIONS));
     screen.getByTestId("composer").focus();
 
-    fireEvent.keyDown(window, { key: "F", code: "KeyF", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "G", code: "KeyG", altKey: true, shiftKey: true });
 
     expect(document.activeElement).toBe(card());
     expect(highlightedIndex()).toBe(0);
@@ -396,7 +396,7 @@ describe("AskUserQuestionForm — keyboard", () => {
     pressCard({ key: "Escape", code: "Escape" });
     expect(document.activeElement).toBe(screen.getByTestId("composer"));
 
-    fireEvent.keyDown(window, { key: "F", code: "KeyF", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "G", code: "KeyG", altKey: true, shiftKey: true });
 
     expect(document.activeElement).toBe(card());
     expect(customLabel?.getAttribute("data-highlighted")).toBe("true");
@@ -514,7 +514,7 @@ describe("AskUserQuestionForm — keyboard", () => {
   it("advances with primary+Enter, submits on the last question and returns focus", () => {
     const { onSubmit } = renderKeyboardForm(questionsOf(TWO_QUESTIONS));
     screen.getByTestId("composer").focus();
-    fireEvent.keyDown(window, { key: "F", code: "KeyF", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "G", code: "KeyG", altKey: true, shiftKey: true });
 
     pressCard({ key: " ", code: "Space" });
     pressCard({ key: "Enter", code: "Enter", ctrlKey: true });
@@ -691,7 +691,7 @@ describe("AskUserQuestionForm — keyboard", () => {
     });
     const toolbar = screen.getByTestId("toolbar");
     toolbar.focus();
-    fireEvent.keyDown(window, { key: "F", code: "KeyF", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "G", code: "KeyG", altKey: true, shiftKey: true });
 
     pressCard({ key: "Escape", code: "Escape" });
 

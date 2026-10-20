@@ -9,7 +9,13 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { isAgentNavigationAllowed } = require("../src/browserUrlPolicy");
+const {
+  checkAgentNavigation,
+  isAgentConnectionAllowed,
+  isAgentNavigationAllowed,
+  isProxyAddress,
+  proxyHosts,
+} = require("../src/browserUrlPolicy");
 
 // Private IPv4 fixtures are built from octets so no LAN address literal enters the source.
 const ip = (...octets) => octets.join(".");
@@ -26,6 +32,8 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
     }
     for (const url of [
       "http://app.localhost",
+      "http://[::ffff:127.0.0.1]:5173/",
+      "http://[::127.0.0.1]/",
       "http://127.2.3.4",
       "http://0.0.0.0",
       "http://[::]",
@@ -83,6 +91,8 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
       "http://localhost/",
       "http://localhost:6767/health",
       "http://app.localhost/",
+      "http://localhost./",
+      "http://app.localhost./",
       "http://127.0.0.1/",
       "http://127.0.0.1:8080/admin",
       "http://127.5.6.7/",
@@ -128,6 +138,222 @@ describe("browserUrlPolicy — agent navigation allowlist", () => {
       assert.equal(v.ok, false);
     }
   });
+
+  it("blocks IPv6 spellings of loopback, private, and metadata addresses", () => {
+    for (const url of [
+      "http://[::ffff:127.0.0.1]:8080/", // serialized as [::ffff:7f00:1]
+      "http://[::ffff:7f00:1]/",
+      "http://[::ffff:10.0.0.1]/",
+      "http://[::ffff:192.168.1.1]/",
+      "http://[::ffff:169.254.169.254]/latest/meta-data/",
+      "http://[::ffff:100.100.100.200]/", // CGNAT-range metadata
+      "http://[::127.0.0.1]/", // IPv4-compatible, serialized as [::7f00:1]
+      "http://[::]/",
+      "http://[0:0:0:0:0:0:0:1]/",
+      "http://[64:ff9b::127.0.0.1]/", // NAT64
+      "http://[2002:7f00:1::]/", // 6to4
+      "http://[2001::1]/", // Teredo
+      "http://[fc00::1]/", // unique-local
+      "http://[fd12::1]/",
+      "http://[fe80::1]/",
+      "http://[febf::1]/", // top of fe80::/10
+      "http://[fec0::1]/", // site-local
+      "http://[ff02::1]/", // multicast
+      "http://[2001:db8::1]/",
+      "http://[2001:1ff:ffff::1]/", // top of 2001::/23
+      "http://[3fff::1]/", // documentation; global to ssrf.py, blocked here on purpose
+      "http://[3fff:fff:ffff::1]/",
+    ]) {
+      assert.equal(isAgentNavigationAllowed(url).ok, false, `expected reject: ${url}`);
+    }
+  });
+
+  it("blocks shared, reserved, multicast and documentation IPv4 ranges", () => {
+    for (const url of [
+      "http://100.64.0.1/",
+      "http://100.100.100.200/",
+      "http://100.127.255.255/",
+      "http://192.0.0.1/",
+      "http://192.0.0.9/", // anycast; global to ssrf.py, blocked here on purpose
+      "http://192.0.0.255/",
+      "http://192.0.2.1/",
+      "http://198.18.0.1/",
+      "http://198.51.100.1/",
+      "http://203.0.113.1/",
+      "http://224.0.0.1/",
+      "http://240.0.0.1/",
+      "http://255.255.255.255/",
+    ]) {
+      assert.equal(isAgentNavigationAllowed(url).ok, false, `expected reject: ${url}`);
+    }
+  });
+
+  it("allows public IPv4 and IPv6 literals next to the blocked ranges", () => {
+    // Protocol-assignment exceptions remain conservatively excluded.
+    for (const host of ["2001:3::1", "2001:4:112::1"]) {
+      assert.equal(isAgentNavigationAllowed(`http://[${host}]/`).ok, false, host);
+    }
+    for (const url of [
+      "http://8.8.8.8/",
+      "http://100.63.255.255/",
+      "http://100.128.0.1/",
+      "http://169.253.0.1/",
+      "http://192.0.1.1/",
+      "http://198.20.0.1/",
+      "http://223.255.255.254/",
+      "http://[2606:4700:4700::1111]/",
+      "https://[2001:4860:4860::8888]/",
+      "http://[2001:200::1]/", // first address past 2001::/23
+      "http://[3fff:1000::1]/", // first address past 3fff::/20
+      "http://[::ffff:8.8.8.8]/",
+      "http://[64:ff9b::8.8.8.8]/", // NAT64 to a public IPv4
+    ]) {
+      assert.equal(isAgentNavigationAllowed(url).ok, true, `expected allow: ${url}`);
+    }
+  });
+});
+
+/** A resolver stub that records lookups and answers from a fixed table. */
+function fakeResolver(table) {
+  const lookups = [];
+  const resolveHost = async (hostname) => {
+    lookups.push(hostname);
+    const answer = table[hostname];
+    if (answer instanceof Error) throw answer;
+    return answer ?? [];
+  };
+  return { resolveHost, lookups };
+}
+
+describe("browserUrlPolicy — DNS-aware agent navigation", () => {
+  const { resolveHost, lookups } = fakeResolver({
+    "lvh.me": ["127.0.0.1"],
+    "127.0.0.1.nip.io": ["127.0.0.1"],
+    "metadata.example": ["169.254.169.254"],
+    "intranet.example": ["10.0.0.5"],
+    "mapped.example": ["::ffff:127.0.0.1"],
+    "ula.example": ["fd00::5"],
+    "split.example": ["93.184.215.14", "192.168.1.10"],
+    "example.com": ["93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c"],
+    "missing.example": new Error("ENOTFOUND"),
+  });
+
+  const verdictsFor = (hosts) =>
+    Promise.all(hosts.map((host) => checkAgentNavigation(`http://${host}:8899/`, { resolveHost })));
+
+  it("blocks a hostname if any resolved address is internal", async () => {
+    const hosts = [
+      "lvh.me",
+      "127.0.0.1.nip.io",
+      "metadata.example",
+      "intranet.example",
+      "mapped.example",
+      "ula.example",
+      "split.example",
+    ];
+    for (const [i, verdict] of (await verdictsFor(hosts)).entries()) {
+      assert.equal(verdict.ok, false, hosts[i]);
+      assert.match(verdict.error, /does not resolve to a public address/);
+    }
+  });
+
+  it("fails closed when a hostname does not resolve or resolves to nothing", async () => {
+    const verdicts = await verdictsFor(["missing.example", "empty.example"]);
+    assert.deepEqual(
+      verdicts.map((verdict) => verdict.ok),
+      [false, false],
+    );
+  });
+
+  it("allows a hostname whose addresses are all public", async () => {
+    assert.deepEqual(await checkAgentNavigation("https://example.com/", { resolveHost }), {
+      ok: true,
+    });
+  });
+
+  it("does not resolve literals, rejected URLs, or the exact Arca loopback hosts", async () => {
+    lookups.length = 0;
+    assert.equal((await checkAgentNavigation("http://8.8.8.8/", { resolveHost })).ok, true);
+    assert.equal((await checkAgentNavigation("file:///etc/passwd", { resolveHost })).ok, false);
+    assert.equal((await checkAgentNavigation("http://[fd12::1]/", { resolveHost })).ok, false);
+    const arca = { resolveHost, allowLocalhost: true };
+    assert.equal((await checkAgentNavigation("http://localhost:5173/", arca)).ok, true);
+    assert.deepEqual(lookups, []);
+    // A DNS alias for loopback is not part of the Arca exception.
+    assert.equal((await checkAgentNavigation("http://lvh.me:5173/", arca)).ok, false);
+  });
+});
+
+describe("browserUrlPolicy — connected address check", () => {
+  it("blocks a response served from an internal address", () => {
+    for (const connectedAddress of [
+      "127.0.0.1",
+      "10.0.0.5",
+      "169.254.169.254",
+      "::1",
+      "::ffff:7f00:1",
+      "fd00::1",
+    ]) {
+      const verdict = isAgentConnectionAllowed("https://rebind.example/", connectedAddress);
+      assert.equal(verdict.ok, false, connectedAddress);
+      assert.match(verdict.error, /navigation blocked/);
+    }
+  });
+
+  it("allows public addresses", () => {
+    for (const connectedAddress of ["93.184.215.14", "2606:4700:4700::1111"]) {
+      assert.equal(
+        isAgentConnectionAllowed("https://example.com/", connectedAddress).ok,
+        true,
+        connectedAddress,
+      );
+    }
+  });
+
+  it("blocks a response that reports no connected address", () => {
+    for (const connectedAddress of [undefined, ""]) {
+      const verdict = isAgentConnectionAllowed("https://example.com/", connectedAddress);
+      assert.equal(verdict.ok, false, String(connectedAddress));
+      assert.match(verdict.error, /no connected address/);
+    }
+  });
+
+  it("allows loopback only for the exact Arca hosts when eligible", () => {
+    const eligible = { allowLocalhost: true };
+    assert.equal(
+      isAgentConnectionAllowed("http://localhost:5173/", "127.0.0.1", eligible).ok,
+      true,
+    );
+    assert.equal(isAgentConnectionAllowed("http://[::1]:5173/", "::1", eligible).ok, true);
+    assert.equal(isAgentConnectionAllowed("http://localhost:5173/", "127.0.0.1").ok, false);
+    assert.equal(isAgentConnectionAllowed("http://lvh.me:5173/", "127.0.0.1", eligible).ok, false);
+  });
+});
+
+describe("browserUrlPolicy — proxy address matching", () => {
+  it("lists the proxy hosts of a PAC-style result", () => {
+    assert.deepEqual(
+      proxyHosts("PROXY proxy.corp:3128;SOCKS5 [::1]:1080; HTTPS 10.0.0.2:443 ;DIRECT"),
+      ["proxy.corp", "::1", "10.0.0.2"],
+    );
+    assert.deepEqual(proxyHosts("DIRECT"), []);
+  });
+
+  const resolveHost = async (hostname) => ({ "proxy.corp": ["10.0.0.2"] })[hostname] ?? [];
+
+  it("accepts an internal address only when it is a listed proxy's IP", async () => {
+    const pac = "PROXY proxy.corp:3128; DIRECT";
+    // Address-only match: the proxy's IP counts even if the proxy didn't carry
+    // the request (the documented limit on isProxyAddress).
+    const [proxyIp, directFallback, mappedForm, noAddress] = await Promise.all([
+      isProxyAddress("10.0.0.2", pac, resolveHost),
+      isProxyAddress("127.0.0.1", pac, resolveHost), // DIRECT fallback to loopback
+      isProxyAddress("::ffff:a00:2", "PROXY 10.0.0.2:3128", resolveHost),
+      isProxyAddress(undefined, pac, resolveHost),
+    ]);
+    assert.deepEqual([proxyIp, directFallback, mappedForm, noAddress], [true, false, true, false]);
+    assert.equal(await isProxyAddress("10.0.0.2", "DIRECT", resolveHost), false);
+  });
 });
 
 describe("browserUrlPolicy — canonical host bypasses", () => {
@@ -165,12 +391,12 @@ describe("browserUrlPolicy — canonical host bypasses", () => {
       assert.equal(v.error, `navigation blocked: host "${hostname}" is a loopback/internal host`);
     }
 
-    assert.equal(isAgentNavigationAllowed("http://[fec0::1]/").ok, true);
+    assert.equal(isAgentNavigationAllowed("http://[fec0::1]/").ok, false);
   });
 
   it("still allows public IPv6, public mapped/NAT64 IPv4 and public trailing-dot names", () => {
     for (const url of [
-      "http://[2001:db8::1]/",
+      "http://[2606:4700:4700::1111]/",
       "http://[::ffff:8.8.8.8]/",
       "http://[64:ff9b::8.8.8.8]/",
       "https://example.com./",
@@ -181,6 +407,32 @@ describe("browserUrlPolicy — canonical host bypasses", () => {
 });
 
 describe("browserUrlPolicy — allowlist", () => {
+  it("never grants forbidden or malformed resolved endpoints to a listed hostname", async () => {
+    const url = "http://intranet.example:8080/";
+    const allowlist = ["intranet.example:8080"];
+    const loopback = await checkAgentNavigation(url, {
+      allowlist,
+      resolveHost: async () => ["127.0.0.1"],
+    });
+    assert.equal(loopback.ok, true);
+    await Promise.all(
+      ["169.254.169.254", "0.0.0.0", "::", "fe80::1", "not-an-address"].map(async (address) => {
+        const verdict = await checkAgentNavigation(url, {
+          allowlist,
+          resolveHost: async () => [address],
+        });
+        assert.equal(verdict.ok, false, address);
+        assert.equal(verdict.grant, undefined, address);
+        assert.equal(isAgentConnectionAllowed(url, address, { allowlist }).ok, false, address);
+      }),
+    );
+    assert.equal(
+      (await checkAgentNavigation(url, { allowlist, resolveHost: async () => [] })).ok,
+      false,
+    );
+    assert.equal(isAgentConnectionAllowed(url, undefined, { allowlist }).ok, false);
+  });
+
   it("allows a listed internal IPv4 on any port and refuses its neighbours", () => {
     const allowlist = [ip(192, 168, 1, 20)];
     assert.equal(

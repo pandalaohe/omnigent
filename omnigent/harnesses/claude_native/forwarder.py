@@ -888,8 +888,9 @@ class TranscriptForwardState:
         waits for transcript quiescence). Persisted so a restart inside
         that window doesn't lose the settle — the hook cursor has
         already advanced past the Stop edge and won't re-read it.
-    :param api_error_context: Latest explicit API error for the current response.
-        Cleared by subsequent output and persisted for hook retries after restart.
+    :param api_error_context: Latest explicit API error for the current response, kept
+        while the next turn has no output yet. Cleared by subsequent output and
+        persisted for hook retries after restart.
     """
 
     transcript_path: Path
@@ -5425,9 +5426,10 @@ def _transcript_api_error_for_hook(
     bridge_dir: Path, record: ClaudeHookRecord, response_id: str | None
 ) -> FailureContext | None:
     """Match durable API-error evidence to the failed response and native session."""
-    if not response_id or not record.claude_session_id:
+    if not record.claude_session_id:
         return None
     state = _read_forward_state(bridge_dir)
+    # ``None`` on both sides is between turns: evidence kept then is the ended turn's.
     if state is None or state.current_response_id != response_id:
         return None
     context = state.api_error_context
@@ -7018,9 +7020,13 @@ async def _forward_transcript_item_batch(
     # that already finished — the user sees idle → running → idle. Items carry
     # their own ``response_id`` (see :func:`_post_external_conversation_item`),
     # so the transcript's job here is items, not status.
+    # A queued prompt or task notification can open the next turn before the failed
+    # turn's StopFailure is forwarded; keep that turn's API error until its edge posts.
+    ended_response_ids = (dedupe.pending_settled_response_id, dedupe.settled_response_id)
     updated = (
         state
         if state.current_response_id == current_response_id
+        or (current_response_id is None and state.current_response_id not in ended_response_ids)
         else replace(state, api_error_context=None)
     )
     if updated != state:
@@ -7028,7 +7034,12 @@ async def _forward_transcript_item_batch(
     for item in items:
         if item.source_id in seen:
             continue
-        if item.response_id == current_response_id:
+        if item.response_id == current_response_id or (
+            # Between turns, the ended turn's own output still sets or clears its error.
+            current_response_id is None
+            and not (item.item_type == "message" and item.data.get("role") == "user")
+            and item.response_id not in ended_response_ids
+        ):
             context = normalize_failure_context(item.failure_context)
             if context.get("native_api_error_message") is not True:
                 context = {}
@@ -7045,7 +7056,7 @@ async def _forward_transcript_item_batch(
                     api_error_context=context or None,
                     # An error needs its response ID for hooks even if the POST fails.
                     # Ordinary output must not advance it before a wake marker lands.
-                    current_response_id=current_response_id
+                    current_response_id=item.response_id
                     if context
                     else updated.current_response_id,
                 )

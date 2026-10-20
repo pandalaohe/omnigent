@@ -68,9 +68,9 @@ function Pane({
 
 function pressFocusChord(init: KeyboardEventInit = {}): KeyboardEvent {
   const event = new KeyboardEvent("keydown", {
-    code: "KeyF",
-    key: "F",
-    ctrlKey: true,
+    code: "KeyG",
+    key: "G",
+    altKey: true,
     shiftKey: true,
     bubbles: true,
     cancelable: true,
@@ -177,8 +177,8 @@ describe("useFocusQuestionCardHotkey", () => {
 
     pressFocusChord({ repeat: true });
     const altGraph = new KeyboardEvent("keydown", {
-      code: "KeyF",
-      ctrlKey: true,
+      code: "KeyG",
+      altKey: true,
       shiftKey: true,
       cancelable: true,
     });
@@ -223,7 +223,7 @@ describe("useFocusQuestionCardHotkey", () => {
     expect(enter).not.toHaveBeenCalled();
     expect(old.defaultPrevented).toBe(false);
 
-    const rebound = pressFocusChord({ code: "KeyP", key: "P" });
+    const rebound = pressFocusChord({ code: "KeyP", key: "P", altKey: false, ctrlKey: true });
     expect(enter).toHaveBeenCalledTimes(1);
     expect(rebound.defaultPrevented).toBe(true);
   });

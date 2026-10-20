@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -305,6 +306,138 @@ async def _post_native_idle(
         parent_body=parent_body,
     )
     return http, items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_harness", ["codex-native", "claude-native"])
+@pytest.mark.parametrize("origin", ["dispatch", "snapshot", "init-envelope", "restart"])
+@pytest.mark.parametrize("wrapper", [None, "codex-native-ui", "codex-native-ui-subagent"])
+async def test_parent_wake_follows_child_ownership(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_harness: str,
+    origin: str,
+    wrapper: str | None,
+) -> None:
+    """Explicit dispatches survive restart; untracked Codex threads stay silent."""
+    monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
+    labels = (
+        {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID}
+        if origin in {"dispatch", "restart"}
+        else {}
+    )
+    if wrapper is not None:
+        labels[WRAPPER_LABEL_KEY] = wrapper
+    child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    child_body["labels"] = labels
+
+    class WakeClient(_SnapshotServerClient):
+        """Record wake messages while serving persisted child identity and results."""
+
+        def __init__(self) -> None:
+            super().__init__(child_body)
+            self.wakes: list[dict[str, Any]] = []
+
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            if url.endswith("/child_sessions"):
+                children = [_child_summary(labels=labels)] if origin == "restart" else []
+                return self._Resp({"data": children, "has_more": False})
+            if url.endswith("/items"):
+                return self._Resp({"data": [_CHILD_RESULT_ITEM], "has_more": False})
+            return await super().get(url, **kwargs)
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url == f"/v1/sessions/{PARENT_SESSION_ID}/events":
+                self.wakes.append(kwargs["json"])
+            return await super().post(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        # The child is an independent codex-native worker; a claude-native
+        # child's bare idle would need the forwarder's turn_completed flag.
+        is_parent = agent_id == "ag_orchestrator"
+        return AgentSpec(
+            spec_version=1,
+            name="orchestrator" if is_parent else "reviewer",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": parent_harness if is_parent else "codex-native"},
+            ),
+        )
+
+    server = WakeClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=server,  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": PARENT_SESSION_ID, "agent_id": "ag_orchestrator"},
+        )
+        assert response.status_code == 201, response.text
+        if origin == "init-envelope":
+            from omnigent.runner.session_init_protocol import (
+                SESSION_INIT_PAYLOAD_KEY,
+                SESSION_INIT_PROTOCOL_VERSION,
+                RunnerSessionInitEnvelope,
+                RunnerSessionInitSnapshot,
+            )
+
+            envelope = RunnerSessionInitEnvelope(
+                protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+                server_version="0.16.0",
+                session_id=CHILD_SESSION_ID,
+                agent_id="ag_reviewer",
+                snapshot=RunnerSessionInitSnapshot(
+                    created_at=1,
+                    updated_at=1,
+                    parent_session_id=PARENT_SESSION_ID,
+                    labels=labels,
+                ),
+            )
+            response = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": CHILD_SESSION_ID,
+                    "agent_id": "ag_reviewer",
+                    SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
+                },
+            )
+            assert response.status_code == 201, response.text
+        if origin == "dispatch":
+            subagent_work.register_subagent_work(
+                parent_session_id=PARENT_SESSION_ID,
+                child_session_id=CHILD_SESSION_ID,
+                agent="reviewer",
+                title="review",
+                wrapper_label=wrapper,
+                registered_by="sys_session_send",
+            )
+        # The duplicate idle must not deliver or wake a second time.
+        for _ in range(2):
+            response = await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "review complete: LGTM"},
+                },
+            )
+            assert response.status_code == 204, response.text
+        # Yield to the scheduled wake POST, which completes against the in-memory client.
+        await asyncio.sleep(0)
+
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None
+    assert entry.wrapper_label == wrapper
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
+    assert inbox.qsize() == 1
+    assert inbox.get_nowait()["output"] == "review complete: LGTM"
+    if wrapper == "codex-native-ui-subagent" and origin not in {"dispatch", "restart"}:
+        assert server.wakes == []
+    else:
+        assert len(server.wakes) == 1
+        assert "sys_read_inbox" in server.wakes[0]["data"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -2802,3 +2935,54 @@ async def test_drain_inbox_malformed_peer_copy_uses_empty_strings(payload: dict[
         'messaged your sub-agent : (): "". Its turn ended : "". '
         "Full text: sys_session_get_history .]"
     )
+
+
+def _wake_candidate(
+    child_session_id: str,
+    *,
+    wrapper_label: str | None,
+    completed_at: float | None,
+) -> subagent_work._SubagentWorkEntry:
+    return subagent_work._SubagentWorkEntry(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=child_session_id,
+        work_id=f"subagent_{child_session_id}",
+        agent="reviewer",
+        title="review",
+        wrapper_label=wrapper_label,
+        completed_at=completed_at,
+    )
+
+
+def test_stranded_wake_rescue_skips_a_later_codex_owned_thread() -> None:
+    """A suppressed thread finishing last must not shadow an independent child's wake.
+
+    The stranded-wake rescue picks one entry per parent to re-send. Selecting the
+    absolute latest would choose a Codex-owned thread that completed after an
+    independent child, and the ownership guard would then drop the wake the child
+    is still owed.
+    """
+    independent = _wake_candidate(
+        "conv_worker", wrapper_label="codex-native-ui", completed_at=100.0
+    )
+    codex_owned = _wake_candidate(
+        "conv_side", wrapper_label="codex-native-ui-subagent", completed_at=200.0
+    )
+
+    picked = subagent_work.latest_wake_eligible_subagent_work([independent, codex_owned])
+
+    assert picked is independent
+
+
+def test_stranded_wake_rescue_has_nothing_for_a_codex_only_parent() -> None:
+    """A parent whose only entries are Codex-owned threads owes no inbox wake."""
+    entries = [
+        _wake_candidate(
+            "conv_thread_a", wrapper_label="codex-native-ui-subagent", completed_at=100.0
+        ),
+        _wake_candidate(
+            "conv_thread_b", wrapper_label="codex-native-ui-subagent", completed_at=200.0
+        ),
+    ]
+
+    assert subagent_work.latest_wake_eligible_subagent_work(entries) is None
