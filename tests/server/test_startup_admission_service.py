@@ -89,7 +89,7 @@ async def test_saved_inputs_wait_for_compatible_host_then_only_two_dispatch(db_u
     assert len(delivered) == 2
     for session_id, ref, input_id in delivered:
         assert ref.input_id == input_id == dict(sessions)[session_id]
-        assert ref.host_generation == "generation"
+        assert ref.host_generation == conn.startup_generation
         assert len(conversations.list_pending_inputs(session_id)) == 1
     replacement = StartupAdmission(
         startups, conversations, registry, StartupAdmissionPolicy(8, 8, 2)

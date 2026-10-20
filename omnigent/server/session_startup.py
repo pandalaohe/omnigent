@@ -172,7 +172,14 @@ class StartupCoordinator:
                 _logger.warning("Startup preflight failed before dispatch")
 
     async def observe(
-        self, receipt: StartupReceipt, *, session_id: str, host_id: str, runtime_id: str
+        self,
+        receipt: StartupReceipt,
+        *,
+        session_id: str,
+        host_id: str,
+        runtime_id: str,
+        runner_id: str,
+        host_generation: str,
     ) -> bool:
         """Bindings here come from the authenticated transport, never the message body."""
         current = await asyncio.to_thread(self.startups.get, receipt.startup_id)
@@ -183,7 +190,12 @@ class StartupCoordinator:
             or receipt.runtime_id != runtime_id
         ):
             return False
-        accepted = await asyncio.to_thread(self.startups.observe, receipt)
+        accepted = await asyncio.to_thread(
+            self.startups.observe,
+            receipt,
+            expected_runner_id=runner_id,
+            host_generation=host_generation,
+        )
         if accepted:
             await self.advance(host_id)
         return accepted

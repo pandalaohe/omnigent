@@ -23,11 +23,14 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import contextmanager
+from _thread import LockType
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from cachetools import TTLCache
 
@@ -462,6 +465,7 @@ class HostConnection:
     close_requested_code: int | None = None
     close_requested_reason: str | None = None
     account_generation: str | None = None
+    startup_generation: str = field(default_factory=lambda: uuid4().hex)
     # True when this tunnel authenticated with a valid managed-sandbox launch
     # token, i.e. a server-provisioned sandbox proving itself on connect — not a
     # user machine reusing a managed host's id under ordinary login. Read by the
@@ -572,6 +576,9 @@ class HostRegistry:
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
         self._hosts: dict[tuple[int, str], HostConnection] = {}
+        self._startup_registrations: WeakValueDictionary[tuple[int, str], LockType] = (
+            WeakValueDictionary()
+        )
         # Last gateway-inference map each host reported, keyed by canonical
         # host_id alone: the map describes the machine's local config, so the
         # same machine connected to two workspaces reports the same answer.
@@ -587,6 +594,23 @@ class HostRegistry:
             Callable[[HostConnection, str], Awaitable[StartupAttemptRef]] | None
         ) = None
 
+    @asynccontextmanager
+    async def startup_registration(self, host_id: str) -> AsyncIterator[None]:
+        """Publish the durable generation and local connection in the same order."""
+        key = (current_workspace_id(), _canonical_host_id(host_id))
+        with self._lock:
+            lock = self._startup_registrations.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._startup_registrations[key] = lock
+        # Routes may use different event loops. A cancelled waiter never owns the lock.
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        try:
+            yield
+        finally:
+            lock.release()
+
     def register(
         self,
         host_id: str,
@@ -595,6 +619,7 @@ class HostRegistry:
         owner: str | None,
         workspace_id: int | None = None,
         registered_with_managed_token: bool = False,
+        startup_generation: str | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -639,6 +664,7 @@ class HostRegistry:
             last_frame_at=now,
             last_frame_monotonic=time.monotonic(),
             registered_with_managed_token=registered_with_managed_token,
+            startup_generation=startup_generation or uuid4().hex,
         )
         with self._lock:
             key = (ws_id, host_id)

@@ -25,6 +25,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -429,15 +430,22 @@ def create_host_tunnel_router(
                 bind_account_authority(tunnel_owner, persisted_host.account_generation)
 
             stage = "registry"
-            conn = host_registry.register(
-                host_id,
-                ws,
-                frame,
-                owner=tunnel_owner,
-                # A resolved launch token is proof this is a server-provisioned
-                # sandbox, not a user machine reconnecting on a managed host id.
-                registered_with_managed_token=managed_token is not None,
-            )
+            async with host_registry.startup_registration(host_id):
+                startup_generation = uuid4().hex
+                if startup_store is not None:
+                    await asyncio.to_thread(
+                        startup_store.register_host_generation, host_id, startup_generation
+                    )
+                conn = host_registry.register(
+                    host_id,
+                    ws,
+                    frame,
+                    owner=tunnel_owner,
+                    # A resolved launch token is proof this is a server-provisioned
+                    # sandbox, not a user machine reconnecting on a managed host id.
+                    registered_with_managed_token=managed_token is not None,
+                    startup_generation=startup_generation,
+                )
             # A superseded tunnel's cleanup may have written offline after our upsert.
             await asyncio.to_thread(host_store.set_online, host_id)
             # Delivered on the handshake, never persisted: a replica that just

@@ -18,6 +18,7 @@ class SqlStartupBudget(OmnigentBase):
     work_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     work_fence_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     recovery: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    current_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class SqlSessionStartup(OmnigentBase):

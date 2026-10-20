@@ -5,10 +5,12 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Request
 
 from omnigent.entities.session_startup import SessionStartupStatus
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import session_stream
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.schemas import CancelStartupRequest, SessionStartupEvent
+from omnigent.startup_protocol import StartupObservation
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_startup_store import SessionStartupStore
@@ -21,6 +23,75 @@ def register_startup_routes(
     permission_store: PermissionStore | None,
     auth_provider: AuthProvider | None,
 ) -> None:
+    @router.post("/sessions/{session_id}/startup/receipts", include_in_schema=False)
+    async def observe_startup(
+        request: Request, session_id: str, body: StartupObservation
+    ) -> dict[str, bool]:
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if (
+            not token
+            or conv is None
+            or not conv.runner_id
+            or token_bound_runner_id(token) != conv.runner_id
+        ):
+            raise HTTPException(403, "Startup receipts require the bound runner")
+        store: SessionStartupStore | None = getattr(request.app.state, "startup_store", None)
+        hosts = getattr(request.app.state, "host_registry", None)
+        conn = hosts.get(conv.host_id) if hosts is not None and conv.host_id else None
+        current = await asyncio.to_thread(store.get, body.attempt.startup_id) if store else None
+        if (
+            store is None
+            or conn is None
+            or current is None
+            or conv.archived
+            or current.session_id != session_id
+            or current.host_id != conv.host_id
+            or current.attempt_id != body.attempt.attempt_id
+            or current.runtime_id != body.attempt.runtime_id
+            or current.input_id != body.attempt.input_id
+            or conn.startup_generation != body.attempt.host_generation
+            or "startup_admission_v1" not in conn.hello.capabilities
+            or (
+                body.source != "runner"
+                and f"startup_receipts:{body.source}" not in conn.hello.capabilities
+            )
+        ):
+            return {"accepted": False}
+        if body.phase in ("input_accepted", "work_started"):
+            assert body.vendor_session_id and body.vendor_turn_id
+            await asyncio.to_thread(
+                store.bind_dispatch,
+                current.id,
+                body.attempt.attempt_id,
+                runtime_id=body.attempt.runtime_id,
+                source=body.source,
+                vendor_session_id=body.vendor_session_id,
+                vendor_turn_id=body.vendor_turn_id,
+                expected_runner_id=conv.runner_id,
+                host_generation=body.attempt.host_generation,
+            )
+        accepted = await asyncio.to_thread(
+            store.observe,
+            body.receipt(),
+            expected_runner_id=conv.runner_id,
+            host_generation=body.attempt.host_generation,
+        )
+        if accepted:
+            status = await asyncio.to_thread(store.presentation, session_id)
+            session_stream.publish(
+                session_id,
+                SessionStartupEvent(
+                    type="session.startup",
+                    conversation_id=session_id,
+                    startup=status,
+                ).model_dump(),
+            )
+            admission = getattr(request.app.state, "startup_admission", None)
+            if admission is not None:
+                await admission.coordinator.advance(current.host_id)
+        return {"accepted": accepted}
+
     @router.post(
         "/sessions/{session_id}/startup/cancel",
         response_model=SessionStartupStatus,

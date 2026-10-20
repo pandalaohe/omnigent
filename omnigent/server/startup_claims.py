@@ -19,7 +19,7 @@ async def authorize_host_startup_claim(
     ref = frame.attempt
     if (
         registry.get(conn.host_id) is not conn
-        or ref.host_generation != conn.hello.connection_id
+        or ref.host_generation != conn.startup_generation
         or registry.launch_authorizer is None
     ):
         return False

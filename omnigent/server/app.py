@@ -5016,6 +5016,7 @@ def create_app(
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
                 conversation_store=conversation_store,
+                startup_store=app.state.startup_store,
             ),
             prefix="/v1",
             tags=["hosts"],

@@ -59,7 +59,7 @@ class StartupAdmission:
 
     async def _eligible(self, startup: StartupSnapshot) -> bool:
         conn = self.hosts.get(startup.host_id)
-        if conn is None or not conn.hello.connection_id:
+        if conn is None:
             return False
         capabilities = conn.hello.capabilities
         if "startup_admission_v1" not in capabilities:
@@ -105,7 +105,7 @@ class StartupAdmission:
             current = await asyncio.to_thread(self.startups.get, ref.startup_id)
             if (
                 self.hosts.get(conn.host_id) is conn
-                and conn.hello.connection_id == ref.host_generation
+                and conn.startup_generation == ref.host_generation
                 and current is not None
                 and current.host_id == conn.host_id
                 and current.attempt_id == ref.attempt_id
@@ -121,14 +121,14 @@ class StartupAdmission:
 
     async def _launch(self, startup: StartupSnapshot) -> None:
         conn = self.hosts.get(startup.host_id)
-        generation = conn.hello.connection_id if conn is not None else None
+        generation = conn.startup_generation if conn is not None else None
         if (
             self._app is None
             or conn is None
             or not generation
             or startup.attempt_id is None
             or not await self._eligible(startup)
-            or conn.hello.connection_id != generation
+            or conn.startup_generation != generation
         ):
             await asyncio.to_thread(self.startups.cancel_unissued, startup.id, startup.attempt_id)
             return

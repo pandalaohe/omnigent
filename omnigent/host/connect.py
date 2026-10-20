@@ -1981,11 +1981,12 @@ class HostProcess:
         if frame.startup is None:
             return not frame.startup_required
         ws = self._ws
+        generation = self._startup_generation
         if (
             ws is None
             or not frame.session_id
             or not frame.binding_token.strip()
-            or frame.startup.host_generation != self._startup_generation
+            or generation is None
         ):
             return False
         request_id = uuid.uuid4().hex
@@ -2005,11 +2006,7 @@ class HostProcess:
                 ),
             )
             granted = await asyncio.wait_for(future, timeout=5)
-            return (
-                granted
-                and self._ws is ws
-                and self._startup_generation == frame.startup.host_generation
-            )
+            return granted and self._ws is ws and self._startup_generation == generation
         except (ConnectionError, OSError, TimeoutError):
             return False
         finally:

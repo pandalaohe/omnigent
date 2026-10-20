@@ -56,11 +56,14 @@ async def test_host_claim_checks_live_connection_binding_and_canonical_input(db_
     hello = HostHelloFrame(
         version="test", frame_protocol_version=1, name="sample-host", connection_id="connection"
     )
-    conn = registry.register(host, FakeWebSocket(), hello, owner="owner")
+    conn = registry.register(
+        host, FakeWebSocket(), hello, owner="owner", startup_generation="connection"
+    )
     conv = conversations.create_conversation()
     conversations.set_host_id(conv.id, host, "/opt/work/project")
     conversations.set_runner_id(conv.id, "bound-runner")
     store.configure(host, host_resident_limit=7, deployment_resident_limit=20)
+    store.register_host_generation(host, conn.startup_generation)
     handle = store.enqueue(
         owner_user_id="owner",
         host_id=host,

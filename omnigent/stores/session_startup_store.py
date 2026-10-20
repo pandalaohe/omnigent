@@ -114,6 +114,17 @@ class SessionStartupStore:
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             return _snapshot(row) if row else None
 
+    def register_host_generation(self, host_id: str, generation: str) -> None:
+        if not 0 < len(generation) <= 128:
+            raise ValueError("Invalid host startup generation")
+
+        def write(db: Session) -> None:
+            _, host = self._budgets(db, host_id)
+            host.current_generation = generation
+            host.work_revision = (host.work_revision or 0) + 1
+
+        run_write_transaction(self._session, "register_host_startup_generation", write)
+
     def recovery(self, host_id: str) -> HostRecoveryPlan | None:
         with self._session("read_host_recovery") as db:
             host = db.get(SqlStartupBudget, f"{current_workspace_id()}:{host_id}")
@@ -601,28 +612,34 @@ class SessionStartupStore:
                 or not row.occupied
                 or row.runtime_id not in (None, runtime_id)
                 or row.host_generation not in (None, host_generation)
+                or host.current_generation not in (None, host_generation)
+                or (expected_runner_id is not None and host.current_generation != host_generation)
                 or boundary in row.cold_claims
                 or (boundary == "runner_spawn" and "runner_prepare" not in row.cold_claims)
             ):
                 return False
-            if expected_runner_id is not None:
-                binding = db.get(
-                    SqlConversationMetadata,
-                    (current_workspace_id(), row.session_id),
-                    with_for_update=True,
-                )
-                if (
-                    binding is None
-                    or binding.host_id != row.host_id
-                    or binding.runner_id != expected_runner_id
-                ):
-                    return False
+            if expected_runner_id is not None and not self._bound_runner_matches(
+                db, row, expected_runner_id
+            ):
+                return False
             row.runtime_id, row.host_generation = runtime_id, host_generation
             row.cold_claims = {**row.cold_claims, boundary: claim_id}
             row.state, row.updated_at = "verifying", now_epoch()
             return True
 
         return run_write_transaction(self._session, "grant_cold_start_boundary", write)
+
+    def _bound_runner_matches(self, db: Session, row: SqlSessionStartup, runner_id: str) -> bool:
+        binding = db.get(
+            SqlConversationMetadata,
+            (current_workspace_id(), row.session_id),
+            with_for_update=True,
+        )
+        return (
+            binding is not None
+            and binding.host_id == row.host_id
+            and binding.runner_id == runner_id
+        )
 
     def cancel(self, startup_id: str) -> StartupSnapshot | None:
         return self._cancel(startup_id, expected_attempt_id=None, compare=False)
@@ -750,6 +767,8 @@ class SessionStartupStore:
         source: str,
         vendor_session_id: str,
         vendor_turn_id: str,
+        expected_runner_id: str | None = None,
+        host_generation: str | None = None,
     ) -> bool:
         """Bind vendor identities from the owning adapter before accepting its proof."""
         if not (
@@ -763,8 +782,14 @@ class SessionStartupStore:
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             if row is None:
                 return False
-            self._budgets(db, row.host_id)
+            _, host = self._budgets(db, row.host_id)
             db.refresh(row, with_for_update=True)
+            if expected_runner_id is not None and (
+                row.host_generation != host_generation
+                or host.current_generation != host_generation
+                or not self._bound_runner_matches(db, row, expected_runner_id)
+            ):
+                return False
             if (
                 not row.occupied
                 or row.cancel_requested
@@ -783,15 +808,27 @@ class SessionStartupStore:
 
         return run_write_transaction(self._session, "bind_startup_dispatch", write)
 
-    def observe(self, receipt: StartupReceipt) -> bool:
+    def observe(
+        self,
+        receipt: StartupReceipt,
+        *,
+        expected_runner_id: str | None = None,
+        host_generation: str | None = None,
+    ) -> bool:
         """The caller must authenticate the runner/session before supplying a receipt."""
 
         def write(db: Session) -> bool:
             row = db.get(SqlSessionStartup, (current_workspace_id(), receipt.startup_id))
             if row is None:
                 return False
-            self._budgets(db, row.host_id)
+            _, host = self._budgets(db, row.host_id)
             db.refresh(row, with_for_update=True)
+            if expected_runner_id is not None and (
+                row.host_generation != host_generation
+                or host.current_generation != host_generation
+                or not self._bound_runner_matches(db, row, expected_runner_id)
+            ):
+                return False
             if (
                 row.attempt_id != receipt.attempt_id
                 or row.runtime_id != receipt.runtime_id
