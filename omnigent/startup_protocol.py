@@ -17,6 +17,14 @@ class StartupAttemptRef(BaseModel):
     host_generation: str = Field(min_length=1, max_length=128)
 
 
+class StartupBoundaryClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    attempt: StartupAttemptRef
+    boundary: Literal["harness_prepare", "native_prepare", "executor_prepare"]
+    claim_id: str = Field(min_length=1, max_length=128)
+
+
 class StartupObservation(BaseModel):
     """Only an authenticated adapter can turn its vendor observation into startup proof."""
 

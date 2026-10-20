@@ -35,6 +35,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
 )
 from omnigent.stores.host_store import host_is_live
+from omnigent.stores.session_startup_store import StartupSnapshot
 
 _logger = logging.getLogger(__name__)
 STARTUP_LABEL = "omnigent.startup"
@@ -77,6 +78,40 @@ async def restore_pending_inputs(store: ConversationStore, session_id: str) -> N
             conv = await asyncio.to_thread(store.get_conversation, session_id)
             if conv is not None and conv.labels.get(STARTUP_LABEL) == "cancelled":
                 pending_inputs.mark_interrupted(session_id, [pending_id])
+
+
+async def reconcile_accepted_startup_input(
+    conversations: ConversationStore, startup: StartupSnapshot
+) -> None:
+    """Finish an interrupted handoff from durable acceptance without dispatching again."""
+    if not (
+        startup.input_accepted
+        and startup.proof_source == "codex"
+        and startup.input_id
+        and startup.attempt_id
+    ):
+        return
+    pending = await asyncio.to_thread(conversations.get_item, startup.session_id, startup.input_id)
+    if pending is None or pending.response_id != PENDING_INPUT_RESPONSE_ID:
+        return
+    [consumed] = await asyncio.to_thread(
+        conversations.append,
+        startup.session_id,
+        [
+            NewConversationItem(
+                type=pending.type,
+                response_id=f"turn_{startup.attempt_id}",
+                status="completed",
+                stable_id=pending.id,
+                replaces_pending_id=pending.id,
+                data=pending.data,
+                created_by=pending.created_by,
+            )
+        ],
+    )
+    from omnigent.server.routes._sessions.orchestration import _publish_input_consumed
+
+    _publish_input_consumed(startup.session_id, consumed)
 
 
 @dataclass
@@ -362,6 +397,11 @@ class ManagedStartupInputs:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.host_id != connection.host_id:
             return False
+        admission = getattr(app.state, "startup_admission", None)
+        if admission is not None:
+            startup = await asyncio.to_thread(admission.startups.for_session, session_id)
+            if startup is not None:
+                await reconcile_accepted_startup_input(self.conversations, startup)
         state = conv.labels.get(STARTUP_LABEL)
         if state == "failed":
             return False

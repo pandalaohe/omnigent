@@ -33,6 +33,9 @@ class StartupSnapshot:
     preparation: dict | None
     owner_user_id: str
     resident: bool
+    host_generation: str | None
+    input_accepted: bool
+    proof_source: str | None
 
 
 def _snapshot(row: SqlSessionStartup) -> StartupSnapshot:
@@ -694,6 +697,7 @@ class SessionStartupStore:
             "input_dispatch",
             "runner_prepare",
             "runner_spawn",
+            "harness_prepare",
             "native_prepare",
             "executor_prepare",
         ):
