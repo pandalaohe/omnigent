@@ -30,12 +30,16 @@ class StartupSnapshot:
     attempt_id: str | None
     runtime_id: str | None
     runtime_generation: int
+    parent_startup_id: str | None
     preparation: dict | None
     owner_user_id: str
+    occupied: bool
     resident: bool
     host_generation: str | None
     input_accepted: bool
     proof_source: str | None
+    admitted_at: int | None
+    first_dispatch_at: int | None
 
 
 def _snapshot(row: SqlSessionStartup) -> StartupSnapshot:
@@ -344,6 +348,7 @@ class SessionStartupStore:
             row = self._current_session_row(db, session_id)
             if row is None:
                 return None
+            now = now_epoch()
             position = None
             if row.state == "queued":
                 position = db.scalar(
@@ -363,10 +368,26 @@ class SessionStartupStore:
                     "input_id": row.input_id,
                     "state": row.state,
                     "reason": row.reason,
-                    "elapsed_seconds": max(0, now_epoch() - row.created_at),
+                    "elapsed_seconds": max(0, now - row.created_at),
+                    "admitted_elapsed_seconds": (
+                        max(0, now - row.admitted_at) if row.admitted_at is not None else None
+                    ),
+                    "input_elapsed_seconds": (
+                        max(0, now - row.first_dispatch_at)
+                        if row.first_dispatch_at is not None
+                        else None
+                    ),
+                    "unconfirmed_startups": self._unconfirmed_startups(db, row.host_id),
                     "queue_position_estimate": position,
                     "can_cancel": row.state
-                    in ("queued", "starting", "verifying", "uncertain", "blocked"),
+                    in (
+                        "queued",
+                        "starting",
+                        "verifying",
+                        "waiting_input",
+                        "uncertain",
+                        "blocked",
+                    ),
                     "evidence": {
                         name: getattr(row, name)
                         for name in (
@@ -378,6 +399,27 @@ class SessionStartupStore:
                     },
                 }
             )
+
+    def unconfirmed_startups(self, host_id: str) -> int:
+        """Count current uncertain permits on a host for its pause indicator."""
+        with self._session("read_host_unconfirmed_startups") as db:
+            return self._unconfirmed_startups(db, host_id)
+
+    def _unconfirmed_startups(self, db: Session, host_id: str) -> int:
+        candidates = db.scalars(
+            select(SqlSessionStartup).where(
+                SqlSessionStartup.workspace_id == current_workspace_id(),
+                SqlSessionStartup.host_id == host_id,
+                SqlSessionStartup.state == "uncertain",
+                SqlSessionStartup.occupied.is_(True),
+            )
+        ).all()
+        return sum(
+            1
+            for row in candidates
+            if (current := self._current_session_row(db, row.session_id)) is not None
+            and current.id == row.id
+        )
 
     def enqueue(
         self,
@@ -411,8 +453,7 @@ class SessionStartupStore:
                     old.session_id,
                     old.input_id,
                     old.runtime_generation,
-                    old.parent_startup_id,
-                ) != (host_id, session_id, input_id, runtime_generation, parent_startup_id):
+                ) != (host_id, session_id, input_id, runtime_generation):
                     raise ValueError("Conflicting startup operation key")
                 if old.preparation != preparation:
                     raise ValueError("Conflicting startup preparation")
@@ -488,6 +529,10 @@ class SessionStartupStore:
                 state="queued",
                 occupied=False,
                 resident=False,
+                runtime_ready=False,
+                tools_ready=False,
+                input_accepted=False,
+                work_started=False,
                 cancel_requested=False,
                 created_at=now_epoch(),
                 updated_at=now_epoch(),
@@ -546,11 +591,131 @@ class SessionStartupStore:
 
         return run_write_transaction(self._session, "attach_startup_preparation", write)
 
+    def attach_parent_dependency(self, startup_id: str, parent_startup_id: str) -> bool:
+        """Fence a queued child on its parent's current startup generation."""
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            parent = db.get(SqlSessionStartup, (current_workspace_id(), parent_startup_id))
+            child_current = self._current_session_row(db, row.session_id, locked=True)
+            parent_current = (
+                self._current_session_row(db, parent.session_id, locked=True)
+                if parent is not None
+                else None
+            )
+            if (
+                parent is None
+                or row.id == parent.id
+                or row.state != "queued"
+                or row.occupied
+                or row.cancel_requested
+                or row.attempt_id is not None
+                or child_current is None
+                or child_current.id != row.id
+                or parent_current is None
+                or parent_current.id != parent.id
+                or parent.parent_startup_id == row.id
+            ):
+                return False
+            if (row.parent_startup_id, row.family_id) != (parent.id, parent.family_id):
+                row.parent_startup_id = parent.id
+                row.family_id = parent.family_id
+                row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "attach_parent_startup_dependency", write)
+
+    def expire_observations(
+        self, host_id: str, *, now: int | None = None
+    ) -> list[StartupSnapshot]:
+        """Advance fixed observation budgets without releasing uncertain work."""
+        current_time = now_epoch() if now is None else now
+
+        def write(db: Session) -> list[StartupSnapshot]:
+            self._budgets(db, host_id)
+            changed: list[StartupSnapshot] = []
+            rows = db.scalars(
+                select(SqlSessionStartup)
+                .where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == host_id,
+                    SqlSessionStartup.state.in_(("queued", "starting", "verifying", "uncertain")),
+                )
+                .with_for_update()
+            ).all()
+            for row in rows:
+                if row.state == "queued":
+                    if current_time - row.created_at >= 86400:
+                        row.state, row.reason, row.updated_at = (
+                            "blocked",
+                            "needs_attention",
+                            current_time,
+                        )
+                        changed.append(_snapshot(row))
+                    continue
+                if not row.occupied or row.cancel_requested:
+                    continue
+                if row.admitted_at is None:
+                    if row.state != "uncertain":
+                        row.state, row.reason, row.updated_at = (
+                            "uncertain",
+                            "admission_origin_unknown",
+                            current_time,
+                        )
+                        changed.append(_snapshot(row))
+                    continue
+                deadlines: list[tuple[int, str, str]] = []
+                if not (row.runtime_ready and row.tools_ready):
+                    deadlines.append(
+                        (
+                            row.admitted_at + 180,
+                            "runtime_observation_pending",
+                            "runtime_readiness_unconfirmed",
+                        )
+                    )
+                if (
+                    row.input_id is not None
+                    and row.first_dispatch_at is not None
+                    and not (row.input_accepted and row.work_started)
+                ):
+                    deadlines.append(
+                        (
+                            row.first_dispatch_at + 120,
+                            "input_observation_pending",
+                            "input_start_unconfirmed",
+                        )
+                    )
+                if not deadlines:
+                    continue
+                deadline, pending_reason, final_reason = min(deadlines)
+                if current_time < deadline:
+                    continue
+                if row.state == "uncertain" and row.reason not in (
+                    "runtime_observation_pending",
+                    "input_observation_pending",
+                ):
+                    continue
+                if current_time < deadline + 30:
+                    if row.reason != pending_reason:
+                        row.reason, row.updated_at = pending_reason, current_time
+                        changed.append(_snapshot(row))
+                elif (row.state, row.reason) != ("uncertain", final_reason):
+                    row.state, row.reason, row.updated_at = "uncertain", final_reason, current_time
+                    changed.append(_snapshot(row))
+            return changed
+
+        return run_write_transaction(self._session, "expire_startup_observation_budget", write)
+
     def reserve(
         self, host_id: str, *, eligible_ids: set[str] | None = None
     ) -> StartupSnapshot | None:
         def write(db: Session) -> StartupSnapshot | None:
             deployment, host = self._budgets(db, host_id)
+            now = now_epoch()
             scope = (
                 SqlSessionStartup.workspace_id == current_workspace_id(),
                 SqlSessionStartup.host_id == host_id,
@@ -578,6 +743,18 @@ class SessionStartupStore:
                     .subquery()
                 )
                 return db.scalar(select(func.count()).select_from(contexts)) or 0
+
+            stale = db.scalars(
+                select(SqlSessionStartup)
+                .where(
+                    *scope,
+                    SqlSessionStartup.state == "queued",
+                    SqlSessionStartup.created_at <= now - 86400,
+                )
+                .with_for_update()
+            ).all()
+            for row in stale:
+                row.state, row.reason, row.updated_at = "blocked", "needs_attention", now
 
             if (
                 host.fenced
@@ -617,10 +794,16 @@ class SessionStartupStore:
                     parent = db.get(
                         SqlSessionStartup, (current_workspace_id(), row.parent_startup_id)
                     )
-                    if parent is None or parent.state not in (
-                        "working",
-                        "ready_empty",
-                        "command_completed",
+                    parent_current = (
+                        self._current_session_row(db, parent.session_id, locked=True)
+                        if parent is not None
+                        else None
+                    )
+                    if (
+                        parent is None
+                        or parent_current is None
+                        or parent_current.id != parent.id
+                        or parent.state not in ("working", "ready_empty", "command_completed")
                     ):
                         continue
                 eligible.append(row)
@@ -652,7 +835,7 @@ class SessionStartupStore:
             )
             row = family_heads[next_family]
             row.state, row.occupied, row.resident = "starting", True, True
-            row.attempt_id, row.updated_at = uuid4().hex, now_epoch()
+            row.attempt_id, row.updated_at, row.admitted_at = uuid4().hex, now, now
             host.last_family_id = row.family_id
             return _snapshot(row)
 
@@ -791,6 +974,7 @@ class SessionStartupStore:
                         "queued",
                         "starting",
                         "verifying",
+                        "waiting_input",
                         "uncertain",
                         "blocked",
                         "cancelling",
@@ -798,7 +982,10 @@ class SessionStartupStore:
                 ):
                     return None
             row.cancel_requested = True
-            row.state = "cancelling" if row.occupied else "cancelled"
+            physical_runner_claimed = row.state not in ("cancelled", "stopped") and bool(
+                {"runner_prepare", "runner_spawn"} & row.cold_claims.keys()
+            )
+            row.state = "cancelling" if row.occupied or physical_runner_claimed else "cancelled"
             row.updated_at = now_epoch()
             return _snapshot(row)
 
@@ -820,6 +1007,7 @@ class SessionStartupStore:
                 "queued",
                 "starting",
                 "verifying",
+                "waiting_input",
                 "blocked",
                 "uncertain",
                 "cancelling",
@@ -1009,6 +1197,63 @@ class SessionStartupStore:
 
         return run_write_transaction(self._session, "bind_startup_dispatch", write)
 
+    def defer_empty_sdk(
+        self,
+        startup_id: str,
+        attempt_id: str,
+        *,
+        runtime_id: str,
+        host_generation: str,
+        expected_runner_id: str,
+    ) -> bool:
+        """An owned empty runner may wait without claiming an SDK context."""
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            _, host = self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            current = self._current_session_row(db, row.session_id, locked=True)
+            if (
+                current is None
+                or current.id != row.id
+                or row.attempt_id != attempt_id
+                or row.runtime_id != runtime_id
+                or row.host_generation != host_generation
+                or host.current_generation != host_generation
+                or row.input_id is not None
+                or row.cancel_requested
+                or row.proof_source is not None
+                or row.vendor_session_id is not None
+                or row.vendor_turn_id is not None
+                or row.runtime_ready
+                or row.tools_ready
+                or row.input_accepted
+                or row.work_started
+                or any(
+                    boundary in row.cold_claims
+                    for boundary in (
+                        "harness_prepare",
+                        "executor_prepare",
+                        "native_prepare",
+                        "input_dispatch",
+                        "resident_reuse",
+                    )
+                )
+                or not self._bound_runner_matches(db, row, expected_runner_id)
+            ):
+                return False
+            if row.state == "waiting_input":
+                return not row.occupied and not row.resident
+            if row.state not in ("starting", "verifying") or not row.occupied:
+                return False
+            row.state, row.occupied, row.resident = "waiting_input", False, False
+            row.reason, row.updated_at = None, now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "defer_empty_sdk_startup", write)
+
     def observe(
         self,
         receipt: StartupReceipt,
@@ -1041,7 +1286,7 @@ class SessionStartupStore:
                 return True
             if row.cancel_requested:
                 return False
-            if receipt.phase in ("input_accepted", "work_started"):
+            if receipt.phase in ("input_dispatched", "input_accepted", "work_started"):
                 if row.proof_source is None or (
                     row.proof_source,
                     row.vendor_session_id,
@@ -1054,11 +1299,15 @@ class SessionStartupStore:
                 return row.state in ("working", "ready_empty") and receipt.phase in (
                     "runtime_ready",
                     "tools_ready",
+                    "input_dispatched",
                     "input_accepted",
                     "work_started",
                 )
             if receipt.phase in ("blocked", "uncertain") and row.state != "blocked":
                 row.state, row.reason = receipt.phase, receipt.reason
+            elif receipt.phase == "input_dispatched":
+                if row.first_dispatch_at is None:
+                    row.first_dispatch_at = now_epoch()
             elif receipt.phase not in ("blocked", "uncertain"):
                 setattr(row, receipt.phase, True)
                 if row.state != "blocked" and row.runtime_ready and row.tools_ready:

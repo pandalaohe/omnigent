@@ -32,7 +32,13 @@ class StartupObservation(BaseModel):
 
     attempt: StartupAttemptRef
     phase: Literal[
-        "runtime_ready", "tools_ready", "input_accepted", "work_started", "blocked", "uncertain"
+        "runtime_ready",
+        "tools_ready",
+        "input_dispatched",
+        "input_accepted",
+        "work_started",
+        "blocked",
+        "uncertain",
     ]
     source: str = Field(min_length=1, max_length=64)
     vendor_session_id: str | None = Field(default=None, max_length=256)
@@ -41,7 +47,7 @@ class StartupObservation(BaseModel):
 
     @model_validator(mode="after")
     def _require_vendor_identity(self) -> Self:
-        if self.phase in ("input_accepted", "work_started") and (
+        if self.phase in ("input_dispatched", "input_accepted", "work_started") and (
             self.source == "runner"
             or not self.vendor_session_id
             or not self.vendor_turn_id

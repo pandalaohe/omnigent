@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select
 
-from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id, workspace_scope
 from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
 from omnigent.entities.session_startup import StartupReceipt
 from omnigent.stores.session_startup_store import SessionStartupStore
@@ -243,3 +243,170 @@ def test_session_cancel_releases_reserved_permission_before_any_command(db_uri, 
     assert cancelled.state == "cancelled" and not cancelled.resident
     assert not store.claim(first.id, attempt.attempt_id, runtime_id="late")
     assert store.reserve(host).id == second.id
+
+
+def test_old_queue_requires_attention_and_keeps_canonical_work(db_uri):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=2, deployment_resident_limit=2)
+    queued = enqueue(store, host)
+    with store._session("read_startup_created_at") as db:
+        created_at = db.get(SqlSessionStartup, (current_workspace_id(), queued.id)).created_at
+    expired = store.expire_observations(host, now=created_at + 86400)
+    assert [(row.id, row.state, row.reason) for row in expired] == [
+        (queued.id, "blocked", "needs_attention")
+    ]
+    assert store.get(queued.id).input_id == queued.input_id
+    assert store.reserve(host) is None
+
+
+def test_attach_parent_dependency_rechecks_current_parent_and_replay(db_uri):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=3, deployment_resident_limit=3)
+    parent_session, child_session, child_input = uuid4().hex, uuid4().hex, uuid4().hex
+    parent = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=parent_session,
+        operation_key="parent-1",
+        input_id=uuid4().hex,
+    )
+    child = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=child_session,
+        operation_key="child",
+        input_id=child_input,
+    )
+    assert store.attach_parent_dependency(child.id, parent.id)
+    assert store.attach_parent_dependency(child.id, parent.id)
+    assert store.get(child.id).parent_startup_id == parent.id
+    assert (
+        store.enqueue(
+            owner_user_id="owner",
+            host_id=host,
+            session_id=child_session,
+            operation_key="child",
+            input_id=child_input,
+        ).id
+        == child.id
+    )
+    newer = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=parent_session,
+        operation_key="parent-2",
+        input_id=uuid4().hex,
+        runtime_generation=2,
+    )
+    assert not store.attach_parent_dependency(child.id, parent.id)
+    assert store.attach_parent_dependency(child.id, newer.id)
+    assert store.get(child.id).parent_startup_id == newer.id
+    assert store.reserve(host).id == parent.id
+    assert store.reserve(host).id == newer.id
+    assert store.reserve(host) is None
+
+
+def test_reserve_fences_child_when_ready_parent_has_newer_generation(db_uri):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=3, deployment_resident_limit=3)
+    parent_session = uuid4().hex
+    ready_parent = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=parent_session,
+        operation_key="parent-old",
+        input_id=uuid4().hex,
+    )
+    with store._session("seed_ready_old_parent_generation") as db:
+        db.get(SqlSessionStartup, (current_workspace_id(), ready_parent.id)).state = "working"
+    child = enqueue(store, host)
+    assert store.attach_parent_dependency(child.id, ready_parent.id)
+    current_parent = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=parent_session,
+        operation_key="parent-new",
+        input_id=uuid4().hex,
+        runtime_generation=2,
+    )
+    assert store.reserve(host, eligible_ids={child.id}) is None
+    assert store.attach_parent_dependency(child.id, current_parent.id)
+    assert store.reserve(host, eligible_ids={child.id}) is None
+    with store._session("seed_ready_current_parent_generation") as db:
+        db.get(SqlSessionStartup, (current_workspace_id(), current_parent.id)).state = "working"
+    assert store.reserve(host, eligible_ids={child.id}).id == child.id
+
+
+@pytest.mark.parametrize("cancel_path", ["current", "session"])
+def test_lazy_sdk_empty_releases_only_unclaimed_bound_context(db_uri, cancel_path):
+    store, host, session = SessionStartupStore(db_uri), uuid4().hex, uuid4().hex
+    store.configure(host, host_resident_limit=1, deployment_resident_limit=1)
+    store.register_host_generation(host, "generation")
+    with store._session("seed_bound_runner_for_lazy_empty") as db:
+        db.add(
+            SqlConversationMetadata(
+                workspace_id=current_workspace_id(),
+                id=session,
+                kind=1,
+                host_id=host,
+                workspace="/opt/work",
+                runner_id="bound-runner",
+            )
+        )
+    empty = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=session,
+        operation_key="empty-sdk",
+        input_id=None,
+    )
+    attempt = store.reserve(host)
+    assert store.claim_boundary(
+        empty.id,
+        attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="generation",
+        boundary="runner_prepare",
+        claim_id="runner-claim",
+        expected_runner_id="bound-runner",
+    )
+    assert not store.defer_empty_sdk(
+        empty.id,
+        attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="generation",
+        expected_runner_id="wrong-runner",
+    )
+    assert store.defer_empty_sdk(
+        empty.id,
+        attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="generation",
+        expected_runner_id="bound-runner",
+    )
+    deferred = store.get(empty.id)
+    assert (deferred.state, deferred.occupied, deferred.resident) == (
+        "waiting_input",
+        False,
+        False,
+    )
+    assert not deferred.input_accepted
+    assert store.defer_empty_sdk(
+        empty.id,
+        attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="generation",
+        expected_runner_id="bound-runner",
+    )
+    cancelled = (
+        store.cancel_current(empty.id, expected_attempt_id=attempt.attempt_id)
+        if cancel_path == "current"
+        else store.cancel_session_current(session)
+    )
+    assert cancelled.state == "cancelling"
+    assert (
+        store.cancel_current(empty.id, expected_attempt_id=attempt.attempt_id).state
+        == "cancelling"
+    )
+    assert store.confirm_stopped(empty.id, attempt.attempt_id)
+    assert store.get(empty.id).state == "cancelled"

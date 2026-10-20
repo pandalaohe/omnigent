@@ -52,3 +52,46 @@ async def test_snapshot_and_cancellation_keep_session_authority_and_attempt_fenc
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "cancelling"
     assert not startups.claim(queued.id, attempt.attempt_id, runtime_id="late-runtime")
+
+    lazy_created = await auth_client.post(
+        "/v1/sessions", json={"agent_id": agent["id"]}, headers=owner
+    )
+    assert lazy_created.status_code == 201, lazy_created.text
+    lazy_session_id = lazy_created.json()["id"]
+    conversations.set_host_id(lazy_session_id, host, "/opt/work/project")
+    assert conversations.set_runner_id(lazy_session_id, "bound-runner")
+    startups.register_host_generation(host, "generation")
+    lazy = startups.enqueue(
+        owner_user_id="owner@example.test",
+        host_id=host,
+        session_id=lazy_session_id,
+        operation_key="lazy-empty",
+        input_id=None,
+    )
+    lazy_attempt = startups.reserve(host)
+    assert lazy_attempt.id == lazy.id
+    assert startups.claim_boundary(
+        lazy.id,
+        lazy_attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="generation",
+        boundary="runner_prepare",
+        claim_id="runner-claim",
+        expected_runner_id="bound-runner",
+    )
+    assert startups.defer_empty_sdk(
+        lazy.id,
+        lazy_attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="generation",
+        expected_runner_id="bound-runner",
+    )
+    lazy_cancel = await auth_client.post(
+        f"/v1/sessions/{lazy_session_id}/startup/cancel",
+        json={"startup_id": lazy.id, "attempt_id": lazy_attempt.attempt_id},
+        headers=owner,
+    )
+    assert lazy_cancel.status_code == 200, lazy_cancel.text
+    assert lazy_cancel.json()["state"] == "cancelling"
+    assert startups.confirm_stopped(lazy.id, lazy_attempt.attempt_id)
+    assert startups.get(lazy.id).state == "cancelled"

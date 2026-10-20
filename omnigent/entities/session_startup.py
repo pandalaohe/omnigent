@@ -12,6 +12,7 @@ StartupState = Literal[
     "blocked",
     "cancelling",
     "ready_empty",
+    "waiting_input",
     "working",
     "cancelled",
     "stopped",
@@ -35,6 +36,9 @@ class SessionStartupStatus(BaseModel):
     state: StartupState
     reason: str | None
     elapsed_seconds: int = Field(ge=0)
+    admitted_elapsed_seconds: int | None = Field(default=None, ge=0)
+    input_elapsed_seconds: int | None = Field(default=None, ge=0)
+    unconfirmed_startups: int = Field(default=0, ge=0)
     queue_position_estimate: int | None = Field(default=None, ge=1)
     can_cancel: bool = False
     evidence: StartupEvidence
@@ -53,6 +57,7 @@ class StartupReceipt(BaseModel):
         "runtime_ready",
         "tools_ready",
         "input_accepted",
+        "input_dispatched",
         "work_started",
         "blocked",
         "uncertain",
