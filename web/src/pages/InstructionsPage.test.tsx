@@ -247,6 +247,65 @@ describe("InstructionsPage", () => {
     );
     expect(mocks.save).not.toHaveBeenCalled();
   });
+  it("saves an untouched prefill as an independent setting without marking it dirty", async () => {
+    page("/settings/instructions?view=route");
+    fireEvent.click(screen.getByRole("button", { name: "Edit independent setting" }));
+    expect(screen.queryByText(/· Unsaved changes/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save layer" }));
+    await screen.findByText("Layer saved.");
+    expect(mocks.save).toHaveBeenCalledWith({
+      scope: "independent",
+      agent_key: "codex",
+      host_id: "host-a",
+      text: "Shared text\n\nAgent text\n\nHost text",
+    });
+    expect(screen.getByRole("button", { name: "Save layer" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+  it.each(["Close", "Escape"])("closes an untouched independent draft with %s", async (action) => {
+    page();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Laptop / Codex" }));
+    expect(screen.getByLabelText("Instruction text")).toHaveValue(
+      "Shared text\n\nAgent text\n\nHost text",
+    );
+    if (action === "Close") fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    else await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mocks.save).not.toHaveBeenCalled();
+  });
+  it("keeps the discard prompt above long edited text and discards only on request", async () => {
+    page();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Laptop / Codex" }));
+    const editor = screen.getByLabelText("Instruction text");
+    fireEvent.change(editor, { target: { value: "Edited instructions\n".repeat(500) } });
+    await userEvent.keyboard("{Escape}");
+    const prompt = screen.getByRole("alert");
+    expect(prompt).toHaveTextContent("You have unsaved changes.");
+    expect(prompt.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(prompt).toHaveClass("sticky", "top-0");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(editor).toHaveValue("Edited instructions\n".repeat(500));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mocks.save).not.toHaveBeenCalled();
+  });
+  it.each(["Shared", "Codex", "Laptop"])("preserves dirty tracking for the %s layer", (name) => {
+    page();
+    fireEvent.click(screen.getByRole("button", { name: `Edit ${name}` }));
+    const editor = screen.getByLabelText("Instruction text");
+    const original = (editor as HTMLTextAreaElement).value;
+    expect(screen.getByRole("button", { name: "Save layer" })).toBeDisabled();
+    fireEvent.change(editor, { target: { value: "Changed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("You have unsaved changes.");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    fireEvent.change(editor, { target: { value: original } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
   it("reads the selected URL route and copies the exact composed total", async () => {
     page("/settings/instructions?view=route&host=host-a&agent=codex&child=1&peer=0");
     expect(mocks.previewQuery).toHaveBeenLastCalledWith(

@@ -32,13 +32,15 @@ export function LayerEditor({
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState(initialText ?? layer?.text ?? "");
+  const unchangedText = useRef(draft);
   const savedText = useRef(layer?.text ?? "");
   const [rendered, setRendered] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [notice, setNotice] = useState<InstructionRouteSize[] | null>(null);
   const history = useInstructionRevisions(layerKey);
   const save = useSaveInstructionLayer();
-  const dirty = draft !== savedText.current;
+  // An untouched prefill can still be saved as a new independent setting.
+  const dirty = draft !== unchangedText.current;
   const close = () => {
     if (dirty) setConfirmDiscard(true);
     else onClose();
@@ -46,6 +48,7 @@ export function LayerEditor({
   const persist = async (text: string) => {
     try {
       const result = await save.mutateAsync({ ...layerKey, text });
+      unchangedText.current = text;
       savedText.current = text;
       setNotice(result.over_budget_routes);
     } catch {
@@ -77,6 +80,22 @@ export function LayerEditor({
               : "Blank text turns this layer off. Other layers keep applying."}
           </DialogDescription>
         </DialogHeader>
+        {confirmDiscard && (
+          <div
+            role="alert"
+            className="sticky top-0 z-10 shrink-0 rounded-md border bg-popover p-3 text-sm"
+          >
+            You have unsaved changes.
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => setConfirmDiscard(false)}>
+                Keep editing
+              </Button>
+              <Button variant="destructive" onClick={onClose}>
+                Discard changes
+              </Button>
+            </div>
+          </div>
+        )}
         {!!layer?.stale_layers?.length && (
           <p role="status" className="text-sm text-muted-foreground">
             Replaced layers changed since this independent setting was saved:{" "}
@@ -103,7 +122,7 @@ export function LayerEditor({
             {[...draft].length.toLocaleString()} characters{dirty ? " · Unsaved changes" : ""}
           </span>
           <Button
-            disabled={!dirty || save.isPending}
+            disabled={draft === savedText.current || save.isPending}
             loading={save.isPending}
             onClick={() => void persist(draft)}
           >
@@ -137,19 +156,6 @@ export function LayerEditor({
                 kept in full.
               </p>
             )}
-          </div>
-        )}
-        {confirmDiscard && (
-          <div role="alert" className="rounded-md border p-3 text-sm">
-            You have unsaved changes.
-            <div className="mt-2 flex gap-2">
-              <Button variant="outline" onClick={() => setConfirmDiscard(false)}>
-                Keep editing
-              </Button>
-              <Button variant="destructive" onClick={onClose}>
-                Discard changes
-              </Button>
-            </div>
           </div>
         )}
         <section className="mt-4 border-t pt-4">
