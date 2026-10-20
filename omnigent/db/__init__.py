@@ -14,6 +14,7 @@ from omnigent.db.db_models import (
     workspace_scope,
 )
 from omnigent.db.query_context import current_query_name, query_name_scope
+from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
 
 __all__ = [
     "DEFAULT_WORKSPACE_ID",
@@ -24,6 +25,8 @@ __all__ = [
     "SqlConversationItem",
     "SqlFile",
     "SqlSessionPermission",
+    "SqlSessionStartup",
+    "SqlStartupBudget",
     "SqlUser",
     "current_query_name",
     "current_workspace_id",
