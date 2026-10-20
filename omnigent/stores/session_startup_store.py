@@ -190,7 +190,23 @@ class SessionStartupStore:
 
         return run_write_transaction(self._session, "enqueue_startup", write)
 
-    def reserve(self, host_id: str) -> StartupSnapshot | None:
+    def list_queued(self, host_id: str) -> list[StartupSnapshot]:
+        with self._session("read_host_startup_queue") as db:
+            rows = db.scalars(
+                select(SqlSessionStartup)
+                .where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == host_id,
+                    SqlSessionStartup.state == "queued",
+                )
+                .order_by(SqlSessionStartup.sequence)
+                .limit(100)
+            )
+            return [_snapshot(row) for row in rows]
+
+    def reserve(
+        self, host_id: str, *, eligible_ids: set[str] | None = None
+    ) -> StartupSnapshot | None:
         def write(db: Session) -> StartupSnapshot | None:
             deployment, host = self._budgets(db, host_id)
             scope = (
@@ -215,11 +231,10 @@ class SessionStartupStore:
                 or count(SqlSessionStartup.resident.is_(True)) >= deployment.resident_limit
             ):
                 return None
-            rows = db.scalars(
-                select(SqlSessionStartup)
-                .where(*scope, SqlSessionStartup.state == "queued")
-                .order_by(SqlSessionStartup.sequence)
-            ).all()
+            query = select(SqlSessionStartup).where(*scope, SqlSessionStartup.state == "queued")
+            if eligible_ids is not None:
+                query = query.where(SqlSessionStartup.id.in_(eligible_ids))
+            rows = db.scalars(query.order_by(SqlSessionStartup.sequence)).all()
             eligible = []
             for row in rows:
                 if row.parent_startup_id:
@@ -321,6 +336,31 @@ class SessionStartupStore:
 
         return run_write_transaction(self._session, "settle_stopped_startup", write)
 
+    def cancel_unissued(
+        self, startup_id: str, attempt_id: str | None, *, reason: str | None = None
+    ) -> bool:
+        """Fence a callback that has not issued; retain any already claimed runtime."""
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if row.attempt_id != attempt_id:
+                return False
+            row.cancel_requested = True
+            if row.runtime_id is None:
+                row.occupied = row.resident = False
+                row.state = "blocked" if reason else "cancelled"
+                row.reason = reason
+            else:
+                row.state = "cancelling"
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "cancel_unissued_startup", write)
+
     def bind_dispatch(
         self,
         startup_id: str,
@@ -414,3 +454,24 @@ class SessionStartupStore:
             return True
 
         return run_write_transaction(self._session, "observe_startup_receipt", write)
+
+    def mark_uncertain(self, startup_id: str, attempt_id: str | None, *, reason: str) -> bool:
+        """Losing a control-call response never frees a possibly live startup."""
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if (
+                row.attempt_id != attempt_id
+                or not row.occupied
+                or row.cancel_requested
+                or row.state == "blocked"
+            ):
+                return False
+            row.state, row.reason, row.updated_at = "uncertain", reason, now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "retain_uncertain_startup", write)
