@@ -1227,9 +1227,12 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("initial_revision", [None, "bundle.zip"])
-@pytest.mark.parametrize("harness_name", ["claude-native", "kiro-native", "pi-native"])
+@pytest.mark.parametrize(
+    "harness_name", ["claude-native", "kiro-native", "pi-native", "codex-native"]
+)
 async def test_native_revision_refreshes_relay_before_turn_without_reset(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     initial_revision: str | None,
     harness_name: str,
 ) -> None:
@@ -1237,6 +1240,9 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     bridge_id = f"bridge_{uuid.uuid4().hex[:12]}"
     bridge_dir = prepare_bridge_dir(bridge_id, workspace=tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge.bridge_dir_for_bridge_id", lambda _: bridge_dir
+    )
     relay_file = bridge_dir / _TOOL_RELAY_FILE
     tools_at_delivery: list[set[str]] = []
 
@@ -1315,6 +1321,7 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
                         {f"{service}__status"} if service is not None else set()
                     )
                     assert "list_comments" in names
+                    assert "ask_user_async" in names
                     assert manager.get_client_calls[-1][1] == harness_name
                     current_relay = json.loads(relay_file.read_text())
                     assert current_relay["url"] == initial_relay["url"]

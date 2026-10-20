@@ -7080,14 +7080,6 @@ def create_runner_app(
             session_open_enabled=open_for_relay,
             skill_registry=skill_registry,
         )
-        if _session_harness_name(session_id) == _CODEX_NATIVE_HARNESS:
-            # Codex has its own async question tool; the Omnigent card would
-            # duplicate it in the app-server's relay surface.
-            from omnigent.tools.builtins.ask_user import AskUserAsyncTool
-
-            relay_schemas = [
-                schema for schema in relay_schemas if schema.get("name") != AskUserAsyncTool.name()
-            ]
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
