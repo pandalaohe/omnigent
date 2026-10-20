@@ -170,8 +170,7 @@ async def _connect_host(
     )
     # Registration precedes the async online write and gateway report.
     while registry.get(host_id) is None or (
-        gateway_inference is not None
-        and registry.gateway_inference(host_id) != gateway_inference
+        gateway_inference is not None and registry.gateway_inference(host_id) != gateway_inference
     ):
         await asyncio.sleep(0.01)
 
