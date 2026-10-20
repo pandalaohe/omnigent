@@ -6779,7 +6779,7 @@ async def _open_in_panel_via_rest(
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"open_in_panel failed: {exc}"})
+        return json.dumps({"error": f"open_in_panel failed: {type(exc).__name__}: {exc}"})
     if response.status_code >= 400:
         return json.dumps(
             {
@@ -6830,7 +6830,7 @@ async def _ask_user_async_via_rest(
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"ask_user_async failed: {exc}"})
+        return json.dumps({"error": f"ask_user_async failed: {type(exc).__name__}: {exc}"})
     if response.status_code >= 400:
         return json.dumps(
             {
