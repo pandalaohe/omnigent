@@ -1,6 +1,6 @@
 """Admission metadata; pending conversation items remain the only input owner."""
 
-from sqlalchemy import BigInteger, Boolean, Index, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Boolean, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from omnigent.db.db_models import OmnigentBase, Uuid16, current_workspace_id
@@ -47,6 +47,8 @@ class SqlSessionStartup(OmnigentBase):
     occupied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     resident: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cold_claims: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
+    host_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 

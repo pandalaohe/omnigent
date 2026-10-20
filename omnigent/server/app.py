@@ -2236,9 +2236,7 @@ def create_app(
 
     app.state.startup_policy = startup_policy
     app.state.startup_store = (
-        SessionStartupStore(
-            conversation_store.conversation_storage_location or conversation_store.storage_location
-        )
+        SessionStartupStore(conversation_store.storage_location)
         if startup_policy is not None
         else None
     )

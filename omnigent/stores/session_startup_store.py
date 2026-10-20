@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import current_workspace_id
+from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -376,6 +376,65 @@ class SessionStartupStore:
             return True
 
         return run_write_transaction(self._session, "claim_startup", write)
+
+    def claim_boundary(
+        self,
+        startup_id: str,
+        attempt_id: str,
+        *,
+        runtime_id: str,
+        host_generation: str,
+        boundary: str,
+        claim_id: str,
+        expected_runner_id: str | None = None,
+    ) -> bool:
+        """A lost grant response is ambiguous; never grant the same physical start twice."""
+        if boundary not in (
+            "runner_prepare",
+            "runner_spawn",
+            "native_prepare",
+            "executor_prepare",
+        ):
+            raise ValueError("Unknown cold startup boundary")
+        if not all(0 < len(value) <= 128 for value in (runtime_id, host_generation, claim_id)):
+            raise ValueError("Invalid cold startup identity")
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            _, host = self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if (
+                host.fenced
+                or row.cancel_requested
+                or row.state == "blocked"
+                or row.attempt_id != attempt_id
+                or not row.occupied
+                or row.runtime_id not in (None, runtime_id)
+                or row.host_generation not in (None, host_generation)
+                or boundary in row.cold_claims
+                or (boundary == "runner_spawn" and "runner_prepare" not in row.cold_claims)
+            ):
+                return False
+            if expected_runner_id is not None:
+                binding = db.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), row.session_id),
+                    with_for_update=True,
+                )
+                if (
+                    binding is None
+                    or binding.host_id != row.host_id
+                    or binding.runner_id != expected_runner_id
+                ):
+                    return False
+            row.runtime_id, row.host_generation = runtime_id, host_generation
+            row.cold_claims = {**row.cold_claims, boundary: claim_id}
+            row.state, row.updated_at = "verifying", now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "grant_cold_start_boundary", write)
 
     def cancel(self, startup_id: str) -> StartupSnapshot | None:
         return self._cancel(startup_id, expected_attempt_id=None, compare=False)

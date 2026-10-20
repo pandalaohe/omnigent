@@ -66,6 +66,8 @@ from omnigent.host.frames import (
     HostRunnerStatusResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
+    HostStartupClaimFrame,
+    HostStartupClaimResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -90,6 +92,7 @@ from omnigent.server.host_registry import (
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.session_startup_store import SessionStartupStore
 
 _logger = logging.getLogger(__name__)
 
@@ -172,6 +175,7 @@ def create_host_tunnel_router(
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     conversation_store: ConversationStore | None = None,
+    startup_store: SessionStartupStore | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -499,6 +503,7 @@ def create_host_tunnel_router(
                         on_resource_snapshot,
                         on_host_update,
                         conversation_store,
+                        startup_store,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -829,6 +834,7 @@ async def _receive_loop(
     on_resource_snapshot: Callable[[HostConnection, HostResourceSnapshotFrame], None] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
     conversation_store: ConversationStore | None,
+    startup_store: SessionStartupStore | None = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -932,6 +938,29 @@ async def _receive_loop(
             # Delivered Host-local account state: already schema-validated and
             # stripped of auth/account fields by the shared frame decoder.
             conn.hello.codex_rate_limits = frame.codex_rate_limits
+            continue
+
+        if isinstance(frame, HostStartupClaimFrame):
+            from omnigent.server.startup_claims import authorize_host_startup_claim
+
+            granted = False
+            if startup_store is not None and conversation_store is not None:
+                try:
+                    granted = await authorize_host_startup_claim(
+                        frame,
+                        conn=conn,
+                        registry=host_registry,
+                        conversations=conversation_store,
+                        startups=startup_store,
+                    )
+                except Exception:  # noqa: BLE001 -- an unavailable authority never grants cold work
+                    _logger.warning("Startup claim could not be authorized")
+            host_registry.send_text(
+                conn,
+                encode_host_frame(
+                    HostStartupClaimResultFrame(request_id=frame.request_id, granted=granted)
+                ),
+            )
             continue
 
         if isinstance(frame, HostLaunchRunnerResultFrame):

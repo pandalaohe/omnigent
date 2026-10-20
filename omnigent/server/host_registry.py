@@ -23,7 +23,7 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -50,6 +50,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.startup_protocol import StartupAttemptRef
 
 _logger = logging.getLogger(__name__)
 
@@ -582,6 +583,9 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+        self.startup_admitter: (
+            Callable[[HostConnection, str], Awaitable[StartupAttemptRef]] | None
+        ) = None
 
     def register(
         self,
@@ -859,6 +863,24 @@ class HostRegistry:
         return list(reported) if reported is not None else None
 
     async def admit_launch(
+        self,
+        conn: HostConnection,
+        session_id: str,
+        *,
+        allow_unbound: bool = False,
+        transfer_from_host_id: str | None = None,
+    ) -> StartupAttemptRef | None:
+        await self.authorize_launch(
+            conn,
+            session_id,
+            allow_unbound=allow_unbound,
+            transfer_from_host_id=transfer_from_host_id,
+        )
+        if self.startup_admitter is not None:
+            return await self.startup_admitter(conn, session_id)
+        return None
+
+    async def authorize_launch(
         self,
         conn: HostConnection,
         session_id: str,
