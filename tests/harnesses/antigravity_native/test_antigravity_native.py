@@ -61,6 +61,7 @@ def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "omnigent.harnesses.antigravity_native.launch.agy_binary_path", lambda: "agy"
     )
     monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    monkeypatch.setattr(_mod, "_fetch_global_instructions", lambda **_: None)
 
 
 async def test_launch_terminal_body_uses_ensure_native_terminal_not_bridge_inject() -> None:
@@ -755,6 +756,14 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     user_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
     user_settings.write_text('{"model":"gemini-3-pro"}', encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
+    (real_home / ".gemini" / "AGENTS.md").write_text("USER-RULES", encoding="utf-8")
+    fetched: dict[str, object] = {}
+
+    def _global_text(**kwargs: object) -> str:
+        fetched.update(kwargs)
+        return "GLOBAL-MARKER"
+
+    monkeypatch.setattr(_mod, "_fetch_global_instructions", _global_text)
 
     captured_args: list[str] = []
     captured_env: dict[str, str] = {}
@@ -782,6 +791,10 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
 
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
     iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
+    assert fetched["session_id"] == "conv_abc123"
+    assert not (iso_gemini / "AGENTS.md").is_symlink()
+    assert (iso_gemini / "AGENTS.md").read_text() == "USER-RULES\n\nGLOBAL-MARKER"
+    assert (real_home / ".gemini" / "AGENTS.md").read_text() == "USER-RULES"
     # The flag leads the args so it is never swallowed by a later positional.
     assert captured_args[0] == f"--gemini_dir={iso_gemini}"
     # HOME must stay real: relocating it breaks keyring-backed auth on macOS.

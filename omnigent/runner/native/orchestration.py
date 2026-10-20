@@ -6860,6 +6860,7 @@ async def _auto_create_antigravity_terminal(
         seed_isolated_agy_home,
         bridge_dir,
         trusted_workspace=workspace,
+        startup_instructions=startup_instructions,
     )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an

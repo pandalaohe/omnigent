@@ -725,6 +725,7 @@ def seed_isolated_agy_home(
     bridge_dir: Path,
     *,
     trusted_workspace: Path | str | None = None,
+    startup_instructions: str | None = None,
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
@@ -748,6 +749,8 @@ def seed_isolated_agy_home(
         "Do you trust this project?" TUI gate for host-spawned sessions, mirroring
         ``ensure_claude_workspace_trusted`` while keeping trust scoped to this
         bridge-owned ``--gemini_dir``.
+    :param startup_instructions: Session instructions appended to a private
+        AGENTS.md copy, replacing any link without modifying its target.
     :returns: Env overrides to layer onto the agy launch environment. Currently
         empty because ``HOME`` must stay real for platform auth.
     """
@@ -778,6 +781,21 @@ def seed_isolated_agy_home(
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
     for rel in _AGY_INSTRUCTION_PATHS:
+        if rel == Path("AGENTS.md") and startup_instructions:
+            source = real_home / ".gemini" / rel
+            authored = source.read_text(encoding="utf-8") if source.is_file() else ""
+            text = f"{authored}\n\n{startup_instructions}" if authored else startup_instructions
+            fd, tmp_name = tempfile.mkstemp(prefix="AGENTS.md.", dir=iso_gemini)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(text)
+                # Replace the directory entry; never follow the user's symlink.
+                os.replace(tmp_name, iso_gemini / rel)
+            finally:
+                Path(tmp_name).unlink(missing_ok=True)
+            continue
+        if rel == Path("AGENTS.md"):
+            (iso_gemini / rel).unlink(missing_ok=True)
         _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
     _seed_isolated_agy_hooks(real_home, iso_gemini)
 

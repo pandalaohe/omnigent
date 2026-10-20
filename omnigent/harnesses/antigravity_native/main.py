@@ -129,6 +129,7 @@ from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.claude_native.main import (
     _attach_with_reconnect,
     _AttachOutcome,
+    _fetch_global_instructions,
     attach_local_terminal,
 )
 from omnigent.host.daemon_launch import (
@@ -139,6 +140,7 @@ from omnigent.host.daemon_launch import (
     wait_for_runner_online,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
+from omnigent.native.native_bridge_common import write_agent_instructions_preamble
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -1040,6 +1042,19 @@ async def _launch_and_record(
         arg for arg in antigravity_args if arg != "--dangerously-skip-permissions"
     )
     bridge_dir = prepare_bridge_dir(bridge_id)
+    from omnigent.runtime.prompt import native_startup_instructions
+
+    global_instructions = await asyncio.to_thread(
+        _fetch_global_instructions,
+        base_url=str(client.base_url),
+        headers=dict(client.headers),
+        session_id=session_id,
+    )
+    startup_instructions = native_startup_instructions(
+        None, global_instructions=global_instructions
+    )
+    if startup_instructions is not None:
+        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Clear stale turn/conversation state so a fresh launch rediscovers this run's
     # real agy conversation id instead of binding to the previous run's.
     await asyncio.to_thread(clear_bridge_state, bridge_dir)
@@ -1061,6 +1076,7 @@ async def _launch_and_record(
         seed_isolated_agy_home,
         bridge_dir,
         trusted_workspace=Path.cwd().resolve(),
+        startup_instructions=startup_instructions,
     )
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
