@@ -185,10 +185,14 @@ class ToolExecutor(Protocol):
 # str}``. Pi's native tools (e.g. ``read``, enabled for skill loading) execute
 # inside the Pi process and never traverse the bridged ``/mcp`` path, so the
 # ``tool_call`` extension hook routes them here for a TOOL_CALL policy verdict.
-NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
-    [str, dict[str, Any]],
-    Awaitable[dict[str, Any]] | dict[str, Any],
-]
+class NativePolicyGate(Protocol):
+    def __call__(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        call_id: str | None = None,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
 
 
 class _PiProviderConfig(TypedDict):
@@ -271,8 +275,8 @@ class _ToolServer:
         self.port: int = 0
         self._tool_executor: ToolExecutor | None = None
         # Policy gate for native (non-bridged) Pi tool calls, set by
-        # :meth:`PiExecutor._ensure_tool_server`. ``None`` (single-process
-        # / test paths) means native tool calls are not gated.
+        # :meth:`PiExecutor._ensure_tool_server`. An absent gate blocks native
+        # tools because no policy decision can be established.
         self._policy_gate: NativePolicyGate | None = None
         # Per-server bearer token required on every request. Minted at
         # construction (never None) so auth is always enforced.
@@ -323,6 +327,8 @@ class _ToolServer:
                     request = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(request, dict):
+                    break
                 # Authenticate before any dispatch; close the connection on
                 # failure (unlike the malformed-frame ``continue`` below).
                 if not self._token_ok(request.get("token")):
@@ -354,20 +360,39 @@ class _ToolServer:
                 # The Pi extension always supplies ``id`` and ``tool``
                 # on a tool request. Drop malformed frames rather than
                 # executing under an empty-string tool name.
-                if not isinstance(raw_req_id, str) or not isinstance(raw_tool_name, str):
+                if not isinstance(raw_req_id, str):
                     continue
-                tool_args = request.get("args", {})
+                if not isinstance(raw_tool_name, str) or not raw_tool_name:
+                    response = {"id": raw_req_id, "error": "invalid tool name"}
+                    writer.write((_safe_dumps(response, raw_req_id) + "\n").encode())
+                    await writer.drain()
+                    continue
+                tool_args = request.get(
+                    "args", None if request.get("kind") == "policy_eval" else {}
+                )
                 if request.get("kind") == "policy_eval":
                     # The ``tool_call`` extension hook asks for a TOOL_CALL
                     # verdict on a native (non-bridged) tool — evaluate only,
                     # never execute (Pi runs the tool itself on ALLOW).
-                    verdict = await self._evaluate_policy(raw_tool_name, tool_args)
-                    response = {"id": raw_req_id, "verdict": verdict}
-                else:
                     raw_call_id = request.get("call_id")
                     call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
-                    response = await self._execute(raw_tool_name, tool_args, call_id=call_id)
+                    verdict = (
+                        await self._evaluate_policy(raw_tool_name, tool_args, call_id=call_id)
+                        if call_id is not None
+                        else {"block": True, "reason": "invalid tool call ID"}
+                    )
+                    response = {"id": raw_req_id, "verdict": verdict}
+                elif request.get("kind") in (None, "tool_call"):
+                    raw_call_id = request.get("call_id")
+                    call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
+                    response = (
+                        await self._execute(raw_tool_name, tool_args, call_id=call_id)
+                        if isinstance(tool_args, dict)
+                        else {"error": "invalid tool arguments"}
+                    )
                     response["id"] = raw_req_id
+                else:
+                    response = {"id": raw_req_id, "error": "unknown tool request kind"}
                 # Serialize defensively: a tool result may carry a value
                 # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
                 # If it raises here — outside ``_execute``'s try — the frame
@@ -422,6 +447,8 @@ class _ToolServer:
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a native (non-bridged) tool call against TOOL_CALL policy.
 
@@ -429,25 +456,41 @@ class _ToolServer:
         :meth:`PiExecutor._ensure_tool_server`. Returns ``{"block": bool,
         "reason": str}``.
 
-        Fail-open (allow) when no gate is wired or the gate raises: this
-        mirrors the runner/scaffold policy-evaluation contract, which also
-        defaults to ALLOW on a stalled or failed verdict so a transient
-        Omnigent outage can't wedge the agent mid-turn.
+        An absent, failed, or malformed gate blocks the call. The generated
+        extension receives a concrete verdict even when policy is unavailable.
         """
+        unavailable = {"block": True, "reason": "permission check unavailable"}
+        if not isinstance(name, str) or not name or not isinstance(args, dict):
+            return unavailable
         if self._policy_gate is None:
-            return {"block": False, "reason": ""}
+            return unavailable
         try:
-            raw = self._policy_gate(name, args)
-            resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
-            if isinstance(resolved, dict):
+            raw = (
+                self._policy_gate(name, args, call_id=call_id)
+                if call_id is not None
+                else self._policy_gate(name, args)
+            )
+            if asyncio.iscoroutine(raw) or asyncio.isfuture(raw):
+                async with asyncio.timeout(_NATIVE_POLICY_APPROVAL_TIMEOUT_S):
+                    resolved = await raw
+            else:
+                resolved = raw
+            if (
+                isinstance(resolved, dict)
+                and type(resolved.get("block")) is bool
+                and ("reason" not in resolved or isinstance(resolved["reason"], str))
+                and "action" not in resolved
+            ):
                 return {
-                    "block": bool(resolved.get("block")),
-                    "reason": str(resolved.get("reason") or ""),
+                    "block": resolved["block"],
+                    "reason": resolved.get("reason")
+                    if isinstance(resolved.get("reason"), str)
+                    else "",
                 }
-            return {"block": False, "reason": ""}
-        except Exception as exc:  # noqa: BLE001 — fail-open; the verdict path must never wedge Pi
-            logger.warning("Pi native-tool policy eval failed for %r: %s", name, exc)
-            return {"block": False, "reason": ""}
+            return unavailable
+        except Exception:  # noqa: BLE001 — policy failures must not escape the socket
+            logger.warning("Pi native-tool policy eval failed for %r", name)
+            return unavailable
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +577,8 @@ def _generate_extension_js(port: int, tool_schemas: list[ToolSpec], token: str) 
 const net = require("net");
 
 const TOOLS = {tools_json};
-const BRIDGED = new Set(TOOLS.map((t) => t.name));
+const BRIDGED = new Set();
+const PI_NATIVE_TOOLS = new Set(["read", "bash", "write", "edit"]);
 const PORT = {port};
 const TOKEN = {token_json};
 
@@ -595,37 +639,56 @@ function callTool(toolName, args, callId) {{
   }});
 }}
 
-/**
- * Ask the Omnigent tool server for a TOOL_CALL policy verdict on a native
- * (non-bridged) Pi tool. Resolves to the verdict object {{ block, reason }}
- * or null. Fail-open (null) on any transport error: a wedged native tool
- * would break Pi worse than a missed gate, and bridged tools stay gated
- * server-side regardless.
- */
-function evalNativePolicy(toolName, args) {{
+/** Ask the tool server for an explicit native-tool policy verdict. */
+function evalNativePolicy(toolName, args, callId) {{
   return new Promise((resolve) => {{
+    let settled = false;
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
-      const frame = {{ id, token: TOKEN, kind: "policy_eval", tool: toolName, args }};
+      const frame = {{
+        id, token: TOKEN, kind: "policy_eval", tool: toolName,
+        args, call_id: callId
+      }};
       const req = JSON.stringify(frame) + "\\n";
       let buf = "";
       client.on("data", (chunk) => {{
         buf += chunk.toString();
         const nl = buf.indexOf("\\n");
         if (nl !== -1) {{
-          client.end();
           try {{
             const resp = JSON.parse(buf.slice(0, nl));
-            resolve(resp && resp.verdict ? resp.verdict : null);
+            const verdict = resp && resp.id === id && resp.verdict;
+            if (
+              verdict && !resp.error &&
+              !Object.prototype.hasOwnProperty.call(verdict, "action") &&
+              typeof verdict.block === "boolean" &&
+              (verdict.reason === undefined || typeof verdict.reason === "string")
+            ) {{
+              finish({{
+                block: verdict.block,
+                reason: typeof verdict.reason === "string" ? verdict.reason : ""
+              }});
+            }} else {{
+              finish(blocked());
+            }}
           }} catch (e) {{
-            resolve(null);
+            finish(blocked());
           }}
         }}
       }});
-      client.on("error", () => resolve(null));
       client.write(req);
     }});
-    client.on("error", () => resolve(null));
+    const blocked = () => ({{ block: true, reason: "permission check unavailable" }});
+    const timer = setTimeout(() => finish(blocked()), 86_400_000);
+    function finish(verdict) {{
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.destroy();
+      resolve(verdict);
+    }}
+    client.on("error", () => finish(blocked()));
+    client.on("close", () => finish(blocked()));
   }});
 }}
 
@@ -636,10 +699,12 @@ module.exports = function(pi) {{
   // escape all guardrails. Bridged tools ARE evaluated server-side at /mcp,
   // so skip them here to avoid double-evaluation (and double ASK prompts).
   pi.on("tool_call", async (event) => {{
-    if (!event || typeof event.toolName !== "string") return;
-    if (BRIDGED.has(event.toolName)) return;
-    const verdict = await evalNativePolicy(event.toolName, event.input || {{}});
-    if (verdict && verdict.block) {{
+    if (!event || typeof event.toolName !== "string" || !event.toolName) {{
+      return {{ block: true, reason: "invalid tool call" }};
+    }}
+    if (BRIDGED.has(event.toolName) && !PI_NATIVE_TOOLS.has(event.toolName)) return;
+    const verdict = await evalNativePolicy(event.toolName, event.input, event.toolCallId);
+    if (verdict.block) {{
       return {{ block: true, reason: verdict.reason || "blocked by Omnigent policy" }};
     }}
   }});
@@ -647,6 +712,7 @@ module.exports = function(pi) {{
   for (const tool of TOOLS) {{
     // Pi passes tool.parameters directly to the LLM as JSON Schema, so we
     // can use the Omnigent schema as-is without TypeBox conversion.
+    if (typeof pi.registerTool !== "function") continue;
     pi.registerTool({{
       name: tool.name,
       label: tool.name,
@@ -657,6 +723,7 @@ module.exports = function(pi) {{
         return callTool(tool.name, _params, toolCallId);
       }},
     }});
+    BRIDGED.add(tool.name);
   }}
 }};
 """
@@ -725,6 +792,10 @@ _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
 # the turn (a long tool call may stay silent past it); only a real stdout
 # EOF does. Module-level so tests can patch it.
 _TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
+
+# A parked human approval can outlast ordinary tool timeouts. This ceiling
+# bounds callbacks that never return while allowing a full day to decide.
+_NATIVE_POLICY_APPROVAL_TIMEOUT_S = 86_400.0
 
 # Post-error drain budget: pi emits the run's ``agent_end`` right after an
 # errored message, so only that gap is bounded tightly. Module-level so tests
@@ -2328,6 +2399,8 @@ class PiExecutor(Executor):
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a native Pi tool call against Omnigent TOOL_CALL policy.
 
@@ -2342,20 +2415,32 @@ class PiExecutor(Executor):
         :param name: Native tool name, e.g. ``"read"`` or ``"bash"``.
         :param args: The tool's argument dict.
         :returns: ``{"block": bool, "reason": str}`` — block on DENY.
-            Allow when no evaluator is wired (single-process / test paths).
-            TOOL_CALL ASK is collapsed to ALLOW/DENY server-side before the
-            verdict returns, so only DENY blocks here.
+            Only explicit ALLOW or UNSPECIFIED proceeds. A raw ASK or an
+            unavailable/malformed verdict blocks.
         """
         # ``_policy_evaluator`` is installed best-effort by the harness
         # scaffold's executor adapter; absent on single-process / pre-turn
         # paths. Same fetch pattern as the Claude SDK executor.
         evaluator = getattr(self, "_policy_evaluator", None)
         if evaluator is None:
+            return {"block": True, "reason": "permission check unavailable"}
+        if not isinstance(args, dict) or not isinstance(name, str) or not name:
+            return {"block": True, "reason": "invalid tool call"}
+        data: dict[str, Any] = {"name": name, "arguments": args}
+        if call_id is not None:
+            data["call_id"] = call_id
+        try:
+            verdict = await evaluator("PHASE_TOOL_CALL", data)
+        except Exception:  # noqa: BLE001 — a missing verdict must block the native tool
+            logger.warning("Pi native-tool policy evaluator failed for %r", name)
+            return {"block": True, "reason": "permission check unavailable"}
+        action = getattr(verdict, "action", None)
+        if action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
             return {"block": False, "reason": ""}
-        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
-        if verdict.action == "POLICY_ACTION_DENY":
-            return {"block": True, "reason": verdict.reason or "blocked by policy"}
-        return {"block": False, "reason": ""}
+        if action == "POLICY_ACTION_DENY":
+            reason = getattr(verdict, "reason", None)
+            return {"block": True, "reason": reason or "blocked by policy"}
+        return {"block": True, "reason": "permission check unavailable"}
 
     def _build_env_and_dir(
         self,

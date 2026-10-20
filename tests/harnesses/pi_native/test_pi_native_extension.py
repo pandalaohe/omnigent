@@ -1157,6 +1157,7 @@ fs.writeFileSync(
     authHeaders: {},
     tools: [
       { name: "sys_os_read", description: "", parameters: { type: "object", properties: {} } },
+      { name: "read", description: "ambiguous", parameters: { type: "object", properties: {} } },
     ],
   }),
 );
@@ -1196,13 +1197,27 @@ require(extensionPath)(pi);
     "bridged tool must not trigger hook-level policy eval: " + JSON.stringify(policyUrls),
   );
 
-  // Pi's own built-in tool (not bridged): hook MUST evaluate policy.
+  // Pi's built-in read still needs a hook check even if a bridge schema has
+  // the same name; registration alone cannot prove which execute Pi invokes.
   await handlers.tool_call({ toolCallId: "t2", toolName: "read", input: {} }, ctx);
   assert.equal(
     policyUrls.length,
     1,
-    "non-bridged tool must trigger hook-level policy eval: " + JSON.stringify(policyUrls),
+    "native-name collision must trigger hook-level policy eval: " + JSON.stringify(policyUrls),
   );
+
+  // A schema in config alone does not prove that this bridge registered and
+  // will execute the tool. Without registerTool, the hook must check it.
+  const unregisteredHandlers = {};
+  require(extensionPath)({
+    ...pi,
+    registerTool: undefined,
+    on(name, fn) { unregisteredHandlers[name] = fn; },
+  });
+  await unregisteredHandlers.tool_call(
+    { toolCallId: "t3", toolName: "sys_os_read", input: {} }, ctx,
+  );
+  assert.equal(policyUrls.length, 2, "unregistered bridge name must be gated");
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
@@ -2880,6 +2895,66 @@ def test_policy_malformed_body_fails_closed(tmp_path: Path) -> None:
 });
 """
     _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_policy_unknown_action_and_missing_fetch_block(tmp_path: Path) -> None:
+    body = r"""
+(async () => {
+  responders = [(_b) => makeJsonResponse({ result: "POLICY_ACTION_FUTURE" })];
+  const unknown = await runToolCall();
+  assert.equal(unknown && unknown.block, true, JSON.stringify(unknown));
+  assert.equal(evalBodies[0].event.data.call_id, "call-1");
+
+  global.fetch = undefined;
+  const unavailable = await runToolCall();
+  assert.equal(unavailable && unavailable.block, true, JSON.stringify(unavailable));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_policy_missing_config_blocks_even_with_fetch(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the Pi native extension")
+    script = r"""
+const assert = require("assert").strict;
+const path = require("path");
+process.env.OMNIGENT_PI_NATIVE_CONFIG = path.join(process.argv[2], "missing.json");
+let fetched = false;
+global.fetch = async () => {
+  fetched = true;
+  return { ok: true, json: async () => ({ result: "POLICY_ACTION_ALLOW" }) };
+};
+global.setInterval = () => ({ fakeInterval: true });
+const handlers = {};
+require(process.argv[1])({
+  on(name, handler) { handlers[name] = handler; },
+  registerCommand() {},
+});
+(async () => {
+  const verdict = await handlers.tool_call(
+    { toolCallId: "call-1", toolName: "bash", input: { command: "pwd" } },
+    { isIdle: () => false, abort() {} },
+  );
+  assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));
+  assert.equal(fetched, false, "missing config cannot authorize a tool");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(_extension_path()), str(tmp_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_policy_raw_ask_never_collapses_fails_closed(tmp_path: Path) -> None:

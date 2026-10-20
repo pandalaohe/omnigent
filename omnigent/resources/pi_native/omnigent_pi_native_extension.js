@@ -210,20 +210,30 @@ function relayCredentials() {
  * the deliberate exception: that is the human approval window, not an outage,
  * and we keep waiting (re-attaching) rather than blocking.
  *
- * @returns {Promise<{block: boolean, reason: string} | null>} A verdict.
- *   ``{block: true}`` either from a DENY or from failing closed; ``{block:
- *   false}`` on ALLOW; ``null`` only when the gate is structurally disabled
- *   (no server/session configured or no global fetch) so there is nothing to
- *   enforce against.
+ * @returns {Promise<{block: boolean, reason: string}>} A verdict; missing
+ *   configuration, transport failure and unknown actions block.
  */
-async function evalNativePolicyHttp(config, toolName, args) {
+async function evalNativePolicyHttp(config, toolName, args, callId) {
   if (
     !config ||
+    typeof config.serverUrl !== "string" ||
     !config.serverUrl ||
+    typeof config.sessionId !== "string" ||
     !config.sessionId ||
     typeof fetch !== "function"
   )
-    return null;
+    return failClosedVerdict();
+  if (
+    typeof toolName !== "string" ||
+    !toolName ||
+    !args ||
+    typeof args !== "object" ||
+    Array.isArray(args) ||
+    typeof callId !== "string" ||
+    !callId
+  ) {
+    return failClosedVerdict();
+  }
   // Prefer relay (non-expiring local token); fall back to direct server call.
   const relay = relayCredentials();
   const url = relay
@@ -234,15 +244,20 @@ async function evalNativePolicyHttp(config, toolName, args) {
   // card. Kept for the whole call, across both the park loop and any
   // transient-error retries.
   const elicitationId = mintEvaluateElicitationId();
-  const body = JSON.stringify({
-    event: {
-      type: "PHASE_TOOL_CALL",
-      target: "",
-      data: { name: toolName, arguments: args },
-      context: {},
-    },
-    _omnigent_elicitation_id: elicitationId,
-  });
+  let body;
+  try {
+    body = JSON.stringify({
+      event: {
+        type: "PHASE_TOOL_CALL",
+        target: "",
+        data: { name: toolName, arguments: args, call_id: callId },
+        context: {},
+      },
+      _omnigent_elicitation_id: elicitationId,
+    });
+  } catch (_err) {
+    return failClosedVerdict();
+  }
   const reqHeaders = relay
     ? {
         "content-type": "application/json",
@@ -329,11 +344,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
       if (timer) clearTimeout(timer);
     }
 
-    if (!resp.ok) {
+    if (!resp || resp.ok !== true) {
       // 5xx is transient (retry within budget, re-attaching); 4xx is final
       // (a bad request won't succeed on retry). Either way, an unevaluable
       // PHASE_TOOL_CALL fails CLOSED.
-      if (resp.status >= 500) {
+      if (resp && resp.status >= 500) {
         if (Date.now() + transientBackoff >= transientDeadline) {
           return failClosedVerdict();
         }
@@ -359,7 +374,10 @@ async function evalNativePolicyHttp(config, toolName, args) {
     if (result === "POLICY_ACTION_DENY") {
       return {
         block: true,
-        reason: json.reason || "blocked by Omnigent policy",
+        reason:
+          typeof json.reason === "string" && json.reason
+            ? json.reason
+            : "blocked by Omnigent policy",
       };
     }
     if (result === "POLICY_ACTION_ASK") {
@@ -383,8 +401,13 @@ async function evalNativePolicyHttp(config, toolName, args) {
       await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
       continue;
     }
-    // ALLOW / UNSPECIFIED / anything else → proceed.
-    return { block: false, reason: "" };
+    if (
+      result === "POLICY_ACTION_ALLOW" ||
+      result === "POLICY_ACTION_UNSPECIFIED"
+    ) {
+      return { block: false, reason: "" };
+    }
+    return failClosedVerdict();
   }
 }
 
@@ -637,7 +660,7 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
  * (``isError: true``) rather than throwing, so a server hiccup never wedges Pi's
  * agent loop.
  */
-async function callOmnigentTool(config, toolName, args) {
+async function callOmnigentTool(config, toolName, args, callId) {
   if (
     !config ||
     !config.serverUrl ||
@@ -674,20 +697,12 @@ async function callOmnigentTool(config, toolName, args) {
     };
   }
 
-  const verdict = await evalNativePolicyHttp(config, toolName, args || {});
-  if (verdict === null) {
-    // The approval gate is structurally unavailable (no server/session/fetch,
-    // or a transport error) — fail CLOSED rather than report false success.
-    return {
-      content: [
-        {
-          type: "text",
-          text: "Omnigent tool call requires approval but the policy server was unreachable",
-        },
-      ],
-      isError: true,
-    };
-  }
+  const verdict = await evalNativePolicyHttp(
+    config,
+    toolName,
+    args || {},
+    callId,
+  );
   const action = verdict.block ? "decline" : "accept";
 
   const retry = await postMcpToolsCall(config, toolName, args, 2, {
@@ -1511,12 +1526,12 @@ module.exports = function (pi) {
   // policies, double-prompt. Pi's OWN built-in tools (read/shell/etc) are not
   // in this set and stay gated by the hook below.
   const bridgedTools = new Set();
+  const piNativeTools = new Set(["read", "bash", "write", "edit"]);
   if (config && Array.isArray(config.tools)) {
     for (const tool of config.tools) {
       if (!tool || typeof tool !== "object") continue;
       const name = typeof tool.name === "string" ? tool.name : "";
       if (!name) continue;
-      bridgedTools.add(name);
       const description =
         typeof tool.description === "string" ? tool.description : "";
       const parameters =
@@ -1533,10 +1548,11 @@ module.exports = function (pi) {
           description,
           promptSnippet: description ? description.slice(0, 120) : name,
           parameters,
-          async execute(_toolCallId, params) {
-            return callOmnigentTool(config, name, params || {});
+          async execute(toolCallId, params) {
+            return callOmnigentTool(config, name, params || {}, toolCallId);
           },
         });
+        bridgedTools.add(name);
       }
     }
   }
@@ -2232,7 +2248,10 @@ module.exports = function (pi) {
     // so skip the hook-level eval for them to avoid double-evaluation and, for
     // ASK policies, a double prompt. Pi's own built-in tools (read/shell/etc)
     // are NOT bridged and stay gated here.
-    if (bridgedTools.has((event && event.toolName) || "")) {
+    if (
+      bridgedTools.has((event && event.toolName) || "") &&
+      !piNativeTools.has(event.toolName)
+    ) {
       return;
     }
     // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
@@ -2242,10 +2261,11 @@ module.exports = function (pi) {
     // of whether an Omnigent turn is currently in flight.
     const verdict = await evalNativePolicyHttp(
       config,
-      (event && event.toolName) || "",
-      (event && event.input) || {},
+      event && event.toolName,
+      event && event.input,
+      event && event.toolCallId,
     );
-    if (verdict && verdict.block) {
+    if (verdict.block) {
       return {
         block: true,
         reason: verdict.reason || "blocked by Omnigent policy",
