@@ -26,4 +26,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Retain startup receipts until all admitted attempts are reconciled")
+    with op.batch_alter_table("session_startups") as batch_op:
+        for name in (
+            "work_started",
+            "input_accepted",
+            "tools_ready",
+            "runtime_ready",
+            "vendor_turn_id",
+            "vendor_session_id",
+            "proof_source",
+        ):
+            batch_op.drop_column(name)

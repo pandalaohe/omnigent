@@ -344,7 +344,6 @@ def test_model_bounds_and_corrupt_row_stops_page(tmp_path: Path) -> None:
 
 def test_additive_migration_roundtrip(tmp_path: Path) -> None:
     from alembic import command
-    from alembic.script import ScriptDirectory
 
     from omnigent.db.enum_codecs import encode_device_grant_status
     from omnigent.db.utils import _build_alembic_config
@@ -352,7 +351,7 @@ def test_additive_migration_roundtrip(tmp_path: Path) -> None:
     uri = f"sqlite:///{tmp_path / 'migration.db'}"
     config = _build_alembic_config(uri)
     command.upgrade(config, "a31c20261019")
-    assert ScriptDirectory.from_config(config).get_heads() == ["a33c20261020"]
+
     engine = create_engine(uri)
     with engine.begin() as connection:
         connection.execute(

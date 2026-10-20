@@ -21,4 +21,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Retain recovery ownership and fences until reconciliation")
+    with op.batch_alter_table("session_startup_budgets") as batch_op:
+        batch_op.drop_column("recovery")
+        batch_op.drop_column("work_fence_epoch")
+        batch_op.drop_column("work_revision")

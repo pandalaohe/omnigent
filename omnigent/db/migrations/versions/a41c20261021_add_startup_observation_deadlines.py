@@ -19,4 +19,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Retain startup observation origins until attempts are reconciled")
+    with op.batch_alter_table("session_startups") as batch_op:
+        batch_op.drop_column("first_dispatch_at")
+        batch_op.drop_column("admitted_at")

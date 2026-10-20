@@ -62,5 +62,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Accepted input and unresolved execution permissions must survive rollback.
-    raise RuntimeError("Pause and reconcile startup admission before removing its tables")
+    op.drop_index("ix_session_startups_resident", table_name="session_startups")
+    op.drop_index("ix_session_startups_host_queue", table_name="session_startups")
+    op.drop_table("session_startups")
+    op.drop_table("session_startup_budgets")

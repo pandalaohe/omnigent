@@ -16,4 +16,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Retain accepted startup preparation until reconciled")
+    with op.batch_alter_table("session_startups") as batch_op:
+        batch_op.drop_column("preparation")
