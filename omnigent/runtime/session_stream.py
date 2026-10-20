@@ -43,7 +43,7 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.native.input_diagnostics import input_attributes
-from omnigent.runtime import disconnect_outcome, inflight_text, pending_elicitations
+from omnigent.runtime import disconnect_outcome, inflight_text, pending_elicitations, turn_activity
 
 _logger = logging.getLogger(__name__)
 
@@ -339,6 +339,7 @@ def publish(
     # server produces — including ones with no live subscriber.
     _log_sse_event(conversation_id, event)
     disconnect_outcome.observe_event(conversation_id, event)
+    turn_activity.record_publish(conversation_id, event)
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
     live_event = inflight_text.record_publish(conversation_id, event)
@@ -390,6 +391,7 @@ def close(conversation_id: str) -> None:
     :param conversation_id: The conversation whose subscribers
         should be signalled, e.g. ``"conv_abc123"``.
     """
+    turn_activity.discard(conversation_id)
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for subscriber in subs:

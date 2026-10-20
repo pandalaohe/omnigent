@@ -13,11 +13,15 @@ import pytest
 from fastapi import APIRouter
 
 from omnigent.entities import Conversation
-from omnigent.entities.conversation import MessageData, NewConversationItem
-from omnigent.runtime import pending_elicitations
+from omnigent.entities.conversation import (
+    MessageData,
+    NewConversationItem,
+)
+from omnigent.runtime import pending_elicitations, session_stream, turn_activity
 from omnigent.server.child_idle import (
     CHILD_IDLE_BATCH_LABEL,
     CHILD_IDLE_LABEL,
+    CHILD_RESUME_LABEL,
     ChildIdleSweeper,
     NoticeOutcome,
     batch_claim_valid,
@@ -42,6 +46,7 @@ class _Harness:
         self.owned: set[str] = set()
         self.outcome: NoticeOutcome = "accepted"
         self.raise_on_post = False
+        self.resumes: list[str] = []
         self.sweeper = self.new_sweeper()
         self.settings()
 
@@ -51,6 +56,7 @@ class _Harness:
             permission_store=None,
             owns_parent=lambda conv: conv.id in self.owned,
             post_notice=self.post,
+            resume_child=self.resume,
             clock=lambda: self.now,
         )
         sweeper._app = SimpleNamespace(state=SimpleNamespace(user_preferences_store=self.prefs))
@@ -62,29 +68,61 @@ class _Harness:
             raise TimeoutError("response lost")
         return self.outcome
 
+    async def resume(self, child: Conversation, _claim: str) -> NoticeOutcome:
+        self.resumes.append(child.id)
+        return "uncertain"
+
+    def freeze(self, **patch: Any) -> Conversation:
+        self.settings(
+            enabled=False,
+            mergeWindowSeconds=0,
+            repeatSeconds=0,
+            agents={
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                    "enabled": True,
+                    "checkIntervalSeconds": 60,
+                    "freezeThresholdSeconds": 120,
+                    **patch,
+                }
+            },
+        )
+        self.sweeper._liveness_lookup = lambda ids: {
+            sid: SimpleNamespace(runner_online=True) for sid in ids
+        }
+        return self.child(agent_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
     def settings(self, **patch: Any) -> None:
         self.prefs.patch_namespace("local", "child_idle", {"enabled": True, **patch})
 
-    def child(self, title: str = "work", parent: Conversation | None = None) -> Conversation:
+    def child(
+        self, title: str = "work", parent: Conversation | None = None, agent_id: str | None = None
+    ) -> Conversation:
         if parent is None:
             parent = self.store.create_conversation(title="mother")
         self.owned.add(parent.id)
         child = self.store.create_conversation(
             title=title,
+            agent_id=agent_id,
             kind="sub_agent",
             parent_conversation_id=parent.id,
             workspace="/opt/work/project",
             labels={RUNNING_SINCE_LABEL_KEY: "90000"},
         )
         self.store.set_session_live_status(child.id, "idle")
+        if agent_id is not None:
+            session_stream.publish(
+                child.id, {"type": "response.in_progress", "response": {"id": "initial-turn"}}
+            )
         return child
 
 
 @pytest.fixture
 def harness(db_uri: str):
     pending_elicitations.reset_for_tests()
+    turn_activity.reset_for_tests()
     yield _Harness(db_uri)
     pending_elicitations.reset_for_tests()
+    turn_activity.reset_for_tests()
 
 
 async def test_each_child_threshold_and_non_sliding_mother_window(harness: _Harness) -> None:
@@ -523,6 +561,42 @@ async def test_disable_and_repeat_zero(harness: _Harness) -> None:
     assert CHILD_IDLE_LABEL not in harness.store.get_conversation(child.id).labels
 
 
+@pytest.mark.parametrize("signal", ["running_quiet", "transient_error", "runner_offline"])
+async def test_freeze_signals_share_notice_batch(harness: _Harness, signal: str) -> None:
+    harness.settings(
+        enabled=False,
+        mergeWindowSeconds=0,
+        agents={
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                "enabled": True,
+                "checkIntervalSeconds": 120,
+                "freezeThresholdSeconds": 120,
+            }
+        },
+    )
+    child = harness.child(agent_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    harness.sweeper._liveness_lookup = lambda ids: {
+        sid: SimpleNamespace(runner_online=signal != "runner_offline") for sid in ids
+    }
+    if signal == "running_quiet":
+        harness.store.set_session_live_status(child.id, "running")
+    elif signal == "transient_error":
+        harness.store.set_labels(
+            child.id, {"omnigent.last_task_error_message": "Selected model is at capacity"}
+        )
+    await harness.sweeper._tick()
+    harness.now += 119
+    await harness.sweeper._tick()
+    assert harness.calls == []
+    harness.now += 1
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+    notice = json.loads(harness.calls[0][1].splitlines()[1])
+    assert notice["signal"] == signal
+    assert notice["signal_minutes"] == 2
+    assert notice["session_id"] == child.id
+
+
 def test_preference_defaults_validation_and_owner_roundtrip(db_uri: str) -> None:
     store = SqlAlchemyUserPreferencesStore(db_uri)
     assert read_child_idle_settings(store, "alice") == ChildIdleSettings()
@@ -534,7 +608,297 @@ def test_preference_defaults_validation_and_owner_roundtrip(db_uri: str) -> None
         {"idleThresholdSeconds": True},
         {"mergeWindowSeconds": -1},
         {"repeatSeconds": 1},
+        {"agents": []},
+        {"agents": {"a": {"enabled": 1}}},
+        {"agents": {"a": {"checkIntervalSeconds": True}}},
+        {"agents": {"a": {"freezeThresholdSeconds": 59}}},
+        {"agents": {"a": {"resumeOnce": "yes"}}},
     ):
         with pytest.raises(UserPreferencesValidationError):
             store.patch_namespace("alice", "child_idle", patch)
     assert json.loads(json.dumps(store.get("alice")))["settings"]["child_idle"]["enabled"] is True
+
+
+async def test_running_activity_resets_freeze_and_agent_rows_stay_independent(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = harness.freeze()
+    other = harness.child(
+        title="other",
+        agent_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        parent=harness.store.get_conversation(child.parent_conversation_id),
+    )
+    harness.store.set_session_live_status(child.id, "running")
+    await harness.sweeper._tick()
+    harness.now += 100
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: harness.now
+    )
+    harness.store.update_conversation(child.id, title="progress")
+    await harness.sweeper._tick()
+    harness.now += 119
+    await harness.sweeper._tick()
+    assert harness.calls == []
+    harness.now += 60
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+    assert other.id not in harness.calls[0][1]
+
+
+@pytest.mark.parametrize("block", ["pending", "archive", "unknown-runner"])
+async def test_freeze_guards(harness: _Harness, block: str) -> None:
+    child = harness.freeze()
+    harness.store.set_session_live_status(child.id, "running")
+    if block == "pending":
+        harness.store.set_pending_elicitation_count(child.id, 1)
+    elif block == "archive":
+        harness.store.update_conversation(child.id, archived=True)
+    elif block == "unknown-runner":
+        harness.sweeper._liveness_lookup = lambda _ids: {}
+    await harness.sweeper._tick()
+    harness.now += 7200
+    await harness.sweeper._tick()
+    assert harness.calls == []
+
+
+async def test_resume_budget_survives_restart_and_failed_new_turn(harness: _Harness) -> None:
+    child = harness.freeze(resumeOnce=True)
+    harness.store.set_labels(
+        child.id, {"omnigent.last_task_error_message": "Selected model is at capacity"}
+    )
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert harness.resumes == [child.id]
+    assert harness.calls == []
+    assert CHILD_RESUME_LABEL in harness.store.get_conversation(child.id).labels
+    harness.store.set_session_live_status(child.id, "running")
+    harness.store.set_labels(child.id, {RUNNING_SINCE_LABEL_KEY: "resume-turn"})
+    session_stream.publish(
+        child.id, {"type": "response.in_progress", "response": {"id": "resume-turn"}}
+    )
+    # Native PTY quiescence is not a successful completion.
+    harness.store.set_session_live_status(child.id, "idle")
+    harness.store.set_labels(child.id, {"omnigent.last_task_error_message": ""})
+    await harness.sweeper._tick()
+    assert CHILD_RESUME_LABEL in harness.store.get_conversation(child.id).labels
+    harness.store.set_labels(
+        child.id, {"omnigent.last_task_error_message": "Selected model is at capacity"}
+    )
+    await harness.sweeper._tick()
+    harness.sweeper = harness.new_sweeper()
+    harness.store.set_session_live_status(child.id, "failed")
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert harness.resumes == [child.id]
+    assert len(harness.calls) == 1
+    assert '"resume_attempted": true' in harness.calls[0][1]
+    harness.store.set_session_live_status(child.id, "idle")
+    harness.store.set_labels(child.id, {"omnigent.last_task_error_message": ""})
+    session_stream.publish(
+        child.id, {"type": "response.completed", "response": {"id": "resume-turn"}}
+    )
+    await harness.sweeper._tick()
+    assert CHILD_RESUME_LABEL in harness.store.get_conversation(child.id).labels
+
+
+async def test_resume_is_opt_in_and_does_not_retry_permanent_error(harness: _Harness) -> None:
+    child = harness.freeze(resumeOnce=True)
+    harness.store.set_session_live_status(child.id, "failed")
+    harness.store.set_labels(
+        child.id, {"omnigent.last_task_error_message": "authentication failed"}
+    )
+    await harness.sweeper._tick()
+    harness.now += 7200
+    await harness.sweeper._tick()
+    assert harness.resumes == [] and harness.calls == []
+
+
+@pytest.mark.parametrize("completion", ["native-injection", "replica-change"])
+async def test_resume_budget_cannot_be_rearmed_by_local_completion(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    completion: str,
+) -> None:
+    child = harness.freeze(resumeOnce=True)
+    session_stream.publish(
+        child.id, {"type": "response.completed", "response": {"id": "initial-turn"}}
+    )
+    old_replica = turn_activity.snapshot_for(child.id)
+    turn_activity.discard(child.id)
+    harness.store.set_labels(
+        child.id, {"omnigent.last_task_error_code": "transient_upstream_error"}
+    )
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    budget = harness.store.get_conversation(child.id).labels[CHILD_RESUME_LABEL]
+    assert harness.resumes == [child.id]
+    if completion == "native-injection":
+        session_stream.publish(
+            child.id, {"type": "response.in_progress", "response": {"id": "injection"}}
+        )
+        session_stream.publish(
+            child.id, {"type": "response.completed", "response": {"id": "injection"}}
+        )
+    else:
+        monkeypatch.setattr(turn_activity, "snapshot_for", lambda _sid: old_replica)
+    harness.store.set_labels(child.id, {"omnigent.last_task_error_code": ""})
+    harness.store.set_session_live_status(child.id, "idle")
+    await harness.sweeper._tick()
+    assert harness.store.get_conversation(child.id).labels[CHILD_RESUME_LABEL] == budget
+    harness.store.set_labels(
+        child.id,
+        {
+            "omnigent.last_task_error_code": "transient_upstream_error",
+            RUNNING_SINCE_LABEL_KEY: "later-failure",
+        },
+    )
+    harness.store.set_session_live_status(child.id, "failed")
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert harness.resumes == [child.id]
+    assert harness.store.get_conversation(child.id).labels[CHILD_RESUME_LABEL] == budget
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "archive", "card", "busy", "parent-archive", "disable"]
+)
+async def test_resume_entry_rechecks_eligibility(db_uri: str, change: str) -> None:
+    harness = _Harness(db_uri)
+    child = harness.freeze(resumeOnce=True)
+    parent = harness.store.get_conversation(child.parent_conversation_id)
+    harness.store.replace_runner_id(parent.id, "runner-a")
+    harness.store.set_session_live_status(child.id, "failed")
+    harness.store.set_labels(child.id, {"omnigent.last_task_error_code": "model_at_capacity"})
+    child = harness.store.get_conversation(child.id)
+    posts: list[str] = []
+
+    async def post(_request: Any, session_id: str, _event: Any, **_kwargs: Any) -> dict[str, Any]:
+        posts.append(session_id)
+        return {}
+
+    state = SimpleNamespace(user_preferences_store=harness.prefs)
+    register_peer_routes(
+        APIRouter(),
+        conversation_store=harness.store,
+        post_event_impl=post,
+        runner_router=SimpleNamespace(runner_is_online=lambda _id: True),
+        app_state=state,
+        liveness_lookup=lambda ids: {sid: SimpleNamespace(runner_online=True) for sid in ids},
+    )
+    idle = state.child_idle
+    idle._app = SimpleNamespace(state=state)
+    claim = idle._claim_batch(parent.id)
+    assert claim is not None
+    if change == "archive":
+        harness.store.update_conversation(child.id, archived=True)
+    elif change == "parent-archive":
+        harness.store.update_conversation(parent.id, archived=True)
+    elif change == "card":
+        harness.store.set_pending_elicitation_count(child.id, 1)
+    elif change == "busy":
+        harness.store.set_session_live_status(child.id, "running")
+    elif change == "disable":
+        harness.settings(enabled=False, agents={})
+    assert await idle._resume_child(child, claim) == (
+        "accepted" if change == "none" else "deferred"
+    )
+    assert posts == ([child.id] if change == "none" else [])
+
+
+async def test_check_interval_limits_tool_inspection(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = harness.freeze(checkIntervalSeconds=120)
+    harness.store.set_session_live_status(child.id, "running")
+    checks: list[str] = []
+
+    def open_tool(conv: Conversation) -> bool:
+        checks.append(conv.id)
+        return True
+
+    monkeypatch.setattr(harness.sweeper, "_running_has_open_tool", open_tool)
+    await harness.sweeper._tick()
+    harness.now += 60
+    await harness.sweeper._tick()
+    assert checks == [child.id]
+    harness.now += 60
+    await harness.sweeper._tick()
+    assert checks == [child.id, child.id]
+    assert harness.calls == []
+
+
+async def test_sdk_tool_events_excluded_from_history_still_block_freeze(harness: _Harness) -> None:
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    child = harness.freeze()
+    harness.store.set_session_live_status(child.id, "running")
+    event = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "status": "action_required",
+            "call_id": "blocking-shell",
+            "name": "shell",
+            "arguments": "{}",
+            "model": "test-agent",
+        },
+    }
+    assert _extract_persistent_item_from_sse(event, "initial-turn") is None
+    session_stream.publish(child.id, event)
+    await harness.sweeper._tick()
+    harness.now += 7200
+    await harness.sweeper._tick()
+    assert harness.calls == []
+    assert harness.store.list_items(child.id).data == []
+    session_stream.publish(
+        child.id,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call_output",
+                "call_id": "blocking-shell",
+                "output": "done",
+            },
+        },
+    )
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+
+
+async def test_relay_gap_cannot_prove_absence_of_tools(harness: _Harness) -> None:
+    child = harness.freeze()
+    harness.store.set_session_live_status(child.id, "running")
+    turn_activity.discard(child.id)
+    await harness.sweeper._tick()
+    harness.now += 7200
+    await harness.sweeper._tick()
+    assert harness.calls == []
+
+
+@pytest.mark.parametrize(
+    "message", ["The model is overloaded", "HTTP 503 service unavailable", "HTTP 529 overloaded"]
+)
+async def test_existing_native_error_classification_is_monitored(
+    harness: _Harness, message: str
+) -> None:
+    from omnigent.runner.launch_failure import classify_native_turn_error
+
+    child = harness.freeze()
+    code = classify_native_turn_error("native_turn_error", message)
+    assert code == "transient_upstream_error"
+    harness.store.set_labels(
+        child.id,
+        {"omnigent.last_task_error_code": code, "omnigent.last_task_error_message": message},
+    )
+    harness.store.set_session_live_status(child.id, "failed")
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1

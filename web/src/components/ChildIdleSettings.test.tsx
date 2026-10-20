@@ -10,6 +10,15 @@ import { ChildIdleSettings } from "./ChildIdleSettings";
 
 const { queuePatch } = vi.hoisted(() => ({ queuePatch: vi.fn() }));
 vi.mock("@/lib/userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatch }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: () => ({
+    data: [
+      { id: "agent-a", display_name: "Agent A" },
+      { id: "agent-b", display_name: "Agent B" },
+    ],
+    isLoading: false,
+  }),
+}));
 
 beforeEach(() => {
   localStorage.clear();
@@ -39,6 +48,7 @@ describe("idle child reminders", () => {
       idleThresholdSeconds: 7200,
       mergeWindowSeconds: 600,
       repeatSeconds: 0,
+      agents: {},
     });
     expect(localStorage.getItem("omnigent:keep-warm")).toBe('{"agents":{}}');
     fireEvent.click(screen.getByRole("switch", { name: /Remind parent sessions/ }));
@@ -68,5 +78,23 @@ describe("idle child reminders", () => {
     fireEvent.blur(input);
     expect(input).toHaveValue(60);
     expect(queuePatch).not.toHaveBeenCalled();
+  });
+
+  it("keeps independent agent rows and enables monitoring without idle reminders", () => {
+    render(<ChildIdleSettings />);
+    fireEvent.click(screen.getByRole("switch", { name: "Monitor Agent A children" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Agent A check every in minutes" }), {
+      target: { value: "15" },
+    });
+    fireEvent.click(screen.getByRole("switch", { name: "Resume Agent A once" }));
+    expect(readChildIdlePreferences().enabled).toBe(false);
+    expect(readChildIdlePreferences().agents["agent-a"]).toEqual({
+      enabled: true,
+      checkIntervalSeconds: 900,
+      freezeThresholdSeconds: 3600,
+      resumeOnce: true,
+    });
+    expect(screen.getByRole("switch", { name: "Monitor Agent B children" })).not.toBeChecked();
+    expect(screen.getByRole("spinbutton", { name: "Merge window in minutes" })).toBeEnabled();
   });
 });

@@ -3,11 +3,26 @@ import { queueUserPreferencePatch } from "@/lib/userPreferencesSync";
 export const CHILD_IDLE_STORAGE_KEY = "omnigent:child-idle";
 export const CHILD_IDLE_CHANGED_EVENT = "omnigent:child-idle-changed";
 
+export interface ChildFreezePreferences {
+  enabled: boolean;
+  checkIntervalSeconds: number;
+  freezeThresholdSeconds: number;
+  resumeOnce: boolean;
+}
+
+export const CHILD_FREEZE_DEFAULTS: ChildFreezePreferences = {
+  enabled: false,
+  checkIntervalSeconds: 3600,
+  freezeThresholdSeconds: 3600,
+  resumeOnce: false,
+};
+
 export interface ChildIdlePreferences {
   enabled: boolean;
   idleThresholdSeconds: number;
   mergeWindowSeconds: number;
   repeatSeconds: number;
+  agents: Record<string, ChildFreezePreferences>;
 }
 
 export const CHILD_IDLE_DEFAULTS: ChildIdlePreferences = {
@@ -15,6 +30,7 @@ export const CHILD_IDLE_DEFAULTS: ChildIdlePreferences = {
   idleThresholdSeconds: 3600,
   mergeWindowSeconds: 1800,
   repeatSeconds: 14400,
+  agents: {},
 };
 
 function normalize(value: unknown): ChildIdlePreferences {
@@ -26,11 +42,24 @@ function normalize(value: unknown): ChildIdlePreferences {
       ? input
       : fallback;
   const repeat = number(raw.repeatSeconds, 14400, 0, 604800);
+  const agents: Record<string, ChildFreezePreferences> = {};
+  if (raw.agents && typeof raw.agents === "object" && !Array.isArray(raw.agents)) {
+    for (const [id, row] of Object.entries(raw.agents)) {
+      if (!id || !row || typeof row !== "object" || Array.isArray(row)) continue;
+      agents[id] = {
+        enabled: row.enabled === true,
+        checkIntervalSeconds: number(row.checkIntervalSeconds, 3600, 60, 604800),
+        freezeThresholdSeconds: number(row.freezeThresholdSeconds, 3600, 60, 604800),
+        resumeOnce: row.resumeOnce === true,
+      };
+    }
+  }
   return {
     enabled: raw.enabled === true,
     idleThresholdSeconds: number(raw.idleThresholdSeconds, 3600, 60, 604800),
     mergeWindowSeconds: number(raw.mergeWindowSeconds, 1800, 0, 86400),
     repeatSeconds: repeat === 0 || repeat >= 60 ? repeat : 14400,
+    agents,
   };
 }
 

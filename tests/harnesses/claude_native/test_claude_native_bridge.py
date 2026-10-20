@@ -14795,6 +14795,7 @@ def test_http_ingress_advertises_absolute_socket_path(
     ``serve-mcp`` starts in. The runner reads ``server.json`` from its own working
     directory, so the advertised path has to be absolute to resolve there.
     """
+    monkeypatch.chdir(tmp_path)
     relative_root = os.path.relpath(_short_harness_socket_root / "nested" / "oa")
     assert not os.path.isabs(relative_root)
     assert not (_short_harness_socket_root / "nested").exists()

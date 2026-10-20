@@ -152,6 +152,14 @@ CHILD_IDLE_NAMESPACE = "child_idle"
 
 
 @dataclass(frozen=True)
+class ChildFreezeSettings:
+    enabled: bool = False
+    check_interval_s: int = 3600
+    freeze_threshold_s: int = 3600
+    resume_once: bool = False
+
+
+@dataclass(frozen=True)
 class ChildIdleSettings:
     """Owner-wide idle-child reminders, independent of provider cache warming."""
 
@@ -159,6 +167,7 @@ class ChildIdleSettings:
     idle_threshold_s: int = 3600
     merge_window_s: int = 1800
     repeat_s: int = 14400
+    agents: dict[str, ChildFreezeSettings] = field(default_factory=dict)
 
 
 def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
@@ -184,7 +193,28 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
                 "child_idle.repeatSeconds must be 0 or at least 60"
             )
         numbers.append(number)
-    return ChildIdleSettings(enabled, *numbers)
+    raw_agents = value.get("agents", {})
+    if not isinstance(raw_agents, dict):
+        raise UserPreferencesValidationError("child_idle.agents must be an object")
+    agents: dict[str, ChildFreezeSettings] = {}
+    for agent_id, row in raw_agents.items():
+        if not isinstance(agent_id, str) or not agent_id or not isinstance(row, dict):
+            raise UserPreferencesValidationError("child_idle.agents requires agent objects")
+        switches = [row.get("enabled", False), row.get("resumeOnce", False)]
+        if any(type(switch) is not bool for switch in switches):
+            raise UserPreferencesValidationError("child_idle agent switches must be booleans")
+        durations = [
+            row.get("checkIntervalSeconds", 3600),
+            row.get("freezeThresholdSeconds", 3600),
+        ]
+        if any(
+            type(duration) is not int or not 60 <= duration <= 604800 for duration in durations
+        ):
+            raise UserPreferencesValidationError("child_idle agent durations must be 60..604800")
+        agents[agent_id] = ChildFreezeSettings(
+            switches[0], durations[0], durations[1], switches[1]
+        )
+    return ChildIdleSettings(enabled, numbers[0], numbers[1], numbers[2], agents)
 
 
 def read_child_idle_settings(

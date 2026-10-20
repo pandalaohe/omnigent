@@ -5998,6 +5998,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             "omnigent.goal_state": "active",
+            "omnigent.child_idle_resume": "reserved",
             # The per-session artifact-link secret keys the source's links; the
             # clone must mint its own key rather than inherit them.
             ARTIFACT_LINK_KEY_LABEL: "source-secret",
