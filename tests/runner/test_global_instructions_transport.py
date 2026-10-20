@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -36,7 +37,11 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
-def _build_turn_app() -> tuple[FastAPI, _ScriptedHarnessClient]:
+def _build_turn_app(
+    *,
+    resolve_spec: bool = True,
+    resolver: Callable[[str, str | None], Awaitable[AgentSpec]] | None = None,
+) -> tuple[FastAPI, _ScriptedHarnessClient]:
     """Runner app whose harness completes one empty turn per request."""
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_1"}}),
@@ -51,7 +56,7 @@ def _build_turn_app() -> tuple[FastAPI, _ScriptedHarnessClient]:
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
+        spec_resolver=(resolver or _resolver) if resolve_spec else None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     return app, harness_client
@@ -131,17 +136,22 @@ async def _turn_instructions(
     client: httpx.AsyncClient,
     harness_client: _ScriptedHarnessClient,
     session_id: str,
+    *,
+    stream: bool = False,
+    instructions: str | None = None,
 ) -> str:
     """Run one background SDK turn; return the instructions it composed."""
     before = len(harness_client.posted_bodies)
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
+        params={"stream": str(stream).lower()},
         json={
             "type": "message",
             "role": "user",
             "model": "test-agent",
             "content": [{"type": "input_text", "text": "hello"}],
             "harness": "openai-agents",
+            "instructions": instructions,
         },
     )
     assert resp.status_code in (200, 202), resp.text
@@ -155,6 +165,55 @@ async def _turn_instructions(
     composed = harness_client.posted_bodies[-1].get("instructions")
     assert isinstance(composed, str)
     return composed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("request_instructions", [None, "REQUEST-MARKER"])
+async def test_unresolved_spec_keeps_global_instructions(
+    stream: bool, request_instructions: str | None
+) -> None:
+    app, harness_client = _build_turn_app(resolve_spec=False)
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(client, session_id, agent_id, "GLOBAL-MARKER")
+        composed = await _turn_instructions(
+            client, harness_client, session_id, stream=stream, instructions=request_instructions
+        )
+    assert composed == (
+        "REQUEST-MARKER\n\nGLOBAL-MARKER" if request_instructions else "GLOBAL-MARKER"
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_spec_resolution_error_keeps_global_instructions() -> None:
+    unavailable = False
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        if unavailable:
+            raise RuntimeError("spec temporarily unavailable")
+        return AgentSpec(spec_version=1, name="t")
+
+    app, harness_client = _build_turn_app(resolver=_resolver)
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(client, session_id, agent_id, "GLOBAL-MARKER")
+        unavailable = True
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            params={"stream": "true"},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": agent_id,
+                "agent_revision": "changed",
+                "harness": "openai-agents",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "instructions": "REQUEST-MARKER",
+            },
+        )
+        assert response.status_code == 200, response.text
+    assert harness_client.posted_bodies[-1]["instructions"] == "REQUEST-MARKER\n\nGLOBAL-MARKER"
 
 
 @pytest.mark.asyncio

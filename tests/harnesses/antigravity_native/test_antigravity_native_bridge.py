@@ -2216,6 +2216,39 @@ def test_seed_isolated_agy_home_links_symlinked_global_instructions(
     assert isolated_agents.read_text(encoding="utf-8") == "# published global agents"
 
 
+@pytest.mark.parametrize("existing", ["missing", "file", "symlink"])
+def test_seed_isolated_agy_home_keeps_startup_instructions_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: str
+) -> None:
+    fake_home = tmp_path / "real-home"
+    real_gemini = fake_home / ".gemini"
+    real_gemini.mkdir(parents=True)
+    source = real_gemini / "AGENTS.md"
+    if existing == "file":
+        source.write_text("USER-RULES", encoding="utf-8")
+    elif existing == "symlink":
+        target = tmp_path / "published.md"
+        target.write_text("USER-RULES", encoding="utf-8")
+        source.symlink_to(target)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    bridge = tmp_path / "bridge"
+    seed_isolated_agy_home(bridge)
+    isolated = agy_gemini_dir(bridge) / "AGENTS.md"
+    for marker in ("GI-FIRST", "GI-SECOND"):
+        seed_isolated_agy_home(bridge, startup_instructions=marker)
+        assert not isolated.is_symlink()
+        assert isolated.read_text() == (
+            marker if existing == "missing" else f"USER-RULES\n\n{marker}"
+        )
+        assert isolated.stat().st_mode & 0o777 == 0o600
+        if existing != "missing":
+            assert source.read_text() == "USER-RULES"
+        else:
+            assert not source.exists()
+    seed_isolated_agy_home(bridge, startup_instructions=None)
+    assert "GI-SECOND" not in (isolated.read_text() if isolated.exists() else "")
+
+
 def test_seed_isolated_agy_home_seeds_markers_but_never_tokens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

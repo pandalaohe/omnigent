@@ -226,6 +226,7 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
@@ -7112,14 +7113,6 @@ def create_runner_app(
             session_open_enabled=open_for_relay,
             skill_registry=skill_registry,
         )
-        if _session_harness_name(session_id) == _CODEX_NATIVE_HARNESS:
-            # Codex has its own async question tool; the Omnigent card would
-            # duplicate it in the app-server's relay surface.
-            from omnigent.tools.builtins.ask_user import AskUserAsyncTool
-
-            relay_schemas = [
-                schema for schema in relay_schemas if schema.get("name") != AskUserAsyncTool.name()
-            ]
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
@@ -7528,6 +7521,12 @@ def create_runner_app(
                             _bg_delivery.value,
                             extra={"session_id": conv},
                         )
+
+        else:
+            instructions = append_framework_instructions(
+                _raw_per_request_instructions,
+                _global_framework_instructions(_session_global_instructions.get(conv)),
+            )
 
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
@@ -8227,6 +8226,12 @@ def create_runner_app(
             # background path pre-composes).
             _instr_body = body
             if dispatch is None:
+                _instr_val = append_framework_instructions(
+                    cast(str | None, body.get("instructions")),
+                    _global_framework_instructions(_session_global_instructions.get(conv_id)),
+                )
+                if _instr_val is not None:
+                    _instr_body = {**body, "instructions": _instr_val}
                 with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
                     _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
                     _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
