@@ -5628,6 +5628,231 @@ def test_populate_codex_home_config_resyncs_dotted_key_role_defaults(tmp_path: P
     assert config["model"] == "gpt-session"
 
 
+def test_populate_codex_home_config_refreshes_windows_sandbox_in_reused_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows launch picks up the host sandbox choice without losing private edits."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "win32")
+    source = tmp_path / "source"
+    target = tmp_path / "private"
+    source.mkdir()
+    target.mkdir()
+    source_config = source / "config.toml"
+    source_config.write_text('windows.sandbox = "unelevated"\nmodel = "host"\n')
+    private_config = target / "config.toml"
+    private_config.write_text(
+        'model = "session" # private choice\n'
+        "[windows] # keep section comment\n"
+        'sandbox = "disabled" # keep sandbox comment\n'
+        'other = "private" # keep field comment\n'
+        "[profiles.local]\n"
+        'model = "session-profile"\n'
+    )
+
+    _populate_codex_home_config(target, source)
+
+    refreshed = private_config.read_text()
+    parsed = tomllib.loads(refreshed)
+    assert parsed["windows"] == {"sandbox": "unelevated", "other": "private"}
+    assert parsed["model"] == "session"
+    assert parsed["profiles"]["local"]["model"] == "session-profile"
+    assert "# private choice" in refreshed
+    assert "# keep section comment" in refreshed
+    assert "# keep sandbox comment" in refreshed
+    assert "# keep field comment" in refreshed
+    assert source_config.read_text() == 'windows.sandbox = "unelevated"\nmodel = "host"\n'
+
+    _populate_codex_home_config(target, source)
+    assert private_config.read_text() == refreshed
+
+
+def test_populate_codex_home_config_refreshes_inline_windows_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "win32")
+    source = tmp_path / "source"
+    target = tmp_path / "private"
+    source.mkdir()
+    target.mkdir()
+    (source / "config.toml").write_text('windows = { sandbox = "host" }\n')
+    private_config = target / "config.toml"
+    private_config.write_text('windows = { sandbox = "private", other = true }\n')
+
+    _populate_codex_home_config(target, source)
+
+    assert tomllib.loads(private_config.read_text())["windows"] == {
+        "sandbox": "host",
+        "other": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    ['model = "host"\n', '[windows]\nother = "host"\n'],
+)
+def test_populate_codex_home_config_keeps_private_sandbox_if_source_omits_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_text: str
+) -> None:
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "win32")
+    source = tmp_path / "source"
+    target = tmp_path / "private"
+    source.mkdir()
+    target.mkdir()
+    (source / "config.toml").write_text(source_text)
+    private_config = target / "config.toml"
+    original = '[windows]\nsandbox = "private" # keep\n'
+    private_config.write_text(original)
+
+    _populate_codex_home_config(target, source)
+
+    assert private_config.read_text() == original
+
+
+def test_populate_codex_home_config_skips_windows_sandbox_refresh_off_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "linux")
+    source = tmp_path / "source"
+    target = tmp_path / "private"
+    source.mkdir()
+    target.mkdir()
+    (source / "config.toml").write_text('[windows]\nsandbox = "host"\n')
+    private_config = target / "config.toml"
+    original = '[windows]\nsandbox = "private"\n'
+    private_config.write_text(original)
+
+    _populate_codex_home_config(target, source)
+
+    assert private_config.read_text() == original
+
+
+@pytest.mark.parametrize("options", [{"minimal_config": True}, {"include_credentials": False}])
+def test_populate_codex_home_config_skips_windows_sandbox_for_special_homes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, options: dict[str, bool]
+) -> None:
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "win32")
+    source = tmp_path / "source"
+    target = tmp_path / "private"
+    source.mkdir()
+    target.mkdir()
+    (source / "config.toml").write_text('[windows]\nsandbox = "host"\n')
+    private_config = target / "config.toml"
+    original = 'model_provider = "generated"\n[windows]\nsandbox = "private"\n'
+    private_config.write_text(original)
+
+    _populate_codex_home_config(target, source, **options)
+
+    assert private_config.read_text() == original
+
+
+@pytest.mark.parametrize("bad_side", ["source", "private"])
+def test_populate_codex_home_config_keeps_config_on_invalid_windows_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_side: str
+) -> None:
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "win32")
+    source = tmp_path / "source"
+    target = tmp_path / "private"
+    source.mkdir()
+    target.mkdir()
+    (source / "config.toml").write_text(
+        'windows = { sandbox = "host" }\n' if bad_side != "source" else "[windows\n"
+    )
+    private_config = target / "config.toml"
+    original = '[windows]\nsandbox = "private"\n' if bad_side != "private" else "[windows\n"
+    private_config.write_text(original)
+
+    _populate_codex_home_config(target, source)
+
+    assert private_config.read_text() == original
+
+
+@pytest.mark.parametrize("failure", ["mkstemp", "fdopen", "partial_write", "chmod", "replace"])
+def test_populate_codex_home_config_windows_sandbox_write_failure_keeps_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "win32")
+    source = tmp_path / "source"
+    target = tmp_path / "private"
+    source.mkdir()
+    target.mkdir()
+    (source / "config.toml").write_text('[windows]\nsandbox = "host"\n')
+    private_config = target / "config.toml"
+    original = b'[windows]\nsandbox = "private"\n'
+    private_config.write_bytes(original)
+    opened_fds: list[int] = []
+
+    with monkeypatch.context() as fault:
+        if failure == "mkstemp":
+            fault.setattr(
+                tempfile, "mkstemp", Mock(side_effect=OSError("cannot create temp file"))
+            )
+        elif failure == "fdopen":
+
+            def fail_fdopen(fd: int, *args: object, **kwargs: object) -> None:
+                opened_fds.append(fd)
+                raise OSError("cannot open temp file")
+
+            fault.setattr(os, "fdopen", fail_fdopen)
+        elif failure == "partial_write":
+            real_fdopen = os.fdopen
+
+            class PartialWriter:
+                def __init__(self, stream: Any) -> None:
+                    self.stream = stream
+
+                def __enter__(self) -> "PartialWriter":
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args: object) -> object:
+                    return self.stream.__exit__(*args)
+
+                def write(self, text: str) -> None:
+                    self.stream.write(text[:8])
+                    self.stream.flush()
+                    raise OSError("disk full during write")
+
+            fault.setattr(
+                os,
+                "fdopen",
+                lambda fd, *args, **kwargs: PartialWriter(real_fdopen(fd, *args, **kwargs)),
+            )
+        elif failure == "chmod":
+            fault.setattr(os, "chmod", Mock(side_effect=OSError("cannot set temp mode")))
+        else:
+            fault.setattr(os, "replace", Mock(side_effect=OSError("cannot replace config")))
+        _populate_codex_home_config(target, source)
+
+    for fd in opened_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    assert private_config.read_bytes() == original
+    assert set(target.iterdir()) == {private_config}
+
+    _populate_codex_home_config(target, source)
+    assert tomllib.loads(private_config.read_text())["windows"]["sandbox"] == "host"
+
+
 def test_populate_codex_home_config_minimal_mode_skips_role_default_sync(
     tmp_path: Path,
 ) -> None:
