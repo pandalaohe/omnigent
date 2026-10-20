@@ -580,6 +580,7 @@ export interface Session {
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;
+  startup?: SessionStartupStatus | null;
   /**
    * Per-MCP-server startup state for native harness sessions
    * (codex-native). Present while the harness boots its MCP servers or
@@ -640,6 +641,35 @@ export interface SandboxStatus {
   error?: string | null;
   /** Sandbox provider being launched, e.g. `"arclet"`; absent from older servers. */
   provider?: string | null;
+}
+
+/** Durable startup state; readiness flags come from correlated runtime receipts. */
+export interface SessionStartupStatus {
+  id: string;
+  attemptId: string | null;
+  inputId: string | null;
+  state:
+    | "queued"
+    | "starting"
+    | "verifying"
+    | "uncertain"
+    | "blocked"
+    | "cancelling"
+    | "ready_empty"
+    | "working"
+    | "cancelled"
+    | "stopped"
+    | "command_completed";
+  reason: string | null;
+  elapsedSeconds: number;
+  queuePositionEstimate: number | null;
+  canCancel: boolean;
+  evidence: {
+    runtimeReady: boolean;
+    toolsReady: boolean;
+    inputAccepted: boolean;
+    workStarted: boolean;
+  };
 }
 
 /** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */

@@ -1274,6 +1274,34 @@
         "title": "CallingDefaultsSyncRequest",
         "type": "object"
       },
+      "CancelStartupRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Id"
+          },
+          "startup_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Startup Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "startup_id",
+          "attempt_id"
+        ],
+        "title": "CancelStartupRequest",
+        "type": "object"
+      },
       "CancelledEvent": {
         "description": "Terminal event for a turn cancelled before completion.",
         "properties": {
@@ -7685,6 +7713,7 @@
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
             "session.speed_tier": "#/components/schemas/SessionSpeedTierEvent",
+            "session.startup": "#/components/schemas/SessionStartupEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
@@ -7738,6 +7767,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSandboxStatusEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionStartupEvent"
           },
           {
             "$ref": "#/components/schemas/SessionMcpStartupEvent"
@@ -10276,6 +10308,16 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
+          "startup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionStartupStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
@@ -10591,6 +10633,146 @@
           "speed_tier"
         ],
         "title": "SessionSpeedTierEvent",
+        "type": "object"
+      },
+      "SessionStartupEvent": {
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "startup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionStartupStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "const": "session.startup",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "startup"
+        ],
+        "title": "SessionStartupEvent",
+        "type": "object"
+      },
+      "SessionStartupStatus": {
+        "description": "Permission-filtered presentation carries no provider identity or input payload.",
+        "properties": {
+          "attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Id"
+          },
+          "can_cancel": {
+            "default": false,
+            "title": "Can Cancel",
+            "type": "boolean"
+          },
+          "elapsed_seconds": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Elapsed Seconds",
+            "type": "integer"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/StartupEvidence"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Id"
+          },
+          "queue_position_estimate": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Queue Position Estimate"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "queued",
+              "starting",
+              "verifying",
+              "uncertain",
+              "blocked",
+              "cancelling",
+              "ready_empty",
+              "working",
+              "cancelled",
+              "stopped",
+              "command_completed"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "attempt_id",
+          "input_id",
+          "state",
+          "reason",
+          "elapsed_seconds",
+          "evidence"
+        ],
+        "title": "SessionStartupStatus",
         "type": "object"
       },
       "SessionStatusEvent": {
@@ -11460,6 +11642,34 @@
           "level"
         ],
         "title": "SoundAlertClaimRequest",
+        "type": "object"
+      },
+      "StartupEvidence": {
+        "properties": {
+          "input_accepted": {
+            "title": "Input Accepted",
+            "type": "boolean"
+          },
+          "runtime_ready": {
+            "title": "Runtime Ready",
+            "type": "boolean"
+          },
+          "tools_ready": {
+            "title": "Tools Ready",
+            "type": "boolean"
+          },
+          "work_started": {
+            "title": "Work Started",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "runtime_ready",
+          "tools_ready",
+          "input_accepted",
+          "work_started"
+        ],
+        "title": "StartupEvidence",
         "type": "object"
       },
       "StartupInputOptions": {
@@ -22728,6 +22938,67 @@
           }
         },
         "summary": "Get Session Sign In Link",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/startup/cancel": {
+      "post": {
+        "operationId": "cancel_startup_v1_sessions__session_id__startup_cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelStartupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStartupStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "description": "Owner access required"
+          },
+          "404": {
+            "description": "Session startup not found"
+          },
+          "409": {
+            "description": "Startup attempt changed or already completed"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Startup",
         "tags": [
           "sessions"
         ]

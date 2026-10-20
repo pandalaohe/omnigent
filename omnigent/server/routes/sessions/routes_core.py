@@ -531,6 +531,14 @@ def register_core_routes(
         WorkspaceScopedCache()
     )
     child_cap_locks = ChildCapLocks()
+    from omnigent.server.routes.sessions.routes_startup import register_startup_routes
+
+    register_startup_routes(
+        router,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+    )
 
     @router.get("/sessions/{session_id}/child-cap", include_in_schema=False)
     async def get_child_cap(request: Request, session_id: str) -> dict[str, Any]:

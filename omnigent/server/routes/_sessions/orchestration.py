@@ -16245,6 +16245,13 @@ async def _get_session_snapshot(
     response.inference_error = inference_error
     response.usage_included = include_usage
     response.running_since = running_since
+    startup_store = (
+        getattr(request.app.state, "startup_store", None) if request is not None else None
+    )
+    if startup_store is not None:
+        response.startup = await asyncio.to_thread(startup_store.presentation, session_id)
+        if response.startup is not None and permission_level is not None and permission_level < 4:
+            response.startup.can_cancel = False
     startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
     if startup is not None and STARTUP_LABEL in conv.labels:
         queued = await startup.pending_snapshot(session_id)

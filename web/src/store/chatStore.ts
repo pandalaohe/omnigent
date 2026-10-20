@@ -132,6 +132,7 @@ import type {
   NativeModelOption,
   PendingInput,
   SandboxStatus,
+  SessionStartupStatus,
   Session,
   SessionStatus,
 } from "@/lib/types";
@@ -1099,6 +1100,7 @@ export interface ConversationState {
    * launch.
    */
   sandboxStatus: SandboxStatus | null;
+  startup: SessionStartupStatus | null;
   /** Managed startup accepts sends durably before its first harness dispatch. */
   startupPending: boolean;
   /**
@@ -2164,6 +2166,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
+  startup: null,
   startupPending: false,
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
@@ -4610,6 +4613,7 @@ function sessionBindingPatch(
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
+  | "startup"
   | "startupPending"
   | "mcpStartup"
   | "mcpStartupLaunch"
@@ -4649,6 +4653,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
+    startup: session.startup ?? null,
     // "ready" with saved inputs left: a native first input awaits its transcript
     // receipt, and the server still saves new messages behind it.
     startupPending:
@@ -8068,6 +8073,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           })
           .catch(() => {});
       }
+      return;
+    case "session_startup":
+      applyToNamedConversation(event.conversationId, { startup: event.startup });
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round

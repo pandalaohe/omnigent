@@ -9,6 +9,7 @@
 // catch — please add an SSE-parser test when you touch this.
 
 import { readSubagentActivity } from "./subagentActivity";
+import { sessionStartupFromWire } from "./sessionStartup";
 import type {
   ArtifactOpenRequestEvent,
   BrowserActionRequestEvent,
@@ -845,6 +846,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       error: typeof data.error === "string" ? data.error : null,
       provider: typeof data.provider === "string" ? data.provider : undefined,
     } satisfies SessionSandboxStatusEvent;
+  }
+  if (eventType === "session.startup") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const startup = sessionStartupFromWire(data.startup);
+    if (data.startup !== null && startup === null) return null;
+    return { type: "session_startup", conversationId, startup };
   }
   if (eventType === "session.mcp_startup") {
     const conversationId = data.conversation_id;

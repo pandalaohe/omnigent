@@ -1645,11 +1645,13 @@ def create_app(
         load_branding_snapshot,
         load_server_config,
         session_title_instructions,
+        startup_admission_policy,
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
+    startup_policy = startup_admission_policy(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     resolved_extension_state = _resolve_extension_state(extension_state)
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
@@ -2230,6 +2232,16 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    from omnigent.stores.session_startup_store import SessionStartupStore
+
+    app.state.startup_policy = startup_policy
+    app.state.startup_store = (
+        SessionStartupStore(
+            conversation_store.conversation_storage_location or conversation_store.storage_location
+        )
+        if startup_policy is not None
+        else None
+    )
     app.state.host_store = host_store
     app.state.project_host_binding_store = project_host_binding_store
     app.state.project_repository_store = project_repository_store

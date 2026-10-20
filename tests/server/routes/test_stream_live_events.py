@@ -8,6 +8,7 @@ normal stream completion — never during ``aclose`` / ``GeneratorExit``.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -128,3 +129,40 @@ async def test_normal_completion_emits_done_and_cleans_up(
             break
         await asyncio.sleep(0.02)
     assert presence.snapshot(SESSION_ID, SESSION_ID)["viewers"] == []
+
+
+@pytest.mark.parametrize("owner", [False, True])
+async def test_startup_cancel_capability_is_filtered_per_subscriber(owner: bool) -> None:
+    gen = _stream_live_events(
+        _ConnectedRequest(),
+        SESSION_ID,
+        startup_can_cancel=owner,  # type: ignore[arg-type]
+    )
+    await gen.__anext__()
+    session_stream.publish(
+        SESSION_ID,
+        {
+            "type": "session.startup",
+            "conversation_id": SESSION_ID,
+            "startup": {
+                "id": "startup",
+                "attempt_id": None,
+                "input_id": "input",
+                "state": "queued",
+                "reason": None,
+                "elapsed_seconds": 1,
+                "queue_position_estimate": 1,
+                "can_cancel": True,
+                "evidence": {
+                    "runtime_ready": False,
+                    "tools_ready": False,
+                    "input_accepted": False,
+                    "work_started": False,
+                },
+            },
+        },
+    )
+    frame = await asyncio.wait_for(gen.__anext__(), timeout=2)
+    await gen.aclose()
+    data = json.loads(next(line[6:] for line in frame.splitlines() if line.startswith("data: ")))
+    assert data["startup"]["can_cancel"] is owner

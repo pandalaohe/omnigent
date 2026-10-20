@@ -4,6 +4,41 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+StartupState = Literal[
+    "queued",
+    "starting",
+    "verifying",
+    "uncertain",
+    "blocked",
+    "cancelling",
+    "ready_empty",
+    "working",
+    "cancelled",
+    "stopped",
+    "command_completed",
+]
+
+
+class StartupEvidence(BaseModel):
+    runtime_ready: bool
+    tools_ready: bool
+    input_accepted: bool
+    work_started: bool
+
+
+class SessionStartupStatus(BaseModel):
+    """Permission-filtered presentation carries no provider identity or input payload."""
+
+    id: str
+    attempt_id: str | None
+    input_id: str | None
+    state: StartupState
+    reason: str | None
+    elapsed_seconds: int = Field(ge=0)
+    queue_position_estimate: int | None = Field(default=None, ge=1)
+    can_cancel: bool = False
+    evidence: StartupEvidence
+
 
 class StartupReceipt(BaseModel):
     """The authenticated adapter reports a correlated observation, not a UI badge."""

@@ -313,6 +313,7 @@ from omnigent.server.schemas import (
     SessionResourcePaginatedList,
     SessionSandboxStatusEvent,
     SessionSpeedTierEvent,
+    SessionStartupEvent,
     SessionStatusEvent,
     SessionSupersededEvent,
     SessionTerminalPendingEvent,
@@ -10166,6 +10167,7 @@ async def _stream_live_events(
     viewer_user_id: str | None = None,
     viewer_idle: bool = False,
     presence_root_id: str | None = None,
+    startup_can_cancel: bool = False,
 ) -> AsyncIterator[str]:
     """
     Yield SSE-formatted events from the conversation's live stream.
@@ -10271,6 +10273,17 @@ async def _stream_live_events(
                         f"session stream event missing string ``type`` field: {event!r}",
                     )
                 validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+                if isinstance(validated, SessionStartupEvent) and validated.startup is not None:
+                    validated = validated.model_copy(
+                        update={
+                            "startup": validated.startup.model_copy(
+                                update={
+                                    "can_cancel": startup_can_cancel
+                                    and validated.startup.can_cancel
+                                }
+                            )
+                        }
+                    )
                 yield _format_sse(event_type, validated.model_dump())
     except session_stream.SubscriberOverflowError:
         _logger.warning(

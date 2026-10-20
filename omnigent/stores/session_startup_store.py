@@ -15,7 +15,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
-from omnigent.entities.session_startup import StartupReceipt
+from omnigent.entities.session_startup import SessionStartupStatus, StartupReceipt
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,66 @@ class SessionStartupStore:
         with self._session("read_startup") as db:
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             return _snapshot(row) if row else None
+
+    def for_session(self, session_id: str) -> StartupSnapshot | None:
+        with self._session("read_current_session_startup") as db:
+            row = self._current_session_row(db, session_id)
+            return _snapshot(row) if row else None
+
+    @staticmethod
+    def _current_session_row(
+        db: Session, session_id: str, *, locked: bool = False
+    ) -> SqlSessionStartup | None:
+        query = (
+            select(SqlSessionStartup)
+            .where(
+                SqlSessionStartup.workspace_id == current_workspace_id(),
+                SqlSessionStartup.session_id == session_id,
+            )
+            .order_by(SqlSessionStartup.runtime_generation.desc())
+            .limit(1)
+        )
+        return db.scalar(query.with_for_update() if locked else query)
+
+    def presentation(self, session_id: str) -> SessionStartupStatus | None:
+        with self._session("read_startup_presentation") as db:
+            row = self._current_session_row(db, session_id)
+            if row is None:
+                return None
+            position = None
+            if row.state == "queued":
+                position = db.scalar(
+                    select(func.count())
+                    .select_from(SqlSessionStartup)
+                    .where(
+                        SqlSessionStartup.workspace_id == current_workspace_id(),
+                        SqlSessionStartup.host_id == row.host_id,
+                        SqlSessionStartup.state == "queued",
+                        SqlSessionStartup.sequence <= row.sequence,
+                    )
+                )
+            return SessionStartupStatus.model_validate(
+                {
+                    "id": row.id,
+                    "attempt_id": row.attempt_id,
+                    "input_id": row.input_id,
+                    "state": row.state,
+                    "reason": row.reason,
+                    "elapsed_seconds": max(0, now_epoch() - row.created_at),
+                    "queue_position_estimate": position,
+                    "can_cancel": row.state
+                    in ("queued", "starting", "verifying", "uncertain", "blocked"),
+                    "evidence": {
+                        name: getattr(row, name)
+                        for name in (
+                            "runtime_ready",
+                            "tools_ready",
+                            "input_accepted",
+                            "work_started",
+                        )
+                    },
+                }
+            )
 
     def enqueue(
         self,
@@ -318,12 +378,40 @@ class SessionStartupStore:
         return run_write_transaction(self._session, "claim_startup", write)
 
     def cancel(self, startup_id: str) -> StartupSnapshot | None:
+        return self._cancel(startup_id, expected_attempt_id=None, compare=False)
+
+    def cancel_current(
+        self, startup_id: str, *, expected_attempt_id: str | None
+    ) -> StartupSnapshot | None:
+        return self._cancel(startup_id, expected_attempt_id=expected_attempt_id, compare=True)
+
+    def _cancel(
+        self, startup_id: str, *, expected_attempt_id: str | None, compare: bool
+    ) -> StartupSnapshot | None:
         def write(db: Session) -> StartupSnapshot | None:
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             if row is None:
                 return None
             self._budgets(db, row.host_id)
             db.refresh(row, with_for_update=True)
+            if compare and row.attempt_id != expected_attempt_id:
+                return None
+            if compare:
+                current = self._current_session_row(db, row.session_id, locked=True)
+                if (
+                    current is None
+                    or current.id != row.id
+                    or row.state
+                    not in (
+                        "queued",
+                        "starting",
+                        "verifying",
+                        "uncertain",
+                        "blocked",
+                        "cancelling",
+                    )
+                ):
+                    return None
             row.cancel_requested = True
             row.state = "cancelling" if row.occupied else "cancelled"
             row.updated_at = now_epoch()

@@ -32,6 +32,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.entities.session_startup import SessionStartupStatus
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
@@ -2338,6 +2339,12 @@ class BackgroundTaskInfo(BaseModel):
     command: str | None = Field(default=None, max_length=8192)
 
 
+class CancelStartupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    startup_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    attempt_id: str | None = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -2717,6 +2724,7 @@ class SessionResponse(BaseModel):
     inference_error: str | None = None
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    startup: SessionStartupStatus | None = None
     # Per-MCP-server startup state for native harness sessions
     # (codex-native), present while the harness boots its MCP servers or
     # when servers were cancelled/failed. ``None`` otherwise. Sourced from
@@ -4176,6 +4184,12 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     provider: str | None = None
 
 
+class SessionStartupEvent(_SSEEventBase):
+    type: Literal["session.startup"]
+    conversation_id: str
+    startup: SessionStartupStatus | None
+
+
 class McpServerStartup(BaseModel):
     """
     One MCP server's startup state within a ``session.mcp_startup`` event.
@@ -5511,6 +5525,7 @@ ServerStreamEvent = Annotated[
     | SessionTodosEvent
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
+    | SessionStartupEvent
     | SessionMcpStartupEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent

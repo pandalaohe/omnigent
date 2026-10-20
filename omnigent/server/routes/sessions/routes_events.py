@@ -4669,6 +4669,7 @@ def register_events_routes(
                 # the CHILD conversation's stream, and per-conversation
                 # scoping would hide co-viewers on other agents.
                 presence_root_id=conv.root_conversation_id,
+                startup_can_cancel=access.level is None or access.level >= LEVEL_OWNER,
             ),
             media_type="text/event-stream",
             headers={
