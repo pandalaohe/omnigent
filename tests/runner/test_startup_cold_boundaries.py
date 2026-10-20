@@ -1,5 +1,6 @@
 """Cold admission precedes configuration, teardown and physical adapter work."""
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -8,11 +9,16 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from omnigent.inner.executor import MockExecutor
 from omnigent.runner import create_runner_app
 from omnigent.runner.native import _ensure_native_terminal, _launch_native_terminal
 from omnigent.runner.startup_admission import StartupAdmission
+from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, _SubprocessEntry
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.startup_protocol import StartupAttemptRef
+from tests.runner.conftest import _FakeProcessManager, _runner_client
+from tests.runner.helpers import NullServerClient
 from tests.runner.test_app_sessions_native_workflow_init import (
     _ensure_ctx,
     _FakeEnsureRegistry,
@@ -132,7 +138,8 @@ async def test_bound_harness_claim_requires_explicit_server_grant():
         base_url="http://server.test", transport=httpx.MockTransport(respond)
     ) as client:
         admission = StartupAdmission(client, root_session_id="root", root_attempt=_attempt())
-        await admission.admit_harness("child", "codex")
+        with pytest.raises(RuntimeError, match="Startup permission unavailable"):
+            await admission.admit_harness("child", "codex")
         assert requests == []
         await admission.admit_harness("root", "codex")
 
@@ -142,6 +149,64 @@ async def test_bound_harness_claim_requires_explicit_server_grant():
     assert body["attempt"] == _attempt().model_dump()
     assert body["boundary"] == "harness_prepare"
     assert len(body["claim_id"]) == 32
+
+
+@pytest.mark.asyncio
+async def test_protected_runner_refuses_unregistered_side_contexts():
+    async with httpx.AsyncClient() as client:
+        admission = StartupAdmission(client)
+        await admission.admit_harness("legacy", "codex")
+        admission.register("root", _attempt())
+        assert not admission.required("side-context")
+        with pytest.raises(RuntimeError, match="Startup permission unavailable"):
+            await admission.admit_harness("side-context", "codex")
+        with pytest.raises(RuntimeError, match="startup_proof_unavailable"):
+            await admission.native_admitter("side-context")()
+        admission.forget("root")
+        assert not admission.required("replacement")
+        with pytest.raises(RuntimeError, match="Startup permission unavailable"):
+            await admission.claim("replacement", "harness_prepare")
+
+
+@pytest.mark.asyncio
+async def test_enabling_cold_protection_keeps_warm_non_codex_messages_working():
+    executor = MockExecutor()
+    executor.enqueue_response("first")
+    executor.enqueue_response("followup")
+    harness = ExecutorAdapter(lambda: executor).build()
+    harness.state.conversation_id = "warm"
+    spec = AgentSpec(
+        spec_version=1,
+        name="agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+    async with _runner_client(harness) as harness_client:
+        app = create_runner_app(
+            process_manager=_FakeProcessManager(harness_client),
+            spec_resolver=AsyncMock(return_value=spec),
+            server_client=NullServerClient(),
+        )
+        async with _runner_client(app) as client:
+            assert (
+                await client.post("/v1/sessions", json={"session_id": "warm", "agent_id": "agent"})
+            ).status_code == 201
+            for turn in range(2):
+                if turn:
+                    app.state.startup_admission.register("root", _attempt())
+                response = await client.post(
+                    "/v1/sessions/warm/events",
+                    json={"type": "message", "role": "user", "model": "agent", "content": []},
+                )
+                assert response.status_code == 202
+
+                async def settled():
+                    while "warm" in app.state.active_turns:
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(settled(), 3)
+            events = list(app.state.session_event_queues["warm"]._queue)
+            assert sum(event.get("type") == "response.completed" for event in events) == 2
+            assert all(event.get("type") != "response.failed" for event in events)
 
 
 @pytest.mark.asyncio
@@ -177,7 +242,9 @@ async def test_missing_child_ref_and_native_proof_refuse_before_claim():
             await admission.admit_harness("child", "codex")
         with pytest.raises(RuntimeError, match="startup_proof_unavailable"):
             await admission.native_admitter("root")()
-        await admission.native_admitter("ordinary")()
+        with pytest.raises(RuntimeError, match="startup_proof_unavailable"):
+            await admission.native_admitter("ordinary")()
+        await StartupAdmission(client).native_admitter("ordinary")()
     assert requests == []
 
 

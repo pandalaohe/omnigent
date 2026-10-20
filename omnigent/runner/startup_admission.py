@@ -21,6 +21,7 @@ class StartupAdmission:
         root_attempt: StartupAttemptRef | None = None,
     ) -> None:
         self._server_client = server_client
+        self._enabled = False
         self._attempts: dict[str, StartupAttemptRef | None] = {}
         self._observations: dict[str, dict[str, StartupObservation]] = {}
         if root_attempt is not None:
@@ -39,6 +40,7 @@ class StartupAdmission:
         if not session_id:
             raise ValueError("Startup session id is required")
         if required:
+            self._enabled = True
             if self._attempts.get(session_id) != attempt:
                 self._observations.pop(session_id, None)
             self._attempts[session_id] = attempt
@@ -73,9 +75,9 @@ class StartupAdmission:
     def required(self, session_id: str) -> bool:
         return session_id in self._attempts
 
-    def native_admitter(self, session_id: str) -> Callable[[], Awaitable[None]]:
+    def native_admitter(self, _session_id: str) -> Callable[[], Awaitable[None]]:
         async def admit() -> None:
-            if self.required(session_id):
+            if self._enabled:
                 # None of the native adapters has an exclusive first-input/work
                 # proof contract yet. Refuse before claiming or booting it.
                 raise RuntimeError("startup_proof_unavailable")
@@ -83,14 +85,14 @@ class StartupAdmission:
         return admit
 
     async def admit_harness(self, session_id: str, harness: str) -> None:
-        if self.required(session_id) and harness != "codex":
+        if self._enabled and harness != "codex":
             raise RuntimeError("startup_proof_unavailable")
         await self.claim(session_id, "harness_prepare")
 
     async def claim(self, session_id: str, boundary: str) -> None:
-        if session_id not in self._attempts:
+        if not self._enabled:
             return
-        attempt = self._attempts[session_id]
+        attempt = self._attempts.get(session_id)
         if attempt is None:
             raise RuntimeError("Startup permission unavailable")
         try:
