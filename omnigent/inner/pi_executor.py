@@ -45,7 +45,6 @@ import re
 import secrets
 import shlex
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -56,7 +55,7 @@ from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
-from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
 from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
@@ -117,6 +116,7 @@ logger = logging.getLogger(__name__)
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
 _GATEWAY_AUTH_TIMEOUT_S = 7
+_GATEWAY_AUTH_REAP_TIMEOUT_S = 0.5
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
 
 
@@ -132,22 +132,25 @@ CodexEvent: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 async def _fetch_shell_command_token(command: str) -> str:
     """Resolve a token with a deadline, without exposing helper output on failure."""
-    process = await asyncio.create_subprocess_exec(
-        "sh",
-        "-c",
-        command,
+    process = await _create_subprocess_exec(
+        *default_shell_argv(command),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=True,
+        **_proc.spawn_kwargs(),
     )
+    _proc.remember_process_group(process)
     try:
         try:
             stdout, _ = await asyncio.wait_for(process.communicate(), _GATEWAY_AUTH_TIMEOUT_S)
         except (TimeoutError, asyncio.CancelledError):
             # Children may still hold stdout open after the helper shell exits.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            await process.communicate()
+            with contextlib.suppress(Exception):
+                _proc.kill_tree(process)
+            try:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(process.communicate(), _GATEWAY_AUTH_REAP_TIMEOUT_S)
+            finally:
+                close_subprocess_transport(process)
             raise
         if process.returncode != 0:
             raise _GatewayAuthError("Pi gateway auth command failed")

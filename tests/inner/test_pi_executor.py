@@ -2436,6 +2436,108 @@ async def test_gateway_helper_failure_is_bounded_and_redacted(monkeypatch, comma
     assert "secret" not in str(failure.value)
 
 
+async def test_gateway_helper_windows_shell_and_process_flags(monkeypatch):
+    import omnigent._platform as platform_mod
+    from omnigent.inner import _proc, pi_executor
+
+    command = 'echo "synthetic value" & exit /b 0'
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(pi_executor, "IS_WINDOWS", True)
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    monkeypatch.setattr(_proc, "_CREATE_NEW_PROCESS_GROUP", 0x200)
+    monkeypatch.setattr(pi_executor.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setenv("COMSPEC", "C:/fixtures/cmd.exe")
+    process = SimpleNamespace(
+        pid=90001, returncode=0, communicate=AsyncMock(return_value=(b"synthetic value\n", b""))
+    )
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(
+        pi_executor,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            wait_for=asyncio.wait_for,
+            CancelledError=asyncio.CancelledError,
+        ),
+    )
+
+    assert await pi_executor._fetch_shell_command_token(command) == "synthetic value"
+    spawn.assert_awaited_once_with(
+        "C:/fixtures/cmd.exe",
+        "/c",
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        creationflags=0x08000200,
+    )
+
+
+@pytest.mark.parametrize("interruption", ["timeout", "cancel"])
+async def test_gateway_helper_interruption_kills_tree_and_drains(monkeypatch, interruption):
+    from omnigent.inner import _proc, pi_executor
+
+    entered = asyncio.Event()
+    killed = asyncio.Event()
+    communicate_calls = 0
+
+    async def communicate():
+        nonlocal communicate_calls
+        communicate_calls += 1
+        entered.set()
+        await killed.wait()
+        return b"synthetic\n", b""
+
+    process = SimpleNamespace(pid=90002, returncode=None, communicate=communicate)
+    spawn = AsyncMock(return_value=process)
+    kill = MagicMock(side_effect=lambda _: killed.set())
+    monkeypatch.setattr(pi_executor, "_create_subprocess_exec", spawn)
+    monkeypatch.setattr(_proc, "remember_process_group", MagicMock())
+    monkeypatch.setattr(_proc, "kill_tree", kill)
+    monkeypatch.setattr(
+        pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 1 if interruption == "cancel" else 0.01
+    )
+
+    task = asyncio.create_task(pi_executor._fetch_shell_command_token("synthetic command"))
+    if interruption == "cancel":
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(OSError, match="timed out"):
+            await task
+    kill.assert_called_once_with(process)
+    assert communicate_calls == 2
+
+
+async def test_gateway_helper_exited_leader_pipe_is_bounded(monkeypatch):
+    from omnigent.inner import _proc, pi_executor
+
+    entered = asyncio.Event()
+
+    async def communicate():
+        entered.set()
+        await asyncio.Event().wait()  # A child retains stdout after its shell exits.
+
+    process = SimpleNamespace(pid=90003, returncode=0, communicate=communicate)
+    monkeypatch.setattr(pi_executor, "_create_subprocess_exec", AsyncMock(return_value=process))
+    monkeypatch.setattr(_proc, "remember_process_group", MagicMock())
+    kill = MagicMock()
+    monkeypatch.setattr(_proc, "kill_tree", kill)
+    close = MagicMock()
+    monkeypatch.setattr(pi_executor, "close_subprocess_transport", close)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_REAP_TIMEOUT_S", 0.01, raising=False)
+
+    async with asyncio.timeout(0.5):
+        with pytest.raises(OSError, match="timed out"):
+            await pi_executor._fetch_shell_command_token("synthetic command")
+    assert entered.is_set()
+    kill.assert_called_once_with(process)
+    close.assert_called_once_with(process)
+
+
 async def test_gateway_bridge_authenticates_and_cancels_helper_on_shutdown(tmp_path):
     pid_file = tmp_path / "helper pid"
     executor = PiExecutor(
