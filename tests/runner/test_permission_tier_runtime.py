@@ -550,3 +550,33 @@ def test_full_install_skips_rules_but_auto_requires_them(
     assert runtime.install(envelope("full"), "antigravity-native") is not None
     with pytest.raises(ValueError, match="invalid test rules"):
         runtime.install(envelope("auto"), "antigravity-native")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
+async def test_runner_rejects_missing_trusted_init_and_accepts_current_server_input(
+    monkeypatch, tmp_path, harness
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.native import orchestration
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    monkeypatch.setattr(orchestration, "_auto_create_pi_terminal", AsyncMock())
+    monkeypatch.setattr(orchestration, "_auto_create_antigravity_terminal", AsyncMock())
+    app, _ = await _build_app_for_spec(_harness_spec(harness))
+    body = {"session_id": "trusted-startup", "agent_id": "test-agent"}
+    async with _runner_client(app) as client:
+        refused = await client.post("/v1/sessions", json=body)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"] == "permission_tier_unavailable"
+    assert app.state.permission_tiers.state(body["session_id"]) is None
+    async with _runner_client(app, permission_harness=harness) as client:
+        created = await client.post("/v1/sessions", json=body)
+    assert created.status_code == 201, created.text
+    state = app.state.permission_tiers.state(body["session_id"])
+    assert (state.tier, state.revision, state.status) == ("auto", 1, "ready")
+    state_path = app.state.permission_tiers.state_path(body["session_id"], harness, {})
+    assert state_path.is_relative_to(tmp_path)
+    assert state_path.is_file()

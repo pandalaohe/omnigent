@@ -387,7 +387,7 @@ async def test_http_owned_native_stop_waits_for_runtime_registration(
     session_id = "conv_starting"
     name = harness.removesuffix("-native")
     instance = make_test_terminal_instance(name, "main", tmp_path)
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness=harness) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": session_id, "agent_id": "agent"}
         )

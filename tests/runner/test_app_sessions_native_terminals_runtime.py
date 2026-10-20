@@ -222,7 +222,9 @@ async def test_create_session_threads_workspace_to_pi_cwd(
         runner_workspace=runner_workspace,
     )
 
-    async with _runner_client(app) as client:
+    async with _runner_client(
+        app, permission_harness="pi", permission_snapshot={"workspace": str(worktree)}
+    ) as client:
         resp = await client.post(
             "/v1/sessions",
             json={"session_id": session_id, "agent_id": "86c64e0f9cab937bd04c79b9957dd55a"},
@@ -245,7 +247,7 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pi pre-spawn falls back to runner workspace when session workspace is empty."""
+    """Pi rejects a missing trusted workspace; blank cwd falls back to the runner."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
     # which on a multi-profile Databricks dev box otherwise 400s the create
@@ -270,36 +272,27 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
         del agent_id, session_id
         return ResolvedSpec(spec=spec, workdir=bundle_dir)
 
-    class _SessionWorkspaceClient(NullServerClient):
-        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
-            del kwargs
-            if url == f"/v1/sessions/{session_id}":
-                return httpx.Response(
-                    200,
-                    json={
-                        "id": session_id,
-                        "agent_id": "86c64e0f9cab937bd04c79b9957dd55a",
-                        "created_at": 1.0,
-                        "workspace": workspace_value,
-                    },
-                    request=httpx.Request("GET", url),
-                )
-            return await super().get(url)
-
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=_SessionWorkspaceClient(),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
         runner_workspace=runner_workspace,
     )
 
-    async with _runner_client(app) as client:
+    async with _runner_client(
+        app, permission_harness="pi", permission_snapshot={"workspace": workspace_value}
+    ) as client:
         resp = await client.post(
             "/v1/sessions",
             json={"session_id": session_id, "agent_id": "86c64e0f9cab937bd04c79b9957dd55a"},
         )
 
-    assert resp.status_code == 201
+    if workspace_value is None:
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"] == "permission_tier_unavailable"
+        assert not pm.get_client_calls
+        return
+    assert resp.status_code == 201, resp.text
     assert pm.get_client_calls
     conversation_id, harness, env = pm.get_client_calls[-1]
     assert conversation_id == session_id
@@ -3553,9 +3546,50 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
         )
         await asyncio.wait_for(wired.wait(), timeout=5.0)
 
+        from omnigent.permission_tiers.host import (
+            HOST_PERMISSION_STATE_FILE,
+            HostPermissionState,
+            write_host_permission_state,
+        )
+
+        # Direct auto-create skips the runner's post-install confirmation.
+        write_host_permission_state(
+            bridge_mod.bridge_dir_for_bridge_id(session_id) / HOST_PERMISSION_STATE_FILE,
+            HostPermissionState(
+                session_id, "test-host", str(tmp_path / "workspace"), "ask", 1, "ready"
+            ),
+        )
+
         # The single-instance task slot holds the reader task, named for the reader.
         task = runner_app_mod._AUTO_FORWARDER_TASKS[session_id]
         assert task.get_name() == f"antigravity-reader-{session_id}"
+
+        from omnigent.harnesses.antigravity_native import guard
+
+        bdir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+        (bdir / "tool_relay.json").write_text(
+            json.dumps(
+                {
+                    "url": "http://relay.test",
+                    "token": "test-token",
+                    "session_id": session_id,
+                    "permission_tiers_v1": True,
+                }
+            )
+        )
+        relay_checks = []
+
+        def relay_post(relay, path, payload):
+            assert path == "/permission-tiers/state"
+            relay_checks.append(path)
+            return {
+                "permission_tiers_capability": True,
+                "permission_tier": "ask",
+                "permission_tier_revision": 1,
+                "permission_tier_state": "ready",
+            }
+
+        monkeypatch.setattr(guard, "_relay_post", relay_post)
 
         # Drive the captured wiring with a WAITING (permission) interaction, as the
         # reader would when it observes one. Use the SAME cascade id + port the
@@ -3569,10 +3603,12 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
         assert len(hook_posts) == 1
         path, body = hook_posts[0]
         assert path == f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request"
-        assert body["elicitation_id"] == agy_elicitation_id(
+        assert body["elicitation_id"].startswith("elicit_agy_")
+        assert body["elicitation_id"] != agy_elicitation_id(
             resume_id, pending["trajectory_id"], pending["step_index"]
         )
-        assert isinstance(body["params"], dict)
+        assert body["params"]["single_use_approval"] is True
+        assert len(relay_checks) == 2
 
         # 2) On the ACCEPT verdict it delivered the answer to agy via the bridge.
         assert len(delivered) == 1
@@ -5455,7 +5491,8 @@ async def test_auto_create_antigravity_applies_server_tier_and_effort(
     assert calls[0]["extra_args"] == expected_args
     assert calls[0]["effort"] == "high"
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
-    assert (bridge_dir / "permission_tier").read_text() == tier + "\n"
+    canonical_tier = "auto" if tier.startswith("auto-") else tier
+    assert (bridge_dir / "permission_tier").read_text() == canonical_tier + "\n"
     settings = json.loads(
         (bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json").read_text()
     )
@@ -5464,5 +5501,5 @@ async def test_auto_create_antigravity_applies_server_tier_and_effort(
     hooks = json.loads(
         (bridge_mod.agy_gemini_dir(bridge_dir) / "config" / "hooks.json").read_text()
     )
-    assert ("omnigent-guard" in hooks) == (tier != "full")
-    assert orchestration._AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] == tier
+    assert hooks["omnigent-guard"]["enabled"] is True
+    assert orchestration._AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] == canonical_tier
