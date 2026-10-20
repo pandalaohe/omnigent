@@ -72,8 +72,10 @@ from omnigent.server.schemas import (
     RetryErrorDetail,
     RetryEvent,
     ServerStreamEvent,
+    StartupClaimRequestEvent,
     Usage,
 )
+from omnigent.startup_protocol import StartupAttemptRef
 
 _logger = logging.getLogger(__name__)
 
@@ -108,6 +110,7 @@ _POLICY_EVAL_TIMEOUT_S = 86400.0
 # lost in delivery must not stall the turn for the full human-wait budget.
 _HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
 _UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
+_STARTUP_CLAIM_TIMEOUT_S = 10.0
 
 # Stable, client-visible error code for a turn-context desync (the inner SDK
 # generation outlived its turn — an orphaned tool/policy callback, or a turn
@@ -433,6 +436,13 @@ class KeepWarmEvent(BaseModel):
     family: str
 
 
+class StartupClaimResultEvent(BaseModel):
+    type: Literal["startup_claim_result"]
+    claim_id: str
+    granted: bool
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 # Discriminated union of every downward event the harness accepts on
 # ``POST /v1/sessions/{conversation_id}/events``. FastAPI / Pydantic
 # v2 dispatches by the ``type`` field at request-validation time;
@@ -444,6 +454,7 @@ InboundEventRequest = Annotated[
     | ToolResultEvent
     | ApprovalEvent
     | PolicyVerdictEvent
+    | StartupClaimResultEvent
     | KeepWarmEvent,
     Field(discriminator="type"),
 ]
@@ -534,6 +545,7 @@ class TurnContext:
         # Populated by ``evaluate_policy``; resolved by the
         # ``policy_verdict`` /events handler.
         self._pending_policy_evaluations: dict[str, asyncio.Future[PolicyVerdictPayload]] = {}
+        self._pending_startup_claims: dict[str, asyncio.Future[bool]] = {}
         # In-band injections (steering, async completions) the
         # scaffold's ``message`` /events handler pushes here when
         # ``previous_response_id`` matches this turn. Subclass
@@ -583,6 +595,9 @@ class TurnContext:
         # but heartbeats for as long as the human takes, so heartbeats hold
         # the idle window open then — via the idle-only hook, so the
         # absolute ceiling stays the hard cap even for an ignored approval.
+        if isinstance(event, StartupClaimRequestEvent):
+            self._event_queue.put_nowait(event)
+            return
         if not isinstance(event, HeartbeatEvent):
             if not isinstance(event, RetryEvent) and not (
                 isinstance(event, PolicyEvaluationRequestEvent)
@@ -759,6 +774,37 @@ class TurnContext:
         future.set_result(result)
         return True
 
+    async def claim_startup(
+        self, attempt: StartupAttemptRef, boundary: Literal["executor_prepare"]
+    ) -> bool:
+        if self.cancelled.is_set():
+            return False
+        claim_id = uuid.uuid4().hex
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_startup_claims[claim_id] = future
+        self.emit(
+            StartupClaimRequestEvent(
+                type="startup.claim.requested",
+                claim_id=claim_id,
+                attempt=attempt,
+                boundary=boundary,
+            )
+        )
+        try:
+            granted = await asyncio.wait_for(future, timeout=_STARTUP_CLAIM_TIMEOUT_S)
+            return granted and not self.cancelled.is_set()
+        except TimeoutError:
+            return False
+        finally:
+            self._pending_startup_claims.pop(claim_id, None)
+
+    def _complete_startup_claim(self, claim_id: str, granted: bool) -> bool:
+        future = self._pending_startup_claims.get(claim_id)
+        if future is None or future.done():
+            return False
+        future.set_result(granted)
+        return True
+
     async def evaluate_policy(
         self, evaluation_id: str, phase: str, data: dict[str, Any]
     ) -> PolicyVerdictPayload:
@@ -878,6 +924,9 @@ class TurnContext:
         for policy_future in self._pending_policy_evaluations.values():
             if not policy_future.done():
                 policy_future.cancel()
+        for startup_future in self._pending_startup_claims.values():
+            if not startup_future.done():
+                startup_future.cancel()
 
 
 class HarnessApp:
@@ -1300,6 +1349,11 @@ class HarnessApp:
             )
         if isinstance(body, PolicyVerdictEvent):
             return await self._handle_policy_verdict_event(body)
+        if isinstance(body, StartupClaimResultEvent):
+            for ctx in self._in_flight.values():
+                if ctx._complete_startup_claim(body.claim_id, body.granted):
+                    break
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
         if isinstance(body, KeepWarmEvent):
             return await self._handle_keep_warm_event(body)
         # Pydantic's discriminated-union validator should reject

@@ -70,6 +70,7 @@ from omnigent.runner.session_runtime_lifecycle import (
     SessionRuntimeLifecycle,
     SessionRuntimeLock,
 )
+from omnigent.runner.startup_admission import StartupAdmission
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -198,6 +199,7 @@ def register_resource_routes(
     _session_open_enabled: dict[str, bool],
     _session_peer_messaging_enabled: dict[str, bool],
     _session_worktree_value: Callable[[str], Coroutine[Any, Any, str | None]],
+    startup_admission: StartupAdmission,
     auth_token_factory: Callable[[], str | None] | None,
     filesystem_registry: FilesystemRegistry | None,
     resource_registry: SessionResourceRegistry,
@@ -494,6 +496,8 @@ def register_resource_routes(
                 session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
                 rebind_bridge=_rebind_claude_bridge,
+                startup_required=startup_admission.required(session_id),
+                admit_cold=startup_admission.native_admitter(session_id),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
@@ -614,6 +618,16 @@ def register_resource_routes(
             )
             if _ensure_result is not None:
                 return _ensure_result
+
+        if (
+            _ensure_agent is not None
+            and session_key == "main"
+            and startup_admission.required(session_id)
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"code": "startup_proof_unavailable"}},
+            )
 
         from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -1036,6 +1050,8 @@ def register_resource_routes(
         async with lock:
             existing = registry.get(session_id, "qwen", "main")
             if existing is None or not existing.running or not await existing.is_alive():
+                if startup_admission.required(session_id):
+                    return None
                 await registry.close(session_id, "qwen", "main")
                 try:
                     await _auto_create_qwen_terminal(

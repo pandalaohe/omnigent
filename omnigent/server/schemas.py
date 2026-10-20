@@ -34,6 +34,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_startup import SessionStartupStatus
 from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1351,6 +1352,9 @@ class CreateResponseRequest(BaseModel):
     injection_id: str | None = None
     peer_delivery: dict[str, str] | None = None
     peer_delivery_start: bool = False
+    # Trusted runner control metadata; excluded from the public request schema.
+    startup_attempt: SkipJsonSchema[StartupAttemptRef | None] = None
+    startup_required: SkipJsonSchema[bool] = False
     # Server-side identity of the native web input, independent of native transcript matching.
     input_stable_id: str | None = None
     pending_id: str | None = None
@@ -5732,6 +5736,22 @@ class SubagentToolCallEvent(_SSEEventBase):
     arguments: str = ""
 
 
+class StartupProofEvent(_SSEEventBase):
+    """Harness-to-runner startup proof; never part of the public event union."""
+
+    type: Literal["startup.proof"] = "startup.proof"
+    observation: StartupObservation
+
+
+class StartupClaimRequestEvent(_SSEEventBase):
+    """Harness asks the runner to authorize its actual cold executor boundary."""
+
+    type: Literal["startup.claim.requested"] = "startup.claim.requested"
+    claim_id: str = Field(min_length=1, max_length=128)
+    attempt: StartupAttemptRef
+    boundary: Literal["executor_prepare"]
+
+
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
@@ -5740,6 +5760,8 @@ HarnessStreamEvent = (
     | SubagentStartedEvent
     | SubagentCompletedEvent
     | SubagentToolCallEvent
+    | StartupProofEvent
+    | StartupClaimRequestEvent
 )
 
 
