@@ -158,6 +158,7 @@ function TranscriptImpl({
       "blocked",
       "cancelling",
       "ready_empty",
+      "waiting_input",
     ].includes(startup.state);
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse

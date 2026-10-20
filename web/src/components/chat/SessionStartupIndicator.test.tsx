@@ -21,8 +21,124 @@ describe("SessionStartupIndicator", () => {
     render(<SessionStartupIndicator startup={queued} onCancel={vi.fn()} />);
     expect(screen.getByRole("status")).toHaveTextContent("Waiting to start on this host");
     expect(screen.getByRole("status")).toHaveTextContent("About 3 in queue");
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting 45s since request");
     expect(screen.getByRole("status")).toHaveTextContent("Your message is saved");
     expect(screen.queryByText("Working")).toBeNull();
+  });
+
+  it("shows the first-message wait without claiming readiness", () => {
+    render(
+      <SessionStartupIndicator
+        startup={{ ...queued, inputId: null, state: "waiting_input", admittedElapsedSeconds: 8 }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting for your first message");
+    expect(screen.getByRole("status")).toHaveTextContent("8s since host admission");
+    expect(screen.getByRole("status")).not.toHaveTextContent("since first message");
+    expect(screen.getByText("Waiting for your first message")).not.toHaveTextContent("ready");
+  });
+
+  it("separates request, admission, and first-message clocks", () => {
+    render(
+      <SessionStartupIndicator
+        startup={{
+          ...queued,
+          state: "verifying",
+          elapsedSeconds: 400,
+          admittedElapsedSeconds: 185,
+          inputElapsedSeconds: 121,
+        }}
+        onCancel={vi.fn()}
+      />,
+    );
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("400s since request");
+    expect(status).toHaveTextContent("185s since host admission");
+    expect(status).toHaveTextContent("121s since first message");
+  });
+
+  it("warns after 30 admitted seconds, not after 30 seconds in the queue", () => {
+    const onCancel = vi.fn();
+    const { rerender } = render(
+      <SessionStartupIndicator startup={{ ...queued, elapsedSeconds: 45 }} onCancel={onCancel} />,
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent("Startup is taking longer");
+
+    rerender(
+      <SessionStartupIndicator
+        startup={{ ...queued, state: "starting", admittedElapsedSeconds: 29 }}
+        onCancel={onCancel}
+      />,
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent("Startup is taking longer");
+
+    rerender(
+      <SessionStartupIndicator
+        startup={{ ...queued, state: "verifying", admittedElapsedSeconds: 30 }}
+        onCancel={onCancel}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Startup is taking longer than expected. Your message remains saved.",
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent("failed");
+    expect(screen.getByRole("status")).not.toHaveTextContent("retry");
+  });
+
+  it("explains paused admissions and observation deadlines without implying retry", () => {
+    const { rerender } = render(
+      <SessionStartupIndicator
+        startup={{ ...queued, unconfirmedStartups: 2 }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Host startups are paused until earlier unconfirmed startups are reconciled.",
+    );
+    rerender(
+      <SessionStartupIndicator
+        startup={{ ...queued, state: "blocked", reason: "needs_attention", elapsedSeconds: 86400 }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "This request has waited 24 hours and needs attention.",
+    );
+    rerender(
+      <SessionStartupIndicator
+        startup={{ ...queued, state: "uncertain", reason: "runtime_readiness_unconfirmed" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Host readiness could not be confirmed.");
+    rerender(
+      <SessionStartupIndicator
+        startup={{ ...queued, state: "uncertain", reason: "input_start_unconfirmed" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Work after your first message could not be confirmed.",
+    );
+    rerender(
+      <SessionStartupIndicator
+        startup={{ ...queued, state: "uncertain", reason: "runtime_observation_pending" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Waiting to confirm that the host is ready.",
+    );
+    rerender(
+      <SessionStartupIndicator
+        startup={{ ...queued, state: "uncertain", reason: "input_observation_pending" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Waiting to confirm work after your first message.",
+    );
   });
 
   it("keeps uncertain work visible and prevents duplicate stop requests", async () => {

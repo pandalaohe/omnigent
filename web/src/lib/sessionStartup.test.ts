@@ -40,10 +40,52 @@ describe("sessionStartupFromWire", () => {
       state: "verifying",
       reason: null,
       elapsedSeconds: 12,
+      admittedElapsedSeconds: null,
+      inputElapsedSeconds: null,
+      unconfirmedStartups: 0,
       queuePositionEstimate: null,
       canCancel: true,
       evidence: { runtimeReady: true, toolsReady: false, inputAccepted: true, workStarted: false },
     });
+  });
+  it("preserves fixed-origin clocks and host uncertainty from the wire", () => {
+    expect(
+      sessionStartupFromWire({
+        ...wire,
+        state: "waiting_input",
+        input_id: null,
+        admitted_elapsed_seconds: 180,
+        input_elapsed_seconds: null,
+        unconfirmed_startups: 2,
+      }),
+    ).toMatchObject({
+      state: "waiting_input",
+      admittedElapsedSeconds: 180,
+      inputElapsedSeconds: null,
+      unconfirmedStartups: 2,
+    });
+    expect(
+      sessionStartupFromWire({
+        ...wire,
+        admitted_elapsed_seconds: 190,
+        input_elapsed_seconds: 120,
+      }),
+    ).toMatchObject({ admittedElapsedSeconds: 190, inputElapsedSeconds: 120 });
+  });
+  it("rejects invalid optional clocks and host counts", () => {
+    for (const changed of [
+      { admitted_elapsed_seconds: -1 },
+      { admitted_elapsed_seconds: 1.5 },
+      { admitted_elapsed_seconds: Infinity },
+      { input_elapsed_seconds: -1 },
+      { input_elapsed_seconds: 2.5 },
+      { input_elapsed_seconds: NaN },
+      { unconfirmed_startups: -1 },
+      { unconfirmed_startups: 1.5 },
+      { unconfirmed_startups: Infinity },
+      { unconfirmed_startups: null },
+    ])
+      expect(sessionStartupFromWire({ ...wire, ...changed })).toBeNull();
   });
   it("drops unsupported states or incomplete evidence instead of inventing readiness", () => {
     for (const changed of [

@@ -34,6 +34,7 @@ import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import { sessionStartupFromWire } from "@/lib/sessionStartup";
 import { readCallingLast } from "@/lib/callingDefaults";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
@@ -8767,6 +8768,51 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       },
     );
 
+    it("keeps MCP dismissal when runner refresh and agent refresh overlap", async () => {
+      await bindStartingSession();
+      sessionTerminalPending.set("conv_abc", true);
+      const staleSnapshot = defaultFetchHandler("/v1/sessions/conv_abc");
+      let releaseRunner!: (response: Response) => void;
+      let releaseAgent!: (response: Response) => void;
+      let snapshotReads = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).split("?")[0] === "/v1/sessions/conv_abc") {
+          snapshotReads += 1;
+          return new Promise<Response>((resolve) => {
+            if (snapshotReads === 1) releaseRunner = resolve;
+            else releaseAgent = resolve;
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const runnerRefresh = useChatStore.getState().refreshSessionState("conv_abc");
+      await tick();
+      expect(snapshotReads).toBe(1);
+      await streamFrames(sse("response.output_text.delta", { message_id: "m1", delta: "Hello" }));
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+
+      handleSessionEvent({
+        type: "session_agent_changed",
+        conversationId: "conv_abc",
+        agentId: "agent_xyz",
+        agentName: "Test agent",
+      });
+      await tick();
+      expect(snapshotReads).toBe(2);
+      releaseAgent(staleSnapshot);
+      await tick();
+      releaseRunner(staleSnapshot);
+      await runnerRefresh;
+      await tick();
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: starting,
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
     it("dismisses only the conversation whose background stream produced text", async () => {
       const sink = pushableStream();
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -14494,6 +14540,28 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   const setState = useChatStore.setState as unknown as Parameters<typeof startStreamPump>[2];
   const getState = useChatStore.getState as unknown as Parameters<typeof startStreamPump>[3];
 
+  function queuedStartupWire(unconfirmedStartups: number) {
+    return {
+      id: "startup",
+      attempt_id: "attempt",
+      input_id: "input",
+      state: "queued",
+      reason: null,
+      elapsed_seconds: 60,
+      admitted_elapsed_seconds: null,
+      input_elapsed_seconds: null,
+      unconfirmed_startups: unconfirmedStartups,
+      queue_position_estimate: 1,
+      can_cancel: true,
+      evidence: {
+        runtime_ready: false,
+        tools_ready: false,
+        input_accepted: false,
+        work_started: false,
+      },
+    };
+  }
+
   /** Route `/stream` opens to controllable sinks; everything else hits the
    *  default handler. Returns the growing list of opened stream sinks. */
   function routeStreamOpens(epochs: readonly string[] = []): StreamSink[] {
@@ -16417,6 +16485,322 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it("refreshes queued startup host uncertainty from the periodic session snapshot", async () => {
+    const id = "conv_startup_refresh";
+    seedSession(id, []);
+    const sink = pushableStream();
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === `/v1/sessions/${id}/stream`) {
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith(`/v1/sessions/${id}?`) && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          startup: queuedStartupWire(2),
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest(id, {
+      abortController: controller,
+      startup: sessionStartupFromWire(queuedStartupWire(0)),
+    });
+    const loop = startStreamPump(id, controller, bound.set, bound.get);
+    await drainAsync();
+    expect(bound.get().startup?.unconfirmedStartups).toBe(0);
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(bound.get().startup?.unconfirmedStartups).toBe(2);
+
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps a newer startup SSE when an older reconnect snapshot finishes late", async () => {
+    const id = "conv_startup_race";
+    seedSession(id, []);
+    const sinks: StreamSink[] = [];
+    let releaseItems: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === `/v1/sessions/${id}/stream`) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith(`/v1/sessions/${id}?`) && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          startup: queuedStartupWire(2),
+        });
+      }
+      if (url.startsWith(`/v1/sessions/${id}/items`)) {
+        return new Promise<Response>((resolve) => {
+          releaseItems = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest(id, {
+      abortController: controller,
+      startup: sessionStartupFromWire(queuedStartupWire(0)),
+    });
+    const loop = startStreamPump(id, controller, bound.set, bound.get);
+    await drainAsync();
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(releaseItems).not.toBeNull();
+
+    sinks[1]!.push(sse("session.startup", { conversation_id: id, startup: queuedStartupWire(3) }));
+    await drainAsync();
+    expect(bound.get().startup?.unconfirmedStartups).toBe(3);
+    releaseItems!(defaultFetchHandler(`/v1/sessions/${id}/items?limit=100&order=desc`));
+    await drainAsync();
+    expect(bound.get().startup?.unconfirmedStartups).toBe(3);
+
+    controller.abort();
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("ignores a shared session query started before a newer startup SSE on reconnect", async () => {
+    const id = "conv_startup_old_query";
+    seedSession(id, []);
+    const sinks: StreamSink[] = [];
+    let snapshotReads = 0;
+    let currentSnapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === `/v1/sessions/${id}/stream`) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith(`/v1/sessions/${id}?`) && (init?.method ?? "GET") === "GET") {
+        snapshotReads += 1;
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          startup: queuedStartupWire(currentSnapshotCount),
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const oldSnapshot = await getSessionSlim(id);
+    let releaseOldQuery: ((session: typeof oldSnapshot) => void) | null = null;
+    const oldQuery = client.fetchQuery({
+      queryKey: ["session", id],
+      queryFn: () =>
+        new Promise<typeof oldSnapshot>((resolve) => {
+          releaseOldQuery = resolve;
+        }),
+      staleTime: 0,
+    });
+    await drainAsync();
+    expect(releaseOldQuery).not.toBeNull();
+
+    const controller = new AbortController();
+    const bound = bindConversationForTest(id, {
+      abortController: controller,
+      startup: sessionStartupFromWire(queuedStartupWire(0)),
+    });
+    const loop = startStreamPump(id, controller, bound.set, bound.get);
+    await drainAsync();
+    currentSnapshotCount = 3;
+    sinks[0]!.push(sse("session.startup", { conversation_id: id, startup: queuedStartupWire(3) }));
+    await drainAsync();
+    expect(bound.get().startup?.unconfirmedStartups).toBe(3);
+
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(
+      client.getQueryData<typeof oldSnapshot>(["session", id])?.startup?.unconfirmedStartups,
+    ).toBe(3);
+    releaseOldQuery!(oldSnapshot);
+    await oldQuery;
+    await drainAsync();
+    expect(bound.get().startup?.unconfirmedStartups).toBe(3);
+    expect(snapshotReads).toBe(2);
+
+    controller.abort();
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps startup progress when revisiting a live session with an older shared query", async () => {
+    const id = "conv_startup_revisit";
+    seedSession(id, []);
+    seedSession("conv_startup_other", []);
+    const sink = pushableStream();
+    let snapshotReads = 0;
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === `/v1/sessions/${id}/stream`) {
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+        snapshotReads += 1;
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          startup: queuedStartupWire(snapshotCount),
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().startup?.unconfirmedStartups).toBe(0);
+    await useChatStore.getState().switchTo("conv_startup_other");
+
+    const oldSnapshot = await getSessionSlim(id);
+    let releaseOldQuery: ((session: typeof oldSnapshot) => void) | null = null;
+    const oldQuery = client.fetchQuery({
+      queryKey: ["session", id],
+      queryFn: () =>
+        new Promise<typeof oldSnapshot>((resolve) => {
+          releaseOldQuery = resolve;
+        }),
+      staleTime: 0,
+    });
+    await drainAsync();
+    expect(releaseOldQuery).not.toBeNull();
+
+    snapshotCount = 3;
+    sink.push(sse("session.startup", { conversation_id: id, startup: queuedStartupWire(3) }));
+    await drainAsync();
+    await useChatStore.getState().switchTo(id);
+    await drainAsync();
+
+    expect(useChatStore.getState().startup?.unconfirmedStartups).toBe(3);
+    expect(
+      client.getQueryData<typeof oldSnapshot>(["session", id])?.startup?.unconfirmedStartups,
+    ).toBe(3);
+    expect(snapshotReads).toBeGreaterThanOrEqual(3);
+
+    releaseOldQuery!(oldSnapshot);
+    await oldQuery;
+    await drainAsync();
+    expect(useChatStore.getState().startup?.unconfirmedStartups).toBe(3);
+  });
+
+  it("keeps startup SSE received while the first binding snapshot is pending", async () => {
+    const id = "conv_startup_first_bind";
+    seedSession(id, []);
+    const sink = pushableStream();
+    let releaseSnapshot: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === `/v1/sessions/${id}/stream`) {
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+        return new Promise<Response>((resolve) => {
+          releaseSnapshot = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const binding = useChatStore.getState().switchTo(id);
+    await drainAsync();
+    expect(releaseSnapshot).not.toBeNull();
+    sink.push(sse("session.startup", { conversation_id: id, startup: queuedStartupWire(3) }));
+    await drainAsync();
+    expect(useChatStore.getState().startup?.unconfirmedStartups).toBe(3);
+
+    releaseSnapshot!(
+      mockResponse({
+        id,
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        startup: queuedStartupWire(0),
+      }),
+    );
+    await binding;
+    expect(useChatStore.getState().startup?.unconfirmedStartups).toBe(3);
+  });
+
+  it.each(["agent change", "runner refresh"])(
+    "keeps startup SSE received during a %s binding snapshot",
+    async (source) => {
+      const id = `conv_startup_${source.replace(" ", "_")}`;
+      seedSession(id, []);
+      const sink = pushableStream();
+      let holdSnapshot = false;
+      let releaseSnapshot: ((response: Response) => void) | null = null;
+      const staleSnapshot = () =>
+        mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          startup: queuedStartupWire(0),
+        });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.split("?")[0] === `/v1/sessions/${id}/stream`) {
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+          if (holdSnapshot) {
+            return new Promise<Response>((resolve) => {
+              releaseSnapshot = resolve;
+            });
+          }
+          return staleSnapshot();
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo(id);
+      holdSnapshot = true;
+      let refresh: Promise<void> | undefined;
+      if (source === "runner refresh") {
+        refresh = useChatStore.getState().refreshSessionState(id);
+      } else {
+        handleSessionEvent({
+          type: "session_agent_changed",
+          conversationId: id,
+          agentId: "agent_xyz",
+          agentName: "Test agent",
+        });
+      }
+      await drainAsync();
+      expect(releaseSnapshot).not.toBeNull();
+      sink.push(sse("session.startup", { conversation_id: id, startup: queuedStartupWire(3) }));
+      await drainAsync();
+      releaseSnapshot!(staleSnapshot());
+      if (refresh) await refresh;
+      await drainAsync();
+      expect(useChatStore.getState().startup?.unconfirmedStartups).toBe(3);
+    },
+  );
 
   /**
    * Pump a conversation whose "Compacting…" spinner is owned by `owner`, and

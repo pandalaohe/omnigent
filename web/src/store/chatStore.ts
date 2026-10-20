@@ -4538,12 +4538,32 @@ function updateMcpStartupLaunch(
     : { pending, dismissed: pending ? false : launch.dismissed };
 }
 
-/** Joined requests may predate live text, so they cannot prove a new launch. */
+const independentMetadataReadsInFlight = new Map<string, number>();
+
+async function getIndependentSessionMetadata(
+  id: string,
+  options?: Parameters<typeof getSessionSlim>[1],
+): Promise<Session> {
+  independentMetadataReadsInFlight.set(id, (independentMetadataReadsInFlight.get(id) ?? 0) + 1);
+  try {
+    return await getSessionSlim(id, options);
+  } finally {
+    const remaining = (independentMetadataReadsInFlight.get(id) ?? 1) - 1;
+    if (remaining === 0) independentMetadataReadsInFlight.delete(id);
+    else independentMetadataReadsInFlight.set(id, remaining);
+  }
+}
+
+/** Overlapping reads may predate live text, so they cannot prove a new launch. */
 function mcpStartupBeforeSnapshot(
   id: string,
   state: Pick<ConversationState, "mcpStartupLaunch"> | null,
 ): ConversationState["mcpStartupLaunch"] | undefined {
-  if (queryClient?.getQueryState(["session", id])?.fetchStatus === "fetching") return undefined;
+  if (
+    queryClient?.getQueryState(["session", id])?.fetchStatus === "fetching" ||
+    (independentMetadataReadsInFlight.get(id) ?? 0) > 0
+  )
+    return undefined;
   return state?.mcpStartupLaunch;
 }
 
@@ -4585,9 +4605,10 @@ function sessionBindingPatch(
   session: Session,
   state: Pick<
     ConversationState,
-    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride" | "startup"
   >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  startupBeforeFetch: ConversationState["startup"] | undefined,
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
@@ -4653,7 +4674,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    startup: session.startup ?? null,
+    startup: state.startup === startupBeforeFetch ? (session.startup ?? null) : state.startup,
     // "ready" with saved inputs left: a native first input awaits its transcript
     // receipt, and the server still saves new messages behind it.
     startupPending:
@@ -4670,33 +4691,30 @@ function sessionBindingPatch(
  *
  * The change happens without a navigation, so the URL-driven
  * `switchTo`/`bindStream` path never re-runs; this is the only thing
- * that updates the store's binding state. Fetches through the shared `["session", id]` query key with
- * `staleTime: 0` so the React-query consumers (header, pickers) get the
- * fresh snapshot too. No-op when the session changed mid-fetch or the
+ * that updates the store's binding state. Publishes the independent snapshot
+ * to the shared session query so React-query consumers see it too. No-op when the session changed mid-fetch or the
  * fetch fails (transient — any later rebind re-derives from scratch).
  *
  * @param id - Conversation/session id whose binding changed.
  */
 async function refreshSessionBinding(id: string): Promise<void> {
   if (queryClient === null) return;
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
+  const stateBeforeFetch = setterForState(id);
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
+  const startupBeforeFetch = stateBeforeFetch?.startup;
   let session: Session;
   try {
-    session = await queryClient.fetchQuery({
-      queryKey: ["session", id],
-      queryFn: () => getSessionSlim(id),
-      staleTime: 0,
-      retry: false,
-    });
+    session = await getIndependentSessionMetadata(id);
   } catch {
     return;
   }
+  queryClient.setQueryData(["session", id], session);
   void queryClient?.invalidateQueries({ queryKey: ["skills", id] });
   // Apply to the conversation this refresh was for, not whichever is on screen:
   // an agent switch in a backgrounded conversation must still re-derive its
   // binding (most importantly `isNativeTerminalSession`, which gates the
   // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
-  setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
+  setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch, startupBeforeFetch));
 }
 
 /**
@@ -4802,20 +4820,17 @@ async function bindStream(
   }
   const stateBeforeFetch = get();
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
+  const startupBeforeFetch = stateBeforeFetch.startup;
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
     const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
-        staleTime: 0,
-        retry: false,
-      }),
+      getIndependentSessionMetadata(id, { refreshState: true }),
       fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
     ]);
     if (isConversationDisposed(id)) return;
+    queryClient.setQueryData(["session", id], session);
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
@@ -4838,7 +4853,12 @@ async function bindStream(
     const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
-      const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
+      const bindingPatch = sessionBindingPatch(
+        session,
+        state,
+        launchBeforeFetch,
+        startupBeforeFetch,
+      );
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
         bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
@@ -5226,7 +5246,7 @@ function launchSnapshotPatch(
 
 /**
  * Session-snapshot state every reconnect path recovers: `sessionStatus`,
- * token/context/cost counters, the MCP startup band, and — when the turn
+ * token/context/cost counters, startup, the MCP startup band, and — when the turn
  * ended during the gap —
  * the terminal `activeResponse` transition the missed `session.status`
  * event would have applied, so "Working…" clears.
@@ -5244,6 +5264,7 @@ function reconnectStatusPatch(
   s: ChatState,
   todosAtReconnectStart: ChatState["todos"] | undefined,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  startupBeforeFetch: ChatState["startup"],
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
@@ -5256,6 +5277,8 @@ function reconnectStatusPatch(
   if (todosAtReconnectStart === undefined || s.todos === todosAtReconnectStart) {
     patch.todos = session.todos ?? [];
   }
+  // A live startup event may arrive while this snapshot is in flight.
+  if (s.startup === startupBeforeFetch) patch.startup = session.startup ?? null;
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
@@ -5392,7 +5415,13 @@ async function reconcileActiveSessionStatus(
     return;
   }
   set((s) => {
-    const patch = reconnectStatusPatch(session, s, undefined, stateBeforeFetch.mcpStartupLaunch);
+    const patch = reconnectStatusPatch(
+      session,
+      s,
+      undefined,
+      stateBeforeFetch.mcpStartupLaunch,
+      stateBeforeFetch.startup,
+    );
     const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     return blocks === null ? patch : { ...patch, blocks };
   });
@@ -5779,6 +5808,7 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  startupBeforeFetch: ChatState["startup"],
   pendingAtReconnectStart: Set<string>,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
@@ -5844,7 +5874,13 @@ async function rehydrateWindowOnReconnect(
       settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
       pendingAtReconnectStart,
     );
-    const statusPatch = reconnectStatusPatch(session, s, todosAtReconnectStart, launchBeforeFetch);
+    const statusPatch = reconnectStatusPatch(
+      session,
+      s,
+      todosAtReconnectStart,
+      launchBeforeFetch,
+      startupBeforeFetch,
+    );
     const blocks =
       reconcileElicitationBlocks(
         merged,
@@ -5904,6 +5940,7 @@ async function reconcileOnReconnect(
 ): Promise<void> {
   if (queryClient === null) return;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  const startupBeforeFetch = get().startup;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -5926,18 +5963,16 @@ async function reconcileOnReconnect(
   let page: SessionItemsPage;
   try {
     [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id),
-        staleTime: 0,
-        retry: false,
-      }),
+      // A shared query can already be in flight before the startup state above
+      // was captured. Read independently so this snapshot starts afterward.
+      getIndependentSessionMetadata(id),
       fetchSessionItemsPage(id),
     ]);
   } catch {
     return;
   }
   if (stale()) return;
+  queryClient.setQueryData(["session", id], session);
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
 
   // Page backwards until the fetched window reaches the pre-gap transcript
@@ -5982,6 +6017,7 @@ async function reconcileOnReconnect(
       get,
       ignoredNativeMessageIds,
       launchBeforeFetch,
+      startupBeforeFetch,
       pendingAtReconnectStart,
     );
     return;
@@ -6003,7 +6039,13 @@ async function reconcileOnReconnect(
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = {
-      ...reconnectStatusPatch(session, s, todosAtReconnectStart, launchBeforeFetch),
+      ...reconnectStatusPatch(
+        session,
+        s,
+        todosAtReconnectStart,
+        launchBeforeFetch,
+        startupBeforeFetch,
+      ),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
@@ -7739,13 +7781,17 @@ async function refetchRunnerBackedSessionState(
   // re-bound on return — dropping the nudge here would leave its
   // model catalog empty for as long as the entry stays live.
   if (isConversationDisposed(conversationId)) return;
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(
-    conversationId,
-    setterForState(conversationId),
-  );
+  const stateBeforeFetch = setterForState(conversationId);
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(conversationId, stateBeforeFetch);
+  const startupBeforeFetch = stateBeforeFetch?.startup;
   let session: Session;
   try {
-    if (queryClient !== null) {
+    if (options.applyBindingPatch === true) {
+      session = await getIndependentSessionMetadata(conversationId, {
+        refreshState: options.refreshState,
+      });
+      queryClient?.setQueryData(["session", conversationId], session);
+    } else if (queryClient !== null) {
       session = await queryClient.fetchQuery({
         queryKey: ["session", conversationId],
         queryFn: () => getSessionSlim(conversationId, { refreshState: options.refreshState }),
@@ -7779,7 +7825,7 @@ async function refetchRunnerBackedSessionState(
   // A delayed catalog only hydrates this session's runner-backed state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
-      ? sessionBindingPatch(session, currentState, launchBeforeFetch)
+      ? sessionBindingPatch(session, currentState, launchBeforeFetch, startupBeforeFetch)
       : { codexModelOptions: session.codexModelOptions ?? [] };
   setterFor(conversationId)(statePatch);
 }

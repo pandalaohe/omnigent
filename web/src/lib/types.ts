@@ -656,12 +656,18 @@ export interface SessionStartupStatus {
     | "blocked"
     | "cancelling"
     | "ready_empty"
+    | "waiting_input"
     | "working"
     | "cancelled"
     | "stopped"
     | "command_completed";
   reason: string | null;
   elapsedSeconds: number;
+  /** Fixed time since host admission, when known. */
+  admittedElapsedSeconds?: number | null;
+  /** Fixed time since the first input was dispatched, when known. */
+  inputElapsedSeconds?: number | null;
+  unconfirmedStartups?: number;
   queuePositionEstimate: number | null;
   canCancel: boolean;
   evidence: {
