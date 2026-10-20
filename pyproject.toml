@@ -457,6 +457,7 @@ where = ["."]
 include = ["omnigent*"]
 
 [tool.setuptools.package-data]
+"omnigent.permission_tiers" = ["ares_rules.json", "ares_signatures.json"]
 "omnigent.harnesses.antigravity_native" = ["ares_rules.json", "ares_signatures.json"]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
