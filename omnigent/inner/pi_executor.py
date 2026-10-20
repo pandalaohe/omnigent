@@ -58,6 +58,13 @@ from urllib.parse import urlparse as _urlparse
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.harnesses.pi_cli import pi_cli_argv
+from omnigent.harnesses.pi_native.bridge import (
+    bridge_dir_for_session_id,
+    clear_inbox,
+    prepare_bridge_dir,
+    prepare_permission_installation,
+    verify_pi_permission_installation,
+)
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
@@ -78,6 +85,8 @@ from omnigent.models.pi_model_compatibility import (
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.permission_tiers import plan_visible_tool_names
+from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -192,10 +201,14 @@ class ToolExecutor(Protocol):
 # str}``. Pi's native tools (e.g. ``read``, enabled for skill loading) execute
 # inside the Pi process and never traverse the bridged ``/mcp`` path, so the
 # ``tool_call`` extension hook routes them here for a TOOL_CALL policy verdict.
-NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
-    [str, dict[str, Any]],
-    Awaitable[dict[str, Any]] | dict[str, Any],
-]
+class NativePolicyGate(Protocol):
+    def __call__(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        call_id: str | None = None,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
 
 
 class _PiProviderConfig(TypedDict):
@@ -278,13 +291,18 @@ class _ToolServer:
         self.port: int = 0
         self._tool_executor: ToolExecutor | None = None
         # Policy gate for native (non-bridged) Pi tool calls, set by
-        # :meth:`PiExecutor._ensure_tool_server`. ``None`` (single-process
-        # / test paths) means native tool calls are not gated.
+        # :meth:`PiExecutor._ensure_tool_server`. An absent gate blocks native
+        # tools because no policy decision can be established.
         self._policy_gate: NativePolicyGate | None = None
         # Per-server bearer token required on every request. Minted at
         # construction (never None) so auth is always enforced.
         self.token: str = secrets.token_urlsafe(32)
         self._gateway_auth: Callable[[], Awaitable[str]] | None = None
+        self._permission_bridge_dir: pathlib.Path | None = None
+        self._permission_session_id: str | None = None
+        self._permission_finish: (
+            Callable[[str, dict[str, Any], dict[str, Any], str, int], Awaitable[bool]] | None
+        ) = None
         self._clients: set[asyncio.Task[None]] = set()
 
     async def start(self) -> int:
@@ -330,6 +348,8 @@ class _ToolServer:
                     request = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(request, dict):
+                    break
                 # Authenticate before any dispatch; close the connection on
                 # failure (unlike the malformed-frame ``continue`` below).
                 if not self._token_ok(request.get("token")):
@@ -361,20 +381,68 @@ class _ToolServer:
                 # The Pi extension always supplies ``id`` and ``tool``
                 # on a tool request. Drop malformed frames rather than
                 # executing under an empty-string tool name.
-                if not isinstance(raw_req_id, str) or not isinstance(raw_tool_name, str):
+                if not isinstance(raw_req_id, str):
                     continue
-                tool_args = request.get("args", {})
+                if not isinstance(raw_tool_name, str) or not raw_tool_name:
+                    response = {"id": raw_req_id, "error": "invalid tool name"}
+                    writer.write((_safe_dumps(response, raw_req_id) + "\n").encode())
+                    await writer.drain()
+                    continue
+                if request.get("kind") == "permission_finish":
+                    raw_call_id = request.get("call_id")
+                    raw_revision = request.get("permission_tier_revision")
+                    raw_args = request.get("args")
+                    raw_result = request.get("result")
+                    finished = False
+                    if (
+                        isinstance(raw_call_id, str)
+                        and raw_call_id
+                        and type(raw_revision) is int
+                        and raw_revision > 0
+                        and isinstance(raw_args, dict)
+                        and isinstance(raw_result, dict)
+                        and self._permission_finish is not None
+                    ):
+                        try:
+                            finished = await self._permission_finish(
+                                raw_tool_name, raw_args, raw_result, raw_call_id, raw_revision
+                            )
+                        except Exception:  # noqa: BLE001 - a missing finish ACK keeps the lease fenced
+                            finished = False
+                    writer.write(
+                        (
+                            _safe_dumps({"id": raw_req_id, "finished": finished}, raw_req_id)
+                            + "\n"
+                        ).encode()
+                    )
+                    await writer.drain()
+                    continue
+                tool_args = request.get(
+                    "args", None if request.get("kind") == "policy_eval" else {}
+                )
                 if request.get("kind") == "policy_eval":
                     # The ``tool_call`` extension hook asks for a TOOL_CALL
                     # verdict on a native (non-bridged) tool — evaluate only,
                     # never execute (Pi runs the tool itself on ALLOW).
-                    verdict = await self._evaluate_policy(raw_tool_name, tool_args)
-                    response = {"id": raw_req_id, "verdict": verdict}
-                else:
                     raw_call_id = request.get("call_id")
                     call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
-                    response = await self._execute(raw_tool_name, tool_args, call_id=call_id)
+                    verdict = (
+                        await self._evaluate_policy(raw_tool_name, tool_args, call_id=call_id)
+                        if call_id is not None
+                        else {"block": True, "reason": "invalid tool call ID"}
+                    )
+                    response = {"id": raw_req_id, "verdict": verdict}
+                elif request.get("kind") in (None, "tool_call"):
+                    raw_call_id = request.get("call_id")
+                    call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
+                    response = (
+                        await self._execute(raw_tool_name, tool_args, call_id=call_id)
+                        if isinstance(tool_args, dict)
+                        else {"error": "invalid tool arguments"}
+                    )
                     response["id"] = raw_req_id
+                else:
+                    response = {"id": raw_req_id, "error": "unknown tool request kind"}
                 # Serialize defensively: a tool result may carry a value
                 # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
                 # If it raises here — outside ``_execute``'s try — the frame
@@ -403,6 +471,17 @@ class _ToolServer:
         """
         return isinstance(presented, str) and hmac.compare_digest(presented, self.token)
 
+    def _permission_state_ready(self) -> bool:
+        if self._permission_bridge_dir is None:
+            return True
+        try:
+            state = read_host_permission_state(
+                self._permission_bridge_dir / HOST_PERMISSION_STATE_FILE
+            )
+            return state.status == "ready" and state.session_id == self._permission_session_id
+        except (OSError, ValueError, TypeError):
+            return False
+
     async def _execute(  # type: ignore[explicit-any]
         self,
         name: str,
@@ -410,6 +489,10 @@ class _ToolServer:
         *,
         call_id: str | None = None,
     ) -> dict[str, Any]:
+        if self._permission_bridge_dir is not None and (
+            call_id is None or not self._permission_state_ready()
+        ):
+            return {"error": "permission state unavailable"}
         if self._tool_executor is None:
             return {"error": f"No tool executor for '{name}'"}
         try:
@@ -429,6 +512,8 @@ class _ToolServer:
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a native (non-bridged) tool call against TOOL_CALL policy.
 
@@ -436,25 +521,45 @@ class _ToolServer:
         :meth:`PiExecutor._ensure_tool_server`. Returns ``{"block": bool,
         "reason": str}``.
 
-        Fail-open (allow) when no gate is wired or the gate raises: this
-        mirrors the runner/scaffold policy-evaluation contract, which also
-        defaults to ALLOW on a stalled or failed verdict so a transient
-        Omnigent outage can't wedge the agent mid-turn.
+        An absent, failed, or malformed gate blocks the call. The generated
+        extension receives a concrete verdict even when policy is unavailable.
         """
+        unavailable = {"block": True, "reason": "permission check unavailable"}
+        if self._permission_bridge_dir is not None and (
+            call_id is None or not self._permission_state_ready()
+        ):
+            return unavailable
+        if not isinstance(name, str) or not name or not isinstance(args, dict):
+            return unavailable
         if self._policy_gate is None:
-            return {"block": False, "reason": ""}
+            return unavailable
         try:
-            raw = self._policy_gate(name, args)
-            resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
-            if isinstance(resolved, dict):
+            raw = (
+                self._policy_gate(name, args, call_id=call_id)
+                if call_id is not None
+                else self._policy_gate(name, args)
+            )
+            if asyncio.iscoroutine(raw) or asyncio.isfuture(raw):
+                async with asyncio.timeout(_NATIVE_POLICY_APPROVAL_TIMEOUT_S):
+                    resolved = await raw
+            else:
+                resolved = raw
+            if (
+                isinstance(resolved, dict)
+                and type(resolved.get("block")) is bool
+                and ("reason" not in resolved or isinstance(resolved["reason"], str))
+                and "action" not in resolved
+            ):
                 return {
-                    "block": bool(resolved.get("block")),
-                    "reason": str(resolved.get("reason") or ""),
+                    "block": resolved["block"],
+                    "reason": resolved.get("reason")
+                    if isinstance(resolved.get("reason"), str)
+                    else "",
                 }
-            return {"block": False, "reason": ""}
-        except Exception as exc:  # noqa: BLE001 — fail-open; the verdict path must never wedge Pi
-            logger.warning("Pi native-tool policy eval failed for %r: %s", name, exc)
-            return {"block": False, "reason": ""}
+            return unavailable
+        except Exception:  # noqa: BLE001 — policy failures must not escape the socket
+            logger.warning("Pi native-tool policy eval failed for %r", name)
+            return unavailable
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +601,183 @@ def _sanitize_schema(schema: ToolSpec) -> ToolSpec:
     return result
 
 
-def _generate_extension_js(port: int, tool_schemas: list[ToolSpec], token: str) -> str:
+def _rpc_permission_extension_setup(
+    bridge_dir: pathlib.Path, session_id: str, plan_tools: list[str]
+) -> str:
+    """Render the controlled RPC extension's process-local installation gate."""
+    setup = r"""
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const PERMISSION_BRIDGE_DIR = __BRIDGE_DIR__;
+const PERMISSION_SESSION_ID = __SESSION_ID__;
+const PLAN_VISIBLE_TOOLS = new Set(__PLAN_TOOLS__);
+const PERMISSION_LEASES = new Map();
+let baselineActiveTools = null;
+
+function permissionPath(name) { return path.join(PERMISSION_BRIDGE_DIR, name); }
+function readPermissionJson(name) {
+  try {
+    const file = permissionPath(name);
+    if (fs.lstatSync(file).isSymbolicLink()) return null;
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch (_err) { return null; }
+}
+function permissionState() {
+  const state = readPermissionJson("permission_state.json");
+  if (!state || state.session_id !== PERMISSION_SESSION_ID ||
+      !["ask", "plan", "accept-edits", "auto", "full"].includes(state.tier) ||
+      !["ready", "switching", "blocked"].includes(state.status) ||
+      !Number.isInteger(state.revision) || state.revision < 1) return null;
+  return state;
+}
+function permissionReady(event) {
+  const state = permissionState();
+  return !!state && state.status === "ready" && !!event &&
+    typeof event.toolCallId === "string" && !!event.toolCallId &&
+    event.input && typeof event.input === "object" && !Array.isArray(event.input);
+}
+function permissionRevision() {
+  const state = permissionState();
+  return state && state.status === "ready" ? state.revision : null;
+}
+function writePermissionJson(name, payload) {
+  const target = permissionPath(name);
+  const temporary = `${target}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(payload), { mode: 0o600 });
+  fs.renameSync(temporary, target);
+}
+function applyPermissionTools(pi, tier) {
+  if (!baselineActiveTools || typeof pi.setActiveTools !== "function" ||
+      typeof pi.getActiveTools !== "function") return null;
+  const desired = tier === "plan"
+    ? baselineActiveTools.filter((name) => PLAN_VISIBLE_TOOLS.has(name))
+    : baselineActiveTools;
+  try {
+    pi.setActiveTools(desired);
+    const actual = pi.getActiveTools();
+    return Array.isArray(actual) && actual.length === desired.length &&
+      actual.every((name, index) => name === desired[index]) ? actual : null;
+  } catch (_err) { return null; }
+}
+function writePermissionInstallation(pi) {
+  const state = permissionState();
+  const expected = readPermissionJson("permission_expected.json");
+  if (!state || !expected || expected.session_id !== PERMISSION_SESSION_ID ||
+      expected.harness !== "pi" || typeof expected.installation_id !== "string" ||
+      !expected.installation_id ||
+      (state.tier !== "full" && !permissionExtensionOrderProven())) return;
+  const tools = pi.getActiveTools();
+  if (!Array.isArray(tools) || !tools.every((name) => typeof name === "string")) return;
+  baselineActiveTools = tools;
+  const active = applyPermissionTools(pi, state.tier);
+  if (!active) return;
+  try {
+    writePermissionJson("permission_installation.json", {
+      version: 1, installation_id: expected.installation_id,
+      session_id: PERMISSION_SESSION_ID, harness: "pi",
+      extension_sha256: crypto.createHash("sha256")
+        .update(fs.readFileSync(__filename)).digest("hex"),
+      tier: state.tier, revision: state.revision,
+      tools_verified: true, active_tools: active,
+    });
+  } catch (_err) {}
+}
+function permissionExtensionOrderProven() {
+  if (process.env.OMNIGENT_PI_PERMISSION_INLINE) {
+    try {
+      return fs.realpathSync(process.env.OMNIGENT_PI_PERMISSION_INLINE) ===
+        fs.realpathSync(__filename);
+    } catch (_err) { return false; }
+  }
+  const argv = process.argv;
+  if (!argv.includes("--no-extensions") && !argv.includes("-ne")) return false;
+  let lastExtension = null;
+  for (let index = 0; index < argv.length - 1; index += 1) {
+    if (argv[index] === "--extension" || argv[index] === "-e") {
+      lastExtension = argv[index + 1];
+    }
+  }
+  try {
+    return !!lastExtension && fs.realpathSync(path.resolve(lastExtension)) ===
+      fs.realpathSync(__filename);
+  } catch (_err) { return false; }
+}
+function pollPermissionInbox(pi, ctx) {
+  const inbox = permissionPath("inbox");
+  setInterval(() => {
+    let entries;
+    try { entries = fs.readdirSync(inbox).filter((name) => name.endsWith(".json")).sort(); }
+    catch (_err) { return; }
+    for (const entry of entries) {
+      const file = path.join(inbox, entry);
+      let payload;
+      try { payload = JSON.parse(fs.readFileSync(file, "utf8")); }
+      catch (_err) { continue; }
+      if (!payload || payload.type !== "permission_tier_change") continue;
+      const state = permissionState();
+      const idle = ctx && typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
+      const valid = state && state.status === "switching" &&
+        state.revision === payload.expected_revision && idle &&
+        ["ask", "plan", "accept-edits", "auto"].includes(payload.target_tier) &&
+        state.tier !== "full";
+      const active = valid ? applyPermissionTools(pi, payload.target_tier) : null;
+      try { writePermissionJson("permission_ack.json", {
+        id: payload.id, session_id: PERMISSION_SESSION_ID,
+        target_tier: payload.target_tier,
+        expected_revision: payload.expected_revision,
+        ok: !!active, active_tools: active || [],
+      }); } catch (_err) {}
+      try { fs.unlinkSync(file); } catch (_err) {}
+    }
+  }, 250);
+}
+function finishPermissionTool(event) {
+  const callId = event && event.toolCallId;
+  if (typeof callId !== "string" || !PERMISSION_LEASES.has(callId)) return;
+  const lease = PERMISSION_LEASES.get(callId);
+  const client = net.createConnection({ port: PORT, host: "127.0.0.1" }, () => {
+    client.write(JSON.stringify({ id: crypto.randomUUID(), token: TOKEN,
+      kind: "permission_finish", tool: lease.name, args: lease.args,
+      call_id: callId, permission_tier_revision: lease.revision,
+      result: { isError: !!(event && event.isError) } }) + "\n");
+  });
+  let response = "";
+  client.on("data", (chunk) => { response += chunk.toString();
+    if (response.includes("\n")) {
+      try { if (JSON.parse(response.slice(0, response.indexOf("\n"))).finished === true)
+        PERMISSION_LEASES.delete(callId); } catch (_err) {}
+      client.end();
+    }
+  });
+  client.on("error", () => {});
+  client.setTimeout(10_000, () => client.destroy());
+}
+function installPermissionHooks(pi) {
+  pi.on("session_start", (_event, ctx) => {
+    writePermissionInstallation(pi);
+    pollPermissionInbox(pi, ctx);
+  });
+  pi.on("tool_result", (event) => finishPermissionTool(event));
+  pi.on("tool_execution_end", (event) => finishPermissionTool(event));
+}
+"""
+    return (
+        setup.replace("__BRIDGE_DIR__", json.dumps(str(bridge_dir)))
+        .replace("__SESSION_ID__", json.dumps(session_id))
+        .replace("__PLAN_TOOLS__", json.dumps(plan_tools))
+    )
+
+
+def _generate_extension_js(
+    port: int,
+    tool_schemas: list[ToolSpec],
+    token: str,
+    *,
+    permission_bridge_dir: pathlib.Path | None = None,
+    session_id: str | None = None,
+) -> str:
     """Generate a JavaScript Pi extension that registers Omnigent tools.
 
     Each tool is forwarded to the TCP tool server at ``127.0.0.1:<port>``.
@@ -534,6 +815,38 @@ def _generate_extension_js(port: int, tool_schemas: list[ToolSpec], token: str) 
     tools_json = json.dumps(descriptors, indent=2)
     # json.dumps so the secret is correctly JS-string-escaped.
     token_json = json.dumps(token)
+    permission_setup = (
+        _rpc_permission_extension_setup(
+            permission_bridge_dir,
+            session_id,
+            list(plan_visible_tool_names(["read", *(tool["name"] for tool in descriptors)])),
+        )
+        if permission_bridge_dir is not None and session_id is not None
+        else ""
+    )
+    permission_hook = "installPermissionHooks(pi);" if permission_setup else ""
+    permission_guard = (
+        "if (!permissionReady(event)) return "
+        '{ block: true, reason: "permission state unavailable" };'
+        if permission_setup
+        else ""
+    )
+    permission_revision_capture = (
+        "const permissionRevisionAtCall = permissionRevision();" if permission_setup else ""
+    )
+    permission_post_guard = (
+        "if (permissionRevision() !== permissionRevisionAtCall) return "
+        '{ block: true, reason: "permission revision changed" };'
+        if permission_setup
+        else ""
+    )
+    permission_lease = (
+        'if (permissionState().tier !== "full") '
+        "PERMISSION_LEASES.set(event.toolCallId, { revision: permissionRevisionAtCall, "
+        "name: event.toolName, args: event.input });"
+        if permission_setup
+        else ""
+    )
 
     return f"""\
 // Auto-generated Omnigent tool bridge extension for Pi.
@@ -541,9 +854,11 @@ def _generate_extension_js(port: int, tool_schemas: list[ToolSpec], token: str) 
 const net = require("net");
 
 const TOOLS = {tools_json};
-const BRIDGED = new Set(TOOLS.map((t) => t.name));
+const BRIDGED = new Set();
+const PI_NATIVE_TOOLS = new Set(["read", "bash", "write", "edit"]);
 const PORT = {port};
 const TOKEN = {token_json};
+{permission_setup}
 
 /** Send a tool call request over TCP and return the result. */
 function callTool(toolName, args, callId) {{
@@ -602,58 +917,85 @@ function callTool(toolName, args, callId) {{
   }});
 }}
 
-/**
- * Ask the Omnigent tool server for a TOOL_CALL policy verdict on a native
- * (non-bridged) Pi tool. Resolves to the verdict object {{ block, reason }}
- * or null. Fail-open (null) on any transport error: a wedged native tool
- * would break Pi worse than a missed gate, and bridged tools stay gated
- * server-side regardless.
- */
-function evalNativePolicy(toolName, args) {{
+/** Ask the tool server for an explicit native-tool policy verdict. */
+function evalNativePolicy(toolName, args, callId) {{
   return new Promise((resolve) => {{
+    let settled = false;
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
-      const frame = {{ id, token: TOKEN, kind: "policy_eval", tool: toolName, args }};
+      const frame = {{
+        id, token: TOKEN, kind: "policy_eval", tool: toolName,
+        args, call_id: callId
+      }};
       const req = JSON.stringify(frame) + "\\n";
       let buf = "";
       client.on("data", (chunk) => {{
         buf += chunk.toString();
         const nl = buf.indexOf("\\n");
         if (nl !== -1) {{
-          client.end();
           try {{
             const resp = JSON.parse(buf.slice(0, nl));
-            resolve(resp && resp.verdict ? resp.verdict : null);
+            const verdict = resp && resp.id === id && resp.verdict;
+            if (
+              verdict && !resp.error &&
+              !Object.prototype.hasOwnProperty.call(verdict, "action") &&
+              typeof verdict.block === "boolean" &&
+              (verdict.reason === undefined || typeof verdict.reason === "string")
+            ) {{
+              finish({{
+                block: verdict.block,
+                reason: typeof verdict.reason === "string" ? verdict.reason : ""
+              }});
+            }} else {{
+              finish(blocked());
+            }}
           }} catch (e) {{
-            resolve(null);
+            finish(blocked());
           }}
         }}
       }});
-      client.on("error", () => resolve(null));
       client.write(req);
     }});
-    client.on("error", () => resolve(null));
+    const blocked = () => ({{ block: true, reason: "permission check unavailable" }});
+    const timer = setTimeout(() => finish(blocked()), 86_400_000);
+    function finish(verdict) {{
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.destroy();
+      resolve(verdict);
+    }}
+    client.on("error", () => finish(blocked()));
+    client.on("close", () => finish(blocked()));
   }});
 }}
 
 module.exports = function(pi) {{
+  {permission_hook}
   // Gate native (non-bridged) tool calls through Omnigent policy. Pi's
   // native tools (e.g. ``read``, enabled for skill loading) run in-process
   // and never traverse the bridged /mcp path, so without this hook they
   // escape all guardrails. Bridged tools ARE evaluated server-side at /mcp,
   // so skip them here to avoid double-evaluation (and double ASK prompts).
   pi.on("tool_call", async (event) => {{
-    if (!event || typeof event.toolName !== "string") return;
-    if (BRIDGED.has(event.toolName)) return;
-    const verdict = await evalNativePolicy(event.toolName, event.input || {{}});
-    if (verdict && verdict.block) {{
+    if (!event || typeof event.toolName !== "string" || !event.toolName) {{
+      return {{ block: true, reason: "invalid tool call" }};
+    }}
+    {permission_guard}
+    if (BRIDGED.has(event.toolName) && !PI_NATIVE_TOOLS.has(event.toolName)) return;
+    {permission_revision_capture}
+    const verdict = await evalNativePolicy(event.toolName, event.input, event.toolCallId);
+    if (verdict.block) {{
       return {{ block: true, reason: verdict.reason || "blocked by Omnigent policy" }};
     }}
+    {permission_post_guard}
+    {permission_lease}
   }});
 
   for (const tool of TOOLS) {{
     // Pi passes tool.parameters directly to the LLM as JSON Schema, so we
     // can use the Omnigent schema as-is without TypeBox conversion.
+    if (typeof pi.registerTool !== "function") continue;
     pi.registerTool({{
       name: tool.name,
       label: tool.name,
@@ -664,6 +1006,7 @@ module.exports = function(pi) {{
         return callTool(tool.name, _params, toolCallId);
       }},
     }});
+    BRIDGED.add(tool.name);
   }}
 }};
 """
@@ -732,6 +1075,10 @@ _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
 # the turn (a long tool call may stay silent past it); only a real stdout
 # EOF does. Module-level so tests can patch it.
 _TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
+
+# A parked human approval can outlast ordinary tool timeouts. This ceiling
+# bounds callbacks that never return while allowing a full day to decide.
+_NATIVE_POLICY_APPROVAL_TIMEOUT_S = 86_400.0
 
 # Post-error drain budget: pi emits the run's ``agent_end`` right after an
 # errored message, so only that gap is bounded tightly. Module-level so tests
@@ -1405,6 +1752,7 @@ class _PiSessionState:
     system_prompt: str | None = None
     model: str | None = None
     model_selection: str | None = None
+    tool_names: tuple[str, ...] = ()
     # Thinking level (Pi vocabulary) this process is known to be running at,
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
@@ -1442,6 +1790,7 @@ class PiSubprocessConfig:
     env: dict[str, str]
     tmp_dir: str
     extra_args: list[str]
+    executable: str | None = None
 
 
 def _extract_text(msg: Message) -> str:
@@ -1624,6 +1973,7 @@ def _try_sandbox_pi(
     os_env: OSEnvSpec | None,
     cwd: str | None,
     spawn_env_names: Sequence[str] | None = None,
+    resource_executable: str | None = None,
 ) -> SandboxedPiCli:
     """Wrap the Pi CLI in a sandbox if ``os_env`` requests it.
 
@@ -1661,9 +2011,10 @@ def _try_sandbox_pi(
             return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
         # Bundled and legacy CLIs both need their sibling npm dependencies.
         executable = pathlib.Path(pi_path).resolve()
+        resource_path = pathlib.Path(resource_executable or pi_path).resolve()
         pi_dir = next(
-            (parent for parent in executable.parents if parent.name == "node_modules"),
-            executable.parent,
+            (parent for parent in resource_path.parents if parent.name == "node_modules"),
+            resource_path.parent,
         )
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
@@ -1902,6 +2253,7 @@ class PiExecutor(Executor):
         system_prompt_mode: str = "append",
         preserve_model_ids: bool = False,
         model_metadata: Mapping[str, Mapping[str, int]] | None = None,
+        permission_controlled: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
@@ -1970,6 +2322,8 @@ class PiExecutor(Executor):
         if system_prompt_mode not in ("append", "replace"):
             raise ValueError("system_prompt_mode must be 'append' or 'replace'")
         self._system_prompt_mode = system_prompt_mode
+        self._permission_controlled = permission_controlled
+        self._permission_session_id: str | None = None
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
@@ -2306,7 +2660,7 @@ class PiExecutor(Executor):
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
         """Start the authenticated bridge for tools or gateway credentials."""
-        if not tools and not self._gateway:
+        if not tools and not self._gateway and not self._permission_controlled:
             return None
         if self._tool_server is None:
             self._tool_server = _ToolServer()
@@ -2314,6 +2668,12 @@ class PiExecutor(Executor):
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
         self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
+        if self._permission_controlled and self._permission_session_id:
+            self._tool_server._permission_bridge_dir = bridge_dir_for_session_id(
+                self._permission_session_id
+            )
+            self._tool_server._permission_session_id = self._permission_session_id
+            self._tool_server._permission_finish = self._finish_native_permission_lease
         return self._tool_server.port
 
     async def _get_gateway_token(self) -> str:
@@ -2351,6 +2711,8 @@ class PiExecutor(Executor):
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a native Pi tool call against Omnigent TOOL_CALL policy.
 
@@ -2365,20 +2727,81 @@ class PiExecutor(Executor):
         :param name: Native tool name, e.g. ``"read"`` or ``"bash"``.
         :param args: The tool's argument dict.
         :returns: ``{"block": bool, "reason": str}`` — block on DENY.
-            Allow when no evaluator is wired (single-process / test paths).
-            TOOL_CALL ASK is collapsed to ALLOW/DENY server-side before the
-            verdict returns, so only DENY blocks here.
+            Only explicit ALLOW or UNSPECIFIED proceeds. A raw ASK or an
+            unavailable/malformed verdict blocks.
         """
         # ``_policy_evaluator`` is installed best-effort by the harness
         # scaffold's executor adapter; absent on single-process / pre-turn
         # paths. Same fetch pattern as the Claude SDK executor.
         evaluator = getattr(self, "_policy_evaluator", None)
         if evaluator is None:
+            return {"block": True, "reason": "permission check unavailable"}
+        if not isinstance(args, dict) or not isinstance(name, str) or not name:
+            return {"block": True, "reason": "invalid tool call"}
+        data: dict[str, Any] = {"name": name, "arguments": args}
+        if self._permission_controlled:
+            if not self._permission_session_id or not call_id:
+                return {"block": True, "reason": "permission check unavailable"}
+            try:
+                state = read_host_permission_state(
+                    bridge_dir_for_session_id(self._permission_session_id)
+                    / HOST_PERMISSION_STATE_FILE
+                )
+            except (OSError, ValueError, TypeError):
+                return {"block": True, "reason": "permission check unavailable"}
+            if state.status != "ready" or state.session_id != self._permission_session_id:
+                return {"block": True, "reason": "permission state unavailable"}
+            data["expected_permission_tier_revision"] = state.revision
+        if call_id is not None:
+            data["call_id"] = call_id
+        try:
+            verdict = await evaluator("PHASE_TOOL_CALL", data)
+        except Exception:  # noqa: BLE001 — a missing verdict must block the native tool
+            logger.warning("Pi native-tool policy evaluator failed for %r", name)
+            return {"block": True, "reason": "permission check unavailable"}
+        action = getattr(verdict, "action", None)
+        if action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
             return {"block": False, "reason": ""}
-        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
-        if verdict.action == "POLICY_ACTION_DENY":
-            return {"block": True, "reason": verdict.reason or "blocked by policy"}
-        return {"block": False, "reason": ""}
+        if action == "POLICY_ACTION_DENY":
+            reason = getattr(verdict, "reason", None)
+            return {"block": True, "reason": reason or "blocked by policy"}
+        return {"block": True, "reason": "permission check unavailable"}
+
+    async def _finish_native_permission_lease(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+        call_id: str,
+        revision: int,
+    ) -> bool:
+        evaluator = getattr(self, "_policy_evaluator", None)
+        if evaluator is None or not self._permission_controlled:
+            return False
+        try:
+            verdict = await evaluator(
+                "PHASE_TOOL_RESULT",
+                {
+                    "name": name,
+                    "arguments": arguments,
+                    "result": result,
+                    "call_id": call_id,
+                    "permission_tier_revision": revision,
+                },
+            )
+        except Exception:  # noqa: BLE001 - an unacknowledged result keeps the lease fenced
+            return False
+        data = getattr(verdict, "data", None)
+        acknowledgement = (
+            data.get("_omnigent_permission_finish") if isinstance(data, dict) else None
+        )
+        return (
+            isinstance(acknowledgement, dict)
+            and acknowledgement.get("call_id") == call_id
+            and type(acknowledgement.get("revision")) is int
+            and acknowledgement["revision"] == revision
+            and acknowledgement.get("finished") is True
+        )
 
     def _build_env_and_dir(
         self,
@@ -2386,6 +2809,7 @@ class PiExecutor(Executor):
         tool_server_port: int | None,
         tool_server_token: str | None,
         models_json: _PiModelsConfig | None,
+        permission_session_id: str | None = None,
     ) -> PiSubprocessConfig:
         """Build env dict, temp dir, and extra CLI args for a Pi subprocess.
 
@@ -2408,6 +2832,7 @@ class PiExecutor(Executor):
             tmp_parent.mkdir(parents=True, exist_ok=True)
         tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_", dir=tmp_parent)
         extra_args: list[str] = list(self._extra_args)
+        executable: str | None = None
 
         if self._gateway:
             assert tool_server_port is not None and tool_server_token is not None
@@ -2457,15 +2882,57 @@ class PiExecutor(Executor):
                     json.dump(retry_settings, f, indent=2)
 
         # Generate the Omnigent tool bridge extension if tools are available.
-        if tools and tool_server_port is not None:
+        if tool_server_port is not None and (tools or permission_session_id is not None):
             if tool_server_token is None:
                 # A port without a token would spawn the bridge
                 # unauthenticated; fail loud instead.
                 raise ValueError("tool_server_token is required when tool_server_port is set")
             ext_path = os.path.join(tmp_dir, "omnigent_tools.js")
+            permission_bridge_dir = (
+                prepare_bridge_dir(permission_session_id)
+                if permission_session_id is not None
+                else None
+            )
+            if permission_bridge_dir is not None:
+                clear_inbox(permission_bridge_dir)
             with open(ext_path, "w") as f:
-                f.write(_generate_extension_js(tool_server_port, tools, tool_server_token))
+                f.write(
+                    _generate_extension_js(
+                        tool_server_port,
+                        tools,
+                        tool_server_token,
+                        permission_bridge_dir=permission_bridge_dir,
+                        session_id=permission_session_id,
+                    )
+                )
+            if permission_bridge_dir is not None and permission_session_id is not None:
+                prepare_permission_installation(
+                    permission_bridge_dir,
+                    session_id=permission_session_id,
+                    harness="pi",
+                    extension=pathlib.Path(ext_path),
+                )
             extra_args.extend(["--extension", ext_path])
+            if permission_bridge_dir is not None:
+                permission_state = read_host_permission_state(
+                    permission_bridge_dir / HOST_PERMISSION_STATE_FILE
+                )
+                if permission_state.tier != "full":
+                    from omnigent.inner.pi_settings import ordered_pi_launch
+
+                    launcher, extra_args = ordered_pi_launch(
+                        self._pi_path,
+                        extra_args,
+                        extension=pathlib.Path(ext_path),
+                    )
+                    sandbox_launch = _try_sandbox_pi(
+                        launcher,
+                        self._os_env_spec,
+                        self._cwd,
+                        spawn_env_names=list(env),
+                        resource_executable=self._pi_path,
+                    )
+                    executable = sandbox_launch.launch_path
             # Allowlist the bridged tool names. ``--no-tools`` (set in
             # __init__) disables every tool by default in pi 0.68+;
             # ``--tools`` adds specific names back. Without this pass
@@ -2491,7 +2958,9 @@ class PiExecutor(Executor):
             if tool_names:
                 extra_args.extend(["--tools", ",".join(tool_names)])
 
-        return PiSubprocessConfig(env=env, tmp_dir=tmp_dir, extra_args=extra_args)
+        return PiSubprocessConfig(
+            env=env, tmp_dir=tmp_dir, extra_args=extra_args, executable=executable
+        )
 
     async def _available_thinking_levels(self, rpc: _PiRpcSession) -> list[str] | None:
         """Ask Pi which thinking levels the current model offers.
@@ -2579,8 +3048,15 @@ class PiExecutor(Executor):
             signature. A model change respawns, which re-asserts the level.
         """
         state = self._session_states.setdefault(session_key, _PiSessionState())
+        if self._permission_controlled:
+            if not session_key or session_key == "__default__":
+                raise ValueError("Pi permission session is not bound")
+            self._permission_session_id = session_key
 
         effective_model = model
+        effective_tool_names = tuple(
+            name for tool in tools if isinstance((name := tool.get("name")), str) and name
+        )
 
         if (
             state.rpc is not None
@@ -2588,7 +3064,10 @@ class PiExecutor(Executor):
             and state.rpc.process.returncode is None
             and state.system_prompt == system_prompt
             and state.model == effective_model
+            and state.tool_names == effective_tool_names
         ):
+            if self._permission_controlled:
+                await self._await_permission_installation(session_key)
             return state.rpc
 
         wire_catalog = await self._load_gateway_model_wire_apis()
@@ -2612,7 +3091,11 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, models_json
+            tools,
+            tool_server_port,
+            tool_server_token,
+            models_json,
+            permission_session_id=session_key if self._permission_controlled else None,
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -2636,7 +3119,7 @@ class PiExecutor(Executor):
             pi_model = effective_model
 
         await rpc.start(
-            self._pi_launch_path,
+            subprocess_config.executable or self._pi_launch_path,
             env=env,
             cwd=self._cwd,
             model=pi_model or None,
@@ -2645,13 +3128,44 @@ class PiExecutor(Executor):
             thinking=thinking,
             extra_args=extra_args or None,
         )
+        if self._permission_controlled:
+            try:
+                await self._await_permission_installation(session_key)
+            except Exception:
+                await rpc.close()
+                raise
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
         state.model_selection = pi_model
+        state.tool_names = effective_tool_names
         state.applied_thinking = thinking
         state._has_sent_prompt = False
         return rpc
+
+    async def _await_permission_installation(self, session_key: str) -> None:
+        bridge_dir = bridge_dir_for_session_id(session_key)
+        state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
+        if state.session_id != session_key:
+            raise RuntimeError("Pi permission state has wrong session")
+        deadline = asyncio.get_running_loop().time() + 8.0
+        while asyncio.get_running_loop().time() < deadline:
+            if verify_pi_permission_installation(bridge_dir, state.tier):
+                return
+            await asyncio.sleep(0.05)
+        raise RuntimeError("Pi permission extension installation was not verified")
+
+    async def bootstrap_permission_tier(self, session_id: str) -> bool:
+        """Spawn Pi without a user prompt and prove the installed extension."""
+        if not self._permission_controlled or not session_id:
+            return False
+        self._permission_session_id = session_id
+        try:
+            await self._ensure_rpc(session_id, "", None, [])
+        except Exception:  # noqa: BLE001 - the harness returns an explicit failed bootstrap
+            logger.warning("Pi permission bootstrap failed", exc_info=True)
+            return False
+        return True
 
     async def run_turn(
         self,
@@ -2680,6 +3194,20 @@ class PiExecutor(Executor):
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces startup errors as ExecutorError
             yield ExecutorError(message=f"Failed to start Pi: {exc}")
             return
+
+        if self._permission_controlled:
+            try:
+                permission_state = read_host_permission_state(
+                    bridge_dir_for_session_id(session_key) / HOST_PERMISSION_STATE_FILE
+                )
+                if (
+                    permission_state.session_id != session_key
+                    or permission_state.status != "ready"
+                ):
+                    raise ValueError("Pi permission state is blocked")
+            except (OSError, ValueError, TypeError) as exc:
+                yield ExecutorError(message=f"Pi permission state unavailable: {exc}")
+                return
 
         turn_state = self._session_states.get(session_key)
         if turn_state is not None:

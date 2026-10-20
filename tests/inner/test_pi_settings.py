@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
+
+import pytest
 
 from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
@@ -122,3 +126,114 @@ def test_prepare_managed_pi_agent_dir_deep_merges_nested_overlay(tmp_path: Path)
         "enabled": True,
         "reserveTokens": 8192,
     }
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+@pytest.mark.parametrize("managed", [False, True])
+def test_inline_guard_follows_actual_sdk_extensions(tmp_path, monkeypatch, trusted, managed):
+    """Exercise Pi's loader, including built-ins and an untrusted project."""
+    import subprocess
+
+    from omnigent.inner.pi_settings import ordered_pi_launch
+
+    pi = shutil.which("pi")
+    node = shutil.which("node")
+    if pi is None or node is None:
+        pytest.skip("installed Pi SDK and Node required")
+    dist = next(
+        parent
+        for parent in Path(pi).resolve().parents
+        if (parent / "core" / "resource-loader.js").is_file()
+    )
+    agent = tmp_path / "agent"
+    project = tmp_path / "project"
+    (agent / "extensions").mkdir(parents=True)
+    (project / ".pi" / "extensions").mkdir(parents=True)
+    user = agent / "extensions" / "user.js"
+    project_extension = project / ".pi" / "extensions" / "project.js"
+    package = agent / "local-package"
+    package.mkdir()
+    (package / "package.json").write_text(json.dumps({"pi": {"extensions": ["index.js"]}}))
+    package_extension = package / "index.js"
+    relative_extension = agent / "relative.js"
+    (agent / "settings.json").write_text(
+        json.dumps(
+            {
+                "packages": ["./local-package"],
+                "extensions": ["./relative.js"],
+            }
+        )
+    )
+    for extension in (user, project_extension, package_extension, relative_extension):
+        extension.write_text("module.exports = pi => pi.on('tool_call', () => {});")
+    active_agent = tmp_path / "managed" if managed else agent
+    if managed:
+        prepare_managed_pi_agent_dir(active_agent, global_agent_dir=agent)
+    guard = tmp_path / "guard.js"
+    guard.write_text("module.exports = pi => pi.on('tool_call', () => {});")
+    # Replace only the CLI front end; keep the real SDK loader and built-ins.
+    sdk = tmp_path / "sdk"
+    (sdk / "cli").mkdir(parents=True)
+    (sdk / "core").mkdir()
+    (sdk / "utils").mkdir()
+    (sdk / "package.json").write_text('{"type":"module"}')
+    (sdk / "cli.js").write_text("")
+    (sdk / "cli" / "setup.js").write_text("export function setupCli() {}")
+    resource_loader = (dist / "core" / "resource-loader.js").as_uri()
+    settings_manager = (dist / "core" / "settings-manager.js").as_uri()
+    builtins = (dist / "extensions" / "index.js").as_uri()
+    (sdk / "core" / "resource-loader.js").write_text(
+        f"export {{DefaultResourceLoader}} from {json.dumps(resource_loader)};"
+    )
+    for name, symbol in (
+        ("package-manager", "DefaultPackageManager"),
+        ("settings-manager", "SettingsManager"),
+    ):
+        (sdk / "core" / f"{name}.js").write_text(
+            f"export {{{symbol}}} from {json.dumps((dist / 'core' / f'{name}.js').as_uri())};"
+        )
+    (sdk / "utils" / "paths.js").write_text(
+        f"export {{resolvePath}} from {json.dumps((dist / 'utils' / 'paths.js').as_uri())};"
+    )
+    (sdk / "main.js").write_text(
+        f"""
+import {{DefaultResourceLoader}} from {json.dumps(resource_loader)};
+import {{SettingsManager}} from {json.dumps(settings_manager)};
+import {{builtInExtensions}} from {json.dumps(builtins)};
+export async function main(args, options) {{
+  const settingsManager = SettingsManager.create(args[0], args[1],
+    {{projectTrusted: {str(trusted).lower()}}});
+  const loader = new DefaultResourceLoader({{cwd: args[0], agentDir: args[1],
+    settingsManager, extensionFactories: [...builtInExtensions, ...options.extensionFactories]}});
+  await loader.reload();
+  console.log(JSON.stringify(loader.getExtensions().extensions.map(entry => entry.path)));
+}}
+"""
+    )
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", agent.as_uri())
+    launcher, args = ordered_pi_launch(
+        str(sdk / "cli.js"),
+        [str(project), str(active_agent), "--extension", str(guard)],
+        extension=guard,
+    )
+    result = subprocess.run(
+        [node, launcher, *args],
+        text=True,
+        capture_output=True,
+        check=True,
+        env={**os.environ, "PI_CODING_AGENT_DIR": str(active_agent)},
+    )
+    paths = json.loads(result.stdout)
+    assert paths[-1] == "<inline:omnigent-permission>"
+    assert str(user) in paths
+    assert str(package_extension) in paths
+    assert str(relative_extension) in paths
+    assert any(path.startswith("builtin:") for path in paths)
+    assert (str(project_extension) in paths) is trusted
+
+
+def test_inline_launch_refuses_unsupported_sdk(tmp_path):
+    from omnigent.inner.pi_settings import ordered_pi_launch
+
+    with pytest.raises(ValueError, match="does not expose"):
+        ordered_pi_launch("/opt/bin/standalone-pi", [], extension=tmp_path / "guard.js")

@@ -817,6 +817,7 @@ def open_server_client(
     from omnigent_client._http import is_loopback_url
 
     pinned = {
+        "X-Omnigent-Permission-Tiers": "1",
         **(headers or {}),
         **databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id),
     }

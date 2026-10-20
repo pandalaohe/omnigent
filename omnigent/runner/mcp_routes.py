@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import Callable, Coroutine, Mapping
@@ -43,8 +44,10 @@ from omnigent.runner.native import (
     _resolved_workdir_for_spec,
     _unwrap_resolved_spec,
 )
+from omnigent.runner.permission_tiers import PermissionTierRuntime
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.server.permission_tiers import TIER_HARNESSES
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -93,6 +96,7 @@ def register_mcp_routes(
     _session_spec_cache: dict[str, _SpecEntry | None],
     filesystem_registry: FilesystemRegistry | None,
     mcp_execution_registry: McpExecutionRegistry,
+    permission_tiers: PermissionTierRuntime,
     mcp_manager: RunnerMcpManager | None,
     process_manager: HarnessProcessManager | None,
     resource_registry: SessionResourceRegistry,
@@ -119,6 +123,32 @@ def register_mcp_routes(
         params: _JsonObject = body.get("params") or {}
 
         raw_operation = body.get("_omnigent_operation")
+        permission = body.get("_omnigent_permission")
+        if (
+            method == "tools/call"
+            and raw_operation is None
+            and "_omnigent_retained_operation" not in body
+            and permission is not None
+        ):
+            tool_name = params.get("name") if isinstance(params, dict) else None
+            arguments = params.get("arguments") if isinstance(params, dict) else None
+            if not isinstance(permission, dict) or not permission_tiers.matches_authorized_call(
+                session_id,
+                call_id=permission.get("call_id"),
+                revision=permission.get("revision"),
+                arguments_digest=permission.get("arguments_digest"),
+                name=tool_name,
+                arguments=arguments,
+            ):
+                return JSONResponse(
+                    status_code=200,
+                    content={"error": {"code": -32000, "message": "Permission lease rejected"}},
+                )
+            call_id = permission["call_id"]
+            raw_operation = {
+                "id": "permission-" + hashlib.sha256(call_id.encode()).hexdigest(),
+                "step": "initial",
+            }
         if method == "tools/call" and raw_operation is not None:
             operation = raw_operation if isinstance(raw_operation, dict) else {}
             operation_id = operation.get("id")
@@ -141,19 +171,32 @@ def register_mcp_routes(
 
             nested_body = cast("_JsonObject", {**body, "_omnigent_operation": None})
             nested_body.pop("_omnigent_operation")
+            nested_body["_omnigent_retained_operation"] = operation
+            execution_started: dict[str, bool] = {"value": False}
+            nested_body["_omnigent_execution_started"] = execution_started
 
             async def _run_retained_mcp_execution() -> McpExecutionResult:
-                nested_response = await mcp_execute(
-                    session_id,
-                    cast("Request", _BodyRequest(nested_body)),
-                )
-                nested_content = json.loads(bytes(nested_response.body))
-                if not isinstance(nested_content, dict):
-                    raise RuntimeError("Runner MCP execution returned a non-object response")
-                return McpExecutionResult(
-                    status_code=nested_response.status_code,
-                    content=cast("_JsonObject", nested_content),
-                )
+                try:
+                    nested_response = await mcp_execute(
+                        session_id,
+                        cast("Request", _BodyRequest(nested_body)),
+                    )
+                    nested_content = json.loads(bytes(nested_response.body))
+                    if not isinstance(nested_content, dict):
+                        raise RuntimeError("Runner MCP execution returned a non-object response")
+                    return McpExecutionResult(
+                        status_code=nested_response.status_code,
+                        content=cast("_JsonObject", nested_content),
+                    )
+                finally:
+                    if execution_started["value"]:
+                        permission = nested_body.get("_omnigent_permission")
+                        if isinstance(permission, dict):
+                            permission_tiers.finish(
+                                session_id,
+                                call_id=permission.get("call_id"),
+                                revision=permission.get("revision"),
+                            )
 
             try:
                 retained = await mcp_execution_registry.execute(
@@ -231,6 +274,45 @@ def register_mcp_routes(
                     status_code=200,
                     content={"error": {"code": -32000, "message": "Missing tool name"}},
                 )
+
+            if _session_harness_name(session_id) in TIER_HARNESSES:
+                state = permission_tiers.state(session_id)
+                if state is None or state.status != "ready":
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "error": {"code": -32000, "message": "Permission tier unavailable"}
+                        },
+                    )
+                if state.tier != "full":
+                    permission = body.get("_omnigent_permission")
+                    operation = body.get("_omnigent_retained_operation")
+                    if not isinstance(permission, dict) or not isinstance(operation, dict):
+                        return JSONResponse(
+                            status_code=200,
+                            content={
+                                "error": {"code": -32000, "message": "Permission lease required"}
+                            },
+                        )
+                    if not permission_tiers.verify_execute(
+                        session_id,
+                        call_id=permission.get("call_id"),
+                        revision=permission.get("revision"),
+                        arguments_digest=permission.get("arguments_digest"),
+                        name=tool_name,
+                        arguments=arguments,
+                        operation_id=operation.get("id"),
+                        step=operation.get("step"),
+                    ):
+                        return JSONResponse(
+                            status_code=200,
+                            content={
+                                "error": {"code": -32000, "message": "Permission lease rejected"}
+                            },
+                        )
+                    started = body.get("_omnigent_execution_started")
+                    if isinstance(started, dict):
+                        started["value"] = True
 
             if tool_name == "sys_read_inbox":
                 # A scan that failed at initialization must not leave the

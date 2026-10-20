@@ -37,6 +37,7 @@ from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.runner_session_init import (
     RunnerSessionInitializer,
     runner_archive_states_for_conversation,
+    runner_permission_verified,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
@@ -84,6 +85,34 @@ def _conversation() -> Conversation:
         workspace="/tmp/workspace",
         labels={"example": "value"},
     )
+
+
+def test_permission_init_ack_requires_exact_revision_and_runner_epoch() -> None:
+    from omnigent.server.permission_tiers import (
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        PERMISSION_STATE_LABEL_KEY,
+    )
+
+    conversation = _conversation()
+    conversation.labels[PERMISSION_STATE_LABEL_KEY] = json.dumps(
+        {"tier": "auto", "revision": 4, "status": "ready"}
+    )
+    conversation.labels[PERMISSION_RUNTIME_ID_LABEL_KEY] = "a" * 32
+
+    def response(revision: int, epoch: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "permission_tiers_capability": "permission_tiers_v1",
+                "permission_tier_revision": revision,
+                "permission_tier_runtime_id": epoch,
+            },
+        )
+
+    assert runner_permission_verified(conversation, response(4, "a" * 32))
+    assert not runner_permission_verified(conversation, response(3, "a" * 32))
+    assert not runner_permission_verified(conversation, response(4, "b" * 32))
+    assert not runner_permission_verified(conversation, httpx.Response(200, json={}))
 
 
 @pytest.mark.asyncio

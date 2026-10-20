@@ -279,10 +279,10 @@ import {
 import { sdkInitialPermissionMode, sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import {
   AGY_NATIVE_DEFAULT_PERMISSION_TIER,
-  AGY_NATIVE_PERMISSION_TIER_LABEL_KEY,
   normalizeAgyPermissionTier,
   AGY_NATIVE_PERMISSION_TIERS,
   AGY_NATIVE_FULL_PERMISSION_TIER,
+  AGY_RESTRICTED_HOOK_RULE,
   AUTO_PERMISSION_MODE,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
@@ -407,7 +407,11 @@ import {
 import { writeNewSessionTarget } from "@/lib/newSessionTarget";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import {
+  createBundledSession,
+  launchRunner,
+  PERMISSION_TIERS_PROTOCOL_HEADERS,
+} from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
 // Re-exported for the composer and settings, whose import paths predate the
@@ -2925,10 +2929,15 @@ export function NewChatLandingScreen() {
   const [cursorExecMode, setCursorExecMode] = useState<string>(
     () => restoredDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
-  const [agySkipMode, setAgySkipMode] = useState<string>(
-    () =>
-      normalizeAgyPermissionTier(restoredDraft?.agySkipMode) ?? AGY_NATIVE_DEFAULT_PERMISSION_TIER,
+  const [agySkipMode, setAgySkipMode] = useState<string>(() =>
+    normalizeAgyPermissionTier(restoredDraft?.agySkipMode) === "full"
+      ? AGY_NATIVE_DEFAULT_PERMISSION_TIER
+      : (normalizeAgyPermissionTier(restoredDraft?.agySkipMode) ??
+        AGY_NATIVE_DEFAULT_PERMISSION_TIER),
   );
+  const [tierFullChosen, setTierFullChosen] = useState(false);
+  const tierFullChoiceHarness = useRef<string | null>(null);
+  const [migratedFullProjectDefault, setMigratedFullProjectDefault] = useState(false);
   // Devin's `--permission-mode`. Only meaningful for the devin-native wrapper.
   const [devinPermissionMode, setDevinPermissionMode] = useState<string>(
     () => restoredDraft?.devinPermissionMode ?? DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
@@ -3564,7 +3573,8 @@ export function NewChatLandingScreen() {
     (activeSdk === "claude-sdk" || activeSdk === "codex")
       ? activeSdk
       : null;
-  const selectionHarness = selectedNativeHarness ?? sdkHarness;
+  const selectionHarness =
+    selectedNativeHarness ?? sdkHarness ?? (activeSdk === "pi" ? "pi" : null);
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings.
   const canLoadHostModels = (harness: string) =>
@@ -3787,7 +3797,8 @@ export function NewChatLandingScreen() {
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsDevinPermission = nativeAgentHasCapability(selectedAgent, "devinPermission");
-  const supportsAgyPermissionTier = nativeAgentHasCapability(selectedAgent, "agyPermissionTier");
+  const supportsAgyPermissionTier =
+    nativeAgentHasCapability(selectedAgent, "agyPermissionTier") || activeSdk === "pi";
   const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // Smart Routing as a Model choice is offered on the two native harnesses
@@ -3962,9 +3973,13 @@ export function NewChatLandingScreen() {
           label: "Model",
           value: pickedModel
             ? nativeModelLabel(
-                agyModelOptions.find((row) => row.id === pickedModel) ?? { id: pickedModel },
+                (selectionHarness === "antigravity-native" ? agyModelOptions : piModelOptions).find(
+                  (row) => row.id === pickedModel,
+                ) ?? { id: pickedModel },
               )
-            : defaultModelLabel(agyModelOptions),
+            : defaultModelLabel(
+                selectionHarness === "antigravity-native" ? agyModelOptions : piModelOptions,
+              ),
         },
         ...(pickedEffort ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }] : []),
         { label: "Permission mode", value: skipValue },
@@ -4043,6 +4058,7 @@ export function NewChatLandingScreen() {
     agySkipMode,
     pickedHarness,
     selectedNativeHarness,
+    selectionHarness,
     sdkHarness,
     sdkModelOptions,
   ]);
@@ -4711,7 +4727,7 @@ export function NewChatLandingScreen() {
       rememberPickerOptions(sdkHarness, { mode });
       return;
     }
-    if (!selectedNativeHarness) return;
+    if (!selectedNativeHarness && selectionHarness !== "pi") return;
     if (supportsPermissionMode) setPermissionMode(mode);
     else if (supportsApprovalMode) {
       if (selectedNativeHarness === "codex-native") {
@@ -4727,9 +4743,12 @@ export function NewChatLandingScreen() {
       setApprovalMode(mode);
       setBypassSandbox(false);
     } else if (supportsCursorMode) setCursorExecMode(mode);
-    else if (supportsAgyPermissionTier) setAgySkipMode(mode);
-    else if (supportsDevinPermission) setDevinPermissionMode(mode);
-    rememberPickerOptions(selectedNativeHarness, { mode });
+    else if (supportsAgyPermissionTier) {
+      setAgySkipMode(mode);
+      setTierFullChosen(mode === "full");
+      tierFullChoiceHarness.current = mode === "full" ? selectionHarness : null;
+    } else if (supportsDevinPermission) setDevinPermissionMode(mode);
+    rememberPickerOptions(selectionHarness!, { mode });
   };
   // Clear shared state on agent changes; the harness seed restores its own
   // saved options. Initial agent resolution must preserve the landing draft.
@@ -4907,12 +4926,17 @@ export function NewChatLandingScreen() {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     } else if (supportsAgyPermissionTier) {
       const savedTier = normalizeAgyPermissionTier(seededPermission ?? stored.mode);
-      setAgySkipMode(
-        AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === savedTier)
-          ? savedTier!
-          : AGY_NATIVE_DEFAULT_PERMISSION_TIER,
-      );
-      if (!projectVisit) {
+      if (!(tierFullChosen && tierFullChoiceHarness.current === selectionHarness)) {
+        setAgySkipMode(
+          savedTier !== "full" &&
+            AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === savedTier)
+            ? savedTier!
+            : AGY_NATIVE_DEFAULT_PERMISSION_TIER,
+        );
+        setTierFullChosen(false);
+        tierFullChoiceHarness.current = null;
+      }
+      if (!projectVisit && selectedNativeHarness === "antigravity-native") {
         const model =
           stored.model && agyModelOptions.some((row) => row.id === stored.model)
             ? stored.model
@@ -5476,10 +5500,13 @@ export function NewChatLandingScreen() {
             setApprovalMode((current) =>
               current === seedFromApprovalMode ? seed.permission! : current,
             );
-          } else if (seedHarness === "antigravity-native") {
+          } else if (["antigravity-native", "pi", "pi-native"].includes(seedHarness)) {
+            setMigratedFullProjectDefault(normalizeAgyPermissionTier(seed.permission) === "full");
             setAgySkipMode((current) =>
               current === seedFromAgySkipMode
-                ? (normalizeAgyPermissionTier(seed.permission) ?? current)
+                ? normalizeAgyPermissionTier(seed.permission) === "full"
+                  ? AGY_NATIVE_DEFAULT_PERMISSION_TIER
+                  : (normalizeAgyPermissionTier(seed.permission) ?? current)
                 : current,
             );
           } else if (seedHarness === "claude-sdk" || seedHarness === "claude-native") {
@@ -6376,7 +6403,8 @@ export function NewChatLandingScreen() {
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
-      const agentSupportsAgyPermissionTier = nativeAgentHasCapability(agent, "agyPermissionTier");
+      const agentSupportsAgyPermissionTier =
+        nativeAgentHasCapability(agent, "agyPermissionTier") || selectionHarness === "pi";
       const agentSupportsDevinPermission = nativeAgentHasCapability(agent, "devinPermission");
       const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
@@ -6525,9 +6553,6 @@ export function NewChatLandingScreen() {
               ...composerContextLabels,
             }
           : { ...(inheritedLabels ?? {}), ...composerContextLabels };
-      if (agentSupportsAgyPermissionTier) {
-        createLabels[AGY_NATIVE_PERMISSION_TIER_LABEL_KEY] = agySkipMode;
-      }
       if (speedHarness && !routingOwnsModel && explicitSpeed) {
         createLabels["omnigent.speed_tier"] = explicitSpeed;
       }
@@ -6732,6 +6757,9 @@ export function NewChatLandingScreen() {
             (createProjectId !== null && effortTouchedRef.current ? null : undefined),
           ...(sdkHarness === "claude-sdk" ? { permission_mode: permissionMode } : {}),
           ...(sdkHarness === "codex" ? { approval_mode: approvalMode } : {}),
+          ...(agentSupportsAgyPermissionTier && !smartRoutingHarnessSelected
+            ? { permission_tier: agySkipMode === "full" && !tierFullChosen ? "auto" : agySkipMode }
+            : {}),
           cost_control_mode_override: costControlOverride,
           // Top-level Smart Routing sends the same "auto" sentinel the bundle
           // path does; the server tells them apart by the bound agent being a
@@ -6755,6 +6783,7 @@ export function NewChatLandingScreen() {
           method: "POST",
           headers: {
             ...(createForm === null ? { "Content-Type": "application/json" } : {}),
+            ...PERMISSION_TIERS_PROTOCOL_HEADERS,
             ...backgroundSessionTitlesRequestHeaders(),
           },
           body: createForm ?? createPayload,
@@ -8189,7 +8218,7 @@ export function NewChatLandingScreen() {
                                     : approvalMode
                                   : selectedNativeHarness === "cursor-native"
                                     ? cursorExecMode
-                                    : selectedNativeHarness === "antigravity-native"
+                                    : supportsAgyPermissionTier
                                       ? agySkipMode
                                       : selectedNativeHarness === "devin-native"
                                         ? devinPermissionMode
@@ -8351,6 +8380,16 @@ export function NewChatLandingScreen() {
           />
         </div>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
+          {selectedNativeHarness === "antigravity-native" && !autoRoutingSelected && (
+            <p role="note" className="text-xs text-muted-foreground">
+              {AGY_RESTRICTED_HOOK_RULE}
+            </p>
+          )}
+          {supportsAgyPermissionTier && migratedFullProjectDefault && (
+            <div role="status" className="rounded-md border border-border px-2 py-1.5 text-xs">
+              项目原有的全放开默认值已迁为自动。若本次确需全放开，请在权限菜单中明确选择。
+            </div>
+          )}
           {supportsAgyPermissionTier &&
             !autoRoutingSelected &&
             agySkipMode === AGY_NATIVE_FULL_PERMISSION_TIER && (
@@ -8360,10 +8399,7 @@ export function NewChatLandingScreen() {
                 className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
               >
                 <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-                <span>
-                  Danger: this session runs Antigravity with all tool permission prompts disabled.
-                  It can edit any file and run any command without asking.
-                </span>
+                <span>全放开会跳过本套审批与规则；仅本次创建时可选。</span>
               </div>
             )}
           {/* Warn (don't block) when the selected agent's harness isn't

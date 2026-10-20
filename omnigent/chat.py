@@ -725,7 +725,7 @@ def _remote_headers(
     """
     # Resolve the bearer in the documented precedence order (one credential
     # source per branch), then merge the workspace-routing header.
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = {"X-Omnigent-Permission-Tiers": "1"}
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if token and (token := token.strip()):
         # 1. Explicit env-var token.

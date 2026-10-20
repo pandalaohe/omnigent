@@ -608,6 +608,21 @@ describe("resolveIdentity base-path login redirect", () => {
 });
 
 describe("authenticatedFetch", () => {
+  it.each([
+    ["/v1/sessions", "GET"],
+    ["/v1/sessions/session", "GET"],
+    ["/v1/sessions/session", "PATCH"],
+    ["/v1/sessions/session/events", "POST"],
+  ])("negotiates permission tiers for %s %s at the HTTP boundary", async (url, method) => {
+    const { authenticatedFetch, authenticatedRequestHeaders } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch(url, { method, headers: { "Content-Type": "application/json" } });
+    const sent = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(sent.get("X-Omnigent-Permission-Tiers")).toBe("1");
+    expect(sent.get("Content-Type")).toBe("application/json");
+    const uploadHeaders = await authenticatedRequestHeaders(url);
+    expect(uploadHeaders.get("X-Omnigent-Permission-Tiers")).toBe("1");
+  });
   it("injects X-Forwarded-Email header once the identity is resolved", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" }));
     const { resolveIdentity, authenticatedFetch } = await import("./identity");

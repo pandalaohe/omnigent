@@ -16,6 +16,7 @@
  */
 
 import { stripBasePath, withBasePath } from "./basePath";
+import { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
 import { getCachedServerInfo } from "./capabilities";
 import {
   getOmnigentHostConfig,
@@ -635,7 +636,7 @@ async function _isWrongReplica(res: Response): Promise<boolean> {
  * @returns The headers to set on the outgoing request.
  */
 export async function authenticatedRequestHeaders(url: string): Promise<Headers> {
-  const headers = new Headers();
+  const headers = new Headers(PERMISSION_TIERS_PROTOCOL_HEADERS);
   const stampEpoch = identityEpoch;
   const stampConnectionId = currentIdentityConnectionId();
   if (
@@ -669,6 +670,9 @@ export async function authenticatedFetch(
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
+  for (const [name, value] of Object.entries(PERMISSION_TIERS_PROTOCOL_HEADERS)) {
+    if (!headers.has(name)) headers.set(name, value);
+  }
   const stampEpoch = identityEpoch;
   const stampConnectionId = currentIdentityConnectionId();
   let stampedUser = false;

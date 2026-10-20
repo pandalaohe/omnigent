@@ -1035,6 +1035,31 @@ async def _launch_and_record(
         raise click.ClickException("Invalid Antigravity terminal_launch_args in session snapshot.")
     launch_args = tuple(raw_launch_args) if isinstance(raw_launch_args, list) else antigravity_args
     tier = resolve_agy_permission_tier(labels if isinstance(labels, dict) else None, launch_args)
+    from omnigent.permission_tiers import AGY_PERMISSION_TIER_LABEL_KEY
+    from omnigent.permission_tiers.host import (
+        HOST_PERMISSION_STATE_FILE,
+        HostPermissionState,
+        evaluate_host_tool,
+        write_host_permission_state,
+    )
+
+    revision, host_id = snapshot.get("permission_tier_revision"), snapshot.get("host_id")
+    if (
+        snapshot.get("permission_tiers_capability") is not True
+        or snapshot.get("permission_tier_state") != "ready"
+        or snapshot.get("permission_tier") != tier
+        or not isinstance(labels, dict)
+        or labels.get(AGY_PERMISSION_TIER_LABEL_KEY) != tier
+        or type(revision) is not int
+        or revision < 1
+        or not isinstance(host_id, str)
+        or not host_id
+        or not isinstance(snapshot.get("workspace"), str)
+        or Path(snapshot["workspace"]).resolve() != Path.cwd().resolve()
+    ):
+        raise click.ClickException(
+            "Permission state requires controlled recovery with a permission-tiers-v1 runner."
+        )
     # The resolved tier is the single source for the skip-permissions flag: a
     # copy in the passthrough args must not survive a later non-full tier; the
     # persisted snapshot args only resolve the tier, never reach agy.
@@ -1077,6 +1102,7 @@ async def _launch_and_record(
         bridge_dir,
         trusted_workspace=Path.cwd().resolve(),
         startup_instructions=startup_instructions,
+        permission_tier=tier,
     )
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
@@ -1084,6 +1110,23 @@ async def _launch_and_record(
     # under --gemini_dir, never the user's real ~/.gemini.
     await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
     await asyncio.to_thread(apply_agy_permission_tier, bridge_dir, tier)
+    state = HostPermissionState(
+        session_id, host_id, str(Path.cwd().resolve()), tier, revision, "ready"
+    )
+    if tier != "full":
+        from omnigent import permission_tiers
+
+        probe = evaluate_host_tool(
+            state,
+            "report_result",
+            {},
+            control_paths=(str(bridge_dir), str(Path(permission_tiers.__file__).parent)),
+        )
+        if probe.action != permission_tiers.Verdict.ALLOW:
+            raise click.ClickException("Permission guard or fixed rules are unavailable.")
+    await asyncio.to_thread(
+        write_host_permission_state, bridge_dir / HOST_PERMISSION_STATE_FILE, state
+    )
     effort = snapshot.get("reasoning_effort")
     argv, launch_env = build_agy_launch(
         conversation_id=conversation_id if resume else None,

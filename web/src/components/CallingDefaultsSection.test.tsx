@@ -271,7 +271,20 @@ describe("CallingDefaultsSection", () => {
     expect(screen.getByTestId("calling-defaults-speed-claude-native")).toHaveTextContent("Default");
     await pickOption("calling-defaults-permission-claude-native", "Accept edits");
     expect(readMaster()["host-a"]["claude-native"]).toEqual({ permission: "acceptEdits" });
-    expect(screen.queryByTestId("calling-defaults-permission-pi-native")).not.toBeInTheDocument();
+    await pickOption("calling-defaults-permission-pi-native", "自动（只拦可怕的事）");
+    expect(readMaster()["host-a"]["pi-native"]).toEqual({ permission: "auto" });
+  });
+
+  it("shows a migrated auto default for a stored full tier", () => {
+    localStorage.setItem(
+      DEFAULTS_KEY,
+      JSON.stringify({ "host-a": { "pi-native": { permission: "full" } } }),
+    );
+    render(<CallingDefaultsSection />);
+    expect(screen.getByTestId("calling-defaults-permission-pi-native")).toHaveTextContent(
+      "自动（只拦可怕的事）",
+    );
+    expect(screen.getByText(/原有全放开默认值已迁为自动/)).toBeVisible();
   });
 
   it("returns an SDK row to Follows after deleting its own entry", async () => {

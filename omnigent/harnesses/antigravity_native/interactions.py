@@ -64,6 +64,7 @@ from omnigent.harnesses.antigravity_native.rpc import (
     handle_user_interaction,
 )
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction, pending_interaction
+from omnigent.permission_tiers.host import HostPermissionState
 from omnigent.server.routes._antigravity_elicitation import (
     to_elicitation_params,
     to_interaction_payload,
@@ -336,6 +337,7 @@ async def bridge_interaction(
     port: int,
     get_steps: GetSteps,
     request_elicitation: RequestElicitation,
+    get_permission_state: Callable[[], Awaitable[HostPermissionState]] | None = None,
     deliver: Deliver = _deliver_via_rpc,
     inject_tui: InjectTui = _inject_via_tui,
     max_retries: int = _DEFAULT_MAX_RETRIES,
@@ -351,9 +353,8 @@ async def bridge_interaction(
     2. If the verdict is ``None`` (the human timed out or cancelled), **returns
        without delivering** — agy's own WAITING timeout handles the dangling step;
        forcing a deny here is out of scope.
-    3. Re-reads the WAITING step, preferring the captured ids. A retry at new
-       ids may reuse the answer only when its kind and spec are unchanged;
-       a changed prompt requires a new elicitation. If no WAITING step remains,
+    3. Re-reads the WAITING step. A retry at new ids requires fresh consent,
+       even when its kind and spec are unchanged. If no WAITING step remains,
        returns without delivering.
     4. On the overloaded ``"input not registered"`` error (the targeted step
        timed out before delivery), re-reads for a NEW higher-index WAITING step;
@@ -385,8 +386,42 @@ async def bridge_interaction(
     """
     current: PendingInteraction = pending
     for attempt in range(max_retries):
+        permission_state = None
+        if get_permission_state is not None:
+            try:
+                permission_state = await get_permission_state()
+                if permission_state.status != "ready":
+                    return
+            except (OSError, ValueError, RuntimeError):
+                _logger.warning("Permission confirmation unavailable; not delivering interaction")
+                return
         eid = agy_elicitation_id(cascade_id, current["trajectory_id"], current["step_index"])
-        params = to_elicitation_params(dict(current))
+        managed_permission = (
+            permission_state is not None
+            and permission_state.tier != "full"
+            and current["kind"] == "permission"
+        )
+        pending_params = dict(current)
+        if managed_permission:
+            assert permission_state is not None
+            eid = (
+                "elicit_agy_"
+                + hashlib.sha256(
+                    json.dumps(
+                        [
+                            eid,
+                            permission_state.session_id,
+                            permission_state.host_id,
+                            permission_state.revision,
+                            current["spec"],
+                        ],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()[:32]
+            )
+            pending_params["permission_tier_revision"] = permission_state.revision
+        params = to_elicitation_params(pending_params)
 
         result = await request_elicitation(eid, params)
         if result is None:
@@ -406,6 +441,16 @@ async def bridge_interaction(
             )
             return
 
+        if permission_state is not None:
+            assert get_permission_state is not None
+            try:
+                if await get_permission_state() != permission_state:
+                    return
+            except (OSError, ValueError, RuntimeError):
+                return
+        if managed_permission:
+            result = result.model_copy(update={"meta": None})
+
         # Prefer the surfaced step. A timed-out step may have a newer retry,
         # but being the same kind alone does not make it the same prompt.
         steps = await get_steps()
@@ -423,7 +468,17 @@ async def bridge_interaction(
             )
             return
 
-        if fresh["kind"] != current["kind"] or fresh["spec"] != current["spec"]:
+        if (
+            fresh["kind"] != current["kind"]
+            or fresh["spec"] != current["spec"]
+            or (
+                managed_permission
+                and (
+                    fresh["trajectory_id"] != current["trajectory_id"]
+                    or fresh["step_index"] != current["step_index"]
+                )
+            )
+        ):
             if (fresh["trajectory_id"], fresh["step_index"]) == (
                 current["trajectory_id"],
                 current["step_index"],

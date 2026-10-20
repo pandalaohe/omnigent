@@ -114,6 +114,7 @@ async def _evaluate_policy_via_omnigent(
         else None
     )
     verdict_data: _JsonObject | None = None
+    permission_finish_ack: dict[str, object] | None = None
 
     from omnigent.native.native_policy_hook import post_evaluate_with_retry_async
 
@@ -136,6 +137,13 @@ async def _evaluate_policy_via_omnigent(
                 "event": {
                     "type": phase,
                     "data": data,
+                    **(
+                        {"target": data["name"]}
+                        if phase == "PHASE_TOOL_RESULT"
+                        and isinstance(data.get("name"), str)
+                        and data["name"]
+                        else {}
+                    ),
                 },
             },
             _ASK_GATE_DELIVERY_TIMEOUT,
@@ -158,6 +166,18 @@ async def _evaluate_policy_via_omnigent(
             verdict_action = result.get("result", _default_action)
             verdict_reason = result.get("reason")
             verdict_data = result.get("data")
+            ack = result.get("permission_tier_finish")
+            if (
+                phase == "PHASE_TOOL_RESULT"
+                and isinstance(ack, dict)
+                and ack.get("finished") is True
+                and isinstance(data.get("call_id"), str)
+                and ack.get("call_id") == data["call_id"]
+                and type(ack.get("revision")) is int
+                and type(data.get("permission_tier_revision")) is int
+                and ack["revision"] == data["permission_tier_revision"]
+            ):
+                permission_finish_ack = ack
         else:
             _logger.warning(
                 "AP policy evaluate returned %d for %s; defaulting to %s",
@@ -176,6 +196,16 @@ async def _evaluate_policy_via_omnigent(
         )
 
     # Post the verdict back to the harness as a policy_verdict event.
+    if (
+        phase == "PHASE_TOOL_RESULT"
+        and isinstance(data.get("call_id"), str)
+        and type(data.get("permission_tier_revision")) is int
+    ):
+        # Policy output and an advisory fallback cannot forge a host completion ACK.
+        verdict_data = dict(verdict_data) if isinstance(verdict_data, dict) else {}
+        verdict_data.pop("_omnigent_permission_finish", None)
+        if permission_finish_ack is not None:
+            verdict_data["_omnigent_permission_finish"] = permission_finish_ack
     verdict_body: dict[str, Any] = {
         "type": "policy_verdict",
         "evaluation_id": evaluation_id,

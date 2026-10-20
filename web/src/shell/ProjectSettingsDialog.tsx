@@ -9,6 +9,7 @@ import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState }
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
 import { HelpTip } from "@/components/HelpTip";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import { normalizeAgyPermissionTier } from "@/lib/nativeHarnessModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
 import {
@@ -1233,7 +1234,14 @@ export function ProjectSettingsDialog({
     );
 
   const inheritedFieldLabel = (row: HostRowDraft, harness: string, field: CallingDefaultField) => {
-    const value = inheritedFor(row, harness, field).value;
+    const inherited = inheritedFor(row, harness, field).value ?? null;
+    const normalizedPermission = normalizeAgyPermissionTier(inherited);
+    const value =
+      field === "permission" && ["antigravity-native", "pi", "pi-native"].includes(harness)
+        ? normalizedPermission === "full"
+          ? "auto"
+          : (normalizedPermission ?? null)
+        : inherited;
     if (value === null) return "Default";
     if (field === "model") return catalogModelLabel(catalogs, row.hostId, harness, value) ?? value;
     if (field === "effort") return normalizeEffortLabel(value);

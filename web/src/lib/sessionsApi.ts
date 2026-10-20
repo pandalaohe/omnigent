@@ -14,6 +14,7 @@ import type { ConversationItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
+import { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
@@ -30,6 +31,8 @@ import type {
   SessionItem,
   SessionStatus,
 } from "./types";
+
+export { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
 
 /**
  * Broadcast when the user's own interaction (a user message or an approval)
@@ -130,6 +133,10 @@ interface ModelUsageWire {
  */
 interface SessionResponseWire {
   id: string;
+  permission_tier?: string | null;
+  permission_tier_revision?: number | null;
+  permission_tier_state?: "ready" | "switching" | "blocked" | null;
+  permission_tiers_capability?: boolean;
   agent_id: string;
   agent_template_id?: string | null;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
@@ -369,6 +376,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
+    permissionTier: wire.permission_tier ?? null,
+    permissionTierRevision: wire.permission_tier_revision ?? null,
+    permissionTierState: wire.permission_tier_state ?? null,
+    permissionTiersCapability: wire.permission_tiers_capability ?? false,
     agentId: wire.agent_id,
     ...(wire.agent_template_id !== undefined ? { agentTemplateId: wire.agent_template_id } : {}),
     agentName: wire.agent_name ?? null,
@@ -495,8 +506,22 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
     // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
+    else if (
+      body.detail &&
+      typeof body.detail === "object" &&
+      "message" in body.detail &&
+      typeof body.detail.message === "string"
+    )
+      message = body.detail.message;
     else if (typeof body.message === "string" && body.message) message = body.message;
     if (body.error?.code) code = body.error.code;
+    else if (
+      body.detail &&
+      typeof body.detail === "object" &&
+      "code" in body.detail &&
+      typeof body.detail.code === "string"
+    )
+      code = body.detail.code;
     else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
@@ -584,6 +609,7 @@ export async function createSession(
     headers: {
       "Content-Type": "application/json",
       "X-Omnigent-Client": getClientSurface(),
+      ...PERMISSION_TIERS_PROTOCOL_HEADERS,
       ...backgroundSessionTitlesRequestHeaders(),
     },
     body: JSON.stringify(body),
@@ -608,6 +634,7 @@ export async function createProjectSession(opts: {
     headers: {
       "Content-Type": "application/json",
       "X-Omnigent-Client": getClientSurface(),
+      ...PERMISSION_TIERS_PROTOCOL_HEADERS,
       ...backgroundSessionTitlesRequestHeaders(),
     },
     body: JSON.stringify({
@@ -634,7 +661,7 @@ export async function createProjectSession(opts: {
 export async function continueArchivedSession(sessionId: string): Promise<Session> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/continue`, {
     method: "POST",
-    headers: { "X-Omnigent-Client": getClientSurface() },
+    headers: { "X-Omnigent-Client": getClientSurface(), ...PERMISSION_TIERS_PROTOCOL_HEADERS },
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
@@ -863,6 +890,7 @@ export async function createBundledSession(
     method: "POST",
     headers: {
       "X-Omnigent-Client": getClientSurface(),
+      ...PERMISSION_TIERS_PROTOCOL_HEADERS,
       ...backgroundSessionTitlesRequestHeaders(),
     },
     body: form,
@@ -1001,7 +1029,11 @@ export async function forkSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...PERMISSION_TIERS_PROTOCOL_HEADERS,
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -1152,6 +1184,9 @@ export async function updateSession(
      * Claude SDK sessions accept any launch mode, applied from the next turn.
      */
     claudePermissionMode?: string;
+    /** Server-confirmed Pi/Antigravity tier, switched with a compare-and-set revision. */
+    permissionTier?: string;
+    expectedPermissionTierRevision?: number;
     /**
      * Codex-native approval mode to switch a RUNNING session to, one of
      * `"ask-for-approval"`, `"approve-for-me"`, `"full-access"`, `"read-only"`
@@ -1178,7 +1213,7 @@ export async function updateSession(
   },
   options?: { literalEffort?: boolean },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null | Record<string, string>> = {};
+  const body: Record<string, string | number | boolean | null | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = options?.literalEffort
       ? (updates.reasoningEffort ?? null)
@@ -1192,6 +1227,11 @@ export async function updateSession(
   }
   if (updates.claudePermissionMode !== undefined) {
     body.permission_mode = updates.claudePermissionMode;
+  }
+  if (updates.permissionTier !== undefined) {
+    body.permission_mode = updates.permissionTier;
+    if (updates.expectedPermissionTierRevision !== undefined)
+      body.expected_permission_tier_revision = updates.expectedPermissionTierRevision;
   }
   if (updates.codexApprovalMode !== undefined) {
     body.approval_mode = updates.codexApprovalMode;
@@ -1221,7 +1261,7 @@ export async function updateSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...PERMISSION_TIERS_PROTOCOL_HEADERS },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -1288,7 +1328,9 @@ export async function bindOnlyOnlineRunner(sessionId: string): Promise<Session |
  * with no transient (delta) coverage.
  */
 export async function getSession(sessionId: string): Promise<Session> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`);
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
+    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+  });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
@@ -1331,7 +1373,7 @@ export async function getSessionSlim(
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
-    { signal: options.signal },
+    { signal: options.signal, headers: PERMISSION_TIERS_PROTOCOL_HEADERS },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
@@ -1697,6 +1739,7 @@ export async function postEvent(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...PERMISSION_TIERS_PROTOCOL_HEADERS,
       ...backgroundSessionTitlesRequestHeaders(),
       ...(opts?.holdWhenHostOffline ? { [HOST_OFFLINE_HOLD_HEADER]: "on" } : {}),
     },
@@ -1741,9 +1784,11 @@ export function openSessionStream(
   signal: AbortSignal,
   opts?: { idle?: boolean },
 ): Promise<Response> {
-  const query = opts?.idle ? "?idle=true" : "";
+  const params = new URLSearchParams({ permission_tiers: "1" });
+  if (opts?.idle) params.set("idle", "true");
+  const query = `?${params.toString()}`;
   return authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/stream${query}`, {
-    headers: { Accept: "text/event-stream" },
+    headers: { Accept: "text/event-stream", ...PERMISSION_TIERS_PROTOCOL_HEADERS },
     signal,
   });
 }
@@ -1836,7 +1881,7 @@ export async function approve(
       `${encodeURIComponent(elicitationId)}/resolve`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...PERMISSION_TIERS_PROTOCOL_HEADERS },
       body: JSON.stringify(result),
     },
   );

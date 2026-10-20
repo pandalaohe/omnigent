@@ -2010,11 +2010,13 @@ describe("Antigravity fork controls", () => {
   }
 
   it.each([
-    ["auto-standard", false, "auto-standard"],
-    ["", true, "full"],
+    ["auto-standard", false, "auto"],
+    ["", true, "auto"],
     ["", false, "ask"],
   ])("inherits an untouched tier %s", async (tier, skip, expected) => {
     seedAgy(tier, skip);
+    expect(screen.getByRole("note")).toHaveTextContent("PreToolUse");
+    expect(screen.getByRole("note")).toHaveTextContent('"enabled": false');
     expect(screen.getByTestId("fork-session-config-model")).toBeVisible();
     expect(screen.getByTestId("fork-session-config-effort")).toBeVisible();
     fireEvent.click(screen.getByTestId("fork-session-submit"));
@@ -2025,7 +2027,7 @@ describe("Antigravity fork controls", () => {
   it("sends a chosen tier and filters effort when the model changes", async () => {
     seedAgy("auto-relaxed");
     fireEvent.click(screen.getByTestId("fork-session-config-agy-skip"));
-    fireEvent.click(screen.getByRole("option", { name: "Plan only" }));
+    fireEvent.click(screen.getByRole("option", { name: "只规划" }));
     fireEvent.click(screen.getByTestId("fork-session-config-model"));
     fireEvent.click(screen.getByRole("option", { name: "GPT OSS" }));
     fireEvent.click(screen.getByTestId("fork-session-config-effort"));
@@ -2050,7 +2052,12 @@ describe("Antigravity fork controls", () => {
     expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({});
   });
 
-  it("seeds the agy default tier when the source ran another harness", async () => {
+  it.each([
+    ["claude-native", undefined, "auto"],
+    ["pi", "plan", "plan"],
+    ["pi-native", "ask", "ask"],
+    ["pi", "full", "auto"],
+  ])("seeds the correct tier from %s (%s)", async (sourceHarness, sourceTier, expected) => {
     const agy = testAgent("ag_agy", "antigravity-native-ui", {
       display_name: "Antigravity",
       harness: "antigravity-native",
@@ -2063,7 +2070,8 @@ describe("Antigravity fork controls", () => {
       session: {
         id: "conv_src",
         agentId: "ag_claude_native",
-        harness: "claude-native",
+        harness: sourceHarness,
+        permissionTier: sourceTier,
         hostId: "host_1",
         workspace: "/opt/work/repo",
         labels: { "omnigent.wrapper": "claude-native-ui" },
@@ -2095,7 +2103,7 @@ describe("Antigravity fork controls", () => {
     fireEvent.click(screen.getByTestId("fork-session-submit"));
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
     expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({
-      permissionTier: "auto-relaxed",
+      permissionTier: expected,
     });
   });
 });

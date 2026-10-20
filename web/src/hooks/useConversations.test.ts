@@ -294,6 +294,8 @@ describe.each([undefined, "updated_at", "created_at"] as const)(
         });
 
         const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+        const init = fetchMock.mock.calls[0][1] as RequestInit;
+        expect(new Headers(init.headers).get("X-Omnigent-Permission-Tiers")).toBe("1");
         expect(params.get("visibility")).toBe(visibility ?? "all");
         expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
         expect(params.get("order")).toBe("desc");

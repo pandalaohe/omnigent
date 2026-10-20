@@ -1605,6 +1605,21 @@ describe("session.permission_mode (FLAT envelope)", () => {
     expect(ev.permissionMode).toBe("auto");
   });
 
+  it("carries the confirmed tier revision and recovery state", () => {
+    const [event] = parse("session.permission_mode", {
+      conversation_id: "conv_pi",
+      permission_mode: "auto",
+      permission_tier_revision: 5,
+      permission_tier_state: "blocked",
+      permission_tiers_capability: false,
+    }) as SessionPermissionModeEvent[];
+    expect(event).toMatchObject({
+      permissionTierRevision: 5,
+      permissionTierState: "blocked",
+      permissionTiersCapability: false,
+    });
+  });
+
   it("rejects missing permission_mode", () => {
     expect(parse("session.permission_mode", { conversation_id: "conv_abc" })).toEqual([]);
   });

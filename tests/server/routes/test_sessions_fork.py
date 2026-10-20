@@ -1208,6 +1208,8 @@ class _StubLoadedSpec:
         class _Executor:
             def __init__(self, hk: str) -> None:
                 self.harness_kind = hk
+                self.config = {"harness": hk}
+                self.type = hk
 
         self.executor = _Executor(harness_kind)
 
@@ -1724,6 +1726,7 @@ async def test_fork_switch_model_and_carry_gating(
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+        headers={"X-Omnigent-Permission-Tiers": "1"},
     )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
@@ -1838,7 +1841,11 @@ async def test_fork_cursor_pi_native_carry_gating(
     )
     client = TestClient(_build_app(conv_store))
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Omnigent-Permission-Tiers": "1"},
+    )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
@@ -1890,7 +1897,11 @@ async def test_fork_reversed_native_spelling_carry_gating(
     )
     client = TestClient(_build_app(conv_store))
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Omnigent-Permission-Tiers": "1"},
+    )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
@@ -2654,6 +2665,7 @@ def test_fork_copies_by_path_attachments_for_any_target(
     response = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+        headers={"X-Omnigent-Permission-Tiers": "1"},
     )
     assert response.status_code == 201, response.text
     assert len(conv_store.fork_calls) == 1
@@ -2789,7 +2801,7 @@ def test_fork_enforces_current_policy_before_creating_destination(
     [
         ("auto-relaxed", "ask", "ask"),
         ("plan", None, "plan"),
-        ("full", None, "full"),
+        ("full", None, "auto"),
         ("ask", "full", "full"),
     ],
 )
@@ -2815,7 +2827,9 @@ def test_antigravity_fork_tier_stamping(source_tier, requested, expected):
     )
     store = _ConversationStore({source.id: source})
     response = TestClient(_build_app(store, _AgentStore({agent.id: agent}))).post(
-        f"/v1/sessions/{source.id}/fork", json={"permission_tier": requested} if requested else {}
+        f"/v1/sessions/{source.id}/fork",
+        json={"permission_tier": requested} if requested else {},
+        headers={"X-Omnigent-Permission-Tiers": "1"},
     )
     assert response.status_code == 201, response.text
     call = store.fork_calls[0]
@@ -2827,12 +2841,63 @@ def test_antigravity_fork_tier_stamping(source_tier, requested, expected):
     assert call["override_terminal_launch_args_set"] is True
 
 
-def test_fork_tier_ignored_for_other_harness_and_invalid_value_rejected():
+def test_antigravity_fork_requires_permission_protocol_before_persistence():
+    from omnigent.native.native_coding_agents import ANTIGRAVITY_NATIVE_CODING_AGENT
+
+    source = _make_conversation(labels={"omnigent.wrapper": "antigravity-native-ui"})
+    source.harness_override = "antigravity-native"
+    agent = Agent(
+        id=source.agent_id,
+        name=ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name,
+        bundle_location="builtin",
+        version=1,
+        created_at=1,
+    )
+    store = _ConversationStore({source.id: source})
+    response = TestClient(_build_app(store, _AgentStore({agent.id: agent}))).post(
+        f"/v1/sessions/{source.id}/fork", json={}
+    )
+    assert response.status_code == 426, response.text
+    assert response.json()["detail"]["code"] == "permission_tiers_refresh_required"
+    assert not store.fork_calls
+
+
+def test_fork_tier_rejected_for_other_harness_and_invalid_value_rejected():
     source = _make_conversation()
     store = _ConversationStore({source.id: source})
     client = TestClient(_build_app(store))
     response = client.post(f"/v1/sessions/{source.id}/fork", json={"permission_tier": "full"})
-    assert response.status_code == 201, response.text
-    assert "omnigent.antigravity_native.permission_tier" not in store.fork_calls[0]["extra_labels"]
+    assert response.status_code == 400, response.text
+    assert not store.fork_calls
     response = client.post(f"/v1/sessions/{source.id}/fork", json={"permission_tier": "invalid"})
     assert response.status_code == 422, response.text
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+@pytest.mark.parametrize("requested", ["full", "auto-relaxed"])
+def test_cross_agent_fork_to_pi_requires_protocol_and_stamps_tier(
+    monkeypatch, versioned, requested
+):
+    from dataclasses import replace
+
+    import omnigent.runtime as runtime
+
+    source = _make_conversation()
+    target_id = "a98bb825ebd41391c19637c58fe3c0b7"
+    agents = _switch_agent_store()
+    agents._agents[target_id] = replace(agents._agents[target_id], session_id=None)
+    cache = _StubAgentCache({source.agent_id: "claude-sdk", target_id: "pi"})
+    monkeypatch.setattr(runtime, "get_agent_cache", lambda: cache)
+    store = _ConversationStore({source.id: source})
+    client = TestClient(_build_app(store, agents))
+    response = client.post(
+        f"/v1/sessions/{source.id}/fork",
+        json={"agent_id": target_id, "permission_tier": requested},
+        headers={"X-Omnigent-Permission-Tiers": "1"} if versioned else {},
+    )
+    expected = 426 if not versioned else 201 if requested == "full" else 400
+    assert response.status_code == expected, response.text
+    if expected == 201:
+        assert store.fork_calls[0]["extra_labels"]["omnigent.pi.permission_tier"] == "full"
+    else:
+        assert not store.fork_calls

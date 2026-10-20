@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -22,6 +23,123 @@ _Settings: TypeAlias = dict[str, object]
 
 # Default global Pi agent root (``PI_CODING_AGENT_DIR`` when unset).
 DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
+
+# The SDK appends inline factories after file, package and built-in extensions.
+_INLINE_LAUNCHER_JS = r"""
+#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+const dist = __PI_SDK_DIR__;
+const extensionPath = __OMNIGENT_EXTENSION__;
+const resourceAgentSource = __PI_RESOURCE_AGENT_DIR__;
+(async () => {
+  const load = (name) => import(pathToFileURL(path.join(dist, name)).href);
+  const { setupCli } = await load("cli/setup.js");
+  const { main } = await load("main.js");
+  const { DefaultResourceLoader } = await load("core/resource-loader.js");
+  const { DefaultPackageManager } = await load("core/package-manager.js");
+  const { SettingsManager } = await load("core/settings-manager.js");
+  const { resolvePath } = await load("utils/paths.js");
+  const resourceAgentDir = resolvePath(resourceAgentSource);
+  // Managed model/auth files must not relocate the user's resource root.
+  const resolve = DefaultPackageManager.prototype.resolve;
+  DefaultPackageManager.prototype.resolve = function (...args) {
+    if (path.resolve(this.agentDir) === resourceAgentDir) return resolve.apply(this, args);
+    const settingsManager = SettingsManager.create(this.cwd, resourceAgentDir, {
+      projectTrusted: this.settingsManager.isProjectTrusted(),
+    });
+    if (settingsManager.drainErrors().length) throw new Error("Invalid Pi resource settings");
+    const resources = new DefaultPackageManager({
+      cwd: this.cwd, agentDir: resourceAgentDir, settingsManager,
+      builtinExtensions: this.builtinExtensions,
+    });
+    resources.setProgressCallback(this.progressCallback);
+    return resolve.apply(resources, args);
+  };
+  const factory = require(extensionPath);
+  if (typeof factory !== "function") throw new Error("Omnigent extension factory unavailable");
+  // Validate the real loader result, including built-ins and project trust passes.
+  const getExtensions = DefaultResourceLoader.prototype.getExtensions;
+  DefaultResourceLoader.prototype.getExtensions = function () {
+    const result = getExtensions.call(this);
+    const last = result.extensions.at(-1);
+    if (result.errors.length || !last || last.path !== "<inline:omnigent-permission>") {
+      throw new Error("Pi cannot order all extensions before the Omnigent permission check");
+    }
+    return result;
+  };
+  process.env.OMNIGENT_PI_PERMISSION_INLINE = fs.realpathSync(extensionPath);
+  setupCli();
+  await main(process.argv.slice(2), {
+    extensionFactories: [{ name: "omnigent-permission", factory }],
+  });
+})().catch(() => {
+  console.error("Pi cannot prove permission extension ordering; check Pi SDK/extension errors.");
+  process.exitCode = 1;
+});
+"""
+
+
+def ordered_pi_launch(
+    executable: str,
+    args: list[str],
+    *,
+    extension: Path,
+    resource_agent_dir: Path | None = None,
+) -> tuple[str, list[str]]:
+    """Use Pi's own CLI/resource loader with a verified final inline policy factory."""
+    required = (
+        "cli/setup.js",
+        "main.js",
+        "core/resource-loader.js",
+        "core/package-manager.js",
+        "core/settings-manager.js",
+        "utils/paths.js",
+    )
+    dist = next(
+        (
+            parent
+            for parent in Path(executable).resolve().parents
+            if all((parent / name).is_file() for name in required)
+        ),
+        None,
+    )
+    if dist is None:
+        raise ValueError(
+            "Pi cannot prove extension ordering: this CLI installation does not expose "
+            "the supported Pi SDK loader"
+        )
+    remaining: list[str] = []
+    index = 0
+    while index < len(args):
+        if (
+            args[index] == "--extension"
+            and index + 1 < len(args)
+            and args[index + 1] == str(extension)
+        ):
+            index += 2
+            continue
+        remaining.append(args[index])
+        index += 1
+    launcher = extension.with_name("omnigent_pi_permissions.cjs")
+    source = (
+        _INLINE_LAUNCHER_JS.lstrip()
+        .replace("__PI_SDK_DIR__", json.dumps(str(dist)))
+        .replace("__OMNIGENT_EXTENSION__", json.dumps(str(extension)))
+        .replace(
+            "__PI_RESOURCE_AGENT_DIR__",
+            json.dumps(
+                str(resource_agent_dir)
+                if resource_agent_dir is not None
+                else os.environ.get("PI_CODING_AGENT_DIR") or str(DEFAULT_PI_AGENT_DIR)
+            ),
+        )
+    )
+    launcher.write_text(source, encoding="utf-8")
+    launcher.chmod(0o700)
+    return str(launcher), remaining
+
 
 # Install / checkout trees Pi places under the agent dir. Symlinked into the
 # managed dir so ``packages`` entries in settings keep resolving.

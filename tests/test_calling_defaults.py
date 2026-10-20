@@ -118,6 +118,20 @@ def test_explicit_speed_wins_over_project_default(speed: str | None) -> None:
     assert result.sources["speed"] == "explicit"
 
 
+@pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
+def test_legacy_full_project_permission_resolves_to_auto_before_master(harness: str) -> None:
+    result = _resolve(
+        explicit={"harness_override": harness},
+        explicit_fields={"harness_override"},
+        project_config={
+            "calling_defaults": {"HDS": {"harnesses": {harness: {"permission": "full"}}}}
+        },
+        master={"HDS": {harness: {"permission": "ask"}}},
+    )
+    assert result.permission == "auto"
+    assert result.sources["permission"] == "project_host"
+
+
 def test_sdk_harness_inherits_master_native() -> None:
     """Scenario 5: an unset SDK harness falls back to its native sibling."""
     master = {"HDS": {"codex-native": {"model": "gpt-6-astra", "effort": "medium"}}}
@@ -648,7 +662,7 @@ def test_validate_session_default_modes(harness: str, field: str, value: str) ->
     [
         ("codex", "speed", "priority;bad"),
         ("claude-native", "speed", "priority"),
-        ("pi-native", "permission", "plan"),
+        ("pi-native", "permission", "full"),
         ("codex", "permission", "plan"),
         ("claude-sdk", "permission", "read-only"),
         ("codex", "speed", None),

@@ -729,6 +729,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_permission_mode",
       conversationId,
       permissionMode,
+      ...(typeof data.permission_tier_revision === "number"
+        ? { permissionTierRevision: data.permission_tier_revision }
+        : {}),
+      ...(data.permission_tier_state === "ready" ||
+      data.permission_tier_state === "switching" ||
+      data.permission_tier_state === "blocked"
+        ? { permissionTierState: data.permission_tier_state }
+        : {}),
+      ...(typeof data.permission_tiers_capability === "boolean"
+        ? { permissionTiersCapability: data.permission_tiers_capability }
+        : {}),
     } satisfies SessionPermissionModeEvent;
   }
   if (eventType === "session.codex_approval_mode") {

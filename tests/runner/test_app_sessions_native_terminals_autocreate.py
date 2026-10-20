@@ -91,7 +91,48 @@ from tests.runner.conftest import (
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, seed_pi_permission_state
+
+
+async def test_auto_create_agy_terminal_refuses_inline_pre_tool_hook(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from omnigent.harnesses.antigravity_native import bridge
+    from omnigent.runner.native.orchestration import _auto_create_antigravity_terminal
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    settings = home / ".gemini/antigravity-cli/settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "user-pre-tool": {
+                        "PreToolUse": [{"matcher": ".*", "hooks": [{"command": "true"}]}]
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    snapshot = {
+        "workspace": str(workspace),
+        "labels": {"omnigent.antigravity_native.permission_tier": "plan"},
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server",
+    ) as client:
+        with pytest.raises(ValueError, match="user-pre-tool"):
+            await _auto_create_antigravity_terminal(
+                "session",
+                Mock(spec=SessionResourceRegistry),
+                lambda *_: None,
+                server_client=client,
+            )
 
 
 async def _no_op_forwarder(**kwargs: Any) -> None:
@@ -180,11 +221,13 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ),
     ],
 )
+@pytest.mark.parametrize("permission_tier", ["full", "ask"])
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     env_denylist: str | None,
     expected_env_unset: list[str],
+    permission_tier: str,
 ) -> None:
     """
     Pi-native auto-create must launch a *required* terminal.
@@ -271,6 +314,15 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     published: list[dict[str, Any]] = []
 
+    ordered_calls = []
+
+    def ordered(executable, args, *, extension):
+        ordered_calls.append((executable, extension))
+        return "/opt/launchers/controlled-pi", args
+
+    monkeypatch.setattr("omnigent.inner.pi_settings.ordered_pi_launch", ordered)
+    seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", permission_tier)
+
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -282,7 +334,10 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["terminal_name"] == "pi"
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
-    assert captured["spec"].command == "pi"
+    assert captured["spec"].command == (
+        "pi" if permission_tier == "full" else "/opt/launchers/controlled-pi"
+    )
+    assert bool(ordered_calls) is (permission_tier != "full")
     # Preserve the exited pane so the idle watcher can report its output.
     assert captured["spec"].keep_alive_after_exit is True
     assert captured["spec"].env_unset == expected_env_unset
@@ -370,6 +425,7 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
             posts.append((url, kwargs.get("json") or {}))
             return self._Response()
 
+    seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", "full")
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -482,6 +538,7 @@ async def test_auto_create_pi_terminal_informational_notice_posts_info_level(
             posts.append((url, kwargs.get("json") or {}))
             return self._Response()
 
+    seed_pi_permission_state(tmp_path, "5e3a1b2c4d6f7e8091a2b3c4d5e6f708", "full")
     await _auto_create_pi_terminal(
         "5e3a1b2c4d6f7e8091a2b3c4d5e6f708",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -553,6 +610,7 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
                 metadata={"terminal_name": "pi", "session_key": "main", "running": True},
             )
 
+    seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", "full")
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -618,6 +676,7 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
                 metadata={"terminal_name": "pi", "session_key": "main", "running": True},
             )
 
+    seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", "full")
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -745,6 +804,7 @@ async def test_auto_create_pi_terminal_cli_version_at_floor_or_unknown_proceeds(
         probed = (floor_parts[0], floor_parts[1], floor_parts[2])
     captured = _pi_launch_test_stubs(tmp_path, monkeypatch, probed)
 
+    seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", "full")
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",
         captured["registry"],  # type: ignore[arg-type]
@@ -1073,6 +1133,7 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
         os_env=agent_os_env,
     )
 
+    seed_pi_permission_state(tmp_path, "28a25c47fe4fd8ccde95c80bab47c1c7", "full")
     await _auto_create_pi_terminal(
         "28a25c47fe4fd8ccde95c80bab47c1c7",
         _FakeResourceRegistry(),  # type: ignore[arg-type]

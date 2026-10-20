@@ -18,7 +18,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.debug_logging import add_audit_attrs
-from omnigent.entities import Conversation
+from omnigent.entities import Agent, Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.native.native_coding_agents import (
@@ -54,6 +54,9 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.permissions import check_session_access
+from omnigent.server.routes._auth_helpers import (
+    SessionAccess,
+)
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
 )
@@ -1837,12 +1840,188 @@ def register_hooks_routes(
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body is malformed.
         """
+        from omnigent.permission_tiers import Verdict
+        from omnigent.server.permission_gate import (
+            authorize_permission_call,
+            finish_permission_call,
+            inspect_permission_call,
+        )
+        from omnigent.server.permission_tiers import TIER_HARNESSES
         from omnigent.server.routes import sessions as _sf
 
         user_id = _sf._get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
+        )
+
+        async def independent_policy() -> Response:
+            return await _evaluate_independent_policy(
+                request, session_id, preloaded=(access, user_id, conv, agent)
+            )
+
+        if harness is None and any(
+            key in conv.labels
+            for key in (
+                "omnigent.pi.permission_tier",
+                "omnigent.antigravity_native.permission_tier",
+            )
+        ):
+            return Response(
+                content=json.dumps(
+                    {"result": "POLICY_ACTION_DENY", "reason": "Permission harness unavailable"}
+                ),
+                media_type="application/json",
+            )
+        if harness not in TIER_HARNESSES:
+            return await independent_policy()
+        payload = await request.json()
+        event = payload.get("event") if isinstance(payload, dict) else None
+        if isinstance(event, dict) and event.get("type") == "PHASE_TOOL_RESULT":
+            independent = await independent_policy()
+            completed = event.get("data")
+            from omnigent.server.routes._sessions.helpers import _has_runner_tunnel_authority
+
+            released = False
+            if (
+                independent.status_code < 400
+                and isinstance(completed, dict)
+                and isinstance(completed.get("name"), str)
+                and bool(completed["name"])
+                and isinstance(completed.get("arguments"), dict)
+                and isinstance(completed.get("call_id"), str)
+                and type(completed.get("permission_tier_revision")) is int
+                and _has_runner_tunnel_authority(request, conv, None)
+            ):
+                released = await finish_permission_call(
+                    conv,
+                    call_id=completed.get("call_id"),
+                    revision=completed.get("permission_tier_revision"),
+                    runner_router=runner_router,
+                )
+            if (
+                isinstance(completed, dict)
+                and isinstance(completed.get("call_id"), str)
+                and type(completed.get("permission_tier_revision")) is int
+            ):
+                verdict = json.loads(bytes(independent.body))
+                verdict["permission_tier_finish"] = {
+                    "call_id": completed["call_id"],
+                    "revision": completed["permission_tier_revision"],
+                    "finished": released,
+                }
+                return Response(
+                    content=json.dumps(verdict),
+                    status_code=independent.status_code,
+                    media_type="application/json",
+                )
+            return independent
+        if not isinstance(event, dict) or event.get("type") != "PHASE_TOOL_CALL":
+            return await independent_policy()
+        data = event.get("data")
+        data = data if isinstance(data, dict) else {}
+        name, arguments = data.get("name"), data.get("arguments")
+        if not isinstance(name, str) or not name or not isinstance(arguments, dict):
+            return Response(
+                content=json.dumps(
+                    {"result": "POLICY_ACTION_DENY", "reason": "Malformed tool call"}
+                ),
+                media_type="application/json",
+            )
+        inspection = await inspect_permission_call(
+            conv,
+            harness=harness,
+            name=name,
+            arguments=arguments,
+            call_id=data.get("call_id"),
+            runner_router=runner_router,
+        )
+
+        def tier_response(reason: str) -> Response:
+            return Response(
+                content=json.dumps({"result": "POLICY_ACTION_DENY", "reason": reason}),
+                media_type="application/json",
+            )
+
+        if inspection.decision.action == Verdict.DENY:
+            return tier_response(inspection.decision.reason)
+        independent = await independent_policy()
+        try:
+            verdict = json.loads(bytes(independent.body))
+        except (TypeError, ValueError):
+            return tier_response("Independent policy confirmation is unavailable")
+        if independent.status_code >= 400 or verdict.get("result") not in (
+            "POLICY_ACTION_ALLOW",
+            "POLICY_ACTION_UNSPECIFIED",
+        ):
+            return independent
+        can_approve = permission_store is None or await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+            conv,
+        )
+        decision = await authorize_permission_call(
+            inspection,
+            request=request,
+            harness=harness,
+            arguments=arguments,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            can_approve=can_approve,
+        )
+        return independent if decision.action == Verdict.ALLOW else tier_response(decision.reason)
+
+    async def _evaluate_independent_policy(
+        request: Request,
+        session_id: str,
+        *,
+        preloaded: tuple[SessionAccess, str | None, Conversation, Agent | None] | None = None,
+    ) -> Response:
+        """
+        Generic policy evaluation endpoint (proto-compatible).
+
+        Accepts an ``EvaluationRequest`` JSON body whose ``event``
+        field carries the phase (``PHASE_TOOL_CALL``,
+        ``PHASE_TOOL_RESULT``, ``PHASE_LLM_REQUEST``,
+        ``PHASE_LLM_RESPONSE``), the event data, and optional
+        context. Returns an ``EvaluationResponse`` with the policy
+        verdict (``result``), an optional ``reason``, and optional
+        ``data`` for content-rewriting policies.
+
+        Used by Claude Code's ``PreToolUse`` and ``PostToolUse``
+        command hooks (via ``omnigent.harnesses.claude_native.hook``) to
+        evaluate admin policies on native tool calls. Also usable
+        by any client that speaks the proto-compatible JSON schema.
+
+        :param request: FastAPI request — body is the
+            ``EvaluationRequest`` JSON envelope.
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: ``EvaluationResponse`` JSON with ``result``,
+            ``reason``, and optional ``data``.
+        :raises OmnigentError: 404 if the session doesn't exist,
+            400 if the body is malformed.
+        """
+        from omnigent.server.routes import sessions as _sf
+
+        if preloaded is None:
+            user_id = _sf._get_user_id(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+        else:
+            access, user_id, _conv, _agent = preloaded
         is_read_only = permission_store is not None and (
             access.level is None or access.level < LEVEL_EDIT
         )
@@ -1989,7 +2168,7 @@ def register_hooks_routes(
         # fewer on the blocking PreToolUse path. Absent for admin callers
         # (who bypass the conversation lookup) and when permissions are
         # disabled, which fall back to their own read.
-        conv = access.conversation
+        conv = preloaded[2] if preloaded is not None else access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
@@ -2013,7 +2192,13 @@ def register_hooks_routes(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
             )
-        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
+        agent = (
+            preloaded[3]
+            if preloaded is not None
+            else (
+                await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
+            )
+        )
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(

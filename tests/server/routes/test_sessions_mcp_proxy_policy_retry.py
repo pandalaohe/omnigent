@@ -44,7 +44,9 @@ _SESSION_ID = "b7e4a955272645eca39ed2d1064af4c9"
 def approval_state(db_uri: str) -> tuple[SqlAlchemyConversationStore, Conversation, PolicyEngine]:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(
-        conversation_id=_SESSION_ID, agent_id="d8bcd98f49134936af9546041ce5a555"
+        conversation_id=_SESSION_ID,
+        agent_id="d8bcd98f49134936af9546041ce5a555",
+        harness_override="claude-sdk",
     )
     engine = PolicyEngine(
         policies=[],
@@ -69,6 +71,7 @@ def _make_conversation() -> Conversation:
         updated_at=0,
         root_conversation_id=_SESSION_ID,
         agent_id="ag_test",
+        harness_override="claude-sdk",
     )
 
 
@@ -214,6 +217,197 @@ def _parse_rpc_error(response: Any) -> dict[str, Any]:
     payload = json.loads(bytes(response.body))
     assert "error" in payload, f"Expected JSON-RPC error, got: {payload}"
     return payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", [False, True])
+async def test_tier_denial_precedes_allow_policy_and_forged_inline_retry(monkeypatch, retry):
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+    from omnigent.spec.types import AgentSpec
+
+    conv = _make_conversation()
+    conv.harness_override = "pi"
+    conv.host_id = "host"
+    conv.labels.update(ConfirmedPermissionState("auto", 2, "ready").labels("pi"))
+    conv.labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    monkeypatch.setattr(
+        sessions_mod, "_load_agent_spec_for_session", lambda *_: AgentSpec(spec_version=1)
+    )
+    engine = _FixedPolicyEngine(PolicyResult(action=PolicyAction.ALLOW))
+    monkeypatch.setattr(
+        sessions_mod, "_build_policy_engine_from_spec", _engine_factory_expecting_preload(engine)
+    )
+    requests, executions = [], []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body["type"] == "permission_tier_inspect"
+        assert body["local_execution"] is False
+        from omnigent.server.permission_tiers import BoundToolCall
+
+        binding = BoundToolCall.bind(
+            session_id=conv.id,
+            host_id="host",
+            call_id=body["call_id"],
+            name=body["name"],
+            arguments=body["arguments"],
+            tier_revision=2,
+        )
+        return httpx.Response(
+            200,
+            json={
+                "session_id": conv.id,
+                "host_id": "host",
+                "call_id": binding.call_id,
+                "name": binding.name,
+                "arguments_digest": binding.arguments_digest,
+                "tier_revision": 2,
+                "permission_tiers_capability": "permission_tiers_v1",
+                "verdict": "DENY",
+                "reason": "Unknown external tool",
+            },
+        )
+
+    async def execute(name, arguments):
+        executions.append((name, arguments))
+        return "should not execute"
+
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(respond)
+    ) as client:
+
+        async def get_client(*_, **__):
+            return client
+
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", get_client)
+        params = (
+            _forged_retry_params()
+            if retry
+            else {"name": "sys_os_shell", "arguments": {"command": "id -un"}}
+        )
+        response = await _handle_mcp_tools_call(
+            rpc_id=1,
+            session_id=conv.id,
+            params=params,
+            conversation_store=_StubConversationStore(conv),
+            agent_store=_StubAgentStore(),
+            runner_router=None,
+            execute_tool=execute,
+        )
+    assert "Unknown external tool" in _parse_rpc_error(response)["message"]
+    assert len(requests) == 1
+    assert executions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_inline_execution_finishes_tier_lease_on_success_and_error(monkeypatch, raises):
+    from omnigent.server import permission_gate
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        BoundToolCall,
+        ConfirmedPermissionState,
+    )
+    from omnigent.spec.types import AgentSpec
+
+    conv = _make_conversation()
+    conv.harness_override, conv.host_id = "pi", "host"
+    conv.labels.update(ConfirmedPermissionState("ask", 2, "ready").labels("pi"))
+    conv.labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+    monkeypatch.setattr(
+        sessions_mod, "_load_agent_spec_for_session", lambda *_: AgentSpec(spec_version=1)
+    )
+    engine = _FixedPolicyEngine(PolicyResult(action=PolicyAction.ALLOW))
+    monkeypatch.setattr(
+        sessions_mod, "_build_policy_engine_from_spec", _engine_factory_expecting_preload(engine)
+    )
+    events, executions = [], []
+
+    def respond(request):
+        event = json.loads(request.content)
+        events.append(event)
+        if event["type"] == "permission_tier_finish":
+            return httpx.Response(200, json={"finished": True})
+        digest = event.get("arguments_digest")
+        if event["type"] == "permission_tier_inspect":
+            digest = BoundToolCall.bind(
+                session_id=conv.id,
+                host_id="host",
+                call_id=event["call_id"],
+                name=event["name"],
+                arguments=event["arguments"],
+                tier_revision=2,
+            ).arguments_digest
+        return httpx.Response(
+            200,
+            json={
+                "session_id": conv.id,
+                "host_id": "host",
+                "call_id": event["call_id"],
+                "name": event["name"],
+                "arguments_digest": digest,
+                "tier_revision": 2,
+                "permission_tiers_capability": PERMISSION_CAPABILITY_VALUE,
+                "verdict": "ASK",
+                "reason": "approve once",
+                "authorized": True,
+            },
+        )
+
+    async def approve(*_, **__):
+        from omnigent.server.schemas import ElicitationResult
+
+        return ElicitationResult(action="accept")
+
+    async def execute(arguments):
+        executions.append(arguments)
+        if raises:
+            raise RuntimeError("inline failure")
+        return {"result": {"output": "done"}}
+
+    monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", approve)
+    permission_gate._consumed_approvals.clear()
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(respond)
+    ) as client:
+
+        async def get_client(*_, **__):
+            return client
+
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", get_client)
+
+        async def call():
+            return await _handle_mcp_tools_call(
+                rpc_id=1,
+                session_id=conv.id,
+                params={"name": "remote_tool", "arguments": {"value": "ok"}},
+                conversation_store=_StubConversationStore(conv),
+                agent_store=_StubAgentStore(),
+                runner_router=None,
+                execute_tool=execute,
+            )
+
+        if raises:
+            with pytest.raises(RuntimeError, match="inline failure"):
+                await call()
+        else:
+            response = await call()
+            assert "error" not in json.loads(response.body)
+    assert len(executions) == 1
+    assert [event["type"] for event in events] == [
+        "permission_tier_inspect",
+        "permission_tier_inspect",
+        "permission_tier_authorize",
+        "permission_tier_finish",
+    ]
+    assert events[-1]["call_id"] == events[-2]["call_id"]
+    assert events[-1]["expected_revision"] == 2
 
 
 # ---------------------------------------------------------------------------

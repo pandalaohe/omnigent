@@ -99,11 +99,11 @@ function nextReconnectDelay(failedAttempts: number): number {
  */
 function buildUpdatesUrl(): string {
   const path = "/v1/sessions/updates";
-  if (!isHostRoutingEnabled()) return resolveWebSocketUrl(path);
+  const params = new URLSearchParams({ permission_tiers: "1" });
+  if (!isHostRoutingEnabled()) return resolveWebSocketUrl(`${path}?${params.toString()}`);
   const sliceKey = modalHostId();
-  return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
-  );
+  if (sliceKey) params.set("omnigent_slice_key", sliceKey);
+  return resolveWebSocketUrl(`${path}?${params.toString()}`);
 }
 
 /**

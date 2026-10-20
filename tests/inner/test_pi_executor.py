@@ -8,6 +8,7 @@ import os
 import shlex
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -21,6 +22,10 @@ from urllib.parse import urlparse
 import psutil
 import pytest
 
+from omnigent.harnesses.pi_native.bridge import (
+    prepare_permission_installation,
+    verify_pi_permission_installation,
+)
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -49,6 +54,7 @@ from omnigent.inner.pi_executor import (
 )
 from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -1103,14 +1109,78 @@ class TestGenerateExtensionJs(unittest.TestCase):
         js = _generate_extension_js(12345, schemas, "tok")
         # (1) A tool_call hook is registered.
         self.assertIn('pi.on("tool_call"', js)
-        # (2) Bridged tools are skipped so they aren't double-evaluated
-        # (the bridged set is built from the registered tool names).
-        self.assertIn("const BRIDGED = new Set(TOOLS.map((t) => t.name));", js)
+        # (2) Only registered bridge tools are skipped.
+        self.assertIn("BRIDGED.add(tool.name)", js)
         self.assertIn("BRIDGED.has(event.toolName)", js)
         # (3) Native tools are evaluated via a policy_eval frame and the
         # block verdict is honored.
         self.assertIn('kind: "policy_eval"', js)
         self.assertIn("block: true", js)
+
+
+def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path) -> None:
+    """The real generated JS must install itself and hide executable tools in plan."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the controlled Pi extension test")
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+    write_host_permission_state(
+        bridge_dir / "permission_state.json",
+        HostPermissionState(
+            session_id="test-session",
+            host_id="test-host",
+            workspace=str(tmp_path),
+            tier="plan",
+            revision=1,
+            status="blocked",
+        ),
+    )
+    extension = tmp_path / "omnigent_tools.js"
+    extension.write_text(
+        _generate_extension_js(
+            12345,
+            [
+                {"name": "sys_os_read", "description": "Read", "parameters": {"type": "object"}},
+                {"name": "sys_os_shell", "description": "Run", "parameters": {"type": "object"}},
+            ],
+            "test-token",
+            permission_bridge_dir=bridge_dir,
+            session_id="test-session",
+        )
+    )
+    prepare_permission_installation(
+        bridge_dir, session_id="test-session", harness="pi", extension=extension
+    )
+    script = r"""
+const assert = require("assert").strict;
+if (process.argv[2] === "safe") {
+  process.argv.push("--no-extensions", "--extension", process.argv[1]);
+}
+const handlers = {};
+let active = ["read", "sys_os_read", "sys_os_shell"];
+global.setInterval = () => 0;
+const pi = {
+  on(name, handler) { handlers[name] = handler; },
+  registerTool() {},
+  getActiveTools() { return active; },
+  setActiveTools(names) { active = names; },
+};
+require(process.argv[1])(pi);
+handlers.session_start({}, { isIdle: () => true });
+assert.deepEqual(active, process.argv[2] === "safe"
+  ? ["read", "sys_os_read"] : ["read", "sys_os_read", "sys_os_shell"]);
+"""
+    result = subprocess.run([node, "-e", script, str(extension)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not verify_pi_permission_installation(bridge_dir, "plan")
+    result = subprocess.run(
+        [node, "-e", script, str(extension), "safe"], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert verify_pi_permission_installation(bridge_dir, "plan")
+    installed = json.loads((bridge_dir / "permission_installation.json").read_text())
+    assert installed["active_tools"] == ["read", "sys_os_read"]
 
 
 # ---------------------------------------------------------------------------
@@ -1555,9 +1625,10 @@ class TestToolServer(unittest.TestCase):
                 executed = True
                 return {"ok": True}
 
-            async def gate(name, args):
+            async def gate(name, args, *, call_id=None):
                 # Echo the inputs back so the assertion proves the real
                 # tool name / args reached the gate, not a fixed stub.
+                self.assertEqual(call_id, "native-call-1")
                 return {"block": True, "reason": f"denied {name}:{args.get('path')}"}
 
             server._tool_executor = executor
@@ -1572,6 +1643,7 @@ class TestToolServer(unittest.TestCase):
                         "kind": "policy_eval",
                         "tool": "read",
                         "args": {"path": "/etc/secret"},
+                        "call_id": "native-call-1",
                     }
                 )
                 + "\n"
@@ -1604,7 +1676,8 @@ class TestToolServer(unittest.TestCase):
             server = _ToolServer()
             await server.start()
 
-            async def gate(name, args):
+            async def gate(name, args, *, call_id=None):
+                self.assertEqual(call_id, "native-call-2")
                 return {"block": False, "reason": ""}
 
             server._policy_gate = gate
@@ -1618,6 +1691,7 @@ class TestToolServer(unittest.TestCase):
                         "kind": "policy_eval",
                         "tool": "read",
                         "args": {"path": "/tmp/ok"},
+                        "call_id": "native-call-2",
                     }
                 )
                 + "\n"
@@ -1634,13 +1708,8 @@ class TestToolServer(unittest.TestCase):
 
         _run(_test())
 
-    def test_policy_eval_without_gate_fails_open(self):
-        """With no ``_policy_gate`` wired, the verdict is ALLOW (fail-open).
-
-        Single-process / test paths never install a gate. The native tool
-        must still run rather than wedge — so an unset gate yields
-        ``block=False`` rather than an error.
-        """
+    def test_policy_eval_without_gate_blocks(self):
+        """An absent policy callback cannot authorize a native tool."""
 
         async def _test():
             server = _ToolServer()
@@ -1656,6 +1725,7 @@ class TestToolServer(unittest.TestCase):
                         "kind": "policy_eval",
                         "tool": "read",
                         "args": {},
+                        "call_id": "native-call-3",
                     }
                 )
                 + "\n"
@@ -1665,20 +1735,17 @@ class TestToolServer(unittest.TestCase):
 
             response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
             response = json.loads(response_line)
-            self.assertEqual(response["verdict"], {"block": False, "reason": ""})
+            self.assertEqual(
+                response["verdict"], {"block": True, "reason": "permission check unavailable"}
+            )
 
             writer.close()
             await server.stop()
 
         _run(_test())
 
-    def test_policy_eval_gate_exception_fails_open(self):
-        """A gate that raises must not wedge Pi — the verdict is ALLOW.
-
-        Mirrors the runner/scaffold contract: a transient policy-evaluation
-        failure defaults to ALLOW. If this raised instead, every native tool
-        call would error out whenever the verdict round-trip hiccupped.
-        """
+    def test_policy_eval_gate_exception_blocks(self):
+        """A callback exception returns a deny verdict without hanging Pi."""
 
         async def _test():
             server = _ToolServer()
@@ -1698,6 +1765,7 @@ class TestToolServer(unittest.TestCase):
                         "kind": "policy_eval",
                         "tool": "read",
                         "args": {},
+                        "call_id": "native-call-4",
                     }
                 )
                 + "\n"
@@ -1707,12 +1775,239 @@ class TestToolServer(unittest.TestCase):
 
             response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
             response = json.loads(response_line)
-            self.assertEqual(response["verdict"], {"block": False, "reason": ""})
+            self.assertEqual(
+                response["verdict"], {"block": True, "reason": "permission check unavailable"}
+            )
 
             writer.close()
             await server.stop()
 
         _run(_test())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_mode", ["close", "wrong_id", "timeout"])
+async def test_generated_pi_policy_socket_failures_block(
+    tmp_path: Path, response_mode: str
+) -> None:
+    """Run the generated extension through real TCP failure boundaries."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for generated Pi extension test")
+
+    async def serve_policy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readline()
+        if response_mode == "wrong_id":
+            writer.write(b'{"id":"other","verdict":{"block":false}}\n')
+            await writer.drain()
+        elif response_mode == "timeout":
+            await reader.read()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(serve_policy, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        extension = tmp_path / "bridge.js"
+        runner = tmp_path / "run.js"
+        extension.write_text(_generate_extension_js(port, [], "test-token"))
+        runner.write_text(
+            textwrap.dedent(
+                """
+                const originalSetTimeout = global.setTimeout;
+                global.setTimeout = (fn, ms) => originalSetTimeout(fn, Math.min(ms, 20));
+                const handlers = {};
+                require(process.argv[2])({ on(name, handler) { handlers[name] = handler; } });
+                handlers.tool_call({
+                  toolCallId: "native-1", toolName: "read", input: { path: "doc.txt" }
+                }).then((result) => process.stdout.write(JSON.stringify(result)))
+                  .catch((error) => {
+                  process.stderr.write(String(error));
+                  process.exit(1);
+                });
+                """
+            )
+        )
+        proc = await asyncio.create_subprocess_exec(
+            node,
+            str(runner),
+            str(extension),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        assert proc.returncode == 0, stderr.decode(errors="replace")
+        assert json.loads(stdout)["block"] is True
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_generated_pi_full_tier_gates_without_finish_lease(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for generated Pi extension test")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    write_host_permission_state(
+        bridge_dir / "permission_state.json",
+        HostPermissionState(
+            session_id="test-session",
+            host_id="test-host",
+            workspace=str(tmp_path),
+            tier="full",
+            revision=1,
+            status="ready",
+        ),
+    )
+    frames: list[dict[str, object]] = []
+
+    async def serve_policy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        frame = json.loads(await reader.readline())
+        frames.append(frame)
+        blocked = len(frames) == 2
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "id": frame["id"],
+                        "verdict": {
+                            "block": blocked,
+                            "reason": "policy denied" if blocked else "",
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(serve_policy, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        extension = tmp_path / "bridge.js"
+        runner = tmp_path / "run.js"
+        extension.write_text(
+            _generate_extension_js(
+                port,
+                [],
+                "test-token",
+                permission_bridge_dir=bridge_dir,
+                session_id="test-session",
+            )
+        )
+        runner.write_text(
+            textwrap.dedent(
+                """
+                const assert = require("assert").strict;
+                const handlers = {};
+                require(process.argv[2])({ on(name, handler) { handlers[name] = handler; } });
+                (async () => {
+                  const input = { path: "doc.txt" };
+                  const allowed = await handlers.tool_call({
+                    toolCallId: "native-1", toolName: "read", input,
+                  });
+                  assert.ok(!allowed || allowed.block !== true);
+                  handlers.tool_result({ toolCallId: "native-1", isError: false });
+                  handlers.tool_execution_end({ toolCallId: "native-1", isError: false });
+                  const denied = await handlers.tool_call({
+                    toolCallId: "native-2", toolName: "read", input,
+                  });
+                  assert.deepEqual(denied, { block: true, reason: "policy denied" });
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+                })().catch((error) => { console.error(error); process.exit(1); });
+                """
+            )
+        )
+        proc = await asyncio.create_subprocess_exec(
+            node,
+            str(runner),
+            str(extension),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        assert proc.returncode == 0, stderr.decode(errors="replace")
+        assert [frame["kind"] for frame in frames] == ["policy_eval", "policy_eval"]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_tool_server_rejects_malformed_policy_and_unknown_action() -> None:
+    server = _ToolServer()
+    executed = False
+
+    async def execute(_name, _args):
+        nonlocal executed
+        executed = True
+        return {"ok": True}
+
+    gate_results = iter(
+        [
+            {"block": "false", "reason": "invalid type"},
+            {"block": False, "reason": "", "action": "POLICY_ACTION_ASK"},
+        ]
+    )
+
+    async def malformed_gate(_name, _args, *, call_id=None):
+        assert call_id == "pi-42"
+        return next(gate_results)
+
+    server._tool_executor = execute
+    server._policy_gate = malformed_gate
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        for request, field, error_text in (
+            ({"kind": "policy_eval", "args": {}}, "verdict", ""),
+            ({"kind": "policy_eval", "args": None}, "verdict", ""),
+            ({"kind": "policy_eval", "args": {}}, "verdict", ""),
+            ({"kind": "tool_call", "args": None}, "error", "invalid"),
+            ({"kind": "unknown", "args": {}}, "error", "unknown"),
+        ):
+            frame = {
+                "id": "req",
+                "token": server.token,
+                "tool": "read",
+                "call_id": "pi-42",
+                **request,
+            }
+            writer.write((json.dumps(frame) + "\n").encode())
+            await writer.drain()
+            response = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+            assert response["id"] == "req"
+            if field == "verdict":
+                assert response[field]["block"] is True
+            else:
+                assert error_text in response[field]
+        assert not executed
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_tool_server_cancels_expired_policy_callback() -> None:
+    server = _ToolServer()
+    cancelled = asyncio.Event()
+
+    async def gate(_name, _args, *, call_id=None):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    server._policy_gate = gate
+    with patch("omnigent.inner.pi_executor._NATIVE_POLICY_APPROVAL_TIMEOUT_S", 0.01):
+        verdict = await server._evaluate_policy("read", {}, call_id="pi-42")
+    assert verdict == {"block": True, "reason": "permission check unavailable"}
+    assert cancelled.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -2021,12 +2316,87 @@ class TestGateNativeTool(unittest.TestCase):
         self.assertEqual(verdict["block"], True)
         self.assertEqual(verdict["reason"], "blocked by policy")
 
-    def test_no_evaluator_allows(self):
+    def test_no_evaluator_blocks(self):
         executor = self._executor()
         # No _policy_evaluator installed (single-process / pre-turn path).
         verdict = _run(executor._gate_native_tool("read", {"path": "/x"}))
-        # Fail-open: without an evaluator wired the tool must still run.
-        self.assertEqual(verdict, {"block": False, "reason": ""})
+        self.assertEqual(verdict, {"block": True, "reason": "permission check unavailable"})
+
+    def test_native_call_id_and_nonfinal_verdicts(self):
+        executor = self._executor()
+        seen: list[dict[str, object]] = []
+
+        async def evaluator(phase, data):
+            self.assertEqual(phase, "PHASE_TOOL_CALL")
+            seen.append(data)
+            return PolicyVerdictPayload(action="POLICY_ACTION_ASK")
+
+        executor._policy_evaluator = evaluator
+        verdict = _run(executor._gate_native_tool("bash", {"command": "pwd"}, call_id="pi-42"))
+        self.assertEqual(verdict, {"block": True, "reason": "permission check unavailable"})
+        self.assertEqual(
+            seen,
+            [{"name": "bash", "arguments": {"command": "pwd"}, "call_id": "pi-42"}],
+        )
+
+    def test_evaluator_exception_blocks(self):
+        executor = self._executor()
+
+        async def evaluator(_phase, _data):
+            raise RuntimeError("policy unavailable")
+
+        executor._policy_evaluator = evaluator
+        self.assertEqual(
+            _run(executor._gate_native_tool("read", {"path": "doc.txt"})),
+            {"block": True, "reason": "permission check unavailable"},
+        )
+
+    def test_finish_requires_matching_runner_acknowledgement(self):
+        executor = self._executor()
+        executor._permission_controlled = True
+        seen: list[tuple[str, dict[str, object]]] = []
+        acknowledgement: dict[str, object] | None = None
+
+        async def evaluator(phase, data):
+            seen.append((phase, data))
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_ALLOW",
+                data={"_omnigent_permission_finish": acknowledgement}
+                if acknowledgement is not None
+                else None,
+            )
+
+        executor._policy_evaluator = evaluator
+
+        def finish() -> bool:
+            return _run(
+                executor._finish_native_permission_lease(
+                    "bash", {"command": "pwd"}, {"isError": False}, "call-42", 3
+                )
+            )
+
+        self.assertFalse(finish(), "an ordinary ALLOW cannot complete a lease")
+        for acknowledgement in (
+            {"call_id": "wrong", "revision": 3, "finished": True},
+            {"call_id": "call-42", "revision": 4, "finished": True},
+            {"call_id": "call-42", "revision": 3, "finished": False},
+        ):
+            self.assertFalse(finish())
+        acknowledgement = {"call_id": "call-42", "revision": 3, "finished": True}
+        self.assertTrue(finish())
+        self.assertEqual(
+            seen[-1],
+            (
+                "PHASE_TOOL_RESULT",
+                {
+                    "name": "bash",
+                    "arguments": {"command": "pwd"},
+                    "result": {"isError": False},
+                    "call_id": "call-42",
+                    "permission_tier_revision": 3,
+                },
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2078,6 +2448,37 @@ class TestResolveModel(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # PiExecutor._build_env_and_dir tests
 # ---------------------------------------------------------------------------
+
+
+def test_controlled_rpc_launch_orders_user_extensions_before_guard(tmp_path, monkeypatch):
+    from omnigent.inner import pi_settings
+
+    monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/opt/bin/pi")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 3, 0))
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState("session", "host", str(tmp_path), "ask", 1, "blocked"),
+    )
+    monkeypatch.setattr("omnigent.inner.pi_executor.prepare_bridge_dir", lambda _: bridge)
+    observed = []
+
+    def ordered(executable, args, *, extension):
+        observed.append(executable)
+        return "/opt/launchers/permission-pi", ["--approve", "--model", "demo"]
+
+    monkeypatch.setattr(pi_settings, "ordered_pi_launch", ordered)
+    executor = PiExecutor(cwd=str(tmp_path), permission_controlled=True)
+    config = executor._build_env_and_dir(
+        [], 12345, "test-token", None, permission_session_id="session"
+    )
+    try:
+        assert config.executable == "/opt/launchers/permission-pi"
+        assert observed == ["/opt/bin/pi"]
+        assert config.extra_args == ["--approve", "--model", "demo", "--tools", "read"]
+    finally:
+        shutil.rmtree(config.tmp_dir)
 
 
 class TestBuildEnvAndDir(unittest.TestCase):

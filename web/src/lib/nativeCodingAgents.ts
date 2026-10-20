@@ -202,7 +202,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 40,
-    capabilities: ["modelPicker"],
+    capabilities: ["modelPicker", "agyPermissionTier"],
   },
   {
     key: "kiro",

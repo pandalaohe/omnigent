@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.native import native_bridge_common
+from omnigent.permission_tiers import PERMISSION_TIERS, PermissionTier, normalize_permission_tier
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -31,16 +32,8 @@ ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.antigravity_native.bridge_id"
 ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR"
 ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID"
 AGY_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native.permission_tier"
-AGY_PERMISSION_TIERS = (
-    "ask",
-    "plan",
-    "accept-edits",
-    "auto-strict",
-    "auto-standard",
-    "auto-relaxed",
-    "full",
-)
-AGY_DEFAULT_PERMISSION_TIER = "auto-relaxed"
+AGY_PERMISSION_TIERS = PERMISSION_TIERS
+AGY_DEFAULT_PERMISSION_TIER = "auto"
 
 _STATE_FILE = "state.json"
 # Advertises the runner-owned tmux pane (socket + target) hosting agy, so the
@@ -476,11 +469,11 @@ def agy_gemini_dir(bridge_dir: Path) -> Path:
 
 def resolve_agy_permission_tier(
     labels: Mapping[str, object] | None, launch_args: Sequence[str]
-) -> str:
-    """Prefer a valid server label, then legacy bypass args, then ask."""
+) -> PermissionTier:
+    """Normalize a server label; only an absent legacy label can use bypass args."""
     tier = labels.get(AGY_PERMISSION_TIER_LABEL_KEY) if labels else None
-    if isinstance(tier, str) and tier in AGY_PERMISSION_TIERS:
-        return tier
+    if labels is not None and AGY_PERMISSION_TIER_LABEL_KEY in labels:
+        return normalize_permission_tier(tier, harness="antigravity-native", legacy=True)
     return "full" if "--dangerously-skip-permissions" in launch_args else "ask"
 
 
@@ -492,7 +485,7 @@ def agy_tier_launch_args(tier: str) -> list[str]:
         return ["--dangerously-skip-permissions"]
     if tier == "plan":
         return ["--mode", "plan"]
-    if tier == "accept-edits" or tier.startswith("auto-"):
+    if tier in ("accept-edits", "auto"):
         return ["--mode", "accept-edits"]
     return []
 
@@ -566,7 +559,7 @@ def apply_agy_permission_tier(bridge_dir: Path, tier: str) -> None:
     original = snapshot.get("allowNonWorkspaceAccess")
     if not isinstance(original, dict) or not isinstance(original.get("present"), bool):
         raise ValueError(f"Invalid user settings snapshot: {snapshot_path}")
-    auto = tier.startswith("auto-")
+    auto = tier == "auto"
     if tier == "full":
         settings.pop("toolPermission", None)
     else:
@@ -588,32 +581,39 @@ def apply_agy_permission_tier(bridge_dir: Path, tier: str) -> None:
         allow.append("mcp(omnigent/*)")
     permissions["allow"] = allow
     settings["permissions"] = permissions
-    if tier == "full":
-        hooks.pop("omnigent-guard", None)
-    else:
-        command = shlex.join(
-            [
-                sys.executable,
-                "-I",
-                str(Path(__file__).with_name("guard.py").resolve()),
-                "--tier-file",
-                str((bridge_dir / "permission_tier").absolute()),
-            ]
-        )
-        hooks["omnigent-guard"] = {
-            "enabled": True,
-            "PreToolUse": [
-                {
-                    "matcher": ".*",
-                    "hooks": [{"type": "command", "command": command, "timeout": 10}],
-                }
-            ],
-        }
+    hooks["omnigent-guard"] = _agy_guard_hook(bridge_dir)
     _write_agy_permission_file(
         settings_path, json.dumps(settings, indent=2, sort_keys=True) + "\n"
     )
     _write_agy_permission_file(hooks_path, json.dumps(hooks, indent=2, sort_keys=True) + "\n")
     reassert_agy_permission_tier(bridge_dir, tier)
+
+
+def _agy_guard_hook(bridge_dir: Path) -> dict[str, object]:
+    command = shlex.join(
+        [
+            sys.executable,
+            "-I",
+            str(Path(__file__).with_name("guard.py").resolve()),
+            "--tier-file",
+            str((bridge_dir / "permission_tier").absolute()),
+        ]
+    )
+    return {
+        "enabled": True,
+        "PreToolUse": [
+            {
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": command, "timeout": 86400}],
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": ".*",
+                "hooks": [{"type": "command", "command": command + " --finish", "timeout": 10}],
+            }
+        ],
+    }
 
 
 def build_mcp_config(
@@ -727,6 +727,7 @@ def seed_isolated_agy_home(
     *,
     trusted_workspace: Path | str | None = None,
     startup_instructions: str | None = None,
+    permission_tier: str | None = None,
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
@@ -755,6 +756,12 @@ def seed_isolated_agy_home(
     :returns: Env overrides to layer onto the agy launch environment. Currently
         empty because ``HOME`` must stay real for platform auth.
     """
+    from omnigent.harnesses.antigravity_native.hook_sources import check_agy_hook_sources
+
+    if permission_tier is not None:
+        if trusted_workspace is None:
+            raise ValueError("Antigravity permission startup requires an explicit workspace")
+        check_agy_hook_sources(Path(trusted_workspace), permission_tier, bridge_dir)
     real_home = Path.home()
     iso_gemini = agy_gemini_dir(bridge_dir)
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -802,6 +809,10 @@ def seed_isolated_agy_home(
 
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
+
+    if permission_tier is not None:
+        assert trusted_workspace is not None
+        check_agy_hook_sources(Path(trusted_workspace), permission_tier, bridge_dir)
 
     return {}
 
@@ -2635,7 +2646,7 @@ def switch_agy_permission_tier(
     if not isinstance(user_access, dict) or not isinstance(user_access.get("present"), bool):
         raise ValueError("Invalid Antigravity user settings snapshot")
     user_on = user_access["present"] and user_access.get("value") is True
-    auto, was_auto = tier.startswith("auto-"), previous.startswith("auto-")
+    auto, was_auto = tier == "auto", previous == "auto"
     mode = "accept-edits" if auto else "default" if tier == "ask" else tier
     previous_mode = "accept-edits" if was_auto else "default" if previous == "ask" else previous
     steps: list[tuple[str, str, str]]
@@ -2681,9 +2692,19 @@ def switch_agy_permission_tier(
         except (OSError, RuntimeError, ValueError) as undo:
             detail = str(undo)
             try:
-                reassert_agy_permission_tier(bridge_dir, "auto-strict")
-            except (OSError, ValueError) as safety:
-                detail += f"; deny-safe tier could not be written: {safety}"
+                from dataclasses import replace
+
+                from omnigent.permission_tiers.host import (
+                    HOST_PERMISSION_STATE_FILE,
+                    read_host_permission_state,
+                    write_host_permission_state,
+                )
+
+                state_path = bridge_dir / HOST_PERMISSION_STATE_FILE
+                state = read_host_permission_state(state_path)
+                write_host_permission_state(state_path, replace(state, status="blocked"))
+            except (OSError, ValueError, TypeError) as safety:
+                detail += f"; permission cache remains unavailable: {type(safety).__name__}"
             try:
                 pane = _agy_control_pane(bridge_dir)
             except (RuntimeError, OSError, ValueError) as capture:

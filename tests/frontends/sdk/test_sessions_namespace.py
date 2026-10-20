@@ -178,6 +178,42 @@ async def test_create_posts_bundle_and_returns_typed_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_permission_tier_create_and_fork_are_explicit() -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/fork"):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(201, json=_session_response_body())
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            201,
+            json=_session_response_body()
+            | {
+                "permission_tier": "full",
+                "permission_tier_revision": 2,
+                "permission_tier_state": "ready",
+                "permission_tiers_capability": True,
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.create_from_agent_id("ag_abc", permission_tier="full")
+        await ns.fork("conv_abc", permission_tier="ask")
+    finally:
+        await client.aclose()
+
+    assert bodies == [
+        {"agent_id": "ag_abc", "permission_tier": "full"},
+        {"permission_tier": "ask"},
+    ]
+    assert (session.permission_tier, session.permission_tier_revision) == ("full", 2)
+    assert session.permission_tier_state == "ready"
+    assert session.permission_tiers_capability is True
+
+
+@pytest.mark.asyncio
 async def test_create_with_empty_metadata_sends_json_object() -> None:
     captured: dict[str, Any] = {}
 

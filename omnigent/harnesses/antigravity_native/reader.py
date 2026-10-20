@@ -2772,10 +2772,8 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
 # wired to the Task 8 interaction bridge (real-time elicitation over the Task 9
 # hook + RPC step reads + the default deliver). This wiring lives here so the two
 # callers share one definition instead of duplicating the bridge/elicitation
-# plumbing. (The retired transcript forwarder used a post-hoc policy audit instead
-# of real-time elicitation; that audit is gone — agy exposes no firing PreToolUse
-# hook, so a tool cannot be blocked before it runs, and the live elicitation card
-# is the honest enforcement surface.)
+# plumbing. Native tool execution is gated separately by the managed PreToolUse
+# hook; this bridge delivers the resulting native permission questions.
 
 
 async def _agy_elicitation_retry_sleep(seconds: float) -> None:
@@ -3316,12 +3314,27 @@ async def run_reader_with_bridge(
             async def _get_steps() -> list[dict[str, object]]:
                 return await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
 
+            async def _permission_state():
+                from omnigent.harnesses.antigravity_native.guard import _confirmed_relay
+                from omnigent.permission_tiers.host import (
+                    HOST_PERMISSION_STATE_FILE,
+                    read_host_permission_state,
+                )
+
+                state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
+                if state.session_id != current["session_id"]:
+                    raise ValueError("Permission session mismatch")
+                if state.tier != "full":
+                    await asyncio.to_thread(_confirmed_relay, bridge_dir, state)
+                return state
+
             await bridge_interaction(
                 cascade_id,
                 pending,
                 port=port,
                 get_steps=_get_steps,
                 request_elicitation=_request_elicitation,
+                get_permission_state=_permission_state,
                 # Bind the injector to THIS reader's bridge dir. The default
                 # resolves it from the harness spawn env, which the runner process
                 # hosting this reader does not carry — that failed every web

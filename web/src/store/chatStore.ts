@@ -8180,6 +8180,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "session_permission_mode":
+      if (event.permissionTierRevision !== undefined) {
+        queryClient?.setQueryData<Session>(["session", event.conversationId], (session) => {
+          if (!session || (session.permissionTierRevision ?? 0) > event.permissionTierRevision!)
+            return session;
+          return {
+            ...session,
+            permissionTier: event.permissionMode,
+            permissionTierRevision: event.permissionTierRevision,
+            permissionTierState: event.permissionTierState ?? session.permissionTierState,
+            permissionTiersCapability:
+              event.permissionTiersCapability ?? session.permissionTiersCapability,
+          };
+        });
+        return;
+      }
       // Pane-driven (in-TUI shift+tab) or UI-driven; either way the server
       // has confirmed this is the session's live mode.
       applyToNamedConversation(event.conversationId, {

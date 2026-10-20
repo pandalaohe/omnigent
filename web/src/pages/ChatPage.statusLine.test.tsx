@@ -235,17 +235,20 @@ describe("Composer status line (branch + context ring)", () => {
   });
 
   it.each([
-    ["ask", "Ask every time", false],
-    ["plan", "Plan only", false],
-    ["accept-edits", "Accept edits", false],
-    ["auto-strict", "Auto · strict", false],
-    ["auto-standard", "Auto · standard", false],
-    ["auto-relaxed", "Auto · relaxed", false],
-    ["full", "Skip permissions", true],
+    ["ask", "每次都问", false],
+    ["plan", "只规划", false],
+    ["accept-edits", "自动改文件", false],
+    ["auto", "自动（只拦可怕的事）", false],
+    ["full", "全放开", true],
   ])("shows Antigravity tier %s with the correct lock", (tier, label, locked) => {
     useSessionMock.mockReturnValue({
       session: {
         id: "conv_test",
+        status: "idle",
+        permissionTier: tier,
+        permissionTierRevision: 1,
+        permissionTierState: "ready",
+        permissionTiersCapability: true,
         labels: {
           "omnigent.wrapper": "antigravity-native-ui",
           "omnigent.antigravity_native.permission_tier": tier,
@@ -261,7 +264,7 @@ describe("Composer status line (branch + context ring)", () => {
     else {
       expect(picker).toBeEnabled();
       fireEvent.pointerDown(picker, { button: 0 });
-      expect(screen.queryByRole("menuitemradio", { name: "Skip permissions" })).toBeNull();
+      expect(screen.queryByRole("menuitemradio", { name: "全放开" })).toBeNull();
     }
   });
 
@@ -269,6 +272,11 @@ describe("Composer status line (branch + context ring)", () => {
     useSessionMock.mockReturnValue({
       session: {
         id: "conv_test",
+        status: "idle",
+        permissionTier: "ask",
+        permissionTierRevision: 2,
+        permissionTierState: "ready",
+        permissionTiersCapability: true,
         labels: {
           "omnigent.wrapper": "antigravity-native-ui",
           "omnigent.antigravity_native.permission_tier": "ask",
@@ -283,13 +291,16 @@ describe("Composer status line (branch + context ring)", () => {
       .mockRejectedValueOnce(new Error("Runner is busy"));
     renderComposer({ modelPickerKind: "antigravity", showClaudePermissionMode: true });
     fireEvent.pointerDown(screen.getByTestId("composer-permission-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("composer-permission-option-auto-relaxed"));
+    fireEvent.click(screen.getByTestId("composer-permission-option-auto"));
     await waitFor(() =>
-      expect(patch).toHaveBeenCalledWith("conv_test", { claudePermissionMode: "auto-relaxed" }),
+      expect(patch).toHaveBeenCalledWith("conv_test", {
+        permissionTier: "auto",
+        expectedPermissionTierRevision: 2,
+      }),
     );
     expect(await screen.findByText("Runner is busy")).toBeVisible();
     expect(screen.getByTestId("composer-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Ask every time",
+      "Permission mode: 每次都问",
     );
   });
 

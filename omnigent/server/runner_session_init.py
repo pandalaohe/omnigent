@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 import httpx
@@ -21,6 +22,16 @@ from omnigent.runner.session_init_protocol import (
     runner_archive_state,
 )
 from omnigent.server.instruction_layers import session_instructions_text
+from omnigent.server.permission_tiers import (
+    PERMISSION_CAPABILITY_LABEL_KEY,
+    PERMISSION_CAPABILITY_VALUE,
+    PERMISSION_MIGRATION_LABEL_KEY,
+    PERMISSION_RUNTIME_ID_LABEL_KEY,
+    PERMISSION_STATE_LABEL_KEY,
+    TIER_HARNESSES,
+    ConfirmedPermissionState,
+    legacy_permission_tier,
+)
 from omnigent.server.project_placement import project_code_locations
 
 if TYPE_CHECKING:
@@ -84,9 +95,49 @@ def runner_inference_verified(conversation: Conversation, response: httpx.Respon
     return isinstance(payload, dict) and payload.get("inference_config_verified") is True
 
 
+def runner_permission_verified(conversation: Conversation, response: httpx.Response) -> bool:
+    """A tiered session needs an exact revision ACK from this runner."""
+    raw = conversation.labels.get(PERMISSION_STATE_LABEL_KEY)
+    if raw is None:
+        return True
+    if response.status_code >= 400:
+        return False
+    try:
+        state = json.loads(raw)
+        payload = response.json()
+    except (ValueError, TypeError):
+        return False
+    return (
+        isinstance(state, dict)
+        and isinstance(payload, dict)
+        and type(state.get("revision")) is int
+        and payload.get("permission_tiers_capability") == PERMISSION_CAPABILITY_VALUE
+        and payload.get("permission_tier_revision") == state["revision"]
+        and isinstance(payload.get("permission_tier_runtime_id"), str)
+        and len(payload["permission_tier_runtime_id"]) == 32
+        and (
+            state.get("status") != "ready"
+            or conversation.labels.get(PERMISSION_RUNTIME_ID_LABEL_KEY)
+            == payload["permission_tier_runtime_id"]
+        )
+    )
+
+
 # Memo key: runner, tunnel generation, conversation, agent, sub-agent, the
 # archive revisions this init was built from, and whether it resumes a turn.
-_SessionInitKey = tuple[str, int, str, str, str | None, tuple[tuple[str, int, bool], ...], bool]
+_SessionInitKey = tuple[
+    str,
+    int,
+    str,
+    str,
+    str | None,
+    tuple[tuple[str, int, bool], ...],
+    bool,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+]
 _BODY_SNIPPET_MAX = 500
 
 # Rejections that mean the runner or session is transiently gone, not a server bug.
@@ -239,6 +290,56 @@ class RunnerSessionInitializer:
         if self.generation_for(runner_id, runner_client) != generation:
             raise ConnectionError("runner tunnel changed during session recovery")
 
+    async def _migrate_legacy_permission_state(
+        self,
+        conversation: Conversation,
+        *,
+        store_slots: asyncio.Semaphore | None,
+    ) -> Conversation:
+        """Fence an idle legacy session before any new runner can launch it."""
+        if PERMISSION_STATE_LABEL_KEY in conversation.labels:
+            return conversation
+        from omnigent.server.routes._sessions.helpers import (
+            _resolve_harness,
+            _session_status_cache,
+        )
+
+        if self._agent_store is None and self._agent_cache is None:
+            harness = _resolve_harness(conversation)
+        else:
+            async with store_slots or nullcontext():
+                harness = await asyncio.to_thread(
+                    _resolve_harness,
+                    conversation,
+                    agent_store=self._agent_store,
+                    agent_cache=self._agent_cache,
+                )
+        if harness not in TIER_HARNESSES:
+            return conversation
+        harness = cast(str, harness)
+        if self._conversation_store is None:
+            raise ValueError("Permission migration requires the conversation store")
+        live = _session_status_cache.get(conversation.id) or conversation.live_status
+        if live in {"running", "waiting", "launching", "queued"}:
+            raise ValueError("Permission migration requires an idle session")
+        tier = legacy_permission_tier(
+            harness=harness,
+            labels=conversation.labels,
+            launch_args=conversation.terminal_launch_args or [],
+        )
+        updates = {
+            **ConfirmedPermissionState(tier, 1, "blocked").labels(harness),
+            PERMISSION_MIGRATION_LABEL_KEY: tier,
+        }
+        async with store_slots or nullcontext():
+            await asyncio.to_thread(self._conversation_store.set_labels, conversation.id, updates)
+            refreshed = await asyncio.to_thread(
+                self._conversation_store.get_conversation, conversation.id
+            )
+        if refreshed is None:
+            raise ValueError("Permission migration lost its session")
+        return refreshed
+
     def is_initialized(self, conversation: Conversation, runner_client: httpx.AsyncClient) -> bool:
         """Whether initialization accepted this session on its current tunnel."""
         runner_id, agent_id = conversation.runner_id, conversation.agent_id
@@ -254,13 +355,25 @@ class RunnerSessionInitializer:
         state = runner_archive_state(conversation)
         current_archive = (state.scope_id, state.revision, state.archived)
         for key, task in self._tasks.items():
-            if key[:5] != session_key or current_archive not in key[5]:
+            if (
+                key[:5] != session_key
+                or current_archive not in key[5]
+                or key[7:]
+                != (
+                    conversation.labels.get(PERMISSION_STATE_LABEL_KEY),
+                    conversation.labels.get(PERMISSION_RUNTIME_ID_LABEL_KEY),
+                    conversation.host_id,
+                    conversation.worktree or conversation.workspace,
+                )
+            ):
                 continue
             if not task.done() or task.cancelled() or task.exception() is not None:
                 continue
             response = task.result()
-            if 200 <= response.status_code < 300 and runner_inference_verified(
-                conversation, response
+            if (
+                200 <= response.status_code < 300
+                and runner_inference_verified(conversation, response)
+                and runner_permission_verified(conversation, response)
             ):
                 return True
         return False
@@ -285,6 +398,9 @@ class RunnerSessionInitializer:
         if generation is None:
             generation = self.generation_for(runner_id, runner_client)
         self.require_generation(runner_id, runner_client, generation)
+        conversation = await self._migrate_legacy_permission_state(
+            conversation, store_slots=store_slots
+        )
         async with store_slots or nullcontext():
             peer = await self.resolve_peer_messaging(conversation)
         pkey = (runner_id, generation, conversation.id)
@@ -318,6 +434,10 @@ class RunnerSessionInitializer:
             conversation.sub_agent_name,
             archive_key,
             resume_interrupted_turn,
+            conversation.labels.get(PERMISSION_STATE_LABEL_KEY),
+            conversation.labels.get(PERMISSION_RUNTIME_ID_LABEL_KEY),
+            conversation.host_id,
+            conversation.worktree or conversation.workspace,
         )
         task = self._tasks.get(key)
         if (
@@ -422,6 +542,125 @@ class RunnerSessionInitializer:
             generation=generation,
         )
 
+    async def _advance_permission_epoch(
+        self,
+        conversation: Conversation,
+        response: httpx.Response,
+        *,
+        store_slots: asyncio.Semaphore | None,
+    ) -> Conversation | None:
+        """Revoke old-process approvals before a replacement runner can start."""
+        if response.status_code != 409 or self._conversation_store is None:
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        if not isinstance(body, dict) or body.get("error") != "permission_tier_epoch_changed":
+            return None
+        runtime_id = body.get("permission_tier_runtime_id")
+        if not isinstance(runtime_id, str) or len(runtime_id) != 32:
+            return None
+        raw = conversation.labels.get(PERMISSION_STATE_LABEL_KEY)
+        if raw is None:
+            return None
+        try:
+            state = json.loads(raw)
+        except ValueError:
+            return None
+        if (
+            not isinstance(state, dict)
+            or state.get("status") != "ready"
+            or type(state.get("revision")) is not int
+        ):
+            return None
+        blocked = json.dumps(
+            {
+                **state,
+                "revision": state["revision"] + 1,
+                "status": "blocked",
+                "transaction_id": None,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        async with store_slots or nullcontext():
+            changed = await asyncio.to_thread(
+                self._conversation_store.compare_and_set_label,
+                conversation.id,
+                PERMISSION_STATE_LABEL_KEY,
+                raw,
+                blocked,
+            )
+            if not changed:
+                return None
+            await asyncio.to_thread(
+                self._conversation_store.set_labels,
+                conversation.id,
+                {PERMISSION_RUNTIME_ID_LABEL_KEY: runtime_id},
+            )
+            return await asyncio.to_thread(
+                self._conversation_store.get_conversation, conversation.id
+            )
+
+    async def _confirm_permission_ready(
+        self,
+        conversation: Conversation,
+        response: httpx.Response,
+        *,
+        store_slots: asyncio.Semaphore | None,
+    ) -> httpx.Response:
+        """Stamp capability only for the revision this runner actually accepted."""
+        raw = conversation.labels.get(PERMISSION_STATE_LABEL_KEY)
+        if raw is None:
+            return response
+        if self._conversation_store is None:
+            return httpx.Response(
+                503,
+                json={"error": "Permission state store unavailable"},
+                request=httpx.Request("POST", "/v1/sessions"),
+            )
+        state = json.loads(raw)
+        if state.get("status") == "ready":
+            return response
+        if state.get("status") != "blocked" or state.get("transaction_id") is not None:
+            return httpx.Response(
+                409,
+                json={"error": "Permission state requires controlled recovery"},
+                request=httpx.Request("POST", "/v1/sessions"),
+            )
+        ready = json.dumps({**state, "status": "ready"}, separators=(",", ":"), sort_keys=True)
+        runtime_id = response.json().get("permission_tier_runtime_id")
+        if not isinstance(runtime_id, str) or len(runtime_id) != 32:
+            return httpx.Response(
+                409,
+                json={"error": "Runner permission runtime identity unavailable"},
+                request=httpx.Request("POST", "/v1/sessions"),
+            )
+        async with store_slots or nullcontext():
+            await asyncio.to_thread(
+                self._conversation_store.set_labels,
+                conversation.id,
+                {
+                    PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+                    PERMISSION_RUNTIME_ID_LABEL_KEY: runtime_id,
+                },
+            )
+            changed = await asyncio.to_thread(
+                self._conversation_store.compare_and_set_label,
+                conversation.id,
+                PERMISSION_STATE_LABEL_KEY,
+                raw,
+                ready,
+            )
+        if changed:
+            return response
+        return httpx.Response(
+            409,
+            json={"error": "Permission tier changed during initialization"},
+            request=httpx.Request("POST", "/v1/sessions"),
+        )
+
     def _start_post(
         self,
         conversation: Conversation,
@@ -499,6 +738,40 @@ class RunnerSessionInitializer:
                 recovery_id=recovery_id,
                 generation=generation,
             )
+            refreshed = await self._advance_permission_epoch(
+                conversation, response, store_slots=store_slots
+            )
+            if refreshed is not None:
+                self.require_generation(runner_id, runner_client, generation)
+                refreshed_payload = build_runner_session_init_payload(
+                    refreshed,
+                    server_version=self._server_version,
+                    suppress_recovery_turn=suppress_recovery_turn,
+                    archive_states=archive_states,
+                    peer_messaging_enabled=peer,
+                    global_instructions=global_instructions,
+                    project_code=project_code,
+                    resume_interrupted_turn=resume_interrupted_turn,
+                    recovery_id=recovery_id,
+                )
+                response = await self._post_initialize(
+                    runner_client,
+                    session_id=refreshed.id,
+                    runner_id=runner_id,
+                    payload=refreshed_payload,
+                    timeout=timeout,
+                    resume_interrupted_turn=resume_interrupted_turn,
+                    suppress_recovery_turn=suppress_recovery_turn,
+                    recovery_id=recovery_id,
+                    generation=generation,
+                )
+                conversation.labels = refreshed.labels
+            if 200 <= response.status_code < 300 and runner_permission_verified(
+                conversation, response
+            ):
+                response = await self._confirm_permission_ready(
+                    conversation, response, store_slots=store_slots
+                )
             if 200 <= response.status_code < 300:
                 self._applied_peer[pkey] = peer
             return response
@@ -555,6 +828,12 @@ class RunnerSessionInitializer:
             response = httpx.Response(
                 409,
                 json={"error": "The runner did not accept this session's inference configuration"},
+                request=httpx.Request("POST", "/v1/sessions"),
+            )
+        if not runner_permission_verified(conversation, response):
+            response = httpx.Response(
+                409,
+                json={"error": "Runner did not confirm this permission tier revision"},
                 request=httpx.Request("POST", "/v1/sessions"),
             )
         if response.status_code >= 400 and self._tasks.get(key) is task:

@@ -565,14 +565,24 @@ class PolicyEngine:
         """
         if not set_labels:
             return
-        reserved_keys = [key for key in set_labels if is_server_secret_label_key(key)]
+        from omnigent.server.permission_tiers import is_permission_label_key
+
+        reserved_keys = [
+            key
+            for key in set_labels
+            if is_server_secret_label_key(key) or is_permission_label_key(key)
+        ]
         if reserved_keys:
             _logger.warning(
                 "Dropping policy label write for server-reserved key(s) %s (conversation %s)",
                 ", ".join(repr(key) for key in reserved_keys),
                 self._conversation_id,
             )
-            set_labels = drop_server_secret_labels(set_labels)
+            set_labels = {
+                key: value
+                for key, value in set_labels.items()
+                if not is_server_secret_label_key(key) and not is_permission_label_key(key)
+            }
         filtered = self._filter_schema_valid(set_labels)
         if not filtered:
             return

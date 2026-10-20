@@ -58,7 +58,11 @@ import {
   readPinnedConversationIds,
   setLegacyPinnedConversationId,
 } from "@/shell/sidebarNav";
-import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
+import {
+  apiErrorFromResponse,
+  PERMISSION_TIERS_PROTOCOL_HEADERS,
+  stopSession,
+} from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
@@ -718,7 +722,10 @@ export async function fetchConversationsPage({
   // hang, and the palette shows "Searching…" for the whole in-flight window.
   // Plain list pagination is indexed/fast, so it keeps no timeout.
   const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : requestSignal;
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+    signal,
+    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+  });
   // Carries the server's `code`, so a dead cursor stays recognizable as
   // `stale_cursor` instead of an opaque "400 Bad Request".
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -1007,7 +1014,10 @@ async function fetchArchivedConversationsPage(
       sort_by: "archived_at",
       limit: "1",
     });
-    const probeResponse = await authenticatedFetch(`/v1/sessions?${probe.toString()}`, { signal });
+    const probeResponse = await authenticatedFetch(`/v1/sessions?${probe.toString()}`, {
+      signal,
+      headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+    });
     ensureCurrentConnection();
     if (probeResponse.status === 422) {
       archivedAtQuerySupported = false;
@@ -1018,7 +1028,10 @@ async function fetchArchivedConversationsPage(
   }
 
   let params = buildParams(archivedAtQuerySupported);
-  let res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+  let res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+    signal,
+    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+  });
   ensureCurrentConnection();
   if (res.status === 422 && archivedAtQuerySupported && usesArchiveExtensions) {
     // f7 and older reject archived_at before the UI can apply its display
@@ -1027,7 +1040,10 @@ async function fetchArchivedConversationsPage(
     archivedAtQuerySupported = false;
     archivedAtCapabilityConfirmed = true;
     params = buildParams(false);
-    res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+    res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+      signal,
+      headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+    });
     ensureCurrentConnection();
   } else if (res.ok && usesArchiveExtensions) {
     archivedAtCapabilityConfirmed = true;
@@ -2062,7 +2078,9 @@ async function fetchPinnedScope(
     visibility,
     pinned: "true",
   });
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+  });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const rows = applySessionTombstones((await res.json()) as ConversationsPage, true).data;
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
@@ -2591,7 +2609,9 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
     // Sequential by necessity: each page's request needs the previous page's
     // cursor (`after`), so these awaits can't be parallelized.
     // eslint-disable-next-line no-await-in-loop
-    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+      headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+    });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     // eslint-disable-next-line no-await-in-loop
     const page = (await res.json()) as ConversationsPage;
@@ -2934,7 +2954,9 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
     // Sequential by necessity: each page's request needs the previous page's
     // cursor (`after`), so these awaits can't be parallelized.
     // eslint-disable-next-line no-await-in-loop
-    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+      headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+    });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     // eslint-disable-next-line no-await-in-loop
     const page = (await res.json()) as ConversationsPage;
@@ -2961,7 +2983,9 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
     visibility: "all",
     project,
   });
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+  });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const page = (await res.json()) as ConversationsPage;
   return page.data.map((conv) => conv.id);
@@ -2982,7 +3006,9 @@ async function fetchProjectSessionsPage(
     project,
   });
   if (after) params.set("after", after);
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+  });
   // Carries the server's `code`, so a dead cursor stays recognizable.
   if (!res.ok) throw await apiErrorFromResponse(res);
   return applySessionTombstones((await res.json()) as ConversationsPage, true);

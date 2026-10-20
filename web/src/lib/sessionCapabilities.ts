@@ -8,6 +8,44 @@ export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
 export const SESSION_ACTIONS_UNAVAILABLE =
   "Unable to check session capabilities. Reload to try again.";
+export const PERMISSION_TIER_BLOCKED = "权限状态待恢复，工具已暂停";
+
+/** The server owns both the switch capability and the confirmed revision. */
+export function permissionTierSwitchDisabledReason(
+  session:
+    | {
+        permissionTier?: string | null;
+        permissionTierRevision?: number | null;
+        permissionTierState?: "ready" | "switching" | "blocked" | null;
+        permissionTiersCapability?: boolean;
+        status?: string;
+        activeResponseId?: string | null;
+        queuedItems?: readonly unknown[];
+        pendingInputs?: readonly unknown[];
+        pendingElicitations?: readonly unknown[];
+      }
+    | null
+    | undefined,
+): string | undefined {
+  if (session?.permissionTierState === "blocked") return PERMISSION_TIER_BLOCKED;
+  if (session?.permissionTierState === "switching") return "权限切换中，请稍候";
+  if (session?.permissionTier === "full") return "全放开仅可在创建会话时选择";
+  if (
+    !session?.permissionTiersCapability ||
+    session.permissionTierState !== "ready" ||
+    session.permissionTierRevision == null
+  )
+    return "此会话尚未确认权限切换能力";
+  if (
+    session.status !== "idle" ||
+    session.activeResponseId ||
+    session.queuedItems?.length ||
+    session.pendingInputs?.length ||
+    session.pendingElicitations?.length
+  )
+    return "会话忙碌或有待审批操作，空闲后才能切换";
+  return undefined;
+}
 
 /**
  * Fallback wire IDs for snapshots missing the deployment's managed marker.

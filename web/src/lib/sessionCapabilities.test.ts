@@ -6,7 +6,40 @@ import {
   SANDBOX_SWITCH_HOST_UNSUPPORTED,
   sessionActionRestrictions,
   supportsEffortControl,
+  permissionTierSwitchDisabledReason,
+  PERMISSION_TIER_BLOCKED,
 } from "./sessionCapabilities";
+
+describe("permission tier switch gate", () => {
+  const ready = {
+    permissionTier: "auto",
+    permissionTierRevision: 3,
+    permissionTierState: "ready" as const,
+    permissionTiersCapability: true,
+    status: "idle",
+  };
+  it("allows only a confirmed idle revision", () => {
+    expect(permissionTierSwitchDisabledReason(ready)).toBeUndefined();
+    expect(
+      permissionTierSwitchDisabledReason({ ...ready, permissionTiersCapability: false }),
+    ).toBeDefined();
+    expect(
+      permissionTierSwitchDisabledReason({ ...ready, permissionTierRevision: null }),
+    ).toBeDefined();
+    expect(permissionTierSwitchDisabledReason({ ...ready, status: "running" })).toBeDefined();
+    expect(
+      permissionTierSwitchDisabledReason({ ...ready, pendingElicitations: [{}] }),
+    ).toBeDefined();
+  });
+  it("keeps full creation-only and names blocked recovery", () => {
+    expect(permissionTierSwitchDisabledReason({ ...ready, permissionTier: "full" })).toContain(
+      "创建",
+    );
+    expect(permissionTierSwitchDisabledReason({ ...ready, permissionTierState: "blocked" })).toBe(
+      PERMISSION_TIER_BLOCKED,
+    );
+  });
+});
 
 describe("session action restrictions", () => {
   it("recognizes the managed snapshot without access to its host record", () => {

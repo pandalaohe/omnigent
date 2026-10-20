@@ -248,6 +248,7 @@ def _build_pi_executor() -> Executor:
         skills_filter=_resolve_skills_filter(),
         context_files=_parse_truthy(_ENV_CONTEXT_FILES, default=True),
         system_prompt_mode=os.environ.get(_ENV_SYSTEM_PROMPT_MODE, "append"),
+        permission_controlled=True,
     )
 
 
@@ -338,6 +339,30 @@ def create_app() -> FastAPI:
                 )
             return JSONResponse({"applied": True})
 
+    async def bootstrap_permission_tier(request: Request) -> Response:
+        denied = adapter._check_auth(request)
+        if denied is not None:
+            return denied
+        try:
+            payload = await request.json()
+        except ValueError:
+            return JSONResponse({"installed": False}, status_code=400)
+        session_id = payload.get("session_id") if isinstance(payload, dict) else None
+        if not isinstance(session_id, str) or not session_id:
+            return JSONResponse({"installed": False}, status_code=400)
+        adapter._check_conversation_id(request, session_id)
+        adapter._session_key = session_id
+        try:
+            executor = adapter._ensure_executor()
+            installed = isinstance(
+                executor, PiExecutor
+            ) and await executor.bootstrap_permission_tier(session_id)
+        except Exception:  # noqa: BLE001 - no prompt may proceed after bootstrap failure
+            _logger.warning("Pi permission bootstrap failed", exc_info=True)
+            installed = False
+        return JSONResponse({"installed": installed}, status_code=200 if installed else 503)
+
+    app.add_api_route("/v1/permission-tier/bootstrap", bootstrap_permission_tier, methods=["POST"])
     return app
 
 

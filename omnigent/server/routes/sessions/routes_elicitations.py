@@ -46,6 +46,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
+    _resolve_harness,
 )
 from omnigent.server.schemas import (
     ElicitationResult,
@@ -136,6 +137,11 @@ def register_elicitations_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        from omnigent.server.permission_tiers import require_permission_protocol
+
+        require_permission_protocol(
+            request, harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=None)
+        )
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(
             session_id, _resolve_data, runner_router, conversation_store, file_store

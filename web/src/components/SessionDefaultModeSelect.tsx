@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import { normalizeAgyPermissionTier } from "@/lib/nativeHarnessModes";
 import type { NativeModelOption } from "@/lib/types";
 
 const EMPTY_MODELS: readonly NativeModelOption[] = [];
@@ -40,7 +41,16 @@ export function SessionDefaultModeSelect({
 }) {
   const options = sessionDefaultModeOptions(harness, field, models, model);
   if (options.length === 0) return null;
-  const selected = value === "priority" ? "fast" : value;
+  const tierDefault =
+    field === "permission" && ["antigravity-native", "pi", "pi-native"].includes(harness);
+  const legacyTier = tierDefault ? normalizeAgyPermissionTier(value) : null;
+  const selected = tierDefault
+    ? legacyTier === "full"
+      ? "auto"
+      : legacyTier
+    : value === "priority"
+      ? "fast"
+      : value;
   const available = selected == null || options.some((option) => option.value === selected);
   const select = (
     <Select
@@ -69,6 +79,26 @@ export function SessionDefaultModeSelect({
       </SelectContent>
     </Select>
   );
+  if (tierDefault && legacyTier === "full") {
+    return (
+      <div className="min-w-0 flex-1">
+        {select}
+        <p role="status" className="mt-1 text-xs text-muted-foreground">
+          原有全放开默认值已迁为自动；新会话不会继承全放开。
+        </p>
+      </div>
+    );
+  }
+  if (tierDefault && ["auto-strict", "auto-standard"].includes(value ?? "")) {
+    return (
+      <div className="min-w-0 flex-1">
+        {select}
+        <p role="status" className="mt-1 text-xs text-muted-foreground">
+          旧自动档现使用固定的宽松危险规则。
+        </p>
+      </div>
+    );
+  }
   if (field !== "speed" || !["claude-native", "claude-sdk"].includes(harness)) return select;
   return (
     <div className="flex min-w-0 items-center gap-1">

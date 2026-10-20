@@ -48,9 +48,21 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
     ask: "manual",
     plan: "read-only",
     "accept-edits": "edit-automatic",
-    "auto-strict": "automatic",
-    "auto-standard": "automatic",
-    "auto-relaxed": "automatic",
+    auto: "automatic",
+    full: "full-access",
+  },
+  pi: {
+    ask: "manual",
+    plan: "read-only",
+    "accept-edits": "edit-automatic",
+    auto: "automatic",
+    full: "full-access",
+  },
+  "pi-native": {
+    ask: "manual",
+    plan: "read-only",
+    "accept-edits": "edit-automatic",
+    auto: "automatic",
     full: "full-access",
   },
 };
@@ -87,42 +99,37 @@ export function permissionModeConcept(
 
 // The server owns tier launch flags; create sends the tier label instead.
 export const AGY_NATIVE_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native.permission_tier";
-export const AGY_NATIVE_DEFAULT_PERMISSION_TIER = "auto-relaxed";
+export const AGY_NATIVE_DEFAULT_PERMISSION_TIER = "auto";
 export const AGY_NATIVE_FULL_PERMISSION_TIER = "full";
+export const AGY_RESTRICTED_HOOK_RULE =
+  'AG 受限档启动前会检查第三方 PreToolUse hooks；发现启用的 hook 或配置不可读时拒绝启动，并提示名称和文件。可新建全放开会话，或在源文件把该 hook 设为 "enabled": false。插件筛选规则不豁免这项检查。其他事件不阻止启动；所有档位仍执行 Omnigent 独立策略。';
 export const AGY_NATIVE_PERMISSION_TIERS: NativeHarnessMode[] = [
-  { value: "ask", label: "Ask every time", description: "Prompts before tools run", args: [] },
-  { value: "plan", label: "Plan only", description: "Read-only planning", args: [] },
+  { value: "ask", label: "每次都问", description: "工具执行前逐次询问", args: [] },
+  { value: "plan", label: "只规划", description: "仅规划与只读操作", args: [] },
   {
     value: "accept-edits",
-    label: "Accept edits",
-    description: "Approves workspace edits",
+    label: "自动改文件",
+    description: "工作区内编辑自动通过，其他操作询问",
     args: [],
   },
   {
-    value: "auto-strict",
-    label: "Auto · strict",
-    description: "Runs tools with strict guard rules",
-    args: [],
-  },
-  {
-    value: "auto-standard",
-    label: "Auto · standard",
-    description: "Runs tools with standard guard rules",
-    args: [],
-  },
-  {
-    value: "auto-relaxed",
-    label: "Auto · relaxed",
-    description: "Runs tools with relaxed guard rules",
+    value: "auto",
+    label: "自动（只拦可怕的事）",
+    description: "按固定危险规则拦截，不是 OS 沙箱",
     args: [],
   },
   {
     value: "full",
-    label: "Skip permissions",
-    description: "Runs everything without prompts or guard checks",
+    label: "全放开",
+    description: "跳过本套审批与规则；仅创建时可选",
     args: [],
   },
 ];
+export const PI_PERMISSION_TIERS = AGY_NATIVE_PERMISSION_TIERS;
+export const PI_DEFAULT_PERMISSION_TIER = AGY_NATIVE_DEFAULT_PERMISSION_TIER;
+export const NON_FULL_PERMISSION_TIERS = AGY_NATIVE_PERMISSION_TIERS.filter(
+  (tier) => tier.value !== "full",
+);
 
 export function agyPermissionTierFromSession(
   session:
@@ -131,7 +138,8 @@ export function agyPermissionTierFromSession(
     | undefined,
 ): string {
   const tier = session?.labels?.[AGY_NATIVE_PERMISSION_TIER_LABEL_KEY];
-  if (AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === tier)) return tier!;
+  const normalized = normalizeAgyPermissionTier(tier);
+  if (AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === normalized)) return normalized!;
   return session?.terminalLaunchArgs?.includes("--dangerously-skip-permissions") ? "full" : "ask";
 }
 
@@ -139,7 +147,10 @@ export function normalizeAgyPermissionTier(
   value: string | null | undefined,
 ): string | null | undefined {
   // Remove legacy values two local/host-custom releases after this one.
-  return value === "default" ? "ask" : value === "skip" ? "full" : value;
+  if (value === "default") return "ask";
+  if (value === "skip") return "full";
+  if (["auto-strict", "auto-standard", "auto-relaxed"].includes(value ?? "")) return "auto";
+  return value;
 }
 
 // The Auto Harness's Permissions vocabulary: Default only. No cross-harness

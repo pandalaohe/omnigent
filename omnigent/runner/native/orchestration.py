@@ -2789,6 +2789,22 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 pi_args.extend(["--model", own_login_model])
+    from omnigent.inner.pi_settings import ordered_pi_launch
+    from omnigent.permission_tiers.host import (
+        HOST_PERMISSION_STATE_FILE,
+        read_host_permission_state,
+    )
+
+    permission_state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
+    if permission_state.session_id != session_id:
+        raise ValueError("Pi launch permission state belongs to another session")
+    if permission_state.tier != "full":
+        pi_command, pi_args = await asyncio.to_thread(
+            ordered_pi_launch,
+            pi_command,
+            pi_args,
+            extension=pi_extension,
+        )
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -6877,11 +6893,15 @@ async def _auto_create_antigravity_terminal(
     # (file I/O) and done BEFORE terminal launch so agy sees the config on its
     # first MCP scan.
     await asyncio.to_thread(write_mcp_config, bridge_dir)
+    tier = resolve_agy_permission_tier(
+        labels if isinstance(labels, dict) else None, terminal_launch_args
+    )
     env_overrides = await asyncio.to_thread(
         seed_isolated_agy_home,
         bridge_dir,
         trusted_workspace=workspace,
         startup_instructions=startup_instructions,
+        permission_tier=tier,
     )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
@@ -6891,9 +6911,6 @@ async def _auto_create_antigravity_terminal(
     # /.gemini/antigravity-cli/settings.json to its arg), NOT the user's real
     # HOME — env_overrides no longer carries a HOME key.
     await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
-    tier = resolve_agy_permission_tier(
-        labels if isinstance(labels, dict) else None, terminal_launch_args
-    )
     await asyncio.to_thread(apply_agy_permission_tier, bridge_dir, tier)
     # The resolved tier is the single source for the skip-permissions flag; a
     # copy persisted in the launch args must not survive a later non-full tier.

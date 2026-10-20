@@ -2830,6 +2830,39 @@ def _build_session_response(
         labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     busy = status in ("running", "waiting")
     now = now_epoch()
+    permission_tier = None
+    permission_tier_revision = None
+    permission_tier_state = None
+    permission_tiers_capability = False
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        TIER_HARNESSES,
+        legacy_permission_tier,
+        read_permission_state,
+    )
+
+    if harness in TIER_HARNESSES:
+        assert harness is not None
+        try:
+            confirmed = read_permission_state(conv.labels, harness=harness)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            try:
+                permission_tier = legacy_permission_tier(
+                    harness=harness,
+                    labels=conv.labels,
+                    launch_args=conv.terminal_launch_args or [],
+                )
+            except ValueError:
+                permission_tier = None
+            permission_tier_state = "blocked"
+        else:
+            permission_tier = confirmed.tier
+            permission_tier_revision = confirmed.revision
+            permission_tier_state = confirmed.status
+            permission_tiers_capability = (
+                conv.labels.get(PERMISSION_CAPABILITY_LABEL_KEY) == PERMISSION_CAPABILITY_VALUE
+            )
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2866,6 +2899,10 @@ def _build_session_response(
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
         harness=harness,
+        permission_tier=permission_tier,
+        permission_tier_revision=permission_tier_revision,
+        permission_tier_state=permission_tier_state,
+        permission_tiers_capability=permission_tiers_capability,
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
@@ -11772,6 +11809,79 @@ async def _evaluate_tool_call_policy(
     *,
     actor: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
+    harness = await asyncio.to_thread(_resolve_harness, conv, agent_store=agent_store)
+    from omnigent.server.permission_tiers import TIER_HARNESSES
+
+    if harness is None and any(
+        key in conv.labels
+        for key in ("omnigent.pi.permission_tier", "omnigent.antigravity_native.permission_tier")
+    ):
+        return {"verdict": "deny", "reason": "Permission harness unavailable"}
+    if harness in TIER_HARNESSES:
+        from omnigent.permission_tiers import Verdict
+        from omnigent.server.permission_gate import (
+            authorize_permission_call,
+            inspect_permission_call,
+        )
+
+        name = body.data.get("name")
+        arguments = body.data.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = None
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return {"verdict": "deny", "reason": "Malformed tool call"}
+        inspection = await inspect_permission_call(
+            conv,
+            harness=harness,
+            name=name,
+            arguments=arguments,
+            call_id=body.data.get("call_id"),
+            runner_router=_runner_router,
+        )
+        if inspection.decision.action == Verdict.DENY:
+            return {"verdict": "deny", "reason": inspection.decision.reason}
+        independent = await _evaluate_independent_tool_call_policy(
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            agent_store,
+            _runner_router,
+            actor=actor,
+            blocking=True,
+        )
+        if independent is not None:
+            return independent
+        decision = await authorize_permission_call(
+            inspection,
+            request=None,
+            harness=harness,
+            arguments=arguments,
+            conversation_store=conversation_store,
+            runner_router=_runner_router,
+        )
+        if decision.action != Verdict.ALLOW:
+            return {"verdict": "deny", "reason": decision.reason}
+        return None
+    return await _evaluate_independent_tool_call_policy(
+        session_id, conv, body, conversation_store, agent_store, _runner_router, actor=actor
+    )
+
+
+async def _evaluate_independent_tool_call_policy(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    _runner_router: RunnerRouter | None,
+    *,
+    actor: dict[str, str] | None = None,
+    blocking: bool = False,
+) -> dict[str, Any] | None:
     """
     Evaluate a tool call against TOOL_CALL phase policy rules.
 
@@ -11834,6 +11944,33 @@ async def _evaluate_tool_call_policy(
             "verdict": "deny",
             "reason": result.reason or "Denied by policy",
         }
+
+    if blocking:
+        params = ElicitationRequestParams(
+            mode="form",
+            message=result.reason or "Approval required",
+            requestedSchema=None,
+            url=None,
+            phase=Phase.TOOL_CALL.value,
+            policy_name=result.deciding_policy or "unknown",
+            content_preview=arguments_str[:4096],
+        )
+        approval = await _publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=session_id,
+            params=params,
+            timeout_s=float(resolve_ask_timeout(engine, result)),
+            conversation_store=conversation_store,
+        )
+        if approval is None or approval.action != "accept":
+            return {"verdict": "deny", "reason": result.reason or "Approval was not granted"}
+        if result.set_labels:
+            await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
+        if result.state_updates:
+            await asyncio.to_thread(
+                engine.apply_state_updates, result.state_updates, approved=True
+            )
+        return None
 
     # ASK — publish elicitation event. Approval state lives
     # on the runner (_pending_approvals dict).
@@ -13590,6 +13727,14 @@ async def _create_session_from_existing_agent(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
     )
+    from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
+
+    require_permission_protocol(request, harness=selected_harness)
+    if body.permission_tier is not None and selected_harness not in TIER_HARNESSES:
+        raise OmnigentError(
+            "permission_tier is only supported by Pi and Antigravity sessions",
+            code=ErrorCode.INVALID_INPUT,
+        )
     await validate_create_harness_readiness(
         harness=selected_harness,
         host_id=body.host_id,
@@ -14002,12 +14147,44 @@ async def _create_session_from_existing_agent(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
     )
-    if create_harness == "antigravity-native":
-        validated_launch_args = _stamp_antigravity_permission_tier(
-            initial_labels,
-            validated_launch_args,
-            default=project_resolution.permission if body.sub_agent_name is None else None,
+    require_permission_protocol(request, harness=create_harness)
+    if body.permission_tier is not None and create_harness not in TIER_HARNESSES:
+        raise OmnigentError(
+            "permission_tier is only supported by Pi and Antigravity sessions",
+            code=ErrorCode.INVALID_INPUT,
         )
+    if create_harness in TIER_HARNESSES:
+        assert create_harness is not None
+        from omnigent.server.permission_tiers import (
+            ConfirmedPermissionState,
+            creation_permission_tier,
+            legacy_permission_tier,
+        )
+
+        inherited_tier = None
+        if parent_conv is not None:
+            try:
+                inherited_tier = legacy_permission_tier(
+                    harness=create_harness,
+                    labels=parent_conv.labels or {},
+                    launch_args=parent_conv.terminal_launch_args or [],
+                )
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"Parent permission tier requires recovery: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+        tier = creation_permission_tier(
+            harness=create_harness,
+            explicit=body.permission_tier,
+            default=project_resolution.permission if body.sub_agent_name is None else None,
+            inherited=inherited_tier,
+        )
+        initial_labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(create_harness))
+        if create_harness == "antigravity-native":
+            validated_launch_args = _stamp_antigravity_permission_tier(
+                initial_labels, validated_launch_args, tier=tier
+            )
 
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
@@ -14445,9 +14622,19 @@ def _create_session_from_bundle(
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
-    if _spec_harness(spec) == "antigravity-native":
+    if _spec_harness(spec) in {"pi", "pi-native", "antigravity-native"}:
+        from omnigent.server.permission_tiers import (
+            ConfirmedPermissionState,
+            creation_permission_tier,
+        )
+
+        harness = _spec_harness(spec)
         labels = dict(metadata.labels or {})
-        launch_args = _stamp_antigravity_permission_tier(labels, metadata.terminal_launch_args)
+        tier = creation_permission_tier(harness=harness, explicit=metadata.permission_tier)
+        labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
+        launch_args = metadata.terminal_launch_args
+        if harness == "antigravity-native":
+            launch_args = _stamp_antigravity_permission_tier(labels, launch_args, tier=tier)
         metadata = metadata.model_copy(
             update={"labels": labels, "terminal_launch_args": launch_args}
         )
@@ -14632,6 +14819,7 @@ async def _handle_mcp_tools_call(
         return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
     operation_id = cast("str | None", operation_id_value)
     is_retry = request_state_str is not None
+    permission_execution_binding: dict[str, object] | None = None
 
     def _runner_execute_body(
         execute_params: dict[str, Any],
@@ -14639,6 +14827,8 @@ async def _handle_mcp_tools_call(
         step: str,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        if permission_execution_binding is not None:
+            body["_omnigent_permission"] = permission_execution_binding
         if operation_id is not None:
             body["_omnigent_operation"] = {"id": operation_id, "step": step}
         return body
@@ -14668,6 +14858,37 @@ async def _handle_mcp_tools_call(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return _mcp_error_response(rpc_id, -32000, f"Agent not found: {conv.agent_id!r}")
+
+    from omnigent.permission_tiers import Verdict
+    from omnigent.server.permission_gate import (
+        authorize_permission_call,
+        finish_permission_call,
+        inspect_permission_call,
+    )
+    from omnigent.server.permission_tiers import TIER_HARNESSES
+
+    permission_harness = await asyncio.to_thread(_resolve_harness, conv, agent_store=agent_store)
+    permission_call_id = params.get("_omnigent_permission_call_id") or operation_id
+    if permission_call_id is None:
+        permission_call_id = "mcp:" + uuid.uuid4().hex
+    tier_local_execution = permission_harness not in TIER_HARNESSES or (
+        execute_tool is None
+        and not any(
+            config.transport == "registry" and namespaced_name.startswith(config.name + "__")
+            for config in spec.mcp_servers
+        )
+    )
+    tier_inspection = await inspect_permission_call(
+        conv,
+        harness=permission_harness,
+        name=namespaced_name,
+        arguments=arguments,
+        call_id=permission_call_id,
+        runner_router=runner_router,
+        local_execution=tier_local_execution,
+    )
+    if tier_inspection.decision.action == Verdict.DENY:
+        return _mcp_error_response(rpc_id, -32000, tier_inspection.decision.reason)
 
     if is_retry:
         # ── Retry path: user has responded to the elicitation ────────
@@ -14832,18 +15053,53 @@ async def _handle_mcp_tools_call(
         if call_result.data is not None:
             arguments = cast("dict[str, object]", call_result.data)
 
+    # Policies may transform arguments; inspect the exact execution input again.
+    if tier_inspection.binding is not None:
+        tier_inspection = await inspect_permission_call(
+            conv,
+            harness=permission_harness,
+            name=namespaced_name,
+            arguments=arguments,
+            call_id=permission_call_id,
+            runner_router=runner_router,
+            local_execution=tier_local_execution,
+        )
+    tier_decision = await authorize_permission_call(
+        tier_inspection,
+        request=request,
+        harness=permission_harness,
+        arguments=arguments,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+    )
+    if tier_decision.action != Verdict.ALLOW:
+        return _mcp_error_response(rpc_id, -32000, tier_decision.reason)
+    permission_execution_binding = tier_inspection.execution_binding()
+
+    async def finish_server_execution() -> None:
+        if tier_inspection.binding is not None:
+            await finish_permission_call(
+                conv,
+                call_id=tier_inspection.binding.call_id,
+                revision=tier_inspection.binding.tier_revision,
+                runner_router=runner_router,
+            )
+
     # ── Server-side sys_advise_models intercept ──────────────────────────
     # After policy evaluation (DENY/ASK handled above); arguments may have
     # been transformed. The advisor runs server-side where routing_client lives.
     if namespaced_name in ("sys_advise_models", "mcp__omnigent__sys_advise_models"):
-        return await _handle_advise_models_mcp(
-            rpc_id,
-            conv,
-            arguments,
-            agent_store,
-            session_id=session_id,
-            runner_router=runner_router,
-        )
+        try:
+            return await _handle_advise_models_mcp(
+                rpc_id,
+                conv,
+                arguments,
+                agent_store,
+                session_id=session_id,
+                runner_router=runner_router,
+            )
+        finally:
+            await finish_server_execution()
 
     from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
 
@@ -14859,18 +15115,24 @@ async def _handle_mcp_tools_call(
             None,
         )
     if execute_tool is not None:
-        exec_data = await execute_tool(arguments)
+        try:
+            exec_data = await execute_tool(arguments)
+        finally:
+            await finish_server_execution()
     elif registry_config is not None:
         from omnigent.server.registry_gateway import execute_registry_tool
 
-        exec_data = await execute_registry_tool(
-            request,
-            conv,
-            registry_config,
-            namespaced_name,
-            arguments,
-            credential_user,
-        )
+        try:
+            exec_data = await execute_registry_tool(
+                request,
+                conv,
+                registry_config,
+                namespaced_name,
+                arguments,
+                credential_user,
+            )
+        finally:
+            await finish_server_execution()
     else:
         # ── Execute on the runner via WS tunnel ──────────────────────────
         # The runner owns stdio subprocess spawning (correct machine, cwd,
@@ -14882,6 +15144,7 @@ async def _handle_mcp_tools_call(
 
             runner_client = cast("httpx.AsyncClient | None", get_runner_client())
         if runner_client is None:
+            await finish_server_execution()
             return _mcp_error_response(
                 rpc_id, -32000, f"No runner bound for session {session_id!r}"
             )
@@ -14961,6 +15224,27 @@ async def _handle_mcp_tools_call(
             return _mcp_error_response(rpc_id, -32000, "Registry MCP elicitation is not supported")
 
         # Retry on the runner with the user's inputResponses.
+        if tier_inspection.binding is not None:
+            tier_inspection = await inspect_permission_call(
+                conv,
+                harness=permission_harness,
+                name=namespaced_name,
+                arguments=arguments,
+                call_id=str(permission_call_id) + ":elicitation-response",
+                runner_router=runner_router,
+                local_execution=tier_local_execution,
+            )
+            retry_permission = await authorize_permission_call(
+                tier_inspection,
+                request=request,
+                harness=permission_harness,
+                arguments=arguments,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
+            if retry_permission.action != Verdict.ALLOW:
+                return _mcp_error_response(rpc_id, -32000, retry_permission.reason)
+            permission_execution_binding = tier_inspection.execution_binding()
         try:
             retry_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",

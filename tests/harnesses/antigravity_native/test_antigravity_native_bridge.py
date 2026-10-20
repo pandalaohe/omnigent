@@ -3462,14 +3462,13 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     [
         (None, [], "ask"),
         (None, ["--dangerously-skip-permissions"], "full"),
-        ("invalid", [], "ask"),
-        ("invalid", ["--dangerously-skip-permissions"], "full"),
         ("ask", ["--dangerously-skip-permissions"], "ask"),
         ("plan", [], "plan"),
         ("accept-edits", [], "accept-edits"),
-        ("auto-strict", [], "auto-strict"),
-        ("auto-standard", [], "auto-standard"),
-        ("auto-relaxed", [], "auto-relaxed"),
+        ("auto-strict", [], "auto"),
+        ("auto-standard", [], "auto"),
+        ("auto-relaxed", [], "auto"),
+        ("auto", [], "auto"),
         ("full", [], "full"),
     ],
 )
@@ -3478,15 +3477,19 @@ def test_permission_tier_resolution(label: str | None, args: list[str], expected
     assert _mod.resolve_agy_permission_tier(labels, args) == expected
 
 
+@pytest.mark.parametrize("args", [[], ["--dangerously-skip-permissions"]])
+def test_invalid_tier_never_falls_back_to_bypass(args):
+    with pytest.raises(ValueError):
+        _mod.resolve_agy_permission_tier({_mod.AGY_PERMISSION_TIER_LABEL_KEY: "invalid"}, args)
+
+
 @pytest.mark.parametrize(
     "tier,expected",
     [
         ("ask", []),
         ("plan", ["--mode", "plan"]),
         ("accept-edits", ["--mode", "accept-edits"]),
-        ("auto-strict", ["--mode", "accept-edits"]),
-        ("auto-standard", ["--mode", "accept-edits"]),
-        ("auto-relaxed", ["--mode", "accept-edits"]),
+        ("auto", ["--mode", "accept-edits"]),
         ("full", ["--dangerously-skip-permissions"]),
     ],
 )
@@ -3523,7 +3526,7 @@ def test_permission_settings_snapshot_restore_and_hooks_merge(
         ],
     }
     hooks.write_text(json.dumps({"user": user_hook, "omnigent-guard": {"enabled": False}}))
-    _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+    _mod.apply_agy_permission_tier(bridge_dir, "auto")
     merged = json.loads(settings.read_text())
     assert merged["toolPermission"] == "always-proceed"
     assert merged["allowNonWorkspaceAccess"] is True
@@ -3547,7 +3550,7 @@ def test_permission_settings_snapshot_restore_and_hooks_merge(
     assert entry["PreToolUse"][0]["matcher"] == ".*"
     command_hook = entry["PreToolUse"][0]["hooks"][0]
     assert command_hook["type"] == "command"
-    assert command_hook["timeout"] == 10
+    assert command_hook["timeout"] == 86400
     import sys
 
     assert shlex.split(command_hook["command"]) == [
@@ -3559,7 +3562,7 @@ def test_permission_settings_snapshot_restore_and_hooks_merge(
     ]
     files = [settings, hooks, snapshot, bridge_dir / "permission_tier"]
     contents = [path.read_bytes() for path in files]
-    _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+    _mod.apply_agy_permission_tier(bridge_dir, "auto")
     assert [path.read_bytes() for path in files] == contents
     for tier in ["ask", "plan", "accept-edits", "full"]:
         _mod.apply_agy_permission_tier(bridge_dir, tier)
@@ -3571,7 +3574,7 @@ def test_permission_settings_snapshot_restore_and_hooks_merge(
         assert snapshot.read_bytes() == saved
         assert (bridge_dir / "permission_tier").read_text() == tier + "\n"
         assert json.loads(hooks.read_text())["user"] == user_hook
-        assert ("omnigent-guard" in json.loads(hooks.read_text())) == (tier != "full")
+        assert "omnigent-guard" in json.loads(hooks.read_text())
 
 
 @pytest.mark.parametrize(
@@ -3592,7 +3595,7 @@ def test_apply_tier_refuses_symlink_destination(
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.symlink_to(target)
     with pytest.raises(ValueError, match="symlink"):
-        _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+        _mod.apply_agy_permission_tier(bridge_dir, "auto")
     assert destination.is_symlink()
     assert target.read_text() == "{}"
     assert (
@@ -3603,14 +3606,14 @@ def test_apply_tier_refuses_symlink_destination(
 
 def test_tier_reassert_repairs_drift_without_churning(bridge_dir: Path) -> None:
     tier = bridge_dir / "permission_tier"
-    _mod.reassert_agy_permission_tier(bridge_dir, "auto-strict")
-    assert tier.read_text() == "auto-strict\n"
+    _mod.reassert_agy_permission_tier(bridge_dir, "auto")
+    assert tier.read_text() == "auto\n"
     before = tier.stat().st_mtime_ns
-    _mod.reassert_agy_permission_tier(bridge_dir, "auto-strict")
+    _mod.reassert_agy_permission_tier(bridge_dir, "auto")
     assert tier.stat().st_mtime_ns == before
     tier.write_text("ask\n")
-    _mod.reassert_agy_permission_tier(bridge_dir, "auto-strict")
-    assert tier.read_text() == "auto-strict\n"
+    _mod.reassert_agy_permission_tier(bridge_dir, "auto")
+    assert tier.read_text() == "auto\n"
 
 
 def test_apply_creates_missing_hooks(bridge_dir: Path) -> None:
@@ -3628,7 +3631,7 @@ def test_invalid_tier_and_malformed_settings_refused(bridge_dir: Path) -> None:
     settings.parent.mkdir(parents=True)
     settings.write_text("[]")
     with pytest.raises(ValueError, match="Expected JSON object"):
-        _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+        _mod.apply_agy_permission_tier(bridge_dir, "auto")
     assert settings.read_text() == "[]"
 
 
@@ -3665,16 +3668,16 @@ def test_agy_config_and_footer_captured_screens(agy_controls_captures):
     [
         (
             "ask",
-            "auto-relaxed",
+            "auto",
             [
-                ("tier", "auto-relaxed"),
+                ("tier", "auto"),
                 ("Tool Permission", "always-proceed"),
                 ("Non-Workspace Access", "on"),
                 ("mode", "accept-edits"),
             ],
         ),
         (
-            "auto-standard",
+            "auto",
             "plan",
             [
                 ("Tool Permission", "request-review"),
@@ -3683,7 +3686,7 @@ def test_agy_config_and_footer_captured_screens(agy_controls_captures):
                 ("tier", "plan"),
             ],
         ),
-        ("auto-strict", "auto-relaxed", [("tier", "auto-relaxed")]),
+        ("auto", "auto", [("tier", "auto")]),
         ("ask", "plan", [("mode", "plan")]),
     ],
 )
@@ -3714,6 +3717,18 @@ def test_agy_live_switch_order(tmp_path, monkeypatch, previous, tier, expected):
 
 @pytest.mark.parametrize("undo_fails", [False, True])
 def test_agy_live_switch_reverse_undo(tmp_path, monkeypatch, undo_fails):
+    from omnigent.permission_tiers.host import (
+        HOST_PERMISSION_STATE_FILE,
+        HostPermissionState,
+        read_host_permission_state,
+        write_host_permission_state,
+    )
+
+    state_path = tmp_path / HOST_PERMISSION_STATE_FILE
+    write_host_permission_state(
+        state_path,
+        HostPermissionState("s", "h", str(tmp_path), "auto", 1, "switching", "transaction"),
+    )
     calls = []
     (tmp_path / "agy_user_settings.json").write_text(
         '{"allowNonWorkspaceAccess": {"present": false, "value": null}}'
@@ -3733,9 +3748,7 @@ def test_agy_live_switch_reverse_undo(tmp_path, monkeypatch, undo_fails):
         _mod, "apply_agy_permission_tier", lambda _, tier: calls.append(("settings", tier))
     )
     with pytest.raises(_mod.AgyPermissionRollbackError if undo_fails else RuntimeError):
-        _mod.switch_agy_permission_tier(
-            tmp_path, tier="ask", previous="auto-relaxed", timeout_s=0.1
-        )
+        _mod.switch_agy_permission_tier(tmp_path, tier="ask", previous="auto", timeout_s=0.1)
     assert calls[:4] == [
         ("Tool Permission", "request-review"),
         ("Non-Workspace Access", "off"),
@@ -3743,17 +3756,16 @@ def test_agy_live_switch_reverse_undo(tmp_path, monkeypatch, undo_fails):
         ("Tool Permission", "always-proceed"),
     ]
     if undo_fails:
-        assert (tmp_path / "permission_tier").read_text() == "auto-strict\n"
+        assert read_host_permission_state(state_path).status == "blocked"
+        assert not (tmp_path / "permission_tier").exists()
     else:
-        assert calls[-1] == ("settings", "auto-relaxed")
+        assert calls[-1] == ("settings", "auto")
 
 
 def test_agy_busy_and_full_refuse_before_mutation(tmp_path, monkeypatch):
     monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: "esc to cancel")
     with pytest.raises(RuntimeError, match="busy"):
-        _mod.switch_agy_permission_tier(
-            tmp_path, tier="auto-relaxed", previous="ask", timeout_s=0.1
-        )
+        _mod.switch_agy_permission_tier(tmp_path, tier="auto", previous="ask", timeout_s=0.1)
     with pytest.raises(ValueError, match="create-only"):
         _mod.switch_agy_permission_tier(tmp_path, tier="ask", previous="full", timeout_s=0.1)
     assert not (tmp_path / "permission_tier").exists()
@@ -3762,9 +3774,7 @@ def test_agy_busy_and_full_refuse_before_mutation(tmp_path, monkeypatch):
 def test_agy_live_switch_requires_user_settings_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(_mod, "_require_agy_idle", lambda _: "? for shortcuts    Gemini · high")
     with pytest.raises(ValueError, match="missing user settings snapshot"):
-        _mod.switch_agy_permission_tier(
-            tmp_path, tier="auto-relaxed", previous="ask", timeout_s=0.1
-        )
+        _mod.switch_agy_permission_tier(tmp_path, tier="auto", previous="ask", timeout_s=0.1)
     assert not (tmp_path / "agy_user_settings.json").exists()
 
 
@@ -3890,11 +3900,9 @@ def test_agy_unwritable_safe_tier_still_requests_cold_resume(tmp_path, monkeypat
     monkeypatch.setattr(_mod, "reassert_agy_permission_tier", fail_tier)
     monkeypatch.setattr(_mod, "_agy_control_pane", fail)
     with pytest.raises(
-        _mod.AgyPermissionRollbackError, match="deny-safe tier could not be written"
+        _mod.AgyPermissionRollbackError, match="permission cache remains unavailable"
     ):
-        _mod.switch_agy_permission_tier(
-            tmp_path, tier="ask", previous="auto-relaxed", timeout_s=0.1
-        )
+        _mod.switch_agy_permission_tier(tmp_path, tier="ask", previous="auto", timeout_s=0.1)
 
 
 def test_agy_old_active_marker_does_not_block_idle_footer(tmp_path, monkeypatch):

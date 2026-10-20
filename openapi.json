@@ -8270,6 +8270,16 @@
           "permission_tier": {
             "anyOf": [
               {
+                "enum": [
+                  "ask",
+                  "plan",
+                  "accept-edits",
+                  "auto",
+                  "full",
+                  "auto-strict",
+                  "auto-standard",
+                  "auto-relaxed"
+                ],
                 "type": "string"
               },
               {
@@ -9308,6 +9318,19 @@
             "title": "Permission Mode",
             "type": "string"
           },
+          "permission_tier_revision": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Permission Tier Revision"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -10100,6 +10123,57 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "permission_tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ask",
+                  "plan",
+                  "accept-edits",
+                  "auto",
+                  "full"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Tier"
+          },
+          "permission_tier_revision": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Tier Revision"
+          },
+          "permission_tier_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ready",
+                  "switching",
+                  "blocked"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Tier State"
+          },
+          "permission_tiers_capability": {
+            "default": false,
+            "title": "Permission Tiers Capability",
+            "type": "boolean"
           },
           "project_id": {
             "anyOf": [
@@ -12005,6 +12079,19 @@
             "description": "Legacy archive request flag. Deletion still requires an effective archive tier permitting removal and the host's safe cleanup checks. Rejected (400) without `archived=True`.",
             "title": "Delete Worktree",
             "type": "boolean"
+          },
+          "expected_permission_tier_revision": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Permission Tier Revision"
           },
           "external_session_id": {
             "anyOf": [

@@ -88,6 +88,140 @@ function readConfig() {
   }
 }
 
+const PERMISSION_TIERS = new Set(["ask", "plan", "accept-edits", "auto", "full"]);
+
+function readPermissionState(config) {
+  const configPath = process.env.OMNIGENT_PI_NATIVE_CONFIG;
+  if (!config || typeof configPath !== "string" || !configPath ||
+      typeof config.sessionId !== "string" || !config.sessionId) return null;
+  const statePath = path.join(path.dirname(configPath), "permission_state.json");
+  try {
+    if (fs.lstatSync(statePath).isSymbolicLink()) return null;
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    if (!state || state.session_id !== config.sessionId ||
+        typeof state.host_id !== "string" || !state.host_id ||
+        typeof state.workspace !== "string" || !state.workspace ||
+        !PERMISSION_TIERS.has(state.tier) ||
+        !["ready", "switching", "blocked"].includes(state.status) ||
+        !Number.isInteger(state.revision) || state.revision < 1) return null;
+    return state;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function writePermissionControlFile(config, name, payload) {
+  const configPath = process.env.OMNIGENT_PI_NATIVE_CONFIG;
+  if (!config || !configPath) throw new Error("Pi permission config missing");
+  const target = path.join(path.dirname(configPath), name);
+  const temporary = `${target}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(payload), { mode: 0o600 });
+  fs.renameSync(temporary, target);
+}
+
+function permissionExtensionOrderProven() {
+  if (process.env.OMNIGENT_PI_PERMISSION_INLINE) {
+    try {
+      return fs.realpathSync(process.env.OMNIGENT_PI_PERMISSION_INLINE) ===
+        fs.realpathSync(__filename);
+    } catch (_err) { return false; }
+  }
+  const argv = process.argv;
+  if (!argv.includes("--no-extensions") && !argv.includes("-ne")) return false;
+  let lastExtension = null;
+  for (let index = 0; index < argv.length - 1; index += 1) {
+    if (argv[index] === "--extension" || argv[index] === "-e") {
+      lastExtension = argv[index + 1];
+    }
+  }
+  try {
+    return !!lastExtension && fs.realpathSync(path.resolve(lastExtension)) ===
+      fs.realpathSync(__filename);
+  } catch (_err) {
+    return false;
+  }
+}
+
+function activeToolsForTier(pi, config, baselineTools, tier) {
+  if (typeof pi.setActiveTools !== "function" ||
+      typeof pi.getActiveTools !== "function" || !Array.isArray(baselineTools)) return null;
+  const planTools = Array.isArray(config.planVisibleTools) ? config.planVisibleTools : null;
+  if (!planTools || !planTools.every((name) => typeof name === "string")) return null;
+  const desired = tier === "plan"
+    ? baselineTools.filter((name) => planTools.includes(name))
+    : baselineTools;
+  try {
+    pi.setActiveTools(desired);
+    const actual = pi.getActiveTools();
+    return Array.isArray(actual) && actual.length === desired.length &&
+      actual.every((name, index) => name === desired[index]) ? actual : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function markPermissionInstallation(config, state, activeTools) {
+  if (!config || !state || !activeTools ||
+      (state.tier !== "full" && !permissionExtensionOrderProven()) ||
+      typeof config.permissionInstallationId !== "string" ||
+      !config.permissionInstallationId) return false;
+  try {
+    const extensionSha256 = crypto.createHash("sha256")
+      .update(fs.readFileSync(__filename)).digest("hex");
+    writePermissionControlFile(config, "permission_installation.json", {
+      version: 1,
+      installation_id: config.permissionInstallationId,
+      session_id: state.session_id,
+      harness: "pi-native",
+      extension_sha256: extensionSha256,
+      tier: state.tier,
+      revision: state.revision,
+      tools_verified: true,
+      active_tools: activeTools,
+    });
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+async function finishPermissionLease(config, callId, lease, result) {
+  if (!config || typeof config.serverUrl !== "string" || !config.serverUrl ||
+      typeof config.sessionId !== "string" || !config.sessionId ||
+      typeof callId !== "string" || !callId ||
+      !lease || !Number.isInteger(lease.revision) || lease.revision < 1 ||
+      typeof fetch !== "function") return false;
+  try {
+    const relay = relayCredentials();
+    const url = relay
+      ? `${relay.url}/policies/evaluate`
+      : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+    const response = await fetch(
+      url,
+      {
+        method: "POST",
+        headers: relay
+          ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
+          : { "content-type": "application/json", "X-Omnigent-Permission-Tiers": "1",
+              ...freshAuthHeaders(config.authHeaders) },
+        body: JSON.stringify({ event: { type: "PHASE_TOOL_RESULT", target: lease.name,
+          data: { name: lease.name, arguments: lease.args,
+            result: { isError: !!(result && result.isError) }, call_id: callId,
+            permission_tier_revision: lease.revision }, context: {} } }),
+      },
+    );
+    if (!response || !response.ok) return false;
+    const verdict = await response.json();
+    const acknowledgement = verdict && verdict.permission_tier_finish;
+    return !!acknowledgement && typeof acknowledgement === "object" &&
+      acknowledgement.call_id === callId &&
+      acknowledgement.revision === lease.revision &&
+      acknowledgement.finished === true;
+  } catch (_err) {
+    return false;
+  }
+}
+
 function nativeAuthFailure(message, ctx) {
   const authDir = process.env.OMNIGENT_PI_NATIVE_AUTH_DIR;
   const error = message && message.errorMessage;
@@ -210,20 +344,32 @@ function relayCredentials() {
  * the deliberate exception: that is the human approval window, not an outage,
  * and we keep waiting (re-attaching) rather than blocking.
  *
- * @returns {Promise<{block: boolean, reason: string} | null>} A verdict.
- *   ``{block: true}`` either from a DENY or from failing closed; ``{block:
- *   false}`` on ALLOW; ``null`` only when the gate is structurally disabled
- *   (no server/session configured or no global fetch) so there is nothing to
- *   enforce against.
+ * @returns {Promise<{block: boolean, reason: string}>} A verdict; missing
+ *   configuration, transport failure and unknown actions block.
  */
-async function evalNativePolicyHttp(config, toolName, args) {
+async function evalNativePolicyHttp(config, toolName, args, callId) {
   if (
     !config ||
+    typeof config.serverUrl !== "string" ||
     !config.serverUrl ||
+    typeof config.sessionId !== "string" ||
     !config.sessionId ||
     typeof fetch !== "function"
   )
-    return null;
+    return failClosedVerdict();
+  if (
+    typeof toolName !== "string" ||
+    !toolName ||
+    !args ||
+    typeof args !== "object" ||
+    Array.isArray(args) ||
+    typeof callId !== "string" ||
+    !callId
+  ) {
+    return failClosedVerdict();
+  }
+  const permissionState = readPermissionState(config);
+  if (!permissionState || permissionState.status !== "ready") return failClosedVerdict();
   // Prefer relay (non-expiring local token); fall back to direct server call.
   const relay = relayCredentials();
   const url = relay
@@ -234,15 +380,21 @@ async function evalNativePolicyHttp(config, toolName, args) {
   // card. Kept for the whole call, across both the park loop and any
   // transient-error retries.
   const elicitationId = mintEvaluateElicitationId();
-  const body = JSON.stringify({
-    event: {
-      type: "PHASE_TOOL_CALL",
-      target: "",
-      data: { name: toolName, arguments: args },
-      context: {},
-    },
-    _omnigent_elicitation_id: elicitationId,
-  });
+  let body;
+  try {
+    body = JSON.stringify({
+      event: {
+        type: "PHASE_TOOL_CALL",
+        target: "",
+        data: { name: toolName, arguments: args, call_id: callId,
+          expected_permission_tier_revision: permissionState.revision },
+        context: {},
+      },
+      _omnigent_elicitation_id: elicitationId,
+    });
+  } catch (_err) {
+    return failClosedVerdict();
+  }
   const reqHeaders = relay
     ? {
         "content-type": "application/json",
@@ -250,6 +402,7 @@ async function evalNativePolicyHttp(config, toolName, args) {
       }
     : {
         "content-type": "application/json",
+        "X-Omnigent-Permission-Tiers": "1",
         ...freshAuthHeaders(config.authHeaders),
       };
 
@@ -262,6 +415,10 @@ async function evalNativePolicyHttp(config, toolName, args) {
   let rawAskRounds = 0;
 
   while (true) {
+    const current = readPermissionState(config);
+    if (!current || current.status !== "ready" ||
+        current.revision !== permissionState.revision ||
+        current.tier !== permissionState.tier) return failClosedVerdict();
     if (Date.now() >= parkDeadline) {
       // Park ceiling reached (well past any sane ask_timeout): the gate is
       // wedged, not resolving. Fail CLOSED — PHASE_TOOL_CALL is the sole
@@ -329,11 +486,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
       if (timer) clearTimeout(timer);
     }
 
-    if (!resp.ok) {
+    if (!resp || resp.ok !== true) {
       // 5xx is transient (retry within budget, re-attaching); 4xx is final
       // (a bad request won't succeed on retry). Either way, an unevaluable
       // PHASE_TOOL_CALL fails CLOSED.
-      if (resp.status >= 500) {
+      if (resp && resp.status >= 500) {
         if (Date.now() + transientBackoff >= transientDeadline) {
           return failClosedVerdict();
         }
@@ -359,7 +516,10 @@ async function evalNativePolicyHttp(config, toolName, args) {
     if (result === "POLICY_ACTION_DENY") {
       return {
         block: true,
-        reason: json.reason || "blocked by Omnigent policy",
+        reason:
+          typeof json.reason === "string" && json.reason
+            ? json.reason
+            : "blocked by Omnigent policy",
       };
     }
     if (result === "POLICY_ACTION_ASK") {
@@ -383,8 +543,17 @@ async function evalNativePolicyHttp(config, toolName, args) {
       await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
       continue;
     }
-    // ALLOW / UNSPECIFIED / anything else → proceed.
-    return { block: false, reason: "" };
+    if (
+      result === "POLICY_ACTION_ALLOW" ||
+      result === "POLICY_ACTION_UNSPECIFIED"
+    ) {
+      const confirmed = readPermissionState(config);
+      if (!confirmed || confirmed.status !== "ready" ||
+          confirmed.revision !== permissionState.revision ||
+          confirmed.tier !== permissionState.tier) return failClosedVerdict();
+      return { block: false, reason: "" };
+    }
+    return failClosedVerdict();
   }
 }
 
@@ -541,19 +710,21 @@ function mcpContentTypeIsJson(resp) {
  *   200 response; ``piResult`` is a terminal fail-closed tool result the caller
  *   returns as-is.
  */
-async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
+async function postMcpToolsCall(config, toolName, args, rpcId, callId, extraParams) {
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`;
   const body = JSON.stringify({
     jsonrpc: "2.0",
     id: rpcId,
     method: "tools/call",
-    params: { name: toolName, arguments: args || {}, ...(extraParams || {}) },
+    params: { name: toolName, arguments: args || {},
+      _omnigent_permission_call_id: callId, ...(extraParams || {}) },
   });
   try {
     const resp = await fetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        "X-Omnigent-Permission-Tiers": "1",
         ...freshAuthHeaders(config.authHeaders),
       },
       body,
@@ -637,12 +808,14 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
  * (``isError: true``) rather than throwing, so a server hiccup never wedges Pi's
  * agent loop.
  */
-async function callOmnigentTool(config, toolName, args) {
+async function callOmnigentTool(config, toolName, args, callId) {
   if (
     !config ||
     !config.serverUrl ||
     !config.sessionId ||
-    typeof fetch !== "function"
+    typeof fetch !== "function" ||
+    typeof callId !== "string" || !callId ||
+    !args || typeof args !== "object" || Array.isArray(args)
   ) {
     return {
       content: [
@@ -652,7 +825,12 @@ async function callOmnigentTool(config, toolName, args) {
     };
   }
 
-  const first = await postMcpToolsCall(config, toolName, args, 1);
+  const permissionState = readPermissionState(config);
+  if (!permissionState || permissionState.status !== "ready") {
+    return { content: [{ type: "text", text: "权限状态待恢复，工具已暂停" }], isError: true };
+  }
+
+  const first = await postMcpToolsCall(config, toolName, args, 1, callId);
   if (first.piResult) return first.piResult;
   const initial = mcpInputRequired(first.json);
   if (initial === null) {
@@ -674,23 +852,20 @@ async function callOmnigentTool(config, toolName, args) {
     };
   }
 
-  const verdict = await evalNativePolicyHttp(config, toolName, args || {});
-  if (verdict === null) {
-    // The approval gate is structurally unavailable (no server/session/fetch,
-    // or a transport error) — fail CLOSED rather than report false success.
-    return {
-      content: [
-        {
-          type: "text",
-          text: "Omnigent tool call requires approval but the policy server was unreachable",
-        },
-      ],
-      isError: true,
-    };
-  }
+  const verdict = await evalNativePolicyHttp(
+    config,
+    toolName,
+    args || {},
+    callId,
+  );
   const action = verdict.block ? "decline" : "accept";
 
-  const retry = await postMcpToolsCall(config, toolName, args, 2, {
+  const current = readPermissionState(config);
+  if (!current || current.status !== "ready" ||
+      current.revision !== permissionState.revision || current.tier !== permissionState.tier) {
+    return { content: [{ type: "text", text: "权限状态已变化，工具未执行" }], isError: true };
+  }
+  const retry = await postMcpToolsCall(config, toolName, args, 2, callId, {
     requestState: initial.requestState,
     inputResponses: { [initial.elicitationId]: { action } },
   });
@@ -1277,6 +1452,7 @@ function startInboxPoller(
   handleThinkingLevelChange,
   isTurnActive,
   isCompacting,
+  handlePermissionTierChange,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1437,6 +1613,10 @@ function startInboxPoller(
           handleThinkingLevelChange(payload.thinkingLevel);
         }
       }
+      if (payload.type === "permission_tier_change" &&
+          typeof handlePermissionTierChange === "function") {
+        handlePermissionTierChange(payload);
+      }
       if (id !== null) rememberSeen(id);
       try {
         fs.unlinkSync(fullPath);
@@ -1511,12 +1691,28 @@ module.exports = function (pi) {
   // policies, double-prompt. Pi's OWN built-in tools (read/shell/etc) are not
   // in this set and stay gated by the hook below.
   const bridgedTools = new Set();
+  const piNativeTools = new Set(["read", "bash", "write", "edit"]);
+  const permittedNativeCalls = new Map();
+  async function finishNativePermissionCall(callId, event) {
+    if (typeof callId !== "string") return;
+    const lease = permittedNativeCalls.get(callId);
+    if (!lease || lease.finishing) return;
+    lease.finishing = true;
+    try {
+      if (await finishPermissionLease(config, callId, lease, event) &&
+          permittedNativeCalls.get(callId) === lease) {
+        permittedNativeCalls.delete(callId);
+      }
+    } finally {
+      lease.finishing = false;
+    }
+  }
+  let baselineActiveTools = null;
   if (config && Array.isArray(config.tools)) {
     for (const tool of config.tools) {
       if (!tool || typeof tool !== "object") continue;
       const name = typeof tool.name === "string" ? tool.name : "";
       if (!name) continue;
-      bridgedTools.add(name);
       const description =
         typeof tool.description === "string" ? tool.description : "";
       const parameters =
@@ -1533,10 +1729,11 @@ module.exports = function (pi) {
           description,
           promptSnippet: description ? description.slice(0, 120) : name,
           parameters,
-          async execute(_toolCallId, params) {
-            return callOmnigentTool(config, name, params || {});
+          async execute(toolCallId, params) {
+            return callOmnigentTool(config, name, params || {}, toolCallId);
           },
         });
+        bridgedTools.add(name);
       }
     }
   }
@@ -2015,6 +2212,15 @@ module.exports = function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
     registerTaskToolIfMissing();
+    const permissionState = readPermissionState(config);
+    if (permissionState && typeof pi.getActiveTools === "function") {
+      const currentTools = pi.getActiveTools();
+      if (Array.isArray(currentTools) && currentTools.every((name) => typeof name === "string")) {
+        baselineActiveTools = currentTools;
+        const active = activeToolsForTier(pi, config, baselineActiveTools, permissionState.tier);
+        markPermissionInstallation(config, permissionState, active);
+      }
+    }
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
     setOmnigentStatus(config, ctx, "linked");
@@ -2051,6 +2257,30 @@ module.exports = function (pi) {
         return idle === null ? agentRunning : !idle;
       },
       () => compacting,
+      (payload) => {
+        const state = readPermissionState(config);
+        const target = payload && payload.target_tier;
+        const idle = safeIsIdle(latestContext);
+        const turnActive = idle === null ? agentRunning : !idle;
+        const valid = state && state.status === "switching" &&
+          state.revision === payload.expected_revision &&
+          PERMISSION_TIERS.has(target) && target !== "full" &&
+          state.tier !== "full" && baselineActiveTools &&
+          !turnActive;
+        const active = valid
+          ? activeToolsForTier(pi, config, baselineActiveTools, target)
+          : null;
+        try {
+          writePermissionControlFile(config, "permission_ack.json", {
+            id: payload.id,
+            session_id: config.sessionId,
+            target_tier: target,
+            expected_revision: payload.expected_revision,
+            ok: !!active,
+            active_tools: active || [],
+          });
+        } catch (_err) {}
+      },
     );
     markInputReady(config);
     const nativeSessionId =
@@ -2227,12 +2457,23 @@ module.exports = function (pi) {
     if (blocked) {
       return { block: true, reason: "Interrupted by user" };
     }
+    const permissionState = readPermissionState(config);
+    if (!permissionState || permissionState.status !== "ready") {
+      return { block: true, reason: "权限状态待恢复，工具已暂停" };
+    }
+    if (!event || typeof event.toolCallId !== "string" || !event.toolCallId ||
+        !event.input || typeof event.input !== "object" || Array.isArray(event.input)) {
+      return { block: true, reason: "invalid tool call" };
+    }
     // Bridged Omnigent tools (registered via pi.registerTool above) are
     // policy-evaluated server-side inside the /mcp proxy when execute() runs,
     // so skip the hook-level eval for them to avoid double-evaluation and, for
     // ASK policies, a double prompt. Pi's own built-in tools (read/shell/etc)
     // are NOT bridged and stay gated here.
-    if (bridgedTools.has((event && event.toolName) || "")) {
+    if (
+      bridgedTools.has((event && event.toolName) || "") &&
+      !piNativeTools.has(event.toolName)
+    ) {
       return;
     }
     // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
@@ -2242,20 +2483,28 @@ module.exports = function (pi) {
     // of whether an Omnigent turn is currently in flight.
     const verdict = await evalNativePolicyHttp(
       config,
-      (event && event.toolName) || "",
-      (event && event.input) || {},
+      event && event.toolName,
+      event && event.input,
+      event && event.toolCallId,
     );
-    if (verdict && verdict.block) {
+    if (verdict.block) {
       return {
         block: true,
         reason: verdict.reason || "blocked by Omnigent policy",
       };
+    }
+    if (permissionState.tier !== "full") {
+      permittedNativeCalls.set(event.toolCallId, {
+        revision: permissionState.revision, name: event.toolName, args: event.input,
+      });
     }
   });
 
   pi.on("tool_result", async (event, ctx) => {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
+    const callId = event && event.toolCallId;
+    await finishNativePermissionCall(callId, event);
     await syncTaskListFromResult(event);
     await postToolResult(event, currentResponseId());
   });
@@ -2263,6 +2512,8 @@ module.exports = function (pi) {
   pi.on("tool_execution_end", async (event, ctx) => {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
+    const callId = event && event.toolCallId;
+    await finishNativePermissionCall(callId, event);
     await postToolResult(event, currentResponseId());
   });
 

@@ -11,7 +11,11 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { authenticatedFetch } from "@/lib/identity";
-import { apiErrorFromResponse, RECENT_SESSIONS_TOUCHED_EVENT } from "@/lib/sessionsApi";
+import {
+  apiErrorFromResponse,
+  PERMISSION_TIERS_PROTOCOL_HEADERS,
+  RECENT_SESSIONS_TOUCHED_EVENT,
+} from "@/lib/sessionsApi";
 
 /** Thrown for the 404 an older server returns; callers render the old-server note. */
 export class RecentSessionsUnavailableError extends Error {
@@ -22,7 +26,9 @@ export class RecentSessionsUnavailableError extends Error {
 }
 
 async function fetchRecentSessions(count: number): Promise<Conversation[]> {
-  const res = await authenticatedFetch(`/v1/me/recent-sessions?limit=${count}`);
+  const res = await authenticatedFetch(`/v1/me/recent-sessions?limit=${count}`, {
+    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+  });
   if (res.status === 404) throw new RecentSessionsUnavailableError();
   if (!res.ok) throw await apiErrorFromResponse(res);
   return applySessionTombstones((await res.json()) as ConversationsPage, true).data;
