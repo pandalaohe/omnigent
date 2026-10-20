@@ -77,10 +77,23 @@ class StartupAdmission:
         if conv is None or conv.archived or conv.host_id != conn.host_id:
             raise OmnigentError("Session host binding changed", code=ErrorCode.CONFLICT)
         current = await asyncio.to_thread(self.startups.for_session, session_id)
-        if current is not None:
-            return current
         pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
         head = next((item for item in pending if item.status != "failed"), None)
+        if current is not None:
+            if (
+                current.state == "ready_empty"
+                and head is not None
+                and head.status == "in_progress"
+            ):
+                return await self.coordinator.enqueue(
+                    session_id,
+                    input_id=head.id,
+                    owner_user_id=conn.owner or "__local__",
+                    operation_key=f"first-input:{head.id}",
+                    runtime_generation=current.runtime_generation + 1,
+                    reuse_startup_id=current.id,
+                )
+            return current
         if head is not None and head.status != "in_progress":
             # A submitted input predates admission. Reconcile it instead of replaying.
             raise StartupQueued(None)
@@ -136,7 +149,7 @@ class StartupAdmission:
             startup_id=startup.id,
             attempt_id=startup.attempt_id,
             input_id=startup.input_id,
-            runtime_id=startup.attempt_id,
+            runtime_id=startup.runtime_id or startup.attempt_id,
             host_generation=generation,
         )
         if not await asyncio.to_thread(

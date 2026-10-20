@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
+from omnigent.entities.session_startup import StartupReceipt
 from omnigent.stores.session_startup_store import SessionStartupStore
 
 
@@ -128,3 +129,102 @@ def test_empty_database_budget_bootstrap_is_disabled_and_replica_safe(db_uri):
     assert store.reserve(host) is None
     with store._session("read_bootstrap_sequence") as db:
         assert sorted(db.scalars(select(SqlSessionStartup.sequence))) == [1, 2]
+
+
+@pytest.mark.parametrize("stop_proof", ["direct", "receipt"])
+def test_first_input_reuses_empty_runtime_at_full_residency_and_stops_all_generations(
+    db_uri, stop_proof
+):
+    store, host, session = SessionStartupStore(db_uri), uuid4().hex, uuid4().hex
+    store.configure(host, host_resident_limit=1, deployment_resident_limit=1)
+    empty = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=session,
+        operation_key="empty",
+        input_id=None,
+    )
+    attempt = store.reserve(host)
+    assert store.claim_boundary(
+        empty.id,
+        attempt.attempt_id,
+        runtime_id="context",
+        host_generation="generation",
+        boundary="runner_prepare",
+        claim_id="claim",
+    )
+    for phase in ("runtime_ready", "tools_ready"):
+        assert store.observe(
+            StartupReceipt(
+                startup_id=empty.id,
+                attempt_id=attempt.attempt_id,
+                runtime_id="context",
+                source="runner",
+                phase=phase,
+            )
+        )
+    other = enqueue(store, host)
+    args = {
+        "owner_user_id": "owner",
+        "host_id": host,
+        "session_id": session,
+        "operation_key": "first-input",
+        "input_id": uuid4().hex,
+        "runtime_generation": 2,
+        "reuse_startup_id": empty.id,
+    }
+    first = store.enqueue(**args)
+    assert store.enqueue(**args).id == first.id
+    assert first.runtime_id == "context"
+    reserved = store.reserve(host)
+    assert reserved.id == first.id
+    assert reserved.runtime_generation == 2
+    assert not store.claim_boundary(
+        first.id,
+        reserved.attempt_id,
+        runtime_id="context",
+        host_generation="generation",
+        boundary="native_prepare",
+        claim_id="cold-repair",
+    )
+    assert store.reserve(host) is None
+    store.cancel(first.id)
+    assert store.reserve(host) is None
+    if stop_proof == "direct":
+        assert store.confirm_stopped(first.id, reserved.attempt_id)
+    else:
+        assert store.observe(
+            StartupReceipt(
+                startup_id=first.id,
+                attempt_id=reserved.attempt_id,
+                input_id=first.input_id,
+                runtime_id="context",
+                source="runner",
+                phase="stopped",
+            )
+        )
+    assert store.reserve(host).id == other.id
+
+
+@pytest.mark.parametrize("changed", ["owner", "host", "session", "generation"])
+def test_runtime_reuse_rejects_foreign_or_unready_context(db_uri, changed):
+    store, host, session = SessionStartupStore(db_uri), uuid4().hex, uuid4().hex
+    store.configure(host, host_resident_limit=2, deployment_resident_limit=2)
+    empty = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=session,
+        operation_key="empty",
+        input_id=None,
+    )
+    args = {
+        "owner_user_id": "other" if changed == "owner" else "owner",
+        "host_id": uuid4().hex if changed == "host" else host,
+        "session_id": uuid4().hex if changed == "session" else session,
+        "operation_key": "first-input",
+        "input_id": uuid4().hex,
+        "runtime_generation": 3 if changed == "generation" else 2,
+        "reuse_startup_id": empty.id,
+    }
+    with pytest.raises(ValueError, match="reuse"):
+        store.enqueue(**args)

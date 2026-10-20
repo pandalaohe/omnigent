@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -29,6 +29,7 @@ class StartupSnapshot:
     reason: str | None
     attempt_id: str | None
     runtime_id: str | None
+    runtime_generation: int
 
 
 def _snapshot(row: SqlSessionStartup) -> StartupSnapshot:
@@ -382,12 +383,13 @@ class SessionStartupStore:
         input_id: str | None,
         runtime_generation: int = 1,
         parent_startup_id: str | None = None,
+        reuse_startup_id: str | None = None,
     ) -> StartupSnapshot:
         if not 0 < len(operation_key) <= 128 or not 0 < len(owner_user_id) <= 128:
             raise ValueError("Invalid owner or operation key")
 
         def write(db: Session) -> StartupSnapshot:
-            deployment, _ = self._budgets(db, host_id)
+            deployment, host = self._budgets(db, host_id)
             scope = SqlSessionStartup.workspace_id == current_workspace_id()
             old = db.scalar(
                 select(SqlSessionStartup).where(
@@ -406,6 +408,30 @@ class SessionStartupStore:
                 ) != (host_id, session_id, input_id, runtime_generation, parent_startup_id):
                     raise ValueError("Conflicting startup operation key")
                 return _snapshot(old)
+            reuse = (
+                db.get(SqlSessionStartup, (current_workspace_id(), reuse_startup_id))
+                if reuse_startup_id
+                else None
+            )
+            latest = self._current_session_row(db, session_id) if reuse_startup_id else None
+            if reuse_startup_id and (
+                reuse is None
+                or reuse.owner_user_id != owner_user_id
+                or reuse.host_id != host_id
+                or reuse.session_id != session_id
+                or reuse.state != "ready_empty"
+                or reuse.input_id is not None
+                or not reuse.resident
+                or reuse.cancel_requested
+                or not reuse.runtime_id
+                or not reuse.host_generation
+                or host.current_generation not in (None, reuse.host_generation)
+                or runtime_generation != reuse.runtime_generation + 1
+                or input_id is None
+                or latest is None
+                or latest.id != reuse.id
+            ):
+                raise ValueError("Cannot reuse this runtime for first input")
             for predicate, maximum in (
                 (SqlSessionStartup.host_id == host_id, 100),
                 (SqlSessionStartup.owner_user_id == owner_user_id, 500),
@@ -456,6 +482,9 @@ class SessionStartupStore:
                 cancel_requested=False,
                 created_at=now_epoch(),
                 updated_at=now_epoch(),
+                runtime_id=reuse.runtime_id if reuse else None,
+                host_generation=reuse.host_generation if reuse else None,
+                cold_claims={"resident_reuse": reuse.id} if reuse else {},
             )
             db.add(row)
             return _snapshot(row)
@@ -494,21 +523,55 @@ class SessionStartupStore:
                     or 0
                 )
 
+            def residents(*predicates) -> int:
+                contexts = (
+                    select(
+                        SqlSessionStartup.workspace_id,
+                        SqlSessionStartup.host_id,
+                        SqlSessionStartup.session_id,
+                        SqlSessionStartup.runtime_id,
+                        case((SqlSessionStartup.runtime_id.is_(None), SqlSessionStartup.id)),
+                    )
+                    .where(SqlSessionStartup.resident.is_(True), *predicates)
+                    .distinct()
+                    .subquery()
+                )
+                return db.scalar(select(func.count()).select_from(contexts)) or 0
+
             if (
                 host.fenced
                 or deployment.resident_limit == 0
                 or host.resident_limit == 0
                 or count(*scope, SqlSessionStartup.occupied.is_(True)) >= host.startup_limit
-                or count(*scope, SqlSessionStartup.resident.is_(True)) >= host.resident_limit
-                or count(SqlSessionStartup.resident.is_(True)) >= deployment.resident_limit
             ):
                 return None
+            full = (
+                residents(*scope) >= host.resident_limit
+                or residents() >= deployment.resident_limit
+            )
             query = select(SqlSessionStartup).where(*scope, SqlSessionStartup.state == "queued")
             if eligible_ids is not None:
                 query = query.where(SqlSessionStartup.id.in_(eligible_ids))
             rows = db.scalars(query.order_by(SqlSessionStartup.sequence)).all()
             eligible = []
             for row in rows:
+                reuses_resident = (
+                    row.runtime_id is not None
+                    and db.scalar(
+                        select(SqlSessionStartup.id)
+                        .where(
+                            *scope,
+                            SqlSessionStartup.session_id == row.session_id,
+                            SqlSessionStartup.runtime_id == row.runtime_id,
+                            SqlSessionStartup.host_generation == row.host_generation,
+                            SqlSessionStartup.resident.is_(True),
+                        )
+                        .limit(1)
+                    )
+                    is not None
+                )
+                if full and not reuses_resident:
+                    continue
                 if row.parent_startup_id:
                     parent = db.get(
                         SqlSessionStartup, (current_workspace_id(), row.parent_startup_id)
@@ -614,6 +677,7 @@ class SessionStartupStore:
                 or row.host_generation not in (None, host_generation)
                 or host.current_generation not in (None, host_generation)
                 or (expected_runner_id is not None and host.current_generation != host_generation)
+                or "resident_reuse" in row.cold_claims
                 or boundary in row.cold_claims
                 or (boundary == "runner_spawn" and "runner_prepare" not in row.cold_claims)
             ):
@@ -683,6 +747,27 @@ class SessionStartupStore:
 
         return run_write_transaction(self._session, "cancel_startup", write)
 
+    @staticmethod
+    def _settle_runtime_stopped(db: Session, row: SqlSessionStartup) -> None:
+        if row.runtime_id is not None:
+            for previous in db.scalars(
+                select(SqlSessionStartup)
+                .where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == row.host_id,
+                    SqlSessionStartup.session_id == row.session_id,
+                    SqlSessionStartup.runtime_id == row.runtime_id,
+                    SqlSessionStartup.host_generation == row.host_generation,
+                )
+                .with_for_update()
+            ):
+                previous.occupied = previous.resident = False
+                previous.state = "cancelled" if previous.cancel_requested else "stopped"
+                previous.updated_at = now_epoch()
+        row.occupied = row.resident = False
+        row.state = "cancelled" if row.cancel_requested else "stopped"
+        row.updated_at = now_epoch()
+
     def confirm_stopped(self, startup_id: str, attempt_id: str) -> bool:
         """The authenticated runtime owner supplies exact-attempt stop evidence."""
 
@@ -694,9 +779,7 @@ class SessionStartupStore:
             db.refresh(row, with_for_update=True)
             if row.attempt_id != attempt_id:
                 return False
-            row.occupied = row.resident = False
-            row.state = "cancelled" if row.cancel_requested else "stopped"
-            row.updated_at = now_epoch()
+            self._settle_runtime_stopped(db, row)
             return True
 
         return run_write_transaction(self._session, "settle_stopped_startup", write)
@@ -740,7 +823,7 @@ class SessionStartupStore:
             if (
                 row.attempt_id != attempt_id
                 or row.runtime_id != runtime_id
-                or row.cold_claims
+                or set(row.cold_claims) - {"resident_reuse"}
                 or row.proof_source is not None
                 or row.runtime_ready
                 or row.tools_ready
@@ -836,9 +919,7 @@ class SessionStartupStore:
             ):
                 return False
             if receipt.phase == "stopped":
-                row.occupied = row.resident = False
-                row.state = "cancelled" if row.cancel_requested else "stopped"
-                row.updated_at = now_epoch()
+                self._settle_runtime_stopped(db, row)
                 return True
             if row.cancel_requested:
                 return False

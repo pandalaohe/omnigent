@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 from starlette.datastructures import Headers
 
+from omnigent.entities.session_startup import StartupReceipt
 from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import SessionEventInput
@@ -194,5 +195,77 @@ async def test_missing_dispatcher_releases_only_an_ungranted_attempt(db_uri, phy
         )
     assert startups.reserve(host) is not None
     assert (startups.reserve(host) is None) == physical_grant
+    await admission.shutdown()
+    await inputs.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
+    conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
+    registry, host = HostRegistry(), uuid4().hex
+    conn = registry.register(
+        host,
+        FakeWebSocket(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="sample-host",
+            capabilities=["startup_admission_v1", "startup_receipts:test"],
+        ),
+        owner="owner",
+    )
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, host, "/opt/work/project")
+    inputs = ManagedStartupInputs(conversations, registry)
+    admission = StartupAdmission(
+        startups, conversations, registry, StartupAdmissionPolicy(1, 1, 2)
+    )
+    admission.bind(SimpleNamespace(state=SimpleNamespace(startup_inputs=inputs)))
+    admission.resolve_harness = AsyncMock(return_value="test")
+    empty = await admission.queue_session(conn, conv.id)
+    attempt = startups.reserve(host)
+    assert startups.claim_boundary(
+        empty.id,
+        attempt.attempt_id,
+        runtime_id="existing-context",
+        host_generation=conn.startup_generation,
+        boundary="runner_prepare",
+        claim_id="empty",
+    )
+    for phase in ("runtime_ready", "tools_ready"):
+        assert startups.observe(
+            StartupReceipt(
+                startup_id=empty.id,
+                attempt_id=attempt.attempt_id,
+                runtime_id="existing-context",
+                source="runner",
+                phase=phase,
+            )
+        )
+    item = await inputs.enqueue(
+        conv.id,
+        SessionEventInput(type="message", data={"role": "user", "content": []}),
+        user_id="owner",
+        headers=Headers(),
+    )
+    first = await admission.queue_session(conn, conv.id)
+    assert first.id != empty.id and first.input_id == item.id
+    assert (await admission.queue_session(conn, conv.id)).id == first.id
+    delivered = []
+
+    async def dispatch(context, session_id, event):
+        ref = await admission.admit_launch(conn, session_id)
+        assert ref.runtime_id == "existing-context"
+        assert ref.input_id == item.id
+        assert await context.claim(conversations, session_id)
+        delivered.append(ref)
+        return {"pending_id": "pending"}
+
+    inputs.dispatch = dispatch
+    await admission.coordinator.advance(host)
+    await admission.coordinator.drain()
+    assert len(delivered) == 1
+    assert startups.for_session(conv.id).state in ("starting", "verifying")
+    assert len(conversations.list_pending_inputs(conv.id)) == 1
     await admission.shutdown()
     await inputs.shutdown()

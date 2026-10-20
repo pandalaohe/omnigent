@@ -43,6 +43,7 @@ class StartupCoordinator:
         operation_key: str,
         parent_startup_id: str | None = None,
         runtime_generation: int = 1,
+        reuse_startup_id: str | None = None,
     ) -> StartupSnapshot:
         """The entry point authorizes the owner and completes child registration first."""
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
@@ -65,6 +66,7 @@ class StartupCoordinator:
             input_id=input_id,
             runtime_generation=runtime_generation,
             parent_startup_id=parent_startup_id,
+            reuse_startup_id=reuse_startup_id,
         )
 
     async def advance(self, host_id: str) -> None:
