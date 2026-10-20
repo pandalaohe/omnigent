@@ -20,6 +20,7 @@ PERMISSION_STATE_LABEL_KEY = "omnigent.permission_tier.state"
 PERMISSION_MIGRATION_LABEL_KEY = "omnigent.permission_tier.migrated_from"
 PERMISSION_CAPABILITY_LABEL_KEY = "omnigent.permission_tier.capability"
 PERMISSION_CAPABILITY_VALUE = "permission_tiers_v1"
+PERMISSION_RUNTIME_ID_LABEL_KEY = "omnigent.permission_tier.runtime_id"
 PERMISSION_PROTOCOL_HEADER = "X-Omnigent-Permission-Tiers"
 PERMISSION_PROTOCOL_VERSION = "1"
 TIER_HARNESSES = frozenset({"pi", "pi-native", "antigravity-native"})
@@ -30,6 +31,7 @@ PERMISSION_LABEL_KEYS = frozenset(
         PERMISSION_STATE_LABEL_KEY,
         PERMISSION_MIGRATION_LABEL_KEY,
         PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
     }
 )
 

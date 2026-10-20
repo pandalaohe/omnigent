@@ -3968,8 +3968,10 @@ def register_core_routes(
         """
         # A live effort/model change must read the settings its predecessor confirmed
         # or restored; otherwise a refusal can restore a value Codex never applied.
-        if "speed_tier" in body.model_fields_set or (
-            not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set
+        if (
+            "speed_tier" in body.model_fields_set
+            or "permission_mode" in body.model_fields_set
+            or (not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set)
         ):
             live_change = _live_settings_change(session_id)
             async with live_change.lock:
@@ -4052,12 +4054,256 @@ def register_core_routes(
             conversation_store.get_conversation, session_id
         )
         if conv_for_protocol is not None:
+            effective_harness = _resolve_harness(
+                conv_for_protocol, agent_store=agent_store, agent_cache=agent_cache
+            )
             require_permission_protocol(
                 request,
-                harness=_resolve_harness(
-                    conv_for_protocol, agent_store=agent_store, agent_cache=agent_cache
-                ),
+                harness=effective_harness,
             )
+            if body.permission_mode is not None and effective_harness in {
+                "pi",
+                "pi-native",
+                "antigravity-native",
+            }:
+                from omnigent.permission_tiers import NON_FULL_TIERS
+                from omnigent.server.permission_tiers import (
+                    PERMISSION_CAPABILITY_VALUE,
+                    PERMISSION_STATE_LABEL_KEY,
+                    ConfirmedPermissionState,
+                    read_permission_state,
+                    tier_label_key,
+                )
+
+                if body.model_fields_set - {
+                    "permission_mode",
+                    "expected_permission_tier_revision",
+                }:
+                    raise OmnigentError(
+                        "Permission tier must be changed separately",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                target = body.permission_mode
+                if target not in NON_FULL_TIERS:
+                    raise OmnigentError(
+                        "Full permission is create-only",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                raw_state = conv_for_protocol.labels.get(PERMISSION_STATE_LABEL_KEY)
+                try:
+                    state = read_permission_state(
+                        conv_for_protocol.labels, harness=effective_harness
+                    )
+                except (ValueError, TypeError) as exc:
+                    raise OmnigentError(
+                        "Permission tier requires controlled recovery",
+                        code=ErrorCode.CONFLICT,
+                    ) from exc
+                if (
+                    state.status != "ready"
+                    or state.tier == "full"
+                    or body.expected_permission_tier_revision != state.revision
+                    or raw_state is None
+                ):
+                    raise OmnigentError(
+                        "Permission tier revision is stale or unavailable",
+                        code=ErrorCode.CONFLICT,
+                    )
+                if target == state.tier:
+                    level = await _get_permission_level(user_id, session_id, permission_store)
+                    return await _get_session_snapshot(
+                        conversation_store,
+                        session_id,
+                        level,
+                        agent_store,
+                        agent_cache,
+                        liveness_lookup=liveness_lookup,
+                        include_items=False,
+                        include_usage=include_usage,
+                        runner_exit_reports=runner_exit_reports,
+                        viewer_id=user_id,
+                        request=request,
+                    )
+                transaction_id = uuid.uuid4().hex
+                switching = ConfirmedPermissionState(
+                    state.tier, state.revision, "switching", transaction_id
+                )
+                blocked = ConfirmedPermissionState(
+                    state.tier, state.revision, "blocked", transaction_id
+                )
+                changed = await asyncio.to_thread(
+                    conversation_store.compare_and_set_label,
+                    session_id,
+                    PERMISSION_STATE_LABEL_KEY,
+                    raw_state,
+                    switching.state_label(),
+                )
+                if not changed:
+                    raise OmnigentError(
+                        "Permission tier revision changed",
+                        code=ErrorCode.CONFLICT,
+                    )
+                prepare = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {
+                        "type": "permission_tier_prepare",
+                        "permission_tier": target,
+                        "expected_revision": state.revision,
+                        "transaction_id": transaction_id,
+                    },
+                    timeout_s=_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S,
+                )
+                if (
+                    prepare is not None
+                    and prepare.status_code == 409
+                    and _runner_reply_field(prepare.body, "error") == "session_busy"
+                ):
+                    restored = await asyncio.to_thread(
+                        conversation_store.compare_and_set_label,
+                        session_id,
+                        PERMISSION_STATE_LABEL_KEY,
+                        switching.state_label(),
+                        state.state_label(),
+                    )
+                    if not restored:
+                        raise OmnigentError(
+                            "Permission tier changed while restoring a busy session",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
+                    raise OmnigentError(
+                        "Session is busy; permission tier was not changed",
+                        code=ErrorCode.CONFLICT,
+                    )
+                if (
+                    prepare is None
+                    or prepare.status_code != 200
+                    or _runner_reply_field(prepare.body, "prepared") is not True
+                    or _runner_reply_field(prepare.body, "transaction_id") != transaction_id
+                    or _runner_reply_field(prepare.body, "permission_tier") != target
+                    or _runner_reply_field(prepare.body, "tier_revision") != state.revision
+                    or _runner_reply_field(prepare.body, "permission_tiers_capability")
+                    != PERMISSION_CAPABILITY_VALUE
+                ):
+                    await asyncio.to_thread(
+                        conversation_store.compare_and_set_label,
+                        session_id,
+                        PERMISSION_STATE_LABEL_KEY,
+                        switching.state_label(),
+                        blocked.state_label(),
+                    )
+                    # The host may have prepared even if its ACK was lost.
+                    # Keep the server blocked and request the same host fence.
+                    await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {
+                            "type": "permission_tier_block",
+                            "expected_revision": state.revision,
+                            "transaction_id": transaction_id,
+                        },
+                        timeout_s=_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S,
+                    )
+                    raise OmnigentError(
+                        "Permission tier switch was not confirmed; session is blocked",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {tier_label_key(effective_harness): target},
+                )
+                ready = ConfirmedPermissionState(target, state.revision + 1, "ready")
+                changed = await asyncio.to_thread(
+                    conversation_store.compare_and_set_label,
+                    session_id,
+                    PERMISSION_STATE_LABEL_KEY,
+                    switching.state_label(),
+                    ready.state_label(),
+                )
+                if not changed:
+                    raise OmnigentError(
+                        "Permission tier changed concurrently; session remains fenced",
+                        code=ErrorCode.CONFLICT,
+                    )
+                commit = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {
+                        "type": "permission_tier_commit",
+                        "permission_tier": target,
+                        "expected_revision": state.revision,
+                        "revision": ready.revision,
+                        "transaction_id": transaction_id,
+                    },
+                    timeout_s=_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S,
+                )
+
+                def commit_confirmed(reply: _RunnerForwardResult | None) -> bool:
+                    return (
+                        reply is not None
+                        and reply.status_code == 200
+                        and _runner_reply_field(reply.body, "committed") is True
+                        and _runner_reply_field(reply.body, "transaction_id") == transaction_id
+                        and _runner_reply_field(reply.body, "permission_tier") == target
+                        and _runner_reply_field(reply.body, "tier_revision") == ready.revision
+                        and _runner_reply_field(reply.body, "permission_tiers_capability")
+                        == PERMISSION_CAPABILITY_VALUE
+                    )
+
+                if not commit_confirmed(commit):
+                    # A lost ACK can follow a successful host commit. The
+                    # runner responds idempotently for this transaction.
+                    commit = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {
+                            "type": "permission_tier_commit",
+                            "permission_tier": target,
+                            "expected_revision": state.revision,
+                            "revision": ready.revision,
+                            "transaction_id": transaction_id,
+                        },
+                        timeout_s=_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S,
+                    )
+                if not commit_confirmed(commit):
+                    await asyncio.to_thread(
+                        conversation_store.compare_and_set_label,
+                        session_id,
+                        PERMISSION_STATE_LABEL_KEY,
+                        ready.state_label(),
+                        ConfirmedPermissionState(
+                            target, ready.revision, "blocked", transaction_id
+                        ).state_label(),
+                    )
+                    await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {
+                            "type": "permission_tier_block",
+                            "expected_revision": ready.revision,
+                            "transaction_id": transaction_id,
+                        },
+                        timeout_s=_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S,
+                    )
+                    raise OmnigentError(
+                        "Permission tier commit was not confirmed; session is blocked",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                level = await _get_permission_level(user_id, session_id, permission_store)
+                return await _get_session_snapshot(
+                    conversation_store,
+                    session_id,
+                    level,
+                    agent_store,
+                    agent_cache,
+                    liveness_lookup=liveness_lookup,
+                    include_items=False,
+                    include_usage=include_usage,
+                    runner_exit_reports=runner_exit_reports,
+                    viewer_id=user_id,
+                    request=request,
+                )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store

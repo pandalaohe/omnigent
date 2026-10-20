@@ -681,6 +681,51 @@ async def test_patch_session_title_enforces_user_limit(
     assert resp.status_code == 422, resp.text
 
 
+async def test_busy_permission_switch_restores_ready_revision(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.server.routes.sessions.routes_core as routes_core
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+        read_permission_state,
+    )
+
+    store = SqlAlchemyConversationStore(db_uri)
+    store.update_conversation_with_changes(session_id, harness_override="pi")
+    store.set_labels(
+        session_id,
+        {
+            **ConfirmedPermissionState("auto", 1, "ready").labels("pi"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    forwarded: list[dict[str, object]] = []
+
+    async def busy_forward(
+        _session_id: str, _router: object, event: dict[str, object], **_kwargs: object
+    ) -> routes_core._RunnerForwardResult:
+        forwarded.append(event)
+        return routes_core._RunnerForwardResult(409, '{"error":"session_busy"}')
+
+    monkeypatch.setattr(routes_core, "_forward_session_change_to_runner", busy_forward)
+    response = await client.patch(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Omnigent-Permission-Tiers": "1"},
+        json={"permission_mode": "ask", "expected_permission_tier_revision": 1},
+    )
+    assert response.status_code == 409, response.text
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    state = read_permission_state(conversation.labels, harness="pi")
+    assert (state.tier, state.revision, state.status) == ("auto", 1, "ready")
+    assert [event["type"] for event in forwarded] == ["permission_tier_prepare"]
+
+
 async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
     """Patching a nonexistent session returns 404."""
     resp = await client.patch(

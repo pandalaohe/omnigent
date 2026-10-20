@@ -159,6 +159,13 @@ from omnigent.runner.native.interrupt import (
     native_session_has_active_work,
 )
 from omnigent.runner.native_controls import build_native_controls
+from omnigent.runner.permission_tiers import (
+    PERMISSION_RUNTIME_ID,
+    PERMISSION_TIERS_CAPABILITY,
+    PermissionTierEpochChanged,
+    PermissionTierRuntime,
+    decision_payload,
+)
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -242,6 +249,7 @@ from omnigent.sdk_permission_modes import (
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
 )
+from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -2220,6 +2228,10 @@ def create_runner_app(
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
+    permission_tiers = PermissionTierRuntime()
+    app.state.permission_tiers = permission_tiers
+    _permission_tier_targets: dict[str, tuple[str, str]] = {}
+    _permission_tier_commits: dict[str, tuple[str, str, int]] = {}
     # A keep-warm ping's own /btw overlay reads running/"dialog open" on the
     # pane's status file; while the hold (monotonic deadline) is active that
     # edge is the ping's, not a real turn — plus a settle grace (the file lags).
@@ -3763,7 +3775,26 @@ def create_runner_app(
             spawn_env = None
 
         try:
-            await process_manager.get_client(
+            permission_tiers.fence_start(init_context.envelope, harness_name)
+        except PermissionTierEpochChanged:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "permission_tier_epoch_changed",
+                    "permission_tier_runtime_id": PERMISSION_RUNTIME_ID,
+                },
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "permission_tier_unavailable",
+                    "detail": _client_safe_error_detail(exc, context="permission tier startup"),
+                },
+            )
+
+        try:
+            init_harness_client = await process_manager.get_client(
                 session_id,
                 harness_name,
                 env=spawn_env,
@@ -4143,6 +4174,56 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        permission_tier_ack: str | None = None
+        try:
+            if (
+                harness_name == "pi"
+                and init_context.envelope is not None
+                and PERMISSION_STATE_LABEL_KEY in init_context.envelope.snapshot.labels
+            ):
+                bootstrap = await asyncio.wait_for(
+                    init_harness_client.post(
+                        "/v1/permission-tier/bootstrap", json={"session_id": session_id}
+                    ),
+                    timeout=20.0,
+                )
+                bootstrap_body = bootstrap.json()
+                if (
+                    bootstrap.status_code != 200
+                    or not isinstance(bootstrap_body, dict)
+                    or bootstrap_body.get("installed") is not True
+                ):
+                    raise ValueError("Pi permission extension did not acknowledge startup")
+            elif harness_name == "pi-native" and init_context.envelope is not None:
+                from omnigent.harnesses.pi_native.bridge import (
+                    verify_pi_permission_installation,
+                )
+                from omnigent.server.permission_tiers import read_permission_state
+
+                permission_snapshot = init_context.envelope.snapshot
+                startup_tier = read_permission_state(
+                    permission_snapshot.labels, harness=harness_name
+                ).tier
+                bridge_dir = permission_tiers.state_path(
+                    session_id, harness_name, permission_snapshot.labels
+                ).parent
+                deadline = asyncio.get_running_loop().time() + 20.0
+                while not verify_pi_permission_installation(bridge_dir, startup_tier):
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise ValueError("Pi permission extension did not acknowledge startup")
+                    await asyncio.sleep(0.1)
+            permission_state = permission_tiers.install(init_context.envelope, harness_name)
+            if permission_state is not None:
+                permission_tier_ack = PERMISSION_TIERS_CAPABILITY
+        except (OSError, ValueError, TypeError, ImportError, httpx.HTTPError, TimeoutError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "permission_tier_unavailable",
+                    "detail": _client_safe_error_detail(exc, context="permission tier startup"),
+                },
+            )
+
         # Preserve the initialization contract: undrained child results are
         # recovered before POST /sessions returns. The scan no longer delays
         # native terminal registration because it ran concurrently above.
@@ -4345,6 +4426,15 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                **(
+                    {
+                        "permission_tiers_capability": permission_tier_ack,
+                        "permission_tier_revision": permission_state.revision,
+                        "permission_tier_runtime_id": PERMISSION_RUNTIME_ID,
+                    }
+                    if permission_state is not None
+                    else {}
+                ),
                 **(
                     {"inference_config_verified": True}
                     if init_context.envelope is not None
@@ -7182,6 +7272,65 @@ def create_runner_app(
                     extra={"session_id": _captured_session_id},
                 )
 
+        async def _permission_tier_control(event: dict[str, object]) -> dict[str, object]:
+            """Bind AG hook phases to this runner's actual host state."""
+            try:
+                event_type = event.get("type")
+                if event_type == "permission_tier_inspect":
+                    arguments = event.get("arguments")
+                    if not isinstance(arguments, dict):
+                        raise ValueError("Invalid tool arguments")
+                    binding, decision = permission_tiers.inspect(
+                        _captured_session_id,
+                        call_id=cast(str, event.get("call_id")),
+                        name=cast(str, event.get("name")),
+                        arguments=arguments,
+                        expected_revision=cast(int, event.get("expected_revision")),
+                        local_execution=True,
+                    )
+                    return {
+                        **decision_payload(decision),
+                        "call_id": binding.call_id,
+                        "session_id": binding.session_id,
+                        "name": binding.name,
+                        "arguments_digest": binding.arguments_digest,
+                        "host_id": binding.host_id,
+                        "tier_revision": binding.tier_revision,
+                        "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
+                        "rule_id": decision.rule_id,
+                    }
+                if event_type == "permission_tier_authorize":
+                    authorized = permission_tiers.authorize(
+                        _captured_session_id,
+                        call_id=event.get("call_id"),
+                        name=event.get("name"),
+                        arguments_digest=event.get("arguments_digest"),
+                        expected_revision=event.get("expected_revision"),
+                    )
+                    if not authorized:
+                        raise ValueError("Permission authorization stale")
+                    state = permission_tiers.state(_captured_session_id)
+                    if state is None:
+                        raise ValueError("Permission state unavailable")
+                    return {
+                        "authorized": True,
+                        "session_id": _captured_session_id,
+                        "host_id": state.host_id,
+                        "call_id": cast(str, event["call_id"]),
+                        "tier_revision": state.revision,
+                        "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
+                    }
+                if event_type == "permission_tier_finish":
+                    finished = permission_tiers.finish(
+                        _captured_session_id,
+                        call_id=event.get("call_id"),
+                        revision=event.get("expected_revision"),
+                    )
+                    return {"finished": finished}
+            except (KeyError, OSError, TypeError, ValueError):
+                return {"error": "permission_tier_stale"}
+            return {"error": "invalid_input"}
+
         try:
             if current is not None and current.bridge_dir == bridge_dir:
                 # Native policy hooks can cache the relay URL/token at startup.
@@ -7196,6 +7345,7 @@ def create_runner_app(
                     policy_client=server_client,
                     session_id=session_id,
                     file_change_observer=_observe_native_file_changes,
+                    permission_tier_control=_permission_tier_control,
                 )
         except (OSError, RuntimeError):
             _logger.warning(
@@ -7286,6 +7436,28 @@ def create_runner_app(
                         return
                     _cli_runtime_lifecycle.mark_starting(conv)
                     _cli_runtime_lifecycle.mark_live(conv)
+                    permission_state = permission_tiers.state(conv)
+                    if permission_state is not None:
+                        deadline = asyncio.get_running_loop().time() + 20.0
+                        session_path = f"/v1/sessions/{urllib.parse.quote(conv, safe='')}"
+                        while True:
+                            response = await server_client.get(
+                                session_path,
+                                headers={"X-Omnigent-Permission-Tiers": "1"},
+                            )
+                            if response.status_code == 200:
+                                snapshot = response.json()
+                                if (
+                                    isinstance(snapshot, dict)
+                                    and snapshot.get("permission_tier_state") == "ready"
+                                    and snapshot.get("permission_tier_revision")
+                                    == permission_state.revision
+                                    and snapshot.get("permission_tiers_capability") is True
+                                ):
+                                    break
+                            if asyncio.get_running_loop().time() >= deadline:
+                                raise RuntimeError("Permission tier was not confirmed before turn")
+                            await asyncio.sleep(0.1)
                     await _run_turn_bg_setup_and_stream(msg_body, conv, handed_off)
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the
@@ -9885,6 +10057,347 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "permission_tier_inspect":
+            if not isinstance(body, dict):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            local_execution = body.get("local_execution")
+            if not isinstance(local_execution, bool):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            try:
+                binding, decision = permission_tiers.inspect(
+                    conversation_id,
+                    call_id=body["call_id"],
+                    name=body["name"],
+                    arguments=body["arguments"],
+                    expected_revision=body["expected_revision"],
+                    local_execution=local_execution,
+                )
+            except (KeyError, OSError, TypeError, ValueError):
+                return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
+            return JSONResponse(
+                content={
+                    **decision_payload(decision),
+                    "call_id": binding.call_id,
+                    "session_id": binding.session_id,
+                    "name": binding.name,
+                    "arguments_digest": binding.arguments_digest,
+                    "host_id": binding.host_id,
+                    "tier_revision": binding.tier_revision,
+                    "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
+                    "rule_id": decision.rule_id,
+                }
+            )
+
+        if body_type == "permission_tier_authorize":
+            if not isinstance(body, dict):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            authorized = permission_tiers.authorize(
+                conversation_id,
+                call_id=body.get("call_id"),
+                name=body.get("name"),
+                arguments_digest=body.get("arguments_digest"),
+                expected_revision=body.get("expected_revision"),
+            )
+            if not authorized:
+                return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
+            authorized_state = permission_tiers.state(conversation_id)
+            if authorized_state is None:
+                return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
+            return JSONResponse(
+                content={
+                    "authorized": True,
+                    "session_id": conversation_id,
+                    "host_id": authorized_state.host_id,
+                    "call_id": body["call_id"],
+                    "tier_revision": body["expected_revision"],
+                    "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
+                }
+            )
+
+        if body_type == "permission_tier_finish":
+            if not isinstance(body, dict) or not permission_tiers.finish(
+                conversation_id,
+                call_id=body.get("call_id"),
+                revision=body.get("expected_revision"),
+            ):
+                return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
+            return JSONResponse(content={"finished": True})
+
+        if body_type == "permission_tier_block":
+            if not isinstance(body, dict):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            state = permission_tiers.state(conversation_id)
+            transaction_id = body.get("transaction_id")
+            if (
+                state is None
+                or state.revision != body.get("expected_revision")
+                or not isinstance(transaction_id, str)
+                or not transaction_id
+            ):
+                return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
+            try:
+                permission_tiers.force_block(conversation_id, transaction_id)
+            except (OSError, ValueError):
+                return JSONResponse(status_code=503, content={"error": "permission_block_failed"})
+            return JSONResponse(content={"blocked": True, "tier_revision": state.revision})
+
+        if body_type in {
+            "permission_tier_prepare",
+            "permission_tier_commit",
+            "permission_tier_rollback",
+        }:
+            from omnigent.permission_tiers import NON_FULL_TIERS
+            from omnigent.server.permission_tiers import read_permission_state
+
+            harness = _session_harness_name(conversation_id)
+            if harness not in {"pi", "pi-native", "antigravity-native"}:
+                return JSONResponse(status_code=400, content={"error": "unsupported_harness"})
+            if not isinstance(body, dict):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            target = body.get("permission_tier")
+            transaction_id = body.get("transaction_id")
+            expected_revision = body.get("expected_revision")
+            if (
+                target not in NON_FULL_TIERS
+                or not isinstance(transaction_id, str)
+                or not transaction_id
+                or type(expected_revision) is not int
+            ):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            lifecycle_lock = _cli_runtime_lifecycle.lock_for(conversation_id)
+            if lifecycle_lock.locked():
+                return JSONResponse(
+                    status_code=409 if body_type == "permission_tier_prepare" else 503,
+                    content={"error": "session_busy"},
+                )
+            async with lifecycle_lock.exclusive():
+                state = permission_tiers.state(conversation_id)
+                committed = _permission_tier_commits.get(conversation_id)
+                if (
+                    body_type == "permission_tier_commit"
+                    and state is not None
+                    and state.status == "ready"
+                    and committed == (transaction_id, target, body.get("revision"))
+                    and state.revision == body.get("revision")
+                    and state.tier == target
+                ):
+                    return JSONResponse(
+                        content={
+                            "committed": True,
+                            "transaction_id": transaction_id,
+                            "permission_tier": target,
+                            "tier_revision": state.revision,
+                            "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
+                        }
+                    )
+                busy = (
+                    conversation_id in _active_turns
+                    or resource_registry.session_turn_is_active(conversation_id)
+                    or bool(_session_message_buffers.get(conversation_id))
+                    or pending_approvals.has_pending(conversation_id)
+                    or _native_turn_in_flight(conversation_id)
+                    or any(
+                        not task.done()
+                        for task, _cancel in _session_async_tasks.get(conversation_id, {}).values()
+                    )
+                    or not permission_tiers.idle(conversation_id)
+                )
+                if busy:
+                    return JSONResponse(
+                        status_code=409 if body_type == "permission_tier_prepare" else 503,
+                        content={"error": "session_busy"},
+                    )
+                if harness == "antigravity-native":
+                    from omnigent.harnesses.antigravity_native.bridge import _require_agy_idle
+
+                    try:
+                        await asyncio.to_thread(
+                            _require_agy_idle,
+                            permission_tiers.path(conversation_id).parent,
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        return JSONResponse(
+                            status_code=409 if body_type == "permission_tier_prepare" else 503,
+                            content={"error": "session_busy"},
+                        )
+                state = permission_tiers.state(conversation_id)
+                if state is None or state.revision != expected_revision:
+                    return JSONResponse(
+                        status_code=409, content={"error": "permission_tier_stale"}
+                    )
+                if body_type == "permission_tier_prepare":
+                    if state.status != "ready" or state.tier == "full":
+                        return JSONResponse(
+                            status_code=409, content={"error": "permission_tier_stale"}
+                        )
+                    try:
+                        permission_tiers.prepare(
+                            conversation_id,
+                            expected_revision=expected_revision,
+                            transaction_id=transaction_id,
+                        )
+                        if harness == "antigravity-native":
+                            from omnigent.harnesses.antigravity_native.bridge import (
+                                AGY_SWITCH_STEP_TIMEOUT_S,
+                                switch_agy_permission_tier,
+                            )
+
+                            await asyncio.to_thread(
+                                switch_agy_permission_tier,
+                                permission_tiers.path(conversation_id).parent,
+                                tier=target,
+                                previous=state.tier,
+                                timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
+                            )
+                        else:
+                            from omnigent.harnesses.pi_native.bridge import (
+                                apply_pi_permission_tier,
+                            )
+
+                            if not await apply_pi_permission_tier(
+                                conversation_id,
+                                harness,
+                                target,
+                            ):
+                                raise RuntimeError("Pi tier switch was not acknowledged")
+                    except Exception as exc:  # noqa: BLE001 - unverified host state remains fenced
+                        with contextlib.suppress(OSError, ValueError):
+                            permission_tiers.force_block(conversation_id, transaction_id)
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "permission_tier_switch_failed",
+                                "detail": _client_safe_error_detail(
+                                    exc, context="permission tier switch"
+                                ),
+                            },
+                        )
+                    _permission_tier_targets[conversation_id] = (transaction_id, target)
+                    return JSONResponse(
+                        content={
+                            "prepared": True,
+                            "transaction_id": transaction_id,
+                            "permission_tier": target,
+                            "tier_revision": expected_revision,
+                            "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
+                        }
+                    )
+
+                if state.status != "switching" or state.transaction_id != transaction_id:
+                    return JSONResponse(
+                        status_code=409, content={"error": "permission_tier_stale"}
+                    )
+                prepared = _permission_tier_targets.get(conversation_id)
+                if prepared is None or prepared[0] != transaction_id:
+                    return JSONResponse(
+                        status_code=409, content={"error": "permission_tier_stale"}
+                    )
+                if body_type == "permission_tier_commit" and prepared[1] != target:
+                    return JSONResponse(
+                        status_code=409, content={"error": "permission_tier_stale"}
+                    )
+                if body_type == "permission_tier_rollback" and state.tier != target:
+                    return JSONResponse(
+                        status_code=409, content={"error": "permission_tier_stale"}
+                    )
+                snapshot = await _session_payload_for_host_spawn_check(
+                    server_client, conversation_id
+                )
+                labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
+                if not isinstance(labels, dict):
+                    return JSONResponse(
+                        status_code=503, content={"error": "server_state_unavailable"}
+                    )
+                try:
+                    server_state = read_permission_state(labels, harness=harness)
+                except (ValueError, TypeError):
+                    return JSONResponse(
+                        status_code=503, content={"error": "server_state_unavailable"}
+                    )
+                new_revision = body.get("revision")
+                if (
+                    type(new_revision) is not int
+                    or server_state.status != "ready"
+                    or server_state.revision != new_revision
+                    or server_state.tier != target
+                ):
+                    return JSONResponse(
+                        status_code=409, content={"error": "permission_tier_stale"}
+                    )
+                if body_type == "permission_tier_rollback":
+                    # A rollback reverses the prepared host transition before
+                    # lifting the switching fence.
+                    try:
+                        if harness == "antigravity-native":
+                            from omnigent.harnesses.antigravity_native.bridge import (
+                                AGY_SWITCH_STEP_TIMEOUT_S,
+                                switch_agy_permission_tier,
+                            )
+
+                            await asyncio.to_thread(
+                                switch_agy_permission_tier,
+                                permission_tiers.path(conversation_id).parent,
+                                tier=target,
+                                previous=prepared[1],
+                                timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
+                            )
+                        else:
+                            from omnigent.harnesses.pi_native.bridge import (
+                                apply_pi_permission_tier,
+                            )
+
+                            if not await apply_pi_permission_tier(
+                                conversation_id,
+                                harness,
+                                target,
+                            ):
+                                raise RuntimeError("Pi rollback was not acknowledged")
+                    except Exception:  # noqa: BLE001 - never lift an unverified rollback fence
+                        permission_tiers.force_block(conversation_id, transaction_id)
+                        return JSONResponse(
+                            status_code=503, content={"error": "rollback_unverified"}
+                        )
+                try:
+                    permission_tiers.settle(
+                        conversation_id,
+                        transaction_id=transaction_id,
+                        tier=target,
+                        revision=new_revision,
+                    )
+                    if harness == "antigravity-native":
+                        from omnigent.runner.native.orchestration import (
+                            _AGY_CONFIRMED_PERMISSION_TIERS,
+                        )
+
+                        bridge_dir = permission_tiers.path(conversation_id).parent
+                        _AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] = target
+                    _permission_tier_targets.pop(conversation_id, None)
+                    _permission_tier_commits[conversation_id] = (
+                        transaction_id,
+                        target,
+                        new_revision,
+                    )
+                except (OSError, ValueError) as exc:
+                    permission_tiers.force_block(conversation_id, transaction_id)
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "permission_tier_commit_failed",
+                            "detail": _client_safe_error_detail(
+                                exc, context="permission tier commit"
+                            ),
+                        },
+                    )
+                return JSONResponse(
+                    content={
+                        "committed": True,
+                        "transaction_id": transaction_id,
+                        "permission_tier": target,
+                        "tier_revision": new_revision,
+                        "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
+                    }
+                )
+
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
             if harness == "claude-sdk":
@@ -10797,6 +11310,7 @@ def create_runner_app(
         _session_spec_cache=_session_spec_cache,
         filesystem_registry=filesystem_registry,
         mcp_execution_registry=mcp_execution_registry,
+        permission_tiers=permission_tiers,
         mcp_manager=mcp_manager,
         process_manager=process_manager,
         resource_registry=resource_registry,
@@ -11461,8 +11975,14 @@ def create_runner_app_from_env() -> FastAPI:
         raise RuntimeError("RUNNER_SERVER_URL is required for the runner subprocess factory")
     from omnigent_client._http import is_loopback_url
 
+    from omnigent.server.permission_tiers import (
+        PERMISSION_PROTOCOL_HEADER,
+        PERMISSION_PROTOCOL_VERSION,
+    )
+
     server_client = httpx.AsyncClient(
         base_url=server_url,
+        headers={PERMISSION_PROTOCOL_HEADER: PERMISSION_PROTOCOL_VERSION},
         timeout=httpx.Timeout(5.0, read=None),
         # A proxy cannot reach a loopback server, so local targets bypass it.
         trust_env=not is_loopback_url(server_url),

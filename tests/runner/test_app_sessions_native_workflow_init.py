@@ -31,6 +31,7 @@ from omnigent.runner.app import (
     _session_labels_for_runner_spawn,
 )
 from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_env
+from omnigent.runner.permission_tiers import PermissionTierRuntime
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
@@ -49,6 +50,12 @@ from tests.runner.conftest import (
     _sse,
 )
 from tests.runner.helpers import NullServerClient
+
+
+def _stub_permission_start_for_routing_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep harness routing tests independent of the permission hook handshake."""
+    monkeypatch.setattr(PermissionTierRuntime, "fence_start", lambda *args: None)
+    monkeypatch.setattr(PermissionTierRuntime, "install", lambda *args: None)
 
 
 @pytest.mark.asyncio
@@ -551,6 +558,7 @@ async def test_create_session_resolves_agent_spec_for_kiro_and_goose(
         return object()
 
     monkeypatch.setattr(orch, auto_create_target, _fake_auto_create)
+    _stub_permission_start_for_routing_test(monkeypatch)
 
     spec = AgentSpec(
         spec_version=1,
@@ -2358,7 +2366,9 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
 
 
 @pytest.mark.asyncio
-async def test_create_session_spawns_the_snapshot_harness_override() -> None:
+async def test_create_session_spawns_the_snapshot_harness_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Session init must spawn the session's overridden harness, not the spec's.
 
     ``get_client`` entries are keyed by conversation, so resolving the spawn
@@ -2369,6 +2379,7 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
     spec's harness is a native one, init also launches its terminal on top of
     that spawn, leaving two live processes for the one session.
     """
+    _stub_permission_start_for_routing_test(monkeypatch)
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",
@@ -2413,7 +2424,66 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_turn_resolves_the_recorded_harness_override() -> None:
+async def test_permission_prepare_reports_locked_lifecycle_as_busy_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_permission_start_for_routing_test(monkeypatch)
+    spec = AgentSpec(
+        spec_version=1,
+        name="permission-lock-agent",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+    )
+    app, _pm = await _build_app_for_spec(spec)
+    session_id = "5b0c1f7a4d2e4c8fa1b3d6e9c0f2a4b6"
+    agent_id = "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "test",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "snapshot": {
+                "created_at": 1,
+                "updated_at": 1,
+                "harness_override": "pi",
+            },
+        },
+    }
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json=payload)
+        assert created.status_code == 201, created.text
+        async with app.state.cli_runtime_lifecycle.lock_for(session_id).shared():
+            prepared = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "permission_tier_prepare",
+                    "permission_tier": "ask",
+                    "expected_revision": 1,
+                    "transaction_id": "transaction-a",
+                },
+            )
+            uncertain = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "permission_tier_commit",
+                    "permission_tier": "ask",
+                    "expected_revision": 1,
+                    "revision": 2,
+                    "transaction_id": "transaction-a",
+                },
+            )
+    assert prepared.status_code == 409
+    assert prepared.json() == {"error": "session_busy"}
+    assert uncertain.status_code == 503
+    assert uncertain.json() == {"error": "session_busy"}
+
+
+@pytest.mark.asyncio
+async def test_message_turn_resolves_the_recorded_harness_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A turn whose body has no ``harness_override`` still runs the override.
 
     The native terminal forward carries the override as session state, not
@@ -2423,6 +2493,7 @@ async def test_message_turn_resolves_the_recorded_harness_override() -> None:
     evicted the override harness mid-session (the split-brain on the turn
     after the kickoff).
     """
+    _stub_permission_start_for_routing_test(monkeypatch)
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",

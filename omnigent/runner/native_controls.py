@@ -1605,98 +1605,11 @@ def build_native_controls(
         conv_id: str,
         mode: str | None,
     ) -> Response:
-        from omnigent.harnesses.antigravity_native.bridge import (
-            AGY_PERMISSION_TIERS,
-            AGY_SWITCH_STEP_TIMEOUT_S,
-            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-            AgyPermissionRollbackError,
-            bridge_dir_for_bridge_id,
-            resolve_agy_permission_tier,
-            switch_agy_permission_tier,
+        del conv_id, mode
+        return JSONResponse(
+            status_code=409,
+            content={"error": "permission_tier_protocol_required"},
         )
-        from omnigent.runner.native.orchestration import (
-            _AGY_CONFIRMED_PERMISSION_TIERS,
-            _session_payload_for_host_spawn_check,
-        )
-
-        if mode is None or mode not in AGY_PERMISSION_TIERS or mode == "full":
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "detail": "Skip permissions is create-only"
-                    if mode == "full"
-                    else "Invalid permission tier"
-                },
-            )
-        snapshot = await _session_payload_for_host_spawn_check(server_client, conv_id)
-        if snapshot is None:
-            return JSONResponse(
-                status_code=503, content={"detail": "Could not fetch Antigravity tier"}
-            )
-        labels = snapshot.get("labels")
-        labels = labels if isinstance(labels, dict) else {}
-        bridge_dir = bridge_dir_for_bridge_id(
-            labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
-        )
-        raw_args = snapshot.get("terminal_launch_args")
-        launch_args = raw_args if isinstance(raw_args, list) else []
-        previous = _AGY_CONFIRMED_PERMISSION_TIERS.get(
-            bridge_dir.resolve()
-        ) or resolve_agy_permission_tier(labels, launch_args)
-        try:
-            settled = await asyncio.to_thread(
-                switch_agy_permission_tier,
-                bridge_dir,
-                tier=mode,
-                previous=previous,
-                timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
-            )
-        except AgyPermissionRollbackError as exc:
-            try:
-                from omnigent.entities.session_resources import terminal_resource_id
-
-                # The failed undo already reasserted the deny-safe tier file;
-                # record it so every later turn re-asserts auto-strict until a
-                # real launch confirms the pane state again.
-                _AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] = "auto-strict"
-                await resource_registry.close_terminal(
-                    conv_id, terminal_resource_id("antigravity", "main")
-                )
-                await _ensure_native_terminal_for_turn(
-                    conv_id, "antigravity-native", lifecycle_locked=True
-                )
-            except Exception as relaunch:  # noqa: BLE001 - the unsafe pane must not be reported as recovered.
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "antigravity_native_permission_mode_failed",
-                        "detail": _client_safe_error_detail(
-                            RuntimeError(f"{exc}; cold resume failed: {relaunch}"),
-                            context="antigravity-native permission change",
-                        ),
-                    },
-                )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "antigravity_native_permission_mode_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="antigravity-native permission change"
-                    ),
-                },
-            )
-        except (RuntimeError, ValueError, OSError) as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "antigravity_native_permission_mode_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="antigravity-native permission change"
-                    ),
-                },
-            )
-        _AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] = settled
-        return JSONResponse(status_code=200, content={"permission_mode": settled})
 
     async def _handle_antigravity_native_model_change(
         conv_id: str,

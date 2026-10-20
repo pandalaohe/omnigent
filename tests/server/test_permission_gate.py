@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import httpx
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation
 from omnigent.permission_tiers import Verdict
 from omnigent.server import permission_gate as gate
@@ -178,6 +179,17 @@ async def test_approval_is_bound_and_consumed_once(store, arguments, monkeypatch
             assert cards[0]["elicitation_id"] == inspection.binding.approval_id()
             assert cards[0]["params"].phase == "permission_tier"
             assert requests[-1]["type"] == "permission_tier_authorize"
+            with workspace_scope(123):
+                other_workspace = await gate.authorize_permission_call(
+                    inspection,
+                    request=None,
+                    harness="pi",
+                    arguments=actual,
+                    conversation_store=store,
+                    runner_router=None,
+                )
+            assert other_workspace.action == Verdict.ALLOW
+            assert len(cards) == 2
         else:
             assert len(requests) == 1
 

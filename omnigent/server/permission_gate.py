@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from omnigent.db.workspace_cache import WorkspaceScopedSet
 from omnigent.permission_tiers import TierDecision, Verdict
 from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_VALUE,
@@ -125,8 +126,8 @@ async def inspect_permission_call(
         return _denied(f"Permission check unavailable: {type(exc).__name__}")
 
 
-_active_approvals: set[str] = set()
-_consumed_approvals: set[str] = set()
+_active_approvals: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+_consumed_approvals: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
 async def finish_permission_call(

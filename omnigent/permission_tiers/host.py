@@ -116,6 +116,20 @@ def local_host_context(
     )
 
 
+def trusted_permission_control_paths(
+    state_path: Path,
+    *,
+    installed_paths: tuple[Path, ...] = (),
+) -> tuple[str, ...]:
+    """Protect the active bridge and installed policy from tool-side edits."""
+    paths = (
+        state_path.parent,
+        Path(__file__).resolve().parent,
+        *installed_paths,
+    )
+    return tuple(dict.fromkeys(str(path) for path in paths))
+
+
 def evaluate_host_tool(
     state: HostPermissionState,
     name: str,

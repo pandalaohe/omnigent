@@ -44,7 +44,9 @@ _SESSION_ID = "b7e4a955272645eca39ed2d1064af4c9"
 def approval_state(db_uri: str) -> tuple[SqlAlchemyConversationStore, Conversation, PolicyEngine]:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(
-        conversation_id=_SESSION_ID, agent_id="d8bcd98f49134936af9546041ce5a555"
+        conversation_id=_SESSION_ID,
+        agent_id="d8bcd98f49134936af9546041ce5a555",
+        harness_override="claude-sdk",
     )
     engine = PolicyEngine(
         policies=[],
@@ -69,6 +71,7 @@ def _make_conversation() -> Conversation:
         updated_at=0,
         root_conversation_id=_SESSION_ID,
         agent_id="ag_test",
+        harness_override="claude-sdk",
     )
 
 
