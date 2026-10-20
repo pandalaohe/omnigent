@@ -16,12 +16,13 @@ import click
 import httpx
 import yaml
 
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import PI_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
 from omnigent.host.daemon_launch import (
     error_text,
@@ -195,10 +196,11 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
 
     try:
         result = subprocess.run(
-            [executable, "--version"],
+            [*pi_cli_argv(executable), "--version"],
             capture_output=True,
             text=True,
             timeout=5.0,
+            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if IS_WINDOWS else 0,
         )
     except Exception:  # noqa: BLE001
         return None

@@ -734,6 +734,28 @@ def test_resolve_cli_binary_no_env_var(monkeypatch):
     assert _platform.resolve_cli_binary("tool") == "/usr/bin/tool"
 
 
+def test_cli_fallback_dirs_includes_windows_npm(monkeypatch, tmp_path):
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "Program Files"))
+    dirs = _platform._cli_fallback_dirs()
+    assert dirs[:2] == (tmp_path / "Roaming" / "npm", tmp_path / "Program Files" / "nodejs")
+
+
+def test_resolve_cli_binary_windows_prefers_cmd_over_posix_shim(monkeypatch, tmp_path):
+    posix_shim = tmp_path / "pi"
+    posix_shim.write_text("#!/bin/sh\n")
+    posix_shim.chmod(0o755)
+    cmd_shim = tmp_path / "pi.cmd"
+    cmd_shim.write_text("@echo off\n")
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path,))
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: str(cmd_shim) if name == str(posix_shim) else None
+    )
+    assert _platform.resolve_cli_binary("pi", which=lambda _: None) == str(cmd_shim)
+
+
 def test_cli_fallback_dirs_includes_nvm_version_bins(monkeypatch, tmp_path):
     """nvm keeps global bins under ~/.nvm/versions/node/<ver>/bin; the ladder
     must include those (newest first) since that's the reported nvm case.
