@@ -434,6 +434,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.goal_state",
         "omnigent.child_idle",
         "omnigent.child_idle_batch",
+        "omnigent.child_idle_resume",
         "omnigent.last_provider_usage_limits",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         ARTIFACT_LINK_KEY_LABEL,

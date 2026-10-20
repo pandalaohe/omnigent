@@ -117,6 +117,7 @@ from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
     pending_inputs,
+    turn_activity,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
@@ -11380,6 +11381,7 @@ async def _relay_runner_stream_once(
         # mid-turn, or a rebind cancellation) can't strand it forever.
         # Normal turn-ends already clear via record_publish.
         inflight_text.discard(session_id)
+        turn_activity.discard(session_id)
         # The intentional-stop marker is consumed by the disconnect handler
         # above on the expected path; discard it here too so a relay that
         # exits some other way (clean [DONE], rebind cancellation) can't

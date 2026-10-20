@@ -1,8 +1,9 @@
-"""Threshold-based child reminders, batched per mother without waking children."""
+"""Threshold-based child reminders, batched per mother with opt-in recovery."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import secrets
@@ -13,8 +14,11 @@ from typing import Any, Literal
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
+from omnigent.runner.launch_failure import classify_native_turn_error
+from omnigent.runtime import turn_activity
 from omnigent.runtime.pending_elicitations import snapshot_for
 from omnigent.server.routes._sessions.helpers import (
+    SessionLiveness,
     _child_summary_identity,
     _effective_placement,
     _inherited_placement,
@@ -23,7 +27,11 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
-from omnigent.server.user_preferences_store import ChildIdleSettings, read_child_idle_settings
+from omnigent.server.user_preferences_store import (
+    ChildFreezeSettings,
+    ChildIdleSettings,
+    read_child_idle_settings,
+)
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
@@ -31,10 +39,36 @@ from omnigent.util.session_lifecycle import is_session_closed, title_without_clo
 _logger = logging.getLogger(__name__)
 CHILD_IDLE_LABEL = "omnigent.child_idle"
 CHILD_IDLE_BATCH_LABEL = "omnigent.child_idle_batch"
+CHILD_RESUME_LABEL = "omnigent.child_idle_resume"
 _BATCH_LEASE_S = 300
 _POST_TIMEOUT_S = 120
 NoticeOutcome = Literal["accepted", "deferred", "rejected", "uncertain"]
 _MIRRORS = {"claude-code-native-ui-subagent", "codex-native-ui-subagent"}
+
+
+def transient_child_error(conv: Conversation) -> bool:
+    error_runner = conv.labels.get("omnigent.last_task_error_runner_id")
+    if error_runner and error_runner != conv.runner_id:
+        return False
+    code = conv.labels.get("omnigent.last_task_error_code", "").lower()
+    message = conv.labels.get("omnigent.last_task_error_message", "").lower()
+    classified = classify_native_turn_error(code or "native_turn_error", message)
+    return classified in {
+        "model_at_capacity",
+        "overloaded",
+        "approval_service_timeout",
+        "transient_upstream_error",
+        "rate_limit_exceeded",
+    } or any(
+        phrase in message
+        for phrase in (
+            "model is at capacity",
+            "model at capacity",
+            "approval service timeout",
+            "approval-service timeout",
+            "approval service timed out",
+        )
+    )
 
 
 def batch_claim_valid(parent: Conversation, claim: str, now: int) -> bool:
@@ -70,6 +104,9 @@ class _IdleState:
     since: int
     queued: int = 0
     attempted: int = 0
+    signal: str = "idle"
+    activity: str = ""
+    checked: int = 0
 
     @classmethod
     def parse(cls, raw: str | None) -> _IdleState | None:
@@ -82,13 +119,28 @@ class _IdleState:
             turn = data.get("t")
             if turn is not None and not isinstance(turn, str):
                 return None
-            return cls(turn, data["i"], data["q"], data["n"])
+            signal, activity, checked = data.get("s", "idle"), data.get("a", ""), data.get("c", 0)
+            if (
+                not isinstance(signal, str)
+                or not isinstance(activity, str)
+                or type(checked) is not int
+            ):
+                return None
+            return cls(turn, data["i"], data["q"], data["n"], signal, activity, checked)
         except (ValueError, TypeError):
             return None
 
     def label(self) -> str:
         return json.dumps(
-            {"t": self.turn, "i": self.since, "q": self.queued, "n": self.attempted},
+            {
+                "t": self.turn,
+                "i": self.since,
+                "q": self.queued,
+                "n": self.attempted,
+                "s": self.signal,
+                "a": self.activity,
+                "c": self.checked,
+            },
             separators=(",", ":"),
         )
 
@@ -103,6 +155,8 @@ class ChildIdleSweeper:
         permission_store: PermissionStore | None,
         owns_parent: Callable[[Conversation], bool],
         post_notice: Callable[[str, str, str], Awaitable[NoticeOutcome]],
+        liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+        resume_child: Callable[[Conversation, str], Awaitable[NoticeOutcome]] | None = None,
         clock: Callable[[], int] = now_epoch,
         interval: float = 60,
     ) -> None:
@@ -110,6 +164,8 @@ class ChildIdleSweeper:
         self._permissions = permission_store
         self._owns_parent = owns_parent
         self._post_notice = post_notice
+        self._liveness_lookup = liveness_lookup
+        self._resume_child = resume_child
         self._clock = clock
         self._interval = interval
         self._app: Any = None
@@ -167,6 +223,42 @@ class ChildIdleSweeper:
             current = self._store.get_conversation(current.parent_conversation_id)
         return None
 
+    def _running_has_open_tool(self, conv: Conversation) -> bool:
+        live = turn_activity.snapshot_for(conv.id)
+        return live is None or not live.active or bool(live.tools)
+
+    def _signal(self, conv: Conversation, settings: ChildIdleSettings) -> str | None:
+        status = _session_status_from_cache(conv.id, conv.live_status)
+        row = settings.agents.get(conv.agent_id or "", ChildFreezeSettings())
+        if row.enabled:
+            try:
+                live = (
+                    self._liveness_lookup([conv.id]).get(conv.id)
+                    if self._liveness_lookup
+                    else None
+                )
+            except Exception:  # noqa: BLE001 — unknown reachability suppresses this observation
+                _logger.warning("Child runner liveness unavailable for %s", conv.id, exc_info=True)
+                return None
+            if live is not None and live.runner_online is False:
+                return "runner_offline"
+            settled = conv.live_status in ("idle", "failed") and status in ("idle", "failed")
+            if settled and transient_child_error(conv):
+                return "transient_error"
+            if (
+                conv.live_status == status == "running"
+                and live is not None
+                and live.runner_online is True
+            ):
+                return "tool_running" if self._running_has_open_tool(conv) else "running_quiet"
+        if (
+            settings.enabled
+            and conv.live_status in ("idle", "failed")
+            and status in ("idle", "failed")
+        ):
+            return "idle"
+        return None
+
     def _observe(
         self, conv: Conversation, settings: ChildIdleSettings, now: int
     ) -> _IdleState | None:
@@ -176,34 +268,63 @@ class ChildIdleSweeper:
         conv = fresh
         raw = conv.labels.get(CHILD_IDLE_LABEL)
         state = _IdleState.parse(raw)
-        status = _session_status_from_cache(conv.id, conv.live_status)
+        row = settings.agents.get(conv.agent_id or "", ChildFreezeSettings())
         eligible = (
-            settings.enabled
+            (settings.enabled or row.enabled)
             and not conv.archived
             and conv.labels.get("omnigent.wrapper") not in _MIRRORS
             and not is_session_closed(conv.labels, conv.title)
-            and conv.live_status in ("idle", "failed")
-            and status in ("idle", "failed")
             and not has_pending_card(conv)
         )
+        live = turn_activity.snapshot_for(conv.id)
+        turn = conv.labels.get(RUNNING_SINCE_LABEL_KEY)
+        activity = hashlib.sha256(
+            f"{conv.updated_at}:{conv.live_status}:"
+            f"{_session_status_from_cache(conv.id, conv.live_status)}:"
+            f"{conv.labels.get('omnigent.last_task_error_code', '')}:"
+            f"{conv.labels.get('omnigent.last_task_error_message', '')}:"
+            f"{live.updated if live and live.active else ''}".encode()
+        ).hexdigest()[:16]
+        if (
+            eligible
+            and row.enabled
+            and state is not None
+            and state.signal != "idle"
+            and state.turn == turn
+            and state.activity == activity
+            and 0 <= now - state.checked < row.check_interval_s
+            and not state.queued
+        ):
+            return None
+        signal = self._signal(conv, settings) if eligible else None
+        eligible = eligible and signal is not None
         if not eligible:
             if raw is not None:
                 self._store.compare_and_set_label(conv.id, CHILD_IDLE_LABEL, raw, None)
             return None
-        turn = conv.labels.get(RUNNING_SINCE_LABEL_KEY)
-        if state is None or state.turn != turn or state.since > now:
-            state = _IdleState(turn, now)
+        if signal == "idle":
+            activity = ""
+        if (
+            state is None
+            or state.turn != turn
+            or state.since > now
+            or state.signal != signal
+            or state.activity != activity
+        ):
+            state = _IdleState(turn, now, signal=signal or "idle", activity=activity)
+        state.checked = now
+        threshold = settings.idle_threshold_s if signal == "idle" else row.freeze_threshold_s
         if state.attempted:
             due = settings.repeat_s > 0 and now >= state.attempted + settings.repeat_s
         else:
-            due = now >= state.since + settings.idle_threshold_s
+            due = now >= state.since + threshold
+        if signal == "tool_running":
+            due = False
         if not due:
             state.queued = 0
         if due and not state.queued:
             state.queued = (
-                state.attempted + settings.repeat_s
-                if state.attempted
-                else state.since + settings.idle_threshold_s
+                state.attempted + settings.repeat_s if state.attempted else state.since + threshold
             )
         label = state.label()
         if raw is None:
@@ -234,7 +355,12 @@ class ChildIdleSweeper:
                             read_child_idle_settings, prefs, owner
                         )
                     settings = settings_by_owner[owner]
-                    if settings.enabled or CHILD_IDLE_LABEL in child.labels:
+                    if (
+                        settings.enabled
+                        or any(row.enabled for row in settings.agents.values())
+                        or CHILD_IDLE_LABEL in child.labels
+                        or CHILD_RESUME_LABEL in child.labels
+                    ):
                         groups.setdefault(parent.id, []).append(child)
                         settings_by_parent[parent.id] = settings
                 except Exception:
@@ -296,6 +422,27 @@ class ChildIdleSweeper:
                 continue
             state = await asyncio.to_thread(self._observe, fresh, settings, now)
             if state is not None and state.queued:
+                row = settings.agents.get(fresh.agent_id or "", ChildFreezeSettings())
+                if (
+                    state.signal == "transient_error"
+                    and row.resume_once
+                    and self._resume_child is not None
+                    and CHILD_RESUME_LABEL not in fresh.labels
+                ):
+                    # One automatic attempt per child, across turns and replicas.
+                    reservation = secrets.token_hex(8)
+                    stored = await asyncio.to_thread(
+                        self._store.insert_label_if_absent,
+                        fresh.id,
+                        CHILD_RESUME_LABEL,
+                        reservation,
+                    )
+                    if stored == reservation:
+                        await asyncio.wait_for(
+                            self._resume_child(fresh, claim), timeout=_POST_TIMEOUT_S
+                        )
+                        # Re-observe next tick: the post may already have started a turn.
+                        continue
                 current.append((fresh, state))
         if not current:
             return
@@ -319,6 +466,9 @@ class ChildIdleSweeper:
                     "directory": placement.cwd,
                     "status": _session_status_from_cache(child.id, child.live_status),
                     "idle_minutes": max(0, now - state.since) // 60,
+                    "signal": state.signal,
+                    "signal_minutes": max(0, now - state.since) // 60,
+                    "resume_attempted": CHILD_RESUME_LABEL in child.labels,
                     "last_assistant_reply_tail": tail,
                 },
                 ensure_ascii=False,

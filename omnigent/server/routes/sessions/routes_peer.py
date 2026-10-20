@@ -2150,6 +2150,7 @@ def register_peer_routes(
         NoticeOutcome,
         batch_claim_valid,
         has_pending_card,
+        transient_child_error,
     )
 
     def _owns_idle_parent(conv: Conversation) -> bool:
@@ -2204,11 +2205,92 @@ def register_peer_routes(
             return "rejected"
         return "accepted"
 
+    async def _resume_frozen_child(child: Conversation, claim: str) -> NoticeOutcome:
+        from omnigent.server.peer_sweeper import PeerSweeper
+        from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.user_preferences_store import read_child_idle_settings
+
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, child.id)
+        parent = (
+            await asyncio.to_thread(
+                conversation_store.get_conversation, child.parent_conversation_id
+            )
+            if child.parent_conversation_id
+            else None
+        )
+        live = await asyncio.to_thread(_liveness, child.id)
+        lineage_parent = await asyncio.to_thread(child_idle._parent, fresh) if fresh else None
+        owner = await asyncio.to_thread(
+            collab_owner_for, child, conversation_store, permission_store
+        )
+        settings = await asyncio.to_thread(
+            read_child_idle_settings,
+            getattr(child_idle._app.state, "user_preferences_store", None),
+            owner,
+        )
+        row = settings.agents.get(child.agent_id or "")
+        if (
+            fresh is None
+            or parent is None
+            or lineage_parent is None
+            or row is None
+            or not row.enabled
+            or not row.resume_once
+            or not batch_claim_valid(parent, claim, int(time.time()))
+            or not _owns_idle_parent(parent)
+            or fresh.archived
+            or is_session_closed(fresh.labels, fresh.title)
+            or fresh.parent_conversation_id != child.parent_conversation_id
+            or fresh.runner_id != child.runner_id
+            or fresh.agent_id != child.agent_id
+            or fresh.archive_revision != child.archive_revision
+            or fresh.labels.get("omnigent.running_since")
+            != child.labels.get("omnigent.running_since")
+            or fresh.live_status not in ("idle", "failed")
+            or _session_status_from_cache(fresh.id, fresh.live_status) not in ("idle", "failed")
+            or has_pending_card(fresh)
+            or not transient_child_error(fresh)
+            or live is None
+            or live.runner_online is not True
+        ):
+            return "deferred"
+        try:
+            result = await post_event_impl(
+                PeerSweeper._synthetic_request(child.id, child_idle._app),
+                child.id,
+                SessionEventInput(
+                    type="message",
+                    data={
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "[System: child check-in] Resume the work interrupted "
+                                    "by the temporary service error."
+                                ),
+                            }
+                        ],
+                    },
+                ),
+                acting_user_id=effective_owner_id(fresh, conversation_store, permission_store),
+            )
+        except Exception:
+            _logger.warning("Child resume acceptance uncertain", exc_info=True)
+            return "uncertain"
+        return (
+            "rejected"
+            if isinstance(result, dict) and result.get("forwarded") is False
+            else "accepted"
+        )
+
     child_idle = ChildIdleSweeper(
         conversation_store=conversation_store,
         permission_store=permission_store,
         owns_parent=_owns_idle_parent,
         post_notice=_post_idle_notice,
+        liveness_lookup=liveness_lookup,
+        resume_child=_resume_frozen_child,
     )
     if app_state is not None:
         app_state.peer_sweeper = sweeper
