@@ -3604,7 +3604,9 @@ async def test_pi_effort_change_forwards_idle_settings(monkeypatch, effort) -> N
 
     hc = _ScriptedHarnessClient([])
     pm = _FakeProcessManager(hc)
-    forwarded = AsyncMock(return_value=httpx.Response(200, json={"applied": True}))
+    forwarded = AsyncMock(
+        return_value=httpx.Response(200, json={"applied": True, "installed": True})
+    )
     monkeypatch.setattr(hc, "post", forwarded)
 
     async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -3614,11 +3616,12 @@ async def test_pi_effort_change_forwards_idle_settings(monkeypatch, effort) -> N
         process_manager=pm, spec_resolver=resolve, server_client=NullServerClient()
     )
     sid = "pi-effort-control"
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi") as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": sid, "agent_id": "test-agent"}
         )
         assert created.status_code == 201, created.text
+        forwarded.reset_mock()
         response = await client.post(
             f"/v1/sessions/{sid}/events", json={"type": "effort_change", "effort": effort}
         )
