@@ -860,8 +860,11 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
-        project,
-        expect.any(Array),
+        expect.objectContaining({
+          project,
+          composerParts: expect.any(Array),
+          initialInputAccepted: false,
+        }),
       ),
     );
   });
@@ -1009,8 +1012,11 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
-        undefined,
-        expect.any(Array),
+        expect.objectContaining({
+          project: undefined,
+          composerParts: expect.any(Array),
+          initialInputAccepted: false,
+        }),
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -1056,8 +1062,11 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
-        undefined,
-        expect.any(Array),
+        expect.objectContaining({
+          project: undefined,
+          composerParts: expect.any(Array),
+          initialInputAccepted: false,
+        }),
       ),
     );
   });
@@ -1267,8 +1276,11 @@ describe("NewChatLandingScreen create flow", () => {
         null,
         navigateMock,
         expect.any(Function),
-        undefined,
-        expect.any(Array),
+        expect.objectContaining({
+          project: undefined,
+          composerParts: expect.any(Array),
+          initialInputAccepted: false,
+        }),
       ),
     );
 

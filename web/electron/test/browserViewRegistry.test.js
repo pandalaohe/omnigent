@@ -12,7 +12,7 @@
 const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
 // Private IPv4 fixtures are built from octets so no LAN address literal enters the source.
@@ -394,12 +394,14 @@ function makeEventCapturingRegistry(extra = {}) {
   let copyCalls = 0; // webContents.copy() invocations
   let handlers; // { [event]: fn } for the single created view
   let windowOpenHandler;
+  let nextWebContentsId = 1;
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: () => {
       handlers = {};
       return {
         setBounds() {},
         webContents: {
+          id: nextWebContentsId++,
           loadURL(url) {
             loaded.push(url);
           },
@@ -655,6 +657,178 @@ describe("browserViewRegistry — per-server agent allowlist", () => {
       agentContext: {},
     });
     assert.equal(agent.ok, false, "a non-array allowlist must not open the policy");
+  });
+});
+
+// DNS and proxy stubs for the network-layer guard; lookups record their
+// partition argument.
+function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
+  const lookups = [];
+  const dnsTable = {
+    "lvh.me": ["127.0.0.1"],
+    "rebind.example": ["93.184.215.14"],
+    "example.com": ["93.184.215.14"],
+    "cdn.example.net": ["93.184.215.15"],
+    "proxy.corp": ["10.0.0.2"],
+  };
+  const ctx = makeEventCapturingRegistry({
+    partitionScope: "w-test",
+    resolveHost: async (hostname, partition) => {
+      lookups.push({ hostname, partition });
+      return dnsTable[hostname] ?? [];
+    },
+    resolveProxy: async () => proxy,
+    ...extra,
+  });
+  const idOf = (viewId) => ctx.registry.get(viewId).view.webContents.id;
+  return { ...ctx, lookups, idOf };
+}
+
+describe("browserViewRegistry — network-layer agent guard (DNS + connected address)", () => {
+  for (const once of [false, true]) {
+    it(`keeps a ${once ? "once" : "configured"} grant through DNS and response guards`, async () => {
+      const grant = "lvh.me:8899";
+      const context = {
+        serverOrigin: "https://server.example",
+        ...(once ? { allowOnce: [grant] } : {}),
+      };
+      const { registry, idOf } = makeNetworkGuardRegistry({
+        getAgentAllowlist: () => (once ? [] : [grant]),
+      });
+      const url = "http://lvh.me:8899/";
+      assert.equal((await registry.checkAgentNavigation("conv_1", url, context)).ok, true);
+      registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: context });
+      const webContentsId = idOf("conv_1");
+      assert.equal(await registry.shouldCancelAgentRequest({ webContentsId, url }), false);
+      assert.equal(
+        await registry.shouldCancelAgentResponse({ webContentsId, url, ip: "127.0.0.1" }),
+        false,
+      );
+      assert.equal(
+        await registry.shouldCancelAgentResponse({ webContentsId, url, ip: "169.254.169.254" }),
+        true,
+      );
+    });
+  }
+
+  it("refuses an agent first hop to a name that resolves to loopback", async () => {
+    const { registry, lookups } = makeNetworkGuardRegistry();
+    const verdict = await registry.checkAgentNavigation("conv_1", "http://lvh.me:8899/", null);
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.error, /does not resolve to a public address/);
+    assert.deepEqual(lookups, [
+      { hostname: "lvh.me", partition: agentPartition("w-test", "conv_1") },
+    ]);
+    assert.equal(registry.has("conv_1"), false, "the check creates no view");
+  });
+
+  it("cancels an agent-locked redirect or frame request to a loopback alias", async () => {
+    const { registry, sent, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    const webContentsId = idOf("conv_1");
+    assert.equal(
+      await registry.shouldCancelAgentRequest({ webContentsId, url: "https://example.com/" }),
+      false,
+    );
+    assert.equal(
+      await registry.shouldCancelAgentRequest({ webContentsId, url: "https://cdn.example.net/x" }),
+      false,
+    );
+    assert.equal(
+      await registry.shouldCancelAgentRequest({ webContentsId, url: "http://lvh.me:8899/" }),
+      true,
+    );
+    const blocked = sent.filter((s) => s.channel === "browser-nav-blocked");
+    assert.equal(blocked.length, 1);
+    assert.equal(blocked[0].payload.conversationId, "conv_1");
+  });
+
+  it("cancels an agent response whose connected address is internal or missing", async () => {
+    const { registry, sent, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "http://rebind.example/", undefined, { agent: true });
+    const response = (connectedAddress) =>
+      registry.shouldCancelAgentResponse({
+        webContentsId: idOf("conv_1"),
+        url: "http://rebind.example/",
+        ip: connectedAddress,
+      });
+    // A DNS answer that changed to loopback after the request check is still
+    // refused, as is a response with no connected address to judge.
+    const cancels = await Promise.all(["93.184.215.14", "127.0.0.1", undefined].map(response));
+    assert.deepEqual(cancels, [false, true, true]);
+    assert.equal(sent.filter((s) => s.channel === "browser-nav-blocked").length, 2);
+  });
+
+  it("exempts an internal connected address only when it is the configured proxy's IP", async () => {
+    const { registry, idOf } = makeNetworkGuardRegistry({ proxy: "PROXY proxy.corp:3128; DIRECT" });
+    registry.openOrNavigate("conv_1", "http://rebind.example/", undefined, { agent: true });
+    const response = (connectedAddress) =>
+      registry.shouldCancelAgentResponse({
+        webContentsId: idOf("conv_1"),
+        url: "http://rebind.example/",
+        ip: connectedAddress,
+      });
+    // The endpoint metadata cannot distinguish this direct connection from the configured proxy.
+    assert.deepEqual(await Promise.all(["10.0.0.2", "127.0.0.1"].map(response)), [false, true]);
+  });
+
+  it("forces agent-locked document requests past the HTTP cache", () => {
+    const { registry, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    registry.openOrNavigate("browser-tab:conv_1:t1", "https://example.com/");
+    const requestHeaders = { Accept: "text/html", "cache-control": "max-age=0" };
+    const agentHeaders = (headers) =>
+      registry.agentRequestHeaders({ webContentsId: idOf("conv_1"), requestHeaders: headers })
+        .requestHeaders;
+    // Existing directives are kept; no-cache is added once, matched case-insensitively.
+    assert.deepEqual(agentHeaders(requestHeaders), {
+      Accept: "text/html",
+      "Cache-Control": "max-age=0, no-cache",
+    });
+    assert.deepEqual(agentHeaders({ "Cache-Control": "no-store" }), {
+      "Cache-Control": "no-store, no-cache",
+    });
+    assert.deepEqual(agentHeaders({ "cache-control": "No-Cache, no-store" }), {
+      "Cache-Control": "No-Cache, no-store",
+    });
+    assert.deepEqual(
+      registry.agentRequestHeaders({
+        webContentsId: idOf("browser-tab:conv_1:t1"),
+        requestHeaders,
+      }),
+      {},
+      "the user's own tab keeps normal caching",
+    );
+  });
+
+  it("leaves user-driven and unattributed requests alone without resolving", async () => {
+    const { registry, lookups, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "http://intranet.example/", undefined, { force: true });
+    const webContentsId = idOf("conv_1");
+    const request = { webContentsId, url: "http://lvh.me:8899/", ip: "127.0.0.1" };
+    assert.equal(await registry.shouldCancelAgentRequest(request), false);
+    assert.equal(await registry.shouldCancelAgentResponse(request), false);
+    const stray = { ...request, webContentsId: 999 };
+    assert.equal(await registry.shouldCancelAgentRequest(stray), false);
+    assert.deepEqual(lookups, []);
+  });
+
+  it("keeps the Arca loopback exception for exact hosts but not DNS aliases", async () => {
+    const context = { sourceHostId: "arca-host" };
+    const { registry, idOf } = makeNetworkGuardRegistry({
+      isArcaAgentContext: (ctx) => ctx === context,
+    });
+    registry.openOrNavigate("arca", "http://localhost:5173/", undefined, {
+      agent: true,
+      agentContext: context,
+    });
+    const webContentsId = idOf("arca");
+    const localhost = { webContentsId, url: "http://localhost:5173/", ip: "127.0.0.1" };
+    assert.equal(await registry.shouldCancelAgentRequest(localhost), false);
+    assert.equal(await registry.shouldCancelAgentResponse(localhost), false);
+    const alias = { webContentsId, url: "http://lvh.me:5173/", ip: "127.0.0.1" };
+    assert.equal(await registry.shouldCancelAgentRequest(alias), true);
+    assert.equal(await registry.shouldCancelAgentResponse(alias), true);
   });
 });
 

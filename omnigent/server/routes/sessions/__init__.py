@@ -842,6 +842,8 @@ def create_sessions_router(
     app_state: Any | None = None,
     user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
     register_runner_ingest: Callable[..., None] | None = None,
+    register_startup_dispatch: Callable[..., None] | None = None,
+    register_initial_file_upload: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -995,6 +997,7 @@ def create_sessions_router(
         permission_store=permission_store,
         host_registry=host_registry,
         comment_store=comment_store,
+        register_initial_file_upload=register_initial_file_upload,
     )
 
     register_browser_routes(
@@ -1035,6 +1038,7 @@ def create_sessions_router(
         project_store=project_store,
         app_state=app_state,
         register_runner_ingest=register_runner_ingest,
+        register_startup_dispatch=register_startup_dispatch,
     )
 
     register_permissions_routes(

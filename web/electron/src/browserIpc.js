@@ -323,6 +323,9 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
+    const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
+    const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
+    const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
     const agent = true;
     // Renderer flags do not establish user intent.
     // The first-party renderer supplies the source-session host; main owns
@@ -359,7 +362,20 @@ function registerBrowserIpc({
       };
     };
 
-    let r = activeRegistry.openOrNavigate(conversationId, url, bounds, options);
+    const navigate = async (registry, context = agentContext) => {
+      if (url) {
+        const verdict = await registry.checkAgentNavigation(conversationId, url, context);
+        if (!isCurrent()) return cancelled;
+        if (!verdict.ok) return verdict;
+      }
+      return registry.openOrNavigate(conversationId, url, bounds, {
+        ...options,
+        agentContext: context,
+      });
+    };
+    let r = await navigate(activeRegistry);
+    if (!isCurrent()) return cancelled;
+
     // A promptable private-address refusal goes straight to the permission
     // dialog; Arca recovery applies only to other loopback denials.
     if (!r.ok && agent && !r.grant) {
@@ -377,16 +393,19 @@ function registerBrowserIpc({
       }
       if (recovered) {
         const refreshed = gateRegistry(event);
-        if (!refreshed.error) {
+        if (refreshed.error || refreshed.registry !== activeRegistry || !isCurrent())
+          return cancelled;
+        if (!refreshed.error && refreshed.registry === activeRegistry && isCurrent()) {
           activeRegistry = refreshed.registry;
           agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
           options.agentContext = agentContext;
-          r = activeRegistry.openOrNavigate(conversationId, url, bounds, options);
+          r = await navigate(activeRegistry);
         }
       }
     }
     // Only an internal-class refusal on an agent call is promptable; every
     // other outcome returns synchronously, exactly as before.
+    if (!isCurrent()) return cancelled;
     if (r.ok || !agent || !r.grant) return finish(r);
     const grant = r.grant;
     const pending = pendingFor(activeRegistry, conversationId);
@@ -395,7 +414,7 @@ function registerBrowserIpc({
     return (async () => {
       try {
         const choice = await confirmAgentNavigation(event, { url, grant });
-        if (request.cancelled) {
+        if (request.cancelled || !isCurrent()) {
           return finish({
             ok: false,
             error: `${r.error} Browser tab closed before the answer; navigation cancelled.`,
@@ -418,13 +437,10 @@ function registerBrowserIpc({
           }
           if (choice === "always") {
             // Main persisted the grant, so the injected allowlist now has it.
-            return finish(regate.registry.openOrNavigate(conversationId, url, bounds, options));
+            return finish(await navigate(regate.registry));
           }
           return finish(
-            regate.registry.openOrNavigate(conversationId, url, bounds, {
-              ...options,
-              agentContext: { ...(agentContext ?? {}), allowOnce: [grant] },
-            }),
+            await navigate(regate.registry, { ...(agentContext ?? {}), allowOnce: [grant] }),
           );
         }
         return finish({ ok: false, error: `${r.error} The user did not allow this address.` });

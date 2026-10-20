@@ -2,23 +2,27 @@
 // stays permissive — it's a user gesture). An unguarded model-issued loadURL
 // could point the view at file:// / cloud-metadata / loopback / private hosts
 // and read the bytes back via screenshot (SSRF + local-file read + exfil).
-// `opts.allowlist` can open named internal hosts/CIDRs, but link-local,
-// metadata and unspecified addresses stay refused even when listed.
-// Runs in the main process (gate holds regardless of caller); pure + dep-free
-// so `node --test` can exercise it without Electron.
+// Runs in the main process (gate holds regardless of caller); Electron-free,
+// with DNS injectable, so `node --test` can exercise it without Electron.
 
 "use strict";
+
+const dns = require("node:dns");
 
 // Schemes the agent may navigate to; everything else (file:, chrome:, data:,
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
+// The exact loopback hosts an eligible Arca agent context may open. Other
+// loopback spellings and DNS names that resolve to loopback stay blocked.
 // Allowlist entry shapes. Both are validated before any URL parsing so
 // credentials, paths, schemes and CIDR ports can never widen the policy.
 // Host: a bracketed IPv6 literal or a name/WHATWG-IPv4 form, optional port.
 const ALLOWLIST_HOST_ENTRY = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(\d{1,5}))?$/;
 // CIDR: the base may only hold characters a WHATWG IPv4 form can contain.
 const ALLOWLIST_IPV4_CIDR = /^([0-9A-Fa-fxX.]+)\/(\d+)$/;
+
+const ARCA_LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * Parse a dotted-quad IPv4 host into four octets, or null if not IPv4. The
@@ -42,50 +46,134 @@ function parseIpv4(host) {
 }
 
 /**
- * True if the octets are loopback / link-local / RFC-1918 private — the ranges
- * an SSRF payload targets (metadata 169.254.169.254, loopback, internal hosts).
+ * True if the octets are outside public unicast space — the ranges an SSRF
+ * payload targets (metadata 169.254.169.254, loopback, internal hosts). Mirrors
+ * `omnigent/util/ssrf.py`, but deliberately stricter on blocks that are never
+ * web destinations: all of 192.0.0.0/24 (Python exempts the .9/.10 anycast
+ * services), and on the IPv6 side ::/96, fec0::/10, 2001::/23 (including
+ * Python's global exceptions), and 3fff::/20.
  *
  * @param {[number, number, number, number]} octets
  */
 function isBlockedIpv4(octets) {
-  const [a, b] = octets;
-  if (a === 127) return true; // 127.0.0.0/8   loopback
-  if (a === 10) return true; // 10.0.0.0/8    private
-  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local (incl. 169.254.169.254 metadata)
+  const [a, b, c] = octets;
+  if (a === 0 || a === 10 || a === 127) return true; // "this host", RFC 1918, loopback
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 shared (CGNAT)
+  if (a === 169 && b === 254) return true; // link-local (incl. 169.254.169.254 metadata)
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
   if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
-  if (a === 0) return true; // 0.0.0.0/8     "this host"
-  return false;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // protocol assignments, TEST-NET-1
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
+  return a >= 224; // multicast, reserved, broadcast
 }
 
 /**
- * Parse a bracketed IPv6 literal into eight 16-bit hextets, or null. The URL
- * parser serializes IPv6 hosts as lowercase hex with the longest zero run
- * compressed to `::` and never leaves a dotted quad inside the brackets, so
- * that subset is all this accepts.
+ * Parse an IPv6 address — bare or bracketed, with an optional dotted-quad tail
+ * or zone ID — into eight 16-bit groups, or null if it is not one.
  *
- * @param {string} hostname
+ * @param {string} host
  * @returns {number[] | null}
  */
-function parseIpv6(hostname) {
-  if (!hostname.startsWith("[") || !hostname.endsWith("]")) return null;
-  const halves = hostname.slice(1, -1).split("::");
-  if (halves.length > 2) return null;
-  const head = halves[0] === "" ? [] : halves[0].split(":");
-  let parts = head;
-  if (halves.length === 2) {
-    const tail = halves[1] === "" ? [] : halves[1].split(":");
-    const zeros = 8 - head.length - tail.length;
-    if (zeros < 1) return null;
-    parts = [...head, ...Array(zeros).fill("0"), ...tail];
+function parseIpv6(host) {
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  const text = bare.split("%")[0];
+  const halves = text.split("::");
+  if (!text.includes(":") || halves.length > 2) return null;
+  const parseGroups = (part, allowIpv4Tail) => {
+    if (part === "") return [];
+    const groups = [];
+    const pieces = part.split(":");
+    for (const [i, piece] of pieces.entries()) {
+      const ipv4 = allowIpv4Tail && i === pieces.length - 1 ? parseIpv4(piece) : null;
+      if (ipv4) groups.push((ipv4[0] << 8) | ipv4[1], (ipv4[2] << 8) | ipv4[3]);
+      else if (/^[0-9a-f]{1,4}$/i.test(piece)) groups.push(parseInt(piece, 16));
+      else return null;
+    }
+    return groups;
+  };
+  const head = parseGroups(halves[0], halves.length === 1);
+  const tail = halves.length === 2 ? parseGroups(halves[1], true) : [];
+  if (!head || !tail) return null;
+  if (halves.length === 1) return head.length === 8 ? head : null;
+  const zeros = 8 - head.length - tail.length;
+  return zeros >= 1 ? [...head, ...new Array(zeros).fill(0), ...tail] : null;
+}
+
+/**
+ * True if the IPv6 groups are outside public unicast space. Transition forms
+ * that carry an IPv4 destination (IPv4-mapped, NAT64) are judged by that IPv4,
+ * since the URL parser serializes them in hex (`[::ffff:7f00:1]`).
+ *
+ * @param {number[]} groups
+ */
+function isBlockedIpv6(groups) {
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
+  const embeddedIpv4 = () => isBlockedIpv4([g6 >> 8, g6 & 0xff, g7 >> 8, g7 & 0xff]);
+  const zeroThrough4 = g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0;
+  if (g0 === 0 && zeroThrough4 && g5 === 0xffff) return embeddedIpv4(); // ::ffff:0:0/96 mapped
+  if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+    return embeddedIpv4(); // 64:ff9b::/96 NAT64
   }
-  if (parts.length !== 8) return null;
-  const hextets = [];
-  for (const part of parts) {
-    if (!/^[0-9a-f]{1,4}$/.test(part)) return null;
-    hextets.push(parseInt(part, 16));
+  // Only 2000::/3 is global unicast. Everything else is internal or reserved:
+  // ::, ::1, IPv4-compatible ::/96, fc00::/7 unique-local, fe80::/10
+  // link-local, fec0::/10 site-local, ff00::/8 multicast, ...
+  if ((g0 & 0xe000) !== 0x2000) return true;
+  if (g0 === 0x2001 && g1 < 0x200) return true; // 2001::/23 protocol assignments, incl. Teredo
+  if (g0 === 0x2001 && g1 === 0xdb8) return true; // 2001:db8::/32 documentation
+  if (g0 === 0x3fff && g1 < 0x1000) return true; // 3fff::/20 documentation
+  return g0 === 0x2002; // 6to4, which can embed any IPv4 (non-global in ssrf.py too)
+}
+
+/**
+ * Canonical text for an IP address (IPv4-mapped IPv6 collapses to its IPv4),
+ * or null if `address` is not one, so differently written forms compare equal.
+ *
+ * @param {string} address
+ */
+function canonicalAddress(address) {
+  const ipv4 = parseIpv4(address);
+  if (ipv4) return ipv4.join(".");
+  const groups = parseIpv6(address);
+  if (!groups) return null;
+  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+    return [groups[6] >> 8, groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff].join(".");
   }
-  return hextets;
+  return groups.map((g) => g.toString(16)).join(":");
+}
+
+/** True if `host` is a dotted-quad IPv4 or an IPv6 literal. */
+function isIpLiteral(host) {
+  return parseIpv4(host) !== null || parseIpv6(host) !== null;
+}
+
+/**
+ * True if an IP address is not publicly routable. Anything that does not
+ * parse as an IP counts as internal, so a malformed resolver or connection
+ * address fails closed.
+ *
+ * @param {string} address
+ */
+function isInternalAddress(address) {
+  const ipv4 = parseIpv4(address);
+  if (ipv4) return isBlockedIpv4(ipv4);
+  const ipv6 = parseIpv6(address);
+  return ipv6 ? isBlockedIpv6(ipv6) : true;
+}
+
+/**
+ * True if the hostname is a loopback/internal name or IP literal we block.
+ * `hostname` from the URL parser is lowercased, IPv4-canonicalized, and (for
+ * IPv6) bracketed.
+ *
+ * @param {string} hostname
+ */
+function isBlockedHostname(hostname) {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (host === "localhost" || host === "") return true;
+  if (host.endsWith(".localhost")) return true; // *.localhost → loopback per spec
+  return isIpLiteral(host) && isInternalAddress(host);
 }
 
 /**
@@ -195,20 +283,41 @@ function isAllowlisted(host, ipv4, port, allowlist) {
   return false;
 }
 
+/** Addresses that an explicit allowance must never open. */
+function isNeverAllowable(host) {
+  const groups = parseIpv6(host);
+  const ipv4 = parseIpv4(host) ?? ipv4FromIpv6(groups);
+  return !!(
+    (ipv4 && (ipv4[0] === 0 || (ipv4[0] === 169 && ipv4[1] === 254))) ||
+    (groups && (groups.every((g) => g === 0) || (groups[0] & 0xffc0) === 0xfe80))
+  );
+}
+
+function allowanceFor(parsed, allowlist) {
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
+  const ipv4 = parseIpv4(host) ?? ipv4FromIpv6(parseIpv6(host));
+  const port = parsed.port === "" ? (parsed.protocol === "https:" ? 443 : 80) : Number(parsed.port);
+  return {
+    allowed: isAllowlisted(host, ipv4, port, allowlist),
+    grant: `${ipv4 ? ipv4.join(".") : host}:${port}`,
+  };
+}
+
+function internalHostError(hostname) {
+  const groups = parseIpv6(hostname);
+  const ipv4 = parseIpv4(hostname) ?? ipv4FromIpv6(groups);
+  const range = ipv4 || (groups && (groups[0] & 0xfe00) === 0xfc00);
+  return `navigation blocked: host "${hostname}" is a ${range ? "link-local/loopback/private-range address" : "loopback/internal host"}`;
+}
+
 /**
  * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
- * for an http(s) URL to a non-internal host (or eligible Arca loopback, or a
- * host/CIDR named in `opts.allowlist`), else `{ ok: false, error }`. Never
- * throws — an unparseable URL is a rejection.
- *
- * A refusal of the INTERNAL class — the loopback/private ranges an allowlist
- * entry can lift — also carries `grant`, a stable `"<canonical host>:<port>"`
- * the UI may remember back into `opts.allowlist`. Never-allowable refusals
- * (link-local/metadata, `0.0.0.0`/`::`, bad schemes) carry no grant.
+ * for an http(s) URL to a non-internal host (or eligible Arca loopback), else
+ * `{ ok: false, error }`. Never throws — an unparseable URL is a rejection.
+ * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
  *
  * @param {string} url
- * @param {{ allowLocalhost?: boolean, allowlist?: unknown }} [opts]
- * @returns {{ ok: true } | { ok: false, error: string, grant?: string }}
+ * @returns {{ ok: true } | { ok: false, error: string }}
  */
 function isAgentNavigationAllowed(url, { allowLocalhost = false, allowlist } = {}) {
   if (typeof url !== "string" || url.trim() === "") {
@@ -227,67 +336,173 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false, allowlist } = {
     };
   }
   const hostname = parsed.hostname;
-  if (allowLocalhost && ["localhost", "127.0.0.1", "[::1]"].includes(hostname)) {
+  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) {
     return { ok: true };
   }
-
-  // Canonical host: trailing dots resolve away, and the canonical IPv4 is the
-  // dotted quad itself or the address embedded in a mapped/compatible/NAT64
-  // IPv6 literal (`[::ffff:7f00:1]` → 127.0.0.1).
-  const host = hostname.replace(/\.+$/, "");
-  const hextets = parseIpv6(host);
-  const ipv4 = parseIpv4(host) ?? ipv4FromIpv6(hextets);
-
-  // Link-local/metadata and "this host" addresses are never allowable, even
-  // when the allowlist names them.
-  if (ipv4 && (ipv4[0] === 0 || (ipv4[0] === 169 && ipv4[1] === 254))) {
-    return {
-      ok: false,
-      error: `navigation blocked: host "${hostname}" is a link-local/loopback/private-range address`,
-    };
+  const allowance = allowanceFor(parsed, allowlist);
+  if (isNeverAllowable(hostname)) {
+    return { ok: false, error: internalHostError(hostname) };
   }
-  if (hextets && (hextets.every((h) => h === 0) || (hextets[0] & 0xffc0) === 0xfe80)) {
+  if (allowance.allowed) return { ok: true };
+  if (isBlockedHostname(hostname)) {
     return {
       ok: false,
-      error: `navigation blocked: host "${hostname}" is a loopback/internal host`,
-    };
-  }
-
-  const port = parsed.port === "" ? (parsed.protocol === "https:" ? 443 : 80) : Number(parsed.port);
-  if (isAllowlisted(host, ipv4, port, allowlist)) return { ok: true };
-
-  // The link-local/metadata and unspecified refusals above returned already, so
-  // every internal-class refusal below sits in a range an allowlist can lift.
-  // Canonical IPv4 wins, else the trailing-dot-stripped host (IPv6 bracketed).
-  const grant = `${ipv4 ? ipv4.join(".") : host}:${port}`;
-  if (host === "localhost" || host.endsWith(".localhost") || host === "[::1]") {
-    return {
-      ok: false,
-      error: `navigation blocked: host "${hostname}" is a loopback/internal host`,
-      grant,
-    };
-  }
-  if (ipv4 && isBlockedIpv4(ipv4)) {
-    return {
-      ok: false,
-      error: `navigation blocked: host "${hostname}" is a link-local/loopback/private-range address`,
-      grant,
-    };
-  }
-  if (hextets && (hextets[0] & 0xfe00) === 0xfc00) {
-    return {
-      ok: false,
-      error: `navigation blocked: host "${hostname}" is a link-local/loopback/private-range address`,
-      grant,
+      error: internalHostError(hostname),
+      grant: allowance.grant,
     };
   }
   return { ok: true };
 }
 
+/**
+ * Resolve a hostname with the OS resolver. The desktop shell injects the
+ * view's Chromium resolver instead, so the check sees what Chromium will use.
+ *
+ * @param {string} hostname
+ * @returns {Promise<string[]>}
+ */
+async function lookupHostAddresses(hostname) {
+  const records = await dns.promises.lookup(hostname, { all: true });
+  return records.map((record) => record.address);
+}
+
+/**
+ * `isAgentNavigationAllowed` plus DNS: a hostname must resolve, and every
+ * address it resolves to must be public. Resolution failure blocks.
+ *
+ * @param {string} url
+ * @param {{ allowLocalhost?: boolean, resolveHost?: (hostname: string) => Promise<string[]> }} [options]
+ * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ */
+async function checkAgentNavigation(
+  url,
+  { allowLocalhost = false, allowlist, resolveHost = lookupHostAddresses } = {},
+) {
+  const verdict = isAgentNavigationAllowed(url, { allowLocalhost, allowlist });
+  if (!verdict.ok) return verdict;
+  const { hostname } = new URL(url);
+  if ((allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
+    return verdict;
+  }
+  let addresses = [];
+  try {
+    addresses = await resolveHost(hostname);
+  } catch {
+    // Unresolvable here means no public endpoint to allow.
+  }
+  const neverAllowable = addresses.some(
+    (address) => !isIpLiteral(address) || isNeverAllowable(address),
+  );
+  const allowance = allowanceFor(new URL(url), allowlist);
+  if (
+    neverAllowable ||
+    addresses.length === 0 ||
+    (addresses.some(isInternalAddress) && !allowance.allowed)
+  ) {
+    // One message for both cases so the agent can't probe internal DNS.
+    return {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" does not resolve to a public address`,
+      ...(addresses.length > 0 && !neverAllowable ? { grant: allowance.grant } : {}),
+    };
+  }
+  return verdict;
+}
+
+/**
+ * Judge the address Chromium actually connected to for an agent request, which
+ * catches a DNS answer that changed after `checkAgentNavigation`. A missing
+ * `ip` blocks: agent documents are always fetched from the network, so a
+ * response without a connected address is not one we can vouch for.
+ *
+ * @param {string} url
+ * @param {string | undefined} ip
+ * @param {{ allowLocalhost?: boolean }} [options]
+ * @returns {{ ok: true } | { ok: false, error: string }}
+ */
+function isAgentConnectionAllowed(url, ip, { allowLocalhost = false, allowlist } = {}) {
+  let hostname = "";
+  let parsed;
+  try {
+    parsed = new URL(url);
+    hostname = parsed.hostname;
+  } catch {
+    // Judge the address alone.
+  }
+  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (!ip) {
+    return {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" reported no connected address`,
+    };
+  }
+  if (parsed && isIpLiteral(ip) && !isNeverAllowable(ip) && allowanceFor(parsed, allowlist).allowed)
+    return { ok: true };
+  if (isInternalAddress(ip)) {
+    return {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" connected to a non-public address`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Proxy hosts listed in a PAC-style `resolveProxy` result, e.g.
+ * "PROXY a.example:3128;SOCKS5 [::1]:1080;DIRECT" → ["a.example", "::1"].
+ *
+ * @param {string} pacResult
+ * @returns {string[]}
+ */
+function proxyHosts(pacResult) {
+  const hosts = [];
+  for (const entry of String(pacResult ?? "").split(";")) {
+    const match = /^\s*(?:PROXY|HTTPS|SOCKS|SOCKS4|SOCKS5|QUIC)\s+(\S+)\s*$/i.exec(entry);
+    if (!match) continue; // DIRECT or malformed
+    const hostPort = match[1];
+    const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(hostPort);
+    hosts.push(bracketed ? bracketed[1] : hostPort.replace(/:\d+$/, ""));
+  }
+  return hosts;
+}
+
+/**
+ * True if `ip` is an address of a proxy in `pacResult`. Configuration alone
+ * proves nothing about a connection — "PROXY a:3128; DIRECT" may fall back to
+ * a direct connection — so the connected address itself must be a proxy's.
+ * Known limit: webRequest exposes neither the port nor whether a proxy was
+ * used, so if an internal proxy with a DIRECT fallback is down and the
+ * destination rebinds to that proxy's IP, a direct connection to another port
+ * there is accepted. Failing closed would block agent browsing via such proxies.
+ *
+ * @param {string | undefined} ip
+ * @param {string} pacResult
+ * @param {(hostname: string) => Promise<string[]>} resolveHost
+ */
+async function isProxyAddress(ip, pacResult, resolveHost) {
+  const target = ip ? canonicalAddress(ip) : null;
+  if (target === null) return false;
+  const resolved = await Promise.all(
+    proxyHosts(pacResult).map((host) =>
+      isIpLiteral(host) ? [host] : resolveHost(host).catch(() => []),
+    ),
+  );
+  return resolved.flat().some((address) => canonicalAddress(address) === target);
+}
+
 module.exports = {
   isAgentNavigationAllowed,
+  checkAgentNavigation,
+  isAgentConnectionAllowed,
+  isProxyAddress,
+  lookupHostAddresses,
   // Exported for focused unit tests.
+  proxyHosts,
   parseIpv4,
+  parseIpv6,
   isBlockedIpv4,
+  isBlockedIpv6,
+  isInternalAddress,
+  isBlockedHostname,
   ALLOWED_SCHEMES,
 };

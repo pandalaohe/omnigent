@@ -19,6 +19,7 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
@@ -79,6 +80,7 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # ``_handle_helper_request``.
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
+# Ops without side effects: safe to send again if the helper died before replying.
 _REPLAY_SAFE_OPS = frozenset({"read"})
 
 logger = logging.getLogger(__name__)
@@ -438,6 +440,9 @@ class _HelperProcessClient:
         self._lock = threading.Lock()
         self._cancel_lock = threading.Lock()
         self._active_cancel: threading.Event | None = None
+        # bwrap --die-with-parent kills the helper when the thread that spawned it
+        # exits, and each request runs on its own short-lived thread.
+        self._spawner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="os-env-helper")
         self._closed = False
         atexit.register(self.close)
 
@@ -468,6 +473,8 @@ class _HelperProcessClient:
                 _proc.kill_tree(self._proc)
         with self._lock:
             self._stop_locked()
+        self._spawner.shutdown(wait=False)
+        atexit.unregister(self.close)
 
     def _request_locked(
         self,
@@ -491,28 +498,34 @@ class _HelperProcessClient:
             self._proc.stdin.write(json.dumps(payload) + "\n")
             self._proc.stdin.flush()
         except OSError as exc:
+            # The helper never received the request, so any op can be sent again.
             return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
         try:
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._helper_exit_detail_locked())
             result = json.loads(line)
-            if isinstance(result, dict):
-                return result
-            return {"error": f"Helper returned non-object response: {result!r}"}
         except Exception as exc:  # noqa: BLE001 — helper IO failures are retried or surfaced via error dict
-            if payload.get("op") in _REPLAY_SAFE_OPS:
+            op = payload.get("op")
+            if op in _REPLAY_SAFE_OPS:
                 return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
             self._stop_locked()
             return {
                 "error": (
-                    f"Lost the os_env helper during {payload.get('op')!r}; it may already have "
-                    f"run, so it was not sent again: {exc}"
+                    f"Lost the os_env helper during {op!r}; it may already have run, "
+                    f"so it was not sent again: {exc}"
                 )
             }
+        if isinstance(result, dict):
+            return result
+        return {"error": f"Helper returned non-object response: {result!r}"}
 
     def _resend_on_new_helper_locked(
-        self, payload: OpRequest, *, allow_retry: bool, exc: Exception
+        self,
+        payload: OpRequest,
+        *,
+        allow_retry: bool,
+        exc: Exception,
     ) -> OpResult:
         self._stop_locked()
         cancelled = self._active_cancel
@@ -696,18 +709,20 @@ class _HelperProcessClient:
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
-            self._proc = subprocess.Popen(
-                spawn_argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
-                env=env,
-                **_proc.spawn_kwargs(),
-                **popen_kwargs,
-            )
+            self._proc = self._spawner.submit(
+                lambda: subprocess.Popen(
+                    spawn_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
+                    env=env,
+                    **_proc.spawn_kwargs(),
+                    **popen_kwargs,
+                )
+            ).result()
             _proc.remember_process_group(self._proc)
         except Exception:
             self._stop_locked()

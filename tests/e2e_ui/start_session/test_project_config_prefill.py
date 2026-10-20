@@ -25,7 +25,6 @@ and worktree request variants are covered in
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from typing import Any
@@ -34,6 +33,7 @@ from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests._helpers.picker_routes import OWN_AGENTS
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -50,16 +50,6 @@ _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 _PROJECT_CFG_RE = re.compile(r"/v1/projects/[^/?]+")
 # One project host-roots endpoint: /v1/projects/<id>/host-roots.
 _PROJECT_HOST_ROOTS_RE = re.compile(r"/v1/projects/[^/]+/host-roots")
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
 def _hosts_body() -> str:
@@ -212,7 +202,7 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("start here")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             # The create names its project and OMITS the fields still holding
@@ -369,7 +359,7 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("start here")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             # A sandbox create is managed (server provisions the host); no host_id.
             assert body.get("host_type") == "managed", body
@@ -469,7 +459,7 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("write the docs")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             # Born filed, first-class: the create names the project so the
@@ -682,7 +672,7 @@ async def _drive_typed_picker_trailing_space(base_url: str, session_id: str) -> 
             await page.get_by_test_id("new-chat-landing-input").fill("keep the exact cwd")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == exact_workspace, body

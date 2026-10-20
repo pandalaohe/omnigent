@@ -26,6 +26,7 @@ import {
   resolveChatFilePath,
   useWorkspaceChangedFiles,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
   type WorkspaceAllFilesResult,
@@ -46,6 +47,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
@@ -278,6 +280,7 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
   // The runner is offline but the host still holds the workspace on disk,
   // so the server serves the panel by reading the workspace over the host
   // tunnel. Show a passive "served from host" badge — the panel keeps
@@ -558,6 +561,11 @@ export function FilesPanel({
     : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
   const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
+  // An idle-stopped managed sandbox is asleep, not failed: its status stays
+  // idle, and with neither a runner nor a host to read the workspace from, the
+  // lists can't load. Say so rather than "No files in workspace"; a list
+  // cached before it slept still renders.
+  const showAsleepHint = sandboxAsleep && !dataReady;
 
   return (
     <div
@@ -655,7 +663,7 @@ export function FilesPanel({
                 aria-label="Search changed files"
                 className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                 onChange={(event) => setChangedSearch(event.target.value)}
-                placeholder="Search"
+                placeholder="Find changed files by name"
                 type="search"
                 value={changedSearch}
               />
@@ -679,7 +687,7 @@ export function FilesPanel({
                   aria-label="Search all files"
                   className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                   onChange={(event) => setTreeSearch(event.target.value)}
-                  placeholder="Search"
+                  placeholder="Find files by name"
                   type="search"
                   value={treeSearch}
                 />
@@ -748,7 +756,8 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {flatView ? (
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
+        {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
             isLoading={changedQuery.isLoading}
@@ -762,7 +771,8 @@ export function FilesPanel({
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
           />
-        ) : (
+        )}
+        {!showAsleepHint && !flatView && (
           <FolderTree
             files={allFilesQuery.data?.data}
             isLoading={allFilesQuery.isLoading}

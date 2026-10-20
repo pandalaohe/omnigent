@@ -40,7 +40,6 @@ import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
@@ -216,12 +215,14 @@ from omnigent.runner.subagent_work import (
     _truncate_child_preview,
     get_subagent_work,
     is_codex_native_subagent_wrapper,
+    latest_wake_eligible_subagent_work,
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
     register_child_session,
     unregister_child_session,
     unregister_subagent_work_for_session,
+    wrapper_label_from_labels,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
@@ -3019,11 +3020,7 @@ def create_runner_app(
                     raw_host_id = body.get("host_id")
                     if isinstance(raw_host_id, str) and raw_host_id:
                         host_id = raw_host_id
-                    raw_labels = body.get("labels")
-                    if isinstance(raw_labels, dict):
-                        raw_wrapper = raw_labels.get(WRAPPER_LABEL_KEY)
-                        if isinstance(raw_wrapper, str) and raw_wrapper:
-                            wrapper_label = raw_wrapper
+                    wrapper_label = wrapper_label_from_labels(body.get("labels"))
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -3174,7 +3171,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
-            wrapper_label=snapshot.labels.get(WRAPPER_LABEL_KEY) or None,
+            wrapper_label=wrapper_label_from_labels(snapshot.labels),
             worktree=snapshot.worktree,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
@@ -3236,6 +3233,21 @@ def create_runner_app(
             return envelope
         _session_init_envelopes.pop(session_id, None)
         return None
+
+    async def _rebind_claude_bridge(session_id: str, bridge_id: str) -> None:
+        """Point a session's cached init labels and harness at its new Claude bridge.
+
+        :param session_id: Session whose terminal launch moved its bridge dir.
+        :param bridge_id: The bridge id the new pane was launched under.
+        """
+        from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+
+        cached = _session_init_envelopes.get(session_id)
+        if cached is not None:
+            cached[1].snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
+        # The next turn respawns the harness with the new bridge dir.
+        if process_manager is not None:
+            await process_manager.release(session_id)
 
     async def _load_session_init_context(
         body: _JsonObject,
@@ -3859,6 +3871,7 @@ def create_runner_app(
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
                 session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
+                rebind_bridge=_rebind_claude_bridge,
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -6400,6 +6413,13 @@ def create_runner_app(
                 extra={"session_id": runner_primary_session_id()},
             )
 
+    def _owes_parent_wake(entry: _SubagentWorkEntry) -> bool:
+        """Tool-dispatched children owe a wake; Codex internal threads do not."""
+        codex_internal = is_codex_native_subagent_wrapper(entry.wrapper_label) or (
+            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
+        )
+        return not codex_internal or entry.registered_by is not None
+
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
@@ -6410,10 +6430,7 @@ def create_runner_app(
         # wrapper label path and forwarder/recovery entries — so a real
         # sys_session_create / sys_session_send child of a Codex mother
         # still wakes it (D12).
-        codex_internal = is_codex_native_subagent_wrapper(entry.wrapper_label) or (
-            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
-        )
-        if codex_internal and entry.registered_by is None:
+        if not _owes_parent_wake(entry):
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
@@ -6518,16 +6535,14 @@ def create_runner_app(
         _stranded_wake_parents.discard(parent_session_id)
         if drained:
             return
-        entries = list_subagent_work(parent_session_id)
-        if not entries:
+        latest = latest_wake_eligible_subagent_work(
+            [entry for entry in list_subagent_work(parent_session_id) if _owes_parent_wake(entry)]
+        )
+        if latest is None:
             last_async = _last_async_result.get(parent_session_id)
             if last_async is not None:
                 _wake_for_async_result(parent_session_id, *last_async, is_rewake=True)
             return
-        latest = max(
-            entries,
-            key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
-        )
         _schedule_subagent_wake(latest, is_rewake=True)
 
     async def _retry_stranded_wakes_soon() -> None:
@@ -6546,18 +6561,14 @@ def create_runner_app(
                 inbox = _session_inboxes.get(parent_id)
                 if inbox is None or inbox.empty():
                     continue
-                entries = list_subagent_work(parent_id)
-                if not entries:
+                latest = latest_wake_eligible_subagent_work(
+                    [entry for entry in list_subagent_work(parent_id) if _owes_parent_wake(entry)]
+                )
+                if latest is None:
                     last_async = _last_async_result.get(parent_id)
                     if last_async is not None:
                         _wake_for_async_result(parent_id, *last_async)
                     continue
-                latest = max(
-                    entries,
-                    key=lambda entry: (
-                        entry.completed_at if entry.completed_at is not None else 0.0
-                    ),
-                )
                 _logger.info(
                     "Re-attempting stranded sub-agent wake for parent=%s after reconnect",
                     parent_id,
@@ -10440,6 +10451,7 @@ def create_runner_app(
         _pi_terminal_ensure_locks=_pi_terminal_ensure_locks,
         _publish_event=_publish_event,
         _qwen_terminal_ensure_locks=_qwen_terminal_ensure_locks,
+        _rebind_claude_bridge=_rebind_claude_bridge,
         _record_session_claude_launch_config=_record_session_claude_launch_config,
         _repl_terminal_ensure_locks=_repl_terminal_ensure_locks,
         _repop_pending_cost_popup_on_attach=_repop_pending_cost_popup_on_attach,

@@ -14,6 +14,10 @@ import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 const isNativeShell = vi.fn(() => false);
 const isElectronShell = vi.fn(() => false);
 const supportsBrowser = vi.fn(() => false);
+const contentSearchEnabled = vi.fn(() => false);
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ features: { workspace_content_search: contentSearchEnabled() } }),
+}));
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
   isElectronShell: () => isElectronShell(),
@@ -27,6 +31,7 @@ beforeEach(() => {
   isNativeShell.mockReturnValue(false);
   isElectronShell.mockReturnValue(false);
   supportsBrowser.mockReturnValue(false);
+  contentSearchEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -234,7 +239,7 @@ describe("KeyboardShortcutsList question-card rows", () => {
   it("lists the card actions with their default keys", () => {
     render(<KeyboardShortcutsList />);
 
-    expect(keysFor("Focus question card")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Focus question card")).toEqual(["Alt", "⇧", "G"]);
     expect(keysFor("Move between options")).toEqual(["↑", "↓"]);
     expect(keysFor("Select option")).toEqual(["Space"]);
     expect(keysFor("Next question / submit")).toEqual(["Ctrl", "↵"]);
@@ -261,7 +266,7 @@ describe("KeyboardShortcutsList question-card rows", () => {
 
   it("shows the rebound focus chord and drops the old labels", () => {
     render(<KeyboardShortcutsList />);
-    expect(keysFor("Focus question card")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Focus question card")).toEqual(["Alt", "⇧", "G"]);
 
     act(() => {
       writeShortcutPreference("focusQuestionCard", {
@@ -274,9 +279,27 @@ describe("KeyboardShortcutsList question-card rows", () => {
 });
 
 describe("KeyboardShortcutsDialog", () => {
+  it("shows the workspace search shortcut only when the feature is enabled", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Search workspace contents")).toBeNull();
+    expect(keysFor("Select a workspace tab")).toContain("1…4");
+    contentSearchEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Search workspace contents")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Select a workspace tab")).toContain("1…5");
+  });
+
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
+  });
+
+  it("keeps native new-session keys and updates the Settings reference", () => {
+    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "⇧", "O"]);
+    isNativeShell.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
   });
 
   it("renders nothing until opened", () => {
@@ -292,7 +315,7 @@ describe("KeyboardShortcutsDialog", () => {
     // General / In chats / Navigation / View / Slash commands / Question cards
     // — one each.
     expect(screen.getByText("Start a new session")).toBeTruthy();
-    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "⇧", "O"]);
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();

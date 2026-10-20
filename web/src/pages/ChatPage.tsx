@@ -242,6 +242,7 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
@@ -1867,6 +1868,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           visible={isShown}
           runnerOnline={isActive ? runnerOnline : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
+          sandboxOffline={isActive && liveness.kind === "host_asleep"}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
@@ -2855,6 +2857,8 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  // A send held while the host was offline goes out once the host is back.
+  useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   // Archived sessions keep their unhandled comments; fetch them (visitor
   // drafts included) for the continuation banner above the composer.
@@ -4567,7 +4571,18 @@ function ComposerImpl(
                   disabledOptions={
                     showCodexApprovalMode && sessionHarness === "codex-native" ? ["read-only"] : []
                   }
-                  disabled={isReadOnly || unreachable || configBusy || permissionLocked}
+                  disabled={
+                    isReadOnly ||
+                    unreachable ||
+                    configBusy ||
+                    permissionLocked ||
+                    !isOwnerLevel(permissionLevel)
+                  }
+                  disabledReason={
+                    isOwnerLevel(permissionLevel)
+                      ? undefined
+                      : "Only the session owner can change the permission mode"
+                  }
                   onSelect={(mode) => void changePermission(mode)}
                 />
               )}

@@ -6,6 +6,9 @@ import {
   readSessionWorkspaceState,
   writeInheritLastRightRailTab,
   writeLastExplicitRightRailTab,
+  type SessionWorkspaceState,
+  resetSessionWorkspaceTabSelections,
+  unpinSessionWorkspaceTabs,
   writeSessionWorkspaceState,
 } from "./sessionWorkspaceState";
 
@@ -69,6 +72,71 @@ describe("sessionWorkspaceState", () => {
   it("remembers a selected GitHub tab", () => {
     writeSessionWorkspaceState("conv_github", { rightRailTab: "github" });
     expect(readSessionWorkspaceState("conv_github").rightRailTab).toBe("github");
+  });
+
+  it("remembers opened built-in pages and an empty selection", () => {
+    writeSessionWorkspaceState("conv_panels", {
+      rightRailTab: null,
+      openPanels: ["changes", "github"],
+    });
+    expect(readSessionWorkspaceState("conv_panels")).toEqual({
+      rightRailTab: null,
+      openPanels: ["changes", "github"],
+    });
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "conv_panels",
+          state: { openPanels: ["changes", "browser", "sidechat", "changes", null, "bad"] },
+        },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_panels").openPanels).toEqual(["changes"]);
+  });
+
+  it("preserves opened pages for a default change", () => {
+    writeSessionWorkspaceState("conv_panels", { rightRailTab: "changes", openPanels: ["changes"] });
+    resetSessionWorkspaceTabSelections();
+    expect(readSessionWorkspaceState("conv_panels")).toEqual({ openPanels: ["changes"] });
+  });
+
+  it("forgets only newly unpinned pages while preserving other tabs and selections", () => {
+    const fileState = {
+      open: true,
+      widthPx: 480,
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    };
+    writeSessionWorkspaceState("conv_files", {
+      ...fileState,
+      rightRailTab: "changes",
+      openPanels: ["changes", "github"],
+    });
+    const otherSessions = {
+      shell: {
+        rightRailTab: "github",
+        openPanels: ["github"],
+        selectedTerminalKey: "terminal:one",
+      },
+      browser: {
+        rightRailTab: "browser",
+        openBrowsers: ["browser:one"],
+        selectedBrowserId: "browser:one",
+      },
+      sidechat: { rightRailTab: "sidechat", openSideChats: ["child"], selectedSideChatId: "child" },
+    } satisfies Record<string, SessionWorkspaceState>;
+    for (const [id, state] of Object.entries(otherSessions)) writeSessionWorkspaceState(id, state);
+
+    unpinSessionWorkspaceTabs(["changes"]);
+
+    expect(readSessionWorkspaceState("conv_files")).toEqual({
+      ...fileState,
+      openPanels: ["github"],
+    });
+    for (const [id, state] of Object.entries(otherSessions))
+      expect(readSessionWorkspaceState(id)).toEqual(state);
   });
 
   it("keeps sessions isolated by id", () => {

@@ -1,4 +1,5 @@
 import { queueUserPreferencePatch } from "./userPreferencesSync";
+import { isNativeShell } from "./nativeBridge";
 
 export type ShortcutPlatform = "macos" | "windows" | "linux";
 export type ShortcutModifier = "primary" | "control" | "meta" | "alt" | "shift";
@@ -37,6 +38,7 @@ export type ShortcutActionId =
   | "toggleConversationsSidebar"
   | "toggleWorkspaceSidebar"
   | "toggleAnnotationMode"
+  | "searchWorkspaceContents"
   | "selectWorkspaceTab1"
   | "selectWorkspaceTab2"
   | "selectWorkspaceTab3"
@@ -82,7 +84,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     label: "Start a new session",
     group: "general",
     scope: "global",
-    defaultBindings: [chord("KeyN", ["primary", "alt"])],
+    defaultBindings: [chord("KeyO", ["primary", "shift"])],
   },
   commandPalette: {
     id: "commandPalette",
@@ -278,6 +280,13 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     defaultBindings: [],
     note: WORKSPACE_TAB_NOTE,
   },
+  searchWorkspaceContents: {
+    id: "searchWorkspaceContents",
+    label: "Search workspace contents",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("KeyF", ["primary", "shift"])],
+  },
   newBrowserTab: {
     id: "newBrowserTab",
     label: "Open a new browser tab",
@@ -325,7 +334,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     label: "Focus question card",
     group: "questionCard",
     scope: "global",
-    defaultBindings: [chord("KeyF", ["control", "shift"])],
+    defaultBindings: [chord("KeyG", ["alt", "shift"])],
   },
   questionCardPreviousOption: {
     id: "questionCardPreviousOption",
@@ -651,7 +660,15 @@ function macWindowsTakenKey(mapped: ShortcutChord): MacWindowsKeyPositionTakenKe
 function rawDefaultShortcutBindings(
   actionId: ShortcutActionId,
   context: ShortcutDefaultContext,
+  platform = currentShortcutPlatform(),
 ): ShortcutChord[] {
+  if (actionId === "focusQuestionCard" && platform === "macos") {
+    return [chord("KeyG", ["meta", "shift"])];
+  }
+  if (actionId === "newSession") {
+    const nativeShell = context.nativeShell ?? isNativeShell();
+    return [nativeShell ? chord("KeyN", ["primary", "alt"]) : chord("KeyO", ["primary", "shift"])];
+  }
   if (actionId === "sendMessage" && context.submitWithModEnter) {
     return [chord("Enter", ["primary"])];
   }
@@ -669,7 +686,7 @@ export function defaultShortcutBindings(
   context: ShortcutDefaultContext = {},
   platform = currentShortcutPlatform(),
 ): ShortcutChord[] {
-  const defaults = rawDefaultShortcutBindings(actionId, context);
+  const defaults = rawDefaultShortcutBindings(actionId, context, platform);
   if (platform !== "macos" || !readMacWindowsKeyPositions()) return defaults;
   return defaults.map((binding) => {
     const mapped = macWindowsKeyPositionChord(binding);
@@ -686,7 +703,7 @@ export function macWindowsKeyPositionNotes(
 ): string[] {
   if (platform !== "macos" || !readMacWindowsKeyPositions()) return [];
   const notes: string[] = [];
-  for (const binding of rawDefaultShortcutBindings(actionId, context)) {
+  for (const binding of rawDefaultShortcutBindings(actionId, context, platform)) {
     const mapped = macWindowsKeyPositionChord(binding);
     const taken = macWindowsTakenKey(mapped);
     if (!taken) continue;

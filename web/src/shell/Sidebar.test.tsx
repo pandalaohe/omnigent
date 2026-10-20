@@ -15,7 +15,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as PullRequestsModule from "@/hooks/usePullRequests";
@@ -1472,10 +1472,10 @@ describe("Sidebar session list", () => {
     const newSession = screen.getByTestId("new-chat-button");
     const shortcut = newSession.querySelector<HTMLElement>('[data-slot="shortcut-keys"]');
 
-    expect(newSession).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+N`);
+    expect(newSession).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Shift+O`);
     expect(
       Array.from(newSession.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
-    ).toEqual([MOD_KEY, ALT_KEY, "N"]);
+    ).toEqual([MOD_KEY, SHIFT_KEY, "O"]);
     expect(shortcut).toHaveClass(
       "absolute",
       "top-1/2",

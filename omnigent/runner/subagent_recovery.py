@@ -157,6 +157,7 @@ def build_subagent_recovery(
             or _recovered_subagent_origin(snapshot),
             flow_neutral=True,
             recovered=True,
+            wrapper_label=snapshot.wrapper_label,
         )
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:

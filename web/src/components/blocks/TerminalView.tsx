@@ -132,6 +132,11 @@ interface TerminalViewProps {
   onInput?: TerminalInputListener;
   /** Optional action shown beside the closed-bridge message. */
   onResume?: () => void | Promise<void>;
+  /**
+   * What that action resumes, named in its label and errors: "sandbox" when
+   * the sandbox itself is offline.
+   */
+  resumeTarget?: "session" | "sandbox";
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
   /**
@@ -170,6 +175,7 @@ export function TerminalView({
   onActivity,
   onInput,
   onResume,
+  resumeTarget = "session",
   resumePending = false,
   active = true,
   focusOnConnect = active,
@@ -542,9 +548,9 @@ export function TerminalView({
       disposeActiveSession();
       setConnectAttempt((attempt) => attempt + 1);
     } catch (error) {
-      setResumeError(resumeErrorText(error));
+      setResumeError(resumeErrorText(error, resumeTarget));
     }
-  }, [onResume, disposeActiveSession]);
+  }, [onResume, disposeActiveSession, resumeTarget]);
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
@@ -810,6 +816,7 @@ export function TerminalView({
             state={state}
             reconnectPending={reconnectPending}
             onResume={onResume ? handleResume : undefined}
+            resumeTarget={resumeTarget}
             resumePending={resumePending}
             resumeError={resumeError}
           />
@@ -823,6 +830,7 @@ function StatusOverlay({
   state,
   reconnectPending,
   onResume,
+  resumeTarget,
   resumePending,
   resumeError,
 }: {
@@ -830,6 +838,7 @@ function StatusOverlay({
   /** True while an automatic re-dial is scheduled for a closed bridge. */
   reconnectPending: boolean;
   onResume?: () => void | Promise<void>;
+  resumeTarget: "session" | "sandbox";
   resumePending: boolean;
   resumeError: string | null;
 }) {
@@ -864,7 +873,7 @@ function StatusOverlay({
               className="border-zinc-500/50 bg-zinc-100 text-zinc-950 hover:bg-white"
               componentId="diagnostics.terminal.resume"
             >
-              {resumePending ? "Resuming…" : "Resume session"}
+              {resumePending ? "Resuming…" : `Resume ${resumeTarget}`}
             </Button>
           )}
           {resumeError && (
@@ -877,9 +886,9 @@ function StatusOverlay({
   );
 }
 
-function resumeErrorText(error: unknown): string {
-  if (error instanceof Error && error.message) return `Couldn't resume session: ${error.message}`;
-  return "Couldn't resume session.";
+function resumeErrorText(error: unknown, target: string): string {
+  if (error instanceof Error && error.message) return `Couldn't resume ${target}: ${error.message}`;
+  return `Couldn't resume ${target}.`;
 }
 
 /**

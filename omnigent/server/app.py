@@ -217,6 +217,7 @@ class ServerInfoResponse(BaseModel):
     needs_setup: bool
     databricks_features: bool
     managed_sandboxes_enabled: bool
+    durable_initial_input: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -2174,6 +2175,8 @@ def create_app(
 
             await cancel_managed_launch_tasks()
             await cancel_detached_elicitation_tasks()
+            if startup_inputs is not None:
+                await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
             if cli_retention_coordinator is not None:
                 await cli_retention_coordinator.shutdown()
@@ -2217,6 +2220,16 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    # Only managed creates accept a durable first input, and only managed hosts
+    # need their startup recovered on the replica holding the tunnel.
+    startup_inputs = (
+        ManagedStartupInputs(conversation_store, host_registry)
+        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        else None
+    )
+    app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
     app.state.project_host_binding_store = project_host_binding_store
     app.state.project_repository_store = project_repository_store
@@ -3497,6 +3510,7 @@ def create_app(
                 "needs_setup": needs_setup,
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "durable_initial_input": startup_inputs is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
@@ -3892,6 +3906,14 @@ def create_app(
             # Lets the native hook routes read the session owner's
             # approval-timeout setting; absent → defaults.
             user_preferences_store=user_preferences_store,
+            register_startup_dispatch=lambda handler: (
+                setattr(startup_inputs, "dispatch", handler)
+                if startup_inputs is not None
+                else None
+            ),
+            register_initial_file_upload=lambda handler: setattr(
+                app.state, "initial_file_upload", handler
+            ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
             ),
@@ -4963,6 +4985,8 @@ def create_app(
             pending = getattr(app.state, "pending_session_opens", None)
             if pending is not None and host_registry.get(host_id) is not None:
                 pending.trigger(host_id)
+            if startup_inputs is not None:
+                startup_inputs.host_changed(app, host_id)
 
         app.include_router(
             create_host_tunnel_router(
