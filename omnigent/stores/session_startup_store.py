@@ -15,6 +15,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.entities.host_recovery import HostRecoveryPlan
 from omnigent.entities.session_startup import SessionStartupStatus, StartupReceipt
 
 
@@ -112,6 +113,193 @@ class SessionStartupStore:
         with self._session("read_startup") as db:
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             return _snapshot(row) if row else None
+
+    def recovery(self, host_id: str) -> HostRecoveryPlan | None:
+        with self._session("read_host_recovery") as db:
+            host = db.get(SqlStartupBudget, f"{current_workspace_id()}:{host_id}")
+            return (
+                HostRecoveryPlan.model_validate(host.recovery) if host and host.recovery else None
+            )
+
+    def begin_recovery(
+        self,
+        host_id: str,
+        *,
+        expected_epoch: int,
+        account_generation: str,
+        host_generation: str,
+        process_identity: str,
+        supervisor: str,
+        members: frozenset[tuple[str, str]],
+        unresolved_runtimes: frozenset[tuple[str, str]],
+        startup_attempts: tuple[tuple[str, str], ...],
+        now: float,
+    ) -> HostRecoveryPlan:
+        def write(db: Session) -> HostRecoveryPlan:
+            _, host = self._budgets(db, host_id)
+            old = HostRecoveryPlan.model_validate(host.recovery) if host.recovery else None
+            if old and old.phase not in ("complete", "cancelled"):
+                if (
+                    old.startup_attempts == tuple(sorted(startup_attempts))
+                    and old.account_generation == account_generation
+                    and old.host_generation == host_generation
+                    and old.process_identity == process_identity
+                    and old.supervisor == supervisor
+                    and frozenset(old.members) == members
+                ):
+                    return old
+                raise ValueError("Another recovery owns the host fence")
+            if old and old.committed_at is not None and now - old.committed_at < 600:
+                raise ValueError("Host recovery cooldown is active")
+            if host.fenced or host.work_fence_epoch != expected_epoch:
+                raise ValueError("Host recovery fence changed")
+            targets = db.scalars(
+                select(SqlSessionStartup)
+                .where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == host_id,
+                    SqlSessionStartup.occupied.is_(True),
+                )
+                .with_for_update()
+            ).all()
+            if (
+                len(targets) != 2
+                or {(row.id, row.attempt_id) for row in targets} != set(startup_attempts)
+                or any(row.state not in ("uncertain", "blocked") for row in targets)
+                or {(row.runtime_id, row.host_generation) for row in targets}
+                != unresolved_runtimes
+            ):
+                raise ValueError("Startup incident changed")
+            host.work_fence_epoch += 1
+            plan = HostRecoveryPlan(
+                recovery_id=uuid4().hex,
+                host_id=host_id,
+                account_generation=account_generation,
+                epoch=host.work_fence_epoch,
+                work_revision=host.work_revision,
+                host_generation=host_generation,
+                process_identity=process_identity,
+                supervisor=supervisor,
+                members=tuple(sorted(members)),
+                startup_attempts=tuple(sorted(startup_attempts)),
+                started_at=now,
+            )
+            host.fenced, host.recovery = True, plan.model_dump(mode="json")
+            return plan
+
+        return run_write_transaction(self._session, "fence_host_recovery", write)
+
+    def note_host_work(self, host_id: str) -> None:
+        def write(db: Session) -> None:
+            _, host = self._budgets(db, host_id)
+            host.work_revision += 1
+
+        run_write_transaction(self._session, "observe_host_work_revision", write)
+
+    def commit_recovery(self, plan: HostRecoveryPlan, *, now: float) -> bool:
+        def write(db: Session) -> bool:
+            _, host = self._budgets(db, plan.host_id)
+            current = HostRecoveryPlan.model_validate(host.recovery) if host.recovery else None
+            if (
+                current is None
+                or current != plan
+                or current.phase != "quiescing"
+                or not host.fenced
+                or host.work_fence_epoch != plan.epoch
+                or host.work_revision != plan.work_revision
+            ):
+                return False
+            host.recovery = plan.model_copy(
+                update={"phase": "restart_committed", "committed_at": now}
+            ).model_dump(mode="json")
+            return True
+
+        return run_write_transaction(self._session, "commit_exact_host_recovery", write)
+
+    def cancel_recovery(self, plan: HostRecoveryPlan) -> bool:
+        def write(db: Session) -> bool:
+            _, host = self._budgets(db, plan.host_id)
+            current = HostRecoveryPlan.model_validate(host.recovery) if host.recovery else None
+            if current is None or current != plan or current.phase != "quiescing":
+                return False
+            host.fenced = False
+            host.recovery = current.model_copy(update={"phase": "cancelled"}).model_dump(
+                mode="json"
+            )
+            return True
+
+        return run_write_transaction(self._session, "cancel_uncommitted_host_recovery", write)
+
+    def mark_recovery_unconfirmed(self, plan: HostRecoveryPlan) -> None:
+        def write(db: Session) -> None:
+            _, host = self._budgets(db, plan.host_id)
+            current = HostRecoveryPlan.model_validate(host.recovery) if host.recovery else None
+            if current and current.same_operation(plan) and current.phase == "restart_committed":
+                host.recovery = current.model_copy(
+                    update={"phase": "recovery_unconfirmed"}
+                ).model_dump(mode="json")
+
+        run_write_transaction(self._session, "mark_host_recovery_unconfirmed", write)
+
+    def reconcile_recovery(
+        self,
+        plan: HostRecoveryPlan,
+        *,
+        new_generation: str,
+        account_generation: str,
+        stopped: set[tuple[str, str]],
+        adopted: set[tuple[str, str]],
+        inputs_reconciled: bool,
+    ) -> bool:
+        if (
+            not new_generation
+            or new_generation == plan.host_generation
+            or account_generation != plan.account_generation
+            or not inputs_reconciled
+            or stopped & adopted
+            or stopped | adopted != set(plan.members)
+        ):
+            return False
+
+        def write(db: Session) -> bool:
+            _, host = self._budgets(db, plan.host_id)
+            current = HostRecoveryPlan.model_validate(host.recovery) if host.recovery else None
+            if (
+                current is None
+                or not current.same_operation(plan)
+                or current.phase not in ("restart_committed", "recovery_unconfirmed")
+                or host.work_fence_epoch != plan.epoch
+                or not host.fenced
+            ):
+                return False
+            rows = db.scalars(
+                select(SqlSessionStartup)
+                .where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == plan.host_id,
+                    SqlSessionStartup.resident.is_(True),
+                )
+                .with_for_update()
+            ).all()
+            if any(
+                row.host_generation != plan.host_generation
+                or (row.runtime_id, row.host_generation) not in plan.members
+                or (row.occupied and (row.runtime_id, row.host_generation) not in stopped)
+                for row in rows
+            ):
+                return False
+            for row in rows:
+                if (row.runtime_id, row.host_generation) in stopped:
+                    row.occupied = row.resident = False
+                    row.state = "cancelled" if row.cancel_requested else "stopped"
+                    row.updated_at = now_epoch()
+            host.fenced = False
+            host.recovery = current.model_copy(update={"phase": "complete"}).model_dump(
+                mode="json"
+            )
+            return True
+
+        return run_write_transaction(self._session, "reconcile_recovered_host_generations", write)
 
     def for_session(self, session_id: str) -> StartupSnapshot | None:
         with self._session("read_current_session_startup") as db:

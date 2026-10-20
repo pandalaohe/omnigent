@@ -15,6 +15,9 @@ class SqlStartupBudget(OmnigentBase):
     next_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     last_family_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     fenced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    work_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    work_fence_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    recovery: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class SqlSessionStartup(OmnigentBase):
