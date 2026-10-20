@@ -1552,6 +1552,16 @@ async def forward_claude_transcript_to_session(
         ) as subagent_client,
         NativeSubagentSnapshotPublisher(client, observation_timeout_s=35.0) as snapshots,
     ):
+        from omnigent.usage_export.runtime import (
+            baseline_claude_transcripts,
+            capture_claude_transcript,
+            prepare_capture,
+        )
+
+        await prepare_capture(client, session_id, "claude-native")
+        inherited_path = read_transcript_path(bridge_dir)
+        if start_at_end and inherited_path is not None:
+            await asyncio.to_thread(baseline_claude_transcripts, inherited_path, session_id)
         loop_failures = 0
         loop_failure_logged_at = 0.0
         while True:
@@ -1728,6 +1738,7 @@ async def forward_claude_transcript_to_session(
                         diagnostics=transcript_diagnostics,
                     )
                     if transcript_path is not None:
+                        await prepare_capture(client, current_session_id, "claude-native")
                         previous_state = state
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,
@@ -1736,6 +1747,12 @@ async def forward_claude_transcript_to_session(
                             start_at_end=start_at_end,
                             session_id=current_session_id,
                             start_at_offset=start_at_offset,
+                        )
+                        await asyncio.to_thread(
+                            capture_claude_transcript,
+                            transcript_path,
+                            current_session_id,
+                            start_offset=state.byte_offset,
                         )
                         await _recover_goal_state_from_transcript(
                             transcript_path=transcript_path,
@@ -5036,6 +5053,7 @@ async def _seed_fork_transcript_forward_state(
     *,
     bridge_dir: Path,
     transcript_path: Path | None,
+    session_id: str | None = None,
 ) -> None:
     """
     Seed transcript forwarding after Omnigent has forked history.
@@ -5056,6 +5074,12 @@ async def _seed_fork_transcript_forward_state(
         return
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
     byte_offset = await asyncio.to_thread(_transcript_end_offset, transcript_path)
+    if session_id is not None:
+        from omnigent.usage_export.runtime import baseline_claude_transcripts
+
+        await asyncio.to_thread(
+            baseline_claude_transcripts, transcript_path, session_id, start_offset=byte_offset
+        )
     state = TranscriptForwardState(
         transcript_path=transcript_path,
         line_cursor=0,
@@ -5313,6 +5337,7 @@ async def _maybe_rotate_session_on_fork(
     await _seed_fork_transcript_forward_state(
         bridge_dir=bridge_dir,
         transcript_path=fork_record.transcript_path,
+        session_id=new_session_id,
     )
     return new_session_id
 

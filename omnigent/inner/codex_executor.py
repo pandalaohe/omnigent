@@ -3040,6 +3040,7 @@ class _CodexAppServerSession:
         self._codex_path = codex_path
         self._cwd = cwd
         self._env = env
+        self._usage_session_id: str | None = None
         self._tool_executor = tool_executor
         self._raw_elicitation_handler = raw_elicitation_handler
         self._codex_config_overrides = list(codex_config_overrides or [])
@@ -3763,6 +3764,16 @@ class _CodexAppServerSession:
 
     def _cleanup_process_cwd(self) -> None:
         if self._codex_home_dir is not None:
+            from omnigent.usage_export.runtime import capture_codex_home
+
+            if self._usage_session_id is not None:
+                capture_codex_home(
+                    self._codex_home_dir,
+                    self._usage_session_id,
+                    "codex-sdk",
+                    self.thread_id,
+                    final=True,
+                )
             try:
                 current = self._codex_home_dir.lstat()
                 identity = (current.st_dev, current.st_ino)
@@ -5027,6 +5038,25 @@ class _CodexAppServerSession:
                 message = json.loads(raw)
                 if not isinstance(message, dict):
                     raise ValueError("Codex app-server frame is not an object")
+                from omnigent.usage_export.runtime import (
+                    capture_codex_home,
+                    capture_enabled,
+                    codex_usage_boundary,
+                )
+
+                if (
+                    capture_enabled()
+                    and codex_usage_boundary(message)
+                    and self._codex_home_dir is not None
+                    and self._usage_session_id is not None
+                ):
+                    await asyncio.to_thread(
+                        capture_codex_home,
+                        self._codex_home_dir,
+                        self._usage_session_id,
+                        "codex-sdk",
+                        self.thread_id,
+                    )
                 if (
                     "id" in message
                     and "method" not in message
@@ -5685,6 +5715,8 @@ class CodexExecutor(Executor):
             skills_dir=self._skills_dir,
             os_env=self._os_env_spec,
         )
+        if isinstance(app_session, _CodexAppServerSession):
+            app_session._usage_session_id = session_key
         state.app_session = app_session
         state.signature = signature
         return app_session

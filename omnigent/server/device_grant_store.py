@@ -41,6 +41,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import DeviceGrant
+from omnigent.entities.device_grant import DEVICE_GRANT_SCOPES
 
 
 def hash_secret(secret: str, key: bytes) -> str:
@@ -70,6 +71,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         user_code=row.user_code,
         status=decode_device_grant_status(row.status),
         client_id=row.client_id,
+        scope=row.scope,
         user_id=row.user_id,
         created_at=row.created_at,
         expires_at=row.expires_at,
@@ -112,6 +114,7 @@ class DeviceGrantStore:
         device_code_hash: str,
         user_code: str,
         client_id: str | None,
+        scope: str = "sessions",
         created_at: int,
         expires_at: int,
     ) -> DeviceGrant:
@@ -127,10 +130,14 @@ class DeviceGrantStore:
         :param client_id: RFC 8628 client identifier — a public string
             naming the requesting application (e.g. ``"slack"``); display +
             audit only.
+        :param scope: Authorized device capability, stored separately from
+            the public client identifier.
         :param created_at: Unix epoch seconds.
         :param expires_at: Unix epoch seconds the device_code expires.
         :returns: The created :class:`DeviceGrant`.
         """
+        if scope not in DEVICE_GRANT_SCOPES:
+            raise ValueError("unsupported device grant scope")
 
         def write(session: Session) -> DeviceGrant:
             row = SqlDeviceGrant(
@@ -139,6 +146,7 @@ class DeviceGrantStore:
                 user_code=user_code,
                 status=encode_device_grant_status("pending"),
                 client_id=client_id,
+                scope=scope,
                 user_id=None,
                 refresh_token_hash=None,
                 prev_refresh_token_hash=None,
@@ -196,6 +204,7 @@ class DeviceGrantStore:
                 user_code=user_code,
                 status=encode_device_grant_status("redeemed"),
                 client_id=client_id,
+                scope=None,
                 user_id=user_id,
                 refresh_token_hash=refresh_token_hash,
                 prev_refresh_token_hash=None,

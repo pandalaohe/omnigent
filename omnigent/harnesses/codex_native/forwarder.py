@@ -2604,6 +2604,25 @@ async def supervise_forwarder(
         timeout=httpx.Timeout(30.0),
         transport=ap_transport,
     ) as ap_client:
+        from omnigent.usage_export.runtime import (
+            capture_codex_home,
+            capture_enabled,
+            codex_usage_boundary,
+            prepare_capture,
+        )
+
+        await prepare_capture(ap_client, session_id, "codex-native")
+        if capture_enabled():
+            initial_usage_state = read_bridge_state(bridge_dir)
+            if initial_usage_state is not None:
+                await asyncio.to_thread(
+                    capture_codex_home,
+                    Path(initial_usage_state.codex_home),
+                    session_id,
+                    "codex-native",
+                    thread_id,
+                    baseline_existing=True,
+                )
         # Synthesize the thread's MCP startup round (see the comment on
         # _CODEX_MCP_STARTUP_STATUS_METHOD): the fresh-launch forwarder
         # starts right at thread creation, which is when codex boots its
@@ -2674,6 +2693,17 @@ async def supervise_forwarder(
                         event=event,
                         forwarder_state=forwarder_state,
                     )
+                    if capture_enabled() and (rotated or codex_usage_boundary(event)):
+                        await prepare_capture(ap_client, target.session_id, "codex-native")
+                        usage_state = read_bridge_state(bridge_dir)
+                        if usage_state is not None:
+                            await asyncio.to_thread(
+                                capture_codex_home,
+                                Path(usage_state.codex_home),
+                                target.session_id,
+                                "codex-native",
+                                target.thread_id,
+                            )
                     if rotated:
                         if (
                             forwarder_state.posted_goal_state_known

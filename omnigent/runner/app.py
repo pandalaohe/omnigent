@@ -1942,6 +1942,10 @@ def create_runner_app(
 
     app = FastAPI(title="omnigent-runner")
 
+    from omnigent.usage_export.runtime import usage_capture_router
+
+    app.include_router(usage_capture_router(server_client))
+
     from omnigent.runner.logging_context import RunnerLogContextMiddleware
 
     app.add_middleware(RunnerLogContextMiddleware)
@@ -3646,6 +3650,10 @@ def create_runner_app(
                 or spec.executor.type
             )
             harness_name = canonicalize_harness(raw_harness) or raw_harness
+
+            from omnigent.usage_export.runtime import prepare_capture
+
+            await prepare_capture(server_client, session_id, harness_name)
 
             from omnigent.runner.policy import AgentStartPolicyError
 

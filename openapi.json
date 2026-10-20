@@ -22943,6 +22943,63 @@
           "usage"
         ]
       }
+    },
+    "/v1/usage-events": {
+      "get": {
+        "operationId": "read_events_v1_usage_events_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Events",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-observations": {
+      "post": {
+        "operationId": "append_observation_v1_usage_observations_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Append Observation",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-producers": {
+      "post": {
+        "operationId": "register_producer_v1_usage_producers_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Register Producer",
+        "tags": [
+          "usage"
+        ]
+      }
     }
   },
   "servers": [

@@ -22,6 +22,7 @@ from pathlib import Path
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 
@@ -136,8 +137,34 @@ def test_approve_binds_identity(store: DeviceGrantStore) -> None:
     ok = store.approve(g.id, user_id="a@x", now_epoch_seconds=1010)
     assert ok is not None and ok.status == "approved" and ok.user_id == "a@x"
     assert ok.approved_at == 1010
+    assert ok.scope == "sessions"
     # Re-approving a non-pending grant is a no-op.
     assert store.approve(g.id, user_id="b@x", now_epoch_seconds=1011) is None
+
+
+def test_device_scope_is_stored_independently_of_client_name(store: DeviceGrantStore) -> None:
+    grant = store.create_grant(
+        "usage-grant",
+        device_code_hash=hash_secret("usage-code", _KEY),
+        user_code="USGE-2345",
+        client_id="slack",
+        scope="usage:read",
+        created_at=1000,
+        expires_at=1600,
+    )
+    assert grant.scope == "usage:read"
+    loaded = store.get_by_id(grant.id)
+    assert loaded is not None and loaded.scope == "usage:read"
+    with pytest.raises(ValueError, match="unsupported device grant scope"):
+        store.create_grant(
+            "invalid-grant",
+            device_code_hash=hash_secret("invalid-code", _KEY),
+            user_code="BADG-2345",
+            client_id="usage-reader",
+            scope="admin",
+            created_at=1000,
+            expires_at=1600,
+        )
 
 
 def test_approve_works_with_null_client_id(store: DeviceGrantStore) -> None:
@@ -843,6 +870,91 @@ def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
     )
     assert r2.status_code == 200, r2.text
     assert r2.json()["refresh_token"] != body["refresh_token"]
+
+
+@pytest.mark.parametrize("scope", [None, "", "admin", "sessions usage:read", 0])
+def test_device_authorize_rejects_unsupported_scope(app: TestClient, scope: object) -> None:
+    response = app.post("/oauth/device/authorize", json={"client_id": "slack", "scope": scope})
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_scope"
+
+
+def test_usage_read_device_scope_survives_exchange_and_refresh(app: TestClient) -> None:
+    authorization = app.post(
+        "/oauth/device/authorize", json={"client_id": "slack", "scope": "usage:read"}
+    )
+    assert authorization.status_code == 200, authorization.text
+    data = authorization.json()
+    _login_admin(app)
+    consent = app.get(f"/oauth/device?user_code={data['user_code']}")
+    assert consent.status_code == 200
+    assert "view usage events for" in consent.text
+    assert "read-only" in consent.text
+    approval = app.post(
+        "/oauth/device/approve",
+        data={"user_code": data["user_code"]},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert approval.status_code == 200
+    assert "view usage events for" in approval.text
+    issued = _exchange_device_code(app, data["device_code"])
+    assert issued.status_code == 200, issued.text
+    body = issued.json()
+    claims = jwt.decode(body["access_token"], options={"verify_signature": False})
+    assert claims["scope"] == "usage:read"
+    assert claims["act"] == {"client_id": "slack"}
+    app.cookies.clear()
+    denied = app.get("/v1/agents", headers={"Authorization": f"Bearer {body['access_token']}"})
+    assert denied.status_code in (401, 403)
+
+    refreshed = app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    refreshed_claims = jwt.decode(
+        refreshed.json()["access_token"], options={"verify_signature": False}
+    )
+    assert refreshed_claims["scope"] == "usage:read"
+    assert refreshed_claims["grant_id"] == claims["grant_id"]
+
+
+@pytest.mark.parametrize("corrupt_before_exchange", [True, False])
+def test_unknown_persisted_scope_cannot_mint_or_refresh(
+    app: TestClient, tmp_path: Path, corrupt_before_exchange: bool
+) -> None:
+    from omnigent.db.utils import get_or_create_engine
+
+    authorization = app.post(
+        "/oauth/device/authorize", json={"client_id": "slack", "scope": "usage:read"}
+    )
+    data = authorization.json()
+    _login_admin(app)
+    approved = app.post(
+        "/oauth/device/approve",
+        data={"user_code": data["user_code"]},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert approved.status_code == 200
+    issued = None if corrupt_before_exchange else _exchange_device_code(app, data["device_code"])
+    if issued is not None:
+        assert issued.status_code == 200
+
+    engine = get_or_create_engine(f"sqlite:///{tmp_path}/test.db")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE device_grants SET scope = 'unknown' WHERE user_code = :user_code"),
+            {"user_code": data["user_code"]},
+        )
+    if corrupt_before_exchange:
+        response = _exchange_device_code(app, data["device_code"])
+    else:
+        response = app.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": issued.json()["refresh_token"]},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_grant"
 
 
 def test_device_code_approved_before_password_change_is_refused(app: TestClient) -> None:

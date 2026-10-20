@@ -17,9 +17,10 @@ _MIGRATION = "a31c20261019"
 _TABLE = "global_instruction_revisions"
 
 
-def test_instruction_layers_migration_is_only_head():
+def test_instruction_layers_migration_is_in_single_head_chain():
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
-    assert script.get_heads() == [_MIGRATION]
+    assert len(script.get_heads()) == 1
+    assert _MIGRATION in {revision.revision for revision in script.walk_revisions()}
     assert script.get_revision(_MIGRATION).down_revision == _PREVIOUS
 
 

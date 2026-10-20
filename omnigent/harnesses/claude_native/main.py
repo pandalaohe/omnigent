@@ -5375,6 +5375,9 @@ def _prepare_cold_resume_forward_state(
     if transcript is None:
         reset_transcript_forward_state(bridge_dir)
         return False
+    from omnigent.usage_export.runtime import baseline_claude_transcripts
+
+    baseline_claude_transcripts(transcript, session_id)
     if resolution.synthesized:
         reset_transcript_forward_state(bridge_dir)
         prepare_transcript_forward_state_for_resume(
