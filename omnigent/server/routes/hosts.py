@@ -1703,7 +1703,7 @@ def create_hosts_router(
             )
 
             try:
-                await host_registry.admit_launch(
+                startup = await host_registry.admit_launch(
                     conn,
                     body.session_id,
                     allow_unbound=True,
@@ -1831,6 +1831,8 @@ def create_hosts_router(
                 binding_token=binding_token,
                 workspace=workspace,
                 session_id=body.session_id,
+                startup=startup,
+                startup_required=startup is not None,
                 harness=harness,
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]

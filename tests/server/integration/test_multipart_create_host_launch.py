@@ -233,6 +233,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     conv_store: SqlAlchemyConversationStore,
+    app: FastAPI,
 ) -> None:
     """
     A multipart create carrying ``metadata.host_id`` binds the session
@@ -242,6 +243,18 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     mirroring the JSON create form.
     """
     cap = register_host()
+    from unittest.mock import AsyncMock
+
+    from omnigent.startup_protocol import StartupAttemptRef
+
+    startup = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="context",
+        host_generation="connection",
+    )
+    app.state.host_registry.startup_admitter = AsyncMock(return_value=startup)
 
     with capture_debug_rows("server") as rows:
         resp = await _multipart_create(client, {"host_id": _HOST_ID, "workspace": _WORKSPACE})
@@ -262,6 +275,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     # the validated workspace (not just a row write).
     assert len(cap.launch) == 1, f"expected one launch frame, got {len(cap.launch)}"
     assert cap.launch[0].session_id == session_id
+    assert cap.launch[0].startup == startup and cap.launch[0].startup_required
     assert cap.launch[0].workspace == _WORKSPACE
     # Workspace validation ran against the host (host.stat round-trip).
     assert any(frame.path == _WORKSPACE for frame in cap.stats)

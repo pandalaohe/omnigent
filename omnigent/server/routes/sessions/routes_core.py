@@ -1328,7 +1328,7 @@ def register_core_routes(
                 conversation=conversation,
             )
         conn = target.conn
-        await host_registry.admit_launch(conn, session_id)
+        startup = await host_registry.admit_launch(conn, session_id)
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
         # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
@@ -1369,6 +1369,8 @@ def register_core_routes(
                 binding_token=binding_token,
                 workspace=workspace,
                 session_id=session_id,
+                startup=startup,
+                startup_required=startup is not None,
                 # Lets the host refuse an unconfigured harness before
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.

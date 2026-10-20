@@ -436,13 +436,24 @@ async def test_inline_launch_binds_runner_and_returns_host(
     """
     comm = await _connect_host(app)
     agent = await create_test_agent(client)
+    from omnigent.startup_protocol import StartupAttemptRef
+
+    startup = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="context",
+        host_generation="connection",
+    )
+    app.state.host_registry.startup_admitter = AsyncMock(return_value=startup)
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     resp = await client.post(
         "/v1/sessions",
         json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
     )
-    await responder
+    frame = await responder
+    assert frame.startup == startup and frame.startup_required
 
     assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
     body = resp.json()

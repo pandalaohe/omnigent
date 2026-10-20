@@ -80,6 +80,7 @@ async def test_host_claim_checks_live_connection_binding_and_canonical_input(db_
     assert not await authorize_host_startup_claim(
         request, conn=conn, registry=registry, conversations=conversations, startups=store
     )
+
     request.runner_id = "bound-runner"
     request.attempt = ref.model_copy(update={"input_id": uuid4().hex})
     assert not await authorize_host_startup_claim(
@@ -107,3 +108,47 @@ async def test_host_claim_checks_live_connection_binding_and_canonical_input(db_
     assert not await authorize_host_startup_claim(
         request, conn=conn, registry=registry, conversations=conversations, startups=store
     )
+
+
+@pytest.mark.asyncio
+async def test_relaunch_forwards_admitted_attempt_to_physical_host(db_uri, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import HostHelloFrame, decode_host_frame
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+    from omnigent.startup_protocol import StartupAttemptRef
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests.server.test_host_registry import FakeWebSocket
+
+    conversations, registry = SqlAlchemyConversationStore(db_uri), HostRegistry()
+    host = uuid4().hex
+    conn = registry.register(
+        host,
+        FakeWebSocket(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="sample-host"),
+        owner="owner",
+    )
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, host, "/opt/work/project")
+    conv = conversations.get_conversation(conv.id)
+    startup = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="context",
+        host_generation="connection",
+    )
+    registry.startup_admitter = AsyncMock(return_value=startup)
+    frames = []
+
+    def capture(connection, data):
+        frame = decode_host_frame(data)
+        frames.append(frame)
+        connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(registry, "send_text", capture)
+    result = await _launch_runner_on_host_impl(conv, conversations, registry, conn)
+    assert result.acknowledged
+    assert len(frames) == 1
+    assert frames[0].startup == startup and frames[0].startup_required
