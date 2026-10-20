@@ -14,10 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 from collections.abc import Iterable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
 import zstandard
@@ -432,6 +433,11 @@ class CollabSettings:
     keep_warm_claude_interval_s: int = 3300
     keep_warm_codex_interval_s: int = 1500
     keep_warm_max_s: int = 28800
+    child_cap: int | None = None
+    quota_tight_below_pct: float = 50
+    quota_low_below_pct: float = 20
+    quota_floor_pct: float | None = None
+    quota_periods: dict[str, str] = field(default_factory=dict)
 
 
 _CollabFieldKind: TypeAlias = Literal["bool", "positive_int"]
@@ -439,7 +445,7 @@ _CollabFieldKind: TypeAlias = Literal["bool", "positive_int"]
 # Stored JSON keys are camelCase because the web client writes them. The third
 # entry names how the stored value is read: ``bool`` takes a JSON boolean and
 # ``positive_int`` an int of at least 1 (never a bool). One table keeps all
-# fifteen mappings in a single place.
+# simple field mappings in a single place.
 _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
     ("enabled", "enabled", "bool"),
     ("openRateCount", "open_rate_count", "positive_int"),
@@ -496,6 +502,21 @@ def _parse_collab_value(kind: _CollabFieldKind, raw: Any) -> Any | None:
             return None
 
 
+_QUOTA_PERIOD_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}\Z")
+
+
+def _collab_percentage(raw: Any, minimum: float, maximum: float) -> float | None:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        number = float(raw)
+    except OverflowError:
+        return None
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        return None
+    return number
+
+
 def _parse_collab_settings(value: Any) -> CollabSettings:
     """Resolve one stored ``session_collab`` namespace value, defaulting per field."""
     if not isinstance(value, dict):
@@ -505,6 +526,29 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
         parsed = _parse_collab_value(kind, value.get(json_key))
         if parsed is not None:
             resolved[field_name] = parsed
+    child_cap = _parse_collab_value("positive_int", value.get("childCap"))
+    if child_cap is not None:
+        resolved["child_cap"] = child_cap
+    low = _collab_percentage(value.get("quotaLowBelowPct"), 0, 100)
+    tight = _collab_percentage(value.get("quotaTightBelowPct"), 0, 100)
+    if low is not None and tight is not None and 0 < low < tight:
+        resolved["quota_low_below_pct"] = low
+        resolved["quota_tight_below_pct"] = tight
+    floor = _collab_percentage(value.get("quotaFloorPct"), 0, 100)
+    if floor is not None:
+        resolved["quota_floor_pct"] = floor
+    periods = value.get("quotaPeriods")
+    if isinstance(periods, dict):
+        from omnigent.harness_plugins import native_agents
+
+        products = {agent.key for agent in native_agents()}
+        resolved["quota_periods"] = {
+            product: period
+            for product, period in periods.items()
+            if product in products
+            and isinstance(period, str)
+            and _QUOTA_PERIOD_PATTERN.fullmatch(period)
+        }
     return CollabSettings(**resolved)
 
 

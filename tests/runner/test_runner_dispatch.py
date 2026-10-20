@@ -8610,6 +8610,7 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
             "harness": "claude",
             "available_on_host": None,
             "unavailable_reason": None,
+            "quota": None,
         }
     ]
     # Session-bound agents carry session_id so the caller can then
@@ -8767,7 +8768,8 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_maps_open_rate_refusal() -> None:
+@pytest.mark.parametrize("cap_refusal", [False, True])
+async def test_sys_session_create_maps_open_rate_refusal(cap_refusal: bool) -> None:
     """
     A 429 from the create maps to ``open_rate`` with the server's refusal
     text. If the mapping regressed, the orchestrator would tell the agent a
@@ -8782,7 +8784,12 @@ async def test_sys_session_create_maps_open_rate_refusal() -> None:
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
-        return httpx.Response(429, json={"detail": refusal})
+        return httpx.Response(
+            409 if cap_refusal else 429,
+            json={
+                "detail": {"code": "child_cap", "message": refusal} if cap_refusal else refusal,
+            },
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
@@ -8796,8 +8803,8 @@ async def test_sys_session_create_maps_open_rate_refusal() -> None:
         )
 
     info = json.loads(output)
-    assert info["error"] == "open_rate"
-    assert info["detail"] == refusal
+    assert info["error"] == ("child_cap" if cap_refusal else "open_rate")
+    assert info["message" if cap_refusal else "detail"] == refusal
 
 
 @pytest.mark.asyncio
@@ -9156,7 +9163,10 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_config_path_maps_open_rate_refusal(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cap_refusal", [False, True])
+async def test_sys_session_create_config_path_maps_open_rate_refusal(
+    tmp_path: Path, cap_refusal: bool
+) -> None:
     """
     The multipart config-path create maps a 429 the same way the JSON
     create does, so both child-create modes surface ``open_rate``.
@@ -9171,7 +9181,12 @@ async def test_sys_session_create_config_path_maps_open_rate_refusal(tmp_path: P
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
-        return httpx.Response(429, json={"detail": refusal})
+        return httpx.Response(
+            409 if cap_refusal else 429,
+            json={
+                "detail": {"code": "child_cap", "message": refusal} if cap_refusal else refusal,
+            },
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
@@ -9186,8 +9201,8 @@ async def test_sys_session_create_config_path_maps_open_rate_refusal(tmp_path: P
         )
 
     info = json.loads(output)
-    assert info["error"] == "open_rate"
-    assert info["detail"] == refusal
+    assert info["error"] == ("child_cap" if cap_refusal else "open_rate")
+    assert info["message" if cap_refusal else "detail"] == refusal
 
 
 @pytest.mark.asyncio

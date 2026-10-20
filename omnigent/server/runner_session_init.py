@@ -143,6 +143,7 @@ class RunnerSessionInitializer:
         server_version: str,
         peer_messaging_enabled: bool = False,
         peer_messaging_resolver: Callable[[Conversation], bool] | None = None,
+        quota_resolver: Callable[[Conversation], str] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
@@ -154,6 +155,7 @@ class RunnerSessionInitializer:
         self._server_version = server_version
         self._peer_messaging_enabled = peer_messaging_enabled
         self._peer_messaging_resolver = peer_messaging_resolver
+        self._quota_resolver = quota_resolver
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._agent_store = agent_store
@@ -446,7 +448,13 @@ class RunnerSessionInitializer:
             # and awaiting between the single-flight lookup and the task
             # registration would let a second caller start its own init.
             async with store_slots or nullcontext():
-                global_instructions = await session_instructions_text(conversation)
+                global_instructions = (
+                    await session_instructions_text(
+                        conversation, quota_resolver=self._quota_resolver
+                    )
+                    if self._quota_resolver is not None
+                    else await session_instructions_text(conversation)
+                )
                 project_code = await self.resolve_project_code(conversation)
             payload = build_runner_session_init_payload(
                 conversation,

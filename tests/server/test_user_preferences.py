@@ -816,8 +816,8 @@ def test_read_collab_settings_defaults_on_missing_store_owner_or_namespace(
     assert read_collab_settings(store, "alice@example.com") == default
 
 
-def test_read_collab_settings_reads_all_fifteen_fields(db_uri: str) -> None:
-    """All fifteen camelCase fields load; unknown keys are ignored."""
+def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
+    """Stored collaboration settings load; unknown keys are ignored."""
     store = SqlAlchemyUserPreferencesStore(db_uri)
     store.patch_namespace(
         "all@example.com",
@@ -838,6 +838,11 @@ def test_read_collab_settings_reads_all_fifteen_fields(db_uri: str) -> None:
             "childKeepWarmClaudeIntervalSeconds": 3000,
             "childKeepWarmCodexIntervalSeconds": 1200,
             "childKeepWarmMaxSeconds": 14400,
+            "childCap": 4,
+            "quotaTightBelowPct": 45.5,
+            "quotaLowBelowPct": 15,
+            "quotaFloorPct": 2.5,
+            "quotaPeriods": {"claude": "5h", "codex": "7d"},
             "unexpectedKey": {"nested": True},
         },
     )
@@ -857,7 +862,70 @@ def test_read_collab_settings_reads_all_fifteen_fields(db_uri: str) -> None:
         keep_warm_claude_interval_s=3000,
         keep_warm_codex_interval_s=1200,
         keep_warm_max_s=14400,
+        child_cap=4,
+        quota_tight_below_pct=45.5,
+        quota_low_below_pct=15,
+        quota_floor_pct=2.5,
+        quota_periods={"claude": "5h", "codex": "7d"},
     )
+
+
+def test_read_collab_settings_defaults_invalid_quota_pair_without_losing_other_fields(
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "quota@example.com",
+        "session_collab",
+        {
+            "relayDepthMax": 12,
+            "childCap": True,
+            "quotaLowBelowPct": 60,
+            "quotaTightBelowPct": 50,
+            "quotaFloorPct": 0,
+            "quotaPeriods": {
+                "claude": "5h",
+                "codex": "7d",
+                "opencode": "bad period",
+                "antigravity": "x" * 33,
+                "unknown": "month",
+            },
+        },
+    )
+    settings = read_collab_settings(store, "quota@example.com")
+    assert settings.relay_depth_max == 12
+    assert settings.child_cap is None
+    assert (settings.quota_low_below_pct, settings.quota_tight_below_pct) == (20, 50)
+    assert settings.quota_floor_pct == 0
+    assert settings.quota_periods == {"claude": "5h", "codex": "7d"}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("childCap", 0),
+        ("childCap", 1.5),
+        ("quotaFloorPct", True),
+        ("quotaFloorPct", -1),
+    ],
+)
+def test_read_collab_settings_rejects_bad_optional_values(
+    db_uri: str, field: str, value: object
+) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace("bad@example.com", "session_collab", {field: value})
+    settings = read_collab_settings(store, "bad@example.com")
+    assert settings.child_cap is None
+    assert settings.quota_floor_pct is None
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan"), 10**1000])
+def test_read_collab_settings_tolerates_nonfinite_quota_values(value: object) -> None:
+    class _ShapeStore:
+        def get(self, user_id: str) -> object:
+            return {"settings": {"session_collab": {"quotaFloorPct": value}}}
+
+    assert read_collab_settings(_ShapeStore(), "bad@example.com").quota_floor_pct is None
 
 
 @pytest.mark.parametrize(

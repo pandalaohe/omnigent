@@ -1736,9 +1736,16 @@ def create_app(
         archive_close_coordinator.set_host_lock_provider(cli_retention_coordinator.lease_for_host)
     archive_close_coordinator.set_project_host_binding_store(project_host_binding_store)
     archive_close_coordinator.set_archive_preferences(user_preferences_store, permission_store)
+    from omnigent.server.agent_quota import AgentQuotaService
+    from omnigent.server.routes.agent_quota import create_agent_quota_router
+
+    agent_quota_service = AgentQuotaService(
+        conversation_store, permission_store, user_preferences_store, host_registry, host_store
+    )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        quota_resolver=agent_quota_service.line,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -2218,6 +2225,13 @@ def create_app(
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
     app.state.user_preferences_store = user_preferences_store
+    app.state.agent_quota_service = agent_quota_service
+    app.include_router(
+        create_agent_quota_router(
+            agent_quota_service, auth_provider=auth_provider, host_store=host_store
+        ),
+        prefix="/v1",
+    )
     app.state.host_model_catalog_cache_store = host_model_catalog_cache_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry

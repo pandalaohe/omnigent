@@ -68,6 +68,7 @@ def preview_instructions(
     has_parent: bool,
     spawn: bool,
     peer: bool,
+    quota_line: str = "",
 ) -> dict[str, Any]:
     """Render known delivery bytes and label every visible revision."""
     candidates = _route_layers(revisions, host_id, agent_key)
@@ -83,8 +84,11 @@ def preview_instructions(
         spawn=spawn,
         mother_text=role_layer.text if role == "mother" and role_layer else "",
         child_text=role_layer.text if role == "child" and role_layer else "",
+        quota_line=quota_line,
     )
     sent_user_parts = [_layer_part(r, sent=True) for r in sent_layers]
+    if role == "mother" and role_layer is not None and role_layer.text.strip() and quota_line:
+        sent_user_parts.append(_framework_part(InstructionPart("quota_line", quota_line)))
     replaced = [_layer_part(r, sent=False) for r in candidates if r not in sent_layers]
     if spec is None:
         return {

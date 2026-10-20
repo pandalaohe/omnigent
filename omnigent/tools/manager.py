@@ -52,6 +52,7 @@ from omnigent.tools.builtins import (
     any_skill_has_resources,
     get_builtin_tool,
 )
+from omnigent.tools.builtins.child_cap import SysChildCapTool
 from omnigent.tools.builtins.flow import SysFlowCancelTool, SysFlowListTool, SysFlowStartTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
@@ -566,6 +567,7 @@ class ToolManager:
         # alone only permits the specified sub-agent types.
         if self._spec.spawn:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
+            self._tools[SysChildCapTool.name()] = SysChildCapTool()
 
     def _register_session_tools(self) -> None:
         """Register framework-owned tools for the current session."""

@@ -126,4 +126,50 @@ describe("session collab preferences", () => {
     expect(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY)).toBeNull();
     expect(queuePatchMock).toHaveBeenLastCalledWith("session_collab", null);
   });
+
+  it("round trips child quota settings alongside existing collaboration settings", () => {
+    const value = {
+      ...SESSION_COLLAB_DEFAULTS,
+      relayDepthMax: 3,
+      childCap: 4,
+      quotaTightBelowPct: 45.5,
+      quotaLowBelowPct: 15,
+      quotaFloorPct: 0,
+      quotaPeriods: { claude: "5h", codex: "7d" },
+    };
+    writeSessionCollabPreferences(value);
+    expect(readSessionCollabPreferences()).toEqual(value);
+    expect(queuePatchMock).toHaveBeenLastCalledWith("session_collab", value);
+
+    writeSessionCollabPreferences({ ...readSessionCollabPreferences(), openRateCount: 7 });
+    expect(readSessionCollabPreferences()).toMatchObject({
+      openRateCount: 7,
+      childCap: 4,
+      quotaPeriods: { claude: "5h", codex: "7d" },
+    });
+  });
+
+  it("defaults invalid child quota values while retaining valid siblings", () => {
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({
+        relayDepthMax: 3,
+        childCap: true,
+        quotaTightBelowPct: 50,
+        quotaLowBelowPct: 60,
+        quotaFloorPct: -1,
+        quotaPeriods: {
+          claude: "5h",
+          codex: "bad period",
+          opencode: "x".repeat(33),
+          unknown: "month",
+        },
+      }),
+    );
+    expect(readSessionCollabPreferences()).toEqual({
+      ...SESSION_COLLAB_DEFAULTS,
+      relayDepthMax: 3,
+      quotaPeriods: { claude: "5h" },
+    });
+  });
 });

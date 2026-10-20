@@ -3398,6 +3398,7 @@ async def _persist_external_session_usage(
     conv: Conversation | None = None,
     user_id: str | None = None,
     host_installation_id: str | None = None,
+    quota_service: Any = None,
 ) -> int | None:
     """
     Persist and broadcast a token-usage update from a terminal-backed runtime.
@@ -3556,6 +3557,8 @@ async def _persist_external_session_usage(
             session_id,
             provider_usage_limits,
         )
+        if quota_service is not None and conv is not None:
+            await asyncio.to_thread(quota_service.report_claude, conv, provider_usage_limits)
         # Remove the legacy label after the metadata write. Old snapshots can
         # exceed conversation_labels.value (256 chars) and become invalid JSON.
         await asyncio.to_thread(

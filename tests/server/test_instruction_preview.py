@@ -29,7 +29,8 @@ def _revision(scope: str, text: str, *, agent_key: str = "", host_id: str = ""):
 
 
 @pytest.mark.parametrize("harness", ["codex-native", "claude-sdk", "opencode-native"])
-def test_preview_matches_composer_with_untrimmed_inner_layers(harness: str) -> None:
+@pytest.mark.parametrize("quota", ["", "Quota evidence"])
+def test_preview_matches_composer_with_untrimmed_inner_layers(harness: str, quota: str) -> None:
     spec = AgentSpec(spec_version=1, instructions=" Author ", spawn=True)
     layers = [
         _revision("shared", "  Shared  "),
@@ -47,8 +48,11 @@ def test_preview_matches_composer_with_untrimmed_inner_layers(harness: str) -> N
         has_parent=False,
         spawn=True,
         peer=False,
+        quota_line=quota,
     )
     route = "  Shared  \n\n  Agent  \n\n  Host  \n\n  Mother  "
+    if quota:
+        route += "\n\n" + quota
     if harness == "codex-native":
         expected = native_startup_instructions(spec, global_instructions=route)
     elif harness == "opencode-native":
