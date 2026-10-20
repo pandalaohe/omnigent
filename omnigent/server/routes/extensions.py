@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -14,6 +15,7 @@ from omnigent.extensions import ExtensionManifest, ExtensionPluginState, Externa
 from omnigent.extensions.assets import ASSET_SCRIPT, ASSET_STYLES, ResolvedBundle
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes.extension_proxy import create_extension_proxy_router
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -23,7 +25,7 @@ class ExtensionPageResponse(BaseModel):
     id: str
     title: str
     route: str
-    kind: Literal["view", "external"] = "view"
+    kind: Literal["view", "external", "proxied"] = "view"
     view: str | None
     url: str | None = None
 
@@ -111,9 +113,25 @@ def _serialize_manifest(
                 id=page.id,
                 title=page.title,
                 route=page.route,
-                kind="external" if isinstance(page, ExternalPageContribution) else "view",
+                kind=("proxied" if page.proxy else "external")
+                if isinstance(page, ExternalPageContribution)
+                else "view",
                 view=None if isinstance(page, ExternalPageContribution) else page.view,
-                url=page.url if isinstance(page, ExternalPageContribution) else None,
+                url=(
+                    urlunsplit(
+                        (
+                            "",
+                            "",
+                            f"/v1/extensions/{manifest.id}/proxy/{page.route}/",
+                            urlsplit(page.url).query,
+                            urlsplit(page.url).fragment,
+                        )
+                    )
+                    if page.proxy
+                    else page.url
+                )
+                if isinstance(page, ExternalPageContribution)
+                else None,
             )
             for page in sorted(manifest.pages, key=lambda item: item.id)
         ]
@@ -192,6 +210,7 @@ def create_extensions_router(
 ) -> APIRouter:
     """Build the installed-extension catalog router, mounted under ``/v1``."""
     router = APIRouter()
+    router.include_router(create_extension_proxy_router(state, auth_provider=auth_provider))
     resolved_bundles = bundles or {}
     catalog = tuple(
         _serialize_manifest(manifest, resolved_bundles.get(manifest.id))

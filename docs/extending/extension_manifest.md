@@ -120,10 +120,40 @@ The catalog preserves `id`, `title`, `route`, and `view` for view pages and adds
 | --- | --- | --- | --- |
 | Browser view | `"view"` | View symbol | `null` |
 | External page | `"external"` | `null` | Declared URL |
+| Server-proxied page | `"proxied"` | `null` | Omnigent proxy path |
 
 Web consumers treat missing `kind` as `"view"` for older catalogs. Unknown kinds
 show the not-found page. See the [trust model](extensions.md#trust-model) for
 framing restrictions and navigation limitations.
+
+### Server-proxied pages
+
+Set `ExternalPageContribution.proxy=ExternalPageProxy(...)` and grant both
+`pages.external` and `pages.proxy`. The URL selects a trusted HTTP(S) upstream
+root; an initial query or fragment is preserved in the catalog URL.
+
+```python
+ExternalPageProxy(
+    allowed_routes=(("GET", "/"), ("GET", "/api/summary.json"), ("POST", "/api/settings")),
+    request_headers=(("x-dashboard", "1"),),
+)
+```
+
+The catalog returns `/v1/extensions/{extension_id}/proxy/{route}/`. The server
+strips this prefix and preserves the query. Each request needs normal Omnigent
+authentication and an exact declared method/path pair; `GET /` must be declared.
+Paths are canonical ASCII absolute paths without traversal or percent encoding.
+Writes require a matching browser Origin and, when present, `Sec-Fetch-Site: same-origin`.
+
+The proxy forwards Content-Type and Accept, sets upstream Host and
+X-Forwarded-Prefix/Host/Proto, and rewrites write Origin to the upstream origin.
+`request_headers` adds static operator-declared headers; it never copies arbitrary
+browser headers. Browser Cookie, Authorization, and identity headers are discarded.
+Upstream Set-Cookie and redirect destinations are discarded; redirects return 502.
+Content-Type, Content-Language, CSP, and X-Frame-Options are retained. Responses use
+`Cache-Control: no-store`; upstream errors preserve their status, transport failures
+return 502, and timeouts return 504. Requests are limited to 1 MiB and decoded
+responses to 8 MiB. Upstreams must generate prefix-relative links themselves.
 
 ## Compatibility
 

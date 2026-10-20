@@ -18,6 +18,7 @@ class ExtensionPermission(StrEnum):
 
     NAVIGATION = "navigation"
     PAGES_EXTERNAL = "pages.external"
+    PAGES_PROXY = "pages.proxy"
     PROJECTS_READ = "projects.read"
     PROJECTS_WRITE = "projects.write"
     SESSIONS_READ = "sessions.read"
@@ -43,6 +44,18 @@ class PageContribution:
 
 
 @dataclass(frozen=True)
+class ExternalPageProxy:
+    """Exact method/path pairs exposed from an operator-trusted upstream page.
+
+    Proxied scripts run on the application's origin. Grant this capability only
+    to upstreams trusted with the same access as an installed browser extension.
+    """
+
+    allowed_routes: tuple[tuple[str, str], ...]
+    request_headers: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class ExternalPageContribution:
     """An external web page framed below the extension's namespaced route."""
 
@@ -50,6 +63,7 @@ class ExternalPageContribution:
     title: str
     route: str
     url: str
+    proxy: ExternalPageProxy | None = None
 
 
 @dataclass(frozen=True)

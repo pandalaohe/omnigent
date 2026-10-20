@@ -1,16 +1,24 @@
+import { withBasePath } from "@/lib/basePath";
 import type { ExtensionExternalPage } from "./types";
 
 export function ExternalPageView({ page }: { page: ExtensionExternalPage }) {
+  const proxied = page.kind === "proxied";
+  const navigationUrl = proxied ? withBasePath(page.url) : page.url;
+  const validProxyPath =
+    /^\/v1\/extensions\/[a-z0-9.-]+\/proxy\/[a-z0-9_-]+\/(?:\?[^#]*)?(?:#.*)?$/.test(page.url);
   let url: URL | null;
   try {
-    url = new URL(page.url);
+    url =
+      proxied && validProxyPath
+        ? new URL(navigationUrl, window.location.origin)
+        : new URL(page.url);
   } catch {
     url = null;
   }
   const error =
-    !url || (url.protocol !== "http:" && url.protocol !== "https:")
+    (proxied && !validProxyPath) || !url || (url.protocol !== "http:" && url.protocol !== "https:")
       ? "The page must use an absolute HTTP or HTTPS URL."
-      : url.origin === window.location.origin
+      : !proxied && url.origin === window.location.origin
         ? "External pages cannot use the application's own origin."
         : null;
 
@@ -34,13 +42,13 @@ export function ExternalPageView({ page }: { page: ExtensionExternalPage }) {
           type="button"
           className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
           onClick={() =>
-            window.open(page.url, "_blank", "popup,width=480,height=720,noopener,noreferrer")
+            window.open(navigationUrl, "_blank", "popup,width=480,height=720,noopener,noreferrer")
           }
         >
           Open in window
         </button>
         <a
-          href={page.url}
+          href={navigationUrl}
           target="_blank"
           rel="noopener noreferrer"
           className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
@@ -58,8 +66,8 @@ export function ExternalPageView({ page }: { page: ExtensionExternalPage }) {
       ) : (
         <iframe
           title={page.title}
-          src={page.url}
-          // Declared shell-origin URLs are refused before granting scripts and same-origin access.
+          src={navigationUrl}
+          // Proxied pages require an explicit operator-trusted server capability.
           // oxlint-disable-next-line react/iframe-missing-sandbox
           sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
           referrerPolicy="no-referrer"

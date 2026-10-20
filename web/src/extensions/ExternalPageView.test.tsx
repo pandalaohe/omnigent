@@ -31,11 +31,45 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  delete window.__OMNIGENT_BASE_PATH__;
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe("ExternalPageView", () => {
+  it("prefixes proxy frame, popup and tab URLs for a subpath deployment", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const url = "/v1/extensions/acme.dashboard/proxy/overview/?view=mini#details";
+    render(<ExternalPageView page={{ ...page, kind: "proxied", url }} />);
+    const expected = "/proxy/6767" + url;
+    expect(screen.getByTitle("Dashboard")).toHaveAttribute("src", expected);
+    expect(screen.getByRole("link", { name: "Open in new tab" })).toHaveAttribute("href", expected);
+    fireEvent.click(screen.getByRole("button", { name: "Open in window" }));
+    expect(open).toHaveBeenCalledExactlyOnceWith(
+      expected,
+      "_blank",
+      "popup,width=480,height=720,noopener,noreferrer",
+    );
+  });
+  it("frames a server proxy and keeps standalone navigation behind the same route", () => {
+    vi.stubGlobal("location", new URL("https://app.example.com/"));
+    const url = "/v1/extensions/acme.dashboard/proxy/overview/?view=mini#details";
+    render(<ExternalPageView page={{ ...page, kind: "proxied", url }} />);
+    expect(screen.getByTitle("Dashboard")).toHaveAttribute("src", url);
+    expect(screen.getByRole("link", { name: "Open in new tab" })).toHaveAttribute("href", url);
+  });
+
+  it.each([
+    "https://other.example.com/",
+    "/v1/sessions/",
+    "//other.example.com/",
+    "/v1/extensions/acme.dashboard/proxy/overview/../other/",
+  ])("refuses a proxied page outside its server route: %s", (url) => {
+    render(<ExternalPageView page={{ ...page, kind: "proxied", url }} />);
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByTitle("Dashboard")).toBeNull();
+  });
   it("frames the declared URL with a fixed sandbox and no referrer or device permissions", () => {
     render(<ExternalPageView page={page} />);
 
@@ -124,6 +158,12 @@ describe("ExternalPageView", () => {
 });
 
 describe("ExtensionPageHost", () => {
+  it("routes a proxied page without mounting the bundle host", () => {
+    const url = "/v1/extensions/acme.dashboard/proxy/overview/";
+    render(<ExtensionPageHost resolved={{ extension, page: { ...page, kind: "proxied", url } }} />);
+    expect(screen.getByTitle("Dashboard")).toHaveAttribute("src", url);
+    expect(viewHostMock).not.toHaveBeenCalled();
+  });
   it("routes external pages without mounting the bundle host", () => {
     render(<ExtensionPageHost resolved={{ extension, page }} />);
 
