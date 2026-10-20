@@ -13287,6 +13287,23 @@ def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
     )
 
 
+def test_slash_command_prompt_appearing_after_readiness_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt appearing before any command keys leaves the turn safe to retry."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+    monkeypatch.setattr(claude_native_bridge, "_reclaim_and_wait_for_prompt", lambda *a, **k: None)
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: True)
+
+    with pytest.raises(claude_native_bridge.ClaudeUserPromptPending) as error:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
+
+    assert error.value.nothing_typed is True
+    assert sends == []
+
+
 def test_inject_slash_command_fails_loud_when_dismissal_is_exhausted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

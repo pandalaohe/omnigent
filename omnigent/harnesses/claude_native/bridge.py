@@ -5204,7 +5204,8 @@ def inject_slash_command(
     )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
-            "Answer the pending Claude question or permission request before changing settings."
+            "Answer the pending Claude question or permission request before changing settings.",
+            nothing_typed=True,
         )
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
