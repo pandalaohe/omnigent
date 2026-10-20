@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
@@ -28,6 +29,7 @@ from omnigent.inner.pi_harness import _build_pi_executor
 from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
 from omnigent.onboarding.providers import ModelInfo
+from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
 
@@ -246,6 +248,9 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", home / ".pi" / "agent")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", home / ".pi" / "permission-bridge"
+    )
     monkeypatch.setenv("HARNESS_PI_SKILLS_FILTER", '"none"')
     if sandboxed:
         monkeypatch.setenv(
@@ -265,6 +270,10 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     if wire_api != "anthropic":
         monkeypatch.setenv("HARNESS_PI_GATEWAY_OPENAI_WIRE_API", wire_api)
     executor = _build_pi_executor()
+    write_host_permission_state(
+        bridge_dir_for_session_id(_SESSION_ID) / "permission_state.json",
+        HostPermissionState(_SESSION_ID, "gateway-test-host", str(workspace), "full", 1, "ready"),
+    )
     calls: list[str] = []
     tool_pids: list[int] = []
 

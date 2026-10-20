@@ -3042,6 +3042,8 @@ class PiExecutor(Executor):
         model: str | None,
         tools: list[ToolSpec],
         thinking: str | None = None,
+        *,
+        permission_bootstrap: bool = False,
     ) -> _PiRpcSession:
         """Get or create a Pi RPC subprocess for the given session.
 
@@ -3127,7 +3129,7 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
-            system_prompt_mode=self._system_prompt_mode,
+            system_prompt_mode="append" if permission_bootstrap else self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
         )
@@ -3164,7 +3166,7 @@ class PiExecutor(Executor):
             return False
         self._permission_session_id = session_id
         try:
-            await self._ensure_rpc(session_id, "", None, [])
+            await self._ensure_rpc(session_id, "", None, [], permission_bootstrap=True)
         except Exception:  # noqa: BLE001 - the harness returns an explicit failed bootstrap
             logger.warning("Pi permission bootstrap failed", exc_info=True)
             return False
