@@ -101,6 +101,8 @@ export function permissionModeConcept(
 export const AGY_NATIVE_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native.permission_tier";
 export const AGY_NATIVE_DEFAULT_PERMISSION_TIER = "auto";
 export const AGY_NATIVE_FULL_PERMISSION_TIER = "full";
+export const AGY_RESTRICTED_HOOK_RULE =
+  'AG 受限档启动前会检查第三方 PreToolUse hooks；发现启用的 hook 或配置不可读时拒绝启动，并提示名称和文件。可新建全放开会话，或在源文件把该 hook 设为 "enabled": false。插件筛选规则不豁免这项检查。其他事件不阻止启动；所有档位仍执行 Omnigent 独立策略。';
 export const AGY_NATIVE_PERMISSION_TIERS: NativeHarnessMode[] = [
   { value: "ask", label: "每次都问", description: "工具执行前逐次询问", args: [] },
   { value: "plan", label: "只规划", description: "仅规划与只读操作", args: [] },

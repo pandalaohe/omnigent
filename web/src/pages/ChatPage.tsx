@@ -150,6 +150,7 @@ import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import {
   AGY_NATIVE_PERMISSION_TIERS,
+  AGY_RESTRICTED_HOOK_RULE,
   NON_FULL_PERMISSION_TIERS,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
@@ -4612,7 +4613,14 @@ function ComposerImpl(
                   selectedValue={
                     showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
                   }
-                  options={permissionOptions}
+                  options={
+                    sessionHarness === "antigravity-native"
+                      ? permissionOptions.map((option) => ({
+                          ...option,
+                          description: `${option.description}。${AGY_RESTRICTED_HOOK_RULE}`,
+                        }))
+                      : permissionOptions
+                  }
                   disabledOptions={
                     showCodexApprovalMode && sessionHarness === "codex-native" ? ["read-only"] : []
                   }

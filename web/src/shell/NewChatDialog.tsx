@@ -282,6 +282,7 @@ import {
   normalizeAgyPermissionTier,
   AGY_NATIVE_PERMISSION_TIERS,
   AGY_NATIVE_FULL_PERMISSION_TIER,
+  AGY_RESTRICTED_HOOK_RULE,
   AUTO_PERMISSION_MODE,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
@@ -8379,6 +8380,11 @@ export function NewChatLandingScreen() {
           />
         </div>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
+          {selectedNativeHarness === "antigravity-native" && !autoRoutingSelected && (
+            <p role="note" className="text-xs text-muted-foreground">
+              {AGY_RESTRICTED_HOOK_RULE}
+            </p>
+          )}
           {supportsAgyPermissionTier && migratedFullProjectDefault && (
             <div role="status" className="rounded-md border border-border px-2 py-1.5 text-xs">
               项目原有的全放开默认值已迁为自动。若本次确需全放开，请在权限菜单中明确选择。

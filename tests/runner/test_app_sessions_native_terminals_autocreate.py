@@ -94,6 +94,47 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient, seed_pi_permission_state
 
 
+async def test_auto_create_agy_terminal_refuses_inline_pre_tool_hook(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from omnigent.harnesses.antigravity_native import bridge
+    from omnigent.runner.native.orchestration import _auto_create_antigravity_terminal
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    settings = home / ".gemini/antigravity-cli/settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "user-pre-tool": {
+                        "PreToolUse": [{"matcher": ".*", "hooks": [{"command": "true"}]}]
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    snapshot = {
+        "workspace": str(workspace),
+        "labels": {"omnigent.antigravity_native.permission_tier": "plan"},
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=snapshot)),
+        base_url="http://server",
+    ) as client:
+        with pytest.raises(ValueError, match="user-pre-tool"):
+            await _auto_create_antigravity_terminal(
+                "session",
+                Mock(spec=SessionResourceRegistry),
+                lambda *_: None,
+                server_client=client,
+            )
+
+
 async def _no_op_forwarder(**kwargs: Any) -> None:
     del kwargs
 

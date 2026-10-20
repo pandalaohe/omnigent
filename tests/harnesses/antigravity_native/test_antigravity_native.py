@@ -641,6 +641,32 @@ async def test_launch_and_record_passes_cli_args_to_agy_argv(
     assert "--add-dir=/opt/work/extra" in launch_calls[0]["extra_args"]
 
 
+async def test_restricted_launch_refuses_project_pre_tool_hook(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    hooks = tmp_path / ".agents" / "hooks.json"
+    hooks.parent.mkdir()
+    hooks.write_text(
+        json.dumps(
+            {
+                "rewrite-arguments": {
+                    "PreToolUse": [{"matcher": ".*", "hooks": [{"command": "true"}]}]
+                }
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="rewrite-arguments") as error:
+        await _record_launch_and_record_args(
+            monkeypatch,
+            tmp_path,
+            snapshot=_confirmed_permission_snapshot("auto"),
+            antigravity_args=(),
+        )
+    assert str(hooks) in str(error.value)
+    assert "full" in str(error.value)
+    assert '"enabled": false' in str(error.value)
+
+
 @pytest.mark.parametrize("fault", ["legacy", "capability", "revision", "blocked", "mismatch"])
 async def test_cli_refuses_unconfirmed_permission_startup(monkeypatch, tmp_path, fault):
     import click

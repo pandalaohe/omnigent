@@ -6893,10 +6893,14 @@ async def _auto_create_antigravity_terminal(
     # (file I/O) and done BEFORE terminal launch so agy sees the config on its
     # first MCP scan.
     await asyncio.to_thread(write_mcp_config, bridge_dir)
+    tier = resolve_agy_permission_tier(
+        labels if isinstance(labels, dict) else None, terminal_launch_args
+    )
     env_overrides = await asyncio.to_thread(
         seed_isolated_agy_home,
         bridge_dir,
         trusted_workspace=workspace,
+        permission_tier=tier,
     )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
@@ -6906,9 +6910,6 @@ async def _auto_create_antigravity_terminal(
     # /.gemini/antigravity-cli/settings.json to its arg), NOT the user's real
     # HOME — env_overrides no longer carries a HOME key.
     await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
-    tier = resolve_agy_permission_tier(
-        labels if isinstance(labels, dict) else None, terminal_launch_args
-    )
     await asyncio.to_thread(apply_agy_permission_tier, bridge_dir, tier)
     # The resolved tier is the single source for the skip-permissions flag; a
     # copy persisted in the launch args must not survive a later non-full tier.

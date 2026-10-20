@@ -2015,6 +2015,8 @@ describe("Antigravity fork controls", () => {
     ["", false, "ask"],
   ])("inherits an untouched tier %s", async (tier, skip, expected) => {
     seedAgy(tier, skip);
+    expect(screen.getByRole("note")).toHaveTextContent("PreToolUse");
+    expect(screen.getByRole("note")).toHaveTextContent('"enabled": false');
     expect(screen.getByTestId("fork-session-config-model")).toBeVisible();
     expect(screen.getByTestId("fork-session-config-effort")).toBeVisible();
     fireEvent.click(screen.getByTestId("fork-session-submit"));

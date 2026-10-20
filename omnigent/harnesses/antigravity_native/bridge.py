@@ -580,6 +580,15 @@ def apply_agy_permission_tier(bridge_dir: Path, tier: str) -> None:
         allow.append("mcp(omnigent/*)")
     permissions["allow"] = allow
     settings["permissions"] = permissions
+    hooks["omnigent-guard"] = _agy_guard_hook(bridge_dir)
+    _write_agy_permission_file(
+        settings_path, json.dumps(settings, indent=2, sort_keys=True) + "\n"
+    )
+    _write_agy_permission_file(hooks_path, json.dumps(hooks, indent=2, sort_keys=True) + "\n")
+    reassert_agy_permission_tier(bridge_dir, tier)
+
+
+def _agy_guard_hook(bridge_dir: Path) -> dict[str, object]:
     command = shlex.join(
         [
             sys.executable,
@@ -589,7 +598,7 @@ def apply_agy_permission_tier(bridge_dir: Path, tier: str) -> None:
             str((bridge_dir / "permission_tier").absolute()),
         ]
     )
-    hooks["omnigent-guard"] = {
+    return {
         "enabled": True,
         "PreToolUse": [
             {
@@ -604,11 +613,6 @@ def apply_agy_permission_tier(bridge_dir: Path, tier: str) -> None:
             }
         ],
     }
-    _write_agy_permission_file(
-        settings_path, json.dumps(settings, indent=2, sort_keys=True) + "\n"
-    )
-    _write_agy_permission_file(hooks_path, json.dumps(hooks, indent=2, sort_keys=True) + "\n")
-    reassert_agy_permission_tier(bridge_dir, tier)
 
 
 def build_mcp_config(
@@ -721,6 +725,7 @@ def seed_isolated_agy_home(
     bridge_dir: Path,
     *,
     trusted_workspace: Path | str | None = None,
+    permission_tier: str | None = None,
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
@@ -747,6 +752,12 @@ def seed_isolated_agy_home(
     :returns: Env overrides to layer onto the agy launch environment. Currently
         empty because ``HOME`` must stay real for platform auth.
     """
+    from omnigent.harnesses.antigravity_native.hook_sources import check_agy_hook_sources
+
+    if permission_tier is not None:
+        if trusted_workspace is None:
+            raise ValueError("Antigravity permission startup requires an explicit workspace")
+        check_agy_hook_sources(Path(trusted_workspace), permission_tier, bridge_dir)
     real_home = Path.home()
     iso_gemini = agy_gemini_dir(bridge_dir)
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -779,6 +790,10 @@ def seed_isolated_agy_home(
 
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
+
+    if permission_tier is not None:
+        assert trusted_workspace is not None
+        check_agy_hook_sources(Path(trusted_workspace), permission_tier, bridge_dir)
 
     return {}
 

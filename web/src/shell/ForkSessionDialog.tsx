@@ -56,6 +56,7 @@ import {
   AGY_NATIVE_DEFAULT_PERMISSION_TIER,
   AGY_NATIVE_PERMISSION_TIERS,
   AGY_NATIVE_FULL_PERMISSION_TIER,
+  AGY_RESTRICTED_HOOK_RULE,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
@@ -688,6 +689,11 @@ function ForkRunConfig({
 
       {hasAgyPermissionTier && (
         <>
+          {targetHarness === "antigravity-native" && (
+            <p role="note" className="text-xs text-muted-foreground">
+              {AGY_RESTRICTED_HOOK_RULE}
+            </p>
+          )}
           {sourceSession?.permissionTier === "full" &&
             mode === AGY_NATIVE_DEFAULT_PERMISSION_TIER && (
               <p role="status" className="text-xs text-muted-foreground">

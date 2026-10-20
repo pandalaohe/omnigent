@@ -2282,6 +2282,8 @@ describe("NewChatLandingScreen create flow", () => {
       } as unknown as Response);
       renderLanding();
       await waitForWorkspaceSeed();
+      expect(screen.getByRole("note")).toHaveTextContent("PreToolUse");
+      expect(screen.getByRole("note")).toHaveTextContent('"enabled": false');
       pickPermissionOption(tier);
       typeMessage("go");
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
