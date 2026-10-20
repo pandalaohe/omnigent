@@ -8,7 +8,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import psutil
 import pytest
@@ -31,8 +31,12 @@ from tests.harnesses.codex_native.app_server._support import (
 )
 
 
+@pytest.mark.parametrize("inheritance_fails", [False, True])
 async def test_start_reuses_initialized_readiness_client_for_hook_trust(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inheritance_fails: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Startup trusts hooks over the readiness connection, then closes it."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -47,6 +51,7 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
         return (0, 147, 0)
 
     startup_client = _FakeStartupClient()
+    monkeypatch.setattr(startup_client, "request", AsyncMock(), raising=False)
     trusted_with: list[object] = []
 
     async def _ready(_self: CodexNativeAppServer) -> _FakeStartupClient:
@@ -60,6 +65,10 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
     monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
     monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready)
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _trust)
+    inherit = AsyncMock()
+    if inheritance_fails:
+        inherit.side_effect = RuntimeError("hook RPC unavailable")
+    monkeypatch.setattr(codex_native_app_server, "inherit_codex_hook_approvals", inherit)
     server = _test_app_server(
         tmp_path,
         tmp_path / "codex-home",
@@ -70,7 +79,15 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
     await server.start()
     try:
         assert trusted_with == [startup_client]
+        inherit.assert_awaited_once_with(
+            startup_client.request,
+            cwd=str(workspace),
+            source_home=source_home,
+            private_home=server.codex_home,
+        )
         assert startup_client.close_calls == 1
+        if inheritance_fails:
+            assert "Codex user hook approval inheritance failed" in caplog.text
     finally:
         await server.close()
 

@@ -1285,15 +1285,13 @@ def _populate_codex_home_config(
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
-      enforcement isolated between concurrent sessions. Hook-trust keys inside
-      the copy are rewritten to reference the private home's paths so Codex
-      recognises previously-trusted hooks without an interactive prompt. An
+      enforcement isolated between concurrent sessions. Source hook approvals
+      are inherited through the app-server RPC after initialization. An
       existing private copy keeps its own keys across launches, except the
       lane-owned ``[agents]`` subagent role defaults, which are re-synced
       from the source.
     - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
-      available at the same path within the private home that the rewritten
-      trust keys reference.
+      available within the private home.
     - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
       are respected.
     - ``memories/`` and ``rules/`` are **symlinked** so file-based memories
@@ -3412,6 +3410,18 @@ class _CodexAppServerSession:
             ) >= (0, 142, 0)
             self._containment_confirmed = self._worker_launch.sandboxed
             self._started = True
+            if self._signer is None and not codex_minimal_config_requested():
+                from omnigent.harnesses.codex_native.app_server import inherit_codex_hook_approvals
+
+                try:
+                    await inherit_codex_hook_approvals(
+                        self._request,
+                        cwd=self._cwd or os.getcwd(),
+                        source_home=config_source,
+                        private_home=self._codex_home_dir,
+                    )
+                except Exception:  # noqa: BLE001 - user hook failure never blocks startup
+                    logger.warning("Codex user hook approval inheritance failed", exc_info=True)
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
                 # routing hooks need the trust handshake to be enforced.

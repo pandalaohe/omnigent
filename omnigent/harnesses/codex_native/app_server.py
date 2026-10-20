@@ -2487,6 +2487,18 @@ class CodexNativeAppServer:
                 _proc.native_server_pid, proc.pid, "app-server"
             )
             try:
+                if not minimal_config:
+                    try:
+                        await inherit_codex_hook_approvals(
+                            startup_client.request,
+                            cwd=str(self.cwd),
+                            source_home=config_source,
+                            private_home=self.codex_home,
+                        )
+                    except Exception:  # noqa: BLE001 - user hook failure never blocks startup
+                        _logger.warning(
+                            "Codex user hook approval inheritance failed", exc_info=True
+                        )
                 # Standalone CLI launches may have no shared catalog snapshot.
                 # Correct their copied defaults before a TUI creates its thread.
                 if (
@@ -3262,6 +3274,91 @@ async def _persist_hook_trust(request: CodexRequestFn, untrusted: Sequence[_Json
             "reloadUserConfig": True,
         },
     )
+
+
+async def inherit_codex_hook_approvals(
+    request: CodexRequestFn, *, cwd: str, source_home: Path, private_home: Path
+) -> None:
+    """Inherit source-home approvals via Codex's RPC, never approve a new definition.
+
+    Generated hooks precede user groups, so a key's group index can move.
+    Match the appended source groups before translating indices; Codex's
+    currentHash must still equal the user's persisted approval.
+    """
+    source_path = source_home / "hooks.json"
+    private_path = private_home / "hooks.json"
+    try:
+        config = tomlkit.parse((source_home / "config.toml").read_text(encoding="utf-8"))
+        state = config.get("hooks", {}).get("state", {})
+        source = json.loads(source_path.read_text(encoding="utf-8"))["hooks"]
+        private = json.loads(private_path.read_text(encoding="utf-8"))["hooks"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return
+    if not all(isinstance(value, Mapping) for value in (state, source, private)):
+        return
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    inherited: dict[str, _JsonObject] = {}
+    for hook in _our_hooks_from_list(listed, cwd, None):
+        key = hook.get("key")
+        event = hook.get("eventName")
+        if (
+            hook.get("sourcePath") != str(private_path)
+            or not isinstance(key, str)
+            or not isinstance(event, str)
+        ):
+            continue
+        parts = key.rsplit(":", 3)
+        if len(parts) != 4 or parts[0] != str(private_path):
+            continue
+        _, event_key, group_index, handler_index = parts
+        if not group_index.isdecimal() or not handler_index.isdecimal():
+            continue
+        # RPC uses lower camel case; hooks.json uses upper camel case.
+        event_name = event[:1].upper() + event[1:]
+        source_groups = source.get(event_name)
+        private_groups = private.get(event_name)
+        if not isinstance(source_groups, list) or not isinstance(private_groups, list):
+            continue
+        offset = len(private_groups) - len(source_groups)
+        index = int(group_index) - offset
+        if (
+            not source_groups
+            or offset < 0
+            or private_groups[offset:] != source_groups
+            or not 0 <= index < len(source_groups)
+        ):
+            continue
+        approval = state.get(f"{source_path}:{event_key}:{index}:{handler_index}")
+        if not isinstance(approval, Mapping):
+            continue
+        current_hash = hook.get("currentHash")
+        update: _JsonObject = {}
+        if current_hash and approval.get("trusted_hash") == current_hash:
+            if hook.get("trustStatus") not in _TRUSTED_HOOK_STATUSES:
+                update["trusted_hash"] = current_hash
+        # A disabled source hook must not become enabled under its new key.
+        if approval.get("enabled") is False:
+            update["enabled"] = False
+        if update:
+            inherited[key] = update
+    if inherited:
+        await request(
+            "config/batchWrite",
+            {
+                "edits": [
+                    {"keyPath": "hooks.state", "mergeStrategy": "upsert", "value": inherited}
+                ],
+                "reloadUserConfig": True,
+            },
+        )
+        relisted = await request("hooks/list", {"cwds": [cwd]})
+        observed = {str(h.get("key")): h for h in _our_hooks_from_list(relisted, cwd, None)}
+        for key, update in inherited.items():
+            hook = observed.get(key, {})
+            if (
+                "trusted_hash" in update and hook.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+            ) or ("enabled" in update and hook.get("enabled") != update["enabled"]):
+                _logger.warning("Codex inherited hook approval did not take effect: %s", key)
 
 
 async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:

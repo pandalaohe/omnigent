@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import (
+    inherit_codex_hook_approvals,
     trust_all_codex_hooks,
     trust_codex_router_hooks,
 )
@@ -34,6 +35,79 @@ _ROUTER_GATE_COMMAND = (
     "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
     "route-subagent --bridge-dir /b --harness codex-native"
 )
+
+
+@pytest.mark.parametrize("storage", ["copy", "symlink", "merged"])
+@pytest.mark.parametrize(
+    "approval", ["matching", "changed", "missing", "disabled", "rejected", "disable_rejected"]
+)
+async def test_inherit_user_hook_approval(
+    tmp_path: Path, storage: str, approval: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only a matching source approval authorizes the private hook, even after merging."""
+    import json
+
+    import tomlkit
+
+    source = tmp_path / "source"
+    private = tmp_path / "private"
+    source.mkdir()
+    private.mkdir()
+    group = {"hooks": [{"type": "command", "command": "echo ready"}]}
+    (source / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [group]}}))
+    groups = (
+        [{"hooks": [{"type": "command", "command": "echo framework"}]}]
+        if storage == "merged"
+        else []
+    )
+    (private / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [*groups, group]}}))
+    if storage == "symlink":
+        (private / "hooks.json").unlink()
+        (private / "hooks.json").symlink_to(source / "hooks.json")
+    source_key = f"{source / 'hooks.json'}:session_start:0:0"
+    key = f"{private / 'hooks.json'}:session_start:{len(groups)}:0"
+    state = {"trusted_hash": "sha256:old" if approval == "changed" else "sha256:ready"}
+    if approval in {"disabled", "disable_rejected"}:
+        state["enabled"] = False
+    config = {"hooks": {"state": {} if approval == "missing" else {source_key: state}}}
+    original = tomlkit.dumps(config)
+    (source / "config.toml").write_text(original)
+    hook = _hook(
+        key,
+        "echo ready",
+        "trusted" if approval == "disable_rejected" else "untrusted",
+        "sha256:ready",
+    )
+    hook.update(sourcePath=str(private / "hooks.json"), eventName="sessionStart", enabled=True)
+    project_hook = dict(
+        hook,
+        key="/opt/work/project/hooks.json:session_start:0:0",
+        sourcePath="/opt/work/project/hooks.json",
+        trustStatus="untrusted",
+    )
+    client = _FakeCodexClient(
+        hooks=[hook, project_hook], flip_on_trust=approval not in {"rejected", "disable_rejected"}
+    )
+
+    await inherit_codex_hook_approvals(
+        client.request, cwd=_CWD, source_home=source, private_home=private
+    )
+
+    writes = _batchwrite_calls(client)
+    if approval in {"matching", "disabled", "rejected", "disable_rejected"}:
+        expected = {} if approval == "disable_rejected" else {"trusted_hash": "sha256:ready"}
+        if approval in {"disabled", "disable_rejected"}:
+            expected["enabled"] = False
+        assert writes[0].params["edits"][0]["value"] == {key: expected}
+        assert writes[0].params["reloadUserConfig"] is True
+    else:
+        assert writes == []
+    assert (source / "config.toml").read_text() == original
+    assert project_hook["trustStatus"] == "untrusted"
+    if approval == "disabled":
+        assert hook["enabled"] is False
+    if approval in {"rejected", "disable_rejected"}:
+        assert "inherited hook approval did not take effect" in caplog.text
 
 
 async def test_router_hooks_are_trusted_via_batchwrite() -> None:
