@@ -279,8 +279,8 @@ def _encode_session_state(
 # scan can run unbounded and — since the query runs in a worker thread — a
 # client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
 # a degraded deployment fails the search fast instead of pinning a DB
-# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
-# to the connection's next pooled use. Longer than the client's own
+# connection on PostgreSQL and CockroachDB. ``SET LOCAL`` reverts on commit so
+# it never leaks to the connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
@@ -3111,7 +3111,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not query or limit <= 0:
             return []
         with self._conv_session("search_visible_conversation_items_literal") as session:
-            if session.bind is not None and session.bind.dialect.name == "postgresql":
+            if session.bind is not None and is_postgresql_family(session.bind.dialect.name):
                 session.execute(
                     text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
                 )
@@ -3844,7 +3844,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         agent_ids_for_name: list[str] = []
 
         with self._session("list_archived_facets_metadata_filters") as meta_sess:
-            if meta_sess.bind is not None and meta_sess.bind.dialect.name == "postgresql":
+            if meta_sess.bind is not None and is_postgresql_family(meta_sess.bind.dialect.name):
                 meta_sess.execute(
                     text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
                 )
@@ -4009,7 +4009,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         agent_ids: set[str] = set()
 
         with self._conv_session("list_archived_facets") as ap_sess:
-            if ap_sess.bind is not None and ap_sess.bind.dialect.name == "postgresql":
+            if ap_sess.bind is not None and is_postgresql_family(ap_sess.bind.dialect.name):
                 ap_sess.execute(
                     text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
                 )
@@ -4392,8 +4392,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             # The working tree matches wherever the launch directory does, so a
             # search for a worktree path finds an entry-started session too.
             with self._session("list_conversations") as meta_sess:
-                is_meta_postgres = (
-                    meta_sess.bind is not None and meta_sess.bind.dialect.name == "postgresql"
+                is_meta_postgres = meta_sess.bind is not None and is_postgresql_family(
+                    meta_sess.bind.dialect.name
                 )
                 if is_meta_postgres:
                     meta_sess.execute(
@@ -4418,7 +4418,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 workspace_matching_ids = list(meta_sess.execute(workspace_stmt).scalars())
 
         with self._conv_session("list_conversations") as session:
-            # Bound the content-search scan server-side (Postgres only). SET
+            # Bound the content-search scan on PostgreSQL and CockroachDB. SET
             # LOCAL scopes to this transaction and reverts on commit, so it
             # can't leak to the connection's next pooled use. See
             # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
