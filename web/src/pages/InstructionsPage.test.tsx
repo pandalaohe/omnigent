@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstructionsPage } from "./InstructionsPage";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
   InstructionLayer,
   InstructionLayers,
@@ -81,7 +82,9 @@ function Location() {
 function page(url = "/settings/instructions") {
   return render(
     <MemoryRouter initialEntries={[url]}>
-      <InstructionsPage />
+      <TooltipProvider>
+        <InstructionsPage />
+      </TooltipProvider>
       <Location />
     </MemoryRouter>,
   );
@@ -128,6 +131,51 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("InstructionsPage", () => {
+  it.each([
+    { total: 9999, compact: null },
+    { total: 10000, compact: null },
+    { total: 10001, compact: "10.0k" },
+    { total: 11234, compact: "11.2k" },
+    { total: 123456, compact: "123.5k" },
+  ])("only shows a compact warning total above the limit: $total", ({ total, compact }) => {
+    mocks.layers!.route_sizes = [{ host_id: "host-a", agent_key: "codex", total_chars: total }];
+    page();
+    const warning = screen.queryByRole("button", { name: /instruction characters/ });
+    if (compact === null) expect(warning).not.toBeInTheDocument();
+    else {
+      expect(warning).toHaveTextContent(compact);
+      expect(warning).toHaveClass("text-warning");
+    }
+    expect(screen.queryByText("Over 10,000")).not.toBeInTheDocument();
+  });
+  it("explains the exact total and included sections in the warning tooltip", async () => {
+    mocks.layers!.route_sizes = [
+      { host_id: "host-a", agent_key: "codex", total_chars: 11234, over_budget: true },
+    ];
+    page();
+    fireEvent.focus(screen.getByRole("button", { name: "11,234 instruction characters" }));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("11,234 characters");
+    expect(tooltip).toHaveTextContent("largest of top-level and child-session totals");
+    expect(tooltip).toHaveTextContent("including built-in sections");
+    expect(tooltip).toHaveTextContent("never truncated");
+  });
+  it("qualifies the count when built-in sections could not be counted", async () => {
+    mocks.layers!.route_sizes = [
+      {
+        host_id: "host-a",
+        agent_key: "codex",
+        total_chars: 11234,
+        framework_unavailable: true,
+      },
+    ];
+    page();
+    fireEvent.focus(screen.getByRole("button", { name: "11,234 instruction characters" }));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Built-in sections are unavailable and not counted");
+    expect(tooltip).not.toHaveTextContent("including built-in sections");
+    expect(tooltip).toHaveTextContent("never truncated");
+  });
   it("includes managed hosts in the matrix and route picker", async () => {
     page();
     expect(screen.getByRole("button", { name: "Edit Cloud / Codex" })).toBeInTheDocument();
