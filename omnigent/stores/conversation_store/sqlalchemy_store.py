@@ -1876,6 +1876,38 @@ class SqlAlchemyConversationStore(ConversationStore):
                 result[parent_id].append(child_id)
         return result
 
+    def count_counted_children(self, parent_conversation_id: str) -> int:
+        """Count unarchived direct children without a named sub-agent binding."""
+        with self._conv_session("count_counted_children") as ap_sess:
+            ids = (
+                ap_sess.execute(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.parent_conversation_id == parent_conversation_id,
+                        SqlConversation.archived.is_(False),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if not ids:
+            return 0
+        # Metadata can live in a separate database, so join the id-only AP
+        # result in batches instead of joining tables across engines.
+        count = 0
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            with self._session("count_counted_children_metadata") as meta_sess:
+                rows = meta_sess.execute(
+                    select(SqlConversationMetadata.id, SqlConversationMetadata.sub_agent_name)
+                    .where(SqlConversationMetadata.workspace_id == current_workspace_id())
+                    .where(SqlConversationMetadata.id.in_(batch))
+                ).all()
+            count += sum(name is None for _, name in rows)
+            # Legacy AP rows with no metadata are unnamed by definition.
+            count += len(batch) - len(rows)
+        return count
+
     def list_child_conversation_ids_page(
         self,
         parent_conversation_id: str,

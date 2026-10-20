@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sqlalchemy.exc import StatementError
@@ -78,7 +79,11 @@ async def resolve_instruction_route(conversation: Conversation) -> InstructionRo
 
 
 def route_session_text(
-    store: GlobalInstructionsStore, route: InstructionRoute, *, has_parent: bool
+    store: GlobalInstructionsStore,
+    route: InstructionRoute,
+    *,
+    has_parent: bool,
+    quota_line: str = "",
 ) -> str | None:
     """Compose user layers and the exclusive role without changing the runner envelope."""
     text = compose_route(store.latest_layers(route.host_id, route.agent_key)).text
@@ -90,19 +95,30 @@ def route_session_text(
         spawn=route.spawn,
         mother_text=block.text if block is not None and role == "mother" else "",
         child_text=block.text if block is not None and role == "child" else "",
+        quota_line=quota_line,
     )
     return result or None
 
 
-async def session_instructions_text(conversation: Conversation) -> str | None:
+async def session_instructions_text(
+    conversation: Conversation,
+    *,
+    quota_resolver: Callable[[Conversation], str] | None = None,
+) -> str | None:
     """Return the newly initialized session's route text, or no injection if disabled."""
     store = get_global_instructions_store()
     if store is None:
         return None
     route = await resolve_instruction_route(conversation)
-    return await asyncio.to_thread(
-        route_session_text,
-        store,
-        route,
-        has_parent=conversation.parent_conversation_id is not None,
-    )
+
+    def compose() -> str | None:
+        has_parent = conversation.parent_conversation_id is not None
+        mother = store.current(scope="mother") if not has_parent and route.spawn else None
+        line = (
+            quota_resolver(conversation)
+            if quota_resolver is not None and mother is not None and mother.text.strip()
+            else ""
+        )
+        return route_session_text(store, route, has_parent=has_parent, quota_line=line)
+
+    return await asyncio.to_thread(compose)

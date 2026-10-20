@@ -305,6 +305,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # via the JSON POST /v1/sessions create — same server-permission posture
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
+_CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
 
 # Both sys_session_create create shapes (JSON and config_path multipart)
 # carry the agent-origin marker: the server charges the owner's open-rate
@@ -528,6 +529,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _CHILD_CAP_TOOLS
     | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -999,6 +1001,7 @@ _ALL_LOCAL_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _CHILD_CAP_TOOLS
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -5724,6 +5727,8 @@ async def _execute_session_create(
         return json.dumps({"error": "access_denied", "agent_id": agent_id, "detail": resp.text})
     if resp.status_code == 429:
         return _open_rate_error(resp)
+    if resp.status_code == 409 and (cap_error := _child_cap_error(resp)) is not None:
+        return cap_error
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text}
@@ -5860,6 +5865,8 @@ async def _upload_config_bundle(
         )
     if resp.status_code == 429:
         return _open_rate_error(resp)
+    if resp.status_code == 409 and (cap_error := _child_cap_error(resp)) is not None:
+        return cap_error
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text}
@@ -8306,6 +8313,54 @@ async def _agent_list_host_readiness(
     return None
 
 
+async def _agent_quotas_via_rest(
+    client: httpx.AsyncClient, conversation_id: str | None
+) -> _JsonObject:
+    if conversation_id is None:
+        return {}
+    try:
+        async with asyncio.timeout(2):
+            response = await client.get(f"/v1/sessions/{conversation_id}/agent-quota")
+            response.raise_for_status()
+            payload = _string_object_dict(response.json()) or {}
+            return _string_object_dict(payload.get("agents")) or {}
+    except Exception:  # noqa: BLE001 — quota is advisory, discovery remains usable
+        return {}
+
+
+def _child_cap_error(response: httpx.Response) -> str | None:
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(detail, dict) and detail.get("code") == "child_cap":
+        return json.dumps({"error": "child_cap", "message": detail.get("message")})
+    return None
+
+
+async def _execute_child_cap(
+    args: _JsonObject, client: httpx.AsyncClient | None, conversation_id: str | None
+) -> str:
+    if client is None or conversation_id is None:
+        return json.dumps({"error": "sys_child_cap requires server access and a session id"})
+    cap = args.get("cap")
+    if "cap" in args and not (
+        cap == "none" or (isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1)
+    ):
+        return json.dumps({"error": "cap must be a positive integer or 'none'"})
+    path = f"/v1/sessions/{conversation_id}/child-cap"
+    try:
+        response = (
+            await client.patch(path, json={"cap": cap}, timeout=30)
+            if "cap" in args
+            else await client.get(path, timeout=30)
+        )
+        response.raise_for_status()
+        return json.dumps(response.json())
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_child_cap failed: {exc}"})
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -8355,7 +8410,7 @@ async def _agent_list_via_rest(
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
-    builtins_page, sessions_page, local_configs, readiness, family = await asyncio.gather(
+    builtins_page, sessions_page, local_configs, readiness, family, quotas = await asyncio.gather(
         _agent_list_fetch(
             "/v1/agents",
             server_client,
@@ -8373,6 +8428,7 @@ async def _agent_list_via_rest(
         asyncio.to_thread(_scan_local_agent_configs, configs_dir),
         _agent_list_host_readiness(server_client, conversation_id),
         _spawn_family(server_client, conversation_id),
+        _agent_quotas_via_rest(server_client, conversation_id),
     )
     local_state, local_after = cursor_state["local_configs"]
     if local_state == _DISCOVERY_END:
@@ -8392,11 +8448,26 @@ async def _agent_list_via_rest(
     from omnigent.harness_availability import harness_launch_availability
 
     for row in listing["builtins"]:
+        from omnigent.runtime.instruction_layers import agent_key_for_harness
+
         available, reason = harness_launch_availability(
             _optional_string(row.get("harness")), readiness
         )
         row["available_on_host"] = available
         row["unavailable_reason"] = reason
+        product = agent_key_for_harness(_optional_string(row.get("harness")))
+        quota = _string_object_dict(quotas.get(product)) if product else None
+        if quota is not None:
+            quota = dict(quota)
+            windows = quota.get("windows")
+            if isinstance(windows, list):
+                severity = {"exhausted": 0, "low": 1, "tight": 2, "ok": 3, "unknown": 4}
+                evidence = [w for w in windows if isinstance(w, dict)]
+                evidence.sort(
+                    key=lambda w: (severity.get(str(w.get("state")), 4), w.get("pace_pct") or 0)
+                )
+                quota["windows"] = evidence[:4]
+        row["quota"] = quota
     return _bounded_discovery_result(
         listing,
         limit=limit,
@@ -9646,6 +9717,8 @@ async def execute_tool(
                 _note_member_dispatch_failure(conversation_id, args.get("agent"), output)
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
+        elif tool_name in _CHILD_CAP_TOOLS:
+            output = await _execute_child_cap(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,

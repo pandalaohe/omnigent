@@ -155,4 +155,49 @@ async def test_discovery_reads_run_concurrently(monkeypatch: pytest.MonkeyPatch)
             conversation_id="child",
         )
     assert not timeouts
-    assert arrived == {"/v1/agents", "/v1/sessions", "/v1/hosts/host_test"}
+    assert arrived == {
+        "/v1/agents",
+        "/v1/sessions",
+        "/v1/hosts/host_test",
+        "/v1/sessions/child/agent-quota",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quota_status", [200, 500])
+async def test_discovery_quota_failure_is_advisory(quota_status):
+    def handle(request):
+        path = request.url.path
+        if path == "/v1/agents":
+            return httpx.Response(
+                200, json={"data": [{"id": "agent", "name": "Codex", "harness": "codex-native"}]}
+            )
+        if path.endswith("/agent-quota"):
+            return httpx.Response(
+                quota_status,
+                json={
+                    "agents": {
+                        "codex": {
+                            "state": "low",
+                            "pace_pct": 10,
+                            "deciding_window": "7d",
+                            "windows": [],
+                        }
+                    }
+                },
+            )
+        return httpx.Response(200, json={"data": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_agent_list",
+                arguments="{}",
+                server_client=client,
+                conversation_id="child",
+            )
+        )
+    quota = result["builtins"][0]["quota"]
+    assert (quota["state"] if quota else None) == ("low" if quota_status == 200 else None)

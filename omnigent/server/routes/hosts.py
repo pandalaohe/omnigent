@@ -28,7 +28,7 @@ from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.cli_retention import DEFAULT_CLI_RETENTION_POLICY, CliRetentionPolicy
-from omnigent.codex_rate_limits import CODEX_RATE_LIMITS_HARD_TTL_S
+from omnigent.codex_rate_limits import fresh_codex_rate_limits
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
     add_audit_attrs,
@@ -1252,15 +1252,7 @@ def create_hosts_router(
         response.headers["Cache-Control"] = "private, no-store"
         conn = host_registry.get(host.host_id)
         snapshot = conn.hello.codex_rate_limits if conn is not None else None
-        captured_at = snapshot.get("captured_at") if isinstance(snapshot, dict) else None
-        current_time = now_epoch()
-        if (
-            not isinstance(captured_at, int)
-            or captured_at > current_time + 300
-            or current_time - captured_at > CODEX_RATE_LIMITS_HARD_TTL_S
-        ):
-            snapshot = None
-        return {"rate_limits": snapshot}
+        return {"rate_limits": fresh_codex_rate_limits(snapshot, now=now_epoch())}
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(

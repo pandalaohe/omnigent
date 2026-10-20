@@ -9,8 +9,9 @@ import json
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from typing import Any, Literal
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Annotated, Any, Literal
 
 import httpx
 from fastapi import (
@@ -25,7 +26,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent._wrapper_labels import (
@@ -99,6 +100,12 @@ from omnigent.server.background_session_titles import (
     BackgroundTitleRequest,
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
+from omnigent.server.child_cap import (
+    CHILD_CAP_LABEL_KEY,
+    ChildCapLocks,
+    child_cap_for,
+    complete_child_write,
+)
 from omnigent.server.child_keep_warm import (
     keep_warm_family_for_harness,
     keep_warm_family_from_labels,
@@ -490,6 +497,13 @@ def _sound_alert_primary_device_id(app_state: Any, owner: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+class ChildCapPatch(BaseModel):
+    """A session override; 'none' explicitly removes the owner's limit."""
+
+    model_config = ConfigDict(extra="forbid")
+    cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"]
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -515,6 +529,53 @@ def register_core_routes(
     model_refresh_inflight: WorkspaceScopedCache[str, asyncio.Task[list[dict[str, Any]]]] = (
         WorkspaceScopedCache()
     )
+    child_cap_locks = ChildCapLocks()
+
+    @router.get("/sessions/{session_id}/child-cap", include_in_schema=False)
+    async def get_child_cap(request: Request, session_id: str) -> dict[str, Any]:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        cap, source = await asyncio.to_thread(
+            child_cap_for,
+            conv,
+            conversation_store,
+            permission_store,
+            getattr(request.app.state, "user_preferences_store", None),
+        )
+        open_children = await asyncio.to_thread(
+            conversation_store.count_counted_children, session_id
+        )
+        return {"cap": cap, "source": source, "open_children": open_children}
+
+    @router.patch("/sessions/{session_id}/child-cap", include_in_schema=False)
+    async def patch_child_cap(
+        request: Request, session_id: str, body: ChildCapPatch
+    ) -> dict[str, Any]:
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        async with child_cap_locks.hold(session_id):
+            await complete_child_write(
+                asyncio.to_thread(
+                    conversation_store.set_labels, session_id, {CHILD_CAP_LABEL_KEY: str(body.cap)}
+                )
+            )
+            open_children = await asyncio.to_thread(
+                conversation_store.count_counted_children, session_id
+            )
+        return {
+            "cap": body.cap if isinstance(body.cap, int) else None,
+            "source": "session",
+            "open_children": open_children,
+        }
 
     @router.get("/sessions/{session_id}/model-options")
     async def refresh_session_model_options(
@@ -1269,7 +1330,15 @@ def register_core_routes(
             try:
                 # Blocking store read; inside the try so a read failure still
                 # falls back to the id-only body.
-                global_instructions = await session_instructions_text(conv)
+                quota_service = getattr(request.app.state, "agent_quota_service", None)
+                global_instructions = await session_instructions_text(
+                    conv,
+                    quota_resolver=(
+                        lambda c: quota_service.line(c, _get_user_id(request, auth_provider))
+                    )
+                    if quota_service is not None
+                    else None,
+                )
                 # Prefer the initializer's owner-aware snapshot; embedded
                 # builds without one keep the deployment flag.
                 initializer = getattr(request.app.state, "runner_session_initializer", None)
@@ -1297,14 +1366,15 @@ def register_core_routes(
                 )
         return init_body
 
+    @asynccontextmanager
     async def _admit_child_create(
         request: Request,
         *,
         user_id: str | None,
         parent_session_id: str | None,
         sub_agent_name: str | None,
-    ) -> None:
-        """Refuse an agent-initiated child create when the owner's open-rate window is full.
+    ) -> AsyncIterator[None]:
+        """Hold an agent child's cap check and rate admission through insertion.
 
         An agent's unnamed child create (the runner's ``sys_session_create``
         POST) is an open (D7), so it spends the parent owner's open-rate
@@ -1322,12 +1392,14 @@ def register_core_routes(
         :raises HTTPException: 429 with the settings refusal text.
         """
         if parent_session_id is None or sub_agent_name is not None:
+            yield
             return
         # Only the runner's sys_session_create POST declares itself as
         # agent-initiated; without the header there is no budget to spend,
         # so the access check and the charge are both skipped.
         origin = request.headers.get(CREATE_ORIGIN_HEADER, "")
         if origin.strip().lower() != CREATE_ORIGIN_AGENT:
+            yield
             return
         # Authorize the caller on the parent before charging its owner's
         # window: a forged parent link must not spend the real owner's
@@ -1340,15 +1412,45 @@ def register_core_routes(
                 permission_store,
                 conversation_store,
             )
-        owner: str | None = None
-        if permission_store is not None:
-            owner = await asyncio.to_thread(
-                _get_session_owner_id, parent_session_id, permission_store
+        async with child_cap_locks.hold(parent_session_id):
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, parent_session_id
             )
-        owner = owner or user_id or RESERVED_USER_LOCAL
-        refusal_text = await asyncio.to_thread(admit_open, request.app.state, owner)
-        if refusal_text is not None:
-            raise HTTPException(status_code=429, detail=refusal_text)
+            if parent is None:
+                raise _session_not_found()
+            cap, _ = await asyncio.to_thread(
+                child_cap_for,
+                parent,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+            )
+            if cap is not None:
+                count = await asyncio.to_thread(
+                    conversation_store.count_counted_children, parent_session_id
+                )
+                if count >= cap:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "child_cap",
+                            "message": (
+                                f"This session already has {count} open child sessions "
+                                f"(cap {cap}). Archive a finished child or reuse an idle "
+                                "one, then retry."
+                            ),
+                        },
+                    )
+            owner: str | None = None
+            if permission_store is not None:
+                owner = await asyncio.to_thread(
+                    _get_session_owner_id, parent_session_id, permission_store
+                )
+            owner = owner or user_id or RESERVED_USER_LOCAL
+            refusal_text = await asyncio.to_thread(admit_open, request.app.state, owner)
+            if refusal_text is not None:
+                raise HTTPException(status_code=429, detail=refusal_text)
+            yield
 
     @router.post(
         "/sessions",
@@ -1438,32 +1540,32 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
-        await _admit_child_create(
-            request,
-            user_id=user_id,
-            parent_session_id=body.parent_session_id,
-            sub_agent_name=body.sub_agent_name,
-        )
         # Checked before the session exists so a rejected create leaves nothing
         # behind.
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
-        resp, conv = await _create_session_from_existing_agent(
-            conversation_store,
-            agent_store,
-            runner_router,
-            body,
+        async with _admit_child_create(
             request,
-            agent_cache=agent_cache,
             user_id=user_id,
-            permission_store=permission_store,
-            liveness_lookup=liveness_lookup,
-            file_store=file_store,
-            artifact_store=artifact_store,
-            background_title_coordinator=background_title_coordinator,
-            project_store=project_store,
-        )
+            parent_session_id=body.parent_session_id,
+            sub_agent_name=body.sub_agent_name,
+        ):
+            resp, conv = await _create_session_from_existing_agent(
+                conversation_store,
+                agent_store,
+                runner_router,
+                body,
+                request,
+                agent_cache=agent_cache,
+                user_id=user_id,
+                permission_store=permission_store,
+                liveness_lookup=liveness_lookup,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                background_title_coordinator=background_title_coordinator,
+                project_store=project_store,
+            )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
@@ -1750,17 +1852,6 @@ def register_core_routes(
                         update={"project_id": parent_project_id}
                     )
 
-        # The multipart shape has no sub_agent_name, so an agent's child
-        # bundle create is an open and spends the parent owner's rate budget
-        # when the create-origin header is present. The parent is authorized
-        # above, so a forged link cannot charge it.
-        await _admit_child_create(
-            request,
-            user_id=user_id,
-            parent_session_id=parsed_metadata.parent_session_id,
-            sub_agent_name=None,
-        )
-
         if parsed_metadata.mcp_registry_services:
             from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
             from omnigent.server.routes.session_mcp_servers import _require_registry_service
@@ -1971,22 +2062,32 @@ def register_core_routes(
             labels = dict(parsed_metadata.labels or {})
             labels.setdefault(AGY_PERMISSION_TIER_LABEL_KEY, project_resolution.permission)
             parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
-        with creation_stage("create_persistence_ms"):
-            result = await asyncio.to_thread(
-                _create_session_from_bundle,
-                conversation_store,
-                artifact_store,
-                parsed_metadata,
-                bundle_bytes,
-                inherited_runner_id,
-                spec,
-                inference_snapshot,
-                inference_model,
-                created_by=user_id,
-                worktree=placed_worktree,
-                git_branch=bound_branch,
-                agent_store=agent_store,
-            )
+        # The parent was authorized above; hold its check through the bundle
+        # and conversation write, after other request validation completes.
+        async with _admit_child_create(
+            request,
+            user_id=user_id,
+            parent_session_id=parsed_metadata.parent_session_id,
+            sub_agent_name=None,
+        ):
+            with creation_stage("create_persistence_ms"):
+                result = await complete_child_write(
+                    asyncio.to_thread(
+                        _create_session_from_bundle,
+                        conversation_store,
+                        artifact_store,
+                        parsed_metadata,
+                        bundle_bytes,
+                        inherited_runner_id,
+                        spec,
+                        inference_snapshot,
+                        inference_model,
+                        created_by=user_id,
+                        worktree=placed_worktree,
+                        git_branch=bound_branch,
+                        agent_store=agent_store,
+                    )
+                )
         session_created(
             result.session_id,
             inherited_runner_id,

@@ -28,6 +28,19 @@ _CODEX_RATE_LIMITS_MAX_WINDOW_MINS = 5 * 525_600
 _JSON_SAFE_POSITIVE_INT_MAX = (1 << 53) - 1
 
 
+def fresh_codex_rate_limits(raw: _JsonObject | None, *, now: float) -> _JsonObject | None:
+    """Apply the Host quota route's TTL and clock-skew allowance to a snapshot."""
+    captured_at = raw.get("captured_at") if isinstance(raw, dict) else None
+    if (
+        not isinstance(captured_at, int)
+        or isinstance(captured_at, bool)
+        or captured_at > now + 300
+        or now - captured_at > CODEX_RATE_LIMITS_HARD_TTL_S
+    ):
+        return None
+    return raw
+
+
 def _number(value: object) -> float | None:
     """Return a finite JSON number while rejecting booleans."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):

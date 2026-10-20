@@ -96,7 +96,7 @@ describe("settingsNavGroups", () => {
       settingsNavGroups(false, false, false, false, false, true)
         .find((group) => group.title === "Customize")
         ?.items.map((item) => item.id),
-    ).toEqual(["harnesses", "custom-agents"]);
+    ).toEqual(["harnesses", "custom-agents", "instructions"]);
   });
 
   it("keeps Keyboard shortcuts reachable on mobile for floating-assistant setup", () => {
@@ -398,13 +398,16 @@ describe("SettingsSidebarBody", () => {
     );
   });
 
-  it("hides the admin sub-categories for a non-admin", () => {
+  it("hides admin management while keeping personal Instructions for a non-admin", () => {
     mocks.accountsEnabled = true;
     mocks.isAdmin = false;
     renderBody();
     expect(screen.queryByTestId("settings-nav-members")).toBeNull();
     expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
-    expect(screen.queryByTestId("settings-nav-instructions")).toBeNull();
+    expect(screen.getByTestId("settings-nav-instructions")).toHaveAttribute(
+      "href",
+      "/settings/instructions",
+    );
   });
 
   it("keeps collaboration in General and the Custom agents library in Customize", () => {
@@ -652,7 +655,7 @@ describe("custom agent settings availability", () => {
     ]);
     expect(
       groups.find((group) => group.title === "Customize")?.items.map((item) => item.id),
-    ).toEqual(["harnesses", "custom-agents"]);
+    ).toEqual(["harnesses", "custom-agents", "instructions"]);
     expect(
       groups.flatMap((group) => group.items).filter((item) => item.id === "harnesses"),
     ).toHaveLength(1);

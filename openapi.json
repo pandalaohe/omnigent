@@ -6485,6 +6485,122 @@
         "title": "QueuedEvent",
         "type": "object"
       },
+      "QuotaReport": {
+        "additionalProperties": false,
+        "properties": {
+          "captured_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              }
+            ],
+            "gt": 0,
+            "title": "Captured At"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "pinned_period": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pinned Period"
+          },
+          "windows": {
+            "items": {
+              "$ref": "#/components/schemas/QuotaReportWindow"
+            },
+            "maxItems": 16,
+            "title": "Windows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "captured_at",
+          "windows"
+        ],
+        "title": "QuotaReport",
+        "type": "object"
+      },
+      "QuotaReportWindow": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_mins": {
+            "exclusiveMinimum": 0.0,
+            "format": "int64",
+            "maximum": 2628000.0,
+            "title": "Duration Mins",
+            "type": "integer"
+          },
+          "label": {
+            "maxLength": 32,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+            "title": "Label",
+            "type": "string"
+          },
+          "resets_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              }
+            ],
+            "gt": 0,
+            "title": "Resets At"
+          },
+          "used_percent": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              }
+            ],
+            "ge": 0,
+            "le": 100,
+            "title": "Used Percent"
+          }
+        },
+        "required": [
+          "label",
+          "used_percent",
+          "duration_mins",
+          "resets_at"
+        ],
+        "title": "QuotaReportWindow",
+        "type": "object"
+      },
       "ReadStatePutRequest": {
         "additionalProperties": false,
         "description": "Request body for `PUT /v1/sessions/{session_id}/read-state`.\n\nSets the *calling user's* read tracking for one session. Mirrors the\ntwo values the web client keeps per session: a \"last seen\" wall-clock\nbaseline (seconds since epoch) and an explicit \"marked unread\"\noverride. The unread dot shows when `updated_at > last_seen` and the\nsession is finished; `unread` separately pins the override so the\nthread the user is *viewing* (or a running one) still surfaces the dot\nwhere the automatic \"seen\" logic would otherwise suppress it.",
@@ -15244,6 +15360,48 @@
         "tags": [
           "system"
         ]
+      }
+    },
+    "/v1/me/agent-quota/{product}": {
+      "put": {
+        "operationId": "report_quota_v1_me_agent_quota__product__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "product",
+            "required": true,
+            "schema": {
+              "title": "Product",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaReport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Quota"
       }
     },
     "/v1/me/preferences": {

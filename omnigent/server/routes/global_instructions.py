@@ -14,6 +14,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import native_agents
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.instruction_layers import INSTRUCTION_SIZE_REMINDER_CHARS
+from omnigent.server.agent_quota import QuotaContext
 from omnigent.server.auth import LEVEL_READ, AuthProvider
 from omnigent.server.instruction_layers import resolve_instruction_route, route_session_text
 from omnigent.server.instruction_preview import preview_instructions
@@ -190,6 +191,7 @@ def create_global_instructions_router(
         descriptor = next(a for a in native_agents() if a.key == agent_key)
         if agent_store is None or agent_cache is None:
             return descriptor.agent_name, descriptor.harness, None
+
         try:
             row = await asyncio.to_thread(agent_store.get_by_name, descriptor.agent_name)
             if row is None:
@@ -207,10 +209,23 @@ def create_global_instructions_router(
             _logger.warning("instruction-layers/subject-unavailable: agent=%s", agent_key)
             return descriptor.agent_name, descriptor.harness, None
 
+    async def current_quota(
+        request: Request, user_id: str | None, host_id: str | None, conversation: Any = None
+    ) -> str:
+        service = getattr(request.app.state, "agent_quota_service", None)
+        if service is None:
+            return ""
+        if conversation is not None:
+            return await asyncio.to_thread(service.line, conversation)
+        return await asyncio.to_thread(
+            service.context_line, QuotaContext(user_id or "local", host_id)
+        )
+
     async def route_sizes(
         user_id: str | None,
         layers: list[GlobalInstructionRevision],
         subjects: list[tuple[str, str | None, Any]] | None = None,
+        request: Request | None = None,
     ) -> list[dict[str, Any]]:
         if host_store is None:
             return []
@@ -224,6 +239,7 @@ def create_global_instructions_router(
             )
         results: list[dict[str, Any]] = []
         for host_id in sorted(host_ids):
+            line = await current_quota(request, user_id, host_id) if request else ""
             for descriptor, (name, harness, spec) in zip(native_agents(), subjects, strict=True):
                 sizes = [
                     preview_instructions(
@@ -236,6 +252,7 @@ def create_global_instructions_router(
                         has_parent=child,
                         spawn=bool(spec and spec.spawn),
                         peer=True,
+                        quota_line=line,
                     )
                     for child in (False, True)
                 ]
@@ -300,6 +317,7 @@ def create_global_instructions_router(
                 store,
                 route,
                 has_parent=conv.parent_conversation_id is not None,
+                quota_line=await current_quota(request, user_id, route.host_id, conv),
             )
             result = _to_response(None)
             result["text"] = text or ""
@@ -319,6 +337,7 @@ def create_global_instructions_router(
                 has_parent=False,
                 spawn=spawn,
                 mother_text=mother.text if mother else "",
+                quota_line=await current_quota(request, user_id, host_id) if spawn else "",
             )
             result = _to_response(None)
             result["text"] = text
@@ -353,7 +372,7 @@ def create_global_instructions_router(
             "data": data,
             "agents": [{"key": a.key, "display_name": a.display_name} for a in native_agents()],
             "order": ["shared", "agent", "host"],
-            "route_sizes": await route_sizes(user_id, layers),
+            "route_sizes": await route_sizes(user_id, layers, request=request),
             "size_reminder_chars": INSTRUCTION_SIZE_REMINDER_CHARS,
         }
 
@@ -367,7 +386,7 @@ def create_global_instructions_router(
             await owned_host(key.host_id, user_id)
         before_layers = await visible_layers(user_id)
         subjects = list(await asyncio.gather(*(built_in_subject(a.key) for a in native_agents())))
-        before_sizes = await route_sizes(user_id, before_layers, subjects)
+        before_sizes = await route_sizes(user_id, before_layers, subjects, request=request)
         revision = await asyncio.to_thread(
             store.save,
             body.text,
@@ -388,7 +407,7 @@ def create_global_instructions_router(
                 "agent_key": size["agent_key"],
                 "total_chars": size["total_chars"],
             }
-            for size in await route_sizes(user_id, after_layers, subjects)
+            for size in await route_sizes(user_id, after_layers, subjects, request=request)
             if size["over_budget"] and (size["host_id"], size["agent_key"]) not in before_over
         ]
         return {**_layer_response(revision), "over_budget_routes": warnings}
@@ -425,6 +444,7 @@ def create_global_instructions_router(
         session_id: str | None = None,
     ) -> dict[str, Any]:
         user_id = authenticated_user(request)
+        conv = None
         if session_id:
             conv, route = await session_context(user_id, session_id)
             host_id, agent_key = route.host_id, route.agent_key
@@ -460,6 +480,11 @@ def create_global_instructions_router(
             has_parent=child,
             spawn=bool(spawn),
             peer=peer,
+            quota_line=(
+                await current_quota(request, user_id, host_id, conv if session_id else None)
+                if not child and spawn
+                else ""
+            ),
         )
         result["route"] = {
             "host_id": host_id,

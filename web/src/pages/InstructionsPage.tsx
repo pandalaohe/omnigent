@@ -15,6 +15,7 @@ import { isSingleUserMode } from "@/lib/capabilities";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { useSearchParams } from "@/lib/routing";
 import { LayerEditor } from "./instructions/LayerEditor";
+import { ChildSessionsPanel } from "./instructions/ChildSessionsPanel";
 import { LayerGrid } from "./instructions/LayerGrid";
 import { RoutePicker } from "./instructions/RoutePicker";
 import { RouteView } from "./instructions/RouteView";
@@ -119,6 +120,7 @@ export function InstructionsPage() {
             add specific guidance, or make one route independent.
           </p>
         </header>
+        <ChildSessionsPanel />
         {data.isError && (
           <p role="alert" className="text-sm text-destructive">
             {data.error.message}

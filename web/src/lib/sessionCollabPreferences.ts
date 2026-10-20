@@ -1,7 +1,11 @@
 import { queueUserPreferencePatch } from "./userPreferencesSync";
+import { NATIVE_CODING_AGENTS } from "./nativeCodingAgents";
 
 export const SESSION_COLLAB_STORAGE_KEY = "omnigent:session-collab";
 export const SESSION_COLLAB_CHANGED_EVENT = "omnigent:session-collab-changed";
+export const QUOTA_PRODUCTS = NATIVE_CODING_AGENTS.map((agent) => agent.key);
+export type QuotaProduct = (typeof QUOTA_PRODUCTS)[number];
+export const QUOTA_PERIOD_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 
 /** Field names are the stored JSON keys the server accessor reads. */
 export interface SessionCollabPreferences {
@@ -21,6 +25,11 @@ export interface SessionCollabPreferences {
   childKeepWarmClaudeIntervalSeconds: number;
   childKeepWarmCodexIntervalSeconds: number;
   childKeepWarmMaxSeconds: number;
+  childCap: number | null;
+  quotaTightBelowPct: number;
+  quotaLowBelowPct: number;
+  quotaFloorPct: number | null;
+  quotaPeriods: Partial<Record<QuotaProduct, string>>;
 }
 
 export type SessionCollabNumericField =
@@ -72,6 +81,11 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   childKeepWarmClaudeIntervalSeconds: 3300,
   childKeepWarmCodexIntervalSeconds: 1500,
   childKeepWarmMaxSeconds: 28800,
+  childCap: null,
+  quotaTightBelowPct: 50,
+  quotaLowBelowPct: 20,
+  quotaFloorPct: null,
+  quotaPeriods: {},
 };
 
 function normalizeInteger(value: unknown, field: SessionCollabNumericField): number {
@@ -86,9 +100,30 @@ function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
-function normalizePreferences(value: unknown): SessionCollabPreferences {
-  if (!value || typeof value !== "object") return { ...SESSION_COLLAB_DEFAULTS };
+function normalizePercentage(value: unknown, min: number, max: number): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max
+    ? value
+    : null;
+}
+
+function normalizeQuotaPeriods(value: unknown): SessionCollabPreferences["quotaPeriods"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const raw = value as Record<string, unknown>;
+  const periods: SessionCollabPreferences["quotaPeriods"] = {};
+  for (const product of QUOTA_PRODUCTS) {
+    const period = raw[product];
+    if (typeof period === "string" && QUOTA_PERIOD_PATTERN.test(period)) periods[product] = period;
+  }
+  return periods;
+}
+
+function normalizePreferences(value: unknown): SessionCollabPreferences {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return { ...SESSION_COLLAB_DEFAULTS, quotaPeriods: {} };
+  const raw = value as Record<string, unknown>;
+  const low = normalizePercentage(raw.quotaLowBelowPct, 0, 100);
+  const tight = normalizePercentage(raw.quotaTightBelowPct, 0, 100);
+  const validThresholds = low !== null && tight !== null && low > 0 && low < tight;
   return {
     enabled: normalizeBoolean(raw.enabled, SESSION_COLLAB_DEFAULTS.enabled),
     openRateCount: normalizeInteger(raw.openRateCount, "openRateCount"),
@@ -123,22 +158,35 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
       raw.childKeepWarmMaxSeconds,
       "childKeepWarmMaxSeconds",
     ),
+    childCap:
+      typeof raw.childCap === "number" && Number.isSafeInteger(raw.childCap) && raw.childCap >= 1
+        ? raw.childCap
+        : null,
+    quotaTightBelowPct: validThresholds ? tight : SESSION_COLLAB_DEFAULTS.quotaTightBelowPct,
+    quotaLowBelowPct: validThresholds ? low : SESSION_COLLAB_DEFAULTS.quotaLowBelowPct,
+    quotaFloorPct: normalizePercentage(raw.quotaFloorPct, 0, 100),
+    quotaPeriods: normalizeQuotaPeriods(raw.quotaPeriods),
   };
 }
 
 export function isSessionCollabPreferencesDefault(preferences: SessionCollabPreferences): boolean {
   return (Object.keys(SESSION_COLLAB_DEFAULTS) as (keyof SessionCollabPreferences)[]).every(
-    (key) => preferences[key] === SESSION_COLLAB_DEFAULTS[key],
+    (key) =>
+      key === "quotaPeriods"
+        ? Object.keys(preferences.quotaPeriods).length === 0
+        : preferences[key] === SESSION_COLLAB_DEFAULTS[key],
   );
 }
 
 export function readSessionCollabPreferences(): SessionCollabPreferences {
-  if (typeof window === "undefined") return { ...SESSION_COLLAB_DEFAULTS };
+  if (typeof window === "undefined") return { ...SESSION_COLLAB_DEFAULTS, quotaPeriods: {} };
   try {
     const raw = window.localStorage.getItem(SESSION_COLLAB_STORAGE_KEY);
-    return raw ? normalizePreferences(JSON.parse(raw)) : { ...SESSION_COLLAB_DEFAULTS };
+    return raw
+      ? normalizePreferences(JSON.parse(raw))
+      : { ...SESSION_COLLAB_DEFAULTS, quotaPeriods: {} };
   } catch {
-    return { ...SESSION_COLLAB_DEFAULTS };
+    return { ...SESSION_COLLAB_DEFAULTS, quotaPeriods: {} };
   }
 }
 

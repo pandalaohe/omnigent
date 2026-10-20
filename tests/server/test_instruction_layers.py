@@ -60,6 +60,49 @@ def conversation(**overrides):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "parent,mother,expected",
+    [
+        (None, "Mother", "Mother\n\nQuota evidence"),
+        (None, "", "S\n\nA\n\nH"),
+        ("parent", "Mother", "Child"),
+    ],
+)
+async def test_quota_resolver_runs_only_for_nonblank_mother(
+    instructions, parent, mother, expected
+):
+    instructions.save(mother, created_by=None, scope="mother")
+    resolver = Mock(return_value="Quota evidence")
+    result = await session_instructions_text(
+        conversation(parent_conversation_id=parent), quota_resolver=resolver
+    )
+    assert result.endswith(expected)
+    assert resolver.call_count == (1 if parent is None and mother else 0)
+
+
+@pytest.mark.asyncio
+async def test_initializer_transports_quota_after_mother_block(instructions):
+    payloads = []
+
+    def receive(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(201, json={"status": "initialized"})
+
+    initializer = RunnerSessionInitializer(
+        SimpleNamespace(get=lambda _: SimpleNamespace(generation=1)),
+        server_version="test",
+        quota_resolver=lambda _: "Quota evidence",
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(receive)
+    ) as client:
+        await initializer.initialize(conversation(), client, timeout=1)
+    assert payloads[0]["session_init"]["snapshot"]["global_instructions"].endswith(
+        "Mother\n\nQuota evidence"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "scope,agent,host,text,expected",
     [
         ("shared", "", "", "new S", "new S\n\nA\n\nH\n\nMother"),

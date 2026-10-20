@@ -117,6 +117,11 @@ export function settingsNavGroups(
     label: "Harnesses",
     icon: VectorSquareIcon,
   };
+  const instructions: SettingsNavItem = {
+    id: "instructions",
+    label: "Instructions",
+    icon: FileTextIcon,
+  };
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
@@ -150,6 +155,7 @@ export function settingsNavGroups(
         label: customAgentsEnabled ? "Custom agents" : "Agent library",
         icon: BotIcon,
       },
+      ...(!isAdmin ? [instructions] : []),
     ],
   });
   // Keep shell-specific settings directly after the cross-platform preferences.
@@ -177,11 +183,7 @@ export function settingsNavGroups(
     const adminItems: SettingsNavItem[] = [];
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
-    adminItems.push({
-      id: "instructions",
-      label: "Instructions",
-      icon: FileTextIcon,
-    });
+    adminItems.push(instructions);
     adminItems.push({ id: "system-status", label: "System status", icon: ActivityIcon });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
     groups.push({ title: "Admin", items: adminItems });

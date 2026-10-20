@@ -434,6 +434,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.goal_state",
         "omnigent.child_idle",
         "omnigent.child_idle_batch",
+        "omnigent.child_cap",
         "omnigent.last_provider_usage_limits",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         ARTIFACT_LINK_KEY_LABEL,
@@ -983,6 +984,19 @@ class ConversationStore(ABC):
             children, or ids that do not exist, map to an empty list.
         """
         ...
+
+    def count_counted_children(self, parent_conversation_id: str) -> int:
+        """Count open, unnamed direct children of one session.
+
+        This fallback keeps alternate store implementations compatible.
+        """
+        ids = self.list_child_conversation_ids_by_parent([parent_conversation_id]).get(
+            parent_conversation_id, []
+        )
+        return sum(
+            child is not None and not child.archived and child.sub_agent_name is None
+            for child in self.get_conversations(ids).values()
+        )
 
     @abstractmethod
     def list_child_conversation_ids_page(
