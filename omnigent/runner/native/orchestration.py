@@ -10170,6 +10170,15 @@ class NativeLaunchContext:
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
     rebind_bridge: Callable[[str, str], Awaitable[None]] | None = None
+    startup_required: bool = False
+    admit_cold: Callable[[], Awaitable[None]] | None = None
+
+
+async def _admit_native_cold(ctx: NativeLaunchContext) -> None:
+    if ctx.admit_cold is not None:
+        await ctx.admit_cold()
+    elif ctx.startup_required:
+        raise OmnigentError("Startup permission unavailable", code=ErrorCode.CONFLICT)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -10428,21 +10437,28 @@ async def _launch_native_terminal(
             registry is not None
             and registry.get(ctx.session_id, agent.terminal_name, "main") is not None
         )
-        decision = await pre_launch(has_terminal) if pre_launch is not None else PreLaunchResult()
-        if has_terminal and decision.force_recreate:
-            if registry is not None:
-                await registry.cleanup_conversation(ctx.session_id)
-            has_terminal = False
-        if has_terminal:
-            return True
-        if decision.skip or not decision.needs_terminal:
-            return False
-
-        adapter = resolve_hook(provider, "auto_create_terminal")
-        if adapter is None:
-            return None
-        _publish_terminal_pending(ctx.publish_event, ctx.session_id, True)
+        pending = False
         try:
+            if not has_terminal:
+                await _admit_native_cold(ctx)
+            decision = (
+                await pre_launch(has_terminal) if pre_launch is not None else PreLaunchResult()
+            )
+            if has_terminal and decision.force_recreate:
+                await _admit_native_cold(ctx)
+                if registry is not None:
+                    await registry.cleanup_conversation(ctx.session_id)
+                has_terminal = False
+            if has_terminal:
+                return True
+            if decision.skip or not decision.needs_terminal:
+                return False
+
+            adapter = resolve_hook(provider, "auto_create_terminal")
+            if adapter is None:
+                return None
+            _publish_terminal_pending(ctx.publish_event, ctx.session_id, True)
+            pending = True
             if build_context is not None:
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
@@ -10494,7 +10510,8 @@ async def _launch_native_terminal(
             )
             return False
         finally:
-            _publish_terminal_pending(ctx.publish_event, ctx.session_id, False)
+            if pending:
+                _publish_terminal_pending(ctx.publish_event, ctx.session_id, False)
 
 
 def _ensure_native_terminal_default_response(view: SessionResourceView) -> JSONResponse:
@@ -10563,6 +10580,7 @@ async def _ensure_native_terminal(
     terminal_id = terminal_resource_id(terminal_name, "main")
     lock = ensure_locks.setdefault(ctx.session_id, asyncio.Lock())
     async with lock:
+        admitted = False
         existing = await ctx.resource_registry.get_terminal_resource(ctx.session_id, terminal_id)
         if existing is not None:
             if is_owned is None or is_owned(ctx.resource_registry, existing):
@@ -10574,6 +10592,13 @@ async def _ensure_native_terminal(
                     extra={"session_id": ctx.session_id},
                 )
                 return respond(existing)
+            try:
+                await _admit_native_cold(ctx)
+                admitted = True
+            except (OmnigentError, RuntimeError, httpx.HTTPError, OSError, ValueError) as exc:
+                return _native_terminal_start_error_response(
+                    exc, agent.display_name, session_id=ctx.session_id
+                )
             _logger.info(
                 "Replacing non-native %s terminal %s for session %s",
                 terminal_name,
@@ -10597,6 +10622,8 @@ async def _ensure_native_terminal(
         if adapter is None:
             return None
         try:
+            if not admitted:
+                await _admit_native_cold(ctx)
             if build_context is not None:
                 ctx = await build_context(ctx)
             _logger.info(
