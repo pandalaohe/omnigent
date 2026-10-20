@@ -317,6 +317,81 @@ async def test_terminal_resource_role_moves_on_transfer(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transfer_again", [False, True])
+async def test_claude_fallback_bundle_follows_transferred_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transfer_again: bool
+) -> None:
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    source_bundle = registry.claude_skill_bundle_dir("source")
+    target_bundle = registry.claude_skill_bundle_dir("target")
+    source_skill = source_bundle / "source-skill.md"
+    target_skill = target_bundle / "target-skill.md"
+    source_skill.write_text("source", encoding="utf-8")
+    target_skill.write_text("target", encoding="utf-8")
+    instance.args = ["--plugin-dir", str(source_bundle)]
+    terminal_registry._by_conversation.setdefault("source", {})[("claude", "main")] = instance
+    registry._terminal_roles[("source", "terminal_claude_main")] = CLAUDE_NATIVE_TERMINAL_ROLE
+
+    async def _close() -> None:
+        instance.running = False
+
+    async def _no_status_link(_link: str) -> None:
+        pass
+
+    monkeypatch.setattr(instance, "close", _close)
+    monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
+    moved = await registry.transfer_terminal("source", "target", "terminal_claude_main")
+    assert moved is not None
+    assert instance.args == ["--plugin-dir", str(source_bundle)]
+
+    await registry.cleanup_session("source")
+    assert source_skill.read_text(encoding="utf-8") == "source"
+    assert target_skill.read_text(encoding="utf-8") == "target"
+    assert registry.claude_skill_bundle_dir("target") == source_bundle
+
+    if transfer_again:
+        moved_again = await registry.transfer_terminal("target", "final", "terminal_claude_main")
+        assert moved_again is not None
+        await registry.cleanup_session("target")
+        assert source_skill.read_text(encoding="utf-8") == "source"
+        assert target_skill.read_text(encoding="utf-8") == "target"
+        assert registry.claude_skill_bundle_dir("final") == source_bundle
+
+    await registry.cleanup_session("final" if transfer_again else "target")
+    assert not source_bundle.exists()
+    assert not target_bundle.exists()
+
+
+@pytest.mark.asyncio
+async def test_non_claude_transfer_does_not_move_fallback_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    source_bundle = registry.claude_skill_bundle_dir("source")
+    terminal_registry._by_conversation.setdefault("source", {})[("codex", "main")] = instance
+    registry._terminal_roles[("source", "terminal_codex_main")] = CODEX_NATIVE_TERMINAL_ROLE
+
+    async def _close() -> None:
+        instance.running = False
+
+    async def _no_status_link(_link: str) -> None:
+        pass
+
+    monkeypatch.setattr(instance, "close", _close)
+    monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
+    moved = await registry.transfer_terminal("source", "target", "terminal_codex_main")
+    assert moved is not None
+
+    await registry.cleanup_session("source")
+    assert not source_bundle.exists()
+    await registry.cleanup_session("target")
+
+
+@pytest.mark.asyncio
 async def test_terminal_lifecycle_cannot_change_after_observe(tmp_path: Path) -> None:
     """A terminal cannot silently switch between auxiliary and required lifecycle."""
     terminal_registry = TerminalRegistry()
@@ -1586,6 +1661,26 @@ async def test_cleanup_session_closes_primary_env(
         assert not reg.has_primary_env("conv_1")
     finally:
         os.environ.pop("OMNIGENT_RUNNER_OS_ENV_ROOT", None)
+
+
+@pytest.mark.asyncio
+async def test_claude_skill_bundle_dir_is_session_owned() -> None:
+    registry = SessionResourceRegistry()
+    first = registry.claude_skill_bundle_dir("conv_1")
+    other = registry.claude_skill_bundle_dir("conv_2")
+    assert first == registry.claude_skill_bundle_dir("conv_1")
+    assert first != other
+    marker = first / "skill.md"
+    marker.write_text("session content", encoding="utf-8")
+
+    await registry.cleanup_session("conv_1")
+    assert not first.exists()
+    assert other.is_dir()
+    await registry.cleanup_session("conv_1")
+    assert other.is_dir()
+
+    await registry.cleanup_session("conv_2")
+    assert not other.exists()
 
 
 @pytest.mark.asyncio

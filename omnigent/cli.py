@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import base64
 import concurrent.futures
 import contextlib
@@ -7698,7 +7699,9 @@ def _materialize_harness_launcher_file(
     # id (also colon-sanitized) as before.
     display_name = harness.replace(":", "-")
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-harness-launcher-"))
+    temporary_directory = tempfile.TemporaryDirectory(prefix="omnigent-harness-launcher-")
+    atexit.register(temporary_directory.cleanup)
+    tmpdir = Path(temporary_directory.name)
     yaml_path = tmpdir / f"{effective_harness.replace(':', '-')}.yaml"
 
     executor: dict[str, object] = {"harness": effective_harness}

@@ -15,7 +15,7 @@
 // removed or commented out, which the behavior test in workspace-chrome.test.js
 // cannot, because that test never touches main.js.)
 
-const { describe, it } = require("node:test");
+const { after, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const fs = require("node:fs");
@@ -169,6 +169,7 @@ function loadNavigationHarness({
   acceptedSessions = new Set(),
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
+  after(() => fs.rmSync(userData, { recursive: true, force: true }));
   if (savedServerUrl) {
     fs.writeFileSync(
       path.join(userData, "settings.json"),

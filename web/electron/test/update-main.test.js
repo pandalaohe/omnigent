@@ -1,4 +1,4 @@
-const { describe, it } = require("node:test");
+const { after, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
@@ -22,6 +22,7 @@ function loadMainHarness({
   desktopVersionOverride,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
+  after(() => fs.rmSync(userData, { recursive: true, force: true }));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
 
   const ipcHandlers = new Map();

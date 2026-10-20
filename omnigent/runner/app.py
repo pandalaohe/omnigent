@@ -19,7 +19,6 @@ import logging
 import math
 import os
 import re
-import tempfile
 import time
 import urllib.parse
 import uuid
@@ -3920,7 +3919,7 @@ def create_runner_app(
                         agent_name = getattr(spec, "name", None)
                         skills_filter = getattr(spec, "skills_filter", "all")
                     if bundle_dir is None:
-                        bundle_dir = Path(tempfile.mkdtemp(prefix="omnigent-skill-bundle-"))
+                        bundle_dir = resource_registry.claude_skill_bundle_dir(session_id)
                     _logger.info(
                         "Claude terminal auto-create inputs resolved: session=%s "
                         "bundle_dir=%s agent_name=%s skills_filter=%s",

@@ -492,6 +492,7 @@ class SessionResourceRegistry:
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
+        self._claude_skill_bundle_dirs: dict[str, list[tempfile.TemporaryDirectory[str]]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
@@ -998,6 +999,15 @@ class SessionResourceRegistry:
             )
             self._codex_skills_dirs[session_id] = directory
         return Path(directory.name)
+
+    def claude_skill_bundle_dir(self, session_id: str) -> Path:
+        """Return the stable fallback skill bundle owned by this session."""
+        with self._lock:
+            directories = self._claude_skill_bundle_dirs.get(session_id)
+            if not directories:
+                directories = [tempfile.TemporaryDirectory(prefix="omnigent-skill-bundle-")]
+                self._claude_skill_bundle_dirs[session_id] = directories
+            return Path(directories[-1].name)
 
     def resolve_environment(
         self,
@@ -2177,6 +2187,14 @@ class SessionResourceRegistry:
                 role = self._terminal_roles.pop((source_session_id, terminal_id), None)
                 if role is not None:
                     self._terminal_roles[(target_session_id, terminal_id)] = role
+                if role == CLAUDE_NATIVE_TERMINAL_ROLE and terminal_id == terminal_resource_id(
+                    "claude", "main"
+                ):
+                    directories = self._claude_skill_bundle_dirs.pop(source_session_id, [])
+                    if directories:
+                        self._claude_skill_bundle_dirs.setdefault(target_session_id, []).extend(
+                            directories
+                        )
                 lifecycle = self._terminal_lifecycles.pop((source_session_id, terminal_id), None)
                 if lifecycle is not None:
                     self._terminal_lifecycles[(target_session_id, terminal_id)] = lifecycle
@@ -2242,6 +2260,7 @@ class SessionResourceRegistry:
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
             skills_directory = self._codex_skills_dirs.pop(session_id, None)
+            claude_bundle_directories = self._claude_skill_bundle_dirs.pop(session_id, [])
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)
@@ -2279,6 +2298,14 @@ class SessionResourceRegistry:
             except OSError:
                 _logger.exception(
                     "Error cleaning up Codex skills for session=%s",
+                    session_id,
+                )
+        for claude_bundle_directory in claude_bundle_directories:
+            try:
+                await asyncio.to_thread(claude_bundle_directory.cleanup)
+            except OSError:
+                _logger.exception(
+                    "Error cleaning up Claude skill bundle for session=%s",
                     session_id,
                 )
 
