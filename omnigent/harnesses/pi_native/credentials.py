@@ -275,6 +275,7 @@ class PiProviderConfig:
     curated_models: bool = False
     model_allowlist: tuple[str, ...] | None = None
     inference_bound: bool = False
+    model_metadata: dict[str, dict[str, int]] = field(default_factory=dict, hash=False)
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -336,7 +337,9 @@ class PiProviderConfig:
     def to_models_config(self) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
         models: list[_PiModelEntry] = list(self.extra_models)
-        additional: dict[str, _PiProviderPayload] = dict(self.additional_providers)
+        additional: dict[str, _PiProviderPayload] = {
+            pid: {**payload} for pid, payload in self.additional_providers.items()
+        }
         # Register the selected model only when no provider already serves it.
         # Appending a non-Claude model to the primary (Anthropic) provider would
         # register it under the wrong wire protocol — the gateway then rejects
@@ -386,6 +389,14 @@ class PiProviderConfig:
             provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
+        for payload in providers.values():
+            payload["models"] = [{**entry} for entry in payload["models"]]
+            for entry in payload["models"]:
+                limits = self.model_metadata.get(entry["id"], {})
+                if "context_window" in limits:
+                    entry["contextWindow"] = limits["context_window"]
+                if "max_output_tokens" in limits:
+                    entry["maxTokens"] = limits["max_output_tokens"]
         return {"providers": providers}
 
     def _register_on_surface(
@@ -1551,11 +1562,12 @@ def _inline_family_pi_provider(
             # An empty listing (unreachable workspace, a token without Unity
             # Catalog access) keeps the configured model on its own surface.
             if enumerated.extra_models or enumerated.additional_providers:
-                return enumerated
+                return replace(enumerated, model_metadata=family.model_metadata)
+        limits = family.model_limits(resolved_model)
         model_entry = pi_generic_model_json_entry(
             resolved_model,
-            configured_context_window=family.context_window,
-            configured_max_output_tokens=family.max_output_tokens,
+            configured_context_window=limits.get("context_window"),
+            configured_max_output_tokens=limits.get("max_output_tokens"),
         )
         # Register the family's tiers alongside the selected model.
         shortlist: list[_PiModelEntry] = [model_entry]
@@ -1566,8 +1578,12 @@ def _inline_family_pi_provider(
                 shortlist.append(
                     pi_generic_model_json_entry(
                         tier_id,
-                        configured_context_window=family.context_window,
-                        configured_max_output_tokens=family.max_output_tokens,
+                        configured_context_window=family.model_limits(tier_id).get(
+                            "context_window"
+                        ),
+                        configured_max_output_tokens=family.model_limits(tier_id).get(
+                            "max_output_tokens"
+                        ),
                     )
                 )
         return PiProviderConfig(
@@ -1582,6 +1598,7 @@ def _inline_family_pi_provider(
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
             extra_models=shortlist,
             curated_models=curated_models,
+            model_metadata=family.model_metadata,
             # Record the endpoint the pre-launch picker can enumerate live; no
             # I/O happens here so session launch stays off the network.
             listing_provider=model_catalog.ResolvedModelProvider(
@@ -1636,8 +1653,6 @@ def resolve_pi_native_provider(
         return None
     config = load_runtime_inference_config(base_config)
     selection = _split_pi_native_model_selection(model)
-    if selection is not None:
-        _, model = selection
     binding = binding_for_harness(config, "pi-native")
     if binding is not None:
         entry = resolve_bound_provider(config, "pi-native", auth)
@@ -1682,6 +1697,8 @@ def resolve_pi_native_provider(
             )
         return replace(resolved, inference_bound=True)
 
+    if selection is not None:
+        _, model = selection
     unmanaged_prefix_warning: str | None = None
     try:
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not

@@ -8,6 +8,43 @@ from pathlib import Path
 from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
 
+def test_default_thinking_and_per_model_compaction_survive_settings_merge(tmp_path, monkeypatch):
+    from omnigent.inner import pi_settings
+
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultThinkingLevel": "high",
+                "modelThinkingLevels": {"databricks-completions/kimi-k2": "xhigh"},
+                "compaction": {
+                    "modelOverrides": {
+                        "databricks-completions/kimi-k2": {"reserveTokens": 32000},
+                        "databricks-completions/deepseek-v4": {"reserveTokens": 64000},
+                    }
+                },
+            }
+        )
+    )
+    project_dir = tmp_path / "project" / ".pi"
+    project_dir.mkdir(parents=True)
+    (project_dir / "settings.json").write_text('{"defaultThinkingLevel": "low"}')
+    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_dir)
+    managed = tmp_path / "managed"
+    prepare_managed_pi_agent_dir(managed, overlay={"retry": {"maxRetries": 2}})
+    overrides = json.loads((managed / "settings.json").read_text())["compaction"]["modelOverrides"]
+    assert overrides["databricks-completions/kimi-k2"]["reserveTokens"] == 32000
+    assert overrides["databricks-completions/deepseek-v4"]["reserveTokens"] == 64000
+    assert pi_settings.default_pi_thinking_level(str(tmp_path / "project")) == "low"
+    assert (
+        pi_settings.default_pi_thinking_level(
+            str(tmp_path / "project"), "databricks-completions/kimi-k2"
+        )
+        == "xhigh"
+    )
+
+
 def test_prepare_managed_pi_agent_dir_copies_settings_and_symlinks_npm(
     tmp_path: Path,
 ) -> None:

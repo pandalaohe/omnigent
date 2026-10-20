@@ -342,6 +342,17 @@ class FamilyConfig:
     pricing: ModelPricingConfig | None = None
     context_window: int | None = None
     max_output_tokens: int | None = None
+    model_metadata: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def model_limits(self, model_id: str) -> dict[str, int]:
+        """Resolve token limits, with per-model values ahead of family defaults."""
+        limits = {}
+        if self.context_window is not None:
+            limits["context_window"] = self.context_window
+        if self.max_output_tokens is not None:
+            limits["max_output_tokens"] = self.max_output_tokens
+        limits.update(self.model_metadata.get(model_id, {}))
+        return limits
 
     @property
     def default_model(self) -> str | None:
@@ -813,6 +824,32 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
             )
         max_output_tokens = max_output_tokens_raw
 
+    metadata_raw = raw.get("model_metadata", {})
+    if not isinstance(metadata_raw, dict):
+        raise OmnigentError(
+            f"{prefix}.model_metadata must be a mapping.", code=ErrorCode.INVALID_INPUT
+        )
+    model_metadata: dict[str, dict[str, int]] = {}
+    for model_id, values in metadata_raw.items():
+        if not isinstance(model_id, str) or not model_id.strip() or not isinstance(values, dict):
+            raise OmnigentError(
+                f"{prefix}.model_metadata requires model ids mapped to token limits.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        limits: dict[str, int] = {}
+        for key, value in values.items():
+            if (
+                key not in ("context_window", "max_output_tokens")
+                or type(value) is not int
+                or value <= 0
+            ):
+                raise OmnigentError(
+                    f"{prefix}.model_metadata.{model_id}: expected positive integer token limits.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            limits[key] = value
+        model_metadata[model_id] = limits
+
     return FamilyConfig(
         base_url=base_url_raw,
         api_key=api_key,
@@ -823,6 +860,7 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         pricing=pricing,
         context_window=context_window,
         max_output_tokens=max_output_tokens,
+        model_metadata=model_metadata,
     )
 
 

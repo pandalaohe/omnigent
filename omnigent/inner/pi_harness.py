@@ -76,13 +76,15 @@ import logging
 import os
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.executor import Executor
+from omnigent.inner.executor import Executor, ExecutorConfig
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
-from omnigent.inner.pi_executor import PiExecutor
+from omnigent.inner.pi_executor import PiExecutor, _pi_thinking_from_config
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -230,6 +232,7 @@ def _build_pi_executor() -> Executor:
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE"),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
+        model_metadata=json.loads(os.environ.get("HARNESS_PI_MODEL_METADATA", "{}")),
         pi_path=resolve_harness_path("pi"),
         gateway=_parse_truthy(_ENV_GATEWAY, default=False),
         databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
@@ -300,4 +303,45 @@ def create_app() -> FastAPI:
         FastAPI app-boot crash).
     """
     adapter = ExecutorAdapter(executor_factory=_build_pi_executor)
-    return adapter.build()
+    app = adapter.build()
+
+    @app.post("/v1/sessions/{conversation_id}/settings")
+    async def update_settings(
+        conversation_id: str, body: PiSettingsRequest, request: Request
+    ) -> Response:
+        denied = adapter._check_auth(request)
+        if denied is not None:
+            return denied
+        adapter._check_conversation_id(request, conversation_id)
+        try:
+            thinking = _pi_thinking_from_config(
+                ExecutorConfig(extra={"reasoning_effort": body.effort})
+            )
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        # The scaffold uses this lock when registering turns. Holding it while
+        # idle keeps a new turn from consuming this settings request's response.
+        async with adapter._lock:
+            if adapter._in_flight or adapter._executor is None:
+                return JSONResponse({"applied": False})
+            executor = adapter._executor
+            assert isinstance(executor, PiExecutor)
+            state = executor._session_states.get(adapter._session_key)
+            if state is None or state.rpc is None:
+                return JSONResponse({"applied": False})
+            try:
+                await executor._apply_thinking_level(state, state.rpc, thinking, spawned=False)
+            except (OSError, RuntimeError) as exc:
+                _logger.warning("Pi settings update failed: %s", exc)
+                return JSONResponse(
+                    {"detail": "Pi did not apply the reasoning effort."}, status_code=503
+                )
+            return JSONResponse({"applied": True})
+
+    return app
+
+
+class PiSettingsRequest(BaseModel):
+    """An idle-time effort update; active turns use the next request's value."""
+
+    effort: str | None = None

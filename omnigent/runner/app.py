@@ -9725,6 +9725,23 @@ def create_runner_app(
                 _session_reasoning_effort[conversation_id] = effort
             else:
                 _session_reasoning_effort.pop(conversation_id, None)
+            if harness == "pi" and process_manager is not None:
+                # No launch for a settings-only change; a cold session picks
+                # up the stored value with its first turn.
+                try:
+                    client = await process_manager.get_client(conversation_id, "any")
+                    response = await client.post(
+                        f"/v1/sessions/{conversation_id}/settings",
+                        json={"effort": effort},
+                        timeout=20.0,
+                    )
+                except (httpx.HTTPError, RuntimeError):
+                    return Response(status_code=204)
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    media_type="application/json",
+                )
             if harness in ("claude-native", "pi-native", "devin-native"):
                 if harness == "pi-native":
                     return await _handle_pi_native_effort_change(
@@ -9976,7 +9993,7 @@ def create_runner_app(
                 return await _handle_qwen_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "devin-native":
                 return await _handle_devin_native_compact(conversation_id)
-            if _session_harness_name(conversation_id) == "claude-sdk":
+            if _session_harness_name(conversation_id) in ("claude-sdk", "pi"):
                 return await _handle_claude_sdk_compact(conversation_id)
             return Response(status_code=204)
 

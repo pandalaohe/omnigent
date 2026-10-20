@@ -2925,7 +2925,8 @@ def _body_carries_text(body: dict[str, Any], needle: str) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() -> None:
+@pytest.mark.parametrize("harness", ["claude-sdk", "pi"])
+async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn(harness: str) -> None:
     """
     POST ``/events`` with ``{"type":"compact"}`` on a claude-sdk session
     dispatches a ``/compact`` turn to the harness and returns 200.
@@ -2950,7 +2951,7 @@ async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() ->
     hc = _ScriptedHarnessClient(sse_frames)
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec(harness)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the claude-sdk spec for any agent_id."""
@@ -3002,6 +3003,37 @@ async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() ->
     assert _body_carries_text(hc.posted_bodies[0], "/compact"), (
         f"The forwarded turn must carry the literal '/compact' slash command "
         f"so the SDK runs native compaction; got {hc.posted_bodies[0]}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["high", None])
+async def test_pi_effort_change_forwards_idle_settings(monkeypatch, effort) -> None:
+    from unittest.mock import AsyncMock
+
+    hc = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(hc)
+    forwarded = AsyncMock(return_value=httpx.Response(200, json={"applied": True}))
+    monkeypatch.setattr(hc, "post", forwarded)
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _harness_spec("pi")
+
+    app = create_runner_app(
+        process_manager=pm, spec_resolver=resolve, server_client=NullServerClient()
+    )
+    sid = "pi-effort-control"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": sid, "agent_id": "test-agent"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{sid}/events", json={"type": "effort_change", "effort": effort}
+        )
+        assert response.status_code == 200, response.text
+    forwarded.assert_awaited_once_with(
+        f"/v1/sessions/{sid}/settings", json={"effort": effort}, timeout=20.0
     )
 
 

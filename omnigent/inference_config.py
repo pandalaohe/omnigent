@@ -191,6 +191,17 @@ def resolve_bound_model(config: dict[str, object], harness: str, model: str | No
     if binding is None:
         return model
     selected = model or binding.default_model
+    if (
+        selected is not None
+        and normalize_inference_harness(harness) in {"pi", "pi-native"}
+        and selected != binding.default_model
+        and (binding.model_allowlist is None or selected not in binding.model_allowlist)
+    ):
+        from omnigent.harnesses.pi_native.credentials import _split_pi_native_model_selection
+
+        selection = _split_pi_native_model_selection(selected)
+        if selection is not None:
+            selected = selection[1]
     if selected is None:
         provider = resolve_bound_provider(config, harness)
         if provider is not None:

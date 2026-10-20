@@ -1002,6 +1002,17 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
         env["HARNESS_PI_MODEL"] = auth_source.default_model
     if "HARNESS_PI_MODEL" not in env:
         env["HARNESS_PI_MODEL"] = _catalog_default_model(auth_family)
+    metadata: dict[str, dict[str, int]] = {}
+    for family in (anthropic, openai):
+        if family is None:
+            continue
+        model_ids = {family.resolve_model_tier(tier) for tier in family.models}
+        model_ids.update(family.model_metadata)
+        if family is auth_source:
+            model_ids.add(env["HARNESS_PI_MODEL"])
+        for model_id in model_ids:
+            metadata[model_id] = family.model_limits(model_id)
+    env["HARNESS_PI_MODEL_METADATA"] = json.dumps(metadata, sort_keys=True)
 
 
 def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:

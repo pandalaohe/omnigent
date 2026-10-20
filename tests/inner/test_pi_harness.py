@@ -24,6 +24,42 @@ from omnigent.inner import pi_harness
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", [False, True])
+async def test_idle_settings_route_authenticates_and_defers_busy_turns(monkeypatch, busy) -> None:
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    from omnigent.inner.pi_executor import PiExecutor, _PiSessionState
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    executor._apply_thinking_level = AsyncMock()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="session")
+    adapter._executor = executor
+    executor._session_states["session"] = _PiSessionState(rpc=object())
+    if busy:
+        adapter._in_flight["active"] = object()
+    monkeypatch.setattr(pi_harness, "ExecutorAdapter", lambda **kwargs: adapter)
+    app = pi_harness.create_app()
+    app.state.conversation_id = "session"
+    app.state.harness_auth_token = "test-harness"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        denied = await client.post("/v1/sessions/session/settings", json={"effort": "high"})
+        assert denied.status_code == 401
+        accepted = await client.post(
+            "/v1/sessions/session/settings",
+            json={"effort": "high"},
+            headers={"Authorization": "Bearer test-harness"},
+        )
+        assert accepted.status_code == 200
+        assert accepted.json() == {"applied": not busy}
+    assert executor._apply_thinking_level.await_count == (0 if busy else 1)
+
+
 def test_harness_module_registered_in_module_registry() -> None:
     """``"pi"`` resolves to the harness module path.
 

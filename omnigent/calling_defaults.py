@@ -33,6 +33,7 @@ _logger = logging.getLogger(__name__)
 SDK_NATIVE_PARENT: dict[str, str] = {
     "codex": "codex-native",
     "claude-sdk": "claude-native",
+    "pi": "pi-native",
 }
 
 #: Harnesses a host can answer a model-options request for.
@@ -42,6 +43,7 @@ MODEL_OPTION_HARNESSES: tuple[str, ...] = (
     "claude-native",
     "claude-sdk",
     "pi-native",
+    "pi",
     "devin-native",
     "antigravity-native",
 )

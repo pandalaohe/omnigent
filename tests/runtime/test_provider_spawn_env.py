@@ -140,6 +140,38 @@ def config_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.mark.parametrize(
+    "selected,allowed,expected",
+    [
+        ("omnigent/kimi-k2", "kimi-k2", "kimi-k2"),
+        ("omnigent/kimi-k2", "omnigent/kimi-k2", "omnigent/kimi-k2"),
+    ],
+)
+def test_pi_bound_spawn_decodes_qualified_picker(config_home, selected, allowed, expected):
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "proxy": {
+                    "kind": "gateway",
+                    "openai": {
+                        "base_url": "https://models.example.test/v1",
+                        "api_key": "test-key",
+                        "models": {"default": allowed},
+                    },
+                }
+            },
+            "inference": {
+                "harnesses": {"pi": {"provider": "proxy", "model_allowlist": [allowed]}}
+            },
+        },
+    )
+    spec = _make_spec(harness="pi", model=selected)
+    env = _build_pi_spawn_env(spec, workdir=None)
+    assert env["HARNESS_PI_MODEL"] == expected
+    assert env["HARNESS_PI_PRESERVE_MODEL_IDS"] == "true"
+
+
 def _write_config(config_home: Path, config: dict[str, object]) -> None:
     """
     Write *config* as ``config.yaml`` under *config_home*.

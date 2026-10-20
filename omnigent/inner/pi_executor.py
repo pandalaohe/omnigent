@@ -58,6 +58,7 @@ from urllib.parse import urlparse as _urlparse
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
+    _split_pi_native_model_selection,
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
@@ -91,6 +92,8 @@ from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactionComplete,
+    CompactionStarted,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -781,6 +784,7 @@ def _build_models_json(
     catalog_models: Sequence[model_catalog.ModelEntry] = (),
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
+    model_metadata: Mapping[str, Mapping[str, int]] | None = None,
 ) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
@@ -839,7 +843,6 @@ def _build_models_json(
         "supportsDeveloperRole": False,
         "supportsStore": False,
         "supportsStrictMode": False,
-        **({} if is_generic_provider else {"supportsReasoningEffort": False}),
     }
     provider_models: dict[str, list[_JsonObject]] = {
         "databricks-openai": [],
@@ -906,7 +909,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
                     "supportsUsageInStreaming": False,
                 },
                 "models": provider_models["databricks-mlflow"],
@@ -922,7 +924,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    **({} if is_generic_provider else {"supportsReasoningEffort": False}),
                     # Gemini/Qwen/Llama/inkling models reject stream_options
                     # (which carries include_usage) with 400 "unknown field".
                     "supportsUsageInStreaming": False,
@@ -962,6 +963,13 @@ def _build_models_json(
                 if pi_model_is_reasoning(model):
                     entry["reasoning"] = True
             provider["models"] = [*provider["models"], entry]
+    for provider in config["providers"].values():
+        for entry in provider["models"]:
+            limits = (model_metadata or {}).get(str(entry["id"]), {})
+            if "context_window" in limits:
+                entry["contextWindow"] = limits["context_window"]
+            if "max_output_tokens" in limits:
+                entry["maxTokens"] = limits["max_output_tokens"]
     return config
 
 
@@ -1391,6 +1399,7 @@ class _PiSessionState:
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
     model: str | None = None
+    model_selection: str | None = None
     # Thinking level (Pi vocabulary) this process is known to be running at,
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
@@ -1847,7 +1856,7 @@ def _pi_thinking_from_config(config: ExecutorConfig | None) -> str | None:
 
     Canonical omnigent efforts (:data:`PI_EFFORTS`) are translated to Pi's
     vocabulary; a clear value (``default``/``off``/``reset``) resolves to
-    ``None``, which leaves a live session at its current level and omits
+    ``None``, which restores a live session's configured default and omits
     ``--thinking`` on the next spawn so Pi's model default applies.
 
     :param config: The turn's executor config, or ``None``.
@@ -1887,6 +1896,7 @@ class PiExecutor(Executor):
         context_files: bool = True,
         system_prompt_mode: str = "append",
         preserve_model_ids: bool = False,
+        model_metadata: Mapping[str, Mapping[str, int]] | None = None,
     ) -> None:
         """Create a PiExecutor.
 
@@ -1966,6 +1976,7 @@ class PiExecutor(Executor):
         self._os_env_spec = os_env
         self._model_override = model
         self._preserve_model_ids = preserve_model_ids
+        self._model_metadata = model_metadata
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
@@ -2197,6 +2208,10 @@ class PiExecutor(Executor):
         """
         cfg = config or ExecutorConfig()
         model = cfg.model or self._model_override
+        if model and self._gateway and not self._preserve_model_ids:
+            selection = _split_pi_native_model_selection(model)
+            if selection is not None:
+                model = selection[1]
         if model is None and self._gateway_uses_databricks_profile:
             # DATABRICKS-PATCH(pi-live-model-discovery): resolve from the
             # workspace, not the bundled catalog whose legacy `databricks-` ids
@@ -2509,14 +2524,19 @@ class PiExecutor(Executor):
 
         :param state: Session state whose ``applied_thinking`` is updated.
         :param rpc: The live Pi RPC session.
-        :param thinking: Requested level in Pi vocabulary, or ``None`` to leave
-            the session alone (clear-to-default is a no-op mid-session).
+        :param thinking: Requested level in Pi vocabulary, or ``None`` to restore
+            the configured model/project/global default after an override.
         :param spawned: ``True`` when *rpc* was just spawned with ``--thinking``.
         """
+        requested_thinking = thinking
+        if not spawned and requested_thinking == state.applied_thinking:
+            return
         if thinking is None:
-            return
-        if not spawned and thinking == state.applied_thinking:
-            return
+            if state.applied_thinking is None:
+                return
+            from .pi_settings import default_pi_thinking_level
+
+            thinking = default_pi_thinking_level(self._cwd, state.model_selection)
         supported = await self._available_thinking_levels(rpc)
         level = nearest_pi_thinking_level(thinking, supported) if supported else None
         if level is None:
@@ -2530,10 +2550,13 @@ class PiExecutor(Executor):
             )
         elif spawned:
             return
-        await rpc.send_command(
-            {"type": "set_thinking_level", "level": level, "id": f"thinking_{level}"}
+        response = await rpc.request(
+            {"type": "set_thinking_level", "level": level, "id": f"thinking_{level}"},
+            "set_thinking_level",
         )
-        state.applied_thinking = thinking
+        if response is None:
+            raise RuntimeError("Pi did not confirm the requested thinking level")
+        state.applied_thinking = requested_thinking
 
     async def _ensure_rpc(
         self,
@@ -2575,6 +2598,7 @@ class PiExecutor(Executor):
                 catalog_models=self._gateway_model_entries or (),
                 model_wire_apis=wire_catalog,
                 openai_wire_api=self._openai_wire_api,
+                model_metadata=self._model_metadata,
             )
 
         if state.rpc is not None:
@@ -2619,6 +2643,7 @@ class PiExecutor(Executor):
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
+        state.model_selection = pi_model
         state.applied_thinking = thinking
         state._has_sent_prompt = False
         return rpc
@@ -2657,8 +2682,32 @@ class PiExecutor(Executor):
                 await self._apply_thinking_level(
                     turn_state, rpc, thinking, spawned=rpc is not prior_rpc
                 )
-            except Exception as exc:  # noqa: BLE001 — executor boundary: an effort failure must not sink the turn
-                logger.warning("PiExecutor: could not apply thinking level: %s", exc)
+            except Exception as exc:  # noqa: BLE001 — executor boundary
+                yield ExecutorError(message=f"Could not apply Pi thinking level: {exc}")
+                return
+
+        if messages and _extract_text(messages[-1]).strip() == "/compact":
+            if turn_state is None or not turn_state._has_sent_prompt:
+                yield ExecutorError(message="Send a message before compacting this Pi session.")
+                return
+            yield CompactionStarted()
+            response = await rpc.request(
+                {"type": "compact", "id": f"compact_{secrets.token_hex(8)}"},
+                "compact",
+                timeout=_TURN_STDOUT_IDLE_TIMEOUT_S,
+            )
+            data = response.get("data") if response else None
+            if not isinstance(data, dict) or not isinstance(data.get("summary"), str):
+                yield ExecutorError(message="Pi did not complete context compaction.")
+                return
+            tokens = data.get("estimatedTokensAfter")
+            yield CompactionComplete(
+                summary=data["summary"],
+                token_count=tokens if isinstance(tokens, int) else 0,
+                model=model,
+            )
+            yield TurnComplete()
+            return
 
         # Build the prompt to send to Pi.  On the first turn of a new Pi
         # process, if there are prior messages (e.g. parent history passed

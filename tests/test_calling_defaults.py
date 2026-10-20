@@ -23,7 +23,19 @@ def _agent_harness(agent_id: str) -> str | None:
         "codex-sdk": "codex",
         "claude-agent": "claude-sdk",
         "legacy-agent": "claude-native",
+        "pi-agent": "pi",
     }.get(agent_id)
+
+
+def test_pi_inherits_native_defaults() -> None:
+    result = _resolve(
+        explicit={"agent_id": "pi-agent"},
+        explicit_fields={"agent_id"},
+        master={"HDS": {"pi-native": {"model": "omnigent/kimi-k2", "effort": "high"}}},
+    )
+    assert (result.model, result.effort) == ("omnigent/kimi-k2", "high")
+    assert result.sources["model"] == "master_native"
+    assert result.sources["effort"] == "master_native"
 
 
 def _resolve(
