@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -372,20 +372,74 @@ describe("InstructionsPage", () => {
     ).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit layer" })).not.toBeInTheDocument();
   });
-  it("marks replaced layers and incomplete framework previews", () => {
-    mocks.preview!.parts.push({
-      kind: "user_layers",
-      scope: "host",
-      host_id: "host-a",
-      agent_key: "",
-      text: "Replaced",
-      chars: 8,
-      sent: false,
-      readonly: false,
-    });
+  it.each([
+    { scope: "host" as const, text: "" },
+    { scope: "host" as const, text: "\u0085" },
+    { scope: "host" as const, text: "\u001c" },
+    { scope: "independent" as const, text: " \n " },
+  ])(
+    "labels an empty $scope layer as not sent without an independent setting",
+    ({ scope, text }) => {
+      mocks.preview!.parts.push({
+        kind: "user_layers",
+        scope,
+        host_id: "host-a",
+        agent_key: scope === "independent" ? "codex" : "",
+        text,
+        chars: text.length,
+        sent: false,
+        readonly: false,
+      });
+      page("/settings/instructions?view=route");
+      const empty = screen.getByRole("heading", { name: "Empty layers · Not sent" }).parentElement!;
+      expect(
+        within(empty).getByText(scope === "host" ? "Host" : "Independent"),
+      ).toBeInTheDocument();
+      expect(within(empty).getByText(/Not sent on this route/)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("heading", { name: "Replaced by the independent setting" }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByText("Shared text")).toBeInTheDocument();
+    },
+  );
+  it.each(["Shared text", "\ufeff"])("separates replaced text (%j) from empty layers", (text) => {
+    mocks.preview!.parts[0].sent = false;
+    mocks.preview!.parts[0].text = text;
+    mocks.preview!.parts[0].chars = text.length;
+    mocks.preview!.parts.push(
+      {
+        kind: "user_layers",
+        scope: "independent",
+        host_id: "host-a",
+        agent_key: "codex",
+        text: "Independent text",
+        chars: 16,
+        sent: true,
+        readonly: false,
+      },
+      {
+        kind: "user_layers",
+        scope: "host",
+        host_id: "host-a",
+        agent_key: "",
+        text: "",
+        chars: 0,
+        sent: false,
+        readonly: false,
+      },
+    );
     mocks.preview!.framework_unavailable = true;
     page("/settings/instructions?view=route");
-    expect(screen.getByText(/Not sent on this route/)).toBeInTheDocument();
+    const replaced = screen.getByRole("heading", {
+      name: "Replaced by the independent setting",
+    }).parentElement!;
+    expect(within(replaced).getByText("Shared")).toBeInTheDocument();
+    expect(replaced.textContent).toContain(text);
+    expect(within(replaced).queryByText("Host")).not.toBeInTheDocument();
+    const empty = screen.getByRole("heading", { name: "Empty layers · Not sent" }).parentElement!;
+    expect(within(empty).getByText("Host")).toBeInTheDocument();
+    expect(within(empty).queryByText("Shared text")).not.toBeInTheDocument();
+    expect(screen.getByText("Independent text")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("This preview is incomplete");
   });
 });
