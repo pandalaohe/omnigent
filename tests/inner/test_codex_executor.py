@@ -6144,8 +6144,12 @@ def test_app_server_skips_native_pid_lookup_for_linux_sandbox(
     _run(_t())
 
 
+@pytest.mark.parametrize("inheritance_fails", [False, True])
 def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inheritance_fails: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Empty inherited ``CODEX_HOME`` does not hide the real user login at startup.
@@ -6211,13 +6215,29 @@ def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
         )
         session._request = AsyncMock(return_value={"result": {}})
 
-        with patch(
-            "omnigent.inner.codex_executor._create_subprocess_exec",
-            new=_fake_create_subprocess_exec,
+        with (
+            patch(
+                "omnigent.inner.codex_executor._create_subprocess_exec",
+                new=_fake_create_subprocess_exec,
+            ),
+            patch(
+                "omnigent.harnesses.codex_native.app_server.inherit_codex_hook_approvals",
+                new_callable=AsyncMock,
+            ) as inherit,
         ):
+            if inheritance_fails:
+                inherit.side_effect = RuntimeError("hook RPC unavailable")
             await session.start()
             assert recorded_env is not None
             assert target_at_spawn is not None
+            inherit.assert_awaited_once_with(
+                session._request,
+                cwd=str(workspace),
+                source_home=real_codex_home,
+                private_home=target_at_spawn,
+            )
+            if inheritance_fails:
+                assert "Codex user hook approval inheritance failed" in caplog.text
             await session.close()
 
         assert fake_proc.terminated

@@ -103,6 +103,8 @@ class _FakeCodexClient:
                     update = written.get(hook["key"])
                     if update and update.get("trusted_hash") == hook["currentHash"]:
                         hook["trustStatus"] = "trusted"
+                    if update and "enabled" in update:
+                        hook["enabled"] = update["enabled"]
             return {"result": {"status": "ok"}}
         raise AssertionError(f"unexpected RPC method {method!r}")
 
