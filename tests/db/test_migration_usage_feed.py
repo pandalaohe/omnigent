@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
 
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import SqlUsageFeed
 from omnigent.db.enum_codecs import encode_device_grant_status
 from omnigent.db.utils import (
     _build_alembic_config,
-    _get_current_db_revision,
     get_or_create_engine,
 )
 
@@ -27,6 +27,11 @@ def _migrate(engine: sa.Engine, uri: str, *, downgrade: bool = False) -> None:
         else:
             command.upgrade(config, "a32c20261020")
         connection.commit()
+
+
+def _current_heads(engine: sa.Engine) -> set[str]:
+    with engine.connect() as connection:
+        return set(MigrationContext.configure(connection).get_current_heads())
 
 
 def test_usage_feed_model_creates_and_defaults_progress(db_uri: str) -> None:
@@ -87,7 +92,7 @@ def test_usage_feed_migration_backfills_scope_and_round_trips(db_uri: str) -> No
         assert connection.execute(
             sa.text("SELECT client_id,scope FROM device_grants ORDER BY id")
         ).all() == [(None, "sessions"), ("slack", "sessions"), ("omnigent-cli", None)]
-    assert _get_current_db_revision(engine) == "a32c20261020"
+    assert _current_heads(engine) == {"a32c20261020", "nf12ab34cd56"}
     progress = next(
         c for c in sa.inspect(engine).get_columns("usage_feeds") if c["name"] == "progress"
     )
@@ -117,7 +122,7 @@ def test_usage_feed_upgrade_resumes_after_scope_schema_commit(db_uri: str) -> No
             _migrate(engine, db_uri)
     finally:
         sa.event.remove(engine, "before_cursor_execute", interrupt_backfill)
-    assert _get_current_db_revision(engine) == "a31c20261019"
+    assert _current_heads(engine) == {"a31c20261019", "nf12ab34cd56"}
     assert "scope" in {c["name"] for c in sa.inspect(engine).get_columns("device_grants")}
     _migrate(engine, db_uri)
-    assert _get_current_db_revision(engine) == "a32c20261020"
+    assert _current_heads(engine) == {"a32c20261020", "nf12ab34cd56"}

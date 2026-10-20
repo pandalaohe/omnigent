@@ -18,7 +18,9 @@ def _head(uri: str) -> str:
     return ScriptDirectory.from_config(_build_alembic_config(uri)).get_heads()[0]
 
 
-@pytest.mark.parametrize("start", ["ff1b2c3d4e5", "ge1b2c3d4e5f", "legacy-custom-ge"])
+@pytest.mark.parametrize(
+    "start", ["ff1b2c3d4e5", "ge1b2c3d4e5f", "legacy-custom-ge", "a32c20261020"]
+)
 @pytest.mark.parametrize("manual", [False, True])
 def test_join_preserves_existing_data(tmp_path: Path, start: str, manual: bool) -> None:
     uri = f"sqlite:///{tmp_path / 'join.db'}"
