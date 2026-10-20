@@ -1615,6 +1615,7 @@ def test_sdk_seed_is_distinct_and_uses_host_defaults(
 
     without_spawn = replace(loaded.spec, spawn=False)
     expected_added = {
+        "sys_child_cap",
         "sys_session_create",
         "sys_session_send",
         "sys_session_close",

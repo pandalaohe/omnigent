@@ -1559,9 +1559,10 @@ async def forward_claude_transcript_to_session(
         )
 
         await prepare_capture(client, session_id, "claude-native")
-        inherited_path = read_transcript_path(bridge_dir)
-        if start_at_end and inherited_path is not None:
-            await asyncio.to_thread(baseline_claude_transcripts, inherited_path, session_id)
+        if start_at_end:
+            inherited_path = read_transcript_path(bridge_dir)
+            if inherited_path is not None:
+                await asyncio.to_thread(baseline_claude_transcripts, inherited_path, session_id)
         loop_failures = 0
         loop_failure_logged_at = 0.0
         while True:

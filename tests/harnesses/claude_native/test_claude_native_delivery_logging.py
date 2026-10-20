@@ -24,7 +24,7 @@ from omnigent.native.input_diagnostics import input_delivery_scope
         ("blank_line", "unverified", "returned"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
-        ("empty_capture", "inconclusive_capture", "returned"),
+        ("empty_capture", "inconclusive_capture", "error"),
         ("missing_glyph", "inconclusive_capture", "returned"),
         ("transport_error", "not_started", "error"),
         ("observation_error", "not_started", "returned"),
@@ -42,6 +42,11 @@ def test_delivery_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    tmux_info = {"socket_path": "/unused/socket", "tmux_target": "main"}
+    (tmp_path / bridge._TMUX_FILE).write_text(json.dumps(tmux_info))
+    (tmp_path / bridge._STATE_FILE).write_text(json.dumps({"accepted_input_tmux": tmux_info}))
     secret = "private customer prompt"
     if scenario == "unknown_command":
         secret = "/private-customer-command"
@@ -181,7 +186,7 @@ def test_delivery_diagnostics(
         assert all(attempt["submit_sent"] for attempt in attempts)
         assert all(attempt["verification"] == "draft_absent" for attempt in attempts)
 
-    if scenario in {"normal", "empty_capture"}:
+    if scenario == "normal":
         assert attrs["draft_polls"] == 1
         assert attrs["draft_empty_captures"] == 0
         assert attrs["draft_wait_ms"] == 0
@@ -194,6 +199,12 @@ def test_delivery_diagnostics(
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == 10
         assert attrs["elapsed_ms"] == 30
+
+    if scenario == "empty_capture":
+        assert attrs["submit_sent"] is True
+        assert attrs["submit_capture_empty"] is True
+        assert attrs["submit_polls"] > 1
+        assert attrs["submit_wait_ms"] >= 60
 
     if scenario == "blank_line":
         assert attrs["draft_seen"] is False
