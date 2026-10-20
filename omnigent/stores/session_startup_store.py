@@ -521,6 +521,38 @@ class SessionStartupStore:
 
         return run_write_transaction(self._session, "cancel_unissued_startup", write)
 
+    def discard_ungranted_attempt(
+        self, startup_id: str, attempt_id: str, *, runtime_id: str
+    ) -> bool:
+        """Release a preflight failure only when no physical boundary was granted."""
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if (
+                row.attempt_id != attempt_id
+                or row.runtime_id != runtime_id
+                or row.cold_claims
+                or row.proof_source is not None
+                or row.runtime_ready
+                or row.tools_ready
+            ):
+                return False
+            if not row.occupied:
+                return row.state in ("blocked", "cancelled")
+            cancelled = row.cancel_requested
+            row.cancel_requested = True
+            row.occupied = row.resident = False
+            row.state = "cancelled" if cancelled else "blocked"
+            row.reason = None if cancelled else "input_dispatch_unavailable"
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "discard_ungranted_startup_attempt", write)
+
     def bind_dispatch(
         self,
         startup_id: str,

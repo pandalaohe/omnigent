@@ -9,7 +9,7 @@ import re
 import weakref
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from starlette.datastructures import Headers
@@ -28,6 +28,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
+from omnigent.startup_protocol import StartupAttemptRef
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     ConversationNotFoundError,
@@ -87,6 +88,7 @@ class StartupInputContext:
     user_id: str | None
     input_id: str
     submitted: bool = False
+    startup: StartupAttemptRef | None = None
 
     async def is_disconnected(self) -> bool:
         return False
@@ -377,14 +379,21 @@ class ManagedStartupInputs:
                 self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
             )
 
-    async def _deliver(self, app: Any, session_id: str, item: ConversationItem) -> None:
+    async def _deliver(
+        self,
+        app: Any,
+        session_id: str,
+        item: ConversationItem,
+        *,
+        startup: StartupAttemptRef | None = None,
+    ) -> Literal["submitted", "not_dispatched", "unconfirmed"]:
         if self.dispatch is None:
-            return
+            return "not_dispatched"
         key = (current_workspace_id(), session_id)
         task = asyncio.current_task()
         assert task is not None
         if key in self._deliveries and self._deliveries[key] is not task:
-            return
+            return "unconfirmed"
         self._deliveries[key] = task
         context: StartupInputContext | None = None
         try:
@@ -397,7 +406,7 @@ class ManagedStartupInputs:
                 or current.response_id != PENDING_INPUT_RESPONSE_ID
                 or current.status != "in_progress"
             ):
-                return
+                return "not_dispatched"
             options = (
                 item.data.startup_options
                 if isinstance(item.data, (MessageData, SlashCommandData))
@@ -414,6 +423,7 @@ class ManagedStartupInputs:
                 ),
                 item.created_by,
                 item.id,
+                startup=startup,
             )
             event = SessionEventInput(
                 type=item.type,
@@ -446,6 +456,7 @@ class ManagedStartupInputs:
                 await asyncio.to_thread(
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
+            return "submitted" if context.submitted else "not_dispatched"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -471,6 +482,7 @@ class ManagedStartupInputs:
                 )
                 + str(exc)[:1000],
             )
+            return "unconfirmed" if uncertain else "not_dispatched"
         finally:
             self._deliveries.pop(key, None)
 
