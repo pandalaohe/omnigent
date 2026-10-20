@@ -2344,14 +2344,13 @@ def test_list_conversations_search_sets_statement_timeout(
 ) -> None:
     """
     A content search bounds itself with ``SET LOCAL statement_timeout`` on
-    Postgres, so an unindexed scan can't run unbounded (the query runs in a
-    worker thread a client disconnect wouldn't stop).
+    PostgreSQL and CockroachDB, so an unindexed scan can't run unbounded
+    (the query runs in a worker thread a client disconnect wouldn't stop).
 
-    Postgres-only: SQLite has no ``statement_timeout``; the search path skips
-    the SET there, which the companion assertion below guards.
+    SQLite and MySQL skip this PostgreSQL-family setting.
     """
-    if conversation_store._conv_engine.dialect.name != "postgresql":
-        pytest.skip("statement_timeout is a Postgres feature")
+    if conversation_store._conv_engine.dialect.name not in {"postgresql", "cockroachdb"}:
+        pytest.skip("SET LOCAL statement_timeout requires PostgreSQL or CockroachDB")
 
     conv = conversation_store.create_conversation()
     conversation_store.update_conversation(conv.id, title="deployment runbook")
@@ -2381,6 +2380,64 @@ def test_list_conversations_no_search_skips_statement_timeout(
         lambda: conversation_store.list_conversations(),
     )
     assert not any("statement_timeout" in s.lower() for s in statements), statements
+
+
+@pytest.mark.parametrize("dialect_name", ["postgresql", "cockroachdb", "sqlite", "mysql", None])
+@pytest.mark.parametrize(
+    "operation,meta_timeout,conv_timeout",
+    [
+        ("visible_items", False, True),
+        ("archived_facets", True, True),
+        ("workspace_search", True, True),
+        ("content_search", False, True),
+        ("title_search", False, False),
+        ("no_search", False, False),
+    ],
+)
+def test_search_statement_timeout_by_dialect(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    dialect_name: str | None,
+    operation: str,
+    meta_timeout: bool,
+    conv_timeout: bool,
+) -> None:
+    """Each search transaction bounds its reads on PostgreSQL and CockroachDB."""
+    sessions = [MagicMock(spec=Session), MagicMock(spec=Session)]
+    for attribute, session in zip(("_session", "_conv_session"), sessions, strict=True):
+        session.bind = MagicMock() if dialect_name is not None else None
+        if session.bind is not None:
+            session.bind.dialect.name = dialect_name
+        session.execute.return_value.scalars.return_value.all.return_value = []
+        monkeypatch.setattr(
+            conversation_store, attribute, lambda _name, sess=session: contextlib.nullcontext(sess)
+        )
+
+    if operation == "visible_items":
+        conversation_store.search_visible_items_literal("0" * 32, "needle")
+    elif operation == "archived_facets":
+        conversation_store.list_archived_facets(project="needle")
+    else:
+        scope = {
+            "workspace_search": "all",
+            "content_search": "content",
+            "title_search": "title",
+            "no_search": "all",
+        }[operation]
+        conversation_store.list_conversations(
+            search_query=None if operation == "no_search" else "needle", search_scope=scope
+        )
+
+    for session, needs_timeout in zip(sessions, (meta_timeout, conv_timeout), strict=True):
+        statements = [str(call.args[0]) for call in session.execute.call_args_list]
+        expected = (
+            ["SET LOCAL statement_timeout = 15000"]
+            if needs_timeout and dialect_name in {"postgresql", "cockroachdb"}
+            else []
+        )
+        assert [sql for sql in statements if "statement_timeout" in sql] == expected
+        if expected:
+            assert statements[0] == expected[0]
 
 
 def test_list_conversations_search_content_match_is_correlated(
