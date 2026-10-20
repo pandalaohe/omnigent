@@ -84,7 +84,15 @@ class StartupCoordinator:
 
     async def _valid_input(self, startup: StartupSnapshot) -> bool:
         conv = await asyncio.to_thread(self.conversations.get_conversation, startup.session_id)
-        if conv is None or conv.archived or conv.host_id != startup.host_id:
+        if conv is None or conv.archived:
+            return False
+        if startup.preparation is None:
+            if conv.host_id != startup.host_id:
+                return False
+        elif (conv.host_id, conv.runner_id) != (
+            startup.preparation["previous_host_id"],
+            startup.preparation["previous_runner_id"],
+        ):
             return False
         if startup.input_id is None:
             return True

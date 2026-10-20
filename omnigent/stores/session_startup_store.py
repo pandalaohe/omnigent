@@ -30,6 +30,9 @@ class StartupSnapshot:
     attempt_id: str | None
     runtime_id: str | None
     runtime_generation: int
+    preparation: dict | None
+    owner_user_id: str
+    resident: bool
 
 
 def _snapshot(row: SqlSessionStartup) -> StartupSnapshot:
@@ -384,6 +387,7 @@ class SessionStartupStore:
         runtime_generation: int = 1,
         parent_startup_id: str | None = None,
         reuse_startup_id: str | None = None,
+        preparation: dict | None = None,
     ) -> StartupSnapshot:
         if not 0 < len(operation_key) <= 128 or not 0 < len(owner_user_id) <= 128:
             raise ValueError("Invalid owner or operation key")
@@ -407,6 +411,8 @@ class SessionStartupStore:
                     old.parent_startup_id,
                 ) != (host_id, session_id, input_id, runtime_generation, parent_startup_id):
                     raise ValueError("Conflicting startup operation key")
+                if old.preparation != preparation:
+                    raise ValueError("Conflicting startup preparation")
                 return _snapshot(old)
             reuse = (
                 db.get(SqlSessionStartup, (current_workspace_id(), reuse_startup_id))
@@ -485,6 +491,7 @@ class SessionStartupStore:
                 runtime_id=reuse.runtime_id if reuse else None,
                 host_generation=reuse.host_generation if reuse else None,
                 cold_claims={"resident_reuse": reuse.id} if reuse else {},
+                preparation=preparation,
             )
             db.add(row)
             return _snapshot(row)
@@ -504,6 +511,37 @@ class SessionStartupStore:
                 .limit(100)
             )
             return [_snapshot(row) for row in rows]
+
+    def attach_queued_input(self, startup_id: str, input_id: str) -> StartupSnapshot | None:
+        """Attach the canonical first input only before any permit is issued."""
+
+        def write(db: Session) -> StartupSnapshot | None:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return None
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if row.state == "queued" and not row.cancel_requested and row.input_id is None:
+                row.input_id, row.updated_at = input_id, now_epoch()
+            return _snapshot(row)
+
+        return run_write_transaction(self._session, "attach_queued_startup_input", write)
+
+    def attach_preparation(self, startup_id: str, preparation: dict) -> StartupSnapshot:
+        def write(db: Session) -> StartupSnapshot:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                raise ValueError("Startup disappeared")
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if row.state != "queued" or row.cancel_requested or row.occupied:
+                raise ValueError("Startup preparation already issued")
+            if row.preparation is not None and row.preparation != preparation:
+                raise ValueError("Conflicting startup preparation")
+            row.preparation, row.updated_at = preparation, now_epoch()
+            return _snapshot(row)
+
+        return run_write_transaction(self._session, "attach_startup_preparation", write)
 
     def reserve(
         self, host_id: str, *, eligible_ids: set[str] | None = None
@@ -652,6 +690,8 @@ class SessionStartupStore:
     ) -> bool:
         """A lost grant response is ambiguous; never grant the same physical start twice."""
         if boundary not in (
+            "workspace_prepare",
+            "input_dispatch",
             "runner_prepare",
             "runner_spawn",
             "native_prepare",
@@ -677,7 +717,7 @@ class SessionStartupStore:
                 or row.host_generation not in (None, host_generation)
                 or host.current_generation not in (None, host_generation)
                 or (expected_runner_id is not None and host.current_generation != host_generation)
-                or "resident_reuse" in row.cold_claims
+                or ("resident_reuse" in row.cold_claims and boundary != "input_dispatch")
                 or boundary in row.cold_claims
                 or (boundary == "runner_spawn" and "runner_prepare" not in row.cold_claims)
             ):
@@ -686,6 +726,19 @@ class SessionStartupStore:
                 db, row, expected_runner_id
             ):
                 return False
+            if boundary == "workspace_prepare":
+                binding = db.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), row.session_id),
+                    with_for_update=True,
+                )
+                if (
+                    row.preparation is None
+                    or binding is None
+                    or (binding.host_id, binding.runner_id)
+                    != (row.preparation["previous_host_id"], row.preparation["previous_runner_id"])
+                ):
+                    return False
             row.runtime_id, row.host_generation = runtime_id, host_generation
             row.cold_claims = {**row.cold_claims, boundary: claim_id}
             row.state, row.updated_at = "verifying", now_epoch()
@@ -746,6 +799,67 @@ class SessionStartupStore:
             return _snapshot(row)
 
         return run_write_transaction(self._session, "cancel_startup", write)
+
+    def cancel_session_current(self, session_id: str) -> StartupSnapshot | None:
+        """Session Stop fences the latest attempt atomically with reservation."""
+
+        def write(db: Session) -> StartupSnapshot | None:
+            row = self._current_session_row(db, session_id)
+            if row is None:
+                return None
+            self._budgets(db, row.host_id)
+            row = self._current_session_row(db, session_id, locked=True)
+            assert row is not None
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if row.state not in (
+                "queued",
+                "starting",
+                "verifying",
+                "blocked",
+                "uncertain",
+                "cancelling",
+            ):
+                return None
+            row.cancel_requested = True
+            if not (set(row.cold_claims) - {"resident_reuse"}):
+                row.occupied = row.resident = False
+                row.state = "cancelled"
+            else:
+                row.state = "cancelling"
+            row.updated_at = now_epoch()
+            return _snapshot(row)
+
+        return run_write_transaction(self._session, "cancel_current_session_startup", write)
+
+    def reject_preparation(self, startup_id: str, attempt_id: str) -> bool:
+        """A definite preparation refusal proves no runtime command was issued."""
+
+        def write(db: Session) -> bool:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
+            if row is None:
+                return False
+            self._budgets(db, row.host_id)
+            db.refresh(row, with_for_update=True)
+            if (
+                row.attempt_id != attempt_id
+                or set(row.cold_claims) - {"workspace_prepare"}
+                or row.runtime_ready
+                or row.tools_ready
+                or row.proof_source is not None
+            ):
+                return False
+            if not row.occupied:
+                return row.state in ("blocked", "cancelled")
+            cancelled = row.cancel_requested
+            row.occupied = row.resident = False
+            row.cancel_requested = True
+            row.state = "cancelled" if cancelled else "blocked"
+            row.reason = None if cancelled else "preparation_refused"
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session, "reject_startup_preparation", write)
 
     @staticmethod
     def _settle_runtime_stopped(db: Session, row: SqlSessionStartup) -> None:

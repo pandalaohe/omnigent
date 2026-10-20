@@ -53,6 +53,7 @@ class SqlSessionStartup(OmnigentBase):
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     cold_claims: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
     host_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    preparation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 

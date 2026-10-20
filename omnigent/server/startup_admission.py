@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from typing import Any
 
@@ -43,13 +44,32 @@ class StartupAdmission:
             policy,
         )
         self._app: Any = None
+        self.prepare_dispatch: Callable[[Any, StartupSnapshot], Awaitable[None]] | None = None
         self.coordinator = StartupCoordinator(
             startups, conversations, eligible=self._eligible, launch=self._launch
         )
 
     def bind(self, app: Any) -> None:
         self._app = app
+        app.state.startup_store = self.startups
+        app.state.startup_admission = self
         self.hosts.startup_admitter = self.admit_launch
+        inputs = app.state.startup_inputs
+        if inputs is not None:
+            inputs.on_saved = self.input_saved
+            inputs.cancel_attempt = self.cancel_session
+
+    async def input_saved(self, session_id: str, _input_id: str) -> None:
+        current = await asyncio.to_thread(self.startups.for_session, session_id)
+        if current is not None and current.state == "queued" and current.input_id is None:
+            pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+            head = next((item for item in pending if item.status != "failed"), None)
+            if head is not None and head.status == "in_progress":
+                await asyncio.to_thread(self.startups.attach_queued_input, current.id, head.id)
+
+    async def cancel_session(self, session_id: str) -> bool:
+        cancelled = await asyncio.to_thread(self.startups.cancel_session_current, session_id)
+        return cancelled is not None and cancelled.state == "cancelled" and not cancelled.resident
 
     async def resolve_harness(self, startup: StartupSnapshot) -> str | None:
         from omnigent.server.routes._sessions.helpers import _resolve_harness_async
@@ -81,6 +101,16 @@ class StartupAdmission:
         head = next((item for item in pending if item.status != "failed"), None)
         if current is not None:
             if (
+                current.state == "queued"
+                and current.input_id is None
+                and head is not None
+                and head.status == "in_progress"
+            ):
+                attached = await asyncio.to_thread(
+                    self.startups.attach_queued_input, current.id, head.id
+                )
+                return attached or current
+            if (
                 current.state == "ready_empty"
                 and head is not None
                 and head.status == "in_progress"
@@ -110,6 +140,74 @@ class StartupAdmission:
             owner_user_id=conn.owner or "__local__",
             operation_key=f"startup:{session_id}",
         )
+
+    async def queue_preparation(
+        self, conn: HostConnection, session_id: str, preparation: dict
+    ) -> StartupSnapshot:
+        current = await asyncio.to_thread(self.startups.for_session, session_id)
+        if (
+            current is not None
+            and current.state == "blocked"
+            and not current.resident
+            and current.reason == "preparation_refused"
+        ):
+            current = await asyncio.to_thread(
+                self.startups.cancel_current, current.id, expected_attempt_id=current.attempt_id
+            )
+            if current is None:
+                raise OmnigentError("Startup preparation changed", code=ErrorCode.CONFLICT)
+        if (
+            current is not None
+            and current.preparation is not None
+            and current.state not in ("cancelled", "stopped")
+        ):
+            fields = ("session_id", "workspace", "git", "user_id", "account_generation")
+            if current.host_id == conn.host_id and all(
+                current.preparation[name] == preparation[name] for name in fields
+            ):
+                return current
+            raise OmnigentError("Startup preparation changed", code=ErrorCode.CONFLICT)
+        pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        head = next((item for item in pending if item.status != "failed"), None)
+        if head is not None and head.status != "in_progress":
+            raise OmnigentError("Previous input requires reconciliation", code=ErrorCode.CONFLICT)
+        if current is not None and current.state == "queued" and current.host_id == conn.host_id:
+            attached = await asyncio.to_thread(
+                self.startups.attach_preparation, current.id, preparation
+            )
+            if head is not None and attached.input_id is None:
+                attached = await asyncio.to_thread(
+                    self.startups.attach_queued_input, attached.id, head.id
+                )
+            return attached or current
+        if current is not None and (
+            current.resident or current.state not in ("stopped", "cancelled")
+        ):
+            raise OmnigentError(
+                "Previous startup must be reconciled first", code=ErrorCode.CONFLICT
+            )
+        await asyncio.to_thread(
+            self.startups.configure,
+            conn.host_id,
+            host_resident_limit=self.policy.host_resident_limit,
+            deployment_resident_limit=self.policy.deployment_resident_limit,
+            startup_limit=self.policy.startup_limit,
+        )
+        generation = current.runtime_generation + 1 if current else 1
+        return await asyncio.to_thread(
+            self.startups.enqueue,
+            owner_user_id=conn.owner or "__local__",
+            host_id=conn.host_id,
+            session_id=session_id,
+            operation_key=f"prepare:{session_id}:{generation}",
+            input_id=head.id if head else None,
+            runtime_generation=generation,
+            preparation=preparation,
+        )
+
+    def dispatching(self, session_id: str) -> bool:
+        scope = _dispatch.get()
+        return scope is not None and scope[0] == session_id
 
     async def admit_launch(self, conn: HostConnection, session_id: str) -> StartupAttemptRef:
         scope = _dispatch.get()
@@ -158,6 +256,10 @@ class StartupAdmission:
             return
         token = _dispatch.set((startup.session_id, ref))
         try:
+            if startup.preparation is not None:
+                if self.prepare_dispatch is None:
+                    raise StartupQueued(startup.id)
+                await self.prepare_dispatch(self._app, startup)
             if startup.input_id is not None:
                 item = await asyncio.to_thread(
                     self.conversations.get_item, startup.session_id, startup.input_id
@@ -181,7 +283,7 @@ class StartupAdmission:
                             ref.attempt_id,
                             reason="input_dispatch_unconfirmed",
                         )
-            else:
+            elif startup.preparation is None:
                 from omnigent.server.routes.sessions import _launch_runner_on_host
 
                 conv = await asyncio.to_thread(
@@ -203,7 +305,8 @@ class StartupAdmission:
     async def recover_session(self, session_id: str, conn: HostConnection) -> bool:
         await self.queue_session(conn, session_id)
         await self.coordinator.advance(conn.host_id)
-        return True
+        current = await asyncio.to_thread(self.startups.for_session, session_id)
+        return current is not None and current.state in ("starting", "verifying")
 
     async def shutdown(self) -> None:
         await self.coordinator.shutdown()

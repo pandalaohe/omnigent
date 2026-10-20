@@ -1328,7 +1328,15 @@ def register_core_routes(
                 conversation=conversation,
             )
         conn = target.conn
-        startup = await host_registry.admit_launch(conn, session_id)
+        from omnigent.server.startup_admission import StartupQueued
+
+        try:
+            startup = await host_registry.admit_launch(conn, session_id)
+        except StartupQueued:
+            inputs = getattr(request.app.state, "startup_inputs", None)
+            if inputs is not None:
+                inputs.host_changed(request.app, host_id)
+            return None
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
         # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.

@@ -228,3 +228,18 @@ def test_runtime_reuse_rejects_foreign_or_unready_context(db_uri, changed):
     }
     with pytest.raises(ValueError, match="reuse"):
         store.enqueue(**args)
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_session_cancel_releases_reserved_permission_before_any_command(db_uri, claimed):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=2, deployment_resident_limit=2)
+    first = enqueue(store, host)
+    second = enqueue(store, host)
+    attempt = store.reserve(host)
+    if claimed:
+        assert store.claim(first.id, attempt.attempt_id, runtime_id="context")
+    cancelled = store.cancel_session_current(first.session_id)
+    assert cancelled.state == "cancelled" and not cancelled.resident
+    assert not store.claim(first.id, attempt.attempt_id, runtime_id="late")
+    assert store.reserve(host).id == second.id

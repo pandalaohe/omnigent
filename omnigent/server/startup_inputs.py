@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import weakref
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -96,6 +96,18 @@ class StartupInputContext:
     async def claim(self, store: ConversationStore, session_id: str) -> bool:
         # Leave the row queued throughout launch, authorization and policy checks.
         # A submitted native input is never replayed without its transcript receipt.
+        if self.startup is not None:
+            admission = self.app.state.startup_store
+            if not await asyncio.to_thread(
+                admission.claim_boundary,
+                self.startup.startup_id,
+                self.startup.attempt_id,
+                runtime_id=self.startup.runtime_id,
+                host_generation=self.startup.host_generation,
+                boundary="input_dispatch",
+                claim_id=self.input_id,
+            ):
+                return False
         self.submitted = await asyncio.to_thread(
             store.transition_pending_input,
             session_id,
@@ -132,6 +144,8 @@ class ManagedStartupInputs:
         self.hosts = hosts
         _services.add(self)
         self.dispatch: StartupDispatch | None = None
+        self.on_saved: Callable[[str, str], Awaitable[None]] | None = None
+        self.cancel_attempt: Callable[[str], Awaitable[bool]] | None = None
         self._workers: dict[
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
@@ -198,6 +212,8 @@ class ManagedStartupInputs:
                 await asyncio.to_thread(
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
+        if self.on_saved is not None:
+            await self.on_saved(session_id, saved[0].id)
         return saved[0]
 
     async def record_launch_failure(self, session_id: str, reason: str) -> None:
@@ -232,6 +248,19 @@ class ManagedStartupInputs:
 
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
+        admission = getattr(app.state, "startup_admission", None)
+        if admission is not None:
+            current = await asyncio.to_thread(admission.startups.for_session, conv.id)
+            if current is not None and current.state in ("cancelled", "stopped", "cancelling"):
+                raise OmnigentError(
+                    "Startup is stopped or still stopping; "
+                    "resume the session before sending input",
+                    code=ErrorCode.CONFLICT,
+                )
+            if (conv.host_id is not None or current is not None) and (
+                current is None or current.state not in ("working", "command_completed")
+            ):
+                return True
         state = conv.labels.get(STARTUP_LABEL)
         if state not in ("pending", "ready"):
             return False
@@ -285,7 +314,10 @@ class ManagedStartupInputs:
                 wake.set()
                 return
             worker.cancel()
-        if connection is None or not connection.registered_with_managed_token:
+        if connection is None or (
+            not connection.registered_with_managed_token
+            and getattr(app.state, "startup_admission", None) is None
+        ):
             return
         wake = asyncio.Event()
 
@@ -295,6 +327,9 @@ class ManagedStartupInputs:
             while self.hosts.get(host_id) is connection:
                 busy = False
                 try:
+                    admission = getattr(app.state, "startup_admission", None)
+                    if admission is not None:
+                        await admission.coordinator.advance(host_id)
                     ids = await asyncio.to_thread(
                         self.conversations.list_host_conversation_ids, host_id, after=after
                     )
@@ -339,6 +374,23 @@ class ManagedStartupInputs:
         # ones behind it. One submitted to a native harness and awaiting its
         # transcript receipt still does: it may already have run.
         head = next((item for item in items if item.status != "failed"), None)
+        admission = getattr(app.state, "startup_admission", None)
+        if admission is not None:
+            current = await asyncio.to_thread(admission.startups.for_session, session_id)
+            if (
+                (
+                    current is not None
+                    and current.state not in ("working", "command_completed", "ready_empty")
+                )
+                or (head is not None and (current is None or current.state == "ready_empty"))
+                or (state == "pending" and conv.runner_id is None)
+            ):
+                from omnigent.server.startup_admission import StartupQueued
+
+                try:
+                    return await admission.recover_session(session_id, connection)
+                except StartupQueued:
+                    return False
         if head is not None:
             # Delivered even without the label: a message saved while the label
             # was being cleared still belongs to this session's startup.
@@ -501,10 +553,13 @@ class ManagedStartupInputs:
 
     async def cancel(self, session_id: str) -> bool:
         """Cancel saved inputs; return whether startup was cancelled before dispatch."""
+        fenced_before_dispatch = (
+            await self.cancel_attempt(session_id) if self.cancel_attempt is not None else False
+        )
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if not items and (conv is None or conv.labels.get(STARTUP_LABEL) != "pending"):
-            return False
+            return fenced_before_dispatch
         cancelled_before_dispatch = (
             conv is not None and conv.labels.get(STARTUP_LABEL) == "pending"
         )

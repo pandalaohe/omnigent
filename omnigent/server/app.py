@@ -2177,6 +2177,8 @@ def create_app(
 
             await cancel_managed_launch_tasks()
             await cancel_detached_elicitation_tasks()
+            if startup_admission is not None:
+                await startup_admission.shutdown()
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
@@ -2224,11 +2226,10 @@ def create_app(
     app.state.host_registry = host_registry
     from omnigent.server.startup_inputs import ManagedStartupInputs
 
-    # Only managed creates accept a durable first input, and only managed hosts
-    # need their startup recovered on the replica holding the tunnel.
     startup_inputs = (
         ManagedStartupInputs(conversation_store, host_registry)
-        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        if startup_policy is not None
+        or (sandbox_config is not None and sandbox_config.managed_launch_supported)
         else None
     )
     app.state.startup_inputs = startup_inputs
@@ -2240,6 +2241,18 @@ def create_app(
         if startup_policy is not None
         else None
     )
+    from omnigent.server.startup_admission import StartupAdmission
+
+    startup_admission = (
+        StartupAdmission(
+            app.state.startup_store, conversation_store, host_registry, startup_policy
+        )
+        if startup_policy is not None
+        else None
+    )
+    app.state.startup_admission = startup_admission
+    if startup_admission is not None:
+        startup_admission.bind(app)
     app.state.host_store = host_store
     app.state.project_host_binding_store = project_host_binding_store
     app.state.project_repository_store = project_repository_store
@@ -5032,6 +5045,11 @@ def create_app(
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
                 cli_retention_coordinator=cli_retention_coordinator,
+                register_startup_prepare=(
+                    lambda dispatch: setattr(startup_admission, "prepare_dispatch", dispatch)
+                )
+                if startup_admission is not None
+                else None,
             ),
             prefix="/v1",
             tags=["hosts"],
