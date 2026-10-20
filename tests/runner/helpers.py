@@ -7,6 +7,18 @@ from typing import Any
 
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.permission_tiers import PermissionTier
+
+
+def seed_pi_permission_state(workspace: Path, session_id: str, tier: PermissionTier) -> None:
+    """Provide the trusted launch fence normally written by runner initialization."""
+    from omnigent.harnesses.pi_native.bridge import prepare_bridge_dir
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    write_host_permission_state(
+        prepare_bridge_dir(session_id) / "permission_state.json",
+        HostPermissionState(session_id, "test-host", str(workspace), tier, 1, "blocked"),
+    )
 
 
 class NullServerClient:

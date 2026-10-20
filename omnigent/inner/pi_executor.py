@@ -678,6 +678,12 @@ function writePermissionInstallation(pi) {
   } catch (_err) {}
 }
 function permissionExtensionOrderProven() {
+  if (process.env.OMNIGENT_PI_PERMISSION_INLINE) {
+    try {
+      return fs.realpathSync(process.env.OMNIGENT_PI_PERMISSION_INLINE) ===
+        fs.realpathSync(__filename);
+    } catch (_err) { return false; }
+  }
   const argv = process.argv;
   if (!argv.includes("--no-extensions") && !argv.includes("-ne")) return false;
   let lastExtension = null;
@@ -1767,6 +1773,7 @@ class PiSubprocessConfig:
     env: dict[str, str]
     tmp_dir: str
     extra_args: list[str]
+    executable: str | None = None
 
 
 def _extract_text(msg: Message) -> str:
@@ -1949,6 +1956,7 @@ def _try_sandbox_pi(
     os_env: OSEnvSpec | None,
     cwd: str | None,
     spawn_env_names: Sequence[str] | None = None,
+    resource_executable: str | None = None,
 ) -> SandboxedPiCli:
     """Wrap the Pi CLI in a sandbox if ``os_env`` requests it.
 
@@ -1986,9 +1994,10 @@ def _try_sandbox_pi(
             return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
         # Bundled and legacy CLIs both need their sibling npm dependencies.
         executable = pathlib.Path(pi_path).resolve()
+        resource_path = pathlib.Path(resource_executable or pi_path).resolve()
         pi_dir = next(
-            (parent for parent in executable.parents if parent.name == "node_modules"),
-            executable.parent,
+            (parent for parent in resource_path.parents if parent.name == "node_modules"),
+            resource_path.parent,
         )
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
@@ -2800,6 +2809,7 @@ class PiExecutor(Executor):
             tmp_parent.mkdir(parents=True, exist_ok=True)
         tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_", dir=tmp_parent)
         extra_args: list[str] = list(self._extra_args)
+        executable: str | None = None
 
         if self._gateway:
             assert tool_server_port is not None and tool_server_token is not None
@@ -2880,6 +2890,26 @@ class PiExecutor(Executor):
                     extension=pathlib.Path(ext_path),
                 )
             extra_args.extend(["--extension", ext_path])
+            if permission_bridge_dir is not None:
+                permission_state = read_host_permission_state(
+                    permission_bridge_dir / HOST_PERMISSION_STATE_FILE
+                )
+                if permission_state.tier != "full":
+                    from omnigent.inner.pi_settings import ordered_pi_launch
+
+                    launcher, extra_args = ordered_pi_launch(
+                        self._pi_path,
+                        extra_args,
+                        extension=pathlib.Path(ext_path),
+                    )
+                    sandbox_launch = _try_sandbox_pi(
+                        launcher,
+                        self._os_env_spec,
+                        self._cwd,
+                        spawn_env_names=list(env),
+                        resource_executable=self._pi_path,
+                    )
+                    executable = sandbox_launch.launch_path
             # Allowlist the bridged tool names. ``--no-tools`` (set in
             # __init__) disables every tool by default in pi 0.68+;
             # ``--tools`` adds specific names back. Without this pass
@@ -2905,7 +2935,9 @@ class PiExecutor(Executor):
             if tool_names:
                 extra_args.extend(["--tools", ",".join(tool_names)])
 
-        return PiSubprocessConfig(env=env, tmp_dir=tmp_dir, extra_args=extra_args)
+        return PiSubprocessConfig(
+            env=env, tmp_dir=tmp_dir, extra_args=extra_args, executable=executable
+        )
 
     async def _available_thinking_levels(self, rpc: _PiRpcSession) -> list[str] | None:
         """Ask Pi which thinking levels the current model offers.
@@ -3055,7 +3087,7 @@ class PiExecutor(Executor):
             pi_model = effective_model
 
         await rpc.start(
-            self._pi_launch_path,
+            subprocess_config.executable or self._pi_launch_path,
             env=env,
             cwd=self._cwd,
             model=pi_model or None,

@@ -120,6 +120,12 @@ function writePermissionControlFile(config, name, payload) {
 }
 
 function permissionExtensionOrderProven() {
+  if (process.env.OMNIGENT_PI_PERMISSION_INLINE) {
+    try {
+      return fs.realpathSync(process.env.OMNIGENT_PI_PERMISSION_INLINE) ===
+        fs.realpathSync(__filename);
+    } catch (_err) { return false; }
+  }
   const argv = process.argv;
   if (!argv.includes("--no-extensions") && !argv.includes("-ne")) return false;
   let lastExtension = null;

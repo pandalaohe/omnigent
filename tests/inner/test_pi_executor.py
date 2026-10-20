@@ -2255,6 +2255,37 @@ class TestResolveModel(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def test_controlled_rpc_launch_orders_user_extensions_before_guard(tmp_path, monkeypatch):
+    from omnigent.inner import pi_settings
+
+    monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/opt/bin/pi")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 3, 0))
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState("session", "host", str(tmp_path), "ask", 1, "blocked"),
+    )
+    monkeypatch.setattr("omnigent.inner.pi_executor.prepare_bridge_dir", lambda _: bridge)
+    observed = []
+
+    def ordered(executable, args, *, extension):
+        observed.append(executable)
+        return "/opt/launchers/permission-pi", ["--approve", "--model", "demo"]
+
+    monkeypatch.setattr(pi_settings, "ordered_pi_launch", ordered)
+    executor = PiExecutor(cwd=str(tmp_path), permission_controlled=True)
+    config = executor._build_env_and_dir(
+        [], 12345, "test-token", None, permission_session_id="session"
+    )
+    try:
+        assert config.executable == "/opt/launchers/permission-pi"
+        assert observed == ["/opt/bin/pi"]
+        assert config.extra_args == ["--approve", "--model", "demo", "--tools", "read"]
+    finally:
+        shutil.rmtree(config.tmp_dir)
+
+
 class TestBuildEnvAndDir(unittest.TestCase):
     def test_databricks_creates_models_json(self):
         with (

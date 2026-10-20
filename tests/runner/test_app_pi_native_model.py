@@ -26,6 +26,7 @@ from omnigent.runner.native.orchestration import (
     _pi_native_model_from_spec,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests.runner.helpers import seed_pi_permission_state
 
 
 def _spec(model: str | None) -> AgentSpec:
@@ -184,6 +185,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
         ),
     )
 
+    seed_pi_permission_state(workspace, session_id, "full")
     await _auto_create_pi_terminal(
         session_id,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -293,6 +295,7 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
         executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
     )
 
+    seed_pi_permission_state(workspace, session_id, "full")
     await _auto_create_pi_terminal(
         session_id,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -390,6 +393,7 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
         executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
     )
 
+    seed_pi_permission_state(workspace, session_id, "full")
     await _auto_create_pi_terminal(
         session_id,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
