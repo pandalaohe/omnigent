@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Host } from "@/hooks/useHosts";
 import { layerId, type InstructionLayers, type LayerKey } from "@/hooks/useInstructionLayers";
 
@@ -97,8 +98,23 @@ export function LayerGrid({
                         >
                           View route
                         </Button>
-                        {size?.over_budget && (
-                          <span className="text-xs font-medium">Over 10,000</span>
+                        {size && size.total_chars > data.size_reminder_chars && (
+                          <Tooltip>
+                            <TooltipTrigger
+                              className="cursor-help rounded-sm text-xs font-medium text-warning focus-visible:outline-2 focus-visible:outline-ring"
+                              aria-label={`${size.total_chars.toLocaleString()} instruction characters`}
+                            >
+                              {(size.total_chars / 1000).toFixed(1)}k
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {size.total_chars.toLocaleString()} characters: largest of top-level
+                              and child-session totals
+                              {size.framework_unavailable
+                                ? ". Built-in sections are unavailable and not counted."
+                                : ", including built-in sections."}{" "}
+                              Text is never truncated.
+                            </TooltipContent>
+                          </Tooltip>
                         )}
                       </div>
                     </td>

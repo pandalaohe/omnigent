@@ -44,7 +44,12 @@ export function RouteView({
   );
   const [copyState, setCopyState] = useState("");
   const sent = data.parts.filter((part) => part.sent);
-  const replaced = data.parts.filter((part) => !part.sent && part.scope);
+  const unsent = data.parts.filter((part) => !part.sent && part.scope);
+  const hasText = (part: InstructionPreview["parts"][number]) =>
+    // eslint-disable-next-line no-control-regex -- Match Python str.strip() control whitespace.
+    /[^\p{White_Space}\u001c-\u001f]/u.test(part.text ?? "");
+  const replaced = unsent.filter(hasText);
+  const empty = unsent.filter((part) => !hasText(part));
   const section = (part: InstructionPreview["parts"][number], index: number) => {
     const label = LABELS[part.scope ?? part.kind] ?? part.kind.replaceAll("_", " ");
     const partIndex = data.parts.indexOf(part);
@@ -162,6 +167,12 @@ export function RouteView({
         <section className="space-y-3 border-t pt-5">
           <h3 className="text-sm font-medium">Replaced by the independent setting</h3>
           {replaced.map(section)}
+        </section>
+      )}
+      {empty.length > 0 && (
+        <section className="space-y-3 border-t pt-5">
+          <h3 className="text-sm font-medium">Empty layers · Not sent</h3>
+          {empty.map(section)}
         </section>
       )}
       <footer className="space-y-2 border-t pt-4 text-sm">

@@ -1,8 +1,9 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstructionsPage } from "./InstructionsPage";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
   InstructionLayer,
   InstructionLayers,
@@ -81,7 +82,9 @@ function Location() {
 function page(url = "/settings/instructions") {
   return render(
     <MemoryRouter initialEntries={[url]}>
-      <InstructionsPage />
+      <TooltipProvider>
+        <InstructionsPage />
+      </TooltipProvider>
       <Location />
     </MemoryRouter>,
   );
@@ -128,6 +131,51 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("InstructionsPage", () => {
+  it.each([
+    { total: 9999, compact: null },
+    { total: 10000, compact: null },
+    { total: 10001, compact: "10.0k" },
+    { total: 11234, compact: "11.2k" },
+    { total: 123456, compact: "123.5k" },
+  ])("only shows a compact warning total above the limit: $total", ({ total, compact }) => {
+    mocks.layers!.route_sizes = [{ host_id: "host-a", agent_key: "codex", total_chars: total }];
+    page();
+    const warning = screen.queryByRole("button", { name: /instruction characters/ });
+    if (compact === null) expect(warning).not.toBeInTheDocument();
+    else {
+      expect(warning).toHaveTextContent(compact);
+      expect(warning).toHaveClass("text-warning");
+    }
+    expect(screen.queryByText("Over 10,000")).not.toBeInTheDocument();
+  });
+  it("explains the exact total and included sections in the warning tooltip", async () => {
+    mocks.layers!.route_sizes = [
+      { host_id: "host-a", agent_key: "codex", total_chars: 11234, over_budget: true },
+    ];
+    page();
+    fireEvent.focus(screen.getByRole("button", { name: "11,234 instruction characters" }));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("11,234 characters");
+    expect(tooltip).toHaveTextContent("largest of top-level and child-session totals");
+    expect(tooltip).toHaveTextContent("including built-in sections");
+    expect(tooltip).toHaveTextContent("never truncated");
+  });
+  it("qualifies the count when built-in sections could not be counted", async () => {
+    mocks.layers!.route_sizes = [
+      {
+        host_id: "host-a",
+        agent_key: "codex",
+        total_chars: 11234,
+        framework_unavailable: true,
+      },
+    ];
+    page();
+    fireEvent.focus(screen.getByRole("button", { name: "11,234 instruction characters" }));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Built-in sections are unavailable and not counted");
+    expect(tooltip).not.toHaveTextContent("including built-in sections");
+    expect(tooltip).toHaveTextContent("never truncated");
+  });
   it("includes managed hosts in the matrix and route picker", async () => {
     page();
     expect(screen.getByRole("button", { name: "Edit Cloud / Codex" })).toBeInTheDocument();
@@ -247,6 +295,65 @@ describe("InstructionsPage", () => {
     );
     expect(mocks.save).not.toHaveBeenCalled();
   });
+  it("saves an untouched prefill as an independent setting without marking it dirty", async () => {
+    page("/settings/instructions?view=route");
+    fireEvent.click(screen.getByRole("button", { name: "Edit independent setting" }));
+    expect(screen.queryByText(/· Unsaved changes/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save layer" }));
+    await screen.findByText("Layer saved.");
+    expect(mocks.save).toHaveBeenCalledWith({
+      scope: "independent",
+      agent_key: "codex",
+      host_id: "host-a",
+      text: "Shared text\n\nAgent text\n\nHost text",
+    });
+    expect(screen.getByRole("button", { name: "Save layer" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+  it.each(["Close", "Escape"])("closes an untouched independent draft with %s", async (action) => {
+    page();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Laptop / Codex" }));
+    expect(screen.getByLabelText("Instruction text")).toHaveValue(
+      "Shared text\n\nAgent text\n\nHost text",
+    );
+    if (action === "Close") fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    else await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mocks.save).not.toHaveBeenCalled();
+  });
+  it("keeps the discard prompt above long edited text and discards only on request", async () => {
+    page();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Laptop / Codex" }));
+    const editor = screen.getByLabelText("Instruction text");
+    fireEvent.change(editor, { target: { value: "Edited instructions\n".repeat(500) } });
+    await userEvent.keyboard("{Escape}");
+    const prompt = screen.getByRole("alert");
+    expect(prompt).toHaveTextContent("You have unsaved changes.");
+    expect(prompt.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(prompt).toHaveClass("sticky", "top-0");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(editor).toHaveValue("Edited instructions\n".repeat(500));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mocks.save).not.toHaveBeenCalled();
+  });
+  it.each(["Shared", "Codex", "Laptop"])("preserves dirty tracking for the %s layer", (name) => {
+    page();
+    fireEvent.click(screen.getByRole("button", { name: `Edit ${name}` }));
+    const editor = screen.getByLabelText("Instruction text");
+    const original = (editor as HTMLTextAreaElement).value;
+    expect(screen.getByRole("button", { name: "Save layer" })).toBeDisabled();
+    fireEvent.change(editor, { target: { value: "Changed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("You have unsaved changes.");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    fireEvent.change(editor, { target: { value: original } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
   it("reads the selected URL route and copies the exact composed total", async () => {
     page("/settings/instructions?view=route&host=host-a&agent=codex&child=1&peer=0");
     expect(mocks.previewQuery).toHaveBeenLastCalledWith(
@@ -265,20 +372,74 @@ describe("InstructionsPage", () => {
     ).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit layer" })).not.toBeInTheDocument();
   });
-  it("marks replaced layers and incomplete framework previews", () => {
-    mocks.preview!.parts.push({
-      kind: "user_layers",
-      scope: "host",
-      host_id: "host-a",
-      agent_key: "",
-      text: "Replaced",
-      chars: 8,
-      sent: false,
-      readonly: false,
-    });
+  it.each([
+    { scope: "host" as const, text: "" },
+    { scope: "host" as const, text: "\u0085" },
+    { scope: "host" as const, text: "\u001c" },
+    { scope: "independent" as const, text: " \n " },
+  ])(
+    "labels an empty $scope layer as not sent without an independent setting",
+    ({ scope, text }) => {
+      mocks.preview!.parts.push({
+        kind: "user_layers",
+        scope,
+        host_id: "host-a",
+        agent_key: scope === "independent" ? "codex" : "",
+        text,
+        chars: text.length,
+        sent: false,
+        readonly: false,
+      });
+      page("/settings/instructions?view=route");
+      const empty = screen.getByRole("heading", { name: "Empty layers · Not sent" }).parentElement!;
+      expect(
+        within(empty).getByText(scope === "host" ? "Host" : "Independent"),
+      ).toBeInTheDocument();
+      expect(within(empty).getByText(/Not sent on this route/)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("heading", { name: "Replaced by the independent setting" }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByText("Shared text")).toBeInTheDocument();
+    },
+  );
+  it.each(["Shared text", "\ufeff"])("separates replaced text (%j) from empty layers", (text) => {
+    mocks.preview!.parts[0].sent = false;
+    mocks.preview!.parts[0].text = text;
+    mocks.preview!.parts[0].chars = text.length;
+    mocks.preview!.parts.push(
+      {
+        kind: "user_layers",
+        scope: "independent",
+        host_id: "host-a",
+        agent_key: "codex",
+        text: "Independent text",
+        chars: 16,
+        sent: true,
+        readonly: false,
+      },
+      {
+        kind: "user_layers",
+        scope: "host",
+        host_id: "host-a",
+        agent_key: "",
+        text: "",
+        chars: 0,
+        sent: false,
+        readonly: false,
+      },
+    );
     mocks.preview!.framework_unavailable = true;
     page("/settings/instructions?view=route");
-    expect(screen.getByText(/Not sent on this route/)).toBeInTheDocument();
+    const replaced = screen.getByRole("heading", {
+      name: "Replaced by the independent setting",
+    }).parentElement!;
+    expect(within(replaced).getByText("Shared")).toBeInTheDocument();
+    expect(replaced.textContent).toContain(text);
+    expect(within(replaced).queryByText("Host")).not.toBeInTheDocument();
+    const empty = screen.getByRole("heading", { name: "Empty layers · Not sent" }).parentElement!;
+    expect(within(empty).getByText("Host")).toBeInTheDocument();
+    expect(within(empty).queryByText("Shared text")).not.toBeInTheDocument();
+    expect(screen.getByText("Independent text")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("This preview is incomplete");
   });
 });

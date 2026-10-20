@@ -31,7 +31,7 @@ export function InstructionsPage() {
   const [editor, setEditor] = useState<{
     key: LayerKey;
     title: string;
-    initialText?: string;
+    initialText: string;
   } | null>(null);
   const session = params.get("session");
   const view = session || params.get("view") === "route" ? "route" : "overview";
@@ -107,7 +107,7 @@ export function InstructionsPage() {
             .filter((text) => text?.trim())
             .join("\n\n")
         : undefined;
-    setEditor({ key, title, initialText: stack });
+    setEditor({ key, title, initialText: stack ?? existing?.text ?? "" });
   };
 
   return (
