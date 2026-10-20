@@ -226,6 +226,7 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
@@ -7489,6 +7490,12 @@ def create_runner_app(
                             extra={"session_id": conv},
                         )
 
+        else:
+            instructions = append_framework_instructions(
+                _raw_per_request_instructions,
+                _global_framework_instructions(_session_global_instructions.get(conv)),
+            )
+
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
             harness=harness_name,
@@ -8187,6 +8194,12 @@ def create_runner_app(
             # background path pre-composes).
             _instr_body = body
             if dispatch is None:
+                _instr_val = append_framework_instructions(
+                    cast(str | None, body.get("instructions")),
+                    _global_framework_instructions(_session_global_instructions.get(conv_id)),
+                )
+                if _instr_val is not None:
+                    _instr_body = {**body, "instructions": _instr_val}
                 with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
                     _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
                     _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
