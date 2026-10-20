@@ -46,6 +46,11 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
         Path("/opt/homebrew/bin"),
         home / ".npm-global" / "bin",
     ]
+    if IS_WINDOWS:
+        appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+        dirs.insert(0, appdata / "npm")
+        if program_files := os.environ.get("PROGRAMFILES"):
+            dirs.insert(1, Path(program_files) / "nodejs")
     # nvm keeps global bins per Node version; newest first so a current install
     # wins over a stale one. Sort by parsed numeric version (so v10 > v9, not
     # the lexicographic order in which "v10" < "v9").
@@ -116,6 +121,12 @@ def resolve_cli_binary(
         return on_path
     for directory in _cli_fallback_dirs():
         candidate = directory / name
+        if IS_WINDOWS:
+            # npm also writes an extensionless POSIX shim; prefer PATHEXT's
+            # executable sibling (.cmd) even when the directory is off PATH.
+            resolved = shutil.which(str(candidate))
+            if resolved:
+                return resolved
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     return None

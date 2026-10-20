@@ -46,6 +46,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import subprocess
 import tempfile
 import time
 from asyncio import Queue, Task
@@ -55,6 +56,8 @@ from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
@@ -668,8 +671,8 @@ module.exports = function(pi) {{
 
 
 def _find_pi_cli() -> str | None:
-    """Find the ``pi`` CLI on PATH."""
-    return shutil.which("pi")
+    """Find Pi on PATH or in a standard CLI installation directory."""
+    return resolve_cli_binary("pi")
 
 
 # ---------------------------------------------------------------------------
@@ -1110,6 +1113,10 @@ async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subproce
         ``env``, ``cwd``, ...) forwarded as-is.
     :returns: The spawned subprocess handle.
     """
+    if IS_WINDOWS:
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | int(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
     return await asyncio.create_subprocess_exec(*args, **kwargs)
 
 
@@ -1193,7 +1200,7 @@ class _PiRpcSession:
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
         """
-        args = [pi_path, "--mode", "rpc", "--no-session"]
+        args = [*pi_cli_argv(pi_path), "--mode", "rpc", "--no-session"]
         if model:
             pi_coding_agent_dir = env.get("PI_CODING_AGENT_DIR")
             args.extend(

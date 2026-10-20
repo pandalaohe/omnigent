@@ -160,6 +160,157 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+def test_find_pi_cli_uses_off_path_install(monkeypatch, tmp_path):
+    import omnigent._platform as platform_mod
+    import omnigent.inner.pi_executor as pi_mod
+
+    binary = tmp_path / "pi"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(platform_mod.shutil, "which", lambda _: None)
+    monkeypatch.setattr(platform_mod, "_cli_fallback_dirs", lambda: (tmp_path,))
+    assert pi_mod._find_pi_cli() == str(binary)
+
+
+def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_path):
+    import omnigent.harnesses.pi_cli as pi_cli_mod
+    import omnigent.inner.pi_executor as pi_mod
+
+    prefix = tmp_path / "npm 空间"
+    prefix.mkdir()
+    script = prefix / "node_modules" / "pi-agent" / "cli.js"
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    shim = prefix / "pi.CMD"
+    shim.write_text('@"%_prog%" "%dp0%\\node_modules\\pi-agent\\cli.js" %*\n')
+    node = prefix / "node.exe"
+    node.write_text("")
+    monkeypatch.setattr(pi_cli_mod, "IS_WINDOWS", True)
+    spawn = AsyncMock(return_value=_FakeProcess())
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", spawn)
+    prompt = '中文 "quoted"\n%PATH% ! & | < > ^ trailing\\'
+    env = {"PATH": "/opt/bin", "SYSTEMROOT": "C:/Windows"}
+    cwd = str(tmp_path / "工作 tree")
+
+    async def run():
+        rpc = _PiRpcSession()
+        await rpc.start(str(shim), env=env, cwd=cwd, system_prompt=prompt)
+        await rpc.close()
+
+    _run(run())
+    args, kwargs = spawn.call_args
+    assert args == (
+        str(node),
+        str(script.resolve()),
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--append-system-prompt",
+        prompt,
+    )
+    assert kwargs["cwd"] == cwd
+    assert kwargs["env"] is env
+
+
+@pytest.mark.parametrize("failure", ["unknown-shim", "missing-script", "missing-node"])
+def test_rpc_start_reports_unusable_windows_shim(monkeypatch, tmp_path, failure):
+    import omnigent.harnesses.pi_cli as pi_cli_mod
+    import omnigent.inner.pi_executor as pi_mod
+
+    shim = tmp_path / "pi.cmd"
+    shim.write_text(
+        "@echo custom launcher\n" if failure == "unknown-shim" else '@node "%dp0%\\cli.js" %*\n'
+    )
+    if failure == "missing-node":
+        (tmp_path / "cli.js").write_text("")
+    monkeypatch.setattr(pi_cli_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(pi_cli_mod, "resolve_cli_binary", lambda _: None)
+    spawn = AsyncMock()
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", spawn)
+    with pytest.raises(
+        OSError,
+        match={
+            "unknown-shim": "not an npm shim",
+            "missing-script": "entry point",
+            "missing-node": "Node.js",
+        }[failure],
+    ):
+        _run(_PiRpcSession().start(str(shim), env={}))
+    spawn.assert_not_awaited()
+
+
+def test_pi_spawn_hides_window_and_preserves_group_flags(monkeypatch):
+    import omnigent.inner.pi_executor as pi_mod
+
+    monkeypatch.setattr(pi_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(pi_mod.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    spawn = AsyncMock(return_value=_FakeProcess())
+    monkeypatch.setattr(pi_mod, "asyncio", SimpleNamespace(create_subprocess_exec=spawn))
+    _run(pi_mod._create_subprocess_exec("node.exe", creationflags=0x200))
+    spawn.assert_awaited_once_with("node.exe", creationflags=0x08000200)
+
+
+def test_rpc_launch_roundtrips_literal_arguments_in_node(tmp_path, monkeypatch):
+    import omnigent._platform as platform_mod
+    import omnigent.inner.pi_executor as pi_mod
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the Pi launcher test")
+    prefix = tmp_path / "npm 空间 & tools"
+    prefix.mkdir()
+    script = prefix / "cli.js"
+    script.write_text(
+        "#!/usr/bin/env node\n"
+        "console.log(process.argv.includes('--version') ? '1.3.0' : "
+        "JSON.stringify({argv: process.argv.slice(2), cwd: process.cwd()}));\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    shim = prefix / "pi.cmd"
+    shim.write_text('@node "%dp0%\\cli.js" %*\n')
+    prompt = '中文 "quoted"\n%PATH% ! & | < > ^ trailing\\'
+    cwd = tmp_path / "工作 tree"
+    cwd.mkdir()
+    if os.name == "nt":
+        monkeypatch.setenv("PATH", str(cwd))
+        monkeypatch.setattr(
+            platform_mod, "_cli_fallback_dirs", lambda: (prefix, Path(node).parent)
+        )
+    launcher = str(shim if os.name == "nt" else script)
+    executor = PiExecutor(pi_path=launcher)
+    assert executor._pi_version == (1, 3, 0)
+    assert executor._settled_turn_boundary
+    assert "--approve" in executor._extra_args
+
+    async def run():
+        rpc = _PiRpcSession()
+        try:
+            await rpc.start(
+                launcher,
+                env=pi_mod._clean_pi_env(),
+                cwd=str(cwd),
+                system_prompt=prompt,
+            )
+            line = await rpc.read_line(timeout=10)
+            assert line is not None
+            result = json.loads(line)
+            assert result["argv"] == [
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--append-system-prompt",
+                prompt,
+            ]
+            assert Path(result["cwd"]).resolve() == cwd.resolve()
+            assert rpc.process is not None
+            assert await asyncio.wait_for(rpc.process.wait(), 10) == 0
+        finally:
+            await rpc.close()
+
+    _run(run())
+
+
 # ---------------------------------------------------------------------------
 # _sanitize_schema tests
 # ---------------------------------------------------------------------------

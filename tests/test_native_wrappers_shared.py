@@ -1010,6 +1010,22 @@ def test_pi_version_is_none_when_the_probe_fails(
     assert pi.pi_version("/bin/pi") is None
 
 
+def test_pi_version_hides_windows_probe(pi: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    monkeypatch.setattr(pi, "IS_WINDOWS", True)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    seen: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> _Completed:
+        seen.update(kwargs)
+        return _Completed("1.3.0")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert pi.pi_version("/bin/pi") == (1, 3, 0)
+    assert seen["creationflags"] == 0x08000000
+
+
 @pytest.mark.parametrize(
     ("version", "supported"),
     [
