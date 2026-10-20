@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import base64
 import codecs
@@ -33,7 +34,7 @@ from omnigent.util.json_types import JsonValue
 
 from . import _proc
 from .agent_env import strip_desktop_session_env
-from .async_utils import run_sync_on_thread
+from .async_utils import run_sync_cleanup, run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
@@ -57,8 +58,6 @@ from .sandbox import (
 )
 
 if TYPE_CHECKING:
-    import asyncio
-
     from .egress import EgressProxyHandle
     from .egress.proxy import EgressProxy
 from .sandbox import (
@@ -79,6 +78,8 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # opaque JSON object at this boundary with runtime validation in
 # ``_handle_helper_request``.
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+_REPLAY_SAFE_OPS = frozenset({"read"})
 
 logger = logging.getLogger(__name__)
 
@@ -435,16 +436,37 @@ class _HelperProcessClient:
         self._egress_handle: EgressProxyHandle | None = None
         self._git_ssh_broker: GitSshBroker | None = None
         self._lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
+        self._active_cancel: threading.Event | None = None
         self._closed = False
         atexit.register(self.close)
 
-    def request(self, payload: OpRequest) -> OpResult:
+    def request(
+        self, payload: OpRequest, *, cancel_event: threading.Event | None = None
+    ) -> OpResult:
         with self._lock:
-            return self._request_locked(payload, allow_retry=True)
+            with self._cancel_lock:
+                self._active_cancel = cancel_event or threading.Event()
+            try:
+                return self._request_locked(payload, allow_retry=True)
+            finally:
+                with self._cancel_lock:
+                    self._active_cancel = None
+
+    def cancel_request(self, cancel_event: threading.Event) -> None:
+        """Stop only the request owning this cancellation token, including queued calls."""
+        cancel_event.set()
+        with self._cancel_lock:
+            if self._active_cancel is cancel_event:
+                _proc.kill_tree(self._proc)
 
     def close(self) -> None:
+        self._closed = True
+        # A request can hold _lock while blocked on helper stdout.
+        with self._cancel_lock:
+            if self._active_cancel is not None:
+                _proc.kill_tree(self._proc)
         with self._lock:
-            self._closed = True
             self._stop_locked()
 
     def _request_locked(
@@ -453,10 +475,14 @@ class _HelperProcessClient:
         *,
         allow_retry: bool,
     ) -> OpResult:
-        if self._closed:
+        cancelled = self._active_cancel
+        if self._closed or (cancelled is not None and cancelled.is_set()):
             return {"error": "OS environment helper is closed"}
 
         self._ensure_started_locked()
+        if self._closed or (cancelled is not None and cancelled.is_set()):
+            self._stop_locked()
+            return {"error": "OS environment helper request was cancelled"}
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
@@ -464,6 +490,9 @@ class _HelperProcessClient:
         try:
             self._proc.stdin.write(json.dumps(payload) + "\n")
             self._proc.stdin.flush()
+        except OSError as exc:
+            return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
+        try:
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._helper_exit_detail_locked())
@@ -472,11 +501,24 @@ class _HelperProcessClient:
                 return result
             return {"error": f"Helper returned non-object response: {result!r}"}
         except Exception as exc:  # noqa: BLE001 — helper IO failures are retried or surfaced via error dict
+            if payload.get("op") in _REPLAY_SAFE_OPS:
+                return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
             self._stop_locked()
-            if allow_retry and not self._closed:
-                self._ensure_started_locked()
-                return self._request_locked(payload, allow_retry=False)
-            return {"error": f"os_env helper failed: {exc}"}
+            return {
+                "error": (
+                    f"Lost the os_env helper during {payload.get('op')!r}; it may already have "
+                    f"run, so it was not sent again: {exc}"
+                )
+            }
+
+    def _resend_on_new_helper_locked(
+        self, payload: OpRequest, *, allow_retry: bool, exc: Exception
+    ) -> OpResult:
+        self._stop_locked()
+        cancelled = self._active_cancel
+        if allow_retry and not self._closed and not (cancelled is not None and cancelled.is_set()):
+            return self._request_locked(payload, allow_retry=False)
+        return {"error": f"os_env helper failed: {exc}"}
 
     def _ensure_started_locked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -663,8 +705,10 @@ class _HelperProcessClient:
                 bufsize=1,
                 cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
                 env=env,
+                **_proc.spawn_kwargs(),
                 **popen_kwargs,
             )
+            _proc.remember_process_group(self._proc)
         except Exception:
             self._stop_locked()
             raise
@@ -711,6 +755,12 @@ class _HelperProcessClient:
         try:
             if proc is None:
                 return
+            _proc.terminate_tree(proc)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=1)
+            _proc.kill_tree(proc)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=1)
             try:
                 if proc.stdin is not None:
                     proc.stdin.close()
@@ -726,13 +776,6 @@ class _HelperProcessClient:
                     proc.stderr.close()
             except Exception:  # noqa: BLE001 — best-effort cleanup of helper subprocess pipes
                 pass
-            if proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1)
-                except Exception:  # noqa: BLE001 — terminate may fail on already-exited process; escalate to kill
-                    with contextlib.suppress(Exception):
-                        proc.kill()
         finally:
             # Release the containment handle (Windows Job Object): with
             # kill-on-close this also reaps any helper descendants that
@@ -1014,7 +1057,17 @@ class CallerProcessOSEnvironment(OSEnvironment):
         }
         if max_output is not None:
             request["max_output"] = max_output
-        result = await run_sync_on_thread(self._helper.request, request)
+        cancel_event = threading.Event()
+        try:
+            result = await run_sync_on_thread(
+                self._helper.request, request, cancel_event=cancel_event
+            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            await run_sync_cleanup(
+                self._helper.cancel_request, cancel_event, component="os_env_shell_cancel"
+            )
+            raise
         return cast(OpResult, result)
 
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:

@@ -2472,6 +2472,107 @@ _SSE_RESPONSE_COMPLETED = (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["pi", "codex", "claude-sdk"])
+@pytest.mark.parametrize("control", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("eof_first", [False, True])
+async def test_runner_cancels_dispatch_with_turn(
+    monkeypatch: pytest.MonkeyPatch, harness: str, control: str, streamed: bool, eof_first: bool
+) -> None:
+    """A stopped turn must finish its runner-owned tool tasks and response."""
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    interrupted = asyncio.Event()
+    eof = asyncio.Event()
+    calls: list[object] = []
+    dispatch_task = None
+    request_task = None
+    conv = f"conv_cancel_dispatch_{harness}_{control}_{streamed}_{eof_first}"
+
+    async def dispatch(**kwargs: object) -> None:
+        nonlocal dispatch_task
+        calls.append(kwargs.get("call_id"))
+        dispatch_task = asyncio.current_task()
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.set()
+
+    class Stream(_FakeHarnessStream):
+        async def aiter_text(self) -> AsyncIterator[str]:
+            yield _SSE_RESPONSE_CREATED
+            yield (
+                'data: {"type":"response.output_item.done","item":'
+                '{"type":"function_call","status":"action_required",'
+                '"name":"sys_os_read","call_id":"owned-call","arguments":"{}"}}\n\n'
+            )
+            if not eof_first:
+                await interrupted.wait()
+                # A harness can emit one final tool event after acknowledging interrupt.
+                yield (
+                    'data: {"type":"response.output_item.done","item":'
+                    '{"type":"function_call","status":"action_required",'
+                    '"name":"sys_os_read","call_id":"late-call","arguments":"{}"}}\n\n'
+                )
+            eof.set()
+
+    class Client(_FakeHarnessClient):
+        def stream(self, *args: object, **kwargs: object) -> Stream:
+            return Stream([])
+
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            interrupted.set()
+            return httpx.Response(200, json={})
+
+    async def resolve(*args: object, **kwargs: object) -> AgentSpec:
+        return AgentSpec(
+            spec_version=1,
+            name="cancel-dispatch",
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        )
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(Client([]))),
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_test_client(app) as http:
+            request_task = asyncio.create_task(
+                http.post(
+                    f"/v1/sessions/{conv}/events",
+                    params={"stream": "true"} if streamed else {},
+                    json={"type": "message", "agent_id": "fixture", "content": []},
+                )
+            )
+            if not streamed:
+                response = await request_task
+                assert response.status_code == 202
+            await asyncio.wait_for(started.wait(), timeout=3)
+            if eof_first:
+                await asyncio.wait_for(eof.wait(), timeout=3)
+                if streamed:
+                    assert not request_task.done()
+                assert not finished.is_set()
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": control})
+            assert response.status_code in (202, 204)
+            if streamed:
+                response = await asyncio.wait_for(request_task, timeout=3)
+                assert response.status_code == 200
+            assert finished.is_set(), "Stopped turn left its dispatch task running"
+            assert calls == ["owned-call"], "An interrupted turn ran a late tool call"
+    finally:
+        if request_task is not None:
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+        if dispatch_task is not None:
+            dispatch_task.cancel()
+            await asyncio.gather(dispatch_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("harness", "frames", "until", "expected_statuses"),
     [
@@ -11730,6 +11831,70 @@ class _PolicyDeadChannelHarnessClient:
         del json, timeout
         self.attempts += 1
         raise self._exc
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_policy_sse_delivery_failure_finishes_recovery(streamed: bool) -> None:
+    """Policy dispatch must not cancel itself while recovering its owning turn."""
+    conv = f"conv_policy_sse_failure_{streamed}"
+    interrupted = asyncio.Event()
+    attempts = 0
+
+    class Stream(_FakeHarnessStream):
+        async def aiter_text(self) -> AsyncIterator[str]:
+            yield _SSE_RESPONSE_CREATED
+            yield (
+                'data: {"type":"policy_evaluation.requested","evaluation_id":"eval-owned",'
+                '"phase":"PHASE_TOOL_CALL","data":{"name":"sys_os_read"}}\n\n'
+            )
+            await interrupted.wait()
+
+    class Client(_FakeHarnessClient):
+        def stream(self, *args: object, **kwargs: object) -> Stream:
+            return Stream([])
+
+        async def post(self, url: str, *, json: dict[str, Any], **kwargs: Any) -> httpx.Response:
+            nonlocal attempts
+            if json.get("type") == "policy_verdict":
+                attempts += 1
+                raise httpx.RemoteProtocolError("fixture verdict channel closed")
+            if json.get("type") == "interrupt":
+                # Ensure a pending self-cancellation is observed before forwarding succeeds.
+                await asyncio.sleep(0)
+                interrupted.set()
+            return httpx.Response(200, json={})
+
+    class Server(NullServerClient):
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(Client([]))),
+        server_client=Server(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        request = asyncio.create_task(
+            http.post(
+                f"/v1/sessions/{conv}/events",
+                params={"stream": "true"} if streamed else {},
+                json={"type": "message", "agent_id": "fixture", "content": []},
+            )
+        )
+        try:
+            statuses = await _drain_published_statuses(
+                app.state.session_event_queues, conv, until="failed", timeout=10
+            )
+            assert "failed" in statuses
+            assert interrupted.is_set()
+            assert attempts == 2
+            response = await asyncio.wait_for(request, timeout=3)
+            assert response.status_code == (200 if streamed else 202)
+            await _await_bg_turn_task(conv, timeout=3)
+            assert conv not in app.state.active_turns
+        finally:
+            interrupted.set()
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
 
 
 async def test_verdict_delivery_failure_retries_then_signals() -> None:

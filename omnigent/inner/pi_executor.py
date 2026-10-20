@@ -86,6 +86,7 @@ from omnigent.util.reasoning_effort import (
     validate_effort,
 )
 
+from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
@@ -1225,7 +1226,9 @@ class _PiRpcSession:
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=env,
+            **_proc.spawn_kwargs(),
         )
+        _proc.remember_process_group(self.process)
         self._read_task = asyncio.create_task(self._reader())
         self._stderr_task = asyncio.create_task(self._stderr_reader())
 
@@ -1362,18 +1365,13 @@ class _PiRpcSession:
         self._read_task = None
         self._stderr_task = None
         if self.process is not None:
-            with contextlib.suppress(ProcessLookupError):
-                self.process.terminate()
-            try:
+            _proc.terminate_tree(self.process)
+            # Cross-loop shutdown can make wait() raise even after termination.
+            with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, RuntimeError):
                 await asyncio.wait_for(
                     self.process.wait(), timeout=_RPC_SESSION_CLOSE_REAP_TIMEOUT_S
                 )
-            except (asyncio.TimeoutError, ProcessLookupError, RuntimeError):
-                # RuntimeError can happen when the subprocess was created on a
-                # different event loop (e.g. test fixtures that call close() in
-                # a fresh loop).  Fall back to synchronous kill.
-                with contextlib.suppress(ProcessLookupError):
-                    self.process.kill()
+            _proc.kill_tree(self.process)
             close_subprocess_transport(self.process)
             self.process = None
         if self._tmp_dir is not None:
