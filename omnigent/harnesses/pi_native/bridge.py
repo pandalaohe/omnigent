@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import itertools
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
+from omnigent.permission_tiers import PermissionTier, plan_visible_tool_names
+from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -64,6 +67,9 @@ _INBOX_DIR = "inbox"
 # Written by the extension once ``session_start`` has armed the inbox poller.
 _INPUT_READY_FILE = "input_ready"
 _SESSIONS_DIR = "sessions"
+PERMISSION_INSTALLATION_FILE = "permission_installation.json"
+PERMISSION_EXPECTED_FILE = "permission_expected.json"
+PERMISSION_ACK_FILE = "permission_ack.json"
 
 
 def bridge_root() -> Path:
@@ -375,12 +381,148 @@ def write_extension_files(
         "inboxDir": str(bridge_dir / _INBOX_DIR),
         "authHeaders": auth_headers or {},
         "tools": tools or [],
+        "planVisibleTools": list(
+            plan_visible_tool_names(
+                [
+                    "read",
+                    *(
+                        tool.get("name")
+                        for tool in tools or []
+                        if isinstance(tool.get("name"), str)
+                    ),
+                ]
+            )
+        ),
     }
     # A marker left by a previous Pi process would report this launch ready early.
     (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
+    source = _extension_source()
+    _atomic_text(extension_path(bridge_dir), source)
+    payload["permissionInstallationId"] = prepare_permission_installation(
+        bridge_dir,
+        session_id=session_id,
+        harness="pi-native",
+        extension=extension_path(bridge_dir),
+    )
     _atomic_json(config_path(bridge_dir), payload)
-    _atomic_text(extension_path(bridge_dir), _extension_source())
     return extension_path(bridge_dir), config_path(bridge_dir)
+
+
+def prepare_permission_installation(
+    bridge_dir: Path, *, session_id: str, harness: str, extension: Path
+) -> str:
+    """Pin the exact extension file this launch must load before any turn."""
+    if harness not in ("pi", "pi-native") or not session_id:
+        raise ValueError("Invalid Pi permission installation")
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    installation_id = uuid.uuid4().hex
+    (bridge_dir / PERMISSION_INSTALLATION_FILE).unlink(missing_ok=True)
+    (bridge_dir / PERMISSION_ACK_FILE).unlink(missing_ok=True)
+    expected: _JsonObject = {
+        "version": 1,
+        "installation_id": installation_id,
+        "session_id": session_id,
+        "harness": harness,
+        "extension_path": str(extension),
+        "extension_sha256": hashlib.sha256(extension.read_bytes()).hexdigest(),
+    }
+    _atomic_json(bridge_dir / PERMISSION_EXPECTED_FILE, expected)
+    return installation_id
+
+
+def verify_pi_permission_installation(bridge_dir: Path, tier: PermissionTier) -> bool:
+    """Require a fresh extension hook and active-tool ACK for this launch."""
+    try:
+        state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
+        if state.tier != tier:
+            return False
+        expected_path = bridge_dir / PERMISSION_EXPECTED_FILE
+        installed_path = bridge_dir / PERMISSION_INSTALLATION_FILE
+        if expected_path.is_symlink() or installed_path.is_symlink():
+            return False
+        expected = json.loads(expected_path.read_text(encoding="utf-8"))
+        installed = json.loads(installed_path.read_text(encoding="utf-8"))
+        if not isinstance(expected, dict) or not isinstance(installed, dict):
+            return False
+        for field in ("version", "installation_id", "session_id", "harness", "extension_sha256"):
+            if installed.get(field) != expected.get(field):
+                return False
+        if expected.get("version") != 1 or expected.get("session_id") != state.session_id:
+            return False
+        if installed.get("tier") != tier or installed.get("revision") != state.revision:
+            return False
+        if installed.get("tools_verified") is not True:
+            return False
+        active = installed.get("active_tools")
+        if not isinstance(active, list) or not all(isinstance(name, str) for name in active):
+            return False
+        if tier == "plan" and tuple(active) != plan_visible_tool_names(active):
+            return False
+        extension = Path(str(expected.get("extension_path", "")))
+        if not extension.is_file() or extension.is_symlink():
+            return False
+        return hashlib.sha256(extension.read_bytes()).hexdigest() == expected.get(
+            "extension_sha256"
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def enqueue_permission_tier_change(
+    bridge_dir: Path, *, target_tier: PermissionTier, expected_revision: int
+) -> str:
+    """Ask the resident Pi extension to update its model-visible tools."""
+    change_id = f"permission_tier_change_{uuid.uuid4().hex}"
+    payload: _JsonObject = {
+        "id": change_id,
+        "type": "permission_tier_change",
+        "target_tier": target_tier,
+        "expected_revision": expected_revision,
+    }
+    _enqueue_payload(bridge_dir, change_id, payload)
+    return change_id
+
+
+async def apply_pi_permission_tier(
+    session_id: str, harness: str, target_tier: PermissionTier
+) -> bool:
+    """Wait for the resident extension to prove its active-tool switch."""
+    if harness not in ("pi", "pi-native") or not session_id:
+        return False
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    try:
+        state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
+        if state.session_id != session_id or state.status != "switching":
+            return False
+        change_id = enqueue_permission_tier_change(
+            bridge_dir, target_tier=target_tier, expected_revision=state.revision
+        )
+        deadline = asyncio.get_running_loop().time() + 8.0
+        while asyncio.get_running_loop().time() < deadline:
+            ack_path = bridge_dir / PERMISSION_ACK_FILE
+            if ack_path.is_symlink():
+                return False
+            try:
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                await asyncio.sleep(0.05)
+                continue
+            if not isinstance(ack, dict) or ack.get("id") != change_id:
+                await asyncio.sleep(0.05)
+                continue
+            active = ack.get("active_tools")
+            return (
+                ack.get("ok") is True
+                and ack.get("session_id") == session_id
+                and ack.get("target_tier") == target_tier
+                and ack.get("expected_revision") == state.revision
+                and isinstance(active, list)
+                and all(isinstance(name, str) for name in active)
+                and (target_tier != "plan" or tuple(active) == plan_visible_tool_names(active))
+            )
+        return False
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:

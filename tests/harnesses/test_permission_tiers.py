@@ -23,6 +23,7 @@ from omnigent.permission_tiers import (
     decide_tier,
     load_rules,
     normalize_permission_tier,
+    plan_visible_tool_names,
     resolve_local_path,
 )
 
@@ -77,6 +78,27 @@ def test_read_plan_edit_and_single_call_ask() -> None:
     first = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     second = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     assert first.action == second.action == Verdict.ASK
+
+
+def test_plan_visible_tools_only_include_registered_known_safe_names() -> None:
+    names = (
+        "read",
+        "list_dir",
+        "ask_user",
+        "report_result",
+        "sys_terminal_read",
+        "read",
+        "bash",
+        "write",
+        "third_party_read",
+    )
+    assert plan_visible_tool_names(names) == (
+        "read",
+        "list_dir",
+        "ask_user",
+        "report_result",
+        "sys_terminal_read",
+    )
 
 
 def test_auto_uses_only_fixed_relaxed_membership() -> None:

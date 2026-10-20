@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from omnigent.inner import pi_harness
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -51,6 +52,18 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
     # discriminated-event endpoint per §The Harness API Subset.
     assert "/health" in paths
     assert "/v1/sessions/{conversation_id}/events" in paths
+    assert "/v1/permission-tier/bootstrap" in paths
+
+
+def test_permission_bootstrap_requires_harness_auth() -> None:
+    app = pi_harness.create_app()
+    app.state.conversation_id = "test-session"
+    app.state.harness_auth_token = "test-token"
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/permission-tier/bootstrap", json={"session_id": "test-session"}
+        )
+    assert response.status_code == 401
 
 
 @pytest.mark.parametrize("value", [None, "true", "false"])

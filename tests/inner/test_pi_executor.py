@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import socket
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -18,6 +19,10 @@ from urllib.parse import urlparse
 
 import pytest
 
+from omnigent.harnesses.pi_native.bridge import (
+    prepare_permission_installation,
+    verify_pi_permission_installation,
+)
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -46,6 +51,7 @@ from omnigent.inner.pi_executor import (
 )
 from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -917,6 +923,71 @@ class TestGenerateExtensionJs(unittest.TestCase):
         self.assertIn("block: true", js)
 
 
+def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path) -> None:
+    """The real generated JS must install itself and hide executable tools in plan."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the controlled Pi extension test")
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+    write_host_permission_state(
+        bridge_dir / "permission_state.json",
+        HostPermissionState(
+            session_id="test-session",
+            host_id="test-host",
+            workspace=str(tmp_path),
+            tier="plan",
+            revision=1,
+            status="blocked",
+        ),
+    )
+    extension = tmp_path / "omnigent_tools.js"
+    extension.write_text(
+        _generate_extension_js(
+            12345,
+            [
+                {"name": "sys_os_read", "description": "Read", "parameters": {"type": "object"}},
+                {"name": "sys_os_shell", "description": "Run", "parameters": {"type": "object"}},
+            ],
+            "test-token",
+            permission_bridge_dir=bridge_dir,
+            session_id="test-session",
+        )
+    )
+    prepare_permission_installation(
+        bridge_dir, session_id="test-session", harness="pi", extension=extension
+    )
+    script = r"""
+const assert = require("assert").strict;
+if (process.argv[2] === "safe") {
+  process.argv.push("--no-extensions", "--extension", process.argv[1]);
+}
+const handlers = {};
+let active = ["read", "sys_os_read", "sys_os_shell"];
+global.setInterval = () => 0;
+const pi = {
+  on(name, handler) { handlers[name] = handler; },
+  registerTool() {},
+  getActiveTools() { return active; },
+  setActiveTools(names) { active = names; },
+};
+require(process.argv[1])(pi);
+handlers.session_start({}, { isIdle: () => true });
+assert.deepEqual(active, process.argv[2] === "safe"
+  ? ["read", "sys_os_read"] : ["read", "sys_os_read", "sys_os_shell"]);
+"""
+    result = subprocess.run([node, "-e", script, str(extension)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not verify_pi_permission_installation(bridge_dir, "plan")
+    result = subprocess.run(
+        [node, "-e", script, str(extension), "safe"], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert verify_pi_permission_installation(bridge_dir, "plan")
+    installed = json.loads((bridge_dir / "permission_installation.json").read_text())
+    assert installed["active_tools"] == ["read", "sys_os_read"]
+
+
 # ---------------------------------------------------------------------------
 # _ToolServer tests
 # ---------------------------------------------------------------------------
@@ -1578,6 +1649,100 @@ async def test_generated_pi_policy_socket_failures_block(
 
 
 @pytest.mark.asyncio
+async def test_generated_pi_full_tier_gates_without_finish_lease(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for generated Pi extension test")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    write_host_permission_state(
+        bridge_dir / "permission_state.json",
+        HostPermissionState(
+            session_id="test-session",
+            host_id="test-host",
+            workspace=str(tmp_path),
+            tier="full",
+            revision=1,
+            status="ready",
+        ),
+    )
+    frames: list[dict[str, object]] = []
+
+    async def serve_policy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        frame = json.loads(await reader.readline())
+        frames.append(frame)
+        blocked = len(frames) == 2
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "id": frame["id"],
+                        "verdict": {
+                            "block": blocked,
+                            "reason": "policy denied" if blocked else "",
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(serve_policy, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        extension = tmp_path / "bridge.js"
+        runner = tmp_path / "run.js"
+        extension.write_text(
+            _generate_extension_js(
+                port,
+                [],
+                "test-token",
+                permission_bridge_dir=bridge_dir,
+                session_id="test-session",
+            )
+        )
+        runner.write_text(
+            textwrap.dedent(
+                """
+                const assert = require("assert").strict;
+                const handlers = {};
+                require(process.argv[2])({ on(name, handler) { handlers[name] = handler; } });
+                (async () => {
+                  const input = { path: "doc.txt" };
+                  const allowed = await handlers.tool_call({
+                    toolCallId: "native-1", toolName: "read", input,
+                  });
+                  assert.ok(!allowed || allowed.block !== true);
+                  handlers.tool_result({ toolCallId: "native-1", isError: false });
+                  handlers.tool_execution_end({ toolCallId: "native-1", isError: false });
+                  const denied = await handlers.tool_call({
+                    toolCallId: "native-2", toolName: "read", input,
+                  });
+                  assert.deepEqual(denied, { block: true, reason: "policy denied" });
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+                })().catch((error) => { console.error(error); process.exit(1); });
+                """
+            )
+        )
+        proc = await asyncio.create_subprocess_exec(
+            node,
+            str(runner),
+            str(extension),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        assert proc.returncode == 0, stderr.decode(errors="replace")
+        assert [frame["kind"] for frame in frames] == ["policy_eval", "policy_eval"]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_tool_server_rejects_malformed_policy_and_unknown_action() -> None:
     server = _ToolServer()
     executed = False
@@ -1989,6 +2154,53 @@ class TestGateNativeTool(unittest.TestCase):
         self.assertEqual(
             _run(executor._gate_native_tool("read", {"path": "doc.txt"})),
             {"block": True, "reason": "permission check unavailable"},
+        )
+
+    def test_finish_requires_matching_runner_acknowledgement(self):
+        executor = self._executor()
+        executor._permission_controlled = True
+        seen: list[tuple[str, dict[str, object]]] = []
+        acknowledgement: dict[str, object] | None = None
+
+        async def evaluator(phase, data):
+            seen.append((phase, data))
+            return PolicyVerdictPayload(
+                action="POLICY_ACTION_ALLOW",
+                data={"_omnigent_permission_finish": acknowledgement}
+                if acknowledgement is not None
+                else None,
+            )
+
+        executor._policy_evaluator = evaluator
+
+        def finish() -> bool:
+            return _run(
+                executor._finish_native_permission_lease(
+                    "bash", {"command": "pwd"}, {"isError": False}, "call-42", 3
+                )
+            )
+
+        self.assertFalse(finish(), "an ordinary ALLOW cannot complete a lease")
+        for acknowledgement in (
+            {"call_id": "wrong", "revision": 3, "finished": True},
+            {"call_id": "call-42", "revision": 4, "finished": True},
+            {"call_id": "call-42", "revision": 3, "finished": False},
+        ):
+            self.assertFalse(finish())
+        acknowledgement = {"call_id": "call-42", "revision": 3, "finished": True}
+        self.assertTrue(finish())
+        self.assertEqual(
+            seen[-1],
+            (
+                "PHASE_TOOL_RESULT",
+                {
+                    "name": "bash",
+                    "arguments": {"command": "pwd"},
+                    "result": {"isError": False},
+                    "call_id": "call-42",
+                    "permission_tier_revision": 3,
+                },
+            ),
         )
 
 

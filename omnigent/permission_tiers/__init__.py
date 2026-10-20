@@ -15,7 +15,7 @@ import os
 import re
 import shlex
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -129,7 +129,12 @@ _PROTECTED_PREFIX = (
     "~/.gnupg",
     "~/Library/Keychains",
 )
-_READ_PATH = {"read": "path", "sys_os_read": "path", "view_file": "AbsolutePath"}
+_READ_PATH = {
+    "read": "path",
+    "sys_os_read": "path",
+    "view_file": "AbsolutePath",
+    "list_dir": "DirectoryPath",
+}
 _EDIT_PATH = {
     "write": "path",
     "edit": "path",
@@ -142,6 +147,18 @@ _EXEC_COMMAND = {"bash": "command", "sys_os_shell": "command", "run_command": "C
 _READ_NO_PATH = frozenset(("sys_terminal_read", "sys_terminal_list"))
 _QUESTION_TOOLS = frozenset(("ask_user", "ask_user_async", "request_user_input"))
 _CONTROL_TOOLS = frozenset(("report_result",))
+
+
+def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:
+    """Keep only registered, framework-known read/question/control tools.
+
+    This filters the model's tool list; the execution gate still checks every
+    actual call, including direct extension ``executeTool`` calls.
+    """
+    allowed = {*_READ_PATH, *_READ_NO_PATH, *_QUESTION_TOOLS, *_CONTROL_TOOLS}
+    return tuple(dict.fromkeys(name for name in names if name in allowed))
+
+
 _DEVICE = re.compile(r"^(?:\\\\[?.]\\|\\[?.]\\)")
 _WINDOWS_ENV = re.compile(r"%([A-Za-z][A-Za-z0-9_]*)%")
 _ENCODED = re.compile(
@@ -809,5 +826,6 @@ __all__ = [
     "decide_tier",
     "load_rules",
     "normalize_permission_tier",
+    "plan_visible_tool_names",
     "resolve_local_path",
 ]
