@@ -10438,12 +10438,15 @@ async def _launch_native_terminal(
             and registry.get(ctx.session_id, agent.terminal_name, "main") is not None
         )
         pending = False
+        checking_pre_launch = False
         try:
             if not has_terminal:
                 await _admit_native_cold(ctx)
+            checking_pre_launch = True
             decision = (
                 await pre_launch(has_terminal) if pre_launch is not None else PreLaunchResult()
             )
+            checking_pre_launch = False
             if has_terminal and decision.force_recreate:
                 await _admit_native_cold(ctx)
                 if registry is not None:
@@ -10484,6 +10487,9 @@ async def _launch_native_terminal(
             )
             return True
         except Exception as exc:
+            # Callers must observe pre-launch failure before awaiting inbox recovery.
+            if checking_pre_launch:
+                raise
             if not (
                 isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
             ):
