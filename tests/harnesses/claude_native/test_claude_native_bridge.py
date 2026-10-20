@@ -5927,6 +5927,9 @@ def test_inject_user_message_raises_when_draft_never_submits(
         socket_path=_TEST_TMUX_SOCKET,
         tmux_target="claude:0.0",
     )
+    record_hook_event(
+        bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"}
+    )
 
     tui = {"pane": _composer_pane()}
 
@@ -5985,6 +5988,9 @@ def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
+    )
+    record_hook_event(
+        bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"}
     )
 
     enters: list[float] = []
@@ -6081,6 +6087,144 @@ def test_inject_user_message_outlasts_slow_submit_acceptance(
     assert any("not accepted after" in record.getMessage() for record in caplog.records), [
         record.getMessage() for record in caplog.records
     ]
+
+
+def test_first_submit_waits_for_acceptance_but_next_submit_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rendered composer can precede readiness; keep its first draft through slow boot."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    pane = _composer_pane()
+    pasted_at = 0.0
+    pastes = 0
+
+    def run_tmux(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal pane, pasted_at, pastes
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "list-panes" in cmd:
+            return SimpleNamespace(returncode=0, stdout="0", stderr="")
+        if "paste-buffer" in cmd:
+            pastes += 1
+            pasted_at = time.monotonic()
+            pane = _composer_pane("original first message")
+        if cmd[-1] == "Enter" and pastes not in {2, 3} and time.monotonic() - pasted_at >= 0.3:
+            pane = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run_tmux)
+    inject_user_message(bridge_dir, content="original first message")
+    assert pastes == 1
+    with pytest.raises(claude_native_bridge.ClaudeMessageNotAccepted):
+        inject_user_message(bridge_dir, content="original first message")
+    assert pastes == 2
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    with pytest.raises(claude_native_bridge.ClaudeMessageNotAccepted):
+        inject_user_message(bridge_dir, content="original first message")
+    assert pastes == 3
+    write_tmux_target(
+        bridge_dir, socket_path=Path("/tmp/recreated/tmux.sock"), tmux_target="claude:0.0"
+    )
+    inject_user_message(bridge_dir, content="original first message")
+    assert pastes == 4
+
+
+@pytest.mark.parametrize("startup", [True, False])
+def test_first_message_model_pick_waits_through_slow_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: bool
+) -> None:
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    write_tmux_target(tmp_path, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    pane = _BOOTING_PANE if startup else _composer_pane()
+    booted_at = time.monotonic() + 0.05
+    typed_at = 0.0
+
+    def send(_socket: str, *args: str) -> None:
+        nonlocal pane, typed_at
+        if args[-1] == "/model sonnet":
+            assert pane != _BOOTING_PANE
+            pane = _composer_pane(args[-1])
+            typed_at = time.monotonic()
+        if args[-1] == "Enter" and time.monotonic() - typed_at >= 0.3:
+            pane = _composer_pane()
+
+    def capture(*_: object, **_kwargs: object) -> str:
+        nonlocal pane
+        if pane == _BOOTING_PANE and time.monotonic() >= booted_at:
+            pane = _composer_pane()
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    if startup:
+        claude_native_bridge.inject_slash_command(
+            tmp_path, command="/model sonnet", wait_for_startup=True
+        )
+        assert pane == _composer_pane()
+    else:
+        with pytest.raises(RuntimeError, match="command was not delivered"):
+            claude_native_bridge.inject_slash_command(tmp_path, command="/model sonnet")
+
+
+@pytest.mark.parametrize("outcome", ["exit", "cancel", "repaint"])
+def test_first_submit_observes_terminal_exit_cancellation_and_repaint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """A blank capture is not acceptance; startup remains cancellable and observes exit."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.001)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_LIVENESS_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    cancelled = threading.Event()
+    pasted = False
+    entered = False
+    captures = 0
+    enters = 0
+
+    def run_tmux(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal pasted, entered, captures, enters
+        stdout = ""
+        if "paste-buffer" in cmd:
+            pasted = True
+        if cmd[-1] == "Enter":
+            entered = True
+            enters += 1
+        if "list-panes" in cmd:
+            stdout = "1 7" if entered and outcome == "exit" else "0"
+        if "capture-pane" in cmd:
+            stdout = _composer_pane("original first message" if pasted else "")
+            if entered:
+                captures += 1
+                if outcome == "cancel":
+                    cancelled.set()
+                if outcome == "repaint":
+                    stdout = "" if captures == 1 else _composer_pane()
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", run_tmux)
+    with claude_native_bridge.cancellable_injection(cancelled):
+        if outcome == "exit":
+            with pytest.raises(claude_native_bridge.ClaudeMessageNotAccepted, match="exited"):
+                inject_user_message(bridge_dir, content="original first message")
+        elif outcome == "cancel":
+            with pytest.raises(claude_native_bridge.ClaudeInjectionCancelled):
+                inject_user_message(bridge_dir, content="original first message")
+        else:
+            inject_user_message(bridge_dir, content="original first message")
+            assert captures == 2
+    assert enters == 1
 
 
 def test_inject_slash_command_outlasts_slow_submit_acceptance(

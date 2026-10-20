@@ -3118,6 +3118,8 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
                 claude_session_id,
                 pinned,
             )
+        if identity_allowed and event_name == "UserPromptSubmit":
+            state["accepted_input_tmux"] = _tmux_input_identity(bridge_dir)
         state["updated_at"] = time.time()
         _write_json_file(bridge_dir / _STATE_FILE, state)
 
@@ -4592,6 +4594,13 @@ def inject_user_message(
     )
 
 
+def _tmux_input_identity(bridge_dir: Path) -> _JsonObject:
+    # Each terminal instance owns a new private socket; re-advertising it
+    # changes updated_at, but does not make an already interactive pane cold.
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    return {key: info.get(key) for key in ("socket_path", "tmux_target")}
+
+
 def _paste_and_submit(
     bridge_dir: Path,
     socket_path: str,
@@ -4623,6 +4632,10 @@ def _paste_and_submit(
         prompt appears after the submit Enter.
     """
     delivery_diagnostics.start_attempt()
+    tmux_info = _tmux_input_identity(bridge_dir)
+    startup_submit = (
+        _read_json_file(bridge_dir / _STATE_FILE).get("accepted_input_tmux") != tmux_info
+    )
     delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
@@ -4725,6 +4738,7 @@ def _paste_and_submit(
             needle=needle,
             what="submitted message",
             bridge_dir=bridge_dir,
+            wait_for_startup=startup_submit,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -4733,6 +4747,10 @@ def _paste_and_submit(
             "it may already have been delivered."
         ) from exc
     if accepted:
+        with _bridge_metadata_write_lock(bridge_dir):
+            state = _read_json_file(bridge_dir / _STATE_FILE)
+            state["accepted_input_tmux"] = tmux_info
+            _write_json_file(bridge_dir / _STATE_FILE, state)
         return
     raise ClaudeMessageNotAccepted(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
@@ -4747,6 +4765,7 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    wait_for_startup: bool = False,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4758,14 +4777,17 @@ def _verify_submit_accepted(
     message dropped, so this wait out-lasts realistic starvation: a
     warning is logged once at :data:`_SUBMIT_SLOW_ACCEPT_WARN_S`, the
     Enter retries back off exponentially (each retry into a stalled TUI
-    queues in the pty and replays on recovery, so fewer is safer), and
-    only after :data:`_SUBMIT_VERIFY_TIMEOUT_S` does the caller fail.
+    queues in the pty and replays on recovery, so fewer is safer).
+    Later submissions fail after :data:`_SUBMIT_VERIFY_TIMEOUT_S`. The first
+    submission waits for actual acceptance while the terminal remains alive;
+    a rendered composer alone does not prove startup hooks have finished.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param wait_for_startup: Preserve the first draft through slow terminal startup.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4776,11 +4798,13 @@ def _verify_submit_accepted(
     retries = 0
     polls = 0
     pane = ""
-    while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
+    next_liveness_probe = start + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+    while wait_for_startup or time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
+        _check_injection_cancelled()
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
-        if not _draft_in_input_box(pane, needle):
+        if pane.strip() and not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
                 pane=pane,
@@ -4798,16 +4822,27 @@ def _verify_submit_accepted(
                 )
             return True
         now = time.monotonic()
+        if wait_for_startup and now >= next_liveness_probe:
+            if _claude_pane_state(socket_path, tmux_target).alive is False:
+                if _draft_in_input_box(pane, needle):
+                    raise ClaudeMessageNotAccepted(
+                        "Claude Code exited with the submitted draft still in the input box. "
+                        "The message was not delivered."
+                    )
+                raise RuntimeError("Claude Code exited before submission could be confirmed.")
+            next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
             warned = True
             _logger.warning(
                 "claude-native: %s not accepted after %.0fs (the draft is "
-                "still in the input box); retrying for up to %.0fs",
+                "still in the input box); %s",
                 what,
                 _SUBMIT_SLOW_ACCEPT_WARN_S,
-                _SUBMIT_VERIFY_TIMEOUT_S,
+                "waiting for terminal startup"
+                if wait_for_startup
+                else f"retrying for up to {_SUBMIT_VERIFY_TIMEOUT_S:.0f}s",
             )
-        if now - last_enter >= retry_interval:
+        if _draft_in_input_box(pane, needle) and now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
@@ -4823,6 +4858,8 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if not pane.strip():
+        raise RuntimeError("Claude Code submission could not be confirmed from an empty pane.")
     return False
 
 
@@ -4971,6 +5008,7 @@ def inject_slash_command(
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     auto_confirm: bool = False,
     confirm_hint: str | None = None,
+    wait_for_startup: bool = False,
 ) -> None:
     """
     Type a Claude Code slash command into the tmux pane and submit it.
@@ -5000,6 +5038,8 @@ def inject_slash_command(
         dialog is polled for by its own title so a late render (~1.9s on a
         session with cached history) still gets its Enter, and so the Enter
         cannot answer a dialog that is not ours.
+    :param wait_for_startup: A first-message model pick waits for the cold
+        terminal like its user input; ordinary settings controls stay bounded.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
@@ -5022,10 +5062,14 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    startup_submit = wait_for_startup and (
+        _read_json_file(bridge_dir / _STATE_FILE).get("accepted_input_tmux")
+        != _tmux_input_identity(bridge_dir)
+    )
     # Same reclaim as inject_user_message: a surface left occupying the
     # composer would swallow the C-u and the typed command.
     surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
-    if surface is not None:
+    if surface is not None and not (startup_submit and surface == _OVERLAY_SURFACE):
         # No readiness gate follows; a blind Enter would answer the dialog.
         raise ClaudeTerminalDialog(
             f"Claude Code's input box is occupied by {surface}, so the command was "
@@ -5034,6 +5078,10 @@ def inject_slash_command(
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
+        )
+    if startup_submit:
+        _wait_for_claude_prompt_ready(
+            socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir
         )
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
@@ -5073,6 +5121,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            wait_for_startup=startup_submit,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "

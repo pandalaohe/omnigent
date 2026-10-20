@@ -1174,9 +1174,11 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
         timeout_s: float = 30.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        wait_for_startup: bool = False,
     ) -> None:
         """Record the ``/model`` switch keystroke and its auto_confirm flag."""
         del bridge_dir_arg, timeout_s
+        assert wait_for_startup is True
         calls.append(("slash", command, auto_confirm))
 
     def fake_inject_user_message(
@@ -1236,6 +1238,7 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
         timeout_s: float = 30.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        wait_for_startup: bool = False,
     ) -> None:
         del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
@@ -1292,6 +1295,7 @@ async def test_run_turn_types_a_managed_picker_row_verbatim(
         timeout_s: float = 30.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        wait_for_startup: bool = False,
     ) -> None:
         del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
@@ -1354,6 +1358,7 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
         timeout_s: float = 30.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        wait_for_startup: bool = False,
     ) -> None:
         del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
@@ -1464,6 +1469,7 @@ async def test_run_turn_without_model_override_injects_message_only(
         timeout_s: float = 30.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        wait_for_startup: bool = False,
     ) -> None:
         del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
@@ -1518,6 +1524,7 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
         timeout_s: float = 30.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        wait_for_startup: bool = False,
     ) -> None:
         del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
         slash_calls.append(command)
@@ -1784,6 +1791,8 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     """
     Refusals preserve input; a prompt after Enter may belong to its accepted turn.
     """
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     pane = "❯ "
@@ -1810,10 +1819,11 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
             lambda directory, **_kwargs: wait_for_target(directory, timeout_s=0.0),
         )
     else:
-        monkeypatch.setattr(
-            claude_bridge,
-            "_wait_for_tmux_info",
-            lambda *_a, **_k: {"socket_path": "/unused/socket", "tmux_target": "main"},
+        claude_bridge.write_tmux_target(
+            bridge_dir, socket_path=Path("/unused/socket"), tmux_target="main"
+        )
+        claude_bridge.record_hook_event(
+            bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"}
         )
     monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)

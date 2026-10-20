@@ -2807,6 +2807,62 @@ def test_run_turn_polls_startup_error_at_fast_startup_interval(
     assert events[0].message == "Codex native thread never started: app-server exited"
 
 
+@pytest.mark.parametrize("outcome", ["ready", "failed", "cancelled"])
+def test_first_input_waits_through_pending_native_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    """Keep the original input past the watchdog; never dispatch before a thread exists."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_startup_error(tmp_path, "Still starting", code="agent_startup_pending")
+    waited = 0.0
+
+    async def advance_startup(seconds: float) -> None:
+        nonlocal waited
+        waited += seconds
+        assert _FakeCodexNativeClient.requests == []
+        if waited >= 121:
+            if outcome == "ready":
+                _start_state(tmp_path)
+            elif outcome == "failed":
+                write_bridge_startup_error(tmp_path, "Terminal exited", code="terminal_exited")
+            else:
+                raise asyncio.CancelledError
+
+    monkeypatch.setattr(codex_native_executor.asyncio, "sleep", advance_startup)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            _collect_turn_events(executor, "original first message")
+    else:
+        events = _collect_turn_events(executor, "original first message")
+        if outcome == "ready":
+            assert [type(event) for event in events] == [TurnComplete]
+            assert _FakeCodexNativeClient.requests == [
+                (
+                    "turn/start",
+                    {
+                        "threadId": "thread_123",
+                        "input": [{"type": "text", "text": "original first message"}],
+                        "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
+                    },
+                ),
+            ]
+        else:
+            assert len(events) == 1 and isinstance(events[0], ExecutorError)
+            assert events[0].code == "terminal_exited"
+            assert events[0].undelivered is True
+            assert _FakeCodexNativeClient.requests == []
+    assert waited >= 121
+
+
 def test_bridge_state_polling_backs_off_after_fast_window(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
