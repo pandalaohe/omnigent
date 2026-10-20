@@ -7,7 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import httpx
 import pytest
@@ -30,7 +30,9 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.routes.sessions.routes_hooks import _approval_timeout_owner
+from omnigent.server.schemas import UserPreferenceNamespace
 from omnigent.server.user_preferences_store import (
+    USER_PREFERENCE_NAMESPACES,
     AgentKeepWarm,
     ApprovalTimeout,
     CollabSettings,
@@ -568,6 +570,63 @@ async def test_preferences_api_initializes_merges_and_returns_from_me(
 
         synced_me = await client.get("/v1/me", headers=headers)
         assert synced_me.json()["preferences"] == patched.json()
+
+
+def test_preference_namespace_literal_covers_store_allowlist() -> None:
+    missing = USER_PREFERENCE_NAMESPACES - set(get_args(UserPreferenceNamespace))
+    assert not missing, f"Store namespaces missing from the HTTP contract: {sorted(missing)}"
+
+
+@pytest.mark.parametrize(
+    ("namespace", "value"),
+    [
+        pytest.param("child_idle", {"enabled": True}, id="idle-switch"),
+        pytest.param(
+            "child_idle",
+            {
+                "agents": {
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                        "enabled": True,
+                        "resumeOnce": True,
+                        "checkIntervalSeconds": 3600,
+                        "freezeThresholdSeconds": 3600,
+                    }
+                }
+            },
+            id="freeze-switch",
+        ),
+        pytest.param("project_host_agents", {"host-a": "agent-a"}, id="project-host-agent"),
+    ],
+)
+async def test_preferences_api_accepts_child_idle_and_project_host_agents(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    namespace: str,
+    value: dict[str, Any],
+) -> None:
+    app = _preferences_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        headers = {"x-test-user": "alice@example.com"}
+        initialized = await client.put(
+            "/v1/me/preferences", headers=headers, json={"version": 1, "settings": {}}
+        )
+        assert initialized.status_code == 200, initialized.text
+        patched = await client.patch(
+            f"/v1/me/preferences/{namespace}", headers=headers, json={"value": value}
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"][namespace] == value
+        synced = await client.get("/v1/me", headers=headers)
+        assert synced.json()["preferences"] == patched.json()
+        envelope = {"version": 1, "settings": {namespace: value}}
+        initialized = await client.put(
+            "/v1/me/preferences", headers={"x-test-user": "bob@example.com"}, json=envelope
+        )
+        assert initialized.status_code == 200, initialized.text
+        assert initialized.json() == envelope
 
 
 @pytest.mark.asyncio
