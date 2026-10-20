@@ -557,6 +557,8 @@ class SqlDeviceGrant(OmnigentBase):
         every grant that application initiates. Shown on the consent page
         and recorded in the issued token's ``act`` claim for audit.
         Display/audit only — not a security-decision key.
+    :param scope: Persisted authority; ``NULL`` only for first-party login
+        grants, ``sessions`` or ``usage:read`` for device grants.
     :param user_id: The Omnigent identity that approved the grant, set at
         consent time. ``NULL`` while pending. The delegated token's ``sub``.
     :param refresh_token_hash: HMAC-SHA256 hex digest of the current
@@ -593,6 +595,7 @@ class SqlDeviceGrant(OmnigentBase):
     # row↔entity boundary.
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     client_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scope: Mapped[str | None] = mapped_column(String(32), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Digest of the just-superseded refresh token, kept only so a replay
@@ -2703,3 +2706,75 @@ class SqlSessionPeerMessage(OmnigentBase):
             "pair_sequence",
         ),
     )
+
+
+class SqlUsageFeed(OmnigentBase):
+    """Durable owner feed, sequence allocator, cursor key, and read budget."""
+
+    __tablename__ = "usage_feeds"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    owner_scope_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    feed_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    feed_epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    signing_key: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    next_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    read_timestamps: Mapped[str] = mapped_column(Text, nullable=False)
+    progress: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default="{}")
+
+
+class SqlUsageUnit(OmnigentBase):
+    """Current revision of a producer unit, independent of session lifetime."""
+
+    __tablename__ = "usage_units"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    unit_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    observation: Mapped[str] = mapped_column(Text, nullable=False)
+    original_event_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    latest_event_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    latest_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_count: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+
+
+class SqlUsageCallAllocation(OmnigentBase):
+    """First producer unit assigned to a proven logical response."""
+
+    __tablename__ = "usage_call_allocations"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    call_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    first_unit_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+
+
+class SqlUsageEvent(OmnigentBase):
+    """Immutable committed feed event in owner-local sequence order."""
+
+    __tablename__ = "usage_events"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class SqlUsageProducer(OmnigentBase):
+    """Immutable owner-authorized producer binding; no session foreign key."""
+
+    __tablename__ = "usage_producers"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    producer_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    producer_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    binding: Mapped[str] = mapped_column(Text, nullable=False)

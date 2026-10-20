@@ -716,7 +716,18 @@ class UnifiedAuthProvider(AuthProvider):
             # first-party login grant carries no scope: its bearer is the
             # user's own CLI/host and the token renews the session JWT it
             # replaced, so it keeps that authority (revocable via ``grant_id``).
-            if scope is not None and not delegated_path_allowed(request.url.path):
+            if scope == "usage:read":
+                # Usage grants delegate one owner's book, never session or
+                # runner authority. An unbacked machine JWT cannot opt in.
+                if (
+                    not isinstance(grant_id, str)
+                    or not grant_id
+                    or self._grant_revoked is None
+                    or request.scope.get("method") != "GET"
+                    or request.url.path != "/v1/usage-events"
+                ):
+                    return None
+            elif scope is not None and not delegated_path_allowed(request.url.path):
                 return None
             return user_id
 

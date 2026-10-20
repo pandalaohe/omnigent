@@ -9007,6 +9007,9 @@ async def _auto_create_claude_terminal(
             # Resume our OWN clone (plain --resume, no --fork-session).
             resume_external_session_id = our_uuid
             resume_prefix_bytes = _measured_prefix_bytes(_cloned)
+            from omnigent.usage_export.runtime import baseline_claude_transcripts
+
+            baseline_claude_transcripts(_cloned, session_id, start_offset=resume_prefix_bytes)
             # Record the assigned id now so Omnigent reflects the clone's own
             # Claude session immediately, and a later relaunch resumes it
             # via the normal cold-resume path (this branch is gated on
@@ -9068,6 +9071,9 @@ async def _auto_create_claude_terminal(
         if _built is not None:
             resume_external_session_id = our_uuid
             resume_prefix_bytes = _measured_prefix_bytes(_built)
+            from omnigent.usage_export.runtime import baseline_claude_transcripts
+
+            baseline_claude_transcripts(_built, session_id, start_offset=resume_prefix_bytes)
             # Record the assigned id so Omnigent reflects the clone's own Claude
             # session and a later relaunch resumes it via the cold-resume
             # path above. Best-effort, mirroring the clone branch.

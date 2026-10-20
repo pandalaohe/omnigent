@@ -61,6 +61,7 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from omnigent.entities.device_grant import DEVICE_GRANT_SCOPES, DeviceGrant
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
@@ -89,6 +90,17 @@ _CLIENT_SECRET_HEADER = "X-Omnigent-Client-Secret"
 # to the session-facing APIs a delegated client needs; the auth layer
 # refuses admin / user-management paths for a token carrying this scope.
 DELEGATED_SCOPE = "sessions"
+
+
+def _grant_scope(grant: DeviceGrant) -> str | None:
+    """Use only persisted authority, rejecting malformed grant rows."""
+    if _is_login_grant(grant.client_id):
+        if grant.scope is None:
+            return None
+    elif grant.scope in DEVICE_GRANT_SCOPES:
+        return grant.scope
+    raise OmnigentError("invalid grant scope", code=ErrorCode.UNAUTHORIZED)
+
 
 # Reserved ``client_id`` for a first-party login grant (issued by
 # ``omnigent login``, not the RFC 8628 device flow). It is a
@@ -431,25 +443,31 @@ def create_oauth_token_router(
         except Exception:  # noqa: BLE001 — housekeeping must never fail a refresh
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
 
-    def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+    def _issue_access_token(grant_id: str) -> str:
         grant = device_grant_store.authorize_access(grant_id)
-        if grant is None or (
-            auth_provider._source == "accounts"
-            and not auth_provider.accepts_account_generation(user_id, grant.account_generation)
+        if (
+            grant is None
+            or grant.user_id is None
+            or (
+                auth_provider._source == "accounts"
+                and not auth_provider.accepts_account_generation(
+                    grant.user_id, grant.account_generation
+                )
+            )
         ):
             raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
         # A first-party login grant renews with the SAME authority as the
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
-        scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
+        scope = _grant_scope(grant)
         return mint_delegated_token(
-            user_id,
+            grant.user_id,
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
             grant_id=grant_id,
-            client_id=client_id or "",
+            client_id=grant.client_id or "",
             jti=secrets.token_urlsafe(16),
             scope=scope,
         )
@@ -534,7 +552,7 @@ def create_oauth_token_router(
             # token stays valid for the grant lifetime; only the short-lived
             # access token is renewed. Revocation + the absolute lifetime cap
             # bound the exposure.
-            access_token = _issue_access_token(grant.id, grant.user_id, grant.client_id or "")
+            access_token = _issue_access_token(grant.id)
             return JSONResponse(
                 status_code=200,
                 content={
@@ -561,11 +579,7 @@ def create_oauth_token_router(
             return _oauth_error("invalid_grant")
         if rotated.user_id is None:
             return _oauth_error("invalid_grant")
-        access_token = _issue_access_token(
-            rotated.id,
-            rotated.user_id,
-            rotated.client_id or "",
-        )
+        access_token = _issue_access_token(rotated.id)
         return JSONResponse(
             status_code=200,
             content={
@@ -673,22 +687,29 @@ def create_device_auth_router(
     # authorize so the table stays bounded without a separate scheduler.
     _last_purge = {"at": 0.0}
 
-    def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+    def _issue_access_token(grant_id: str) -> str:
         grant = device_grant_store.authorize_access(grant_id)
-        if grant is None or (
-            auth_provider._source == "accounts"
-            and not auth_provider.accepts_account_generation(user_id, grant.account_generation)
+        if (
+            grant is None
+            or grant.user_id is None
+            or (
+                auth_provider._source == "accounts"
+                and not auth_provider.accepts_account_generation(
+                    grant.user_id, grant.account_generation
+                )
+            )
         ):
             raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
         return mint_delegated_token(
-            user_id,
+            grant.user_id,
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
             grant_id=grant_id,
-            client_id=client_id or "",
+            client_id=grant.client_id or "",
             jti=secrets.token_urlsafe(16),
+            scope=_grant_scope(grant),
         )
 
     # ── Device authorization (public) ─────────────────────────────
@@ -740,6 +761,10 @@ def create_device_auth_router(
             )
             return _oauth_error("invalid_request")
 
+        requested_scope = body.get("scope", DELEGATED_SCOPE)
+        if not isinstance(requested_scope, str) or requested_scope not in DEVICE_GRANT_SCOPES:
+            return _oauth_error("invalid_scope")
+
         device_code = secrets.token_urlsafe(32)
         grant_id = secrets.token_urlsafe(16)
         user_code = _generate_user_code()
@@ -749,6 +774,7 @@ def create_device_auth_router(
             device_code_hash=hash_secret(device_code, cookie_secret),
             user_code=user_code,
             client_id=client_id,
+            scope=requested_scope,
             created_at=now,
             expires_at=now + _DEVICE_CODE_TTL_SECONDS,
         )
@@ -845,7 +871,12 @@ def create_device_auth_router(
 
         grant = device_grant_store.get_by_user_code(user_code)
         now = int(time.time())
-        if grant is None or grant.status != "pending" or grant.expires_at <= now:
+        if (
+            grant is None
+            or grant.status != "pending"
+            or grant.expires_at <= now
+            or grant.scope not in DEVICE_GRANT_SCOPES
+        ):
             return HTMLResponse(
                 _consent_html(error="This link is invalid or has expired."),
                 status_code=200,
@@ -864,6 +895,7 @@ def create_device_auth_router(
                 user_code=user_code,
                 user_id=user_id,
                 client_id=grant.client_id,
+                scope=grant.scope,
                 base_path=base_path,
             ),
             status_code=200,
@@ -886,7 +918,12 @@ def create_device_auth_router(
         user_code = (str(form.get("user_code") or "")).strip()
         grant = device_grant_store.get_by_user_code(user_code) if user_code else None
         now = int(time.time())
-        if grant is None or grant.status != "pending" or grant.expires_at <= now:
+        if (
+            grant is None
+            or grant.status != "pending"
+            or grant.expires_at <= now
+            or grant.scope not in DEVICE_GRANT_SCOPES
+        ):
             return HTMLResponse(
                 _consent_html(error="This link is invalid or has expired."),
                 status_code=200,
@@ -921,7 +958,7 @@ def create_device_auth_router(
             grant.client_id,
         )
         return HTMLResponse(
-            _consent_html(approved_as=user_id),
+            _consent_html(approved_as=user_id, client_id=approved.client_id, scope=approved.scope),
             status_code=200,
         )
 
@@ -977,11 +1014,7 @@ def create_device_auth_router(
         if redeemed is None or redeemed.user_id is None:
             # Lost the race (concurrent poll already redeemed) or expired.
             return _oauth_error("invalid_grant")
-        access_token = _issue_access_token(
-            redeemed.id,
-            redeemed.user_id,
-            redeemed.client_id or "",
-        )
+        access_token = _issue_access_token(redeemed.id)
         _logger.info("oauth/token: issued delegated token for grant %s", redeemed.id)
         return JSONResponse(
             status_code=200,
@@ -1012,6 +1045,7 @@ def _consent_html(
     user_code: str = "",
     user_id: str = "",
     client_id: str | None = None,
+    scope: str | None = DELEGATED_SCOPE,
     prompt_for_code: bool = False,
     error: str = "",
     approved_as: str = "",
@@ -1036,12 +1070,14 @@ def _consent_html(
     # Requesting client's identifier, defaulting to a neutral label when it
     # didn't identify itself.
     app_name = esc(client_id) if client_id else "An application"
+    access_verb = "view usage events for" if scope == "usage:read" else "act as"
+    access_limit = " (read-only)" if scope == "usage:read" else " on session APIs"
     if error:
         body = f'<p class="err">{esc(error)}</p>'
     elif approved_as:
         body = (
-            f"<h1>Connected</h1><p>{app_name} is now authorized to act as "
-            f"<b>{esc(approved_as)}</b>. You can close this tab.</p>"
+            f"<h1>Connected</h1><p>{app_name} can now {access_verb} "
+            f"<b>{esc(approved_as)}</b>{access_limit}. You can close this tab.</p>"
         )
     elif denied:
         body = "<h1>Denied</h1><p>No access was granted. You can close this tab.</p>"
@@ -1056,13 +1092,13 @@ def _consent_html(
     else:
         body = (
             "<h1>Authorize access</h1>"
-            f"<p>{app_name} is requesting permission to act as "
-            f"<b>{esc(user_id)}</b> on this Omnigent server.</p>"
+            f"<p>{app_name} is requesting permission to {access_verb} "
+            f"<b>{esc(user_id)}</b>{access_limit} on this Omnigent server.</p>"
             f'<p class="muted">Code: {esc(user_code)}</p>'
             '<p class="warn">⚠️ Only approve if <b>you</b> just started this '
             "login and this code matches the one the application showed you. If "
-            "you didn't start it, click Deny — approving lets the application "
-            "act as you.</p>"
+            "you didn't start it, click Deny — approving grants this "
+            "application the access described above.</p>"
             f'<form method="post" action="{base_path}/oauth/device/approve" class="row">'
             f'<input type="hidden" name="user_code" value="{esc(user_code)}">'
             '<button type="submit" class="primary">Approve</button></form>'

@@ -944,6 +944,17 @@ class _ClaudePeerReceiptStore:
         return None
 
     async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+        from omnigent.usage_export.runtime import capture_claude_mirror, capture_enabled
+
+        if capture_enabled():
+            slot = self._owner._query_slots.get(self._session_key)
+            await asyncio.to_thread(
+                capture_claude_mirror,
+                self._session_key,
+                key,
+                entries,
+                internal=slot is not None and slot.maintenance,
+            )
         await self._owner._observe_peer_mirror(self._session_key, key, entries)
 
 

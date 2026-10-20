@@ -249,6 +249,13 @@ def create_usage_router(
     """
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
+    from omnigent.server.routes.usage_events import create_usage_events_router
+
+    router.include_router(
+        create_usage_events_router(
+            conversation_store, _resolve_session_harness, auth_provider=auth_provider
+        )
+    )
 
     @router.get("/usage", response_model=UsageReport)
     async def get_usage(request: Request) -> UsageReport:
