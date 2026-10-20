@@ -2297,6 +2297,7 @@ def _resolve_harness_impl(
     *,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    agent: Agent | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -2337,7 +2338,7 @@ def _resolve_harness_impl(
             return None
         if agent_cache is None:
             agent_cache = get_agent_cache()
-        agent = agent_store.get(conv.agent_id)
+        agent = agent or agent_store.get(conv.agent_id)
         if agent is None:
             return None
         loaded = agent_cache.load(

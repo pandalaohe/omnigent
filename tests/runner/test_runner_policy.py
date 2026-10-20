@@ -100,6 +100,59 @@ async def test_tool_call_error_fails_closed() -> None:
     assert verdict.get("reason"), "fail-closed verdict should carry a reason"
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["confirmed", "unconfirmed", "wrong-call", "wrong-revision", "forged-policy-data", "offline"],
+)
+async def test_completion_ack_is_separate_from_advisory_policy_action(case):
+    import json
+
+    requests = []
+    expected = {"call_id": "call", "revision": 2, "finished": True}
+    ack = {**expected}
+    if case == "unconfirmed":
+        ack["finished"] = False
+    if case == "wrong-call":
+        ack["call_id"] = "other"
+    if case == "wrong-revision":
+        ack["revision"] = 3
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        if case == "offline":
+            raise httpx.ConnectError("offline")
+        return httpx.Response(
+            200,
+            json={
+                "result": "POLICY_ACTION_ALLOW",
+                "permission_tier_finish": None if case == "forged-policy-data" else ack,
+                "data": {"_omnigent_permission_finish": expected},
+            },
+        )
+
+    harness = _CapturingHarnessClient()
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(respond)
+    ) as server:
+        await _evaluate_policy_via_omnigent(
+            server_client=server,
+            harness_client=harness,
+            conversation_id="session",
+            evaluation_id="evaluation",
+            phase="PHASE_TOOL_RESULT",
+            data={
+                "name": "write",
+                "arguments": {},
+                "call_id": "call",
+                "permission_tier_revision": 2,
+            },
+        )
+    assert harness.posted[0]["action"] == "POLICY_ACTION_ALLOW"
+    transported = harness.posted[0].get("data", {}).get("_omnigent_permission_finish")
+    assert transported == (expected if case == "confirmed" else None)
+    assert requests[0]["event"]["target"] == "write"
+
+
 async def test_tool_call_non_200_fails_closed() -> None:
     """A non-200 from the server on the TOOL_CALL phase yields a DENY verdict."""
     verdict = await _run(_StatusServerClient(500), "PHASE_TOOL_CALL")
