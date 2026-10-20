@@ -62,6 +62,16 @@ class CodexTurnEvidence:
         owner = self._owner
         if owner is None or owner.attempt is None or _scope.get() is not owner:
             return
+        if owner.attempt.input_id is not None:
+            owner.emit(
+                StartupObservation(
+                    attempt=owner.attempt,
+                    phase="input_dispatched",
+                    source=self.source,
+                    vendor_session_id=self.thread_id,
+                    vendor_turn_id=self.turn_id,
+                )
+            )
         phases = ("runtime_ready", "tools_ready") if tool_bridge_installed else ("runtime_ready",)
         for phase in phases:
             owner.emit(

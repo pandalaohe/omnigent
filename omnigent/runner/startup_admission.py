@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
 
 
 class StartupAdmission:
@@ -22,6 +22,7 @@ class StartupAdmission:
     ) -> None:
         self._server_client = server_client
         self._attempts: dict[str, StartupAttemptRef | None] = {}
+        self._observations: dict[str, dict[str, StartupObservation]] = {}
         if root_attempt is not None:
             if not root_session_id:
                 raise ValueError("Startup attempt requires a bound root session")
@@ -38,9 +39,36 @@ class StartupAdmission:
         if not session_id:
             raise ValueError("Startup session id is required")
         if required:
+            if self._attempts.get(session_id) != attempt:
+                self._observations.pop(session_id, None)
             self._attempts[session_id] = attempt
         else:
-            self._attempts.pop(session_id, None)
+            self.forget(session_id)
+
+    def forget(self, session_id: str) -> None:
+        self._attempts.pop(session_id, None)
+        self.clear_observations(session_id)
+
+    def clear_observations(self, session_id: str) -> None:
+        self._observations.pop(session_id, None)
+
+    def record_observation(self, session_id: str, observation: StartupObservation) -> bool:
+        """Keep one typed Codex observation per phase for the current attempt."""
+        attempt = self._attempts.get(session_id)
+        if attempt is None or attempt != observation.attempt or observation.source != "codex":
+            return False
+        metadata = observation.model_copy(update={"reason": None})
+        self._observations.setdefault(session_id, {}).setdefault(observation.phase, metadata)
+        return True
+
+    def observations_for(
+        self, session_id: str, attempt: StartupAttemptRef
+    ) -> list[StartupObservation] | None:
+        """Return metadata only when the caller names the current registered attempt."""
+        current = self._attempts.get(session_id)
+        if current is None or current != attempt:
+            return None
+        return list(self._observations.get(session_id, {}).values())
 
     def required(self, session_id: str) -> bool:
         return session_id in self._attempts

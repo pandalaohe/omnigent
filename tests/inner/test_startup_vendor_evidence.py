@@ -87,6 +87,33 @@ def test_codex_hook_or_completion_without_vendor_execution_is_not_work():
     assert emitted == []
 
 
+def test_codex_dispatch_receipt_requires_owned_turn_and_input():
+    emitted = []
+    ref = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="context",
+        host_generation="generation",
+    )
+    with startup_evidence_scope(ref, emitted.append):
+        CodexTurnEvidence("thread", "turn", source="codex").ready(tool_bridge_installed=True)
+    assert [item.phase for item in emitted] == [
+        "input_dispatched",
+        "runtime_ready",
+        "tools_ready",
+    ]
+    assert all(
+        item.vendor_session_id == "thread" and item.vendor_turn_id == "turn" for item in emitted
+    )
+
+    without_input = ref.model_copy(update={"input_id": None})
+    emitted.clear()
+    with startup_evidence_scope(without_input, emitted.append):
+        CodexTurnEvidence("thread", "turn", source="codex").ready(tool_bridge_installed=False)
+    assert [item.phase for item in emitted] == ["runtime_ready"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "work",
@@ -187,6 +214,7 @@ async def test_actual_codex_executor_reports_only_its_own_vendor_turn(work):
         ):
             pass
     assert [item.phase for item in emitted] == [
+        "input_dispatched",
         "runtime_ready",
         "tools_ready",
         "input_accepted",
@@ -303,6 +331,50 @@ async def test_startup_control_frames_roundtrip_only_over_internal_relay():
     assert len(replies) == 2
     assert b'"granted":true' in replies[0][1]
     assert b'"granted":false' in replies[1][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statuses", "accepted", "expected_calls"),
+    [
+        ([503, 200], True, 2),
+        ([400, 200], False, 1),
+        ([200, 200], False, 1),
+    ],
+)
+async def test_startup_receipt_retries_only_transient_responses(
+    statuses, accepted, expected_calls
+):
+    ref = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="context",
+        host_generation="generation",
+    )
+    event = StartupProofEvent(
+        observation=StartupObservation(
+            attempt=ref,
+            phase="input_dispatched",
+            source="codex",
+            vendor_session_id="thread",
+            vendor_turn_id="turn",
+        )
+    )
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        status = statuses[calls]
+        calls += 1
+        return httpx.Response(status, json={"accepted": status == 200 and accepted})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.invalid"
+    ) as server:
+        result = await _relay_startup_proof(server, "session", event.model_dump(), ref)
+    assert result is accepted
+    assert calls == expected_calls
 
 
 @pytest.mark.asyncio

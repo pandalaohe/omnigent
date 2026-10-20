@@ -893,6 +893,8 @@ async def _relay_startup_proof(
     session_id: str,
     event: object,
     expected: StartupAttemptRef,
+    *,
+    admission: StartupAdmission | None = None,
 ) -> bool:
     """Consume a harness control frame using the runner's authenticated AP client."""
     try:
@@ -902,21 +904,32 @@ async def _relay_startup_proof(
     observation = proof.observation
     if observation.attempt != expected or observation.source != "codex":
         return False
+    if admission is not None and not admission.record_observation(session_id, observation):
+        return False
     # The store accepts runner readiness before an input has a vendor binding.
     # This runner reports it only after a typed Codex thread/tool observation.
     if observation.phase in ("runtime_ready", "tools_ready"):
         observation = observation.model_copy(update={"source": "runner"})
-    try:
-        response = await server_client.post(
-            f"/v1/sessions/{session_id}/startup/receipts",
-            json=observation.model_dump(),
-            timeout=5.0,
-        )
-        response.raise_for_status()
-        return response.json().get("accepted") is True
-    except (httpx.HTTPError, ValueError):
-        _logger.warning("Startup proof relay failed for session %s", session_id)
-        return False
+    for _ in range(3):
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{session_id}/startup/receipts",
+                json=observation.model_dump(),
+                timeout=5.0,
+            )
+        except httpx.TransportError:
+            continue
+        if response.status_code >= 500:
+            continue
+        if not 200 <= response.status_code < 300:
+            break
+        try:
+            result = response.json()
+        except ValueError:
+            break
+        return isinstance(result, dict) and result.get("accepted") is True
+    _logger.warning("Startup proof relay failed for session %s", session_id)
+    return False
 
 
 async def _relay_startup_claim(
@@ -4550,6 +4563,16 @@ def create_runner_app(
             },
         )
 
+    @app.post("/v1/sessions/{session_id}/startup/observations")
+    async def startup_observations(session_id: str, attempt: StartupAttemptRef) -> JSONResponse:
+        observations = startup_admission.observations_for(session_id, attempt)
+        if observations is None:
+            return JSONResponse(status_code=404, content={"error": "startup_attempt_not_current"})
+        return JSONResponse(
+            status_code=200,
+            content={"observations": [item.model_dump() for item in observations]},
+        )
+
     @app.post("/v1/sessions")
     async def create_session(request: Request) -> JSONResponse:
         body = await request.json()
@@ -4801,6 +4824,7 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        startup_admission.forget(session_id)
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _unknown_sdk_peers(session_id, "runner_session_deleted")
@@ -8720,7 +8744,11 @@ def create_runner_app(
                                 if _evt_type == "startup.proof":
                                     if startup_ref is not None:
                                         await _relay_startup_proof(
-                                            server_client, conv_id, event, startup_ref
+                                            server_client,
+                                            conv_id,
+                                            event,
+                                            startup_ref,
+                                            admission=startup_admission,
                                         )
                                     continue
                                 if _evt_type == SDK_PEER_STREAM_EVENT:
@@ -10045,6 +10073,8 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            if startup_admission.required(conversation_id):
+                startup_admission.register(conversation_id, None)
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
