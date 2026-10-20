@@ -4040,6 +4040,42 @@ def test_preregister_agent_stored_tarball_rehydrates(tmp_path: Path) -> None:
 # ── no-AGENT harness launch ───────────────────────────
 
 
+@pytest.mark.parametrize("fail_materialization", [False, True])
+def test_materialize_harness_launcher_cleans_up_on_exit(
+    tmp_path: Path, fail_materialization: bool
+) -> None:
+    script = """
+import sys
+from omnigent import cli
+
+if sys.argv[1] == "fail":
+    def fail_dump(*args, **kwargs):
+        raise RuntimeError("materialization failed")
+    cli.yaml.safe_dump = fail_dump
+generated = cli._materialize_harness_launcher_file(
+    harness="claude", model=None, system_prompt=None,
+)
+assert generated.is_file()
+print(generated, flush=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, "fail" if fail_materialization else "ok"],
+        env={**os.environ, "TMPDIR": str(tmp_path), "TMP": str(tmp_path), "TEMP": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if fail_materialization:
+        assert result.returncode != 0
+        assert "materialization failed" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        generated = Path(result.stdout.strip().splitlines()[-1])
+        assert generated.parent.parent == tmp_path
+        assert not generated.exists()
+    assert not list(tmp_path.glob("omnigent-harness-launcher-*"))
+
+
 def test_materialize_harness_launcher_file_writes_omnigent_yaml() -> None:
     """No-AGENT run materialization writes a standalone Omnigent YAML file."""
     generated = _materialize_harness_launcher_file(

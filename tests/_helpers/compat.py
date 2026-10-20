@@ -32,7 +32,7 @@ import httpx
 from packaging.version import Version
 
 # CWD caches keyed by component label ("server" / "runner"), created lazily.
-_compat_cwds: dict[str, str] = {}
+_compat_cwds: dict[str, tempfile.TemporaryDirectory[str]] = {}
 
 # Interpreter for the SERVER subprocess. Set to a venv python holding the
 # pinned older build; unset in normal runs (use the test process's python).
@@ -92,8 +92,8 @@ def _compat_cwd(env_var: str, label: str) -> str | None:
     if _compat_python(env_var) is None:
         return None
     if label not in _compat_cwds:
-        _compat_cwds[label] = tempfile.mkdtemp(prefix=f"omnigent-compat-{label}-cwd-")
-    return _compat_cwds[label]
+        _compat_cwds[label] = tempfile.TemporaryDirectory(prefix=f"omnigent-compat-{label}-cwd-")
+    return _compat_cwds[label].name
 
 
 # ── Server redirect (Config 1) ─────────────────────────────────────────

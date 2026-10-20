@@ -8,7 +8,9 @@ See ``docs/SERVER_VERSION_COMPAT_CI.md``.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -102,6 +104,7 @@ def test_server_redirect_active_with_env(monkeypatch: pytest.MonkeyPatch) -> Non
     # omnigent/ package (else CWD on sys.path[0] would shadow the old install).
     cwd = compat.compat_server_cwd()
     assert cwd is not None
+    assert cwd == compat.compat_server_cwd()
     assert os.path.isdir(cwd)
     assert not os.path.exists(os.path.join(cwd, "omnigent"))
 
@@ -158,6 +161,7 @@ def test_runner_redirect_active_with_env(monkeypatch: pytest.MonkeyPatch) -> Non
     # Neutral CWD with no omnigent/ package (mirrors the server cwd guard).
     cwd = compat.compat_runner_cwd()
     assert cwd is not None
+    assert cwd == compat.compat_runner_cwd()
     assert os.path.isdir(cwd)
     assert not os.path.exists(os.path.join(cwd, "omnigent"))
 
@@ -167,3 +171,29 @@ def test_server_and_runner_cwds_are_distinct(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv(compat.COMPAT_SERVER_PYTHON_ENV, "/srv/bin/python")
     monkeypatch.setenv(compat.COMPAT_RUNNER_PYTHON_ENV, "/old-agent/bin/python")
     assert compat.compat_server_cwd() != compat.compat_runner_cwd()
+
+
+def test_compat_cwds_are_removed_at_interpreter_exit(tmp_path: Path) -> None:
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tests._helpers import compat; "
+            "print(compat.compat_server_cwd()); print(compat.compat_runner_cwd())",
+        ],
+        cwd=Path(__file__).parents[1],
+        env={
+            **os.environ,
+            "TMPDIR": str(tmp_path),
+            compat.COMPAT_SERVER_PYTHON_ENV: sys.executable,
+            compat.COMPAT_RUNNER_PYTHON_ENV: sys.executable,
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    paths = [Path(line) for line in process.stdout.splitlines()]
+    assert len(paths) == 2
+    assert all(path.parent == tmp_path for path in paths)
+    assert all(not path.exists() for path in paths)

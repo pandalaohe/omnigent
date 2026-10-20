@@ -117,14 +117,17 @@ describe("parseLocalServerPidfile", () => {
 
 describe("localServerHealthy", () => {
   const prevDataDir = process.env.OMNIGENT_DATA_DIR;
+  const pidfileDirs = [];
   afterEach(() => {
     if (prevDataDir === undefined) delete process.env.OMNIGENT_DATA_DIR;
     else process.env.OMNIGENT_DATA_DIR = prevDataDir;
+    for (const dir of pidfileDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
   // Point the data dir at a temp dir holding `pidfile` (or none).
   function withPidfile(pidfile) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-pidfile-test-"));
+    pidfileDirs.push(dir);
     if (pidfile !== undefined) fs.writeFileSync(path.join(dir, "local_server.pid"), pidfile);
     process.env.OMNIGENT_DATA_DIR = dir;
   }
