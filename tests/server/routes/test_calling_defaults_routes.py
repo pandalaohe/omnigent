@@ -38,6 +38,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 HOST_A = "a1b2c3d4e5f60718293a4b5c6d7e8f01"
 HOST_B = "b1b2c3d4e5f60718293a4b5c6d7e8f02"
@@ -137,7 +138,9 @@ def app(stores: _Stores) -> FastAPI:
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     """HTTP client wired to the single-user app."""
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=PERMISSION_TIERS_HEADERS
+    ) as c:
         yield c
 
 
@@ -151,7 +154,9 @@ def multi_user_app(stores: _Stores) -> FastAPI:
 async def multi_user_client(multi_user_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     """HTTP client wired to the header-auth app."""
     transport = httpx.ASGITransport(app=multi_user_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=PERMISSION_TIERS_HEADERS
+    ) as c:
         yield c
 
 

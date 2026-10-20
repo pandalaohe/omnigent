@@ -1026,7 +1026,7 @@ async def test_json_create_rejects_handoff_label(
     assert response.json()["error"]["code"] == "invalid_input"
 
 
-async def test_create_and_patch_reject_permission_authority_labels(
+async def test_create_strips_and_patch_rejects_permission_authority_labels(
     client: httpx.AsyncClient, session_id: str, db_uri: str
 ) -> None:
     from omnigent.server.permission_tiers import PERMISSION_LABEL_KEYS
@@ -1038,7 +1038,8 @@ async def test_create_and_patch_reject_permission_authority_labels(
     for key in (*PERMISSION_LABEL_KEYS, "OMNIGENT.PI.PERMISSION_TIER"):
         labels = {key: "full"}
         created = await client.post("/v1/sessions", json={"agent_id": agent_id, "labels": labels})
-        assert created.status_code == 400
+        assert created.status_code == 201, created.text
+        assert key not in created.json()["labels"]
         patched = await client.patch(f"/v1/sessions/{session_id}", json={"labels": labels})
         assert patched.status_code == 400
         current = store.get_conversation(session_id)

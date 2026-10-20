@@ -388,6 +388,7 @@ async def test_open_daemon_client_pins_slice_key_on_workspace_mount() -> None:
 async def test_open_daemon_client_no_slice_key_off_workspace() -> None:
     """An unsharded server has no sharding layer, so no key is baked."""
     async with open_daemon_client("http://test", {}, "host_abc123") as client:
+        assert client.headers["X-Omnigent-Permission-Tiers"] == "1"
         assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
 
 
