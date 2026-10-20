@@ -1257,6 +1257,63 @@ def _sync_codex_role_defaults(source_config: Path, dest_config: Path) -> None:
             logger.warning("could not write %s (%s); skipping role-default sync", dest_config, exc)
 
 
+def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
+    """Refresh only the host's explicit Windows sandbox setting in a private copy."""
+    import tomlkit
+    import tomlkit.exceptions
+    import tomllib
+
+    try:
+        source_data = tomllib.loads(source_config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        logger.warning("could not read %s (%s); skipping Windows sandbox sync", source_config, exc)
+        return
+    source_windows = source_data.get("windows")
+    if not isinstance(source_windows, dict) or "sandbox" not in source_windows:
+        return
+
+    try:
+        document = tomlkit.parse(dest_config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError) as exc:
+        logger.warning("could not parse %s (%s); skipping Windows sandbox sync", dest_config, exc)
+        return
+    windows = document.get("windows")
+    if windows is not None and not isinstance(windows, MutableMapping):
+        logger.warning(
+            "codex config %s has a non-table 'windows' value; skipping sandbox sync", dest_config
+        )
+        return
+    if windows is None:
+        windows = tomlkit.table()
+        document["windows"] = windows
+    if windows.get("sandbox") == source_windows["sandbox"]:
+        return
+    windows["sandbox"] = source_windows["sandbox"]
+    fd: int | None = None
+    tmp_name: str | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(dest_config.parent))
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with handle:
+            handle.write(tomlkit.dumps(document))
+        os.chmod(tmp_name, stat.S_IMODE(dest_config.stat().st_mode))
+        os.replace(tmp_name, dest_config)
+    except OSError as exc:
+        logger.warning("could not write %s (%s); skipping Windows sandbox sync", dest_config, exc)
+    finally:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("could not remove temporary Codex config %s (%s)", tmp_name, exc)
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1289,7 +1346,8 @@ def _populate_codex_home_config(
       are inherited through the app-server RPC after initialization. An
       existing private copy keeps its own keys across launches, except the
       lane-owned ``[agents]`` subagent role defaults, which are re-synced
-      from the source.
+      from the source. On Windows, the source's explicit ``[windows].sandbox``
+      choice is also refreshed.
     - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
       available within the private home.
     - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
@@ -1477,6 +1535,8 @@ def _populate_codex_home_config(
                 # Persistent private homes reuse their copied config across
                 # launches; re-sync the lane-owned role defaults from the host.
                 _sync_codex_role_defaults(source_file, dest_path)
+                if sys.platform == "win32":
+                    _sync_codex_windows_sandbox(source_file, dest_path)
             continue
         if minimal_config and filename == "config.toml":
             import tomlkit
