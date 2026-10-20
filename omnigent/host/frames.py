@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from pydantic import ValidationError
 
@@ -35,6 +35,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PATH_ATTACHMENTS,
 )
+from omnigent.startup_protocol import StartupAttemptRef
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -156,6 +157,8 @@ class HostFrameKind(str, Enum):
     CODEX_RATE_LIMITS = "host.codex_rate_limits"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
+    STARTUP_CLAIM = "host.startup_claim"
+    STARTUP_CLAIM_RESULT = "host.startup_claim_result"
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
@@ -350,6 +353,23 @@ class HostLaunchRunnerFrame:
     session_id: str | None = None
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
+    startup: StartupAttemptRef | None = None
+    startup_required: bool = False
+
+
+@dataclass
+class HostStartupClaimFrame:
+    request_id: str
+    session_id: str
+    runner_id: str
+    attempt: StartupAttemptRef
+    boundary: Literal["runner_prepare", "runner_spawn"] = "runner_prepare"
+
+
+@dataclass
+class HostStartupClaimResultFrame:
+    request_id: str
+    granted: bool
 
 
 @dataclass
@@ -1631,6 +1651,8 @@ HostFrame = (
     | HostCodexRateLimitsFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
+    | HostStartupClaimFrame
+    | HostStartupClaimResultFrame
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
@@ -1780,6 +1802,27 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "session_id": frame.session_id,
                 "harness": frame.harness,
                 "inference_config": frame.inference_config,
+                "startup": frame.startup.model_dump() if frame.startup else None,
+                "startup_required": frame.startup_required,
+            }
+        )
+    if isinstance(frame, HostStartupClaimFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.STARTUP_CLAIM.value,
+                "request_id": frame.request_id,
+                "session_id": frame.session_id,
+                "runner_id": frame.runner_id,
+                "attempt": frame.attempt.model_dump(),
+                "boundary": frame.boundary,
+            }
+        )
+    if isinstance(frame, HostStartupClaimResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.STARTUP_CLAIM_RESULT.value,
+                "request_id": frame.request_id,
+                "granted": frame.granted,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -2625,6 +2668,22 @@ def _decode_known_host_frame(
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:
             return _decode_launch_runner_result(msg)
+        case HostFrameKind.STARTUP_CLAIM:
+            boundary = msg.get("boundary", "runner_prepare")
+            if boundary not in ("runner_prepare", "runner_spawn"):
+                raise ValueError("Unsupported startup claim boundary")
+            return HostStartupClaimFrame(
+                request_id=_required_str(msg, "request_id"),
+                session_id=_required_str(msg, "session_id"),
+                runner_id=_required_str(msg, "runner_id"),
+                attempt=StartupAttemptRef.model_validate(msg.get("attempt")),
+                boundary="runner_spawn" if boundary == "runner_spawn" else "runner_prepare",
+            )
+        case HostFrameKind.STARTUP_CLAIM_RESULT:
+            return HostStartupClaimResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                granted=_required_bool(msg, "granted"),
+            )
         case HostFrameKind.STOP_RUNNER:
             return _decode_stop_runner(msg)
         case HostFrameKind.STOP_RUNNER_RESULT:
@@ -2848,6 +2907,14 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        startup=(
+            StartupAttemptRef.model_validate(msg["startup"])
+            if msg.get("startup") is not None
+            else None
+        ),
+        startup_required=(
+            _required_bool(msg, "startup_required") if "startup_required" in msg else False
+        ),
     )
 
 

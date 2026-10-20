@@ -65,7 +65,9 @@ from omnigent.server.schemas import (
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
     SDKPeerReceiptEvent,
+    StartupProofEvent,
 )
+from omnigent.startup_evidence import startup_evidence_scope
 
 _logger = logging.getLogger(__name__)
 
@@ -242,6 +244,13 @@ class ExecutorAdapter(HarnessApp):
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
         executor = self._ensure_executor()
+        startup_attempt = request.startup_attempt
+        startup_required = request.startup_required or startup_attempt is not None
+        if startup_required:
+            from omnigent.inner.codex_executor import CodexExecutor
+
+            if not isinstance(executor, CodexExecutor):
+                raise RuntimeError("startup_proof_unavailable")
         messages = _translate_input_to_messages(request.input)
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -367,6 +376,12 @@ class ExecutorAdapter(HarnessApp):
                 phase_scope(ErrorPhase.TURN),
                 trace_cm,
                 input_delivery_scope(input_identity, response_id=ctx.response_id),
+                startup_evidence_scope(
+                    startup_attempt,
+                    lambda observation: ctx.emit(StartupProofEvent(observation=observation)),
+                    getattr(ctx, "claim_startup", None),
+                    required=startup_required,
+                ),
             ):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Bubble } from "@/lib/renderItems";
@@ -28,6 +28,7 @@ afterEach(() => {
   useChatStore.setState({
     blocks: [],
     conversationId: null,
+    startup: null,
     sessionStatus: "idle",
     status: "idle",
     backgroundTaskCount: 0,
@@ -238,7 +239,12 @@ const pendingElicitation: ElicitationBlock = {
 
 function renderTranscript(blocks: ElicitationBlock[]) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  useChatStore.setState({ blocks, conversationId: "conv-test", sessionStatus: "running" });
+  useChatStore.setState({
+    blocks,
+    conversationId: "conv-test",
+    sessionStatus: "running",
+    startup: null,
+  });
   return render(
     <MemoryRouter>
       <Transcript
@@ -267,6 +273,36 @@ function renderTranscript(blocks: ElicitationBlock[]) {
     },
   );
 }
+
+it("shows the created session waiting for its first message in the transcript", () => {
+  renderTranscript([]);
+  act(() => {
+    useChatStore.setState({
+      startup: {
+        id: "startup",
+        attemptId: "attempt",
+        inputId: null,
+        state: "waiting_input",
+        reason: null,
+        elapsedSeconds: 10,
+        admittedElapsedSeconds: 5,
+        inputElapsedSeconds: null,
+        unconfirmedStartups: 0,
+        queuePositionEstimate: null,
+        canCancel: false,
+        evidence: {
+          runtimeReady: false,
+          toolsReady: false,
+          inputAccepted: false,
+          workStarted: false,
+        },
+      },
+    });
+  });
+
+  expect(screen.getByRole("status")).toHaveTextContent("Waiting for your first message");
+  expect(screen.getByRole("status")).toHaveTextContent("5s since host admission");
+});
 
 function blockCtx(overrides: Partial<BlockContext> = {}): BlockContext {
   return {

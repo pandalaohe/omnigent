@@ -5300,6 +5300,7 @@ async def _finalize_created_session(
     message: object = None,
     placement: _CreatePlacement | None = None,
     inherited_host_id: str | None = None,
+    metadata_required_for_registration: bool = False,
 ) -> str:
     """
     Register the created child, post its first message, and build the handle.
@@ -5345,6 +5346,35 @@ async def _finalize_created_session(
     )
 
     meta = await _fetch_session_metadata(server_client, child_id)
+    from omnigent.server.startup_registration import (
+        STARTUP_REGISTRATION_LABEL_KEY,
+        STARTUP_REGISTRATION_PENDING,
+    )
+
+    create_labels = data.get("labels")
+    meta_labels = meta.get("labels") if meta is not None else None
+    registration_pending = any(
+        isinstance(labels, dict)
+        and labels.get(STARTUP_REGISTRATION_LABEL_KEY) == STARTUP_REGISTRATION_PENDING
+        for labels in (create_labels, meta_labels)
+    )
+    registration_unknown = meta is None and metadata_required_for_registration
+
+    async def clear_registration_barrier() -> str | None:
+        if registration_unknown:
+            return "child metadata unavailable; registration state unknown"
+        if not registration_pending:
+            return None
+        try:
+            response = await server_client.post(
+                f"{_session_url(child_id)}/startup/registered", timeout=30.0
+            )
+        except (httpx.HTTPError, RuntimeError) as exc:
+            return f"{type(exc).__name__}: {exc}"
+        if response.status_code >= 400:
+            return f"{response.status_code} {response.text}"
+        return None
+
     meta_host = _optional_string(meta.get("host_id")) if meta is not None else None
     workspace = _optional_string(meta.get("workspace")) if meta is not None else None
     if workspace is None and placement is not None:
@@ -5391,8 +5421,13 @@ async def _finalize_created_session(
                 placement_label=placement_label,
                 registered_by="sys_session_create",
             )
-            post_error = await _post_created_child_message(
-                server_client, child_id, message, remote=remote
+            registration_error = await clear_registration_barrier()
+            post_error = (
+                registration_error
+                if registration_error is not None
+                else await _post_created_child_message(
+                    server_client, child_id, message, remote=remote
+                )
             )
             if post_error is not None:
                 _subagent_work.mark_subagent_work_terminal(
@@ -5405,13 +5440,25 @@ async def _finalize_created_session(
                 )
                 initial_message = {
                     "status": "failed",
-                    "error": "child_not_ready",
+                    "error": (
+                        "child_registration_failed"
+                        if registration_error is not None
+                        else "child_not_ready"
+                    ),
                     "detail": post_error,
                 }
             else:
                 initial_message = {"status": "sent"}
                 if remote:
                     _subagent_work.mark_subagent_work_started(child_id)
+    else:
+        registration_error = await clear_registration_barrier()
+        if registration_error is not None:
+            initial_message = {
+                "status": "failed",
+                "error": "child_registration_failed",
+                "detail": registration_error,
+            }
 
     evt = SessionCreatedEvent(
         type="session.created",
@@ -5959,6 +6006,7 @@ async def _session_create_from_config_path(
         message=args.get("message"),
         publish_event=publish_event,
         inherited_host_id=await _effective_host_id(server_client, conversation_id),
+        metadata_required_for_registration=True,
     )
 
 

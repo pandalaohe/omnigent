@@ -752,6 +752,19 @@ async def test_launch_runner_happy_path(
 
     conv = conv_store.create_conversation(agent_id=None)
 
+    from unittest.mock import AsyncMock
+
+    from omnigent.startup_protocol import StartupAttemptRef
+
+    startup = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="context",
+        host_generation="connection",
+    )
+    registry.startup_admitter = AsyncMock(return_value=startup)
+
     async def _respond_to_launch() -> None:
         """Read the launch frame from the host's outbound queue and respond."""
         conn = registry.get(_HOST_ID)
@@ -766,6 +779,7 @@ async def test_launch_runner_happy_path(
                 continue
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
+                assert frame.startup == startup and frame.startup_required
                 result = encode_host_frame(
                     HostLaunchRunnerResultFrame(
                         request_id=frame.request_id,

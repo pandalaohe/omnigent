@@ -20,6 +20,7 @@ import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessio
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
+import { sessionStartupFromWire } from "./sessionStartup";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -30,6 +31,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  SessionStartupStatus,
 } from "./types";
 
 export { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
@@ -316,6 +318,7 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  startup?: unknown;
   mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
@@ -444,6 +447,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       : {}),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    startup: sessionStartupFromWire(wire.startup),
     mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
@@ -1816,6 +1820,26 @@ export function interrupt(sessionId: string, responseId?: string): Promise<PostE
  */
 export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
+}
+
+/** Fence only the selected startup attempt; never stop a shared runner. */
+export async function cancelStartup(
+  sessionId: string,
+  startupId: string,
+  attemptId: string | null,
+): Promise<SessionStartupStatus> {
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/startup/cancel`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...PERMISSION_TIERS_PROTOCOL_HEADERS },
+      body: JSON.stringify({ startup_id: startupId, attempt_id: attemptId }),
+    },
+  );
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  const status = sessionStartupFromWire(await response.json());
+  if (status === null) throw new Error("Startup cancellation could not be confirmed");
+  return status;
 }
 
 /** Reconnect or relaunch the existing runner without replaying user input. */

@@ -129,6 +129,8 @@ from omnigent.host.frames import (
     HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
+    HostStartupClaimFrame,
+    HostStartupClaimResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -1409,6 +1411,8 @@ class HostProcess:
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
+        self._startup_claims: dict[str, asyncio.Future[bool]] = {}
+        self._startup_generation: str | None = None
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -1972,6 +1976,42 @@ class HostProcess:
             )
             return await self._handle_launch_impl(frame)
 
+    async def _claim_startup(self, frame: HostLaunchRunnerFrame, *, spawn: bool = False) -> bool:
+        """Revalidate permission on this authenticated connection before cold work."""
+        if frame.startup is None:
+            return not frame.startup_required
+        ws = self._ws
+        generation = self._startup_generation
+        if (
+            ws is None
+            or not frame.session_id
+            or not frame.binding_token.strip()
+            or generation is None
+        ):
+            return False
+        request_id = uuid.uuid4().hex
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._startup_claims[request_id] = future
+        try:
+            await self._send_text(
+                ws,
+                encode_host_frame(
+                    HostStartupClaimFrame(
+                        request_id=request_id,
+                        session_id=frame.session_id,
+                        runner_id=token_bound_runner_id(frame.binding_token),
+                        attempt=frame.startup,
+                        boundary="runner_spawn" if spawn else "runner_prepare",
+                    )
+                ),
+            )
+            granted = await asyncio.wait_for(future, timeout=5)
+            return granted and self._ws is ws and self._startup_generation == generation
+        except (ConnectionError, OSError, TimeoutError):
+            return False
+        finally:
+            self._startup_claims.pop(request_id, None)
+
     async def _handle_launch_impl(
         self,
         frame: HostLaunchRunnerFrame,
@@ -1988,6 +2028,10 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        if not await self._claim_startup(frame):
+            return self._launch_failed(
+                frame, "Startup permission is no longer current", error_code="startup_not_admitted"
+            )
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -2096,6 +2140,8 @@ class HostProcess:
         # pass it so runner-level log records can be attributed to that session.
         if frame.session_id:
             env[PRIMARY_SESSION_ID_ENV_VAR] = frame.session_id
+        if frame.startup is not None:
+            env["OMNIGENT_STARTUP_ATTEMPT"] = frame.startup.model_dump_json()
         # The runner is 1:1 with this host's owner (cross-owner co-location is
         # rejected server-side), so hand it our resolved owner for user_id
         # attribution of runner-level log records.
@@ -2123,6 +2169,10 @@ class HostProcess:
         # abandoned fork would never be watched, stopped, or reaped, and the
         # zygote would retain its exit status forever. On cancellation we let
         # the spawn land and then tear that runner down.
+        if not await self._claim_startup(frame, spawn=True):
+            return self._launch_failed(
+                frame, "Startup permission changed before spawn", error_code="startup_not_admitted"
+            )
         with self._host_subprocess_op():
             spawn = asyncio.ensure_future(
                 asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
@@ -5109,6 +5159,7 @@ class HostProcess:
         self, ws: websockets.asyncio.client.ClientConnection, *, connection_id: str | None = None
     ) -> None:
         """Wait for bounded startup discovery, register, then service the connection."""
+        self._startup_generation = connection_id
         self._start_capability_discovery()
         if self._capability_init_task is not None:
             await asyncio.shield(self._capability_init_task)
@@ -5207,6 +5258,10 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
+            self._startup_generation = None
+            for claim in tuple(self._startup_claims.values()):
+                if not claim.done():
+                    claim.set_result(False)
             rate_limits_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await rate_limits_task
@@ -5598,7 +5653,11 @@ class HostProcess:
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.
             self._raise_connection_error(frame)
-        if isinstance(frame, HostLaunchRunnerFrame):
+        if isinstance(frame, HostStartupClaimResultFrame):
+            pending = self._startup_claims.get(frame.request_id)
+            if pending is not None and not pending.done():
+                pending.set_result(frame.granted)
+        elif isinstance(frame, HostLaunchRunnerFrame):
             completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             if frame.binding_token.strip():
                 self._track_pending_runner_launch(

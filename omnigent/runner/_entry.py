@@ -1425,6 +1425,7 @@ def create_app(
         get_stable_runner_id,
     )
     from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+    from omnigent.startup_protocol import StartupAttemptRef
 
     server_url = _server_url_from_env()
     runner_workspace = _runner_workspace_from_env()
@@ -1441,6 +1442,16 @@ def create_app(
     # claude-sdk SDK merges os.environ. The deny-by-default env scrubbers
     # (os_env, codex, pi) allowlist it so it survives their scrub.
     os.environ[OMNIGENT_SESSION_ENV_VAR] = OMNIGENT_SESSION_ENV_VALUE
+
+    # The host supplies this only for the runner's bound root session. Consume
+    # it before any child process can inherit it; child attempts arrive through
+    # their own trusted runner control input.
+    raw_startup_attempt = os.environ.pop("OMNIGENT_STARTUP_ATTEMPT", None)
+    root_startup_attempt = (
+        StartupAttemptRef.model_validate_json(raw_startup_attempt)
+        if raw_startup_attempt is not None
+        else None
+    )
 
     # Keep the harness manager on its default /tmp/omnigent root.
     # Nesting harness UDS paths under caller-provided temp dirs can
@@ -1590,6 +1601,8 @@ def create_app(
         mcp_manager=mcp_manager,
         auth_token=runner_auth_token,
         auth_token_factory=auth_token_factory,
+        root_startup_session_id=runner_primary_session_id(),
+        root_startup_attempt=root_startup_attempt,
     )
 
     async def _start_pm() -> None:

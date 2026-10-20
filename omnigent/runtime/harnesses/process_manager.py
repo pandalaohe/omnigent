@@ -633,6 +633,10 @@ class HarnessProcessManager:
         # Only fires when the replaced process had an in-flight response; invoked
         # outside the spawn lock so the callback can re-enter get_client without deadlock.
         self._on_harness_respawn: Callable[[str, str, str], Awaitable[None]] | None = None
+        self._startup_admitter: Callable[[str, str], Awaitable[None]] | None = None
+
+    def set_startup_admitter(self, admitter: Callable[[str, str], Awaitable[None]] | None) -> None:
+        self._startup_admitter = admitter
 
     def set_respawn_hook(self, hook: Callable[[str, str, str], Awaitable[None]] | None) -> None:
         """Register the runner-side respawn→resync hook.
@@ -891,6 +895,16 @@ class HarnessProcessManager:
         # Non-None only for a deliberate replacement of an in-flight entry
         # (not crash respawns — those are already covered by the orphan watchdog).
         respawn_reason: str | None = None
+        admitted = False
+
+        async def admit_cold() -> None:
+            nonlocal admitted
+            if not admitted and self._startup_admitter is not None:
+                await self._startup_admitter(conversation_id, harness)
+            if self._shutting_down:
+                raise RuntimeError("HarnessProcessManager stopped during startup admission")
+            admitted = True
+
         # The replaced entry's in-flight response id, captured at the respawn
         # decision (before ``_close_entry``). ``None`` means the replaced process
         # was NOT mid-response — a between-turns switch that strands no turn, so
@@ -924,6 +938,7 @@ class HarnessProcessManager:
                 and entry.endpoint.socket_path.parent == self._instance_dir
                 and not entry.endpoint.socket_path.exists()
             ):
+                await admit_cold()
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 _logger.warning(
                     "harness %s for conversation %s lost its socket; respawning",
@@ -949,6 +964,8 @@ class HarnessProcessManager:
                 entry = None
                 respawn_reason = "harness_respawn_socket_missing"
             if entry is not None and entry.process.returncode is not None:
+                if harness != "any":
+                    await admit_cold()
                 # Prior subprocess died; drop the stale entry and
                 # respawn below. The dead client is closed on
                 # next ``release`` / ``shutdown`` — leaving it in
@@ -979,6 +996,7 @@ class HarnessProcessManager:
                 self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
             if entry is not None and harness != "any" and entry.harness != harness:
+                await admit_cold()
                 # The harness is fixed at spawn time (it selects which runner
                 # module the subprocess loads), but the socket is keyed by
                 # conversation only, so if the session's agent binding changes,
@@ -1013,6 +1031,7 @@ class HarnessProcessManager:
                 and env is not None
                 and entry.acp_config != _acp_startup_config(env)
             ):
+                await admit_cold()
                 _logger.info(
                     "ACP startup config changed for conversation %s; respawning",
                     conversation_id,
@@ -1035,6 +1054,7 @@ class HarnessProcessManager:
                 # in the live-config set instead apply it in-session.
                 requested_model = (env or {}).get(_model_env_key(harness))
                 if requested_model is not None and requested_model != entry.model:
+                    await admit_cold()
                     _logger.info(
                         "harness %s for conversation %s: model changed %r -> %r; respawning",
                         harness,
@@ -1056,6 +1076,7 @@ class HarnessProcessManager:
                     raise NoLiveHarnessError(
                         f"no live harness subprocess for conversation {conversation_id!r}"
                     )
+                await admit_cold()
                 entry = await self._spawn_entry(conversation_id, harness, env)
                 # Shutdown may have begun while we awaited readiness; discard
                 # rather than registering a process that ``shutdown``'s entry

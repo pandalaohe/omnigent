@@ -313,6 +313,7 @@ from omnigent.server.schemas import (
     SessionResourcePaginatedList,
     SessionSandboxStatusEvent,
     SessionSpeedTierEvent,
+    SessionStartupEvent,
     SessionStatusEvent,
     SessionSupersededEvent,
     SessionTerminalPendingEvent,
@@ -6823,7 +6824,7 @@ async def _launch_runner_on_host_locked(
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
-    await host_registry.admit_launch(host_conn, conv.id)
+    startup = await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
@@ -6886,6 +6887,8 @@ async def _launch_runner_on_host_locked(
                 binding_token=binding_token,
                 workspace=conv.workspace,
                 session_id=conv.id,
+                startup=startup,
+                startup_required=startup is not None,
                 # Canonical harness (see _resolve_harness) so the host runs the
                 # same configuration check it does at create-time launch. None
                 # (agent not resolvable) skips the host-side check — fail open.
@@ -10166,6 +10169,7 @@ async def _stream_live_events(
     viewer_user_id: str | None = None,
     viewer_idle: bool = False,
     presence_root_id: str | None = None,
+    startup_can_cancel: bool = False,
 ) -> AsyncIterator[str]:
     """
     Yield SSE-formatted events from the conversation's live stream.
@@ -10271,6 +10275,17 @@ async def _stream_live_events(
                         f"session stream event missing string ``type`` field: {event!r}",
                     )
                 validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+                if isinstance(validated, SessionStartupEvent) and validated.startup is not None:
+                    validated = validated.model_copy(
+                        update={
+                            "startup": validated.startup.model_copy(
+                                update={
+                                    "can_cancel": startup_can_cancel
+                                    and validated.startup.can_cancel
+                                }
+                            )
+                        }
+                    )
                 yield _format_sse(event_type, validated.model_dump())
     except session_stream.SubscriberOverflowError:
         _logger.warning(
@@ -11604,6 +11619,24 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.server.startup_registration import (
+        STARTUP_CREATE_PREPARATION_LABEL_KEY,
+        STARTUP_REGISTRATION_LABEL_KEY,
+    )
+
+    reserved_startup_key = next(
+        (
+            key
+            for key in (STARTUP_REGISTRATION_LABEL_KEY, STARTUP_CREATE_PREPARATION_LABEL_KEY)
+            if key in labels
+        ),
+        None,
+    )
+    if reserved_startup_key is not None:
+        raise OmnigentError(
+            f"label {reserved_startup_key!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     from omnigent.server.permission_tiers import is_permission_label_key
 
     permission_key = next((key for key in labels if is_permission_label_key(key)), None)

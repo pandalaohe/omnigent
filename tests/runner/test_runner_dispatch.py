@@ -9200,6 +9200,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
                     "project_id": "project",
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"id": "conv_child", "labels": {}})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_bodies.append(json.loads(request.content))
             return httpx.Response(200, json={})
@@ -15774,6 +15776,70 @@ async def test_sys_session_create_stamp_failure_fails_closed() -> None:
     }
     assert entry is None, "a failed stamp must not register the dispatch"
     assert ops == ["create", "patch"], "a failed stamp must not post the first message"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registration_status", [200, 503])
+async def test_sys_session_create_waits_for_child_registration(registration_status: int) -> None:
+    """The parent registers the work entry before releasing a child startup."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.server.startup_registration import (
+        STARTUP_REGISTRATION_LABEL_KEY,
+        STARTUP_REGISTRATION_PENDING,
+    )
+
+    ops: list[str] = []
+
+    async def server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
+        if request.method == "POST" and path == "/v1/sessions":
+            ops.append("create")
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_register_child",
+                    "labels": {STARTUP_REGISTRATION_LABEL_KEY: STARTUP_REGISTRATION_PENDING},
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_register_child":
+            return httpx.Response(200, json={"id": "conv_register_child"})
+        if request.method == "PATCH" and path == "/v1/sessions/conv_register_child":
+            ops.append("stamp")
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path.endswith("/startup/registered"):
+            assert runner_app.get_subagent_work("conv_register_child") is not None
+            ops.append("register")
+            return httpx.Response(registration_status, json={})
+        if request.method == "POST" and path.endswith("/events"):
+            ops.append("event")
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "message": "go"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+        finally:
+            subagent_work.unregister_subagent_work("conv_register_child")
+
+    assert ops == (
+        ["create", "stamp", "register", "event"]
+        if registration_status == 200
+        else ["create", "stamp", "register"]
+    )
+    initial = json.loads(output)["initial_message"]
+    assert initial["status"] == ("sent" if registration_status == 200 else "failed")
+    if registration_status != 200:
+        assert initial["error"] == "child_registration_failed"
 
 
 def test_subagent_wake_notice_carries_placement_label() -> None:

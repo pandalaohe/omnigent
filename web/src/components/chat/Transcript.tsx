@@ -23,7 +23,9 @@ import {
   createBubbleCache,
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
-import { useChatStore } from "@/store/chatStore";
+import { handleSessionEvent, useChatStore } from "@/store/chatStore";
+import { cancelStartup } from "@/lib/sessionsApi";
+import { SessionStartupIndicator } from "./SessionStartupIndicator";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
@@ -84,6 +86,7 @@ export interface TranscriptProps {
   agentsError: unknown;
   /** True while a managed-sandbox launch is in flight (cold-launch spinner). */
   sandboxLaunching: boolean;
+  canCancelStartup?: boolean;
   conversationId: string | null;
   scrollToBottomOnSessionOpen: boolean;
   openedConversationIdRef: { current: string | null };
@@ -126,6 +129,7 @@ function TranscriptImpl({
   showsWorking,
   agentsError,
   sandboxLaunching,
+  canCancelStartup = false,
   conversationId: selectedConversationId,
   scrollToBottomOnSessionOpen,
   openedConversationIdRef,
@@ -143,6 +147,19 @@ function TranscriptImpl({
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
   const conversationId = useChatStore((s) => s.conversationId);
+  const startup = useChatStore((s) => s.startup);
+  const startupVisible =
+    startup !== null &&
+    [
+      "queued",
+      "starting",
+      "verifying",
+      "uncertain",
+      "blocked",
+      "cancelling",
+      "ready_empty",
+      "waiting_input",
+    ].includes(startup.state);
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -332,7 +349,8 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  const showWorkingIndicator =
+    !startupVisible && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
@@ -377,7 +395,24 @@ function TranscriptImpl({
               scrollElement={scroller?.el ?? null}
               rowCount={display.streamBubbles.length}
             />
-            {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
+            {startupVisible && startup !== null && conversationId !== null && (
+              <SessionStartupIndicator
+                key={startup.id}
+                startup={startup}
+                readOnly={!canCancelStartup}
+                onCancel={async (id, attemptId) => {
+                  const status = await cancelStartup(conversationId, id, attemptId);
+                  handleSessionEvent(
+                    { type: "session_startup", conversationId, startup: status },
+                    conversationId,
+                  );
+                }}
+              />
+            )}
+            {display.bubbles.length === 0 &&
+            !startupVisible &&
+            !showWorkingIndicator &&
+            !display.mcpStartupActive ? (
               sandboxLaunching ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (

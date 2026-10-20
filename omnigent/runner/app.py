@@ -185,6 +185,7 @@ from omnigent.runner.session_runtime_lifecycle import (
     SessionRuntimeLock,
 )
 from omnigent.runner.sign_in_watch import build_sign_in_watch
+from omnigent.runner.startup_admission import StartupAdmission
 from omnigent.runner.subagent_recovery import build_subagent_recovery
 from omnigent.runner.subagent_routing import (
     PLAIN_SESSION,
@@ -253,10 +254,13 @@ from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
+    StartupClaimRequestEvent,
+    StartupProofEvent,
 )
 from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
 from omnigent.spec.skill_sources import resolve_session_skills, session_skill_roots
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.startup_protocol import StartupAttemptRef
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -882,6 +886,89 @@ def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
     if "input" in event_body:
         event_body["content"] = event_body.pop("input")
     return event_body
+
+
+async def _relay_startup_proof(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    event: object,
+    expected: StartupAttemptRef,
+    *,
+    admission: StartupAdmission | None = None,
+) -> bool:
+    """Consume a harness control frame using the runner's authenticated AP client."""
+    try:
+        proof = StartupProofEvent.model_validate(event)
+    except ValueError:
+        return False
+    observation = proof.observation
+    if observation.attempt != expected or observation.source != "codex":
+        return False
+    if admission is not None and not admission.record_observation(session_id, observation):
+        return False
+    # The store accepts runner readiness before an input has a vendor binding.
+    # This runner reports it only after a typed Codex thread/tool observation.
+    if observation.phase in ("runtime_ready", "tools_ready"):
+        observation = observation.model_copy(update={"source": "runner"})
+    for _ in range(3):
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{session_id}/startup/receipts",
+                json=observation.model_dump(),
+                timeout=5.0,
+            )
+        except httpx.TransportError:
+            continue
+        if response.status_code >= 500:
+            continue
+        if not 200 <= response.status_code < 300:
+            break
+        try:
+            result = response.json()
+        except ValueError:
+            break
+        return isinstance(result, dict) and result.get("accepted") is True
+    _logger.warning("Startup proof relay failed for session %s", session_id)
+    return False
+
+
+async def _relay_startup_claim(
+    server_client: httpx.AsyncClient,
+    harness_client: httpx.AsyncClient,
+    session_id: str,
+    event: object,
+    expected: StartupAttemptRef | None,
+) -> None:
+    """Answer a cold-boundary claim through the authenticated runner client."""
+    try:
+        claim = StartupClaimRequestEvent.model_validate(event)
+    except ValueError:
+        return
+    granted = False
+    if expected is not None and claim.attempt == expected:
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{session_id}/startup/claims",
+                json={
+                    "attempt": claim.attempt.model_dump(),
+                    "boundary": claim.boundary,
+                    "claim_id": claim.claim_id,
+                },
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            granted = response.json().get("granted") is True
+        except (httpx.HTTPError, ValueError):
+            _logger.warning("Startup claim relay failed for session %s", session_id)
+    try:
+        response = await harness_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "startup_claim_result", "claim_id": claim.claim_id, "granted": granted},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning("Startup claim reply failed for session %s", session_id)
 
 
 class _ContextWindowOverflow(Exception):
@@ -1911,6 +1998,8 @@ def create_runner_app(
     mcp_manager: RunnerMcpManager | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    root_startup_session_id: str | None = None,
+    root_startup_attempt: StartupAttemptRef | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -1950,6 +2039,25 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+    startup_admission = StartupAdmission(
+        server_client,
+        root_session_id=root_startup_session_id,
+        root_attempt=root_startup_attempt,
+    )
+    app.state.startup_admission = startup_admission
+    app.state.register_startup_attempt = startup_admission.register
+    if process_manager is not None and hasattr(process_manager, "set_startup_admitter"):
+        process_manager.set_startup_admitter(startup_admission.admit_harness)
+
+    def _register_startup_control(session_id: str, body: Mapping[str, object]) -> None:
+        raw_attempt = body.get("startup_attempt")
+        if body.get("startup_required") is not True and raw_attempt is None:
+            return
+        attempt = None
+        if raw_attempt is not None:
+            with contextlib.suppress(ValueError):
+                attempt = StartupAttemptRef.model_validate(raw_attempt)
+        startup_admission.register(session_id, attempt)
 
     from omnigent.usage_export.runtime import usage_capture_router
 
@@ -3904,6 +4012,8 @@ def create_runner_app(
                 session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
                 rebind_bridge=_rebind_claude_bridge,
+                startup_required=startup_admission.required(session_id),
+                admit_cold=startup_admission.native_admitter(session_id),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -4453,6 +4563,16 @@ def create_runner_app(
             },
         )
 
+    @app.post("/v1/sessions/{session_id}/startup/observations")
+    async def startup_observations(session_id: str, attempt: StartupAttemptRef) -> JSONResponse:
+        observations = startup_admission.observations_for(session_id, attempt)
+        if observations is None:
+            return JSONResponse(status_code=404, content={"error": "startup_attempt_not_current"})
+        return JSONResponse(
+            status_code=200,
+            content={"observations": [item.model_dump() for item in observations]},
+        )
+
     @app.post("/v1/sessions")
     async def create_session(request: Request) -> JSONResponse:
         body = await request.json()
@@ -4466,6 +4586,8 @@ def create_runner_app(
             )
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
+        if isinstance(session_id, str):
+            _register_startup_control(session_id, body)
         if not isinstance(session_id, str) or not isinstance(agent_id, str):
             return await _initialize_session(body)
         sub_agent_name = body.get("sub_agent_name")
@@ -4702,6 +4824,7 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        startup_admission.forget(session_id)
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _unknown_sdk_peers(session_id, "runner_session_deleted")
@@ -7716,6 +7839,12 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        if startup_admission.required(conv):
+            harness_body["startup_required"] = True
+        if harness_name == "codex" and isinstance(msg_body.get("startup_attempt"), dict):
+            with contextlib.suppress(ValueError):
+                startup_ref = StartupAttemptRef.model_validate(msg_body["startup_attempt"])
+                harness_body["startup_attempt"] = startup_ref.model_dump()
         if isinstance(msg_body.get("peer_delivery"), dict):
             harness_body["peer_delivery"] = msg_body["peer_delivery"]
             if msg_body.get("peer_delivery_start") is True:
@@ -8215,6 +8344,8 @@ def create_runner_app(
                         peer_messaging_enabled=_session_peer_messaging_enabled.get(conv_id, False),
                         session_open_enabled=_session_open_enabled.get(conv_id, False),
                         global_instructions=_session_global_instructions.get(conv_id),
+                        startup_required=startup_admission.required(conv_id),
+                        admit_cold=startup_admission.native_admitter(conv_id),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -8371,6 +8502,10 @@ def create_runner_app(
             )
 
             turn_input_stable_id = _input_stable_id(body)
+            startup_ref = None
+            if harness_name == "codex" and isinstance(body.get("startup_attempt"), dict):
+                with contextlib.suppress(ValueError):
+                    startup_ref = StartupAttemptRef.model_validate(body["startup_attempt"])
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
@@ -8471,6 +8606,8 @@ def create_runner_app(
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
             event_body = _wrap_as_message_event(_instr_body)
+            if startup_admission.required(conv_id):
+                event_body["startup_required"] = True
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _dispatch_tasks: list[_asyncio.Task[object]] = []
             _dispatch_cancelled = (
@@ -8595,6 +8732,25 @@ def create_runner_app(
                                     )
 
                                 _evt_type = event.get("type")
+                                if _evt_type == "startup.claim.requested":
+                                    await _relay_startup_claim(
+                                        server_client,
+                                        client,
+                                        conv_id,
+                                        event,
+                                        startup_ref,
+                                    )
+                                    continue
+                                if _evt_type == "startup.proof":
+                                    if startup_ref is not None:
+                                        await _relay_startup_proof(
+                                            server_client,
+                                            conv_id,
+                                            event,
+                                            startup_ref,
+                                            admission=startup_admission,
+                                        )
+                                    continue
                                 if _evt_type == SDK_PEER_STREAM_EVENT:
                                     try:
                                         receipt_input = SDKPeerInput.from_metadata(
@@ -9105,6 +9261,8 @@ def create_runner_app(
 
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
+        if isinstance(body, dict) and body_type in ("message", None):
+            _register_startup_control(conversation_id, body)
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
             "model_override=%s",
@@ -9915,6 +10073,8 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            if startup_admission.required(conversation_id):
+                startup_admission.register(conversation_id, None)
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
@@ -10985,6 +11145,7 @@ def create_runner_app(
         _session_open_enabled=_session_open_enabled,
         _session_peer_messaging_enabled=_session_peer_messaging_enabled,
         _session_worktree_value=_session_worktree_value,
+        startup_admission=startup_admission,
         auth_token_factory=auth_token_factory,
         filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,

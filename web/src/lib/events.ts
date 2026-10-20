@@ -20,6 +20,7 @@ import type {
   RememberScope,
   Response,
   SandboxLaunchStage,
+  SessionStartupStatus,
 } from "./types";
 
 /** Provider-native tool item types. */
@@ -761,6 +762,12 @@ export interface SessionSandboxStatusEvent {
   provider?: string;
 }
 
+export interface SessionStartupEvent {
+  type: "session_startup";
+  conversationId: string;
+  startup: SessionStartupStatus | null;
+}
+
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */
 export type McpServerStartupState = "starting" | "ready" | "failed" | "cancelled";
 
@@ -1080,6 +1087,7 @@ export type StreamEvent =
   | SessionTodosEvent
   | SessionTerminalPendingEvent
   | SessionSandboxStatusEvent
+  | SessionStartupEvent
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent
   | SessionInterruptedEvent

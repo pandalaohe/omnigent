@@ -23,11 +23,14 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from _thread import LockType
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from cachetools import TTLCache
 
@@ -50,6 +53,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.startup_protocol import StartupAttemptRef
 
 _logger = logging.getLogger(__name__)
 
@@ -461,6 +465,7 @@ class HostConnection:
     close_requested_code: int | None = None
     close_requested_reason: str | None = None
     account_generation: str | None = None
+    startup_generation: str = field(default_factory=lambda: uuid4().hex)
     # True when this tunnel authenticated with a valid managed-sandbox launch
     # token, i.e. a server-provisioned sandbox proving itself on connect — not a
     # user machine reusing a managed host's id under ordinary login. Read by the
@@ -571,6 +576,9 @@ class HostRegistry:
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
         self._hosts: dict[tuple[int, str], HostConnection] = {}
+        self._startup_registrations: WeakValueDictionary[tuple[int, str], LockType] = (
+            WeakValueDictionary()
+        )
         # Last gateway-inference map each host reported, keyed by canonical
         # host_id alone: the map describes the machine's local config, so the
         # same machine connected to two workspaces reports the same answer.
@@ -582,6 +590,26 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+        self.startup_admitter: (
+            Callable[[HostConnection, str], Awaitable[StartupAttemptRef]] | None
+        ) = None
+
+    @asynccontextmanager
+    async def startup_registration(self, host_id: str) -> AsyncIterator[None]:
+        """Publish the durable generation and local connection in the same order."""
+        key = (current_workspace_id(), _canonical_host_id(host_id))
+        with self._lock:
+            lock = self._startup_registrations.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._startup_registrations[key] = lock
+        # Routes may use different event loops. A cancelled waiter never owns the lock.
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        try:
+            yield
+        finally:
+            lock.release()
 
     def register(
         self,
@@ -591,6 +619,7 @@ class HostRegistry:
         owner: str | None,
         workspace_id: int | None = None,
         registered_with_managed_token: bool = False,
+        startup_generation: str | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -635,6 +664,7 @@ class HostRegistry:
             last_frame_at=now,
             last_frame_monotonic=time.monotonic(),
             registered_with_managed_token=registered_with_managed_token,
+            startup_generation=startup_generation or uuid4().hex,
         )
         with self._lock:
             key = (ws_id, host_id)
@@ -859,6 +889,24 @@ class HostRegistry:
         return list(reported) if reported is not None else None
 
     async def admit_launch(
+        self,
+        conn: HostConnection,
+        session_id: str,
+        *,
+        allow_unbound: bool = False,
+        transfer_from_host_id: str | None = None,
+    ) -> StartupAttemptRef | None:
+        await self.authorize_launch(
+            conn,
+            session_id,
+            allow_unbound=allow_unbound,
+            transfer_from_host_id=transfer_from_host_id,
+        )
+        if self.startup_admitter is not None:
+            return await self.startup_admitter(conn, session_id)
+        return None
+
+    async def authorize_launch(
         self,
         conn: HostConnection,
         session_id: str,

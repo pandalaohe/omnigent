@@ -80,6 +80,7 @@ from omnigent.sdk_peer_delivery import PeerOutcome, ReportPeerOutcome, SDKPeerIn
 from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
 from omnigent.session_default_modes import codex_service_tier, valid_speed_tier
 from omnigent.spec.types import RetryPolicy
+from omnigent.startup_evidence import CodexTurnEvidence, claim_startup_boundary
 from omnigent.util.reasoning_effort import (
     CODEX_EFFORTS,
     CODEX_NATIVE_EFFORTS,
@@ -3963,6 +3964,7 @@ class _CodexAppServerSession:
         active_turn_id: str,
         message_buffers: dict[str, str],
         final_response: str,
+        startup_evidence: CodexTurnEvidence,
     ) -> str:
         """Collect a trailing final-answer item that arrives after ``turn/completed``.
 
@@ -3989,6 +3991,10 @@ class _CodexAppServerSession:
                 # A completed turn remains successful when its process exits.
                 return final_response
             self._record_event(message)
+            method = message.get("method")
+            params = message.get("params", {})
+            if isinstance(method, str) and isinstance(params, dict):
+                startup_evidence.notification(method, params)
             if await self._answer_server_request(message, None):
                 continue
             params = message.get("params", {})
@@ -4323,6 +4329,10 @@ class _CodexAppServerSession:
             return
         active_turn_id: str = raw_active_turn_id
         self.active_turn_id = active_turn_id
+        startup_evidence = CodexTurnEvidence(self.thread_id, active_turn_id, source="codex")
+        # thread/start established the owned runtime. A configured dynamic-tool
+        # bridge is ready only after the thread and turn RPCs have both returned.
+        startup_evidence.ready(tool_bridge_installed=not tools or self._tool_executor is not None)
 
         retained_events: list[CodexMessage | HarnessTransportClosedError] = []
         retaining_current_turn = False
@@ -4475,6 +4485,8 @@ class _CodexAppServerSession:
                 raw_method = message.get("method")
                 method: str | None = raw_method if isinstance(raw_method, str) else None
                 params = message.get("params", {})
+                if method is not None and isinstance(params, dict):
+                    startup_evidence.notification(method, params)
 
                 if await self._answer_server_request(message, active_turn_id):
                     continue
@@ -4687,6 +4699,7 @@ class _CodexAppServerSession:
                             active_turn_id=active_turn_id,
                             message_buffers=message_buffers,
                             final_response=final_response,
+                            startup_evidence=startup_evidence,
                         )
                     turn_usage = self._consume_turn_usage()
                     _notify_usage_from_dict(model=model, usage=turn_usage)
@@ -5790,18 +5803,8 @@ class CodexExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
         binary_identity = _codex_binary_identity(self._codex_path)
-        if self._signer_backed and (
-            binary_identity is None or binary_identity != self._brokered_version_identity
-        ):
-            # This probe must precede app-session construction: the latter
-            # creates and preflights the signer before launching the worker.
-            await _require_brokered_codex_version(self._codex_path)
-            validated_identity = _codex_binary_identity(self._codex_path)
-            if binary_identity is not None and validated_identity != binary_identity:
-                raise RuntimeError("Codex executable changed during brokered version validation")
-            self._brokered_version_identity = validated_identity
         session_key = _session_key(messages)
-        state = self._session_states.setdefault(session_key, _CodexSessionState())
+        state = self._session_states.get(session_key) or _CodexSessionState()
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
         # On the cli-config path (model_provider_override set) the codex binary
@@ -5833,6 +5836,26 @@ class CodexExecutor(Executor):
             effective_cwd,
             _tool_signature(tools),
         )
+        app_session = state.app_session
+        if (
+            state.signature != signature
+            or app_session is None
+            or not getattr(app_session, "_started", False)
+            or state.closing
+            or getattr(app_session, "_closing", False)
+            or getattr(app_session, "_transport_error", None) is not None
+        ):
+            await claim_startup_boundary("executor_prepare")
+        if self._signer_backed and (
+            binary_identity is None or binary_identity != self._brokered_version_identity
+        ):
+            # This probe precedes app-session construction and any signer or worker start.
+            await _require_brokered_codex_version(self._codex_path)
+            validated_identity = _codex_binary_identity(self._codex_path)
+            if binary_identity is not None and validated_identity != binary_identity:
+                raise RuntimeError("Codex executable changed during brokered version validation")
+            self._brokered_version_identity = validated_identity
+        state = self._session_states.setdefault(session_key, state)
         try:
             reasoning_effort = validate_effort(
                 cfg.extra.get("reasoning_effort"), "codex", CODEX_NATIVE_EFFORTS

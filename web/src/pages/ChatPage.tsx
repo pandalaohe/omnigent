@@ -1912,6 +1912,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               showsWorking={showsWorking}
               agentsError={agentsError}
               sandboxLaunching={sandboxLaunching}
+              canCancelStartup={isOwnerLevel(permissionLevel)}
               conversationId={conversationId}
               scrollToBottomOnSessionOpen={scrollToBottomOnSessionOpen}
               openedConversationIdRef={autoScrolledConversationIdRef}

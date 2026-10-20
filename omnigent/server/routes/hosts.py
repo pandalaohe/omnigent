@@ -21,6 +21,7 @@ import contextlib
 import logging
 import secrets
 import weakref
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -96,6 +97,7 @@ from omnigent.stores.host_store import (
     host_is_live,
 )
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.session_startup_store import StartupSnapshot
 
 _logger = logging.getLogger(__name__)
 
@@ -839,6 +841,8 @@ def create_hosts_router(
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
     cli_retention_coordinator: Any = None,
+    register_startup_prepare: Callable[[Callable[[Any, StartupSnapshot], Awaitable[None]]], None]
+    | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -1379,6 +1383,11 @@ def create_hosts_router(
         # a runner on another user's host. 401 instead.
         user_id = require_user(request, auth_provider)
 
+        return await _execute_host_launch(request, host_id, body, user_id)
+
+    async def _execute_host_launch(
+        request: Request, host_id: str, body: LaunchRunnerRequest, user_id: str | None
+    ) -> dict[str, Any]:
         # Authorize against BOTH the host and the session before
         # spawning anything (see _host_launch for the threat model).
         target = await asyncio.to_thread(
@@ -1392,6 +1401,41 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        admission = getattr(request.app.state, "startup_admission", None)
+        if admission is not None and not admission.dispatching(body.session_id):
+            startup = await admission.queue_preparation(
+                conn,
+                body.session_id,
+                {
+                    **body.model_dump(mode="json"),
+                    "user_id": user_id,
+                    "account_generation": conn.account_generation,
+                    "previous_host_id": target.conv.host_id,
+                    "previous_runner_id": target.conv.runner_id,
+                },
+            )
+            request.app.state.startup_inputs.host_changed(request.app, host_id)
+            return {"runner_id": None, "status": "queued", "startup_id": startup.id}
+        permission = (
+            await host_registry.admit_launch(
+                conn,
+                body.session_id,
+                allow_unbound=True,
+                transfer_from_host_id=target.conv.host_id,
+            )
+            if admission is not None
+            else None
+        )
+        if permission is not None and not await asyncio.to_thread(
+            request.app.state.startup_store.claim_boundary,
+            permission.startup_id,
+            permission.attempt_id,
+            runtime_id=permission.runtime_id,
+            host_generation=permission.host_generation,
+            boundary="workspace_prepare",
+            claim_id=secrets.token_hex(16),
+        ):
+            raise OmnigentError("Startup preparation permission expired", code=ErrorCode.CONFLICT)
         if agent_store is not None and agent_cache is not None:
             from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
 
@@ -1703,7 +1747,7 @@ def create_hosts_router(
             )
 
             try:
-                await host_registry.admit_launch(
+                startup = await host_registry.admit_launch(
                     conn,
                     body.session_id,
                     allow_unbound=True,
@@ -1831,6 +1875,8 @@ def create_hosts_router(
                 binding_token=binding_token,
                 workspace=workspace,
                 session_id=body.session_id,
+                startup=startup,
+                startup_required=startup is not None,
                 harness=harness,
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
@@ -1903,6 +1949,41 @@ def create_hosts_router(
             "runner_id": runner_id,
             "status": "launching",
         }
+
+    async def _dispatch_startup_preparation(app: Any, startup: StartupSnapshot) -> None:
+        preparation = startup.preparation
+        assert preparation is not None
+        conn = host_registry.get(startup.host_id)
+        if (
+            conn is None
+            or conn.account_generation != preparation["account_generation"]
+            or (conn.owner or "__local__") != startup.owner_user_id
+        ):
+            raise OmnigentError("Startup owner changed", code=ErrorCode.CONFLICT)
+        from omnigent.db.account_authority import bind_account_authority, clear_account_authority
+
+        clear_account_authority()
+        if preparation["user_id"] is not None and preparation["account_generation"] is not None:
+            bind_account_authority(preparation["user_id"], preparation["account_generation"])
+        request = Request({"type": "http", "app": app, "headers": []})
+        try:
+            await _execute_host_launch(
+                request,
+                startup.host_id,
+                LaunchRunnerRequest.model_validate(
+                    {name: preparation[name] for name in ("session_id", "workspace", "git")}
+                ),
+                preparation["user_id"],
+            )
+        except HTTPException as exc:
+            if exc.status_code in (400, 403, 404, 412, 426) and startup.attempt_id is not None:
+                await asyncio.to_thread(
+                    app.state.startup_store.reject_preparation, startup.id, startup.attempt_id
+                )
+            raise
+
+    if register_startup_prepare is not None:
+        register_startup_prepare(_dispatch_startup_preparation)
 
     @router.get("/hosts/{host_id}/filesystem")
     async def list_host_filesystem_root(

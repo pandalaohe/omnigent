@@ -657,6 +657,7 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
         or event.tools
         # A child-history recovery item keeps its per-entry replay-cursor checks.
         or "recovery_after" in event.data
+        or any(key in event.data for key in ("startup_attempt", "startup_required"))
         or any(
             key in event.data
             for key in ("peer_message_id", "peer_delivery", "peer_delivery_start")
@@ -1768,6 +1769,8 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
         nested_item = body.data.get("item_data")
+        if any(key in body.data for key in ("startup_attempt", "startup_required")):
+            raise OmnigentError("Startup metadata is server-owned", code=ErrorCode.FORBIDDEN)
         if not trusted_peer and (
             any(
                 key in body.data
@@ -4674,6 +4677,7 @@ def register_events_routes(
                 # the CHILD conversation's stream, and per-conversation
                 # scoping would hide co-viewers on other agents.
                 presence_root_id=conv.root_conversation_id,
+                startup_can_cancel=access.level is None or access.level >= LEVEL_OWNER,
             ),
             media_type="text/event-stream",
             headers={

@@ -1645,11 +1645,13 @@ def create_app(
         load_branding_snapshot,
         load_server_config,
         session_title_instructions,
+        startup_admission_policy,
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
+    startup_policy = startup_admission_policy(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     resolved_extension_state = _resolve_extension_state(extension_state)
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
@@ -1743,6 +1745,15 @@ def create_app(
     agent_quota_service = AgentQuotaService(
         conversation_store, permission_store, user_preferences_store, host_registry, host_store
     )
+    from omnigent.entities import Conversation
+    from omnigent.server.startup_admission import active_startup_attempt
+    from omnigent.startup_protocol import StartupAttemptRef
+
+    async def _startup_recovery_attempt(conversation: Conversation) -> StartupAttemptRef | None:
+        if startup_admission is None:
+            return None
+        return await startup_admission.initialization_attempt(conversation)
+
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
@@ -1755,6 +1766,11 @@ def create_app(
             permission_store=permission_store,
             prefs_store=user_preferences_store,
         ),
+        startup_control_resolver=lambda conversation: (
+            startup_policy is not None,
+            active_startup_attempt(conversation.id) if startup_policy is not None else None,
+        ),
+        startup_recovery_resolver=_startup_recovery_attempt,
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
@@ -2175,6 +2191,8 @@ def create_app(
 
             await cancel_managed_launch_tasks()
             await cancel_detached_elicitation_tasks()
+            if startup_admission is not None:
+                await startup_admission.shutdown()
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
@@ -2222,14 +2240,33 @@ def create_app(
     app.state.host_registry = host_registry
     from omnigent.server.startup_inputs import ManagedStartupInputs
 
-    # Only managed creates accept a durable first input, and only managed hosts
-    # need their startup recovered on the replica holding the tunnel.
     startup_inputs = (
         ManagedStartupInputs(conversation_store, host_registry)
-        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        if startup_policy is not None
+        or (sandbox_config is not None and sandbox_config.managed_launch_supported)
         else None
     )
     app.state.startup_inputs = startup_inputs
+    from omnigent.stores.session_startup_store import SessionStartupStore
+
+    app.state.startup_policy = startup_policy
+    app.state.startup_store = (
+        SessionStartupStore(conversation_store.storage_location)
+        if startup_policy is not None
+        else None
+    )
+    from omnigent.server.startup_admission import StartupAdmission
+
+    startup_admission = (
+        StartupAdmission(
+            app.state.startup_store, conversation_store, host_registry, startup_policy
+        )
+        if startup_policy is not None
+        else None
+    )
+    app.state.startup_admission = startup_admission
+    if startup_admission is not None:
+        startup_admission.bind(app)
     app.state.host_store = host_store
     app.state.project_host_binding_store = project_host_binding_store
     app.state.project_repository_store = project_repository_store
@@ -5008,6 +5045,7 @@ def create_app(
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
                 conversation_store=conversation_store,
+                startup_store=app.state.startup_store,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -5023,6 +5061,11 @@ def create_app(
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
                 cli_retention_coordinator=cli_retention_coordinator,
+                register_startup_prepare=(
+                    lambda dispatch: setattr(startup_admission, "prepare_dispatch", dispatch)
+                )
+                if startup_admission is not None
+                else None,
             ),
             prefix="/v1",
             tags=["hosts"],
