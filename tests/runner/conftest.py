@@ -24,7 +24,7 @@ from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
 from omnigent.terminals import TerminalRegistry
 from tests.conftest import _TEST_OMNIGENT_DATA_DIR
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, permission_session_init_payload
 
 # The real store-backed catalog resolver, captured before the autouse fixture
 # below stubs it: a test that exercises the catalog path re-patches the module
@@ -84,6 +84,15 @@ _SUITE_ENV_PINS = {
     "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
     "OMNIGENT_LOCAL_SINGLE_USER": "1",
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolated_permission_bridge_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep real permission-state writes inside this test's bridge directories."""
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT", tmp_path / "agy-bridge"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -381,6 +390,8 @@ class _ScriptedHarnessClient:
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
         """PATCH the result back to the harness — record body and return 200."""
+        if url == "/v1/permission-tier/bootstrap":
+            return httpx.Response(200, json={"installed": True})
         del url, timeout
         self.patched_events.append(json)
 
@@ -692,11 +703,92 @@ def _build_app_with_mcp_tool(
 
 
 @contextlib.asynccontextmanager
-async def _runner_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    """ASGI test client for the runner app."""
+async def _runner_client(
+    app: FastAPI,
+    *,
+    permission_harness: str | None = None,
+    permission_snapshot: dict[str, Any] | None = None,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Drive runner routes, optionally emulating a current server and fake vendor startup.
+
+    The opt-in supplies trusted initialization and mocks only vendor installation proof.
+    Permission fencing, runtime state installation, leases and control transactions stay real.
+    Raw clients still exercise missing or malformed initialization unchanged.
+    """
+    from unittest.mock import patch
+
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.runner.permission_tiers import PermissionTierRuntime
+    from omnigent.server.permission_tiers import TIER_HARNESSES
+
+    harness = canonicalize_harness(permission_harness)
+
+    confirmed: dict[str, dict[str, Any]] = {}
+    original_get = NullServerClient.get
+
+    async def server_get(self: NullServerClient, url: str, **kwargs: Any) -> Any:
+        response = await original_get(self, url, **kwargs)
+        snapshot = confirmed.get(url.split("?", 1)[0])
+        if snapshot is not None:
+            return httpx.Response(200, json={**response.json(), **snapshot})
+        return response
+
+    class _CurrentServerClient(httpx.AsyncClient):
+        async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+            body = kwargs.get("json")
+            initialize = (
+                url == "/v1/sessions" and isinstance(body, dict) and "session_init" not in body
+            )
+            if initialize:
+                body = permission_session_init_payload(
+                    body, harness=harness, snapshot=permission_snapshot
+                )
+                kwargs["json"] = body
+            response = await super().post(url, **kwargs)
+            if initialize and response.status_code == 201:
+                # The real server publishes readiness only after this startup ACK.
+                from omnigent.server.permission_tiers import (
+                    PERMISSION_CAPABILITY_LABEL_KEY,
+                    PERMISSION_CAPABILITY_VALUE,
+                    PERMISSION_RUNTIME_ID_LABEL_KEY,
+                    ConfirmedPermissionState,
+                )
+
+                state = app.state.permission_tiers.state(body["session_id"])
+                assert state is not None
+                snapshot = dict(body["session_init"]["snapshot"])
+                snapshot["labels"] = {
+                    **snapshot["labels"],
+                    **ConfirmedPermissionState(state.tier, state.revision, "ready").labels(
+                        harness
+                    ),
+                    PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+                    PERMISSION_RUNTIME_ID_LABEL_KEY: response.json()["permission_tier_runtime_id"],
+                }
+                snapshot.update(
+                    {
+                        "permission_tier_state": "ready",
+                        "permission_tier_revision": response.json()["permission_tier_revision"],
+                        "permission_tiers_capability": True,
+                    }
+                )
+                confirmed[f"/v1/sessions/{body['session_id']}"] = snapshot
+            return response
+
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
-        yield client
+    with contextlib.ExitStack() as stack:
+        if harness in TIER_HARNESSES:
+            stack.enter_context(patch.object(NullServerClient, "get", server_get))
+            stack.enter_context(patch.object(PermissionTierRuntime, "_verify_installation"))
+            stack.enter_context(
+                patch(
+                    "omnigent.harnesses.pi_native.bridge.verify_pi_permission_installation",
+                    return_value=True,
+                )
+            )
+        client_type = _CurrentServerClient if harness in TIER_HARNESSES else httpx.AsyncClient
+        async with client_type(transport=transport, base_url="http://runner") as client:
+            yield client
 
 
 class _FakeFileServerClient:

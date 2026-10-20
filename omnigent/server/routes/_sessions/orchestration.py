@@ -13299,6 +13299,9 @@ async def _create_session_from_existing_agent(
 
     _strip_succession_operation_labels(body.labels)
     _reject_reserved_cost_control_label_seed(body.labels)
+    from omnigent.server.permission_tiers import strip_creation_permission_labels
+
+    strip_creation_permission_labels(body.labels)
     _reject_server_reserved_label_seed(body.labels)
 
     agent = await validate_session_agent(
@@ -13720,12 +13723,21 @@ async def _create_session_from_existing_agent(
         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
     )
 
-    selected_harness = (
-        harness_override or _spec_harness(selection_spec)
-        if selection_spec is not None
-        else await asyncio.to_thread(
-            _create_resolved_harness, agent, harness_override, agent_cache
+    sub_spec = (
+        await asyncio.to_thread(
+            _resolve_subagent_spec,
+            agent=agent,
+            sub_agent_name=body.sub_agent_name,
+            agent_cache=agent_cache,
         )
+        if body.sub_agent_name
+        else None
+    )
+    selected_harness = (
+        harness_override
+        or (_spec_harness(sub_spec) if sub_spec is not None else None)
+        or (_spec_harness(selection_spec) if selection_spec is not None else None)
+        or await asyncio.to_thread(_create_resolved_harness, agent, harness_override, agent_cache)
     )
     from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
 
@@ -13958,14 +13970,7 @@ async def _create_session_from_existing_agent(
     # mirrors the multipart create + PATCH paths. When the body carries no
     # args, the agent's own trusted spec seeds them below — explicit
     # opt-ins only, never the headless worker default bypass.
-    sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
-        sub_spec = await asyncio.to_thread(
-            _resolve_subagent_spec,
-            agent=agent,
-            sub_agent_name=body.sub_agent_name,
-            agent_cache=agent_cache,
-        )
         try:
             validated_launch_args = (
                 _derive_terminal_launch_args_from_spec(sub_spec) if sub_spec is not None else None
@@ -14140,13 +14145,7 @@ async def _create_session_from_existing_agent(
     if sdk_permission_labels:
         initial_labels.update(sdk_permission_labels)
 
-    create_harness = (
-        sub_spec.executor.harness_kind
-        if sub_spec is not None
-        else await asyncio.to_thread(
-            _create_resolved_harness, agent, harness_override, agent_cache
-        )
-    )
+    create_harness = selected_harness
     require_permission_protocol(request, harness=create_harness)
     if body.permission_tier is not None and create_harness not in TIER_HARNESSES:
         raise OmnigentError(
@@ -14163,17 +14162,22 @@ async def _create_session_from_existing_agent(
 
         inherited_tier = None
         if parent_conv is not None:
-            try:
-                inherited_tier = legacy_permission_tier(
-                    harness=create_harness,
-                    labels=parent_conv.labels or {},
-                    launch_args=parent_conv.terminal_launch_args or [],
-                )
-            except ValueError as exc:
-                raise OmnigentError(
-                    f"Parent permission tier requires recovery: {exc}",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
+            parent_harness = await asyncio.to_thread(
+                _resolve_harness, parent_conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            if parent_harness in TIER_HARNESSES:
+                assert parent_harness is not None
+                try:
+                    inherited_tier = legacy_permission_tier(
+                        harness=parent_harness,
+                        labels=parent_conv.labels or {},
+                        launch_args=parent_conv.terminal_launch_args or [],
+                    )
+                except ValueError as exc:
+                    raise OmnigentError(
+                        f"Parent permission tier requires recovery: {exc}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
         tier = creation_permission_tier(
             harness=create_harness,
             explicit=body.permission_tier,

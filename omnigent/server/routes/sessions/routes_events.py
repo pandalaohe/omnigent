@@ -1373,8 +1373,11 @@ def register_events_routes(
             if protocol_conv is not None:
                 require_permission_protocol(
                     request,
-                    harness=_resolve_harness(
-                        protocol_conv, agent_store=agent_store, agent_cache=agent_cache
+                    harness=await asyncio.to_thread(
+                        _resolve_harness,
+                        protocol_conv,
+                        agent_store=agent_store,
+                        agent_cache=agent_cache,
                     ),
                 )
         with contextlib.ExitStack() as in_flight:
@@ -4555,7 +4558,9 @@ def register_events_routes(
 
         require_permission_protocol(
             request,
-            harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache),
+            harness=await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            ),
             allow_query=True,
         )
         runner_client = await _get_runner_client(

@@ -107,7 +107,11 @@ def open_daemon_client(
 
     from omnigent.cli_auth import databricks_request_headers
 
-    pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
+    pinned = {
+        **headers,
+        **databricks_request_headers(base_url, host_id=host_id),
+        "X-Omnigent-Permission-Tiers": "1",
+    }
     # A proxy cannot reach a loopback server, so local targets bypass it.
     return httpx.AsyncClient(
         base_url=base_url,

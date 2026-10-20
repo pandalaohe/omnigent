@@ -1948,6 +1948,9 @@ def register_core_routes(
         )
         _strip_succession_operation_labels(parsed_metadata.labels)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+        from omnigent.server.permission_tiers import strip_creation_permission_labels
+
+        strip_creation_permission_labels(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
@@ -2556,8 +2559,11 @@ def register_core_routes(
         if protocol_conv is not None:
             require_permission_protocol(
                 request,
-                harness=_resolve_harness(
-                    protocol_conv, agent_store=agent_store, agent_cache=agent_cache
+                harness=await asyncio.to_thread(
+                    _resolve_harness,
+                    protocol_conv,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
                 ),
             )
         snapshot = await _get_session_snapshot(
@@ -2566,7 +2572,7 @@ def register_core_routes(
             access.level,
             agent_store,
             agent_cache,
-            conversation=access.conversation,
+            conversation=protocol_conv,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
             include_live_status=include_live_status,
@@ -2638,7 +2644,9 @@ def register_core_routes(
 
         require_permission_protocol(
             request,
-            harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache),
+            harness=await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            ),
         )
         return SessionLabelsResponse(
             id=conv.id,
@@ -4155,8 +4163,11 @@ def register_core_routes(
             conversation_store.get_conversation, session_id
         )
         if conv_for_protocol is not None:
-            effective_harness = _resolve_harness(
-                conv_for_protocol, agent_store=agent_store, agent_cache=agent_cache
+            effective_harness = await asyncio.to_thread(
+                _resolve_harness,
+                conv_for_protocol,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
             )
             require_permission_protocol(
                 request,
@@ -4185,7 +4196,10 @@ def register_core_routes(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 target = body.permission_mode
-                if target not in NON_FULL_TIERS:
+                if (
+                    target not in NON_FULL_TIERS
+                    or conv_for_protocol.labels.get(tier_label_key(effective_harness)) == "full"
+                ):
                     raise OmnigentError(
                         "Full permission is create-only",
                         code=ErrorCode.INVALID_INPUT,

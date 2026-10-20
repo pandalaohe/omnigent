@@ -384,7 +384,7 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
 
     conv_id = "conv_native_in_flight"
     app = await _native_app_with_session(conv_id)
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, status)
@@ -407,7 +407,7 @@ async def test_native_failed_status_releases_idle_pin() -> None:
 
     conv_id = "conv_native_failed"
     app = await _native_app_with_session(conv_id)
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
@@ -428,7 +428,7 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
     conv_id = "conv_native_follow_up"
     app = await _native_app_with_session(conv_id)
     publish_pane_status = app.state.session_resource_registry._session_status_publisher
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
         publish_pane_status(conv_id, "running", None)
@@ -448,7 +448,7 @@ async def test_required_native_terminal_exit_releases_idle_pin() -> None:
     conv_id = "conv_native_exit"
     app = await _native_app_with_session(conv_id)
     registry = app.state.session_resource_registry
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
@@ -473,7 +473,7 @@ async def test_deleted_native_session_late_status_does_not_pin() -> None:
 
     conv_id = "conv_native_deleted"
     app = await _native_app_with_session(conv_id)
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")

@@ -45,6 +45,7 @@ from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 # ── _is_url ──────────────────────────────────────────
 
@@ -2789,7 +2790,8 @@ def test_remote_headers_prefers_explicit_remote_token_env(monkeypatch: pytest.Mo
     )
 
     assert _remote_headers(server_url="https://srv.example.com", host_id=None) == {
-        "Authorization": "Bearer env-token"
+        **PERMISSION_TIERS_HEADERS,
+        "Authorization": "Bearer env-token",
     }
 
 
@@ -2819,7 +2821,7 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
 
     # The ambient token reached the Authorization header.
-    assert headers == {"Authorization": "Bearer ambient-token"}
+    assert headers == {**PERMISSION_TIERS_HEADERS, "Authorization": "Bearer ambient-token"}
     # Ambient resolution: exactly one lookup, with no profile threaded
     # (None) — a non-None value here means profile plumbing came back.
     assert read_calls == [None]
@@ -2845,6 +2847,7 @@ def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
     assert headers == {
+        **PERMISSION_TIERS_HEADERS,
         "Authorization": "Bearer rec-tok",
         "X-Databricks-Org-Id": "2850744067564480",
     }
@@ -2867,7 +2870,7 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
         server_url="https://single.databricks.com/api/2.0/omnigent", host_id=None
     )
 
-    assert headers == {"Authorization": "Bearer rec-tok"}
+    assert headers == {**PERMISSION_TIERS_HEADERS, "Authorization": "Bearer rec-tok"}
     assert "X-Databricks-Org-Id" not in headers
 
 

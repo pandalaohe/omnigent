@@ -8,6 +8,12 @@ from typing import Any
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.permission_tiers import PermissionTier
+from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_PROTOCOL_VERSION,
+    RunnerSessionInitEnvelope,
+    RunnerSessionInitSnapshot,
+)
+from omnigent.server.permission_tiers import ConfirmedPermissionState, tier_label_key
 
 
 def seed_pi_permission_state(workspace: Path, session_id: str, tier: PermissionTier) -> None:
@@ -19,6 +25,38 @@ def seed_pi_permission_state(workspace: Path, session_id: str, tier: PermissionT
         prepare_bridge_dir(session_id) / "permission_state.json",
         HostPermissionState(session_id, "test-host", str(workspace), tier, 1, "blocked"),
     )
+
+
+def permission_session_init_payload(
+    body: dict[str, Any], *, harness: str, snapshot: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build the current server's trusted init for a fake affected harness."""
+    from omnigent.permission_tiers import normalize_permission_tier
+
+    values = dict(snapshot or {})
+    labels = dict(values.pop("labels", {}))
+    tier = normalize_permission_tier(
+        labels.get(tier_label_key(harness), "auto"), harness=harness, legacy=True
+    )
+    labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=body["session_id"],
+        agent_id=body["agent_id"],
+        sub_agent_name=body.get("sub_agent_name"),
+        snapshot=RunnerSessionInitSnapshot(
+            **{
+                "created_at": 1,
+                "updated_at": 1,
+                "host_id": "test-host",
+                "workspace": "/opt/work/project",
+                **values,
+                "labels": labels,
+            }
+        ),
+    )
+    return {**body, "session_init": envelope.model_dump()}
 
 
 class NullServerClient:

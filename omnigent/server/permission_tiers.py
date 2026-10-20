@@ -43,6 +43,13 @@ def is_permission_label_key(key: str) -> bool:
     return any(_may_collate_to(key, owned, prefix=False) for owned in PERMISSION_LABEL_KEYS)
 
 
+def strip_creation_permission_labels(labels: dict[str, str]) -> None:
+    """Discard copied authority; only permission_tier selects a new session's tier."""
+    for key in list(labels):
+        if is_permission_label_key(key):
+            del labels[key]
+
+
 def tier_label_key(harness: str) -> str:
     if harness == "antigravity-native":
         return AGY_PERMISSION_TIER_LABEL_KEY

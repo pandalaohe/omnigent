@@ -2707,7 +2707,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness=harness) as client:
         # POST /v1/sessions seeds _session_spec_cache so the turn path can
         # resolve the harness and decide whether to suppress turn status.
         create_resp = await client.post(

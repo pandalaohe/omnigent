@@ -31,7 +31,7 @@ from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStor
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
-from tests.server.helpers import build_agent_bundle, create_test_agent
+from tests.server.helpers import PERMISSION_TIERS_HEADERS, build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -153,7 +153,9 @@ async def env(
     app.state.inference_catalog = catalog
     launch = AsyncMock()
     monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=PERMISSION_TIERS_HEADERS
+    ) as client:
         yield _Env(app, client, store, catalog, launch, artifact_dir)
 
 

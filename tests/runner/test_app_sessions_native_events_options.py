@@ -1088,7 +1088,7 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
 
     app, _ = await _build_app_for_spec(pi_native_spec)
 
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         # Seeds _session_spec_cache so the dispatch detects "pi-native".
         create_resp = await client.post(
             "/v1/sessions",
@@ -1165,7 +1165,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
 
     app, _ = await _build_app_for_spec(pi_native_spec)
 
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         create_resp = await client.post(
             "/v1/sessions",
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
