@@ -113,17 +113,27 @@ async def _wait_for_bridge_state(
     max_wait_seconds: float,
     startup_timeout_observed: bool,
 ) -> tuple[CodexNativeBridgeState | None, float, float, bool]:
-    """Poll startup files quickly at first, then back off to a modest cadence."""
+    """Poll until ready; a live pending startup is not a delivery failure."""
     state = read_bridge_state(bridge_dir)
-    while state is None and waited_seconds < max_wait_seconds:
-        if read_bridge_startup_error(bridge_dir) is not None:
+    pending_observed = False
+    while state is None:
+        failure = read_bridge_startup_failure(bridge_dir)
+        if failure is not None:
+            if failure.code != "agent_startup_pending":
+                break
+            pending_observed = True
+        if not pending_observed and waited_seconds >= max_wait_seconds:
             break
         poll_interval = (
             _BRIDGE_STATE_FAST_POLL_SECONDS
             if waited_seconds < _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS
             else _BRIDGE_STATE_SLOW_POLL_SECONDS
         )
-        sleep_seconds = min(poll_interval, max_wait_seconds - waited_seconds)
+        sleep_seconds = (
+            poll_interval
+            if pending_observed
+            else min(poll_interval, max_wait_seconds - waited_seconds)
+        )
         await asyncio.sleep(sleep_seconds)
         waited_seconds += sleep_seconds
         state = read_bridge_state(bridge_dir)
@@ -846,6 +856,13 @@ class CodexNativeExecutor(Executor):
                     startup_failure = (
                         read_bridge_startup_failure(self._bridge_dir) if startup_error else None
                     )
+                    if (
+                        startup_failure is not None
+                        and startup_failure.code == "agent_startup_pending"
+                    ):
+                        # The runner is still discovering this same live terminal.
+                        # Keep the original input outside the injection lock.
+                        continue
                     if startup_failure is not None and not startup_failure.code:
                         startup_failure = None
                     error_msg = (

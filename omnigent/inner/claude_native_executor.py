@@ -396,6 +396,7 @@ class ClaudeNativeExecutor(Executor):
                                 command=f"/model {wanted_model_arg}",
                                 auto_confirm=True,
                                 confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                                wait_for_startup=True,
                             )
                         )
                         # Track the routed id, not the alias: the next turn's
