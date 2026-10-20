@@ -28,6 +28,25 @@ DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
 _PI_AGENT_RESOURCE_DIRS: tuple[str, ...] = ("npm", "git")
 
 
+def default_pi_thinking_level(cwd: str | None, model_selection: str | None = None) -> str:
+    """Read Pi's startup default, including the project's settings override."""
+    settings = _read_settings_file(DEFAULT_PI_AGENT_DIR / "settings.json")
+    if cwd:
+        settings = _deep_merge_settings(
+            settings, _read_settings_file(Path(cwd) / ".pi" / "settings.json")
+        )
+    level = settings.get("defaultThinkingLevel", "medium")
+    model_levels = settings.get("modelThinkingLevels")
+    if isinstance(model_levels, dict) and model_selection in model_levels:
+        level = model_levels[model_selection]
+    return (
+        level
+        if isinstance(level, str)
+        and level in ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+        else "medium"
+    )
+
+
 def _read_settings_file(path: Path) -> _Settings:
     """Load a Pi ``settings.json`` file, returning ``{}`` when absent/invalid."""
     if not path.is_file():

@@ -26,6 +26,34 @@ from omnigent.onboarding.provider_config import (
 
 
 @pytest.mark.parametrize(
+    "metadata",
+    [
+        [],
+        {"": {}},
+        {"model": None},
+        {"model": {"context_window": True}},
+        {"model": {"max_output_tokens": 0}},
+        {"model": {"typo": 128000}},
+    ],
+)
+def test_invalid_per_model_metadata_is_refused(metadata) -> None:
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://models.example.test/v1",
+                    "api_key": "test-key",
+                    "model_metadata": metadata,
+                },
+            }
+        }
+    }
+    with pytest.raises(OmnigentError, match="model_metadata"):
+        load_providers(config)
+
+
+@pytest.mark.parametrize(
     "harness,expected",
     [
         ("claude-sdk", ANTHROPIC_FAMILY),

@@ -48,6 +48,22 @@ def _config(**bindings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize(
+    "selected,allowed,expected",
+    [
+        ("omnigent/kimi-k2", ["kimi-k2"], "kimi-k2"),
+        ("omnigent/moonshotai/kimi-k2", ["moonshotai/kimi-k2"], "moonshotai/kimi-k2"),
+        ("omnigent/kimi-k2", ["omnigent/kimi-k2"], "omnigent/kimi-k2"),
+        ("moonshotai/kimi-k2", ["moonshotai/kimi-k2"], "moonshotai/kimi-k2"),
+        ("omnigent/kimi-k2", None, "kimi-k2"),
+    ],
+)
+def test_pi_binding_decodes_picker_values_before_allowlist(harness, selected, allowed, expected):
+    config = _config(**{harness: {"provider": "bifrost", "model_allowlist": allowed}})
+    assert resolve_bound_model(config, harness, selected) == expected
+
+
 def test_native_and_sdk_bindings_do_not_share_provider_defaults() -> None:
     config = _config(
         **{

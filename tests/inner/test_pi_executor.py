@@ -5504,6 +5504,7 @@ def test_midsession_effort_change_sets_thinking_level_before_prompt() -> None:
     executor, rpc = _live_session_executor(
         [
             _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
+            json.dumps({"type": "response", "command": "set_thinking_level", "success": True}),
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
         ],
@@ -5538,6 +5539,7 @@ def test_unsupported_thinking_level_clamps_with_warning(caplog) -> None:
     executor, rpc = _live_session_executor(
         [
             _levels_response(["off", "low", "high"]),
+            json.dumps({"type": "response", "command": "set_thinking_level", "success": True}),
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
         ],
@@ -5568,15 +5570,26 @@ def test_unsupported_thinking_level_clamps_with_warning(caplog) -> None:
     assert "does not support thinking level" in caplog.text
 
 
-def test_midsession_effort_clear_leaves_level_untouched() -> None:
-    """A clear value is a no-op mid-session: no RPC, current level persists."""
+@pytest.mark.parametrize("model_level,expected", [(None, "medium"), ("low", "low")])
+def test_midsession_effort_clear_restores_default(
+    monkeypatch, tmp_path, model_level, expected
+) -> None:
+    """Clearing a prior override restores the configured startup level."""
+    settings = {"defaultThinkingLevel": "medium"}
+    if model_level is not None:
+        settings["modelThinkingLevels"] = {"databricks-completions/kimi-k2": model_level}
+    (tmp_path / "settings.json").write_text(json.dumps(settings))
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path)
     executor, rpc = _live_session_executor(
         [
+            _levels_response(["off", "low", "medium", "high"]),
+            json.dumps({"type": "response", "command": "set_thinking_level", "success": True}),
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
         ],
         applied_thinking="high",
     )
+    executor._session_states["s1"].model_selection = "databricks-completions/kimi-k2"
 
     async def _test():
         return [
@@ -5591,8 +5604,98 @@ def test_midsession_effort_clear_leaves_level_untouched() -> None:
 
     _run(_test())
 
-    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt"]
-    assert executor._session_states["s1"].applied_thinking == "high"
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == [
+        "get_available_thinking_levels",
+        "set_thinking_level",
+        "prompt",
+    ]
+    assert _sent_commands(rpc)[1]["level"] == expected
+    assert executor._session_states["s1"].applied_thinking is None
+
+
+def test_manual_compact_uses_rpc_and_emits_summary() -> None:
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    executor, rpc = _live_session_executor(
+        [
+            json.dumps(
+                {
+                    "type": "response",
+                    "command": "compact",
+                    "success": True,
+                    "data": {"summary": "Retained decisions", "estimatedTokensAfter": 32000},
+                }
+            ),
+        ]
+    )
+    executor._session_states["s1"]._has_sent_prompt = True
+
+    async def compact():
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "/compact", "session_id": "s1"}], [], "system"
+            )
+        ]
+
+    events = _run(compact())
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["compact"]
+    assert isinstance(events[0], CompactionStarted)
+    assert isinstance(events[1], CompactionComplete)
+    assert (events[1].summary, events[1].token_count) == ("Retained decisions", 32000)
+    assert isinstance(events[2], TurnComplete)
+
+
+def test_rpc_model_metadata_overrides_catalog_limits() -> None:
+    config = _build_models_json(
+        "https://workspace.example.test",
+        "test-key",
+        catalog_models=[
+            ModelEntry(
+                id="kimi-k2", family="other", metadata=ModelMetadata(context_window=128000)
+            ),
+            ModelEntry(id="deepseek-v4", family="other"),
+        ],
+        model_metadata={
+            "kimi-k2": {"context_window": 256000, "max_output_tokens": 32000},
+            "deepseek-v4": {"context_window": 550000, "max_output_tokens": 64000},
+        },
+    )
+    entries = {
+        entry["id"]: entry
+        for provider in config["providers"].values()
+        for entry in provider["models"]
+    }
+    assert (entries["kimi-k2"]["contextWindow"], entries["kimi-k2"]["maxTokens"]) == (
+        256000,
+        32000,
+    )
+    assert (entries["deepseek-v4"]["contextWindow"], entries["deepseek-v4"]["maxTokens"]) == (
+        550000,
+        64000,
+    )
+
+
+@pytest.mark.parametrize(
+    "selection,expected",
+    [
+        ("omnigent/deepseek-v4", "deepseek-v4"),
+        ("omnigent-openai/gpt-5.6", "gpt-5.6"),
+        ("omnigent/moonshotai/kimi-k2", "moonshotai/kimi-k2"),
+        ("moonshotai/kimi-k2", "moonshotai/kimi-k2"),
+    ],
+)
+def test_rpc_decodes_native_picker_values(selection, expected):
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://models.example.test",
+        gateway_auth_command="test-auth",
+        base_urls_override={"openai": "https://models.example.test/v1"},
+        model=selection,
+    )
+    assert _run(executor._resolve_model(None)) == expected
+    assert _run(executor._resolve_model(ExecutorConfig(model=selection))) == expected
 
 
 def test_unsupported_effort_value_fails_the_turn() -> None:
@@ -6237,7 +6340,7 @@ def test_generic_reasoning_uses_pi_compat_detection_without_changing_databricks(
     databricks = _build_models_json("https://workspace.example", "synthetic")
     for provider in databricks["providers"].values():
         if provider["api"].startswith("openai"):
-            assert provider["compat"]["supportsReasoningEffort"] is False
+            assert "supportsReasoningEffort" not in provider["compat"]
 
 
 @pytest.mark.parametrize("destination", ["generic", "mixed-databricks", "catalog"])

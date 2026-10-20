@@ -3199,6 +3199,74 @@ def test_gateway_provider_config_context_window_flows_to_models_json() -> None:
     assert entry["maxTokens"] == 131_072
 
 
+def test_bound_native_decodes_nested_managed_prefix_once(monkeypatch) -> None:
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://models.example.test/v1",
+                    "api_key": "test-key",
+                    "models": {"default": "omnigent/custom-model"},
+                },
+            }
+        },
+        "inference": {"harnesses": {"pi-native": {"provider": "proxy"}}},
+    }
+    provider = creds.resolve_pi_native_provider(
+        model="omnigent/omnigent/custom-model", config_loader=lambda: config
+    )
+    assert provider is not None
+    assert provider.model == "omnigent/custom-model"
+
+
+def test_per_model_token_limits_native_and_rpc(monkeypatch) -> None:
+    from omnigent.inner.pi_executor import _build_models_json
+    from omnigent.onboarding.provider_config import load_providers
+    from omnigent.runtime.workflow import _apply_provider_to_pi
+
+    monkeypatch.setattr("omnigent.onboarding.providers.find_catalog_models", lambda model: [])
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://models.example.test/v1",
+                    "api_key": "test-key",
+                    "wire_api": "chat",
+                    "models": {"default": "kimi-k2", "deepseek": "deepseek-v4"},
+                    "context_window": 128000,
+                    "max_output_tokens": 16000,
+                    "model_metadata": {
+                        "kimi-k2": {"context_window": 256000, "max_output_tokens": 32000},
+                        "deepseek-v4": {"context_window": 550000, "max_output_tokens": 64000},
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    native = provider.to_models_config()["providers"]["omnigent"]["models"]
+    env = {}
+    _apply_provider_to_pi(env, load_providers(config)["proxy"])
+    rpc = _build_models_json(
+        "https://models.example.test",
+        "test-key",
+        base_urls={"openai": "https://models.example.test/v1"},
+        model="kimi-k2",
+        model_metadata=json.loads(env["HARNESS_PI_MODEL_METADATA"]),
+    )
+    assert {entry["id"]: entry["contextWindow"] for entry in native} == {
+        "kimi-k2": 256000,
+        "deepseek-v4": 550000,
+    }
+    rpc_entry = next(entry for payload in rpc["providers"].values() for entry in payload["models"])
+    assert (rpc_entry["contextWindow"], rpc_entry["maxTokens"]) == (256000, 32000)
+
+
 def test_gateway_provider_without_limits_still_carries_input_and_reasoning() -> None:
     """A gateway config with no limits still produces a richer entry than bare id.
 
