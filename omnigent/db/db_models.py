@@ -2722,7 +2722,7 @@ class SqlUsageFeed(OmnigentBase):
     signing_key: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
     next_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     read_timestamps: Mapped[str] = mapped_column(Text, nullable=False)
-    progress: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default="{}")
+    progress: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
 
 class SqlUsageUnit(OmnigentBase):

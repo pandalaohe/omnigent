@@ -23,7 +23,13 @@ _DIGEST = sa.LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
 
 def upgrade() -> None:
-    op.add_column("device_grants", sa.Column("scope", sa.String(32), nullable=True))
+    bind = op.get_bind()
+    if "scope" not in {column["name"] for column in sa.inspect(bind).get_columns("device_grants")}:
+        op.add_column("device_grants", sa.Column("scope", sa.String(32), nullable=True))
+    if bind.dialect.name == "cockroachdb":
+        # Publish the new column before backfill; the check above permits resume.
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
     op.execute(
         "UPDATE device_grants SET scope = 'sessions' "
         "WHERE client_id IS NULL OR client_id <> 'omnigent-cli'"
@@ -38,7 +44,12 @@ def upgrade() -> None:
         sa.Column("signing_key", _DIGEST, nullable=False),
         sa.Column("next_sequence", sa.BigInteger(), nullable=False),
         sa.Column("read_timestamps", sa.Text(), nullable=False),
-        sa.Column("progress", sa.Text(), nullable=False, server_default="{}"),
+        sa.Column(
+            "progress",
+            sa.Text(),
+            nullable=False,
+            server_default=None if bind.dialect.name == "mysql" else "{}",
+        ),
         sa.PrimaryKeyConstraint("workspace_id", "owner_digest"),
     )
     op.create_table(
