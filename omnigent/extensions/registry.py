@@ -25,6 +25,7 @@ from omnigent.extensions.api import (
     ExtensionPermission,
     ExtensionPluginState,
     ExternalPageContribution,
+    ExternalPageProxy,
     PageContribution,
     PrimaryNavigationContribution,
 )
@@ -216,6 +217,62 @@ def _validate_page(extension_id: str, page: PageContribution | ExternalPageContr
     _validate_relative_path(page.route, f"page {page.id!r} route", route=True)
     if isinstance(page, ExternalPageContribution):
         _validate_external_url(page.url, f"page {page.id!r} URL")
+        if page.proxy is not None:
+            if not isinstance(page.proxy, ExternalPageProxy):
+                raise ExtensionValidationError("page proxy must be ExternalPageProxy")
+            parsed = urlsplit(page.url)
+            if parsed.path not in {"", "/"}:
+                raise ExtensionValidationError("proxy URL must use the upstream root path")
+            routes = page.proxy.allowed_routes
+            if not isinstance(routes, tuple) or not routes:
+                raise ExtensionValidationError("proxy allowed_routes must be a non-empty tuple")
+            for item in routes:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    raise ExtensionValidationError("proxy route must be a method/path pair")
+                method, path = item
+                if not isinstance(method, str) or method not in {
+                    "GET",
+                    "HEAD",
+                    "POST",
+                    "PUT",
+                    "PATCH",
+                    "DELETE",
+                }:
+                    raise ExtensionValidationError("unsupported proxy method")
+                if not isinstance(path, str) or not re.fullmatch(
+                    r"/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*/?)?",
+                    path,
+                ):
+                    raise ExtensionValidationError("proxy path must be a canonical absolute path")
+            if ("GET", "/") not in routes:
+                raise ExtensionValidationError("proxy routes must allow GET /")
+            if not isinstance(page.proxy.request_headers, tuple):
+                raise ExtensionValidationError("proxy request_headers must be a tuple")
+            for item in page.proxy.request_headers:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    raise ExtensionValidationError("proxy header must be a name/value pair")
+                name, value = item
+                if (
+                    not isinstance(name, str)
+                    or not re.fullmatch(r"[a-z][a-z0-9-]*", name)
+                    or name
+                    in {
+                        "cookie",
+                        "authorization",
+                        "proxy-authorization",
+                        "host",
+                        "origin",
+                        "connection",
+                        "transfer-encoding",
+                        "content-length",
+                        "forwarded",
+                    }
+                    or name.startswith(("sec-", "x-forwarded-", "x-omnigent-"))
+                    or not isinstance(value, str)
+                    or not value.isascii()
+                    or not value.isprintable()
+                ):
+                    raise ExtensionValidationError("unsafe proxy request header")
     else:
         _require_symbol(page.view, f"page {page.id!r} view")
 
@@ -366,6 +423,12 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
 
     for page in manifest.pages:
         _validate_page(manifest.id, page)
+        if (
+            isinstance(page, ExternalPageContribution)
+            and page.proxy is not None
+            and ExtensionPermission.PAGES_PROXY not in manifest.permissions
+        ):
+            raise ExtensionValidationError("proxied page requires permission 'pages.proxy'")
         if (
             isinstance(page, ExternalPageContribution)
             and ExtensionPermission.PAGES_EXTERNAL not in manifest.permissions

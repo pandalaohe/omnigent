@@ -24,7 +24,7 @@ trusted Python package -> validated manifest -> server catalog
 ```
 
 External pages require the `pages.external` permission. The host frames the
-specified HTTP or HTTPS URL directly; Omnigent does not fetch or proxy it.
+specified HTTP or HTTPS URL directly by default.
 The document runs in its own origin and can use its own network and storage.
 It has no browser SDK or host RPC access. The frame allows scripts, same-origin
 access, forms, and popups, but grants no top navigation, downloads, or device
@@ -36,6 +36,13 @@ frame, including to the application's origin. Such a navigation loads the
 application's own content; the host does not prevent it. Declare only sites
 trusted by the operator. Sites can also refuse framing through their response
 headers; the toolbar remains available to open them separately.
+
+An operator-trusted page can opt into [server proxying](extension_manifest.md#server-proxied-pages)
+with the additional `pages.proxy` permission. Its scripts run on Omnigent's origin
+and can access the application's authenticated browser context. Trust the upstream
+as fully as installed extension code; this mode provides connectivity, not browser
+isolation. The server exposes exact method/path pairs, checks the origin of writes,
+strips browser credentials, and refuses upstream redirects.
 
 An HTTPS application does not embed HTTP pages, including loopback URLs. It
 shows an explanation and buttons to open the page in a window or a new tab.

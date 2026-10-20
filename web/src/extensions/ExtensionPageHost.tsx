@@ -8,7 +8,8 @@ import { useExtensionHostServices } from "./services/useExtensionHostServices";
 export function ExtensionPageHost({ resolved }: { resolved: ResolvedExtensionPage }) {
   const refresh = useRefreshExtensions();
   const { methods, events } = useExtensionHostServices(resolved.extension);
-  if (resolved.page.kind === "external") return <ExternalPageView page={resolved.page} />;
+  if (resolved.page.kind === "external" || resolved.page.kind === "proxied")
+    return <ExternalPageView page={resolved.page} />;
   if (resolved.page.kind !== undefined && resolved.page.kind !== "view") return <NotFoundPage />;
   return (
     <ExtensionViewHost

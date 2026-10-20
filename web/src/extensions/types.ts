@@ -13,7 +13,7 @@ export interface ExtensionExternalPage {
   id: string;
   title: string;
   route: string;
-  kind: "external";
+  kind: "external" | "proxied";
   view: null;
   url: string;
 }
