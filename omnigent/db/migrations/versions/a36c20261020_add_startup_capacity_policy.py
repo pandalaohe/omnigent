@@ -19,4 +19,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Retain configured startup limits until admission is paused")
+    with op.batch_alter_table("session_startup_budgets") as batch_op:
+        batch_op.drop_column("startup_limit")

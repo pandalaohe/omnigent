@@ -18,4 +18,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError("Retain host generation fences until attempts are reconciled")
+    with op.batch_alter_table("session_startup_budgets") as batch_op:
+        batch_op.drop_column("current_generation")
