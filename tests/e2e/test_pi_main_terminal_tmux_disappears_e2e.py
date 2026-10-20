@@ -427,6 +427,7 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
                 {
                     "host_id": host.host_id,
                     "workspace": str(workspace),
+                    "permission_tier": "full",
                     "labels": {
                         "omnigent.ui": "terminal",
                         "omnigent.wrapper": "pi-native-ui",

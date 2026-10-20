@@ -64,6 +64,7 @@ process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
 const postedEvents = [];
 global.fetch = async (_url, request) => {
+  assert.equal(request.headers["X-Omnigent-Permission-Tiers"], "1");
   postedEvents.push(JSON.parse(request.body));
   return { ok: true };
 };

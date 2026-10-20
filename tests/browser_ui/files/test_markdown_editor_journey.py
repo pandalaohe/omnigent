@@ -83,7 +83,7 @@ def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSessi
     pickers.first.select_option("typescript")
     picker = pickers.last
     picker.focus()
-    picker.press("End")
+    picker.press("y")
     picker.press("Enter")
     expect(picker).to_have_value("yaml")
     expect(viewer.get_by_role("button", name="All changes saved")).to_be_visible(timeout=15_000)

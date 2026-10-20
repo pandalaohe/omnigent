@@ -1021,6 +1021,7 @@ function headers(config) {
   return {
     "content-type": "application/json",
     ...freshAuthHeaders(config.authHeaders),
+    "X-Omnigent-Permission-Tiers": "1",
   };
 }
 

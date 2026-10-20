@@ -21,7 +21,7 @@ import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict
 
 import click
 import httpx
@@ -170,6 +170,10 @@ def _default_cli_model() -> str:
             "No default model is available for this ad-hoc agent. Pass --model, "
             "set OMNIGENT_MODEL, or retry when Databricks catalog discovery is available."
         ) from exc
+
+
+class _SessionPermissionOptions(TypedDict, total=False):
+    permission_tier: str
 
 
 @dataclass(frozen=True)
@@ -2224,6 +2228,7 @@ def _run_local_headless_prompt(
     overrides: ChatOverrides,
     prompt: str,
     ephemeral: bool = False,
+    permission_tier: str | None = None,
 ) -> None:
     """
     Start a local server, run one prompt, print response, and stop.
@@ -2262,6 +2267,7 @@ def _run_local_headless_prompt(
                 prompt=prompt,
                 runner_id=server.runner_id,
                 session_bundle=_bundle_agent(spec_path),
+                permission_tier=permission_tier,
             )
         finally:
             _stop_local_server(server)
@@ -2278,6 +2284,7 @@ def _run_headless_prompt(
     runner_id: str | None = None,
     session_bundle: bytes | None = None,
     session_bundle_filename: str = "agent.tar.gz",
+    permission_tier: str | None = None,
 ) -> None:
     """
     POST one prompt through the SDK and print the final assistant text.
@@ -2319,6 +2326,7 @@ def _run_headless_prompt(
                 session_bundle=session_bundle,
                 session_bundle_filename=session_bundle_filename,
                 runner_id=runner_id,
+                permission_tier=permission_tier,
             )
             if result_text:
                 print(result_text)
@@ -2346,6 +2354,7 @@ async def _query_sessions_once(
     runner_id: str | None,
     resume_conversation_id: str | None = None,
     on_session_ready: Callable[[str], None] | None = None,
+    permission_tier: str | None = None,
 ) -> str | None:
     """
     Create, bind, and query a sessions-API session for headless ``-p``.
@@ -2373,6 +2382,12 @@ async def _query_sessions_once(
     :raises RuntimeError: If no runner id was supplied.
     """
     from omnigent_client import SessionsChat
+
+    if permission_tier is not None and resume_conversation_id is not None:
+        raise ValueError("Permission tier can only be selected for a new session")
+    permission_options: _SessionPermissionOptions = {}
+    if permission_tier is not None:
+        permission_options["permission_tier"] = permission_tier
 
     # Remote target: no local bundle means no local runner either, so
     # adopt one the server already has online before the dispatch
@@ -2411,12 +2426,14 @@ async def _query_sessions_once(
             created = await client.sessions.create_from_agent_id(
                 agent.id,
                 workspace=os.getcwd(),
+                **permission_options,
             )
         else:
             created = await client.sessions.create(
                 session_bundle,
                 filename=session_bundle_filename,
                 workspace=os.getcwd(),
+                **permission_options,
             )
         bound = await client.sessions.bind_runner(created.id, runner_id=runner_id)
     if on_session_ready is not None:

@@ -1162,6 +1162,7 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
         prompt: str,
         runner_id: str | None = None,
         session_bundle: bytes | None = None,
+        permission_tier: str | None = None,
     ) -> None:
         """Record one-shot prompt inputs instead of making an API call."""
         captured["headless"] = {
@@ -4086,8 +4087,11 @@ class _FakeSessionsNamespace:
         self._forbid_list_items = list_items_must_not_be_called
         self.list_items_calls = 0
 
-    async def create(self, bundle: bytes, *, filename: str, workspace: str) -> SimpleNamespace:
-        """Pretend to create a session; return an object with an ``id``."""
+    async def create(
+        self, bundle: bytes, *, filename: str, workspace: str, permission_tier: str | None = None
+    ) -> SimpleNamespace:
+        """Capture caller-selected creation permissions without changing existing sessions."""
+        self.created_permission_tier = permission_tier
         return SimpleNamespace(id="conv_test")
 
     async def bind_runner(self, session_id: str, *, runner_id: str) -> SimpleNamespace:
@@ -4223,6 +4227,8 @@ async def _run_one_shot(
     client: _FakeAPClient,
     query_impl: Callable[[str], object],
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    permission_tier: str | None = None,
 ) -> str | None:
     """
     Drive ``_query_sessions_once`` with a faked ``SessionsChat.query``.
@@ -4244,6 +4250,7 @@ async def _run_one_shot(
         session_bundle=b"bundle-bytes",
         session_bundle_filename="agent.tar.gz",
         runner_id="runner_test",
+        permission_tier=permission_tier,
     )
 
 
@@ -4322,8 +4329,26 @@ async def test_query_sessions_once_returns_none_when_no_text_and_no_error(
     assert result is None
 
 
+@pytest.mark.parametrize("permission_tier", ["auto", "full"])
+async def test_query_sessions_once_refuses_creation_tier_on_resume(permission_tier: str) -> None:
+    with pytest.raises(ValueError, match="only be selected for a new session"):
+        await _query_sessions_once(
+            client=_FakeAPClient([]),
+            agent_name="test",
+            tool_handler=None,
+            prompt="hello",
+            session_bundle=b"bundle",
+            session_bundle_filename="agent.tar.gz",
+            runner_id="runner-test",
+            resume_conversation_id="existing-session",
+            permission_tier=permission_tier,
+        )
+
+
+@pytest.mark.parametrize("permission_tier", [None, "full"])
 async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     monkeypatch: pytest.MonkeyPatch,
+    permission_tier: str | None,
 ) -> None:
     """The normal completion path returns the live text and skips the transcript.
 
@@ -4331,7 +4356,10 @@ async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     on every turn, adding a needless round-trip to the happy path.
     """
     client = _FakeAPClient([], list_items_must_not_be_called=True)
-    result = await _run_one_shot(client, _return_text, monkeypatch)
+    result = await _run_one_shot(
+        client, _return_text, monkeypatch, permission_tier=permission_tier
+    )
+    assert client.sessions.created_permission_tier == permission_tier
     assert result == "direct answer"
     assert client.sessions.list_items_calls == 0  # no reconcile on success
 
