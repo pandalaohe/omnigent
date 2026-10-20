@@ -981,6 +981,25 @@ async def test_json_create_rejects_handoff_label(
     assert response.json()["error"]["code"] == "invalid_input"
 
 
+async def test_create_and_patch_reject_permission_authority_labels(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    from omnigent.server.permission_tiers import PERMISSION_LABEL_KEYS
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="tier-label-agent", bundle_location="test:///bundle")
+    for key in (*PERMISSION_LABEL_KEYS, "OMNIGENT.PI.PERMISSION_TIER"):
+        labels = {key: "full"}
+        created = await client.post("/v1/sessions", json={"agent_id": agent_id, "labels": labels})
+        assert created.status_code == 400
+        patched = await client.patch(f"/v1/sessions/{session_id}", json={"labels": labels})
+        assert patched.status_code == 400
+        current = store.get_conversation(session_id)
+        assert current is not None and key not in current.labels
+
+
 async def test_create_and_patch_reject_worktree_fence_aliases(
     client: httpx.AsyncClient, session_id: str, db_uri: str
 ) -> None:

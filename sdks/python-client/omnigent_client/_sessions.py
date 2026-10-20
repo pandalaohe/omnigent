@@ -157,6 +157,10 @@ class Session:
         the active credential for the correct provider family
         instead of guessing it from the model. ``None`` when
         unavailable.
+    :param permission_tier: Confirmed Pi/Antigravity tier, or ``None``.
+    :param permission_tier_revision: Confirmed server revision, or ``None``.
+    :param permission_tier_state: ``ready``, ``switching`` or ``blocked``.
+    :param permission_tiers_capability: Whether the runner confirmed v1 support.
     :param model_override: Per-session LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` when no override is active
         and the agent's ``llm_model`` applies. Set via the REPL's
@@ -196,6 +200,10 @@ class Session:
     items: list[dict[str, Any]] = field(default_factory=list)
     llm_model: str | None = None
     harness: str | None = None
+    permission_tier: str | None = None
+    permission_tier_revision: int | None = None
+    permission_tier_state: str | None = None
+    permission_tiers_capability: bool = False
     model_override: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
@@ -232,6 +240,10 @@ class Session:
             items=items_raw if isinstance(items_raw, list) else [],
             llm_model=raw.get("llm_model"),
             harness=raw.get("harness"),
+            permission_tier=raw.get("permission_tier"),
+            permission_tier_revision=raw.get("permission_tier_revision"),
+            permission_tier_state=raw.get("permission_tier_state"),
+            permission_tiers_capability=bool(raw.get("permission_tiers_capability", False)),
             model_override=raw.get("model_override"),
             context_window=int(raw_cw) if raw_cw is not None else None,
             last_total_tokens=int(raw_ltt) if raw_ltt is not None else None,
@@ -381,6 +393,7 @@ class SessionsNamespace:
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        permission_tier: str | None = None,
         workspace: str | None = None,
         host_type: str = "external",
         sandbox_provider: str | None = None,
@@ -403,6 +416,7 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param permission_tier: Optional Pi/Antigravity tier for this creation.
         :param workspace: Optional starting workspace. For an external
             host (the default), an absolute cwd to record on the session,
             e.g. ``"/Users/corey/projects/myapp"`` — CLI-launched sessions
@@ -426,6 +440,8 @@ class SessionsNamespace:
             metadata["labels"] = labels
         if reasoning_effort is not None:
             metadata["reasoning_effort"] = reasoning_effort
+        if permission_tier is not None:
+            metadata["permission_tier"] = permission_tier
         if workspace is not None:
             metadata["workspace"] = workspace
         if host_type != "external":
@@ -449,6 +465,7 @@ class SessionsNamespace:
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        permission_tier: str | None = None,
         workspace: str | None = None,
     ) -> Session:
         """
@@ -468,6 +485,7 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param permission_tier: Optional Pi/Antigravity tier for this creation.
         :param workspace: Optional absolute starting cwd to record on
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :returns: The newly created :class:`Session` snapshot.
@@ -481,6 +499,8 @@ class SessionsNamespace:
             body["labels"] = labels
         if reasoning_effort is not None:
             body["reasoning_effort"] = reasoning_effort
+        if permission_tier is not None:
+            body["permission_tier"] = permission_tier
         if workspace is not None:
             body["workspace"] = workspace
         resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
@@ -1152,6 +1172,7 @@ class SessionsNamespace:
         *,
         title: str | None = None,
         up_to_response_id: str | None = None,
+        permission_tier: str | None = None,
     ) -> dict[str, Any]:
         """
         Fork an existing session into a new session.
@@ -1168,6 +1189,7 @@ class SessionsNamespace:
             ``"resp_abc123"``. When set, the fork copies history only
             up to and including that response; ``None`` copies the
             full history.
+        :param permission_tier: Optional Pi/Antigravity tier for this fork.
         :returns: Raw response dict matching the ``SessionResponse``
             shape: ``id``, ``agent_id``, ``status``, ``created_at``,
             ``title``, ``labels``, ``reasoning_effort``, and
@@ -1181,6 +1203,8 @@ class SessionsNamespace:
             body["title"] = title
         if up_to_response_id is not None:
             body["up_to_response_id"] = up_to_response_id
+        if permission_tier is not None:
+            body["permission_tier"] = permission_tier
         resp = await self._http.post(
             f"{self._base}/v1/sessions/{source_session_id}/fork",
             json=body,

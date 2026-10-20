@@ -3,7 +3,7 @@
 import re
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
-from omnigent.harnesses.antigravity_native.bridge import AGY_PERMISSION_TIERS
+from omnigent.permission_tiers import NON_FULL_TIERS
 
 SPEED_TIER_LABEL_KEY = "omnigent.speed_tier"
 SPEED_TIER_REQUESTED_LABEL_KEY = "omnigent.speed_tier_requested"
@@ -28,7 +28,9 @@ def codex_service_tier(value: str) -> str:
 
 
 PERMISSION_DEFAULT_VALUES: dict[str, frozenset[str]] = {
-    "antigravity-native": frozenset(AGY_PERMISSION_TIERS),
+    "antigravity-native": frozenset(NON_FULL_TIERS),
+    "pi": frozenset(NON_FULL_TIERS),
+    "pi-native": frozenset(NON_FULL_TIERS),
     "codex": CODEX_NATIVE_PERMISSION_VALUES,
     "codex-native": CODEX_NATIVE_PERMISSION_VALUES,
     "claude-native": frozenset({"acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"}),

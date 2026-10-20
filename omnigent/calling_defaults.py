@@ -21,6 +21,7 @@ from typing import Any, Protocol
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import is_harness_availability
+from omnigent.permission_tiers import normalize_permission_tier
 from omnigent.session_default_modes import (
     PERMISSION_DEFAULT_VALUES,
     valid_speed_tier,
@@ -365,6 +366,16 @@ def _resolve_harness_setting(
         )
     for entry, source in entries:
         value = _setting(entry.get(field)) if entry is not None else None
+        if (
+            field == "permission"
+            and value is not None
+            and harness in {"pi", "pi-native", "antigravity-native"}
+        ):
+            try:
+                tier = normalize_permission_tier(value, harness=harness, legacy=True)
+            except ValueError:
+                continue
+            return ("auto" if tier == "full" else tier), source
         if value is not None and (
             (field == "speed" and valid_speed_tier(value, harness))
             or (field != "speed" and (values is None or value in values))

@@ -1358,6 +1358,25 @@ def register_events_routes(
         directly and never stamp.
         """
         user_id = _get_user_id(request, auth_provider)
+        events = body if isinstance(body, list) else [body]
+        if any(event.type in {"message", "approval"} for event in events):
+            from omnigent.server.permission_tiers import require_permission_protocol
+
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+            protocol_conv = access.conversation
+            if protocol_conv is None:
+                protocol_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            if protocol_conv is not None:
+                require_permission_protocol(
+                    request,
+                    harness=_resolve_harness(
+                        protocol_conv, agent_store=agent_store, agent_cache=agent_cache
+                    ),
+                )
         with contextlib.ExitStack() as in_flight:
             if isinstance(body, list):
                 if not body:
@@ -4531,6 +4550,13 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        from omnigent.server.permission_tiers import require_permission_protocol
+
+        require_permission_protocol(
+            request,
+            harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache),
+            allow_query=True,
+        )
         runner_client = await _get_runner_client(
             session_id,
             runner_router,

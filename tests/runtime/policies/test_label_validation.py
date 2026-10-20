@@ -16,6 +16,7 @@ writes still land atomically.
 from __future__ import annotations
 
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.server.permission_tiers import PERMISSION_LABEL_KEYS
 from omnigent.spec.types import LabelDef
 from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL, TOUCHED_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -102,6 +103,19 @@ def test_apply_label_writes_schemaless_keys_pass_freely(
     engine.apply_label_writes({"any": "value", "anything": "123"})
     # Both landed — no schema to enforce.
     assert engine.labels == {"any": "value", "anything": "123"}
+
+
+def test_policy_cannot_write_permission_authority_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    engine = _build_engine_with_defs(conversation_store, {})
+    forged = dict.fromkeys(PERMISSION_LABEL_KEYS, "forged")
+    forged["OMNIGENT.PI.PERMISSION_TIER"] = "full"
+    engine.apply_label_writes({**forged, "ordinary": "kept"})
+    assert engine.labels == {"ordinary": "kept"}
+    assert conversation_store.get_conversation(engine._conversation_id).labels == {
+        "ordinary": "kept"
+    }
 
 
 def test_apply_label_writes_values_only_free_transitions(

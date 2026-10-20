@@ -11325,24 +11325,12 @@ def _spec_config_flag_explicitly_enabled(spec: AgentSpec, key: str) -> bool:
 
 
 def _stamp_antigravity_permission_tier(
-    labels: dict[str, str], launch_args: list[str] | None, *, default: str | None = None
+    labels: dict[str, str], launch_args: list[str] | None, *, tier: str
 ) -> list[str]:
-    from omnigent.harnesses.antigravity_native.bridge import (
-        AGY_DEFAULT_PERMISSION_TIER,
-        AGY_PERMISSION_TIER_LABEL_KEY,
-        AGY_PERMISSION_TIERS,
-    )
+    from omnigent.permission_tiers import AGY_PERMISSION_TIER_LABEL_KEY, normalize_permission_tier
 
-    explicit = labels.get(AGY_PERMISSION_TIER_LABEL_KEY)
-    if explicit is not None and explicit not in AGY_PERMISSION_TIERS:
-        raise OmnigentError("Invalid antigravity permission tier", code=ErrorCode.INVALID_INPUT)
-    tier = explicit or (default if default in AGY_PERMISSION_TIERS else None)
+    tier = normalize_permission_tier(tier, harness="antigravity-native", legacy=False)
     args = [arg for arg in (launch_args or []) if arg != "--dangerously-skip-permissions"]
-    tier = tier or (
-        "full"
-        if "--dangerously-skip-permissions" in (launch_args or [])
-        else AGY_DEFAULT_PERMISSION_TIER
-    )
     labels[AGY_PERMISSION_TIER_LABEL_KEY] = tier
     if tier == "full":
         args.append("--dangerously-skip-permissions")
@@ -11615,6 +11603,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.server.permission_tiers import is_permission_label_key
+
+    permission_key = next((key for key in labels if is_permission_label_key(key)), None)
+    if permission_key is not None:
+        raise OmnigentError(
+            f"label {permission_key!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     handoff_key = next((key for key in labels if key.startswith("omnigent.handoff.")), None)
     if handoff_key is not None:
         raise OmnigentError(

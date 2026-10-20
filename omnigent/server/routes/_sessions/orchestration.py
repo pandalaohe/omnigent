@@ -2829,6 +2829,39 @@ def _build_session_response(
         labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     busy = status in ("running", "waiting")
     now = now_epoch()
+    permission_tier = None
+    permission_tier_revision = None
+    permission_tier_state = None
+    permission_tiers_capability = False
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        TIER_HARNESSES,
+        legacy_permission_tier,
+        read_permission_state,
+    )
+
+    if harness in TIER_HARNESSES:
+        assert harness is not None
+        try:
+            confirmed = read_permission_state(conv.labels, harness=harness)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            try:
+                permission_tier = legacy_permission_tier(
+                    harness=harness,
+                    labels=conv.labels,
+                    launch_args=conv.terminal_launch_args or [],
+                )
+            except ValueError:
+                permission_tier = None
+            permission_tier_state = "blocked"
+        else:
+            permission_tier = confirmed.tier
+            permission_tier_revision = confirmed.revision
+            permission_tier_state = confirmed.status
+            permission_tiers_capability = (
+                conv.labels.get(PERMISSION_CAPABILITY_LABEL_KEY) == PERMISSION_CAPABILITY_VALUE
+            )
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2865,6 +2898,10 @@ def _build_session_response(
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
         harness=harness,
+        permission_tier=permission_tier,
+        permission_tier_revision=permission_tier_revision,
+        permission_tier_state=permission_tier_state,
+        permission_tiers_capability=permission_tiers_capability,
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
@@ -13585,6 +13622,14 @@ async def _create_session_from_existing_agent(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
     )
+    from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
+
+    require_permission_protocol(request, harness=selected_harness)
+    if body.permission_tier is not None and selected_harness not in TIER_HARNESSES:
+        raise OmnigentError(
+            "permission_tier is only supported by Pi and Antigravity sessions",
+            code=ErrorCode.INVALID_INPUT,
+        )
     await validate_create_harness_readiness(
         harness=selected_harness,
         host_id=body.host_id,
@@ -13997,12 +14042,44 @@ async def _create_session_from_existing_agent(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
     )
-    if create_harness == "antigravity-native":
-        validated_launch_args = _stamp_antigravity_permission_tier(
-            initial_labels,
-            validated_launch_args,
-            default=project_resolution.permission if body.sub_agent_name is None else None,
+    require_permission_protocol(request, harness=create_harness)
+    if body.permission_tier is not None and create_harness not in TIER_HARNESSES:
+        raise OmnigentError(
+            "permission_tier is only supported by Pi and Antigravity sessions",
+            code=ErrorCode.INVALID_INPUT,
         )
+    if create_harness in TIER_HARNESSES:
+        assert create_harness is not None
+        from omnigent.server.permission_tiers import (
+            ConfirmedPermissionState,
+            creation_permission_tier,
+            legacy_permission_tier,
+        )
+
+        inherited_tier = None
+        if parent_conv is not None:
+            try:
+                inherited_tier = legacy_permission_tier(
+                    harness=create_harness,
+                    labels=parent_conv.labels or {},
+                    launch_args=parent_conv.terminal_launch_args or [],
+                )
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"Parent permission tier requires recovery: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+        tier = creation_permission_tier(
+            harness=create_harness,
+            explicit=body.permission_tier,
+            default=project_resolution.permission if body.sub_agent_name is None else None,
+            inherited=inherited_tier,
+        )
+        initial_labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(create_harness))
+        if create_harness == "antigravity-native":
+            validated_launch_args = _stamp_antigravity_permission_tier(
+                initial_labels, validated_launch_args, tier=tier
+            )
 
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
@@ -14440,9 +14517,19 @@ def _create_session_from_bundle(
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
-    if _spec_harness(spec) == "antigravity-native":
+    if _spec_harness(spec) in {"pi", "pi-native", "antigravity-native"}:
+        from omnigent.server.permission_tiers import (
+            ConfirmedPermissionState,
+            creation_permission_tier,
+        )
+
+        harness = _spec_harness(spec)
         labels = dict(metadata.labels or {})
-        launch_args = _stamp_antigravity_permission_tier(labels, metadata.terminal_launch_args)
+        tier = creation_permission_tier(harness=harness, explicit=metadata.permission_tier)
+        labels.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
+        launch_args = metadata.terminal_launch_args
+        if harness == "antigravity-native":
+            launch_args = _stamp_antigravity_permission_tier(labels, launch_args, tier=tier)
         metadata = metadata.model_copy(
             update={"labels": labels, "terminal_launch_args": launch_args}
         )

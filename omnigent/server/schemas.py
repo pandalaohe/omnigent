@@ -37,6 +37,16 @@ from omnigent.inner.native_attachments import reject_authored_framework_notices
 # ── Shared ──────────────────────────────────────────────────────
 
 McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+PermissionTierRequest = Literal[
+    "ask",
+    "plan",
+    "accept-edits",
+    "auto",
+    "full",
+    "auto-strict",
+    "auto-standard",
+    "auto-relaxed",
+]
 
 
 class PaginatedList(BaseModel):
@@ -1885,6 +1895,7 @@ class _SessionCreateRequestBase(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     permission_mode: str | None = None
+    permission_tier: PermissionTierRequest | None = None
     approval_mode: str | None = None
     smart_routing_message: str | None = None
 
@@ -2120,6 +2131,7 @@ class SessionCreateMetadata(BaseModel):
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
+    permission_tier: PermissionTierRequest | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2668,6 +2680,10 @@ class SessionResponse(BaseModel):
     root_conversation_id: str | None = None
     llm_model: str | None = None
     harness: str | None = None
+    permission_tier: Literal["ask", "plan", "accept-edits", "auto", "full"] | None = None
+    permission_tier_revision: int | None = None
+    permission_tier_state: Literal["ready", "switching", "blocked"] | None = None
+    permission_tiers_capability: bool = False
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -2864,6 +2880,7 @@ class UpdateSessionRequest(BaseModel):
     model_override: str | None = None
     collaboration_mode: str | None = None
     permission_mode: str | None = None
+    expected_permission_tier_revision: int | None = Field(default=None, ge=1)
     approval_mode: str | None = None
     speed_tier: str | None = None
     cost_control_mode_override: str | None = None
@@ -3147,7 +3164,7 @@ class SessionForkRequest(BaseModel):
     up_to_response_id: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
-    permission_tier: str | None = None
+    permission_tier: PermissionTierRequest | None = None
     terminal_launch_args: list[str] | None = None
     codex_bypass_sandbox: bool = False
     host_type: Literal["external", "managed"] = "external"
@@ -3160,15 +3177,6 @@ class SessionForkRequest(BaseModel):
     side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
-
-    @field_validator("permission_tier")
-    @classmethod
-    def _validate_permission_tier(cls, value: str | None) -> str | None:
-        from omnigent.harnesses.antigravity_native.bridge import AGY_PERMISSION_TIERS
-
-        if value is not None and value not in AGY_PERMISSION_TIERS:
-            raise ValueError(f"permission_tier must be one of {AGY_PERMISSION_TIERS}")
-        return value
 
     @model_validator(mode="after")
     def _check_managed_fork_fields(self) -> Self:
@@ -4012,6 +4020,7 @@ class SessionPermissionModeEvent(_SSEEventBase):
     type: Literal["session.permission_mode"]
     conversation_id: str
     permission_mode: str
+    permission_tier_revision: int | None = None
 
 
 class SessionCodexApprovalModeEvent(_SSEEventBase):

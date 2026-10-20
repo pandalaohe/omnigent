@@ -184,6 +184,42 @@ def _list_row(app: FastAPI, session_id: str, *, owner: str = ALICE) -> dict:
     return {item["id"]: item for item in resp.json()["data"]}[session_id]
 
 
+def test_tiered_list_and_recent_require_v1(app, stores):
+    from omnigent.stores.conversation_store import touched_label_key
+
+    session_id = _seed_session(stores, owner=ALICE, title="Tiered")
+    stores[0].set_labels(
+        session_id,
+        {
+            "omnigent.pi.permission_tier": "auto",
+            touched_label_key(ALICE): str(int(time.time())),
+        },
+    )
+    with TestClient(app) as client:
+        for url in ("/v1/sessions", "/v1/me/recent-sessions"):
+            headers = {"X-Forwarded-Email": ALICE}
+            response = client.get(url, headers=headers)
+            assert response.status_code == 426, response.text
+            headers["X-Omnigent-Permission-Tiers"] = "1"
+            response = client.get(url, headers=headers)
+            assert response.status_code == 200, response.text
+            assert response.json()["data"][0]["labels"]["omnigent.pi.permission_tier"] == "auto"
+
+
+@pytest.mark.usefixtures("fast_rescan")
+def test_tiered_updates_close_old_watch_before_snapshot(app, stores):
+    session_id = _seed_session(stores, owner=ALICE, title="Tiered")
+    stores[0].set_labels(session_id, {"omnigent.pi.permission_tier": "auto"})
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            ws.send_json({"type": "watch", "session_ids": [session_id]})
+            with pytest.raises(WebSocketDisconnect) as error:
+                ws.receive_json()
+            assert error.value.code == 4406
+
+
 def _recv_until(ws: object, wanted: set[str], *, max_frames: int = 50) -> dict[str, object]:
     """
     Read frames until one whose ``type`` is in ``wanted`` arrives.
