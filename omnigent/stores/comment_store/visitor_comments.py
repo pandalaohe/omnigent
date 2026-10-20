@@ -9,12 +9,14 @@ module therefore depends only on the comment entity and the comment store.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
 from omnigent.entities import Comment
 from omnigent.entities.comment_location import comment_location
-from omnigent.entities.element_annotation import parse_element_anchor
+from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX, parse_element_anchor
 from omnigent.stores.comment_store import COMMENT_STATUS_DRAFT
 
 # The marker prefix on a visitor comment's ``created_by``. No account id
@@ -77,15 +79,16 @@ def comment_rows(
     comments: list[Comment],
     *,
     include_visitor_drafts: bool = False,
+    visitor_screenshot_allowed: Callable[[Comment, str], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Serialize comment rows for an agent-facing listing.
 
     Visitor comments still in draft have not been sent to the agent by
     the owner, so they are omitted unless *include_visitor_drafts* is
     set (the owner's own read path). Every returned visitor row carries
-    the untrusted-data source marker and note; an owner row whose
-    ``anchor_content`` is a valid element anchor carries the parsed,
-    clamped payload under ``annotation``.
+    the untrusted-data source marker and note. Valid owner and visitor
+    element anchors carry parsed geometry under ``annotation``; visitor
+    screenshots require a comment-bound provenance check.
 
     :param comments: The comments to serialize.
     :param include_visitor_drafts: When ``True``, keep visitor comments
@@ -103,12 +106,24 @@ def comment_rows(
             "__element__"
         ):
             row["location"] = location
+        annotation = parse_element_anchor(comment.anchor_content)
+        if annotation is not None and visitor:
+            screenshot = annotation.get("screenshot")
+            if isinstance(screenshot, dict) and isinstance(screenshot.get("expires_at"), int):
+                # This server-written descriptor survives lazy file deletion.
+                row["screenshot_expires_at"] = screenshot["expires_at"]
+            if screenshot is not None and (
+                visitor_screenshot_allowed is None
+                or not visitor_screenshot_allowed(comment, screenshot["file_id"])
+            ):
+                annotation["screenshot"] = None
+                row["anchor_content"] = ELEMENT_ANCHOR_PREFIX + json.dumps(
+                    annotation, ensure_ascii=False, separators=(",", ":")
+                )
+        if annotation is not None:
+            row["annotation"] = annotation
         if visitor:
             row["source"] = VISITOR_SOURCE
             row["note"] = VISITOR_COMMENT_NOTE
-        else:
-            annotation = parse_element_anchor(comment.anchor_content)
-            if annotation is not None:
-                row["annotation"] = annotation
         rows.append(row)
     return rows

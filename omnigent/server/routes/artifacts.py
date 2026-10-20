@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import http
+import io
 import json
 import logging
 import mimetypes
@@ -39,16 +41,22 @@ from typing import Any, Literal
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, Field, model_validator
+from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from omnigent.artifact_paths import artifact_path_allowed, artifact_segments_valid
 from omnigent.db.db_models import current_workspace_id, workspace_scope
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import generate_file_id, now_epoch
 from omnigent.entities import Conversation
 from omnigent.entities.comment_location import (
     MAX_TEXT_ANCHOR_BYTES,
     TEXT_ANCHOR_PREFIX,
     parse_text_anchor,
+)
+from omnigent.entities.element_annotation import (
+    ELEMENT_ANCHOR_PREFIX,
+    is_element_anchor_prefix,
+    parse_element_anchor,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import CAP_FS_READ_RAW
@@ -97,11 +105,19 @@ from omnigent.server.routes._oauth import RATE_LIMITER_MAX_KEYS, SlidingWindowRa
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes.sessions.routes_resources import _RunnerStreamResponse
 from omnigent.server.schemas import ArtifactOpenRequestEvent
+from omnigent.server.visitor_screenshots import (
+    VISITOR_SCREENSHOT_BYTES,
+    VISITOR_SCREENSHOT_LIMIT,
+    VISITOR_SCREENSHOT_SECONDS,
+    VisitorScreenshotFiles,
+)
 from omnigent.stores import ConversationStore
+from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.comment_store.visitor_comments import (
     visitor_author as _visitor_author,
 )
+from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
 logger = logging.getLogger(__name__)
@@ -233,6 +249,49 @@ _MODULEPRELOAD_LINK_RE = re.compile(
 # server-side throttles. Keyed by the link's identity, never by visitor.
 _VISITOR_COMMENT_RATE_MAX = 20
 _VISITOR_COMMENT_RATE_WINDOW_SECONDS = 600
+_VISITOR_COMMENT_REQUEST_BYTES = 3 * 1024 * 1024
+
+
+class VisitorScreenshotRequest(BaseModel):
+    data_url: str
+    width: int
+    height: int
+
+
+def _decode_visitor_screenshot(image: VisitorScreenshotRequest) -> tuple[bytes, str, str]:
+    """Verify bounded PNG/JPEG bytes, including actual dimensions and frames."""
+    prefixes = {
+        "data:image/png;base64,": ("PNG", "image/png", "png"),
+        "data:image/jpeg;base64,": ("JPEG", "image/jpeg", "jpg"),
+    }
+    choice = next(
+        (value for prefix, value in prefixes.items() if image.data_url.startswith(prefix)), None
+    )
+    if choice is None:
+        raise ValueError("unsupported screenshot format")
+    encoded = image.data_url.split(",", 1)[1]
+    if len(encoded) > (VISITOR_SCREENSHOT_BYTES + 2) // 3 * 4:
+        raise OverflowError("screenshot exceeds 2 MiB")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("invalid screenshot encoding") from exc
+    if len(content) > VISITOR_SCREENSHOT_BYTES:
+        raise OverflowError("screenshot exceeds 2 MiB")
+    if not 1 <= image.width <= 4096 or not 1 <= image.height <= 4096:
+        raise ValueError("invalid screenshot dimensions")
+    try:
+        with Image.open(io.BytesIO(content)) as decoded:
+            if decoded.format != choice[0] or decoded.size != (image.width, image.height):
+                raise ValueError("screenshot format or dimensions do not match")
+            if getattr(decoded, "n_frames", 1) != 1:
+                raise ValueError("animated screenshots are not supported")
+            decoded.verify()
+        with Image.open(io.BytesIO(content)) as decoded:
+            decoded.load()
+    except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise ValueError("invalid screenshot image") from exc
+    return content, choice[1], choice[2]
 
 
 def _posix_join(root: str, rel: str) -> str:
@@ -590,6 +649,7 @@ class VisitorCommentRequest(BaseModel):
     start_index: int
     end_index: int
     name: str | None = Field(default=None, max_length=40)
+    screenshot: VisitorScreenshotRequest | None = None
 
     @model_validator(mode="after")
     def _validate_range(self) -> VisitorCommentRequest:
@@ -610,6 +670,15 @@ class VisitorCommentRequest(BaseModel):
                 self.anchor_content = TEXT_ANCHOR_PREFIX + json.dumps(
                     parsed, ensure_ascii=False, separators=(",", ":")
                 )
+            elif is_element_anchor_prefix(self.anchor_content):
+                parsed = parse_element_anchor(self.anchor_content)
+                if parsed is None:
+                    raise ValueError("invalid element anchor")
+                # Only the server can assign a stored-file reference.
+                parsed["screenshot"] = None
+                self.anchor_content = ELEMENT_ANCHOR_PREFIX + json.dumps(
+                    parsed, ensure_ascii=False, separators=(",", ":")
+                )
             elif len(self.anchor_content) > 2000:
                 raise ValueError("plain text anchor must be at most 2000 characters")
         return self
@@ -628,6 +697,8 @@ def register_artifact_routes(
     _read_workspace_via_host: Callable[..., Awaitable[dict[str, Any] | None]],
     _runner_path_segment: Callable[..., str],
     comment_store: CommentStore | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> None:
     """Register the artifact capability-URL routes on *router*.
 
@@ -1671,6 +1742,11 @@ def register_artifact_routes(
         }
 
     if comment_store is not None:
+        screenshot_files = (
+            VisitorScreenshotFiles(file_store, artifact_store)
+            if file_store is not None and artifact_store is not None
+            else None
+        )
         # Visitor comments per link, in-memory and per process. Keyed by the
         # link's identity (session, key, root, entry), never by the visitor,
         # so one link's flood cannot spend another link's budget.
@@ -1692,7 +1768,6 @@ def register_artifact_routes(
         )
         async def add_visitor_comment(
             request: Request,
-            body: VisitorCommentRequest,
         ) -> Response:
             """
             Record one comment left by a visitor behind a share link.
@@ -1711,6 +1786,19 @@ def register_artifact_routes(
             :returns: 201 ``{"ok": true}``, or a JSON refusal (403
                 ``{"reason": "reload"|"disabled"}``, 404, 410, 413/422, 429).
             """
+            # Read in chunks so a missing Content-Length cannot bypass the
+            # bound before JSON/Pydantic parsing.
+            raw = bytearray()
+            async for chunk in request.stream():
+                raw.extend(chunk)
+                if len(raw) > _VISITOR_COMMENT_REQUEST_BYTES:
+                    return _visitor_error(413, "too_large")
+            try:
+                body = VisitorCommentRequest.model_validate_json(raw)
+            except ValidationError:
+                return _visitor_error(422, "invalid")
+            if body.screenshot is not None and not is_element_anchor_prefix(body.anchor_content):
+                return _visitor_error(422, "invalid")
             claims = decode_artifact_token(body.token)
             if claims is None or claims.view != "g":
                 return _visitor_error(404, "not_found")
@@ -1756,19 +1844,109 @@ def register_artifact_routes(
                         "too_many",
                         headers={"Retry-After": str(_VISITOR_COMMENT_RATE_WINDOW_SECONDS)},
                     )
+                screenshot_content: bytes | None = None
+                screenshot_mime = screenshot_extension = ""
+                if body.screenshot is not None:
+                    try:
+                        screenshot_content, screenshot_mime, screenshot_extension = (
+                            _decode_visitor_screenshot(body.screenshot)
+                        )
+                    except OverflowError:
+                        return _visitor_error(413, "too_large")
+                    except ValueError:
+                        return _visitor_error(422, "invalid")
                 # The workspace path the owner's own comments carry, so the
                 # row lands in the owner's per-file thread.
                 stored_path = _posix_join(claims.root, body.path)
                 if claims.absolute:
                     stored_path = "/" + stored_path.lstrip("/")
-                await asyncio.to_thread(
-                    comment_store.add,
-                    conversation_id=claims.session_id,
-                    path=stored_path,
-                    body=body.body,
-                    start_index=body.start_index,
-                    end_index=body.end_index,
-                    anchor_content=body.anchor_content,
-                    created_by=_visitor_author(body.name),
-                )
-                return JSONResponse(status_code=201, content={"ok": True})
+                file_id: str | None = None
+                expires_at: int | None = None
+                link_key = hashlib.sha256(window_key.encode()).hexdigest()
+                if screenshot_content is not None:
+                    if screenshot_files is None:
+                        return _visitor_error(503, "unavailable")
+                    expires_at = now + VISITOR_SCREENSHOT_SECONDS
+                    file_id = generate_file_id()
+                    anchor = parse_element_anchor(body.anchor_content)
+                    assert anchor is not None and body.screenshot is not None
+                    anchor["screenshot"] = {
+                        "file_id": file_id,
+                        "filename": f"visitor-screenshot.{screenshot_extension}",
+                        "width": body.screenshot.width,
+                        "height": body.screenshot.height,
+                        "expires_at": expires_at,
+                        "link_key": link_key,
+                    }
+                    body.anchor_content = ELEMENT_ANCHOR_PREFIX + json.dumps(
+                        anchor, ensure_ascii=False, separators=(",", ":")
+                    )
+                    if parse_element_anchor(body.anchor_content) is None:
+                        return _visitor_error(422, "invalid")
+                    count = await asyncio.to_thread(
+                        screenshot_files.clean_expired_and_count,
+                        claims.session_id,
+                        link_key=link_key,
+                        now=now,
+                    )
+                    if count >= VISITOR_SCREENSHOT_LIMIT:
+                        return _visitor_error(429, "screenshot_quota")
+                comment = None
+                try:
+                    comment = await asyncio.to_thread(
+                        comment_store.add,
+                        conversation_id=claims.session_id,
+                        path=stored_path,
+                        body=body.body,
+                        start_index=body.start_index,
+                        end_index=body.end_index,
+                        anchor_content=body.anchor_content,
+                        created_by=_visitor_author(body.name),
+                    )
+                    if (
+                        file_id is not None
+                        and screenshot_content is not None
+                        and body.screenshot is not None
+                    ):
+                        assert file_store is not None and artifact_store is not None
+                        await asyncio.to_thread(
+                            file_store.create,
+                            filename=f"visitor-screenshot.{screenshot_extension}",
+                            bytes=len(screenshot_content),
+                            content_type=screenshot_mime,
+                            session_id=claims.session_id,
+                            file_id=file_id,
+                            source_metadata={
+                                "visitor_screenshot": {
+                                    "link_key": link_key,
+                                    "comment_id": comment.id,
+                                    "created_at": now,
+                                }
+                            },
+                        )
+                        await asyncio.to_thread(artifact_store.put, file_id, screenshot_content)
+                except Exception:
+                    if comment is not None:
+                        try:
+                            await asyncio.to_thread(
+                                comment_store.delete, comment.id, claims.session_id
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Visitor comment rollback failed for comment %s", comment.id
+                            )
+                    if file_id is not None:
+                        try:
+                            assert screenshot_files is not None
+                            await asyncio.to_thread(
+                                screenshot_files.delete, file_id, claims.session_id
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Visitor screenshot rollback failed for file %s", file_id
+                            )
+                    raise
+                receipt: dict[str, Any] = {"ok": True}
+                if expires_at is not None:
+                    receipt["expires_at"] = expires_at
+                return JSONResponse(status_code=201, content=receipt)
