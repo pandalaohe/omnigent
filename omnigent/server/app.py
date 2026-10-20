@@ -4064,6 +4064,8 @@ def create_app(
                 auth_provider=auth_provider,
                 permission_store=permission_store,
                 conversation_store=conversation_store,
+                file_store=file_store,
+                artifact_store=artifact_store,
             ),
             prefix="/v1",
             tags=["comments"],

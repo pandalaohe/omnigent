@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
+import io
 import json
 import re
 import threading
@@ -26,10 +28,12 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from PIL import Image
 
 from omnigent.db.db_models import current_workspace_id
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import generate_file_id, now_epoch
 from omnigent.entities import Conversation, ResolvedAccess, SessionPermission
+from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX, parse_element_anchor
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     CAP_FS_READ_RAW,
@@ -63,9 +67,16 @@ from omnigent.server.artifact_sharing import (
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes import artifacts as artifacts_module
+from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.visitor_screenshots import (
+    VISITOR_SCREENSHOT_SECONDS,
+    VisitorScreenshotFiles,
+)
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -231,6 +242,8 @@ def _build_app(
     permission_store: _PermissionStore | None,
     host_registry: HostRegistry | None = None,
     comment_store: SqlAlchemyCommentStore | None = None,
+    file_store: SqlAlchemyFileStore | None = None,
+    artifact_store: LocalArtifactStore | None = None,
 ) -> FastAPI:
     """Build the sessions router app with the artifact routes wired."""
     app = FastAPI()
@@ -261,11 +274,15 @@ def _build_app(
             auth_provider=auth_provider,
             permission_store=permission_store,  # type: ignore[arg-type]
             comment_store=comment_store,
+            file_store=file_store,
+            artifact_store=artifact_store,
         ),
         prefix="/v1",
     )
     app.state.test_store = store
     app.state.test_comment_store = comment_store
+    app.state.test_file_store = file_store
+    app.state.test_artifact_store = artifact_store
     app.state.test_host_registry = host_registry
     app.state.test_auth_provider = auth_provider
     app.state.test_permission_store = permission_store
@@ -273,7 +290,7 @@ def _build_app(
 
 
 @pytest.fixture
-def app(runner_globals_reset: None, db_uri: str) -> FastAPI:
+def app(runner_globals_reset: None, db_uri: str, tmp_path: Path) -> FastAPI:
     """Build the sessions router app with the artifact routes wired."""
     del runner_globals_reset
     store = _ConversationStore({_SESSION_ID: _conversation()}, storage_location=db_uri)
@@ -287,6 +304,8 @@ def app(runner_globals_reset: None, db_uri: str) -> FastAPI:
         permission_store=permission_store,
         host_registry=host_registry,
         comment_store=SqlAlchemyCommentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
     )
     app.state.test_db_uri = db_uri
     return app
@@ -2622,6 +2641,7 @@ async def _post_visitor_comment(
     anchor_content: str | None = None,
     start_index: int = 0,
     end_index: int = 0,
+    screenshot: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     """POST one visitor comment through the real route."""
@@ -2638,6 +2658,8 @@ async def _post_visitor_comment(
         payload["name"] = name
     if anchor_content is not None:
         payload["anchor_content"] = anchor_content
+    if screenshot is not None:
+        payload["screenshot"] = screenshot
     return await client.post("/v1/artifact-comments", json=payload, headers=headers)
 
 
@@ -2678,6 +2700,269 @@ async def test_visitor_comment_open_gate_stores_a_visitor_row(
     assert row.end_index == 11
     assert row.status == "draft"
     assert row.created_by == "visitor:Alice"
+
+
+def _visitor_element_anchor() -> str:
+    return ELEMENT_ANCHOR_PREFIX + json.dumps(
+        {
+            "v": 1,
+            "kind": "element",
+            "target": {"label": "Save"},
+            "rect": {"x": 1, "y": 2, "w": 30, "h": 20},
+            "screenshot": {
+                "file_id": "forged-file",
+                "filename": "owned.png",
+                "width": 1,
+                "height": 1,
+            },
+        }
+    )
+
+
+def _visitor_png() -> dict[str, Any]:
+    image = Image.new("RGB", (2, 3), color=(12, 34, 56))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return {
+        "data_url": "data:image/png;base64," + base64.b64encode(output.getvalue()).decode(),
+        "width": 2,
+        "height": 3,
+    }
+
+
+async def test_visitor_element_screenshot_is_owned_and_expires(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    minted = await _mint(client, view="visit")
+    started = now_epoch()
+    response = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        anchor_content=_visitor_element_anchor(),
+        screenshot=_visitor_png(),
+    )
+    assert response.status_code == 201, response.text
+    assert (
+        started + VISITOR_SCREENSHOT_SECONDS
+        <= response.json()["expires_at"]
+        <= now_epoch() + VISITOR_SCREENSHOT_SECONDS
+    )
+    comment = _comments(app)[0]
+    anchor = parse_element_anchor(comment.anchor_content)
+    assert anchor is not None
+    screenshot = anchor["screenshot"]
+    assert screenshot["file_id"] != "forged-file"
+    assert screenshot["width"] == 2 and screenshot["height"] == 3
+    assert screenshot["expires_at"] == response.json()["expires_at"]
+    stored = app.state.test_file_store.get(screenshot["file_id"], session_id=_SESSION_ID)
+    assert stored is not None
+    marker = stored.source_metadata["visitor_screenshot"]
+    assert marker["comment_id"] == comment.id
+    assert marker["link_key"] == screenshot["link_key"]
+    assert marker["created_at"] + VISITOR_SCREENSHOT_SECONDS == screenshot["expires_at"]
+    files = VisitorScreenshotFiles(app.state.test_file_store, app.state.test_artifact_store)
+    assert files.is_bound(comment, stored.id, marker["created_at"])
+    forged = app.state.test_comment_store.add(
+        conversation_id=_SESSION_ID,
+        path=comment.path,
+        body="forged",
+        start_index=0,
+        end_index=0,
+        anchor_content=comment.anchor_content,
+        created_by="visitor:Other",
+    )
+    assert not files.is_bound(forged, stored.id, marker["created_at"])
+    content = await client.get(f"/v1/sessions/{_SESSION_ID}/resources/files/{stored.id}/content")
+    assert content.status_code == 200
+    assert content.content.startswith(b"\x89PNG")
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_resources.now_epoch",
+        lambda: screenshot["expires_at"],
+    )
+    expired = await client.get(f"/v1/sessions/{_SESSION_ID}/resources/files/{stored.id}/content")
+    assert expired.status_code == 410
+
+
+@pytest.mark.parametrize("fault", ["dimensions", "crc"])
+async def test_visitor_screenshot_rejects_mismatched_image_without_comment(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    fault: str,
+) -> None:
+    minted = await _mint(client, view="visit")
+    screenshot = _visitor_png()
+    if fault == "dimensions":
+        screenshot["width"] = 9
+    else:
+        content = bytearray(base64.b64decode(screenshot["data_url"].split(",", 1)[1]))
+        chunk_type = content.index(b"IDAT")
+        chunk_length = int.from_bytes(content[chunk_type - 4 : chunk_type], "big")
+        content[chunk_type + 4 + chunk_length] ^= 1
+        screenshot["data_url"] = "data:image/png;base64," + base64.b64encode(content).decode()
+    response = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        anchor_content=_visitor_element_anchor(),
+        screenshot=screenshot,
+    )
+    assert response.status_code == 422
+    assert _comments(app) == []
+
+
+async def test_visitor_comment_rejects_oversized_request_before_parsing(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    response = await client.post(
+        "/v1/artifact-comments",
+        content=b"{" + b" " * (3 * 1024 * 1024),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert _comments(app) == []
+
+
+async def test_visitor_screenshot_quota_refuses_before_comment(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    minted = await _mint(client, view="visit")
+    claims = decode_artifact_token(_token_from_url(minted["url"]))
+    assert claims is not None
+    key = hashlib.sha256(
+        f"{claims.session_id}:{claims.key_id}:{claims.root}:{claims.entry}".encode()
+    ).hexdigest()
+    for _ in range(100):
+        app.state.test_file_store.create(
+            session_id=_SESSION_ID,
+            filename="visitor.png",
+            bytes=1,
+            file_id=generate_file_id(),
+            source_metadata={
+                "visitor_screenshot": {
+                    "link_key": key,
+                    "comment_id": generate_file_id(),
+                    "created_at": now_epoch(),
+                }
+            },
+        )
+    response = await _post_visitor_comment(
+        client,
+        _token_from_url(minted["url"]),
+        anchor_content=_visitor_element_anchor(),
+        screenshot=_visitor_png(),
+    )
+    assert response.status_code == 429
+    assert response.json() == {"reason": "screenshot_quota"}
+    assert _comments(app) == []
+
+
+async def test_owner_listing_lazily_cleans_only_expired_marked_files(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    files = app.state.test_file_store
+    artifacts = app.state.test_artifact_store
+    expired = files.create(
+        session_id=_SESSION_ID,
+        filename="old.png",
+        bytes=3,
+        source_metadata={
+            "visitor_screenshot": {
+                "link_key": "a" * 64,
+                "comment_id": generate_file_id(),
+                "created_at": now_epoch() - VISITOR_SCREENSHOT_SECONDS,
+            }
+        },
+    )
+    ordinary = files.create(session_id=_SESSION_ID, filename="ordinary.png", bytes=3)
+    artifacts.put(expired.id, b"old")
+    artifacts.put(ordinary.id, b"new")
+
+    app.include_router(
+        create_comments_router(
+            app.state.test_comment_store,
+            auth_provider=app.state.test_auth_provider,
+            permission_store=app.state.test_permission_store,
+            conversation_store=app.state.test_store,
+            file_store=files,
+            artifact_store=artifacts,
+        ),
+        prefix="/v1",
+    )
+
+    response = await client.get(f"/v1/sessions/{_SESSION_ID}/comments?include_visitor_drafts=1")
+    assert response.status_code == 200, response.text
+    assert files.get(expired.id, session_id=_SESSION_ID) is None
+    assert not artifacts.exists(expired.id)
+    assert files.get(ordinary.id, session_id=_SESSION_ID) is not None
+    assert artifacts.exists(ordinary.id)
+
+
+@pytest.mark.parametrize("delete_fails", [False, True])
+async def test_link_cleanup_counts_remaining_metadata_and_drops_expired(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    delete_fails: bool,
+) -> None:
+    files = app.state.test_file_store
+    artifacts = app.state.test_artifact_store
+    link_key = "b" * 64
+    now = now_epoch()
+    stale = files.create(
+        session_id=_SESSION_ID,
+        filename="stale.png",
+        bytes=3,
+        source_metadata={
+            "visitor_screenshot": {
+                "link_key": link_key,
+                "comment_id": generate_file_id(),
+                "created_at": now - VISITOR_SCREENSHOT_SECONDS,
+            }
+        },
+    )
+    artifacts.put(stale.id, b"old")
+    files.create(
+        session_id=_SESSION_ID,
+        filename="live.png",
+        bytes=3,
+        source_metadata={
+            "visitor_screenshot": {
+                "link_key": link_key,
+                "comment_id": generate_file_id(),
+                "created_at": now,
+            }
+        },
+    )
+    other = files.create(
+        session_id=_SESSION_ID,
+        filename="other.png",
+        bytes=3,
+        source_metadata={
+            "visitor_screenshot": {
+                "link_key": "c" * 64,
+                "comment_id": generate_file_id(),
+                "created_at": now - VISITOR_SCREENSHOT_SECONDS,
+            }
+        },
+    )
+    if delete_fails:
+
+        def fail_delete(key: str) -> None:
+            raise OSError("storage unavailable")
+
+        monkeypatch.setattr(artifacts, "delete", fail_delete)
+    count = VisitorScreenshotFiles(files, artifacts).clean_expired_and_count(
+        _SESSION_ID,
+        link_key=link_key,
+        now=now,
+    )
+    assert count == (2 if delete_fails else 1)
+    assert (files.get(stale.id, session_id=_SESSION_ID) is not None) == delete_fails
+    assert artifacts.exists(stale.id) == delete_fails
+    assert files.get(other.id, session_id=_SESSION_ID) is not None
 
 
 async def test_visitor_comment_nested_root_path_is_joined(

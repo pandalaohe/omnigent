@@ -22,6 +22,8 @@ export interface ElementAnchorScreenshot {
   filename: string;
   width: number;
   height: number;
+  expires_at?: number;
+  link_key?: string;
 }
 
 interface ElementAnchorPage {
@@ -257,7 +259,17 @@ function clampScreenshot(value: unknown): ElementAnchorScreenshot | null {
   const width = boundedInteger(o.width, 1, 4096);
   const height = boundedInteger(o.height, 1, 4096);
   if (width === null || height === null) return null;
-  return { file_id: fileId, filename: clampString(o.filename, 128), width, height };
+  const expiresAt = boundedInteger(o.expires_at, 1, Number.MAX_SAFE_INTEGER);
+  const linkKey =
+    typeof o.link_key === "string" && /^[0-9a-f]{64}$/.test(o.link_key) ? o.link_key : null;
+  return {
+    file_id: fileId,
+    filename: clampString(o.filename, 128),
+    width,
+    height,
+    ...(expiresAt === null ? {} : { expires_at: expiresAt }),
+    ...(linkKey === null ? {} : { link_key: linkKey }),
+  };
 }
 
 /** Encoded size in UTF-8 bytes, the unit the server's 32 KiB cap uses. */

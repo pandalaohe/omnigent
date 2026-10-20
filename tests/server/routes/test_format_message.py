@@ -538,8 +538,8 @@ def test_format_message_unparsable_owner_anchor_renders_as_text() -> None:
     assert "Excerpt:" in result
 
 
-def test_format_message_visitor_element_anchor_renders_as_text() -> None:
-    """A visitor row carrying an element anchor stays a visitor text comment."""
+def test_format_message_visitor_element_anchor_is_untrusted_evidence() -> None:
+    """Visitor geometry and note stay below the untrusted visitor heading."""
     visitor = _make_comment(
         path="reports/q3.html",
         start_index=0,
@@ -551,9 +551,10 @@ def test_format_message_visitor_element_anchor_renders_as_text() -> None:
 
     result = _format_message([visitor])
 
-    assert "Element annotation" not in result
-    assert "<untrusted_page_evidence>" not in result
-    assert "Excerpt:" in result
+    assert "Element annotation 1" in result
+    assert "<untrusted_page_evidence>" in result
+    assert result.index(VISITOR_FEEDBACK_HEADER) < result.index("Element annotation 1")
+    assert "Excerpt:" not in result
     assert 'Visitor comment (Visitor · Alice): "visitor note"' in result
 
 
@@ -599,6 +600,49 @@ def test_annotation_attachments_follow_message_order() -> None:
         {"comment_id": "a1", "file_id": "file_a", "filename": "a.png"},
         {"comment_id": "b1", "file_id": "file_b", "filename": "b.png"},
     ]
+
+
+def test_visitor_image_follows_owner_and_disappears_at_deadline() -> None:
+    """The same ordered batch drives headings and attachment ids on both sides of expiry."""
+    owner = _make_comment(
+        "z.html",
+        0,
+        "owner",
+        comment_id="o1",
+        anchor_content=_element_anchor(screenshot=_screenshot("file_o", "owner.png")),
+    )
+    visitor = _make_comment(
+        "a.html",
+        0,
+        "visitor",
+        comment_id="v1",
+        created_by="visitor:Alice",
+        anchor_content=_element_anchor(
+            screenshot={
+                **_screenshot("file_v", "visitor.png"),
+                "expires_at": 1000,
+            }
+        ),
+    )
+
+    class BoundScreenshot:
+        def is_bound(self, comment: Comment, file_id: str, now: int) -> bool:
+            return comment.id == "v1" and file_id == "file_v" and now < 1000
+
+    registry = BoundScreenshot()
+    live = _format_message([visitor, owner], registry, 999)  # type: ignore[arg-type]
+    live_attachments = _annotation_attachments([visitor, owner], registry, 999)  # type: ignore[arg-type]
+    assert "Element annotation 1 (image 1)" in live
+    assert "Element annotation 2 (image 2)" in live
+    assert [row["file_id"] for row in live_attachments] == ["file_o", "file_v"]
+    assert live_attachments[1]["expires_at"] == 1000
+
+    expired = _format_message([visitor, owner], registry, 1000)  # type: ignore[arg-type]
+    expired_attachments = _annotation_attachments([visitor, owner], registry, 1000)  # type: ignore[arg-type]
+    assert "Element annotation 2 (image" not in expired
+    assert "Element annotation 2" in expired
+    assert "<untrusted_page_evidence>" in expired
+    assert [row["file_id"] for row in expired_attachments] == ["file_o"]
 
 
 def test_annotation_attachments_empty_without_screenshots() -> None:
