@@ -9,21 +9,7 @@ from pathlib import Path
 
 import pytest
 
-
-def _ready_permission_state(tmp_path: Path, session_id: str) -> None:
-    """Model the runner's trusted, ready host cache for extension calls."""
-    (tmp_path / "permission_state.json").write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "host_id": "test-host",
-                "workspace": str(tmp_path),
-                "tier": "ask",
-                "revision": 1,
-                "status": "ready",
-            }
-        )
-    )
+from tests.harnesses.pi_native.helpers import ready_permission_state as _ready_permission_state
 
 
 def test_delivery_cap_drops_followup_without_failed_session_status(

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+from tests.harnesses.pi_native.helpers import ready_permission_state
 
 pytestmark = pytest.mark.skipif(
     shutil.which("node") is None,
@@ -28,10 +29,11 @@ def _prepare_bridge(tmp_path: Path) -> tuple[Path, Path, Path]:
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    ready_permission_state(bridge_dir, "conv_f18_e2e")
     extension_path, config_path = pi_native_bridge.write_extension_files(
         bridge_dir,
         session_id="conv_f18_e2e",
-        server_url="",
+        server_url="http://server.test",
         conversation_url="",
     )
     return bridge_dir, extension_path, config_path
@@ -63,6 +65,19 @@ def _run_extension_scenario(
             const configPath = process.env.OMNIGENT_PI_NATIVE_CONFIG;
             const scenario = process.env.PI_NATIVE_INTERRUPT_SCENARIO;
             const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+            let policyEvaluations = 0;
+
+            global.fetch = async (url, request) => {
+              if (url.endsWith("/events")) {
+                return { ok: true, json: async () => ({}) };
+              }
+              assert(url.endsWith("/policies/evaluate"), `unexpected request: ${url}`);
+              assert(request.headers["X-Omnigent-Permission-Tiers"] === "1", "missing capability");
+              const body = JSON.parse(request.body);
+              assert(body.event.data.expected_permission_tier_revision === 1, "wrong revision");
+              policyEvaluations += 1;
+              return { ok: true, json: async () => ({ result: "POLICY_ACTION_ALLOW" }) };
+            };
 
             function assert(cond, message) {
               if (!cond) throw new Error(message);
@@ -133,6 +148,7 @@ def _run_extension_scenario(
                   !toolResult || toolResult.block !== true,
                   `idle interrupt blocked next turn tool_call: ${JSON.stringify(toolResult)}`,
                 );
+                assert(policyEvaluations === 1, "next turn must still evaluate policy");
               } else if (scenario === "agent_loop_interrupt_without_is_idle") {
                 const turnCtx = makeCtx(undefined);
                 await handlers.session_start({}, turnCtx);
