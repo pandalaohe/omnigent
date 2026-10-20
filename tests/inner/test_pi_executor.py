@@ -1,12 +1,14 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shlex
 import shutil
 import socket
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -16,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
+import psutil
 import pytest
 
 from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -158,6 +161,47 @@ class _FakeProcess:
 
     async def wait(self):
         return self.returncode or 0
+
+
+@pytest.mark.asyncio
+async def test_rpc_close_stops_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RPC teardown reaps a child that ignores termination and leaves its group."""
+    import omnigent.inner.pi_executor as module
+
+    marker = tmp_path / "pids.json"
+    script = tmp_path / "tree.py"
+    script.write_text(
+        "import json, os, subprocess, sys, time\nfrom pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'], "
+        "start_new_session=os.name != 'nt')\n"
+        f"Path({str(marker)!r}).write_text(json.dumps([os.getpid(), child.pid]))\n"
+        "time.sleep(60)\n"
+    )
+
+    async def spawn(*args, **kwargs):
+        return await asyncio.create_subprocess_exec(sys.executable, str(script), **kwargs)
+
+    monkeypatch.setattr(module, "_create_subprocess_exec", spawn)
+    rpc = _PiRpcSession()
+    processes: list[psutil.Process] = []
+    try:
+        await rpc.start("fixture", env=dict(os.environ), cwd=str(tmp_path))
+        async with asyncio.timeout(10):
+            while not marker.exists():
+                await asyncio.sleep(0.01)
+        processes = [psutil.Process(pid) for pid in json.loads(marker.read_text())]
+        await rpc.close()
+        _, alive = await asyncio.to_thread(psutil.wait_procs, processes, timeout=2)
+        assert not alive, f"RPC close left live processes: {[p.pid for p in alive]}"
+    finally:
+        for process in processes:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                process.kill()
+        await asyncio.to_thread(psutil.wait_procs, processes, timeout=2)
+        await rpc.close()
 
 
 # ---------------------------------------------------------------------------

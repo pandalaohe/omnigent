@@ -2243,6 +2243,7 @@ def create_runner_app(
     _ingest_cond: dict[str, asyncio.Condition] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
+    _turn_dispatch_cancellers: dict[str, tuple[int, Callable[[], list[asyncio.Task[object]]]]] = {}
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
@@ -6002,7 +6003,15 @@ def create_runner_app(
             _sweep_dead_turn_slot(conv_id, target)
             return
         _interrupted_sessions.add(conv_id)
+        dispatch_owner = _turn_dispatch_cancellers.get(conv_id)
+        dispatch_tasks = (
+            dispatch_owner[1]()
+            if dispatch_owner is not None and dispatch_owner[0] == turn_epoch
+            else []
+        )
         await _forward_harness_interrupt(conv_id, turn_epoch=turn_epoch)
+        if dispatch_tasks:
+            await asyncio.gather(*dispatch_tasks, return_exceptions=True)
         # Floor: force-cancel the runner Task when we own one. In stream mode
         # there is no Task here — ``_resync_turn_state`` owns the sentinel pop,
         # and direct interrupt/stop callers rely on the forwarded interrupt
@@ -6126,9 +6135,14 @@ def create_runner_app(
         :param response_id: The response id of the turn whose verdict delivery
             failed, or ``None`` if the eval fired before ``response.created``.
         """
-        await _resync_turn_state(
-            conv_id, "verdict_delivery_channel_dead", owner_response_id=response_id
+        # Recovery cancels this policy dispatch; it must run outside its task.
+        task = asyncio.create_task(
+            _resync_turn_state(
+                conv_id, "verdict_delivery_channel_dead", owner_response_id=response_id
+            )
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     async def _resync_turn_state_on_harness_respawn(
         conv_id: str, reason: str, replaced_response_id: str
@@ -8263,6 +8277,26 @@ def create_runner_app(
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
+            _dispatch_tasks: list[_asyncio.Task[object]] = []
+            _dispatch_cancelled = (
+                conv_id in _interrupted_sessions and _turn_bind_epoch.get(conv_id) == stream_epoch
+            )
+
+            def _cancel_dispatch_tasks() -> list[_asyncio.Task[object]]:
+                nonlocal _dispatch_cancelled
+                _dispatch_cancelled = True
+                for task in _dispatch_tasks:
+                    if not task.done():
+                        task.cancel()
+                return _dispatch_tasks
+
+            def _track_dispatch_task(task: _asyncio.Task[object]) -> None:
+                _dispatch_tasks.append(task)
+                if _dispatch_cancelled:
+                    task.cancel()
+
+            _dispatch_owner = (stream_epoch or 0, _cancel_dispatch_tasks)
+            _turn_dispatch_cancellers[conv_id] = _dispatch_owner
             try:
                 async with client.stream(
                     "POST",
@@ -8310,7 +8344,6 @@ def create_runner_app(
 
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
                     _buffer = ""
-                    _dispatch_tasks: list[_asyncio.Task[object]] = []
                     # Sub-agent start edge → minted child id, so the completion
                     # edge can address the child it created. Per-stream.
                     _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
@@ -8568,7 +8601,7 @@ def create_runner_app(
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
                                         )
-                                        _dispatch_tasks.append(
+                                        _track_dispatch_task(
                                             _asyncio.create_task(
                                                 dispatch_tool_locally(
                                                     tool_name=tool_name,
@@ -8616,7 +8649,7 @@ def create_runner_app(
                                     _eval_id = event.get("evaluation_id", "")
                                     _eval_phase = event.get("phase", "")
                                     _eval_data = event.get("data") or {}
-                                    _dispatch_tasks.append(
+                                    _track_dispatch_task(
                                         _asyncio.create_task(
                                             _evaluate_policy_via_omnigent(
                                                 server_client=server_client,
@@ -8664,7 +8697,7 @@ def create_runner_app(
                                             )
                                         )
                                         _subagent_post_chains[_sa_key] = _sa_mint_task
-                                        _dispatch_tasks.append(_sa_mint_task)
+                                        _track_dispatch_task(_sa_mint_task)
                                     continue
 
                                 if _evt_type == "subagent.tool_call":
@@ -8691,7 +8724,7 @@ def create_runner_app(
                                             ),
                                         )
                                         _subagent_post_chains[_sa_tc_key] = _sa_tc_task
-                                        _dispatch_tasks.append(_sa_tc_task)
+                                        _track_dispatch_task(_sa_tc_task)
                                     continue
 
                                 if _evt_type == "subagent.completed":
@@ -8714,7 +8747,7 @@ def create_runner_app(
                                             ),
                                         )
                                         _subagent_post_chains[_sa_done_key] = _sa_done_task
-                                        _dispatch_tasks.append(_sa_done_task)
+                                        _track_dispatch_task(_sa_done_task)
                                     continue
 
                             if event is None:
@@ -8828,6 +8861,13 @@ def create_runner_app(
                     source="harness",
                     input_stable_id=turn_input_stable_id,
                 )
+            finally:
+                # Dispatches outlive individual SSE frames, but belong to this turn.
+                _cancel_dispatch_tasks()
+                if _dispatch_tasks:
+                    await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
+                if _turn_dispatch_cancellers.get(conv_id) is _dispatch_owner:
+                    _turn_dispatch_cancellers.pop(conv_id, None)
 
         async def proxy_stream() -> AsyncIterator[bytes]:
             try:

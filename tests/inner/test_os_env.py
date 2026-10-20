@@ -10,7 +10,9 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
+import threading
 import time
 import tracemalloc
 from pathlib import Path
@@ -224,6 +226,104 @@ def test_shell_timeout_stops_descendants(tmp_path: Path, layout: str) -> None:
                 process.kill()
         psutil.wait_procs(processes, timeout=2)
         os_env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "close"])
+async def test_shell_cancellation_stops_owned_tree(tmp_path: Path, action: str) -> None:
+    """Cancelling a shell or closing its environment must stop detached descendants."""
+    from omnigent.inner.async_utils import run_sync_on_thread
+
+    marker = tmp_path / "pids.json"
+    script = tmp_path / "tree.py"
+    script.write_text(
+        "import json, os, subprocess, sys, time\nfrom pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "start_new_session=os.name != 'nt')\n"
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]))\n"
+        "time.sleep(60)\n"
+    )
+    argv = [sys.executable, str(script), str(marker)]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    environment = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert environment is not None
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    task = asyncio.create_task(environment.shell(command, timeout=30))
+    close_task = None
+    processes: list[psutil.Process] = []
+    try:
+        async with asyncio.timeout(10):
+            while not marker.exists():
+                await asyncio.sleep(0.01)
+        processes = [psutil.Process(pid) for pid in json.loads(marker.read_text())]
+        if action == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            close_task = asyncio.create_task(run_sync_on_thread(environment.close))
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=3)
+        _, alive = await asyncio.to_thread(psutil.wait_procs, processes, timeout=2)
+        assert not alive, f"{action} left live processes: {[p.pid for p in alive]}"
+        assert unrelated.poll() is None
+        if action == "cancel":
+            # Shared environments must remain usable after interrupting one request.
+            assert (await environment.read(str(script)))["content"]
+    finally:
+        for process in processes:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                process.kill()
+        await asyncio.to_thread(psutil.wait_procs, processes, timeout=2)
+        unrelated.terminate()
+        await asyncio.to_thread(unrelated.wait, timeout=3)
+        await run_sync_on_thread(environment.close)
+        if close_task is not None:
+            await close_task
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_shell_does_not_execute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled request waiting for the shared helper lock must have no side effects."""
+    from omnigent.inner.async_utils import run_sync_on_thread
+
+    environment = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert environment is not None
+    helper = environment._helper
+    entered, done = threading.Event(), threading.Event()
+    request = helper.request
+
+    def queued(*args: object, **kwargs: object) -> object:
+        entered.set()
+        try:
+            return request(*args, **kwargs)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(helper, "request", queued)
+    marker = tmp_path / "must-not-run"
+    argv = [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    helper._lock.acquire()
+    try:
+        task = asyncio.create_task(environment.shell(command))
+        assert await run_sync_on_thread(entered.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        helper._lock.release()
+        assert await run_sync_on_thread(done.wait, 3)
+        await run_sync_on_thread(environment.close)
+    assert not marker.exists()
 
 
 # ---------------------------------------------------------------------------
