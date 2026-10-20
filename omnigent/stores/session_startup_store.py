@@ -83,15 +83,28 @@ class SessionStartupStore:
         return deployment, host
 
     def configure(
-        self, host_id: str, *, host_resident_limit: int, deployment_resident_limit: int
+        self,
+        host_id: str,
+        *,
+        host_resident_limit: int,
+        deployment_resident_limit: int,
+        startup_limit: int = 2,
     ) -> None:
-        if min(host_resident_limit, deployment_resident_limit) < 1:
-            raise ValueError("Resident limits must be positive")
+        if (
+            any(
+                type(value) is not int
+                for value in (host_resident_limit, deployment_resident_limit, startup_limit)
+            )
+            or min(host_resident_limit, deployment_resident_limit) < 1
+            or startup_limit not in (1, 2)
+        ):
+            raise ValueError("Resident limits must be positive and startup limit must be 1 or 2")
 
         def write(db: Session) -> None:
             deployment, host = self._budgets(db, host_id)
             deployment.resident_limit = deployment_resident_limit
             host.resident_limit = host_resident_limit
+            host.startup_limit = startup_limit
 
         run_write_transaction(self._session, "configure_capacity", write)
 
@@ -226,7 +239,7 @@ class SessionStartupStore:
                 host.fenced
                 or deployment.resident_limit == 0
                 or host.resident_limit == 0
-                or count(*scope, SqlSessionStartup.occupied.is_(True)) >= 2
+                or count(*scope, SqlSessionStartup.occupied.is_(True)) >= host.startup_limit
                 or count(*scope, SqlSessionStartup.resident.is_(True)) >= host.resident_limit
                 or count(SqlSessionStartup.resident.is_(True)) >= deployment.resident_limit
             ):

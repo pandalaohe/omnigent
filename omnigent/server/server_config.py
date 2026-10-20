@@ -51,6 +51,37 @@ SESSION_TITLE_INSTRUCTIONS_KEY = "session_title_instructions"
 SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 
 
+@dataclass(frozen=True)
+class StartupAdmissionPolicy:
+    host_resident_limit: int
+    deployment_resident_limit: int
+    startup_limit: int
+
+
+def startup_admission_policy(config: Mapping[str, Any]) -> StartupAdmissionPolicy | None:
+    """Enabling admission requires explicit capacity; invalid enabled policy is fatal."""
+    raw = config.get("startup_admission")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or type(raw.get("enabled", False)) is not bool:
+        raise ValueError("startup_admission requires a boolean enabled setting")
+    if not raw.get("enabled", False):
+        return None
+    host = raw.get("host_resident_limit")
+    deployment = raw.get("deployment_resident_limit")
+    starts = raw.get("startup_limit", 2)
+    if (
+        type(host) is not int
+        or host < 1
+        or type(deployment) is not int
+        or deployment < 1
+        or type(starts) is not int
+        or starts not in (1, 2)
+    ):
+        raise ValueError("startup_admission requires positive resident limits and 1–2 starts")
+    return StartupAdmissionPolicy(host, deployment, starts)
+
+
 def resolve_config_path() -> Path | None:
     """Resolve the server config file path, or ``None`` if there is none.
 
