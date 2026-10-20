@@ -128,10 +128,11 @@ async def test_idle_edge_clears_session_with_pending_rotation(
         *,
         command: str,
         timeout_s: float,
+        ready_timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
     ) -> None:
-        del timeout_s, auto_confirm, confirm_hint
+        del timeout_s, ready_timeout_s, auto_confirm, confirm_hint
         injected.append((bridge_dir, command))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)

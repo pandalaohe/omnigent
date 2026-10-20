@@ -6888,6 +6888,7 @@ async def test_generic_catalog_discovery_does_not_block_runtime(
         )
 
     monkeypatch.setattr(pi_mod, "pi_generic_model_json_entry", discover)
+    monkeypatch.setattr(pi_mod, "_fetch_shell_command_token", AsyncMock(return_value="synthetic"))
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", spawn)
     monkeypatch.setattr(pi_mod, "_find_pi_cli", lambda: "/usr/bin/pi")
     model = "system.ai.gpt-5" if destination == "mixed-databricks" else "custom-model"

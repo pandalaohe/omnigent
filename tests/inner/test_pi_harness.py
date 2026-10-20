@@ -102,6 +102,51 @@ def test_permission_bootstrap_requires_harness_auth() -> None:
     assert response.status_code == 401
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [True, False])
+async def test_recreated_pi_adapter_binds_trusted_conversation_before_turn(monkeypatch, bound):
+    import asyncio
+
+    from omnigent.inner.executor import MockExecutor, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    adapters = []
+    seen = []
+
+    def capture_adapter(**kwargs):
+        adapter = ExecutorAdapter(**kwargs)
+        adapters.append(adapter)
+        return adapter
+
+    async def capture_turn(messages, tools, system_prompt, config=None):
+        seen.append(messages[0]["session_id"])
+        yield TurnComplete()
+
+    executor = MockExecutor()
+    monkeypatch.setattr(executor, "run_turn", capture_turn)
+    monkeypatch.setattr(pi_harness, "_build_pi_executor", lambda: executor)
+    monkeypatch.setattr(pi_harness, "ExecutorAdapter", capture_adapter)
+    for _ in range(2):
+        app = pi_harness.create_app()
+        if bound:
+            app.state.conversation_id = "trusted-pi-session"
+        ctx = TurnContext(
+            response_id="response",
+            event_queue=asyncio.Queue(),
+            cancelled=asyncio.Event(),
+            session_id="trusted-pi-session",
+        )
+        request = CreateResponseRequest(model="test-agent", input="hello")
+        if bound:
+            await adapters[-1].run_turn(request, ctx)
+        else:
+            with pytest.raises(ValueError, match="trusted conversation"):
+                await adapters[-1].run_turn(request, ctx)
+    assert seen == (["trusted-pi-session"] * 2 if bound else [])
+
+
 @pytest.mark.parametrize("value", [None, "true", "false"])
 def test_executor_factory_reads_context_files(
     monkeypatch: pytest.MonkeyPatch, value: str | None

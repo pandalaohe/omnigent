@@ -352,7 +352,7 @@ def test_additive_migration_roundtrip(tmp_path: Path) -> None:
     uri = f"sqlite:///{tmp_path / 'migration.db'}"
     config = _build_alembic_config(uri)
     command.upgrade(config, "a31c20261019")
-    assert ScriptDirectory.from_config(config).get_heads() == ["a32c20261020"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["a33c20261020"]
     engine = create_engine(uri)
     with engine.begin() as connection:
         connection.execute(

@@ -951,7 +951,7 @@ def http_client(live_server: str) -> Iterator[httpx.Client]:
     with httpx.Client(
         base_url=live_server,
         timeout=300,
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, "X-Omnigent-Permission-Tiers": "1"},
     ) as client:
         yield client
 

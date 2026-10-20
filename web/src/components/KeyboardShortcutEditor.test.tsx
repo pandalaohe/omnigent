@@ -58,7 +58,8 @@ describe("KeyboardShortcutEditor", () => {
 
     const row = actionRow("Start a new session");
     expect(within(row).getByText("Ctrl")).toBeTruthy();
-    expect(within(row).getByText("N")).toBeTruthy();
+    expect(within(row).getByText("O")).toBeTruthy();
+    expect(within(row).getByText("⇧")).toBeTruthy();
   });
 
   it("records and persists a common shortcut inline", () => {
@@ -116,7 +117,7 @@ describe("KeyboardShortcutEditor", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Record common shortcut for Open command palette" }),
     );
-    fireEvent.keyDown(window, { key: "n", code: "KeyN", ctrlKey: true, altKey: true });
+    fireEvent.keyDown(window, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
 
     expect(screen.getByText(/already used by Start a new session/i)).toBeTruthy();
     expect(resolveShortcutBindings("commandPalette", "windows")).toEqual([

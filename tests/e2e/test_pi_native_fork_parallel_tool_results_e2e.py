@@ -171,7 +171,10 @@ def pi_fork_rig(
                 base_url=base_url,
                 trust_env=False,
                 timeout=30,
-                headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+                headers={
+                    "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+                    "X-Omnigent-Permission-Tiers": "1",
+                },
             ) as client,
             (tmp_path / "runner.log").open("w") as log,
         ):

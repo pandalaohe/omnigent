@@ -303,7 +303,16 @@ def create_app() -> FastAPI:
         ``pi`` CLI surfaces as a request-time error, not a
         FastAPI app-boot crash).
     """
-    adapter = ExecutorAdapter(executor_factory=_build_pi_executor)
+
+    def build_executor() -> Executor:
+        # A restarted harness has not seen bootstrap; its runner binding is stable.
+        session_id = getattr(app.state, "conversation_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Pi requires a trusted conversation binding")
+        adapter._session_key = session_id
+        return _build_pi_executor()
+
+    adapter = ExecutorAdapter(executor_factory=build_executor)
     app = adapter.build()
 
     @app.post("/v1/sessions/{conversation_id}/settings")

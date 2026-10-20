@@ -13,6 +13,7 @@ from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_VALUE,
     TIER_HARNESSES,
     BoundToolCall,
+    permission_execution_host_id,
     read_permission_state,
 )
 
@@ -71,11 +72,11 @@ async def inspect_permission_call(
             return InspectedPermissionCall(None, TierDecision(Verdict.ALLOW))
         if not isinstance(arguments, dict) or not isinstance(call_id, str):
             return _denied("Permission check requires object arguments and a stable call id")
-        if not conversation.host_id:
-            return _denied("Permission check requires a verified execution host")
         binding = BoundToolCall.bind(
             session_id=conversation.id,
-            host_id=conversation.host_id,
+            host_id=permission_execution_host_id(
+                host_id=conversation.host_id, runner_id=conversation.runner_id
+            ),
             call_id=call_id,
             name=name,
             arguments=arguments,
@@ -233,7 +234,8 @@ async def authorize_permission_call(
         current = await asyncio.to_thread(conversation_store.get_conversation, binding.session_id)
         if (
             current is None
-            or current.host_id != binding.host_id
+            or permission_execution_host_id(host_id=current.host_id, runner_id=current.runner_id)
+            != binding.host_id
             or harness is None
             or harness not in TIER_HARNESSES
         ):

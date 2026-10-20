@@ -160,9 +160,12 @@ def test_pi_run_prompt_settings(
         tools = {tool["function"]["name"]: tool["function"] for tool in request["tools"]}
         assert tools["sys_read_inbox"]["parameters"]["type"] == "object"
         assert "Drain the inbox" in tools["sys_read_inbox"]["description"]
-    assert any(
-        "Inbox is empty" in str(message.get("content", ""))
+    tool_messages = [
+        message
         for request in requests
         for message in request["messages"]
         if message["role"] == "tool"
-    ), "The real inbox tool result must reach the model on its next request"
+    ]
+    assert any("Inbox is empty" in str(message.get("content", "")) for message in tool_messages), (
+        f"The real inbox tool result must reach the model on its next request: {tool_messages}"
+    )

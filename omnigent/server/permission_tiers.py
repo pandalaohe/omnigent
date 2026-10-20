@@ -50,6 +50,15 @@ def strip_creation_permission_labels(labels: dict[str, str]) -> None:
             del labels[key]
 
 
+def permission_execution_host_id(*, host_id: str | None, runner_id: str | None) -> str:
+    """Hostless CLI sessions bind authority to their server-assigned runner."""
+    if host_id:
+        return host_id
+    if runner_id:
+        return f"runner:{runner_id}"
+    raise ValueError("Permission check requires a verified execution host")
+
+
 def tier_label_key(harness: str) -> str:
     if harness == "antigravity-native":
         return AGY_PERMISSION_TIER_LABEL_KEY

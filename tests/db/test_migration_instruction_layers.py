@@ -128,12 +128,11 @@ def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(db_uri:
             finally:
                 sa.event.remove(engine, "before_cursor_execute", interrupt_older_downgrade)
             with engine.connect() as connection:
-                assert (
+                assert set(
                     connection.execute(
                         sa.text("SELECT version_num FROM alembic_version")
-                    ).scalar_one()
-                    == _MIGRATION
-                )
+                    ).scalars()
+                ) == {_MIGRATION, "nf12ab34cd56"}
             assert "scope" not in {
                 column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
             }

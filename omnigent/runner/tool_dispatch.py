@@ -1981,8 +1981,8 @@ async def _session_snapshot(
     inheritance so one dispatch costs at most one session read.
     """
     try:
-        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
-    except (httpx.HTTPError, RuntimeError):
+        resp = await server_client.get(_session_url(conversation_id), timeout=10.0)
+    except (httpx.HTTPError, ValueError, RuntimeError):
         return None
     if resp.status_code != 200:
         return None

@@ -43,6 +43,59 @@ def _runtime(tmp_path: Path, tier: str) -> PermissionTierRuntime:
     return runtime
 
 
+@pytest.mark.parametrize("runner_id", ["runner-a", None])
+def test_cli_permission_fence_uses_authenticated_runner_binding(tmp_path, monkeypatch, runner_id):
+    path = tmp_path / "permission_state.json"
+    monkeypatch.setattr(PermissionTierRuntime, "state_path", staticmethod(lambda *_: path))
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=2,
+        server_version="test",
+        session_id="cli-session",
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=1,
+            updated_at=1,
+            host_id=None,
+            runner_id=runner_id,
+            workspace=str(tmp_path),
+            labels=ConfirmedPermissionState("auto", 1, "blocked").labels("pi"),
+        ),
+    )
+    runtime = PermissionTierRuntime()
+    if runner_id is None:
+        with pytest.raises(ValueError, match="trusted host snapshot"):
+            runtime.fence_start(envelope, "pi")
+        assert not path.exists()
+    else:
+        runtime.fence_start(envelope, "pi")
+        state = json.loads(path.read_text())
+        assert state["host_id"] == "runner:runner-a"
+        assert state["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("name", "local_execution", "expected"),
+    [
+        ("sys_read_inbox", True, "ALLOW"),
+        ("sys_read_inbox", False, "DENY"),
+        ("unknown_control", True, "DENY"),
+    ],
+)
+def test_framework_inbox_requires_local_execution(
+    tmp_path: Path, name: str, local_execution: bool, expected: str
+) -> None:
+    runtime = _runtime(tmp_path, "auto")
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="inbox",
+        name=name,
+        arguments={},
+        expected_revision=3,
+        local_execution=local_execution,
+    )
+    assert decision.action.value == expected
+
+
 def test_remote_tool_name_cannot_impersonate_local_write(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path, "auto")
     binding, decision = runtime.inspect(

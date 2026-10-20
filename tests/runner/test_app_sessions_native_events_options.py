@@ -3556,7 +3556,7 @@ async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn(harn
     )
 
     sid = "b1d0f6a2c3e14f5a9b8c7d6e5f403122"
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi" if harness == "pi" else None) as client:
         create_resp = await client.post(
             "/v1/sessions",
             json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},

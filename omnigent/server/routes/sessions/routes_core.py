@@ -4909,11 +4909,23 @@ def register_core_routes(
                             exc_info=True,
                         )
                     else:
-                        from omnigent.server.runner_session_init import runner_inference_verified
+                        from omnigent.server.runner_session_init import (
+                            runner_inference_verified,
+                            runner_permission_verified,
+                        )
+
+                        initializer = getattr(
+                            request.app.state, "runner_session_initializer", None
+                        )
+                        if initializer is not None:
+                            runner_init_resp = await initializer.confirm_permission_ready(
+                                conv, runner_init_resp, store_slots=None
+                            )
 
                         parent_initialized = (
                             runner_init_resp.status_code < 400
                             and runner_inference_verified(conv, runner_init_resp)
+                            and runner_permission_verified(conv, runner_init_resp)
                         )
                 if (
                     conv is not None

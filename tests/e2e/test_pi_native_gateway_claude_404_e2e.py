@@ -500,6 +500,7 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_p
         bridge_cfg = json.loads((bridge / "config.json").read_text())
         server_url = bridge_cfg.get("serverUrl")
         auth_headers = bridge_cfg.get("authHeaders") or {}
+        auth_headers["X-Omnigent-Permission-Tiers"] = "1"
         assert server_url, f"bridge config.json missing serverUrl: {bridge_cfg!r}"
 
         with httpx.Client(timeout=30.0, trust_env=False) as client:

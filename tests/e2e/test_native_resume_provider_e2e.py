@@ -141,7 +141,10 @@ def test_connected_native_resume_routes_to_configured_provider(
             base_url=stack.base_url,
             trust_env=False,
             timeout=60,
-            headers={"x-omnigent-background-session-titles": "off"},
+            headers={
+                "x-omnigent-background-session-titles": "off",
+                "X-Omnigent-Permission-Tiers": "1",
+            },
         ) as client,
     ):
         if harness == "claude":

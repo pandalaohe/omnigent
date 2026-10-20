@@ -594,6 +594,7 @@ def test_cli_imports_jsonl_harness_chat_end_to_end(
     imported_session_id = match.group(1)
     session = httpx.get(
         f"{live_server}/v1/sessions/{imported_session_id}",
+        headers={"X-Omnigent-Permission-Tiers": "1"},
         params={"include_items": "false", "include_liveness": "false"},
         timeout=10,
     )

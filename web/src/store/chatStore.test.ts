@@ -3,7 +3,7 @@
 // `switchTo` opens the session SSE stream and hydrates session
 // metadata plus committed item history. We mock `fetch` at the global so we
 // control:
-//   - `GET  /v1/sessions/{id}/stream`  → empty SSE body (pump
+//   - `GET  /v1/sessions/{id}/stream?permission_tiers=1`  → empty SSE body (pump
 //     terminates immediately, no blocks delivered)
 //   - `GET  /v1/sessions/{id}`         → session metadata snapshot
 //   - `GET  /v1/sessions/{id}/items`   → paginated committed items
@@ -295,7 +295,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
   // ?include_items=false&include_liveness=false, which must not leak into
   // the matched session id below.
   const path = url.split("?")[0]!;
-  if (url.match(/\/v1\/sessions\/[^/]+\/stream$/)) return streamResponse();
+  if (url.match(/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/)) return streamResponse();
   const itemsMatch = url.match(/^\/v1\/sessions\/([^/]+)\/items(?:\?.*)?$/);
   if (itemsMatch) {
     const sessionId = itemsMatch[1]!;
@@ -666,7 +666,7 @@ describe("temporary conversations", () => {
 
 describe("test harness teardown", () => {
   it("settles a parked SSE reader, which aborting alone cannot do", async () => {
-    // Guards the `afterEach` contract. The default `/stream` mock stays open (so
+    // Guards the `afterEach` contract. The default `/stream?permission_tiers=1` mock stays open (so
     // background retention is exercised faithfully), but `mockResponse` returns a
     // plain object with no fetch plumbing — so aborting the store's controller
     // never errors the body, and `parseSseStream` would stay parked on
@@ -999,7 +999,9 @@ describe("chatStore — lazy subtree usage", () => {
     }
 
     function streamOpenCount(): number {
-      return fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/stream")).length;
+      return fetchMock.mock.calls.filter(([input]) =>
+        String(input).endsWith("/stream?permission_tiers=1"),
+      ).length;
     }
 
     function metadataSnapshotCount(): number {
@@ -1193,7 +1195,8 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_a");
     expect(useChatStore.getState().blocks).toHaveLength(1);
     const streamOpens = () =>
-      fetchMock.mock.calls.filter(([input]) => String(input).includes("/stream")).length;
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/stream?permission_tiers=1"))
+        .length;
     const opensAfterA = streamOpens();
 
     await useChatStore.getState().switchTo("conv_b");
@@ -1280,7 +1283,7 @@ describe("chatStore — switchTo", () => {
     const base = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_native_revisit/stream") {
+      if (url === "/v1/sessions/conv_native_revisit/stream?permission_tiers=1") {
         return mockResponse(null, { bodyStream: sink.stream });
       }
       return base(input, init);
@@ -1337,7 +1340,7 @@ describe("chatStore — switchTo", () => {
     const base = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_bgsend/stream")
+      if (url === "/v1/sessions/conv_bgsend/stream?permission_tiers=1")
         return mockResponse(null, { bodyStream: sink.stream });
       return base(input, init);
     });
@@ -1395,7 +1398,7 @@ describe("chatStore — switchTo", () => {
     const base = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_dead/stream")
+      if (url === "/v1/sessions/conv_dead/stream?permission_tiers=1")
         return mockResponse(null, { bodyStream: sink.stream });
       return base(input, init);
     });
@@ -1501,7 +1504,7 @@ describe("chatStore — switchTo", () => {
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         // Honor the attempt abort like the real fetch does, so the wake
@@ -1616,7 +1619,7 @@ describe("chatStore — switchTo", () => {
     const base = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_a/stream")
+      if (url === "/v1/sessions/conv_a/stream?permission_tiers=1")
         return mockResponse(null, { bodyStream: sink.stream });
       return base(input, init);
     });
@@ -2007,7 +2010,7 @@ describe("chatStore — switchTo", () => {
     ]);
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url.match(/\/v1\/sessions\/[^/]+\/stream$/)) {
+      if (url.match(/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/)) {
         return new Promise<Response>((_, reject) => {
           init?.signal?.addEventListener(
             "abort",
@@ -2993,7 +2996,7 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_abc");
 
     const streamCall = fetchMock.mock.calls.find(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_abc/stream"),
+      String(u).endsWith("/v1/sessions/conv_abc/stream?permission_tiers=1"),
     );
     expect(streamCall).toBeDefined();
   });
@@ -3152,7 +3155,7 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(calls[0]).toEqual({ url: "/v1/sessions", method: "POST" });
     expect(calls[1]).toEqual({ url: "/v1/runners", method: "GET" });
     expect(calls[2]).toEqual({ url: "/v1/sessions/conv_new", method: "PATCH" });
-    expect(calls[3]?.url).toBe("/v1/sessions/conv_new/stream");
+    expect(calls[3]?.url).toBe("/v1/sessions/conv_new/stream?permission_tiers=1");
     const metadataIndex = calls.findIndex(
       (call) => call.url.split("?")[0] === "/v1/sessions/conv_new" && call.method === "GET",
     );
@@ -3550,7 +3553,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Order: open stream → metadata/items hydration → POST event.
     // Asserting position (not just presence) is the proof that the
     // rebind happened BEFORE the POST.
-    expect(calls[0]?.url).toBe("/v1/sessions/conv_existing/stream");
+    expect(calls[0]?.url).toBe("/v1/sessions/conv_existing/stream?permission_tiers=1");
     const metadataIndex = calls.findIndex(
       (call) => call.url.split("?")[0] === "/v1/sessions/conv_existing" && call.method === "GET",
     );
@@ -3579,7 +3582,7 @@ describe("chatStore — send (first-send ordering)", () => {
     const openedStreams: AbortSignal[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_two_subs/stream") {
+      if (url === "/v1/sessions/conv_two_subs/stream?permission_tiers=1") {
         if (init?.signal) openedStreams.push(init.signal);
         return mockResponse(null, { bodyStream: pushableStream().stream });
       }
@@ -3621,7 +3624,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // and the message reaches the server even without a live stream.
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/v1/sessions/conv_existing/stream")) {
+      if (url.endsWith("/v1/sessions/conv_existing/stream?permission_tiers=1")) {
         return mockResponse({}, { ok: false, status: 500 });
       }
       return defaultFetchHandler(input, init);
@@ -4049,7 +4052,7 @@ describe("chatStore — send (first-send ordering)", () => {
     });
 
     const streamOpens = fetchMock.mock.calls.filter(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_new/stream"),
+      String(u).endsWith("/v1/sessions/conv_new/stream?permission_tiers=1"),
     );
     expect(streamOpens).toHaveLength(1);
   });
@@ -4218,7 +4221,11 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       ([u, init]) => String(u).endsWith("/events") && init?.method === "POST",
     );
     expect(posts).toHaveLength(0);
-    expect(fetchMock.mock.calls.some(([u]) => String(u).endsWith("/conv_real/stream"))).toBe(true);
+    expect(
+      fetchMock.mock.calls.some(([u]) =>
+        String(u).endsWith("/conv_real/stream?permission_tiers=1"),
+      ),
+    ).toBe(true);
     expect(useChatStore.getState().pendingUserMessages).toEqual([
       expect.objectContaining({ posted: true, initialDraft: undefined }),
     ]);
@@ -4471,7 +4478,9 @@ describe("chatStore — cancel first message during session creation", () => {
 
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
     expect(
-      fetchMock.mock.calls.filter(([url]) => String(url) === "/v1/sessions/conv_cancelled/stream"),
+      fetchMock.mock.calls.filter(
+        ([url]) => String(url) === "/v1/sessions/conv_cancelled/stream?permission_tiers=1",
+      ),
     ).toHaveLength(1);
     expect(navigate).toHaveBeenCalledWith("/c/conv_cancelled", { replace: true });
     expect(useChatStore.getState()).toMatchObject({
@@ -5666,7 +5675,9 @@ describe("chatStore — sendSlashCommand", () => {
     // step were dropped the create + callback would still fire, so assert it
     // explicitly rather than relying on createdId.)
     expect(calls.some((c) => c.url === "/v1/runners" && c.method === "GET")).toBe(true);
-    expect(calls.some((c) => c.url === "/v1/sessions/conv_new/stream")).toBe(true);
+    expect(calls.some((c) => c.url === "/v1/sessions/conv_new/stream?permission_tiers=1")).toBe(
+      true,
+    );
     expect(calls.at(-1)).toMatchObject({
       url: "/v1/sessions/conv_new/events",
       method: "POST",
@@ -8770,7 +8781,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     it("dismisses only the conversation whose background stream produced text", async () => {
       const sink = pushableStream();
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        if (String(input) === "/v1/sessions/conv_abc/stream") {
+        if (String(input) === "/v1/sessions/conv_abc/stream?permission_tiers=1") {
           return mockResponse(null, { bodyStream: sink.stream });
         }
         return defaultFetchHandler(input, init);
@@ -14494,13 +14505,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   const setState = useChatStore.setState as unknown as Parameters<typeof startStreamPump>[2];
   const getState = useChatStore.getState as unknown as Parameters<typeof startStreamPump>[3];
 
-  /** Route `/stream` opens to controllable sinks; everything else hits the
+  /** Route `/stream?permission_tiers=1` opens to controllable sinks; everything else hits the
    *  default handler. Returns the growing list of opened stream sinks. */
   function routeStreamOpens(epochs: readonly string[] = []): StreamSink[] {
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         const response = mockResponse(null, { bodyStream: sink.stream });
@@ -14566,7 +14577,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let permitReconnect = false;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         if (sinks.length > 0 && !permitReconnect)
           return mockResponse({}, { ok: false, status: 503 });
         const sink = pushableStream();
@@ -15219,7 +15230,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     seedSession("conv_401_blank", []);
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         return mockResponse({}, { ok: false, status: 401 });
       }
       return defaultFetchHandler(input, init);
@@ -15256,7 +15267,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     seedSession("conv_401_visible", [response]);
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         return mockResponse({}, { ok: false, status: 401 });
       }
       return defaultFetchHandler(input, init);
@@ -15293,7 +15304,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let opens = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         opens += 1;
         return mockResponse({}, { ok: false, status: 404 });
       }
@@ -15327,7 +15338,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let opens = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         opens += 1;
         // A reverse proxy 404s the first few opens (backend mid-restart);
         // the next one succeeds once it's back.
@@ -15366,7 +15377,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let reconcileFetches = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         opens += 1;
         // First open fails transiently (500 → retry); the second succeeds.
         if (opens === 1) return mockResponse({}, { ok: false, status: 500 });
@@ -15574,7 +15585,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let releaseItems: ((response: Response) => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         return mockResponse(null, { bodyStream: sink.stream });
@@ -16375,7 +16386,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let snapshotFetches = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_heartbeat_gap/stream") {
+      if (url === "/v1/sessions/conv_heartbeat_gap/stream?permission_tiers=1") {
         streamOpens += 1;
         init?.signal?.addEventListener("abort", () =>
           sink.error(new DOMException("aborted", "AbortError")),
@@ -16433,7 +16444,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let snapshotFetches = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === `/v1/sessions/${id}/stream`) {
+      if (url === `/v1/sessions/${id}/stream?permission_tiers=1`) {
         init?.signal?.addEventListener("abort", () =>
           sink.error(new DOMException("aborted", "AbortError")),
         );
@@ -16565,7 +16576,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let resolveSnapshot: ((response: Response) => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_status_race/stream") {
+      if (url === "/v1/sessions/conv_status_race/stream?permission_tiers=1") {
         init?.signal?.addEventListener("abort", () =>
           sink.error(new DOMException("aborted", "AbortError")),
         );
@@ -16628,7 +16639,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let resolveSnapshot: ((response: Response) => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_same_status_race/stream") {
+      if (url === "/v1/sessions/conv_same_status_race/stream?permission_tiers=1") {
         init?.signal?.addEventListener("abort", () =>
           sink.error(new DOMException("aborted", "AbortError")),
         );
@@ -16706,7 +16717,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let snapshotFetches = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_independent_snapshot/stream") {
+      if (url === "/v1/sessions/conv_independent_snapshot/stream?permission_tiers=1") {
         init?.signal?.addEventListener("abort", () =>
           sink.error(new DOMException("aborted", "AbortError")),
         );
@@ -16747,7 +16758,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let snapshotFetches = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_status_timeout/stream") {
+      if (url === "/v1/sessions/conv_status_timeout/stream?permission_tiers=1") {
         init?.signal?.addEventListener("abort", () =>
           sink.error(new DOMException("aborted", "AbortError")),
         );
@@ -16801,7 +16812,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let opens = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         opens += 1;
         // An expired auth ingress: the fetch follows its redirect to a 200
         // text/html login page instead of the SSE body.
@@ -16836,7 +16847,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         init?.signal?.addEventListener("abort", () =>
@@ -17005,7 +17016,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       let holdItems = false;
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
-        if (url === `/v1/sessions/${id}/stream`) {
+        if (url === `/v1/sessions/${id}/stream?permission_tiers=1`) {
           const sink = pushableStream();
           sinks.push(sink);
           return mockResponse(null, { bodyStream: sink.stream });
@@ -17083,7 +17094,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let injectedFreshCompletion = false;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         return mockResponse(null, { bodyStream: sink.stream });
@@ -17198,7 +17209,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let releaseBackfill: (() => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         return mockResponse(null, { bodyStream: sink.stream });
@@ -17528,7 +17539,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      const match = /\/v1\/sessions\/([^/?]+)\/stream(\?idle=true)?$/.exec(url);
+      const match = /\/v1\/sessions\/([^/?]+)\/stream\?permission_tiers=1(&idle=true)?$/.exec(url);
       if (match) {
         opened.push({ id: match[1]!, idle: match[2] !== undefined });
         const sink = pushableStream();
@@ -17610,7 +17621,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
         const path = url.split("?")[0]!;
-        const streamMatch = /^\/v1\/sessions\/([^/]+)\/stream$/.exec(path);
+        const streamMatch = /^\/v1\/sessions\/([^/]+)\/stream(?:\?.*)?$/.exec(path);
         if (streamMatch) {
           const open: StreamOpen = { headers: new Headers(init?.headers), aborted: false };
           opens.push(open);
@@ -19066,14 +19077,14 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
   const setState = useChatStore.setState as unknown as Parameters<typeof startStreamPump>[2];
   const getState = useChatStore.getState as unknown as Parameters<typeof startStreamPump>[3];
 
-  /** Route `/stream` opens to controllable sinks; everything else hits the
+  /** Route `/stream?permission_tiers=1` opens to controllable sinks; everything else hits the
    *  default handler. Duplicated from the reconnect-loop describe for
    *  fixture locality. */
   function routeStreamOpens(): StreamSink[] {
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         return mockResponse(null, { bodyStream: sink.stream });

@@ -603,7 +603,7 @@ class RunnerSessionInitializer:
                 self._conversation_store.get_conversation, conversation.id
             )
 
-    async def _confirm_permission_ready(
+    async def confirm_permission_ready(
         self,
         conversation: Conversation,
         response: httpx.Response,
@@ -614,6 +614,12 @@ class RunnerSessionInitializer:
         raw = conversation.labels.get(PERMISSION_STATE_LABEL_KEY)
         if raw is None:
             return response
+        if not runner_permission_verified(conversation, response):
+            return httpx.Response(
+                409,
+                json={"error": "Runner did not confirm this permission tier revision"},
+                request=httpx.Request("POST", "/v1/sessions"),
+            )
         if self._conversation_store is None:
             return httpx.Response(
                 503,
@@ -769,7 +775,7 @@ class RunnerSessionInitializer:
             if 200 <= response.status_code < 300 and runner_permission_verified(
                 conversation, response
             ):
-                response = await self._confirm_permission_ready(
+                response = await self.confirm_permission_ready(
                     conversation, response, store_slots=store_slots
                 )
             if 200 <= response.status_code < 300:
