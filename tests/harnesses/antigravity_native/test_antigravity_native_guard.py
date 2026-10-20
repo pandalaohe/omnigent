@@ -1,457 +1,288 @@
-"""Guard decisions pinned to the permission-tier design scenarios."""
+"""Native decision mapping and protected startup/cache failures."""
 
 from __future__ import annotations
 
+import io
 import json
 import re
-import shutil
 import subprocess
 import sys
-from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
-import tomllib
 
 from omnigent.harnesses.antigravity_native import guard
+from omnigent.permission_tiers import load_rules
+from omnigent.permission_tiers.host import (
+    HOST_PERMISSION_STATE_FILE,
+    HostPermissionState,
+    local_host_context,
+    write_host_permission_state,
+)
 
-RULES_PATH = Path(guard.__file__).with_name("ares_rules.json")
-RULES = json.loads(RULES_PATH.read_text())
-CONTROL = ["/opt/work/bridge", "/opt/work/harness/guard.py", "/opt/work/harness/ares_rules.json"]
 
-
-@pytest.fixture(autouse=True)
-def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture
+def state(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    return HostPermissionState("session", "host", str(workspace), "auto", 1, "ready")
 
 
-def command(text: str) -> dict:
-    return {"toolCall": {"name": "run_command", "args": {"CommandLine": text, "Cwd": "/opt/work"}}}
-
-
-def edit(path: str) -> dict:
-    return {"toolCall": {"name": "replace_file_content", "args": {"TargetFile": path}}}
-
-
-def mcp(tool: str, arguments: dict | str, server: str = "omnigent") -> dict:
-    return {
-        "toolCall": {
-            "name": "call_mcp_tool",
-            "args": {"ServerName": server, "ToolName": tool, "Arguments": arguments},
-        }
-    }
+def payload(name, args):
+    return {"toolCall": {"name": name, "args": args}}
 
 
 @pytest.mark.parametrize(
-    ("tier", "text", "decision", "rule_id"),
+    "tier,name,args,expected",
     [
-        ("auto-relaxed", "mkfs.ext4 /dev/disk4", "deny", "disk-destroy"),
-        ("auto-relaxed", "rm -rf node_modules", "ask", None),
-        ("auto-standard", "rm -rf node_modules", "deny", "fs-recursive-delete"),
-        ("auto-strict", "rm -r build", "deny", None),
-        ("auto-standard", "rm -r build", "deny", "fs-recursive-delete"),
-        ("auto-relaxed", "rm -r build", "ask", None),
-        ("auto-strict", 'rm "-x" -r build', "deny", "strict-delete"),
-        ("auto-standard", 'rm "-x" -r build', "ask", None),
-        ("auto-strict", "diskutil eraseDisk APFS X disk4", "deny", "macos-disk-destroy"),
-        ("auto-standard", "diskutil eraseDisk APFS X disk4", "deny", "macos-disk-destroy"),
-        ("auto-relaxed", "diskutil eraseDisk APFS X disk4", "deny", "macos-disk-destroy"),
-        ("auto-strict", 'rm -rf "$HOME"', "deny", None),
-        ("auto-standard", 'rm -rf "$HOME"', "deny", None),
-        ("auto-relaxed", 'rm -rf "$HOME"', "deny", None),
-        ("ask", "git push --force", "force_ask", "git-destructive"),
-        ("plan", "git push --force", "force_ask", "git-destructive"),
-        ("accept-edits", "git push --force", "force_ask", "git-destructive"),
+        ("auto", "run_command", {"CommandLine": "mkfs.ext4 /dev/disk4"}, "deny"),
+        ("auto", "run_command", {"CommandLine": "rm -rf node_modules"}, "ask"),
+        ("auto-standard", "run_command", {"CommandLine": "rm -rf node_modules"}, "ask"),
+        ("auto-strict", "run_command", {"CommandLine": "rm -rf node_modules"}, "ask"),
+        ("ask", "run_command", {"CommandLine": "echo safe"}, "force_ask"),
+        ("plan", "run_command", {"CommandLine": "echo safe"}, "deny"),
+        ("accept-edits", "run_command", {"CommandLine": "echo safe"}, "force_ask"),
+        ("plan", "view_file", {"AbsolutePath": "a.py"}, "ask"),
+        ("plan", "list_dir", {"DirectoryPath": "."}, "ask"),
+        ("ask", "unknown_tool", {}, "force_ask"),
+        ("auto", "unknown_tool", {}, "deny"),
+        ("auto", "run_command", {}, "deny"),
     ],
 )
-def test_command_decision_table(tier: str, text: str, decision: str, rule_id: str | None) -> None:
-    result = guard.decide(command(text), tier, RULES, CONTROL)
-    assert result["decision"] == decision, (tier, text, result)
-    if rule_id:
-        assert f"[{rule_id}]" in result["reason"], result
-        assert result["reason"].endswith(
-            "If the task really needs this, stop and tell the user "
-            "it needs a looser permission tier."
+def test_native_decision_mapping(state, tier, name, args, expected):
+    context = local_host_context(state, control_paths=(str(Path(state.workspace) / "bridge"),))
+    result = guard.decide(payload(name, args), tier, load_rules(), context)
+    assert result["decision"] == expected
+    if name == "run_command" and "mkfs" in args.get("CommandLine", ""):
+        assert "[disk-destroy]" in result["reason"]
+        assert "ARES-218" in result["reason"]
+
+
+@pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
+def test_control_writes_cannot_be_approved(state, tier):
+    control = str(Path(state.workspace) / "bridge")
+    context = local_host_context(state, control_paths=(control,))
+    result = guard.decide(
+        payload(
+            "write_to_file", {"TargetFile": control + "/permission_tier", "CodeContent": "full"}
+        ),
+        tier,
+        load_rules(),
+        context,
+    )
+    assert result["decision"] == "deny"
+    assert "[control-path]" in result["reason"]
+
+
+def test_unknown_mcp_is_not_a_verified_bridge(state):
+    call = payload(
+        "call_mcp_tool", {"ServerName": "omnigent", "ToolName": "custom", "Arguments": {}}
+    )
+    assert not guard._delegated_bridge_call(call, {"tools": [{"name": "sys_os_read"}]})
+    assert guard._delegated_bridge_call(call, {"tools": [{"name": "custom"}]})
+    call["toolCall"]["args"]["ServerName"] = "other"
+    assert not guard._delegated_bridge_call(call, {"tools": [{"name": "custom"}]})
+
+
+@pytest.mark.parametrize(
+    "case", ["missing", "corrupt", "mismatch", "blocked", "relay-missing", "relay-symlink"]
+)
+def test_cli_cache_failure_is_explicit_denial(tmp_path, state, case):
+    from dataclasses import replace
+
+    tier = tmp_path / "permission_tier"
+    tier.write_text("auto\n")
+    cache = tmp_path / HOST_PERMISSION_STATE_FILE
+    if case != "missing":
+        write_host_permission_state(
+            cache, replace(state, status="blocked" if case == "blocked" else "ready")
         )
-    elif decision == "ask":
-        assert result == {"decision": "ask"}
-
-
-def test_disk_reason_exact(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "darwin")
-    assert guard.decide(command("mkfs.ext4 /dev/disk4"), "auto-relaxed", RULES, CONTROL) == {
-        "decision": "deny",
-        "reason": (
-            "Omnigent guard (auto-relaxed): 磁盘/卷破坏 [disk-destroy]. "
-            "ARES ARES-218 重建文件系统或交换区: "
-            "命令可能在目标设备上创建文件系统或交换区，需区分实际写入与预览选项。 "
-            "Impact: 实际写入可能替换原有元数据，使目标分区的数据无法正常访问；"
-            "恢复取决于写入范围及备份。 "
-            "Safer: 确认设备、用途和参数是否只读，验证备份；"
-            "调试优先使用专用测试镜像而非真实业务磁盘。 "
-            "If the task really needs this, stop and tell the user "
-            "it needs a looser permission tier."
-        ),
-    }
-
-
-@pytest.mark.parametrize("path", ["/opt/work/src/a.py", "/tmp/new/a.py"])
-def test_normal_write_passes(path: str) -> None:
-    assert guard.decide(edit(path), "auto-relaxed", RULES, CONTROL) == {"decision": "ask"}
-
-
-@pytest.mark.parametrize("tier", ["auto-strict", "auto-standard", "auto-relaxed"])
-@pytest.mark.parametrize("path", ["/", "~/.ssh/authorized_keys", "/etc/new/config"])
-def test_protected_write(tier: str, path: str) -> None:
-    result = guard.decide(edit(path), tier, RULES, CONTROL)
-    assert result["decision"] == "deny"
-    assert "[protected-path]" in result["reason"]
-
-
-@pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits"])
-def test_ask_family_protected_write_stays_native(tier: str) -> None:
-    assert guard.decide(edit("~/.ssh/authorized_keys"), tier, RULES, CONTROL) == {
-        "decision": "ask"
-    }
-
-
-def test_symlink_protected_new_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    home = tmp_path / "home"
-    protected = home / ".ssh"
-    protected.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
-    alias = tmp_path / "alias"
-    alias.symlink_to(protected, target_is_directory=True)
-    result = guard.decide(
-        edit(str(alias / "new" / "authorized_keys")), "auto-relaxed", RULES, CONTROL
-    )
-    assert result["decision"] == "deny"
-    assert "[protected-path]" in result["reason"]
-
-
-@pytest.mark.parametrize(
-    "tier,decision",
-    [
-        ("auto-relaxed", "deny"),
-        ("ask", "force_ask"),
-        ("plan", "force_ask"),
-        ("accept-edits", "force_ask"),
-    ],
-)
-@pytest.mark.parametrize(
-    "payload",
-    [
-        command("echo ask > /opt/work/bridge/permission_tier"),
-        edit("/opt/work/bridge/permission_tier"),
-        edit("/opt/work/bridge/agy-home/.gemini/antigravity-cli/settings.json"),
-        mcp(
-            "sys_os_write",
-            {"path": "/opt/work/bridge/agy-home/.gemini/config/hooks.json", "content": "{}"},
-        ),
-        command("cat /opt/work/harness/guard.py"),
-    ],
-)
-def test_control_tamper(payload: dict, tier: str, decision: str) -> None:
-    result = guard.decide(payload, tier, RULES, CONTROL)
-    assert result["decision"] == decision
-    assert "[control-path]" in result["reason"]
-
-
-@pytest.mark.parametrize("prefix", ["~", "$HOME", "raw", "real"])
-def test_control_command_path_forms(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
-) -> None:
-    home = tmp_path / "home"
-    bridge = home / "bridge"
-    bridge.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
-    alias = tmp_path / "alias"
-    alias.symlink_to(bridge, target_is_directory=True)
-    path = {"~": "~/bridge", "$HOME": "$HOME/bridge", "raw": str(alias), "real": str(bridge)}[
-        prefix
-    ]
-    result = guard.decide(
-        command(f"echo ask > {path}/permission_tier"), "auto-relaxed", RULES, [str(alias)]
-    )
-    assert result["decision"] == "deny"
-    assert "[control-path]" in result["reason"]
-
-
-@pytest.mark.parametrize("encoded", [False, True])
-def test_omnigent_shell_extraction(encoded: bool) -> None:
-    arguments = {"command": "rm -rf ~"}
-    payload = mcp("sys_os_shell", json.dumps(arguments) if encoded else arguments)
-    result = guard.decide(payload, "auto-relaxed", RULES, CONTROL)
-    assert result["decision"] == "deny"
-    assert "[critical-delete]" in result["reason"]
-
-
-def test_mcp_non_command_and_read_pass() -> None:
-    for payload in [
-        mcp("sys_session_list", {}),
-        mcp("sys_os_shell", {"command": "rm -rf ~"}, "other"),
-        {"toolCall": {"name": "view_file", "args": {"AbsolutePath": "/etc/hosts"}}},
-    ]:
-        assert guard.decide(payload, "auto-relaxed", RULES, CONTROL) == {"decision": "ask"}
-
-
-def test_terminal_literal_text_and_os_edit() -> None:
-    result = guard.decide(
-        mcp("sys_terminal_send", {"text": "mkfs.ext4 /dev/disk4", "keys": "Enter"}),
-        "auto-relaxed",
-        RULES,
-        CONTROL,
-    )
-    assert result["decision"] == "deny"
-    assert "[disk-destroy]" in result["reason"]
-    assert guard.decide(
-        mcp("sys_terminal_send", {"keys": "Enter"}), "auto-relaxed", RULES, CONTROL
-    ) == {"decision": "ask"}
-    result = guard.decide(
-        mcp("sys_os_edit", {"path": "/etc/hosts", "oldText": "a", "newText": "b"}),
-        "auto-relaxed",
-        RULES,
-        CONTROL,
-    )
-    assert "[protected-path]" in result["reason"]
-
-
-def mcp_raw(args: dict) -> dict:
-    return {"toolCall": {"name": "call_mcp_tool", "args": args}}
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        # A no-arg omnigent tool without usable Arguments extracts nothing.
-        {"ServerName": "omnigent", "ToolName": "sys_session_list"},
-        {"ServerName": "omnigent", "ToolName": "sys_session_list", "Arguments": None},
-        {"ServerName": "omnigent", "ToolName": "sys_session_list", "Arguments": ""},
-        {"ServerName": "omnigent", "ToolName": "sys_os_shell"},
-        {"ServerName": "omnigent", "ToolName": "sys_os_shell", "Arguments": None},
-        {"ServerName": "omnigent", "ToolName": "sys_os_shell", "Arguments": ""},
-        # Another server's Arguments are opaque even when malformed.
-        {"ServerName": "other", "ToolName": "sys_os_shell"},
-        {"ServerName": "other", "ToolName": "shell", "Arguments": "{not json"},
-    ],
-)
-def test_mcp_missing_or_empty_arguments_asks(args: dict) -> None:
-    assert guard.decide(mcp_raw(args), "auto-relaxed", RULES, CONTROL) == {"decision": "ask"}
-
-
-def test_mcp_malformed_arguments_fail_closed() -> None:
-    result = guard.decide(mcp("sys_os_shell", "{not json"), "auto-relaxed", RULES, CONTROL)
-    assert result["decision"] == "deny"
-    assert result["reason"].startswith("Omnigent guard error:")
-
-
-def test_all_rules_compile_and_level_ids_exist() -> None:
-    ids = set()
-    for rule in RULES["rules"]:
-        re.compile(rule["pattern"], re.IGNORECASE if rule["ignore_case"] else 0)
-        assert rule["id"] not in ids
-        ids.add(rule["id"])
-    for level, members in RULES["levels"].items():
-        assert set(members) <= ids, (level, set(members) - ids)
-
-
-def run_cli(script: Path, tier_file: Path, payload: str, *args: str) -> dict:
-    completed = subprocess.run(
-        [sys.executable, "-I", str(script), "--tier-file", str(tier_file), *args],
-        input=payload,
+    if case == "corrupt":
+        cache.write_text("[]")
+    if case == "mismatch":
+        tier.write_text("full\n")
+    if case == "relay-symlink":
+        relay = tmp_path / "elsewhere.json"
+        relay.write_text("{}")
+        (tmp_path / "tool_relay.json").symlink_to(relay)
+    result = subprocess.run(
+        [sys.executable, "-I", str(Path(guard.__file__)), "--tier-file", str(tier)],
+        input=json.dumps(payload("run_command", {"CommandLine": "echo safe"})),
         text=True,
         capture_output=True,
         check=False,
     )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stderr == ""
-    assert len(completed.stdout.splitlines()) == 1, completed.stdout
-    result = json.loads(completed.stdout)
-    assert result and result.get("decision"), completed.stdout
-    return result
+    assert result.returncode == 0
+    assert result.stderr == ""
+    response = json.loads(result.stdout)
+    assert response["decision"] == "deny"
+    assert response["reason"].startswith("Permission check unavailable:")
 
 
-@pytest.mark.parametrize(
-    "case,error",
-    [
-        ("missing-tier", "FileNotFoundError"),
-        ("unknown-tier", "ValueError"),
-        ("bad-json", "JSONDecodeError"),
-        ("bad-payload", "ValueError"),
-        ("missing-args", "KeyError"),
-        ("missing-rules", "FileNotFoundError"),
-        ("bad-rules", "JSONDecodeError"),
-        ("bad-pattern", "PatternError"),
-        ("cli-args", "ArgumentError"),
-    ],
-)
-def test_cli_fails_closed(tmp_path: Path, case: str, error: str) -> None:
-    script = tmp_path / "guard.py"
-    shutil.copyfile(guard.__file__, script)
-    rules = tmp_path / "ares_rules.json"
-    shutil.copyfile(RULES_PATH, rules)
+def test_main_checks_server_before_delegating(tmp_path, state, monkeypatch, capsys):
     tier = tmp_path / "permission_tier"
-    if case != "missing-tier":
-        tier.write_text("unknown" if case == "unknown-tier" else "auto-relaxed\n")
-    payload = json.dumps(command("echo safe"))
-    if case == "bad-json":
-        payload = "not json"
-    elif case == "bad-payload":
-        payload = "[]"
-    elif case == "missing-args":
-        payload = '{"toolCall":{"name":"run_command","args":{}}}'
-    elif case == "missing-rules":
-        rules.unlink()
-    elif case == "bad-rules":
-        rules.write_text("not json")
-    elif case == "bad-pattern":
-        invalid = json.loads(rules.read_text())
-        invalid["rules"][0]["pattern"] = "["
-        rules.write_text(json.dumps(invalid))
-        # Python 3.12 calls re.PatternError re.error.
-        error = "error" if sys.version_info < (3, 13) else error
-    args = ("--tier-file",) if case == "cli-args" else ()
-    assert run_cli(script, tier, payload, *args) == {
-        "decision": "deny",
-        "reason": f"Omnigent guard error: {error} — switch the permission tier to reset it",
-    }
-
-
-def test_cli_pass_is_never_empty(tmp_path: Path) -> None:
-    tier = tmp_path / "permission_tier"
-    tier.write_text("auto-relaxed\n")
-    assert run_cli(Path(guard.__file__), tier, json.dumps(mcp("sys_session_list", {}))) == {
-        "decision": "ask"
-    }
-
-
-def test_package_data_covers_ares_and_guard_runs_standalone(tmp_path: Path) -> None:
-    root = Path(__file__).resolve().parents[3]
-    with (root / "pyproject.toml").open("rb") as file:
-        config = tomllib.load(file)
-    patterns = config["tool"]["setuptools"]["package-data"][
-        "omnigent.harnesses.antigravity_native"
-    ]
-    for filename in ["ares_rules.json", "ares_signatures.json"]:
-        assert any(fnmatch(filename, pattern) for pattern in patterns), filename
-    package = tmp_path / "package"
-    package.mkdir()
-    for filename in ["guard.py", "ares_rules.json", "ares_signatures.json"]:
-        shutil.copyfile(Path(guard.__file__).with_name(filename), package / filename)
-    tier = tmp_path / "permission_tier"
-    tier.write_text("auto-relaxed\n")
-    result = run_cli(package / "guard.py", tier, json.dumps(command("mkfs.ext4 /dev/disk4")))
-    assert result["decision"] == "deny"
-    assert "[disk-destroy]" in result["reason"]
-    assert "ARES-218" in result["reason"]
-
-
-def test_control_path_home_forms_with_symlinked_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    real_home = tmp_path / "real-home"
-    bridge = real_home / "bridge"
-    bridge.mkdir(parents=True)
-    home_link = tmp_path / "home-link"
-    home_link.symlink_to(real_home, target_is_directory=True)
-    monkeypatch.setenv("HOME", str(home_link))
-    for path in ["~/bridge/permission_tier", "$HOME/bridge/permission_tier"]:
-        result = guard.decide(command(f"echo ask > {path}"), "auto-relaxed", RULES, [str(bridge)])
-        assert result["decision"] == "deny"
-        assert "[control-path]" in result["reason"]
-
-
-@pytest.mark.parametrize(
-    "text,tier,decision,signature",
-    [
-        ("rm -rf node_modules", "auto-standard", "deny", "ARES-232"),
-        ("git push --force", "ask", "force_ask", "ARES-223"),
-        ("mkfs.ext4 /dev/disk4", "auto-relaxed", "deny", "ARES-218"),
-    ],
-)
-def test_ares_signature_reason(text, tier, decision, signature, monkeypatch):
-    monkeypatch.setattr(sys, "platform", "darwin")
-    result = guard.decide(command(text), tier, RULES, CONTROL)
-    assert result["decision"] == decision
-    assert signature in result["reason"]
-    assert "Impact: " in result["reason"] and "Safer: " in result["reason"]
-
-
-def test_no_signature_falls_back_and_windows_excluded(monkeypatch):
-    monkeypatch.setattr(sys, "platform", "darwin")
-    for text, rule_id in [
-        ("diskutil eraseDisk APFS X disk4", "macos-disk-destroy"),
-        (r"reg delete HKLM\SOFTWARE\Example /f", "system-tamper"),
-    ]:
-        rule = next(rule for rule in RULES["rules"] if rule["id"] == rule_id)
-        result = guard.decide(command(text), "auto-standard", RULES, CONTROL)
-        assert result["decision"] == "deny"
-        assert rule["reason"] in result["reason"]
-        assert "ARES-205" not in result["reason"]
-
-
-@pytest.mark.parametrize("failure", [OSError, ValueError])
-def test_unreadable_signatures_preserve_rule_decision(monkeypatch, failure):
-    def fail_read(*args, **kwargs):
-        raise failure("signature unavailable")
-
-    monkeypatch.setattr(Path, "read_text", fail_read)
-    rule = next(rule for rule in RULES["rules"] if rule["id"] == "fs-recursive-delete")
-    result = guard.decide(command("rm -rf node_modules"), "auto-standard", RULES, [])
-    assert result["decision"] == "deny"
-    assert rule["reason"] in result["reason"]
-
-
-def test_miss_and_path_hit_do_not_open_signatures(monkeypatch):
-    def fail_read(*args, **kwargs):
-        pytest.fail("signature file opened without a command-rule hit")
-
-    monkeypatch.setattr(Path, "read_text", fail_read)
-    assert guard.decide(command("echo safe"), "auto-standard", RULES, []) == {"decision": "ask"}
-    assert (
-        "[protected-path]"
-        in guard.decide(edit("/etc/hosts"), "auto-standard", RULES, [])["reason"]
+    tier.write_text("auto\n")
+    write_host_permission_state(tmp_path / HOST_PERMISSION_STATE_FILE, state)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                payload(
+                    "call_mcp_tool",
+                    {"ServerName": "omnigent", "ToolName": "sys_os_shell", "Arguments": {}},
+                )
+            )
+        ),
     )
-    assert (
-        "[control-path]"
-        in guard.decide(edit("/opt/work/bridge/settings.json"), "ask", RULES, CONTROL)["reason"]
-    )
+
+    def unavailable(*_):
+        raise OSError("offline")
+
+    monkeypatch.setattr(guard, "_confirmed_relay", unavailable)
+    assert guard.main(["--tier-file", str(tier)]) == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == "deny"
 
 
 def test_all_signature_patterns_and_own_cases():
-    signatures = json.loads(Path(guard.__file__).with_name("ares_signatures.json").read_text())[
-        "signatures"
-    ]
+    signatures = load_rules().signatures["signatures"]
     assert len(signatures) == 214
     for signature in signatures:
         pattern = re.compile(
             signature["pattern"], re.IGNORECASE if signature["ignore_case"] else 0
         )
-        for positive in signature.get("test_cases", {}).get("positive", []):
-            assert pattern.search(positive), (signature["id"], positive)
-        for negative in signature.get("test_cases", {}).get("negative", []):
-            assert not pattern.search(negative), (signature["id"], negative)
+        for text in signature.get("test_cases", {}).get("positive", []):
+            assert pattern.search(text), (signature["id"], text)
+        for text in signature.get("test_cases", {}).get("negative", []):
+            assert not pattern.search(text), (signature["id"], text)
 
 
-@pytest.mark.parametrize("invalid", [{"platforms": "all"}, {"ignore_case": 1}, {"pattern": "["}])
-def test_malformed_signature_preserves_per_rule_reason(monkeypatch, invalid):
-    signature = {
-        "id": "broken",
-        "name": "broken",
-        "severity": "high",
-        "priority": 1,
-        "platforms": ["all"],
-        "pattern": "rm",
-        "ignore_case": True,
-        "root_cause": "cause",
-        "destructive_impact": "impact",
-        "safe_alternative": "safer",
-        **invalid,
+@pytest.mark.parametrize("tier", ["auto", "full"])
+@pytest.mark.parametrize(
+    "action",
+    [
+        "POLICY_ACTION_ALLOW",
+        "POLICY_ACTION_UNSPECIFIED",
+        "POLICY_ACTION_DENY",
+        "POLICY_ACTION_ASK",
+        None,
+        True,
+    ],
+)
+def test_native_policy_transport_includes_full_and_fails_closed(state, monkeypatch, tier, action):
+    from dataclasses import replace
+
+    state = replace(state, tier=tier)
+    native = {
+        **payload("view_file", {"AbsolutePath": "中文.py"}),
+        "conversationId": "cascade",
+        "stepIdx": 4,
     }
+    events = []
+
+    def relay_post(_relay, path, event):
+        events.append((path, event))
+        return {"result": action, "reason": "independent denial"}
+
+    monkeypatch.setattr(guard, "_relay_post", relay_post)
+    if action in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
+        assert guard._lease_native_call(native, state, {}) == {
+            "decision": "ask" if tier == "full" else "allow"
+        }
+    elif action == "POLICY_ACTION_DENY":
+        assert guard._lease_native_call(native, state, {}) == {
+            "decision": "deny",
+            "reason": "independent denial",
+        }
+    else:
+        with pytest.raises(ValueError, match="did not confirm permission"):
+            guard._lease_native_call(native, state, {})
+    assert len(events) == 1
+    path, request = events[0]
+    assert path == "/policies/evaluate"
+    assert request["event"] == {
+        "type": "PHASE_TOOL_CALL",
+        "data": {
+            "name": "view_file",
+            "arguments": {"AbsolutePath": "中文.py"},
+            "call_id": guard._native_call_id(native, state),
+            "expected_permission_tier_revision": 1,
+        },
+        "context": {"harness": "antigravity-native"},
+    }
+    from omnigent.server.routes._sessions.common import _EVALUATE_HOOK_ELICITATION_ID_RE
+
+    assert _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(request["_omnigent_elicitation_id"])
+
+
+def test_post_tool_use_releases_only_matching_native_call(tmp_path, state, monkeypatch, capsys):
+    tier = tmp_path / "permission_tier"
+    tier.write_text("auto\n")
+    write_host_permission_state(tmp_path / HOST_PERMISSION_STATE_FILE, state)
+    native = {
+        **payload("view_file", {"AbsolutePath": "a.py"}),
+        "conversationId": "cascade",
+        "stepIdx": 4,
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(native)))
+    monkeypatch.setattr(guard, "_relay_config", lambda *_: {})
+    events = []
     monkeypatch.setattr(
-        Path, "read_text", lambda *a, **kw: json.dumps({"signatures": [signature]})
+        guard, "_relay_post", lambda _r, _p, event: events.append(event) or {"finished": True}
     )
-    result = guard.decide(command("rm -rf node_modules"), "auto-standard", RULES, [])
-    assert result["decision"] == "deny"
-    assert "ARES" not in result["reason"]
-    assert "[fs-recursive-delete]" in result["reason"]
+    assert guard.main(["--tier-file", str(tier), "--finish"]) == 0
+    assert json.loads(capsys.readouterr().out) == {}
+    assert events == [
+        {
+            "type": "permission_tier_finish",
+            "call_id": guard._native_call_id(native, state),
+            "expected_revision": state.revision,
+        }
+    ]
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_full_native_entry_keeps_independent_policy_without_fixed_rules(
+    tmp_path, state, monkeypatch, capsys, changed
+):
+    from dataclasses import replace
+
+    state = replace(state, tier="full")
+    tier = tmp_path / "permission_tier"
+    tier.write_text("full\n")
+    write_host_permission_state(tmp_path / HOST_PERMISSION_STATE_FILE, state)
+    native = {
+        **payload("view_file", {"AbsolutePath": "a.py"}),
+        "conversationId": "cascade",
+        "stepIdx": 4,
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(native)))
+    monkeypatch.setattr(guard, "_confirmed_relay", lambda *_: {})
+
+    def no_fixed_rules():
+        raise AssertionError("full must not load tier rules")
+
+    monkeypatch.setattr(guard, "load_rules", no_fixed_rules)
+    calls = []
+
+    def deny(_relay, path, event):
+        calls.append((path, event))
+        if changed:
+            write_host_permission_state(
+                tmp_path / HOST_PERMISSION_STATE_FILE, replace(state, status="blocked")
+            )
+            return {"result": "POLICY_ACTION_ALLOW"}
+        return {"result": "POLICY_ACTION_DENY", "reason": "independent deny"}
+
+    monkeypatch.setattr(guard, "_relay_post", deny)
+    assert guard.main(["--tier-file", str(tier)]) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["decision"] == "deny"
+    if changed:
+        assert response["reason"].startswith("Permission check unavailable:")
+    else:
+        assert response["reason"] == "independent deny"
+    assert len(calls) == 1
+    assert calls[0][0] == "/policies/evaluate"

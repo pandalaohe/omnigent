@@ -51,6 +51,7 @@ def to_elicitation_params(pending: dict[str, Any]) -> ElicitationRequestParams:
             trajectory_id=trajectory_id,
             step_index=step_index,
             spec=spec,
+            single_use=type(pending.get("permission_tier_revision")) is int,
         )
     raise ValueError(f"Unsupported agy interaction kind: {kind!r}")
 
@@ -182,6 +183,8 @@ def _agy_permission_params(
     trajectory_id: object,
     step_index: object,
     spec: object,
+    *,
+    single_use: bool = False,
 ) -> ElicitationRequestParams:
     """
     Build elicitation params for a ``permission`` pending interaction.
@@ -229,8 +232,10 @@ def _agy_permission_params(
     if action_description:
         extras["action_description"] = action_description
     always_allow_pattern = _suggested_persist_pattern(spec)
-    if always_allow_pattern:
+    if always_allow_pattern and not single_use:
         extras["always_allow_pattern"] = always_allow_pattern
+    if single_use:
+        extras["single_use_approval"] = True
     if isinstance(trajectory_id, str) and trajectory_id:
         extras["trajectory_id"] = trajectory_id
     if isinstance(step_index, int):

@@ -13612,7 +13612,7 @@ def _policy_retry_clock(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return clock
 
 
-def _hook_relay(tmp_path, monkeypatch, client):
+def _hook_relay(tmp_path, monkeypatch, client, *, permission_tier_control=None):
     """Boot a relay wired with *client* for the hook-evaluate tests."""
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
@@ -13631,6 +13631,7 @@ def _hook_relay(tmp_path, monkeypatch, client):
         loop=asyncio.get_running_loop(),
         policy_client=client,  # type: ignore[arg-type]
         session_id="conv_hook_eval",
+        permission_tier_control=permission_tier_control,
     )
     return relay, bridge_dir
 
@@ -13650,6 +13651,119 @@ def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) 
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_permission_state_relay_is_session_scoped_and_minimal(tmp_path, monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "permission_tier": "ask",
+                "permission_tier_revision": 3,
+                "permission_tier_state": "ready",
+                "permission_tiers_capability": True,
+                "items": [{"private": "not returned"}],
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ) as upstream:
+        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, upstream)
+        try:
+            body = await asyncio.to_thread(
+                _relay_request_raw, bridge_dir, "/permission-tiers/state", {}
+            )
+            assert json.loads(body) == {
+                "permission_tier": "ask",
+                "permission_tier_revision": 3,
+                "permission_tier_state": "ready",
+                "permission_tiers_capability": True,
+            }
+            assert requests[0].url.path == "/v1/sessions/conv_hook_eval"
+            assert requests[0].headers["X-Omnigent-Permission-Tiers"] == "1"
+        finally:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_native_permission_control_relay_keeps_session_callback(tmp_path, monkeypatch):
+    events = []
+
+    async def control(event):
+        events.append(event)
+        return {"finished": True}
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, None, permission_tier_control=control)
+    try:
+        event = {
+            "type": "permission_tier_finish",
+            "call_id": "native-call",
+            "expected_revision": 3,
+        }
+        raw = await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/permission-tiers/control", event
+        )
+        assert json.loads(raw) == {"finished": True}
+        assert events == [event]
+        import urllib.error
+
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            await asyncio.to_thread(
+                _relay_request_raw,
+                bridge_dir,
+                "/permission-tiers/control",
+                {"type": "permission_tier_commit"},
+            )
+        assert exc.value.code == 503
+        assert events == [event]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", ["auto", "full"])
+@pytest.mark.parametrize("action", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_DENY"])
+async def test_ag_native_policy_uses_authenticated_relay(tmp_path, monkeypatch, tier, action):
+    from omnigent.harnesses.antigravity_native import guard
+    from omnigent.permission_tiers.host import HostPermissionState
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={"result": action, "reason": "policy decision"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ) as upstream:
+        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, upstream)
+        try:
+            config = json.loads((bridge_dir / "tool_relay.json").read_text())
+            state = HostPermissionState("conv_hook_eval", "host", str(tmp_path), tier, 1, "ready")
+            payload = {
+                "toolCall": {"name": "view_file", "args": {"AbsolutePath": "a.py"}},
+                "conversationId": "cascade",
+                "stepIdx": 3,
+            }
+            result = await asyncio.to_thread(guard._lease_native_call, payload, state, config)
+            expected = (
+                "deny"
+                if action == "POLICY_ACTION_DENY"
+                else ("ask" if tier == "full" else "allow")
+            )
+            assert result["decision"] == expected
+            assert len(requests) == 1
+            assert requests[0].url.path == "/v1/sessions/conv_hook_eval/policies/evaluate"
+            event = json.loads(requests[0].content)["event"]
+            assert event["context"] == {"harness": "antigravity-native"}
+            assert event["data"]["call_id"] == guard._native_call_id(payload, state)
+        finally:
+            relay.close()
 
 
 @pytest.mark.asyncio

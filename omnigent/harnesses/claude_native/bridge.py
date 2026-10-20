@@ -7265,6 +7265,7 @@ def start_tool_relay(
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
+    permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start the shared relay for native-harness Omnigent tool calls.
@@ -7306,6 +7307,7 @@ def start_tool_relay(
         session_id=session_id,
         bridge_dir=bridge_dir,
         file_change_observer=file_change_observer,
+        permission_tier_control=permission_tier_control,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -7317,6 +7319,8 @@ def start_tool_relay(
     }
     if session_id is not None:
         relay_info["session_id"] = session_id
+        if policy_client is not None:
+            relay_info["permission_tiers_v1"] = True
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
     env_path = bridge_dir / _TOOL_RELAY_ENV_FILE
@@ -7606,6 +7610,7 @@ def _tool_relay_handler_factory(
     session_id: str | None = None,
     bridge_dir: Path | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
+    permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -7649,6 +7654,8 @@ def _tool_relay_handler_factory(
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
                 "/hook/observe-tool",
+                "/permission-tiers/state",
+                "/permission-tiers/control",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -7681,6 +7688,12 @@ def _tool_relay_handler_factory(
                 return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
+                return
+            if self.path == "/permission-tiers/state":
+                self._handle_permission_state()
+                return
+            if self.path == "/permission-tiers/control":
+                self._handle_permission_control(payload)
                 return
             name = payload.get("name")
             arguments = payload.get("arguments")
@@ -7836,6 +7849,62 @@ def _tool_relay_handler_factory(
                     extra={"session_id": session_id},
                 )
             self._respond_hook_output(hook_output)
+
+        def _handle_permission_control(self, payload: _JsonObject) -> None:
+            if permission_tier_control is None or payload.get("type") not in (
+                "permission_tier_inspect",
+                "permission_tier_authorize",
+                "permission_tier_finish",
+            ):
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            future = asyncio.run_coroutine_threadsafe(
+                _await_tool_result(permission_tier_control(payload)), loop
+            )
+            try:
+                result = future.result(timeout=5.0)
+                if not isinstance(result, dict):
+                    raise ValueError("Invalid permission control response")
+            except Exception:  # noqa: BLE001 - a timeout retains the host fence
+                future.cancel()
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self._send_json(result)
+
+        def _handle_permission_state(self) -> None:
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            from urllib.parse import quote
+
+            future = asyncio.run_coroutine_threadsafe(
+                policy_client.get(
+                    f"/v1/sessions/{quote(session_id, safe='')}",
+                    headers={"X-Omnigent-Permission-Tiers": "1"},
+                ),
+                loop,
+            )
+            try:
+                response = future.result(timeout=5.0)
+                response.raise_for_status()
+                state = response.json()
+                if not isinstance(state, dict):
+                    raise ValueError("Invalid permission state")
+            except Exception:  # noqa: BLE001 - an unavailable confirmation cannot unlock tools
+                future.cancel()
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self._send_json(
+                {
+                    key: state.get(key)
+                    for key in (
+                        "permission_tier",
+                        "permission_tier_revision",
+                        "permission_tier_state",
+                        "permission_tiers_capability",
+                    )
+                }
+            )
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
             if policy_client is None or session_id is None:

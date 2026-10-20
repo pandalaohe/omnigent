@@ -169,15 +169,14 @@ class PermissionTierRuntime:
 
             if (bridge_dir / "permission_tier").read_text(encoding="utf-8") != tier + "\n":
                 raise ValueError("Antigravity tier file does not match")
-            if tier != "full":
-                hooks_path = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
-                hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
-                guard = hooks.get("omnigent-guard") if isinstance(hooks, dict) else None
-                if not isinstance(guard, dict) or guard.get("enabled") is not True:
-                    raise ValueError("Antigravity permission guard is not installed")
-                steps = guard.get("PreToolUse")
-                if not isinstance(steps, list) or not steps:
-                    raise ValueError("Antigravity permission guard is incomplete")
+            hooks_path = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
+            hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+            guard = hooks.get("omnigent-guard") if isinstance(hooks, dict) else None
+            if not isinstance(guard, dict) or guard.get("enabled") is not True:
+                raise ValueError("Antigravity permission guard is not installed")
+            steps = guard.get("PreToolUse")
+            if not isinstance(steps, list) or not steps:
+                raise ValueError("Antigravity permission guard is incomplete")
             return
         if harness == "pi-native":
             from omnigent.harnesses.pi_native.bridge import (

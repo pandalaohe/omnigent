@@ -1,235 +1,233 @@
-"""Standalone, stdlib-only PreToolUse guard for agy."""
+"""Thin stdlib-only PreToolUse adapter for managed Antigravity sessions."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
-import re
 import sys
+import urllib.request
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+
+from omnigent import permission_tiers
+from omnigent.permission_tiers import (
+    RelaxedRules,
+    TrustedHostContext,
+    Verdict,
+    adapt_tool_call,
+    decide_tier,
+    load_rules,
+    normalize_permission_tier,
+)
+from omnigent.permission_tiers.host import (
+    HOST_PERMISSION_STATE_FILE,
+    HostPermissionState,
+    local_host_context,
+    read_host_permission_state,
+)
 
 
-def _object(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict):
+def _object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ValueError("Expected a JSON object")
     return value
 
 
-def _text(value: object) -> str:
-    if not isinstance(value, str):
-        raise ValueError("Expected text")
-    return value
-
-
-def _under(target: str, parent: str) -> bool:
-    return target == parent or target.startswith(parent.rstrip(os.sep) + os.sep)
-
-
-def _realpath(path: str) -> str:
-    # strict=False resolves existing parent symlinks even for a new file.
-    return str(Path(path).expanduser().resolve(strict=False))
-
-
-def _path_forms(path: str) -> set[str]:
-    forms = {path, os.path.expanduser(path), _realpath(path)}
-    homes = {str(Path.home()), str(Path.home().resolve(strict=False))}
-    for form in tuple(forms):
-        for home in homes:
-            if _under(form, home):
-                suffix = form[len(home) :]
-                forms.update({"~" + suffix, "$HOME" + suffix})
-    return forms
-
-
 def _error(exc: Exception) -> dict[str, str]:
-    return {
-        "decision": "deny",
-        "reason": (
-            f"Omnigent guard error: {type(exc).__name__} — switch the permission tier to reset it"
-        ),
-    }
-
-
-def _ares_explanation(command: str) -> str | None:
-    try:
-        signatures = _object(
-            json.loads(Path(__file__).with_name("ares_signatures.json").read_text())
-        )["signatures"]
-        if not isinstance(signatures, list):
-            return None
-        platform = "windows" if sys.platform == "win32" else sys.platform
-        ranked = sorted(
-            signatures,
-            key=lambda entry: (
-                {"high": 0, "medium": 1, "low": 2}[entry["severity"]],
-                -entry["priority"],
-            ),
-        )
-        for signature in ranked:
-            platforms = signature["platforms"]
-            if (
-                not isinstance(platforms, list)
-                or any(value not in ("all", "darwin", "linux", "windows") for value in platforms)
-                or not isinstance(signature["ignore_case"], bool)
-            ):
-                raise ValueError("Malformed ARES signature")
-            if "all" not in platforms and platform not in platforms:
-                continue
-            pattern = re.compile(
-                signature["pattern"], re.IGNORECASE if signature["ignore_case"] else 0
-            )
-            if pattern.search(command):
-                for field in (
-                    "id",
-                    "name",
-                    "root_cause",
-                    "destructive_impact",
-                    "safe_alternative",
-                ):
-                    _text(signature[field])
-                return (
-                    f"ARES {signature['id']} {signature['name']}: {signature['root_cause']} "
-                    f"Impact: {signature['destructive_impact']} "
-                    f"Safer: {signature['safe_alternative']}"
-                )
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, re.error):
-        return None
-    return None
+    return {"decision": "deny", "reason": f"Permission check unavailable: {type(exc).__name__}"}
 
 
 def decide(
     payload: Mapping[str, object],
     tier: str,
-    rules: Mapping[str, object],
-    control_paths: Sequence[str],
+    rules: RelaxedRules,
+    context: TrustedHostContext,
 ) -> dict[str, str]:
-    """Return an explicit decision, failing closed on malformed input or rules."""
+    """A native `ask` means continue; force_ask is reserved for actual approval."""
     try:
-        auto = tier in ("auto-strict", "auto-standard", "auto-relaxed")
-        if not auto and tier not in ("ask", "plan", "accept-edits"):
-            raise ValueError("Unknown guarded tier")
-        levels = _object(rules["levels"])
-        rule_list = rules["rules"]
-        if not isinstance(rule_list, list):
-            raise ValueError("Expected rule list")
-        compiled = {}
-        for value in rule_list:
-            rule = _object(value)
-            compiled[_text(rule["id"])] = (
-                rule,
-                re.compile(_text(rule["pattern"]), re.IGNORECASE if rule["ignore_case"] else 0),
-            )
-            _text(rule["name"])
-            _text(rule["reason"])
-        for ids in levels.values():
-            if not isinstance(ids, list) or any(rule_id not in compiled for rule_id in ids):
-                raise ValueError("Invalid level rule ids")
-        active = levels[tier if auto else "ask-family"]
-        protected = _object(rules["protected_paths"])
-        reasons = _object(rules["path_reasons"])
-        exact = [_realpath(_text(path)) for path in protected["exact"]]
-        prefixes = [_realpath(_text(path)) for path in protected["prefix"]]
-        _text(reasons["control"])
-        _text(reasons["protected"])
-
+        canonical = normalize_permission_tier(tier, harness="antigravity-native", legacy=True)
         call = _object(payload["toolCall"])
-        name = _text(call["name"])
-        args = _object(call["args"])
-        command = ""
-        target = _text(args["TargetFile"]) if "TargetFile" in args else ""
-        if name == "run_command":
-            command = _text(args["CommandLine"])
-        elif name == "call_mcp_tool":
-            server = _text(args["ServerName"])
-            tool = _text(args["ToolName"])
-            # Only omnigent's command tools carry a command or target the
-            # guard understands; other servers' Arguments are opaque. Absent
-            # or empty means nothing to check (ask); malformed fails closed.
-            if server == "omnigent" and tool in (
-                "sys_os_shell",
-                "sys_terminal_send",
-                "sys_os_write",
-                "sys_os_edit",
-            ):
-                arguments = args.get("Arguments")
-                if arguments:
-                    mcp_args = _object(
-                        json.loads(arguments) if isinstance(arguments, str) else arguments
-                    )
-                    if tool == "sys_os_shell":
-                        command = _text(mcp_args["command"])
-                    elif tool == "sys_terminal_send":
-                        command = _text(mcp_args.get("text", ""))
-                    else:
-                        target = _text(mcp_args["path"])
-        if target:
-            expanded = Path(target).expanduser()
-            if not expanded.is_absolute():
-                workspaces = payload.get("workspacePaths", [])
-                cwd = args.get("Cwd")
-                if cwd is None and isinstance(workspaces, list) and workspaces:
-                    cwd = workspaces[0]
-                expanded = Path(_text(cwd) if cwd is not None else os.getcwd()) / expanded
-            target = _realpath(str(expanded))
-
-        def hit(rule_id: str, name: str, reason: str) -> dict[str, str]:
-            return {
-                "decision": "deny" if auto else "force_ask",
-                "reason": (
-                    f"Omnigent guard ({tier}): {name} [{rule_id}]. {reason} "
-                    "If the task really needs this, stop and tell the user "
-                    "it needs a looser permission tier."
-                ),
-            }
-
-        for path in control_paths:
-            if (target and _under(target, _realpath(path))) or (
-                command and any(form in command for form in _path_forms(path))
-            ):
-                return hit("control-path", "Omnigent control path", reasons["control"])
-        for rule_id in active:
-            rule, pattern = compiled[rule_id]
-            if command and pattern.search(command):
-                return hit(rule_id, rule["name"], _ares_explanation(command) or rule["reason"])
-        if (
-            auto
-            and target
-            and (target in exact or any(_under(target, prefix) for prefix in prefixes))
-        ):
-            return hit("protected-path", "Protected write target", reasons["protected"])
-        return {"decision": "ask"}
+        name = call.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Missing tool name")
+        intent = adapt_tool_call(name, _object(call["args"]), context)
+        decision = decide_tier(canonical, intent, rules)
+        if decision.action == Verdict.ALLOW:
+            return {"decision": "ask"}
+        reason = decision.reason
+        if decision.rule_id:
+            reason = f"[{decision.rule_id}] {reason}"
+        return {
+            "decision": "force_ask" if decision.action == Verdict.ASK else "deny",
+            "reason": reason,
+        }
     except Exception as exc:
         return _error(exc)
 
 
+def _confirmed_relay(bridge_dir: Path, state: HostPermissionState) -> dict[str, object]:
+    """Check server readiness as well as the local fence before any native tool."""
+    if state.status != "ready":
+        raise ValueError("Permission state is blocked or switching")
+    relay = _relay_config(bridge_dir, state)
+    confirmed = _relay_post(relay, "/permission-tiers/state", {})
+    if (
+        confirmed.get("permission_tiers_capability") is not True
+        or confirmed.get("permission_tier") != state.tier
+        or type(confirmed.get("permission_tier_revision")) is not int
+        or confirmed.get("permission_tier_revision") != state.revision
+        or confirmed.get("permission_tier_state") != "ready"
+    ):
+        raise ValueError("Server and host permission state differ")
+    return relay
+
+
+def _relay_config(bridge_dir: Path, state: HostPermissionState) -> dict[str, object]:
+    relay_file = bridge_dir / "tool_relay.json"
+    if relay_file.is_symlink():
+        raise ValueError("Refusing symlink relay configuration")
+    relay = _object(json.loads(relay_file.read_text(encoding="utf-8")))
+    if relay.get("session_id") != state.session_id or relay.get("permission_tiers_v1") is not True:
+        raise ValueError("Permission relay is not verified")
+    return relay
+
+
+def _relay_post(
+    relay: Mapping[str, object], path: str, payload: dict[str, object]
+) -> dict[str, object]:
+    url, token = relay.get("url"), relay.get("token")
+    if not isinstance(url, str) or not isinstance(token, str) or not token:
+        raise ValueError("Permission relay unavailable")
+    request = urllib.request.Request(
+        url.rstrip("/") + path,
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    # Policy ASK is a server-held approval; state/control requests remain short.
+    timeout = 86400 if path == "/policies/evaluate" else 5
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return _object(json.load(response))
+
+
+def _native_call_id(payload: Mapping[str, object], state: HostPermissionState) -> str:
+    conversation_id, step = payload.get("conversationId"), payload.get("stepIdx")
+    if (
+        not isinstance(conversation_id, str)
+        or not conversation_id
+        or type(step) is not int
+        or step < 0
+    ):
+        raise ValueError("Native hook requires conversationId and stepIdx")
+    identity = json.dumps([state.session_id, conversation_id, step]).encode()
+    return "agy-hook:" + hashlib.sha256(identity).hexdigest()
+
+
+def _lease_native_call(
+    payload: Mapping[str, object], state: HostPermissionState, relay: Mapping[str, object]
+) -> dict[str, object]:
+    """The service evaluates independent policy before leasing the exact tiered call."""
+    call = _object(payload.get("toolCall"))
+    name, arguments = call.get("name"), _object(call.get("args"))
+    if not isinstance(name, str) or not name:
+        raise ValueError("Missing native tool name")
+    call_id = _native_call_id(payload, state)
+    verdict = _relay_post(
+        relay,
+        "/policies/evaluate",
+        {
+            "event": {
+                "type": "PHASE_TOOL_CALL",
+                "data": {
+                    "name": name,
+                    "arguments": arguments,
+                    "call_id": call_id,
+                    "expected_permission_tier_revision": state.revision,
+                },
+                "context": {"harness": "antigravity-native"},
+            },
+            "_omnigent_elicitation_id": "elicit_evaluate_" + call_id.partition(":")[2][:32],
+        },
+    )
+    action = verdict.get("result")
+    if action == "POLICY_ACTION_DENY":
+        return {"decision": "deny", "reason": verdict.get("reason") or "Omnigent policy denied"}
+    if action not in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"):
+        raise ValueError("Native policy did not confirm permission")
+    # The service has completed both independent policy and mandatory tier approval.
+    return {"decision": "ask" if state.tier == "full" else "allow"}
+
+
+def _delegated_bridge_call(payload: Mapping[str, object], relay: Mapping[str, object]) -> bool:
+    call = _object(payload.get("toolCall"))
+    if call.get("name") != "call_mcp_tool":
+        return False
+    args = _object(call.get("args"))
+    if args.get("ServerName") != "omnigent":
+        return False
+    tool = args.get("ToolName")
+    tools = relay.get("tools")
+    return (
+        isinstance(tool, str)
+        and isinstance(tools, list)
+        and any(isinstance(entry, dict) and entry.get("name") == tool for entry in tools)
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Read stdin and always print exactly one JSON decision."""
     try:
         parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
         parser.add_argument("--tier-file")
+        parser.add_argument("--finish", action="store_true")
         args, unknown = parser.parse_known_args(argv)
         if unknown or not args.tier_file:
             raise ValueError("Expected --tier-file")
         tier_file = Path(args.tier_file)
+        if tier_file.is_symlink():
+            raise ValueError("Refusing symlink permission tier")
+        state = read_host_permission_state(tier_file.parent / HOST_PERMISSION_STATE_FILE)
+        if tier_file.read_text(encoding="utf-8").strip() != state.tier:
+            raise ValueError("Permission cache mismatch")
         payload = _object(json.load(sys.stdin))
-        tier = tier_file.read_text(encoding="utf-8").strip()
-        rules = _object(json.loads(Path(__file__).with_name("ares_rules.json").read_text()))
-        bridge_dir = tier_file.parent
-        result = decide(
-            payload,
-            tier,
-            rules,
-            [
-                str(bridge_dir),
-                str(bridge_dir / "agy-home" / ".gemini"),
-                str(Path(__file__).resolve()),
-                str(Path(__file__).with_name("ares_rules.json").resolve()),
-                str(Path(__file__).with_name("ares_signatures.json").resolve()),
-            ],
-        )
+        if args.finish:
+            if state.tier == "full":
+                print("{}")
+                return 0
+            relay = _relay_config(tier_file.parent, state)
+            if not _delegated_bridge_call(payload, relay):
+                completed = _relay_post(
+                    relay,
+                    "/permission-tiers/control",
+                    {
+                        "type": "permission_tier_finish",
+                        "call_id": _native_call_id(payload, state),
+                        "expected_revision": state.revision,
+                    },
+                )
+                if completed.get("finished") is not True:
+                    raise ValueError("Native completion was not confirmed")
+            print("{}")
+            return 0
+        relay = _confirmed_relay(tier_file.parent, state)
+        if _delegated_bridge_call(payload, relay):
+            result = {"decision": "ask"}
+        elif state.tier == "full":
+            result = _lease_native_call(payload, state, relay)
+        else:
+            context = local_host_context(
+                state,
+                control_paths=(
+                    str(tier_file.parent),
+                    str(Path(permission_tiers.__file__).parent),
+                    str(Path(__file__).resolve()),
+                ),
+            )
+            result = decide(payload, state.tier, load_rules(), context)
+            if result["decision"] != "deny":
+                result = _lease_native_call(payload, state, relay)
+        if read_host_permission_state(tier_file.parent / HOST_PERMISSION_STATE_FILE) != state:
+            raise ValueError("Permission state changed during native policy check")
     except Exception as exc:
         result = _error(exc)
     print(json.dumps(result))

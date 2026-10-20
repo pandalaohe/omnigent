@@ -515,17 +515,30 @@ async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
 _PLACEHOLDER_ID = "agy_conv_fresh_placeholder"
 
 
+def _confirmed_permission_snapshot(tier: str, **extras: object) -> dict[str, object]:
+    return {
+        "labels": {"omnigent.antigravity_native.permission_tier": tier},
+        "permission_tier": tier,
+        "permission_tier_revision": 1,
+        "permission_tier_state": "ready",
+        "permission_tiers_capability": True,
+        "host_id": "test-host",
+        "workspace": str(Path.cwd()),
+        **extras,
+    }
+
+
 def _terminal_launch_handler(request: httpx.Request) -> httpx.Response:
     """Minimal handler that accepts the terminal POST and returns a stub resource."""
     if request.method == "GET":
-        return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(200, json=_confirmed_permission_snapshot("ask"))
     return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
 
 
 def _terminal_launch_handler_with_pane(request: httpx.Request) -> httpx.Response:
     """Terminal POST handler that exposes a local tmux pane in the response metadata."""
     if request.method == "GET":
-        return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(200, json=_confirmed_permission_snapshot("ask"))
     return httpx.Response(
         200,
         json={
@@ -621,14 +634,35 @@ async def test_launch_and_record_passes_cli_args_to_agy_argv(
     launch_calls = await _record_launch_and_record_args(
         monkeypatch,
         tmp_path,
-        snapshot={
-            "labels": {"omnigent.antigravity_native.permission_tier": "auto-relaxed"},
-            "terminal_launch_args": [],
-        },
+        snapshot=_confirmed_permission_snapshot("auto", terminal_launch_args=[]),
         antigravity_args=("--add-dir=/opt/work/extra",),
     )
     assert len(launch_calls) == 1
     assert "--add-dir=/opt/work/extra" in launch_calls[0]["extra_args"]
+
+
+@pytest.mark.parametrize("fault", ["legacy", "capability", "revision", "blocked", "mismatch"])
+async def test_cli_refuses_unconfirmed_permission_startup(monkeypatch, tmp_path, fault):
+    import click
+
+    snapshot = _confirmed_permission_snapshot("full")
+    if fault == "legacy":
+        snapshot = {"labels": {}, "terminal_launch_args": ["--dangerously-skip-permissions"]}
+    elif fault == "capability":
+        snapshot["permission_tiers_capability"] = False
+    elif fault == "revision":
+        snapshot["permission_tier_revision"] = True
+    elif fault == "blocked":
+        snapshot["permission_tier_state"] = "blocked"
+    else:
+        snapshot["permission_tier"] = "ask"
+    with pytest.raises(click.ClickException, match="controlled recovery"):
+        await _record_launch_and_record_args(
+            monkeypatch,
+            tmp_path,
+            snapshot=snapshot,
+            antigravity_args=("--dangerously-skip-permissions",),
+        )
 
 
 async def test_launch_and_record_strips_snapshot_skip_flag_for_non_full_tier(
@@ -638,10 +672,9 @@ async def test_launch_and_record_strips_snapshot_skip_flag_for_non_full_tier(
     launch_calls = await _record_launch_and_record_args(
         monkeypatch,
         tmp_path,
-        snapshot={
-            "labels": {"omnigent.antigravity_native.permission_tier": "auto-relaxed"},
-            "terminal_launch_args": ["--dangerously-skip-permissions"],
-        },
+        snapshot=_confirmed_permission_snapshot(
+            "auto", terminal_launch_args=["--dangerously-skip-permissions"]
+        ),
         antigravity_args=(),
     )
     assert len(launch_calls) == 1
@@ -708,10 +741,7 @@ async def test_launch_and_record_uses_server_tier_for_headless_launch(
         if request.method == "GET":
             return httpx.Response(
                 200,
-                json={
-                    "labels": {"omnigent.antigravity_native.permission_tier": "auto-relaxed"},
-                    "reasoning_effort": "high",
-                },
+                json=_confirmed_permission_snapshot("auto", reasoning_effort="high"),
             )
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
@@ -734,7 +764,7 @@ async def test_launch_and_record_uses_server_tier_for_headless_launch(
     assert captured_args[captured_args.index("--mode") + 1] == "accept-edits"
     assert captured_args[captured_args.index("--effort") + 1] == "high"
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_headless_test")
-    assert (bridge_dir / "permission_tier").read_text() == "auto-relaxed\n"
+    assert (bridge_dir / "permission_tier").read_text() == "auto\n"
 
 
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
@@ -761,7 +791,7 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json={"labels": {}})
+            return httpx.Response(200, json=_confirmed_permission_snapshot("ask"))
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         captured_env.update(body["spec"]["env"])

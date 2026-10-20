@@ -895,7 +895,9 @@ async def test_retry_storm_is_bounded_by_max_retries() -> None:
         counter["n"] += 1
         return [_question_step(step_index=counter["n"])]
 
-    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "Second"}))
+    request, elicit_calls = _elicitation_returner(
+        ElicitationResult(action="accept", content={"0": "Second"})
+    )
     deliver = _DeliverRecorder(
         errors=[AntigravityRpcError("input not registered for step N")] * 50
     )
@@ -910,8 +912,74 @@ async def test_retry_storm_is_bounded_by_max_retries() -> None:
         max_retries=3,
     )
 
-    # Exactly max_retries delivery attempts, then it gives up.
     assert len(deliver.calls) == 3
+    assert len(elicit_calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_revision", [False, True])
+async def test_managed_permission_is_single_use_and_bound_to_revision(changed_revision):
+    from dataclasses import replace
+
+    from omnigent.permission_tiers.host import HostPermissionState
+
+    state = HostPermissionState("session", "host", "/opt/work/project", "ask", 4, "ready")
+    revision_reads = 0
+
+    async def get_state():
+        nonlocal revision_reads
+        revision_reads += 1
+        return replace(state, revision=5) if changed_revision and revision_reads > 1 else state
+
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    request, cards = _elicitation_returner(
+        ElicitationResult.model_validate({"action": "accept", "_meta": {"persist": "always"}})
+    )
+    deliver, inject = _DeliverRecorder(), _InjectTuiRecorder()
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([_permission_step(step_index=2, persist_pattern="ls")]),
+        request_elicitation=request,
+        get_permission_state=get_state,
+        deliver=deliver,
+        inject_tui=inject,
+    )
+    assert cards[0][1].model_extra.get("single_use_approval") is True
+    assert "always_allow_pattern" not in cards[0][1].model_extra
+    if changed_revision:
+        assert deliver.calls == []
+        assert inject.calls == []
+    else:
+        assert deliver.calls[0]["payload"] == {"permission": {"allow": True}}
+        assert inject.calls == [["1", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_same_permission_at_new_step_requires_a_new_verdict():
+    from omnigent.permission_tiers.host import HostPermissionState
+
+    async def get_state():
+        return HostPermissionState("session", "host", "/opt/work/project", "ask", 4, "ready")
+
+    pending = _pending_permission(step_index=2)
+    request, cards = _elicitation_returner(
+        ElicitationResult(action="accept"), ElicitationResult(action="decline")
+    )
+    deliver = _DeliverRecorder()
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([_permission_step(step_index=3)]),
+        get_permission_state=get_state,
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=_InjectTuiRecorder(),
+    )
+    assert len(cards) == 2 and cards[0][0] != cards[1][0]
+    assert deliver.calls[0]["payload"] == {"permission": {"allow": False}}
 
 
 # ---------------------------------------------------------------------------
