@@ -70,37 +70,41 @@ describe("permissionModeConcept", () => {
   });
 });
 
-describe("Antigravity tiers", () => {
-  it("offers the seven tiers in contract order with no client launch flags", () => {
-    expect(AGY_NATIVE_DEFAULT_PERMISSION_TIER).toBe("auto-relaxed");
+describe("shared Pi and Antigravity tiers", () => {
+  it("offers five Chinese tiers with no client launch flags and excludes full from project defaults", () => {
+    expect(AGY_NATIVE_DEFAULT_PERMISSION_TIER).toBe("auto");
     expect(
       AGY_NATIVE_PERMISSION_TIERS.map(({ value, label, args }) => [value, label, args]),
     ).toEqual([
-      ["ask", "Ask every time", []],
-      ["plan", "Plan only", []],
-      ["accept-edits", "Accept edits", []],
-      ["auto-strict", "Auto · strict", []],
-      ["auto-standard", "Auto · standard", []],
-      ["auto-relaxed", "Auto · relaxed", []],
-      ["full", "Skip permissions", []],
+      ["ask", "每次都问", []],
+      ["plan", "只规划", []],
+      ["accept-edits", "自动改文件", []],
+      ["auto", "自动（只拦可怕的事）", []],
+      ["full", "全放开", []],
     ]);
     expect(
       sessionDefaultModeOptions("antigravity-native", "permission").map((row) => row.value),
-    ).toEqual([
+    ).toEqual(["ask", "plan", "accept-edits", "auto"]);
+    expect(sessionDefaultModeOptions("pi", "permission").map((row) => row.value)).toEqual([
       "ask",
       "plan",
       "accept-edits",
-      "auto-strict",
-      "auto-standard",
-      "auto-relaxed",
-      "full",
+      "auto",
+    ]);
+    expect(sessionDefaultModeOptions("pi-native", "permission").map((row) => row.value)).toEqual([
+      "ask",
+      "plan",
+      "accept-edits",
+      "auto",
     ]);
     expect(sessionDefaultModeOptions("antigravity-native", "speed")).toEqual([]);
   });
   it.each([
     ["default", "ask"],
     ["skip", "full"],
-    ["auto-standard", "auto-standard"],
+    ["auto-standard", "auto"],
+    ["auto-strict", "auto"],
+    ["auto-relaxed", "auto"],
   ])("migrates %s", (value, expected) => {
     expect(normalizeAgyPermissionTier(value)).toBe(expected);
   });
@@ -125,9 +129,7 @@ describe("Antigravity tiers", () => {
     ["ask", "manual"],
     ["plan", "read-only"],
     ["accept-edits", "edit-automatic"],
-    ["auto-strict", "automatic"],
-    ["auto-standard", "automatic"],
-    ["auto-relaxed", "automatic"],
+    ["auto", "automatic"],
     ["full", "full-access"],
   ])("presents %s with its shared concept", (tier, concept) => {
     expect(permissionModeConcept("antigravity-native", tier)).toBe(concept);

@@ -156,6 +156,10 @@ describe("createSession", () => {
     });
     expect(session).toEqual({
       id: "conv_abc",
+      permissionTier: null,
+      permissionTierRevision: null,
+      permissionTierState: null,
+      permissionTiersCapability: false,
       agentId: "agent_xyz",
       agentName: null,
       runnerId: undefined,
@@ -451,7 +455,7 @@ describe("createBundledSession", () => {
 });
 
 describe("forkSession", () => {
-  it.each(["ask", "plan", "accept-edits", "auto-strict", "auto-standard", "auto-relaxed", "full"])(
+  it.each(["ask", "plan", "accept-edits", "auto", "full"])(
     "serializes Antigravity tier %s without launch args",
     async (tier) => {
       fetchMock.mockResolvedValueOnce(
@@ -635,6 +639,37 @@ describe("forkSession", () => {
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
+  });
+});
+
+it("serializes a revision-bound tier switch and preserves confirmed state", async () => {
+  fetchMock.mockResolvedValueOnce(
+    mockJsonResponse({
+      id: "conv_tier",
+      agent_id: "agent_pi",
+      status: "idle",
+      created_at: 1704067200,
+      permission_tier: "plan",
+      permission_tier_revision: 4,
+      permission_tier_state: "ready",
+      permission_tiers_capability: true,
+    }),
+  );
+  const session = await updateSession("conv_tier", {
+    permissionTier: "plan",
+    expectedPermissionTierRevision: 3,
+  });
+  const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(JSON.parse(init.body as string)).toEqual({
+    permission_mode: "plan",
+    expected_permission_tier_revision: 3,
+  });
+  expect(new Headers(init.headers).get("X-Omnigent-Permission-Tiers")).toBe("1");
+  expect(session).toMatchObject({
+    permissionTier: "plan",
+    permissionTierRevision: 4,
+    permissionTierState: "ready",
+    permissionTiersCapability: true,
   });
 });
 
@@ -1891,8 +1926,9 @@ describe("openSessionStream", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/v1/sessions/conv_abc/stream");
+    expect(url).toBe("/v1/sessions/conv_abc/stream?permission_tiers=1");
     expect(new Headers(init.headers).get("Accept")).toBe("text/event-stream");
+    expect(new Headers(init.headers).get("X-Omnigent-Permission-Tiers")).toBe("1");
     expect(init.signal).toBe(signal);
   });
 });

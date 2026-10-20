@@ -150,7 +150,7 @@ import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import {
   AGY_NATIVE_PERMISSION_TIERS,
-  agyPermissionTierFromSession,
+  NON_FULL_PERMISSION_TIERS,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -331,6 +331,8 @@ import {
   isSdkHarnessSession,
   effortLevelsForFamily,
   supportsEffortControl,
+  permissionTierSwitchDisabledReason,
+  PERMISSION_TIER_BLOCKED,
 } from "@/lib/sessionCapabilities";
 import { sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import {
@@ -1284,7 +1286,10 @@ export function ChatPage() {
       inferenceError={activeSession?.inferenceError}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
+      showClaudePermissionMode={
+        shouldShowPermissionModeControl(capabilitySource) ||
+        activeSession?.permissionTierState != null
+      }
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
@@ -2860,6 +2865,18 @@ function ComposerImpl(
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
+  useEffect(() => {
+    const source = composerSession?.labels?.["omnigent.permission_tier.migrated_from"];
+    if (!composerSessionId || !source || typeof sessionStorage === "undefined") return;
+    const noticeKey = `omnigent.permission-tier-migration:${composerSessionId}:${source}`;
+    if (sessionStorage.getItem(noticeKey)) return;
+    sessionStorage.setItem(noticeKey, "1");
+    toast.info(
+      source === "auto-strict" || source === "auto-standard"
+        ? "旧自动档已迁为自动；现在使用固定的宽松危险规则。"
+        : `旧权限档 ${source} 已迁为 ${composerSession.permissionTier ?? "自动"}。`,
+    );
+  }, [composerSession?.labels, composerSession?.permissionTier, composerSessionId]);
   // Archived sessions keep their unhandled comments; fetch them (visitor
   // drafts included) for the continuation banner above the composer.
   const { data: archivedComments } = useComments(
@@ -2884,11 +2901,14 @@ function ComposerImpl(
     null;
   const composerBranch = useChatStore((s) => s.gitBranch);
   const storedPermissionMode = useChatStore((s) => s.claudePermissionMode);
-  const agyPermissionControl = modelPickerKind === "antigravity";
-  const claudePermissionMode = agyPermissionControl
-    ? agyPermissionTierFromSession(composerSession)
+  const tierPermissionControl = composerSession?.permissionTierState != null;
+  const claudePermissionMode = tierPermissionControl
+    ? (composerSession?.permissionTier ?? "")
     : storedPermissionMode;
-  const permissionLocked = agyPermissionControl && claudePermissionMode === "full";
+  const permissionLocked = tierPermissionControl && claudePermissionMode === "full";
+  const tierDisabledReason = tierPermissionControl
+    ? permissionTierSwitchDisabledReason(composerSession)
+    : undefined;
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
@@ -2962,6 +2982,11 @@ function ComposerImpl(
     (message) => message.conversationId === conversationId,
   );
   const hasQueuedComposerMessages = composerQueuedMessages.length > 0;
+  const tierPickerDisabledReason =
+    tierDisabledReason ??
+    (tierPermissionControl && hasQueuedComposerMessages
+      ? "消息仍在排队，排空后才能切换权限"
+      : undefined);
   const openComposerGithubTab = useOpenGithubTab();
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
@@ -2970,16 +2995,20 @@ function ComposerImpl(
   const permissionOptions =
     (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
     (showClaudePermissionMode
-      ? agyPermissionControl
-        ? AGY_NATIVE_PERMISSION_TIERS.filter((tier) => tier.value !== "full" || permissionLocked)
+      ? tierPermissionControl
+        ? permissionLocked
+          ? AGY_NATIVE_PERMISSION_TIERS.filter((tier) => tier.value === "full")
+          : NON_FULL_PERMISSION_TIERS
         : devinPermissionControl
           ? DEVIN_NATIVE_PERMISSION_MODES
           : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
       : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS);
   const permissionLabel = showClaudePermissionMode
-    ? agyPermissionControl
-      ? (AGY_NATIVE_PERMISSION_TIERS.find((tier) => tier.value === claudePermissionMode)?.label ??
-        claudePermissionMode)
+    ? tierPermissionControl
+      ? composerSession?.permissionTierState === "blocked"
+        ? PERMISSION_TIER_BLOCKED
+        : (AGY_NATIVE_PERMISSION_TIERS.find((tier) => tier.value === claudePermissionMode)?.label ??
+          "权限状态待确认")
       : devinPermissionControl
         ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
           claudePermissionMode)
@@ -2989,18 +3018,34 @@ function ComposerImpl(
         codexApprovalMode)
       : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
-    if (isReadOnly || unreachable || permissionLocked || configBusyRef.current) return;
+    if (
+      isReadOnly ||
+      unreachable ||
+      permissionLocked ||
+      tierPickerDisabledReason ||
+      configBusyRef.current
+    )
+      return;
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
     try {
       const store = useChatStore.getState();
-      if (agyPermissionControl && sourceSessionId) {
-        const updated = await updateSession(sourceSessionId, { claudePermissionMode: mode });
+      if (
+        tierPermissionControl &&
+        sourceSessionId &&
+        composerSession?.permissionTierRevision != null
+      ) {
+        const updated = await updateSession(sourceSessionId, {
+          permissionTier: mode,
+          expectedPermissionTierRevision: composerSession.permissionTierRevision,
+        });
         chatQueryClient()?.setQueryData(["session", sourceSessionId], updated);
       } else if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
     } catch (error) {
+      if (tierPermissionControl && sourceSessionId)
+        void chatQueryClient()?.invalidateQueries({ queryKey: ["session", sourceSessionId] });
       if (useChatStore.getState().conversationId === sourceSessionId)
         setCommandError(error instanceof Error ? error.message : "Unable to change permissions");
     } finally {
@@ -4576,12 +4621,13 @@ function ComposerImpl(
                     unreachable ||
                     configBusy ||
                     permissionLocked ||
+                    Boolean(tierPickerDisabledReason) ||
                     !isOwnerLevel(permissionLevel)
                   }
                   disabledReason={
-                    isOwnerLevel(permissionLevel)
-                      ? undefined
-                      : "Only the session owner can change the permission mode"
+                    !isOwnerLevel(permissionLevel)
+                      ? "Only the session owner can change the permission mode"
+                      : tierPickerDisabledReason
                   }
                   onSelect={(mode) => void changePermission(mode)}
                 />
@@ -5201,7 +5247,6 @@ export function shouldShowPermissionModeControl(
   return (
     isClaudeNativeSession(conv) ||
     modelPickerKindForConv(conv) === "devin" ||
-    modelPickerKindForConv(conv) === "antigravity" ||
     (isSdkHarnessSession(conv) && conv?.harness === "claude-sdk")
   );
 }

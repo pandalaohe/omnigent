@@ -326,7 +326,7 @@ function setAgents(agents: AvailableAgent[]): void {
 function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
-): void {
+): ReturnType<typeof render> {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -375,7 +375,7 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return render(<NewChatLandingScreen />, { wrapper: Wrapper });
 }
 
 /**
@@ -1892,13 +1892,49 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.labels).toEqual({
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "antigravity-native-ui",
-      "omnigent.antigravity_native.permission_tier": "auto-relaxed",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
       ...composerContextToLabels({
         workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
         worktree: { kind: "none" },
       }),
     });
+    expect(body.permission_tier).toBe("auto");
+    expect(new Headers(init.headers).get("X-Omnigent-Permission-Tiers")).toBe("1");
+  });
+
+  it.each([
+    ["pi-native-ui", "pi-native"],
+    ["pi-agent", "pi"],
+  ])("creates %s with an explicit auto tier", async (name, harness) => {
+    setAgents([agent({ id: "ag_pi", name, harness, display_name: "Pi" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_pi" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).permission_tier).toBe("auto");
+    expect(new Headers(init.headers).get("X-Omnigent-Permission-Tiers")).toBe("1");
+  });
+
+  it("lets a Pi RPC agent select a non-default tier", async () => {
+    setAgents([agent({ id: "ag_pi", name: "pi-agent", harness: "pi", display_name: "Pi" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_pi" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    pickPermissionOption("plan");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).permission_tier).toBe("plan");
   });
 
   it("posts --permission-mode <mode> when a non-default mode is picked for claude-native", async () => {
@@ -2234,8 +2270,8 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
-  it.each(["ask", "plan", "accept-edits", "auto-strict", "auto-standard", "auto-relaxed", "full"])(
-    "creates Antigravity tier %s through its label",
+  it.each(["ask", "plan", "accept-edits", "auto", "full"])(
+    "creates Antigravity tier %s through the explicit field",
     async (tier) => {
       setAgents([
         agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
@@ -2252,14 +2288,15 @@ describe("NewChatLandingScreen create flow", () => {
       await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
       const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
       const body = JSON.parse(init.body as string);
-      expect(body.labels["omnigent.antigravity_native.permission_tier"]).toBe(tier);
+      expect(body.permission_tier).toBe(tier);
+      expect(body.labels["omnigent.antigravity_native.permission_tier"]).toBeUndefined();
       expect(body.terminal_launch_args).toBeUndefined();
     },
   );
 
   it.each([
     ["default", "ask"],
-    ["skip", "full"],
+    ["skip", "auto"],
   ])("restores legacy Antigravity mode %s", async (legacy, tier) => {
     localStorage.setItem(
       "omnigent:last-mode-by-harness",
@@ -2278,9 +2315,7 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
-    expect(
-      JSON.parse(init.body as string).labels["omnigent.antigravity_native.permission_tier"],
-    ).toBe(tier);
+    expect(JSON.parse(init.body as string).permission_tier).toBe(tier);
   });
 
   it("creates Antigravity with a base model id and a supported effort", async () => {
@@ -2362,7 +2397,7 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(init.body as string);
     // Anchor so the absence check is not vacuous against a malformed body.
     expect(body.labels?.["omnigent.wrapper"]).toBe("antigravity-native-ui");
-    expect(body.labels["omnigent.antigravity_native.permission_tier"]).toBe("auto-relaxed");
+    expect(body.permission_tier).toBe("auto");
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
@@ -2376,10 +2411,34 @@ describe("NewChatLandingScreen create flow", () => {
     pickPermissionOption("full");
     expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveAttribute("role", "alert");
     expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveTextContent(
-      "all tool permission prompts disabled",
+      "跳过本套审批与规则",
     );
     pickPermissionOption("ask");
     expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();
+  });
+
+  it("retains this form's explicit full tier when a late model catalog arrives", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_full" }),
+    } as unknown as Response);
+    const view = renderLanding();
+    await waitForWorkspaceSeed();
+    pickPermissionOption("full");
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [{ id: "late", displayName: "Late model" }],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    view.rerender(<NewChatLandingScreen />);
+    expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toBeVisible();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).permission_tier).toBe("full");
   });
 
   it("omits model + effort on create when the picker is untouched for claude-native", async () => {

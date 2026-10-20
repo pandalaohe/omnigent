@@ -291,6 +291,11 @@ export interface BackgroundTaskInfo {
 
 export interface Session {
   id: string;
+  /** Server-confirmed tier state; absent on older servers and unrelated harnesses. */
+  permissionTier?: string | null;
+  permissionTierRevision?: number | null;
+  permissionTierState?: "ready" | "switching" | "blocked" | null;
+  permissionTiersCapability?: boolean;
   agentId: string;
   agentTemplateId?: string | null;
   /**

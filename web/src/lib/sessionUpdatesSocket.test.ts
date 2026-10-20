@@ -87,6 +87,7 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
       socket.start();
       const first = latestWs();
       expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+      expect(new URL(first.url).searchParams.get("permission_tiers")).toBe("1");
       first.open();
       first.close();
       vi.advanceTimersByTime(RECONNECT_CEILING_MS);
@@ -101,6 +102,7 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
   it("forces a reconnect after the watchdog window of total silence", () => {
     sessionUpdatesSocket.start();
     const ws = latestWs();
+    expect(new URL(ws.url).searchParams.get("permission_tiers")).toBe("1");
     ws.open();
     expect(sessionUpdatesSocket.isConnected()).toBe(true);
 

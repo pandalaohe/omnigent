@@ -314,7 +314,8 @@ function ForkRunConfig({
   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(targetAgent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(targetAgent, "cursorMode");
-  const hasAgyPermissionTier = nativeAgentHasCapability(targetAgent, "agyPermissionTier");
+  const hasAgyPermissionTier =
+    nativeAgentHasCapability(targetAgent, "agyPermissionTier") || targetHarness === "pi";
   const hasModelPicker = nativeAgentHasCapability(targetAgent, "modelPicker");
   // Codex resolves its own catalog, so it gets a model row even though it lacks
   // the modelPicker capability (mirrors the new-session dialog).
@@ -385,9 +386,15 @@ function ForkRunConfig({
     // The source's tier is meaningful only when the source itself ran
     // antigravity-native; a claude/codex source forks into agy's default.
     if (hasAgyPermissionTier) {
-      return nativeCodingAgentForSession(sourceSession)?.harness === "antigravity-native"
-        ? agyPermissionTierFromSession(sourceSession)
-        : AGY_NATIVE_DEFAULT_PERMISSION_TIER;
+      const sourceHarness =
+        sourceSession?.harness ?? nativeCodingAgentForSession(sourceSession)?.harness;
+      const inherited =
+        sourceHarness != null && ["pi", "pi-native", "antigravity-native"].includes(sourceHarness)
+          ? (sourceSession?.permissionTier ??
+            sourceSession?.labels?.["omnigent.pi.permission_tier"] ??
+            agyPermissionTierFromSession(sourceSession))
+          : AGY_NATIVE_DEFAULT_PERMISSION_TIER;
+      return inherited === "full" ? AGY_NATIVE_DEFAULT_PERMISSION_TIER : inherited;
     }
     // Same as permission: launch args carry over only on a same-agent fork, so
     // seed the mode from the source only then; otherwise the harness's default.
@@ -681,6 +688,12 @@ function ForkRunConfig({
 
       {hasAgyPermissionTier && (
         <>
+          {sourceSession?.permissionTier === "full" &&
+            mode === AGY_NATIVE_DEFAULT_PERMISSION_TIER && (
+              <p role="status" className="text-xs text-muted-foreground">
+                来源会话为全放开；新会话默认使用自动。若确需全放开，请在此明确选择。
+              </p>
+            )}
           <ForkConfigRow label="Permissions">
             <DescribedSelect
               value={mode}
@@ -700,10 +713,7 @@ function ForkRunConfig({
               className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
             >
               <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-              <span>
-                Danger: this session runs Antigravity with all tool permission prompts disabled. It
-                can edit any file and run any command without asking.
-              </span>
+              <span>全放开会跳过本套审批与规则；仅本次创建时可选。</span>
             </div>
           )}
         </>
@@ -1069,7 +1079,9 @@ function SupportedForkSessionForm({
   const targetHarness = useMemo(() => {
     const fromAgent = nativeCodingAgentForAvailableAgent(targetAgent)?.harness;
     if (fromAgent) return fromAgent;
-    if (!switching) return nativeCodingAgentForSession(sourceSession)?.harness ?? null;
+    if (targetAgent?.harness === "pi") return "pi";
+    if (!switching)
+      return nativeCodingAgentForSession(sourceSession)?.harness ?? sourceSession?.harness ?? null;
     return null;
   }, [targetAgent, switching, sourceSession]);
   // The two backend carry rules the pickers must mirror so the displayed value

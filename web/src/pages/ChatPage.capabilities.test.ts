@@ -352,7 +352,7 @@ it("enables Antigravity model, effort and permission controls", () => {
   expect(modelPickerKindForConv(session)).toBe("antigravity");
   expect(shouldShowModelPicker(session)).toBe(true);
   expect(shouldShowEffortPicker(session)).toBe(true);
-  expect(shouldShowPermissionModeControl(session)).toBe(true);
+  expect(shouldShowPermissionModeControl(session)).toBe(false);
   expect(effortLevelsForConv(session, [{ id: "gpt-oss", efforts: ["medium"] }], "gpt-oss")).toEqual(
     ["medium"],
   );

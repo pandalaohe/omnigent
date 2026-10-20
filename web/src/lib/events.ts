@@ -665,6 +665,9 @@ export interface SessionPermissionModeEvent {
   type: "session_permission_mode";
   conversationId: string;
   permissionMode: string;
+  permissionTierRevision?: number;
+  permissionTierState?: "ready" | "switching" | "blocked";
+  permissionTiersCapability?: boolean;
 }
 
 /**

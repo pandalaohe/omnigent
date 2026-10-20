@@ -54,6 +54,11 @@ describe("useRecentSessions", () => {
       expect(result.current.error).toBeInstanceOf(RecentSessionsUnavailableError);
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/me/recent-sessions?limit=5");
+      expect(
+        new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers).get(
+          "X-Omnigent-Permission-Tiers",
+        ),
+      ).toBe("1");
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(3 * 60_000);
