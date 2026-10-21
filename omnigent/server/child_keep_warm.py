@@ -76,7 +76,10 @@ from omnigent.server.routes._sessions.helpers import (
     effective_host_id,
 )
 from omnigent.server.session_collab import collab_owner_for, collab_owners_for
-from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
+from omnigent.server.session_live_state import (
+    LAST_REAL_TURN_SETTLED_LABEL_KEY,
+    RUNNING_SINCE_LABEL_KEY,
+)
 from omnigent.server.user_preferences_store import (
     KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S,
     KEEP_WARM_CODEX_DEFAULT_INTERVAL_S,
@@ -607,8 +610,8 @@ def warm_state_for_labels(
     with ``cold_after_s == 0`` reads ``warm`` even with no label. The label's
     ``y`` stamp wins when present; otherwise the caller's ``family`` —
     resolved from the session's harness — supplies the per-family rule. A
-    session outside the sweeper's scan window carries no label at all and
-    reads ``warm`` while busy, ``cold`` otherwise.
+    session outside the sweeper's scan window uses its last real turn's
+    settled stamp (or its start stamp on older rows) for the family clock.
 
     :param labels: Conversation labels, or ``None``.
     :param archived: Whether the session row itself is archived.
@@ -633,6 +636,16 @@ def warm_state_for_labels(
     if raw is None:
         if family is None:
             return None
+        if not busy and cold_after_s is None and labels:
+            turns = [
+                int(stamp)
+                for key in (LAST_REAL_TURN_SETTLED_LABEL_KEY, RUNNING_SINCE_LABEL_KEY)
+                if isinstance((stamp := labels.get(key)), str) and stamp.isdigit()
+            ]
+            if turns:
+                age = now - max(turns)
+                window = _CLAUDE_TTL_S if family == "claude" else _CODEX_DEFAULT_STALENESS_S
+                return "warm" if 0 <= age < window else "cold"
         return "warm" if busy else "cold"
     if family is None:
         return None

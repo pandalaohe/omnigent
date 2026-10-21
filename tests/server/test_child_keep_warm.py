@@ -2354,6 +2354,90 @@ async def test_warm_state_for_labels_falls_back_to_the_harness_family() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("family", "fresh_age", "stale_age"),
+    [("claude", 3599, 3600), ("codex", 1799, 1800)],
+)
+async def test_unlabelled_idle_warm_state_uses_last_real_turn(
+    family: str, fresh_age: int, stale_age: int
+) -> None:
+    now = 1_000_000
+
+    def state(age: int, *, cold_after_s: int | None = None) -> str | None:
+        return warm_state_for_labels(
+            {RUNNING_SINCE_LABEL_KEY: str(now - age)},
+            archived=False,
+            busy=False,
+            now=now,
+            family=family,
+            cold_after_s=cold_after_s,
+        )
+
+    assert state(fresh_age) == "warm"
+    assert state(stale_age) == "cold"
+    assert (
+        warm_state_for_labels(
+            {
+                RUNNING_SINCE_LABEL_KEY: str(now - 7200),
+                "omnigent.last_real_turn_settled": str(now - fresh_age),
+            },
+            archived=False,
+            busy=False,
+            now=now,
+            family=family,
+        )
+        == "warm"
+    )
+    assert state(stale_age, cold_after_s=0) == "warm"
+    assert state(599, cold_after_s=600) == "cold"
+    assert state(600, cold_after_s=600) == "cold"
+    assert (
+        warm_state_for_labels(
+            {RUNNING_SINCE_LABEL_KEY: str(now - 1)},
+            archived=False,
+            busy=False,
+            now=now,
+        )
+        is None
+    )
+    # A keep-warm label remains authoritative even when a later turn is fresh.
+    assert (
+        warm_state_for_labels(
+            {
+                RUNNING_SINCE_LABEL_KEY: str(now - 1),
+                KEEP_WARM_LABEL: _label(s="c", y=family, why="cap", t=now - 7200),
+            },
+            archived=False,
+            busy=False,
+            now=now,
+        )
+        == "cold"
+    )
+    if family == "codex":
+        assert (
+            warm_state_for_labels(
+                {
+                    "omnigent.last_real_turn_settled": str(now - 1),
+                    KEEP_WARM_LABEL: _label(s="w", y="codex", t=now - 100, o=[now - 100, 0]),
+                },
+                archived=False,
+                busy=False,
+                now=now,
+            )
+            == "cold"
+        )
+    assert (
+        warm_state_for_labels(
+            {"omnigent.last_real_turn_settled": str(now - 1)},
+            archived=True,
+            busy=False,
+            now=now,
+            family=family,
+        )
+        is None
+    )
+
+
 async def test_warm_state_from_label_cold_after_zero_never_reads_cold() -> None:
     """cold_after_s == 0: warm for an unlabelled or cold label on both families."""
     now = 1_000_000

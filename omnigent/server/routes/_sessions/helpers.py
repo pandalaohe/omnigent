@@ -5583,13 +5583,19 @@ def _publish_status(
     previous_status = _session_status_cache.get(session_id)
     _note_running_edge(session_id, previous_status, status)
     _session_status_cache[session_id] = status
-    if previous_status != status:
-        _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
     if persist_live_status:
-        session_live_state.persist_live_status(session_id, status)
+        session_live_state.persist_live_status(
+            session_id,
+            status,
+            check_real_turn_settle=(
+                status == "idle" and previous_status in (None, "running", "waiting")
+            ),
+        )
+    if previous_status != status:
+        _publish_child_status_to_parent(session_id, status)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the
@@ -13067,13 +13073,13 @@ def _child_session_summary_from_conversation(
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
         routing_decision_id=routing_decision_id,
-        warm_state=_warm_state_from_label(
+        warm_state=_warm_state_for_child(
             conv, harness=harness, busy=busy, cold_after_s=cold_after_s
         ),
     )
 
 
-def _warm_state_from_label(
+def _warm_state_for_child(
     conv: Conversation,
     *,
     harness: str | None,
@@ -13082,16 +13088,22 @@ def _warm_state_from_label(
 ) -> Literal["warm", "cold"] | None:
     """Derive the keep-warm pill state for a child summary (no settings read)."""
     from omnigent.db.utils import now_epoch
-    from omnigent.server.child_keep_warm import KEEP_WARM_LABEL, warm_state_from_label
+    from omnigent.server.child_keep_warm import (
+        keep_warm_family_for_harness,
+        warm_state_for_labels,
+    )
 
     if _is_harness_subagent_mirror(conv):
         return None
-    return warm_state_from_label(
-        conv.labels.get(KEEP_WARM_LABEL),
+    family = keep_warm_family_for_harness(harness)
+    if family is None:
+        return None
+    return warm_state_for_labels(
+        conv.labels,
         archived=bool(conv.archived),
-        harness=harness,
         busy=busy,
         now=now_epoch(),
+        family=family,
         cold_after_s=cold_after_s,
     )
 
