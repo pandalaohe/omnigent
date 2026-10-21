@@ -8,8 +8,7 @@
 //
 // This test drives the real extension through its public surface: it registers
 // the event handlers with a mock `pi`, and delivers interrupts through the real
-// inbox poller (a temp inbox directory). No network is used (postEvent fails
-// closed when config has no serverUrl).
+// inbox poller (a temp inbox directory). HTTP calls use the mock fetch below.
 //
 // Run with: node omnigent/resources/pi_native/omnigent_pi_native_extension.test.js
 //
@@ -32,30 +31,32 @@ const harnesses = [];
 // Build a fresh extension instance with its own temp inbox directory. Each call
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
-function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
-  const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
-  const configPath = path.join(inboxDir, "config.json");
-  // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
-  // global fetch that lets a test capture the posted event bodies. Without
-  // them postEvent fails closed (the interrupt tests rely on that).
-  const config = captureEvents
-    ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
-    : { inboxDir, bridgeDir: inboxDir };
+function makeHarness({ captureEvents = false, existingTools = [], startupInstructions } = {}) {
+  const bridgeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
+  const inboxDir = path.join(bridgeDir, "inbox");
+  fs.mkdirSync(inboxDir);
+  const configPath = path.join(bridgeDir, "config.json");
+  const config = {
+    inboxDir, bridgeDir, serverUrl: "http://mock", sessionId: "conv_test",
+  };
+  fs.writeFileSync(path.join(bridgeDir, "permission_state.json"), JSON.stringify({
+    session_id: config.sessionId, host_id: "test-host", workspace: bridgeDir,
+    tier: "ask", revision: 1, status: "ready",
+  }));
+  if (startupInstructions !== undefined) config.startupInstructions = startupInstructions;
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
   // Capture posted event bodies (status edges etc.) instead of hitting network.
   const postedEvents = [];
-  if (captureEvents) {
-    global.fetch = async (url, opts) => {
+  global.fetch = async (url, opts) => {
       try {
-        if (opts && typeof opts.body === "string" && String(url).endsWith("/events")) {
+        if (captureEvents && opts && typeof opts.body === "string" && String(url).endsWith("/events")) {
           postedEvents.push(JSON.parse(opts.body));
         }
       } catch (_err) {}
-      return { ok: true, status: 204, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => ({ result: "POLICY_ACTION_ALLOW" }) };
     };
-  }
 
   const handlers = {};
   const registeredTools = {};
@@ -76,7 +77,7 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   const mod = require(EXT_PATH);
   mod(pi);
 
-  const h = { pi, handlers, inboxDir, postedEvents, registeredTools };
+  const h = { pi, handlers, bridgeDir, inboxDir, postedEvents, registeredTools };
   harnesses.push(h);
   return h;
 }
@@ -121,6 +122,40 @@ async function deliverInterrupt(h) {
 function assert(name, cond, detail) {
   console.log(`${cond ? "PASS" : "FAIL"}  ${name}${detail ? "  -- " + detail : ""}`);
   if (!cond) process.exitCode = 1;
+}
+
+async function testStartupInstructionsReachEveryAgentStart() {
+  const h = makeHarness({
+    captureEvents: true,
+    startupInstructions: "Author brief.\n\nGlobal directions.",
+  });
+  const base = "Pi native prompt\n\nAPPEND_SYSTEM content";
+  const expected = `${base}\n\nAuthor brief.\n\nGlobal directions.`;
+  const first = await h.handlers.before_agent_start({ systemPrompt: base }, {});
+  await h.handlers.input({ text: "typed in terminal" }, {});
+  const second = await h.handlers.before_agent_start({ systemPrompt: base }, {});
+  const repeated = await h.handlers.before_agent_start(
+    { systemPrompt: first.systemPrompt }, {},
+  );
+  const compacted = await h.handlers.before_agent_start(
+    { systemPrompt: "Pi prompt after compaction" }, {},
+  );
+  assert("first native prompt retains APPEND_SYSTEM and gets startup text", first.systemPrompt === expected);
+  assert("second agent start gets the same startup text", second.systemPrompt === expected);
+  assert(
+    "terminal input stays a user message while the hook supplies instructions",
+    h.postedEvents.some((event) => event.type === "external_conversation_item" &&
+      event.data.item_data.content[0].text === "typed in terminal"),
+  );
+  assert("repeated hook does not duplicate startup text", repeated === undefined);
+  assert(
+    "post-compaction native prompt gets startup text",
+    compacted.systemPrompt === "Pi prompt after compaction\n\nAuthor brief.\n\nGlobal directions.",
+  );
+  const empty = makeHarness({ startupInstructions: "   " });
+  const absent = makeHarness();
+  assert("blank instructions leave native prompt alone", !await empty.handlers.before_agent_start({ systemPrompt: base }, {}));
+  assert("absent instructions leave native prompt alone", !await absent.handlers.before_agent_start({ systemPrompt: base }, {}));
 }
 
 async function testIdleInterruptDoesNotPoisonNextTurn() {
@@ -426,25 +461,15 @@ async function testExistingTaskToolIsMirroredWithoutConflict() {
   );
 }
 
-// The executor wraps the session's first injected message with the launch-
-// staged instructions (wrap_agent_instructions); the mirrored "input" event
-// must strip that block so the mirrored bubble — and the server's pending-
-// input reconciliation, which matches mirrored text exactly against the
-// queued web message — see only the bare user text.
-async function testInputMirrorStripsAgentInstructionsBlock() {
+// Native instructions now ride the system prompt. User input reaches the
+// mirror unchanged so pending-input reconciliation sees the original text.
+async function testInputMirrorPreservesUserText() {
   const h = makeHarness({ captureEvents: true });
   await h.handlers.session_start({}, {});
+  const userText = "<omnigent_agent_instructions>literal user text</omnigent_agent_instructions>";
 
   await h.handlers.input(
-    {
-      text:
-        "<omnigent_agent_instructions>\n" +
-        "These are your operating instructions for this session; follow them " +
-        "throughout, not just for this message:\n\n" +
-        "be terse\n" +
-        "</omnigent_agent_instructions>\n\n" +
-        "hello there",
-    },
+    { text: userText },
     {},
   );
 
@@ -452,8 +477,8 @@ async function testInputMirrorStripsAgentInstructionsBlock() {
     (item) => item.type === "external_conversation_item",
   );
   assert(
-    "mirrored input drops the wrapped instructions block",
-    !!event && event.data.item_data.content[0].text === "hello there",
+    "mirrored input preserves the user text",
+    !!event && event.data.item_data.content[0].text === userText,
     JSON.stringify(event),
   );
 }
@@ -649,13 +674,14 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
 
 (async () => {
   try {
+    await testStartupInstructionsReachEveryAgentStart();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();
-    await testInputMirrorStripsAgentInstructionsBlock();
+    await testInputMirrorPreservesUserText();
     await testToolCallRetryOutlastsTheShortBudget();
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();
@@ -667,7 +693,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
     for (const h of harnesses) {
       if (h.pi.__omnigentInboxPoller) clearInterval(h.pi.__omnigentInboxPoller);
       try {
-        fs.rmSync(h.inboxDir, { recursive: true, force: true });
+        fs.rmSync(h.bridgeDir, { recursive: true, force: true });
       } catch (_err) {}
     }
   }

@@ -69,7 +69,10 @@ from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environ
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
-from omnigent.native.native_bridge_common import write_agent_instructions_preamble
+from omnigent.native.native_bridge_common import (
+    clear_agent_instructions_preamble,
+    write_agent_instructions_preamble,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
@@ -2598,8 +2601,8 @@ async def _auto_create_pi_terminal(
         back to the platform default. ``None`` only when the session has no
         spec; callers must not pass ``None`` to paper over a resolution error.
     :param global_instructions: The server-held global instructions text for
-        this session, or ``None`` when none is set. Staged with the rest of the
-        startup text for the first injected message.
+        this session, or ``None`` when none is set. Composed into Pi's system
+        prompt on every agent start.
     :param peer_messaging_enabled: Registers ``sys_session_send`` in
         by-id mode on the relay surface, from the session's init snapshot.
     :param session_open_enabled: Registers ``sys_session_open`` on the
@@ -2627,13 +2630,12 @@ async def _auto_create_pi_terminal(
     )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
-    # A relaunched pane is a new Pi process, so it must get a fresh copy of the
-    # instructions; the executor clears them only once the first injection lands.
+    clear_agent_instructions_preamble(bridge_dir)
+    # A relaunched pane gets a fresh config; the extension appends these
+    # instructions to Pi's native prompt on every agent start.
     startup_instructions = _native_startup_instructions_from_spec(
         agent_spec, global_instructions=global_instructions
     )
-    if startup_instructions is not None:
-        write_agent_instructions_preamble(bridge_dir, startup_instructions)
     # Drop stale payloads so a relaunched Pi process can't replay them.
     clear_inbox(bridge_dir)
     pi_extension = pi_extension_path(bridge_dir)
@@ -2690,6 +2692,7 @@ async def _auto_create_pi_terminal(
         conversation_url=conversation_url(launch_config.server_url, session_id),
         auth_headers=auth_headers,
         tools=pi_tools,
+        startup_instructions=startup_instructions,
     )
     pi_command = resolve_pi_executable()
     # One ``pi --version`` probe feeds both the floor gate and the --approve

@@ -367,6 +367,11 @@ def test_every_canonical_harness_declares_instruction_delivery() -> None:
         assert caps[harness].instruction_delivery is not InstructionDelivery.UNKNOWN, harness
 
 
+def test_pi_native_uses_agent_startup_instructions() -> None:
+    caps = harness_capabilities()
+    assert caps["pi-native"].instruction_delivery is InstructionDelivery.AGENT_STARTUP_ADDITIVE
+
+
 def test_sdk_harnesses_only_advertise_effort_their_executor_applies() -> None:
     """A declared effort family puts a dial in the composer; the executor must use the pick.
 

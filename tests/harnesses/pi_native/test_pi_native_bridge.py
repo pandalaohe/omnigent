@@ -248,6 +248,25 @@ def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
     assert payload["tools"] == []
 
 
+def test_write_extension_files_replaces_startup_instructions_on_relaunch(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    arguments = {
+        "session_id": "conv_abc",
+        "server_url": "http://omnigent.test",
+        "conversation_url": "http://omnigent.test/c/conv_abc",
+    }
+    _, config = pi_native_bridge.write_extension_files(
+        bridge_dir, **arguments, startup_instructions="author\n\nglobal"
+    )
+    assert json.loads(config.read_text(encoding="utf-8"))["startupInstructions"] == (
+        "author\n\nglobal"
+    )
+
+    # A relaunch without composed text replaces the old config completely.
+    pi_native_bridge.write_extension_files(bridge_dir, **arguments, startup_instructions="  ")
+    assert "startupInstructions" not in json.loads(config.read_text(encoding="utf-8"))
+
+
 def test_refresh_config_auth_headers_replaces_only_auth(tmp_path: Path) -> None:
     """Refreshing the bearer rewrites only ``authHeaders``, leaving the rest.
 
