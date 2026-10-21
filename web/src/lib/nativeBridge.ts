@@ -228,6 +228,11 @@ interface ElectronDesktopApi extends NativeShellApi {
       sourceIsArcaHost?: boolean;
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  getBrowserLoginSetting?: () => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
+  setBrowserLoginSetting?: (
+    enabled: boolean,
+  ) => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
+  clearBrowserLogin?: () => Promise<{ ok: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -535,6 +540,22 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
  */
 export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
+}
+
+export function browserLoginBridge() {
+  const desktop = electronApi();
+  if (
+    !desktop?.getBrowserLoginSetting ||
+    !desktop.setBrowserLoginSetting ||
+    !desktop.clearBrowserLogin
+  ) {
+    return undefined;
+  }
+  return {
+    get: desktop.getBrowserLoginSetting,
+    set: desktop.setBrowserLoginSetting,
+    clear: desktop.clearBrowserLogin,
+  };
 }
 
 /** Subscribe to recent-session key events forwarded from an embedded Browser page. */
