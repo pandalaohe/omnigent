@@ -794,7 +794,9 @@ def register_open_routes(
         )
         if project is None:
             projects = (
-                await asyncio.to_thread(project_store.list, user_id=owner) if project_store else []
+                await asyncio.to_thread(project_store.list, user_id=owner, archived="include")
+                if project_store
+                else []
             )
             matches = [
                 item for item in projects if item.name.casefold() == body.project.casefold()
@@ -809,6 +811,12 @@ def register_open_routes(
                     [{"id": item.id, "name": item.name} for item in (matches or projects)],
                 )
             project = matches[0]
+        if project.archived_at is not None:
+            return _problem(
+                "refused",
+                "project_archived",
+                f"Project {project.name!r} is archived; unarchive it or choose another project.",
+            )
         bindings = await load_bindings(binding_store, project.id)
         entries = await load_entries(binding_store, project.id)
         roots = host_roots(project, bindings, entries=entries)

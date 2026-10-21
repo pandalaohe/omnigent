@@ -13277,6 +13277,7 @@ async def _create_session_from_existing_agent(
     )
 
     request_fields_set = body.model_fields_set
+    explicit_project_label = "omni_project" in (body.labels or {})
     admission_enabled = getattr(request.app.state, "startup_admission", None) is not None
     # The owner-checked project / host lookup feeds a child's calling defaults,
     # so it runs before the resolver; a child naming a workspace takes the
@@ -13790,7 +13791,11 @@ async def _create_session_from_existing_agent(
     inherited_runner_id: str | None = None
     # The project lookup ran before the resolver; it only counts for
     # inheritance when this caller still owns it.
-    child_project_id: str | None = parent_project.id if parent_project is not None else None
+    child_project_id: str | None = (
+        parent_project.id
+        if parent_project is not None and parent_project.archived_at is None
+        else None
+    )
     if body.parent_session_id is not None and parent_conv is not None:
         inherited_runner_id = parent_conv.runner_id
         if body.host_id is not None and body.host_id != effective_host_id(
@@ -14461,6 +14466,9 @@ async def _create_session_from_existing_agent(
             }
         )
         with creation_stage("create_persistence_ms"):
+            project_owner_kwargs: dict[str, Any] = (
+                {"project_owner_user_id": user_id} if "omni_project" in initial_labels else {}
+            )
             conv = conversation_store.create_conversation(
                 conversation_id=conversation_id,
                 agent_id=agent.id,
@@ -14475,6 +14483,10 @@ async def _create_session_from_existing_agent(
                 git_branch=git_branch,
                 terminal_launch_args=validated_launch_args,
                 project_id=project_resolution.project_id or child_project_id,
+                project_admission="reject"
+                if "project_id" in request_fields_set or explicit_project_label
+                else "inherit",
+                **project_owner_kwargs,
                 labels=initial_labels or None,
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
@@ -14774,6 +14786,7 @@ def _create_session_from_bundle(
     worktree: str | None = None,
     git_branch: str | None = None,
     agent_store: AgentStore | None = None,
+    project_admission: Literal["reject", "inherit"] = "reject",
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -14905,6 +14918,7 @@ def _create_session_from_bundle(
                 inference_model=inference_model,
                 worktree=worktree,
                 git_branch=git_branch,
+                project_owner_user_id=created_by,
             )
 
     agent_id = generate_agent_id()
@@ -14931,6 +14945,7 @@ def _create_session_from_bundle(
         created_by=created_by,
         worktree=worktree,
         git_branch=git_branch,
+        project_admission=project_admission,
     )
 
 

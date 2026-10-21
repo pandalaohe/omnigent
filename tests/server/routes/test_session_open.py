@@ -387,6 +387,23 @@ async def test_host_not_found_lists_rooted_hosts(open_env: dict[str, Any]) -> No
     assert data["candidates"] == [{"id": HOST_ID, "name": HOST_NAME}]
 
 
+@pytest.mark.parametrize("by_id", [False, True])
+async def test_archived_project_is_refused(open_env: dict[str, Any], by_id: bool) -> None:
+    env = open_env
+    project = env["projects"].list(user_id=ALICE)[0]
+    env["projects"].begin_archive_op(project.id, user_id=ALICE, kind="archive")
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            project=project.id if by_id else project.name,
+        )
+    assert data["state"] == "refused"
+    assert data["reason"] == "project_archived"
+    assert project.name in data["message"]
+
+
 @pytest.mark.asyncio
 async def test_known_host_without_root_refused(open_env: dict[str, Any]) -> None:
     """A host the project has no directory on is ``no_root``."""

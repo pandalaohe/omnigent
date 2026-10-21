@@ -72,6 +72,7 @@ import {
   getProjectHostRoots as apiGetProjectHostRoots,
   listProjects as apiListProjects,
   type ProjectConfig,
+  type Project,
   type ProjectHostRoots,
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
@@ -119,6 +120,20 @@ const ARCHIVED_CONVERSATIONS_KEY = ["archived-conversations"] as const;
 const ARCHIVED_SESSION_FACETS_KEY = ["archived-session-facets"] as const;
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 export const ARCHIVED_PAGE_SIZE = 20;
+
+export async function invalidateProjectArchiveQueries(queryClient: QueryClient): Promise<void> {
+  await Promise.all(
+    [
+      ["projects"],
+      ["conversations"],
+      ["project-sessions"],
+      ARCHIVED_CONVERSATIONS_KEY,
+      ARCHIVED_SESSION_FACETS_KEY,
+      ARCHIVED_PROJECT_NAMES_KEY,
+      ["scheduled-tasks"],
+    ].map((queryKey) => queryClient.invalidateQueries({ queryKey })),
+  );
+}
 
 let archivedAtCapabilityGeneration = -1;
 let archivedAtQuerySupported = true;
@@ -2577,6 +2592,15 @@ export function useProjects() {
   });
 }
 
+/** The archive and automation views also need projects hidden from ordinary pickers. */
+export function useProjectsWithArchived() {
+  return useQuery<Project[]>({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => apiListProjects({ includeArchived: true }),
+    staleTime: 30_000,
+  });
+}
+
 /**
  * Fetch the names of every project that has at least one ARCHIVED session,
  * paging through all archived sessions server-side.
@@ -2630,7 +2654,7 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
   if (memberProjectIds.size > 0) {
     // One list call resolves every collected id; an id with no surviving
     // project row (deleted project) is silently dropped.
-    const projects = await apiListProjects();
+    const projects = await apiListProjects({ includeArchived: true });
     for (const project of projects) {
       if (memberProjectIds.has(project.id)) names.add(project.name);
     }

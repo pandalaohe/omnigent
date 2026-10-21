@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -113,6 +114,50 @@ class ScheduledTaskStore(ABC):
         :param owner_user_id: When given, return only tasks owned by this user.
         :returns: List of :class:`ScheduledTask` instances.
         """
+        ...
+
+    @abstractmethod
+    def list_for_project_archive(
+        self, project_id: str, *, owner_user_id: str | None, batch: str | None = None
+    ) -> builtins.list[ScheduledTask]:
+        """List active project tasks, or all owner tasks carrying a batch marker."""
+        ...
+
+    @abstractmethod
+    def pause_for_project_archive(
+        self, task_id: str, project_id: str, batch: str, *, op_id: str | None = None
+    ) -> ScheduledTask | None:
+        """Atomically pause an active project task and add its batch marker."""
+        ...
+
+    @abstractmethod
+    def restore_from_project_archive(
+        self, task_id: str, project_id: str, batch: str, *, op_id: str | None = None
+    ) -> ScheduledTask | None:
+        """Activate a still-paused batch member; keep marker until scheduler sync."""
+        ...
+
+    @abstractmethod
+    def clear_project_archive_marker(
+        self,
+        task_id: str,
+        batch: str,
+        *,
+        project_id: str | None = None,
+        op_id: str | None = None,
+    ) -> bool:
+        """Drop a batch marker after scheduler reconciliation or a skipped member."""
+        ...
+
+    @abstractmethod
+    def reconcile_project_archive_task(
+        self,
+        task_id: str,
+        project_id: str,
+        op_id: str,
+        reconcile: Callable[[ScheduledTask | None], None],
+    ) -> bool:
+        """Run synchronous scheduler reconciliation while holding project and task locks."""
         ...
 
     @abstractmethod

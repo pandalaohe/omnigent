@@ -17,6 +17,7 @@ import hashlib
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
@@ -25,6 +26,13 @@ from omnigent.entities import Project
 class ProjectOrderPreference(TypedDict):
     sort_mode: Literal["alphabetical", "manual"]
     ordered_project_ids: list[str] | None
+
+
+@dataclass(frozen=True)
+class ArchiveOp:
+    id: str
+    kind: Literal["archive", "unarchive"]
+    batch: str
 
 
 def project_config_revision(config: dict[str, Any]) -> str:
@@ -86,13 +94,38 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
-    def list(self, *, user_id: str | None) -> list[Project]:
+    def list(
+        self,
+        *,
+        user_id: str | None,
+        include_archived: bool = False,
+        archived: Literal["exclude", "include", "only"] = "exclude",
+    ) -> list[Project]:
         """
         List the owner's projects ordered by ``created_at ASC, id ASC``.
 
         :param user_id: The owner whose projects to return.
         :returns: List of :class:`Project` instances.
         """
+        ...
+
+    @abstractmethod
+    def begin_archive_op(
+        self, project_id: str, *, user_id: str | None, kind: Literal["archive", "unarchive"]
+    ) -> ArchiveOp:
+        """Claim or take over an operation and commit the project visibility edge."""
+        ...
+
+    @abstractmethod
+    def fence_archive_op(self, project_id: str, op_id: str, *, user_id: str | None) -> bool:
+        """Refresh the operation heartbeat if this caller still owns it."""
+        ...
+
+    @abstractmethod
+    def finish_archive_op(
+        self, project_id: str, op_id: str, *, user_id: str | None, clear_batch: bool = False
+    ) -> bool:
+        """Clear this operation, and optionally the completed batch."""
         ...
 
     @abstractmethod

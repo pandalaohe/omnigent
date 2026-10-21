@@ -46,6 +46,19 @@ const items: RegistryItem[] = [
 afterEach(cleanup);
 
 describe("settings agent picker", () => {
+  it("keeps search visible when there are no agents", () => {
+    render(
+      <AgentPicker
+        items={[]}
+        taken={new Set()}
+        onPick={vi.fn()}
+        trigger={<button type="button">Add exception</button>}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
+    expect(screen.getByRole("textbox", { name: "Search agents" })).toHaveFocus();
+  });
+
   it("searches distinct forms, marks taken rows, and reveals undeployed and unsupported rows", () => {
     const onPick = vi.fn();
     render(
