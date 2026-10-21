@@ -1538,7 +1538,12 @@ class SqlGlobalInstructionRevision(OmnigentBase):
     agent_key: Mapped[str] = mapped_column(String(64), server_default="", default="")
     host_id: Mapped[str] = mapped_column(String(64), server_default="", default="")
 
+    # Only one writer may append after an observed revision (or empty layer).
+    # Historical rows stay NULL; new writes participate even without a guard.
+    parent_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     __table_args__ = (
+        UniqueConstraint("workspace_id", "parent_revision_id", name="uq_instruction_parent"),
         Index(
             "ix_global_instruction_revisions_layer_latest",
             "workspace_id",

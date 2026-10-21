@@ -76,6 +76,8 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        "sys_instruction_layers_read",
+        "sys_instruction_layer_update",
         # Scheduled-task management tools are always auto-registered
         # so agents can create, list, update, and delete recurring
         # runs without spec opt-in. They are runner-dispatched via

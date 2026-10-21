@@ -7,11 +7,14 @@ SQLite database.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.runtime.instruction_layers import compose_route
+from omnigent.stores.global_instructions_store import InstructionRevisionConflict
 from omnigent.stores.global_instructions_store.sqlalchemy_store import (
     SqlAlchemyGlobalInstructionsStore,
 )
@@ -188,3 +191,28 @@ def test_created_us_orders_layers_even_within_same_second(store, monkeypatch):
     assert shared.created_at == independent.created_at == changed.created_at
     assert shared.created_us < independent.created_us < changed.created_us
     assert {r.id for r in store.list_layers()} == {independent.id, changed.id}
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_concurrent_guarded_saves_allow_only_one_writer(store, saved):
+    first = store.save("original", created_by=None) if saved else None
+    ready = Barrier(4)
+
+    def write(index):
+        ready.wait(timeout=10)
+        try:
+            return store.save(
+                f"writer {index}",
+                created_by=None,
+                check_revision=True,
+                expected_revision_id=first.id if first else None,
+            )
+        except InstructionRevisionConflict:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(write, range(4)))
+    winners = [revision for revision in results if revision is not None]
+    assert len(winners) == 1
+    assert store.current() == winners[0]
+    assert len(store.list_revisions()) == (2 if saved else 1)

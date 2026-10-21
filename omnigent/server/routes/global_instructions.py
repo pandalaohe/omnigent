@@ -31,6 +31,7 @@ from omnigent.stores.global_instructions_store import (
     GlobalInstructionRevision,
     GlobalInstructionsStore,
     InstructionLayerKey,
+    InstructionRevisionConflict,
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -56,6 +57,7 @@ class _SaveInstructionLayerRequest(BaseModel):
     agent_key: str = ""
     host_id: str = ""
     text: str
+    expected_revision_id: str | None = None
 
 
 def _layer_response(
@@ -387,14 +389,19 @@ def create_global_instructions_router(
         before_layers = await visible_layers(user_id)
         subjects = list(await asyncio.gather(*(built_in_subject(a.key) for a in native_agents())))
         before_sizes = await route_sizes(user_id, before_layers, subjects, request=request)
-        revision = await asyncio.to_thread(
-            store.save,
-            body.text,
-            created_by=attribution_user(user_id),
-            scope=key.scope,
-            agent_key=key.agent_key,
-            host_id=key.host_id,
-        )
+        try:
+            revision = await asyncio.to_thread(
+                store.save,
+                body.text,
+                created_by=attribution_user(user_id),
+                scope=key.scope,
+                agent_key=key.agent_key,
+                host_id=key.host_id,
+                expected_revision_id=body.expected_revision_id,
+                check_revision="expected_revision_id" in body.model_fields_set,
+            )
+        except InstructionRevisionConflict as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         after_layers = [
             r
             for r in before_layers

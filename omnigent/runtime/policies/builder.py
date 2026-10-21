@@ -107,6 +107,15 @@ _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
     _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC,
 )
 
+_INSTRUCTION_UPDATE_APPROVAL_SPEC = FunctionPolicySpec(
+    name="__ask_on_instruction_layer_update",
+    on=None,
+    function=FunctionRef(
+        path="omnigent.policies.builtins.safety.ask_on_instruction_layer_update",
+        arguments=None,
+    ),
+)
+
 # Bounded cache of ``conversation_id -> session owner``. The owner
 # (``LEVEL_OWNER`` grantee) is immutable for a session's lifetime, so
 # caching it avoids a ``session_permissions`` lookup on every
@@ -117,13 +126,14 @@ _SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.LRUCache(maxsize=4096)
 )
 
-# TTL cache of ``workspace_id -> list[PolicySpec]`` for DB-stored default
+# TTL cache of enabled specs and whether instruction approval is configured,
+# keyed by workspace id, for DB-stored default
 # policies. Default policies are admin-managed and change infrequently, so
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
 # evaluation while still propagating changes within half a minute.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
-_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachetools.TTLCache(
-    maxsize=256, ttl=30
+_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, tuple[list[PolicySpec], bool]] = (
+    cachetools.TTLCache(maxsize=256, ttl=30)
 )
 
 # TTL+LRU cache of ``conversation_id -> list[PolicySpec]`` for session-scoped
@@ -448,7 +458,8 @@ def any_policies_apply(
     # TOOL_CALL events must always reach it: never fast-path sys_add_policy
     # or the scheduled-task mutation tools.
     if phase == Phase.TOOL_CALL and (
-        tool_name == "sys_add_policy" or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
+        tool_name in {"sys_add_policy", "sys_instruction_layer_update"}
+        or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
     ):
         return True
     if spec.guardrails and spec.guardrails.policies:
@@ -640,7 +651,9 @@ def build_policy_engine(
     )
     tree = verified.rows
     root_conversation_id = verified.root_conversation_id
-    db_default_policy_specs = _load_default_policy_specs(policy_store)
+    db_default_policy_specs, instruction_approval_configured = _load_default_policy_configuration(
+        policy_store
+    )
     admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
@@ -648,6 +661,20 @@ def build_policy_engine(
     # and scheduled-task create/update always ask the user, even when no
     # other guardrails are declared.
     all_policy_specs.extend(_REQUIRED_APPROVAL_SPECS)
+    # An explicit server-wide policy, including a disabled row, replaces this
+    # default through existing admin-only policy settings. Session policies
+    # cannot turn off the deployment's approval requirement.
+    assert _INSTRUCTION_UPDATE_APPROVAL_SPEC.function is not None
+    instruction_handler = _INSTRUCTION_UPDATE_APPROVAL_SPEC.function.path
+    configured = (
+        any(
+            isinstance(policy, FunctionPolicySpec)
+            and policy.function is not None
+            and policy.function.path == instruction_handler
+            for policy in admin_policy_specs
+        )
+        or instruction_approval_configured
+    )
 
     label_defs = dict((guardrails.labels or {}) if guardrails else {})
     # One conversation read (``conv``, resolved above for policy
@@ -766,6 +793,8 @@ def build_policy_engine(
             + admin_policy_specs
             + list(_REQUIRED_APPROVAL_SPECS)
         )
+    if not configured:
+        all_policy_specs.append(_INSTRUCTION_UPDATE_APPROVAL_SPEC)
     root_conv = (
         conv
         if root_conversation_id == conversation_id
@@ -1721,6 +1750,13 @@ def ancestor_ids_from_tree(
 def _load_default_policy_specs(
     policy_store: PolicyStore | None,
 ) -> list[PolicySpec]:
+    """Return enabled default policies using the workspace-scoped configuration cache."""
+    return _load_default_policy_configuration(policy_store)[0]
+
+
+def _load_default_policy_configuration(
+    policy_store: PolicyStore | None,
+) -> tuple[list[PolicySpec], bool]:
     """
     Load enabled server-wide default policies from the store.
 
@@ -1736,22 +1772,25 @@ def _load_default_policy_specs(
     mutation to make changes visible before the TTL expires.
 
     :param policy_store: The policy store. ``None`` returns an empty list.
-    :returns: List of :class:`FunctionPolicySpec` for enabled default
-        policies, in ``created_at ASC`` order.
+    :returns: Enabled default specs in creation order, and whether the admin
+        explicitly configured instruction-update approval (including disabling it).
     :raises OmnigentError: If an enabled policy has an unsupported type.
     """
     if policy_store is None:
-        return []
+        return [], False
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
     with _POLICY_SPECS_CACHE_LOCK:
-        cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+        cached = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
         generation = _POLICY_SPECS_CACHE_GENERATION
     if cached is not None:
         return cached
     specs: list[PolicySpec] = []
+    instruction_approval_configured = False
     for policy in policy_store.list_defaults():
+        if policy.handler == "omnigent.policies.builtins.safety.ask_on_instruction_layer_update":
+            instruction_approval_configured = True
         if not policy.enabled:
             continue
         if policy.type != "python":
@@ -1773,8 +1812,8 @@ def _load_default_policy_specs(
     with _POLICY_SPECS_CACHE_LOCK:
         # An invalidation during the DB read must also prevent a stale refill.
         if generation == _POLICY_SPECS_CACHE_GENERATION:
-            _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
-    return specs
+            _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs, instruction_approval_configured
+    return specs, instruction_approval_configured
 
 
 def invalidate_default_policy_specs_cache() -> None:

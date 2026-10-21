@@ -218,6 +218,7 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        self._register_instruction_layer_tools()
         # Scheduled-task tools are always auto-registered so agents can
         # manage recurring runs at runtime without the spec opting in.
         self._register_scheduled_task_tools()
@@ -247,6 +248,16 @@ class ToolManager:
 
         self._tools[SysAddPolicyTool.name()] = SysAddPolicyTool()
         self._tools[SysPolicyRegistryTool.name()] = SysPolicyRegistryTool()
+
+    def _register_instruction_layer_tools(self) -> None:
+        """Expose the settings API to every agent, with server-side authorization."""
+        from omnigent.tools.builtins.instruction_layers import (
+            SysInstructionLayersReadTool,
+            SysInstructionLayerUpdateTool,
+        )
+
+        for tool in (SysInstructionLayersReadTool(), SysInstructionLayerUpdateTool()):
+            self._tools[tool.name()] = tool
 
     def _register_scheduled_task_tools(self) -> None:
         """
