@@ -3988,6 +3988,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             feature_flags=resolved_feature_flags,
+            host_registry=host_registry,
         ),
         prefix="/v1",
         tags=["usage"],

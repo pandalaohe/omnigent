@@ -233,6 +233,7 @@ def create_usage_router(
     *,
     auth_provider: AuthProvider | None = None,
     feature_flags: FeatureFlags | None = None,
+    host_registry: Any = None,
 ) -> APIRouter:
     """
     Create the per-user usage-report router.
@@ -254,6 +255,22 @@ def create_usage_router(
     router.include_router(
         create_usage_events_router(
             conversation_store, _resolve_session_harness, auth_provider=auth_provider
+        )
+    )
+
+    def _host_owner(host_id: str, _workspace_id: str | None = None) -> str | None:
+        if host_registry is None:
+            return None
+        connection = host_registry.get(host_id)
+        return None if connection is None else connection.owner
+
+    from omnigent.server.routes.usage_cutover import create_usage_cutover_router
+
+    router.include_router(
+        create_usage_cutover_router(
+            conversation_store.storage_location,
+            auth_provider=auth_provider,
+            host_owner=_host_owner,
         )
     )
 

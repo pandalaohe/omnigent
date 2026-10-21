@@ -46,18 +46,26 @@ def _observation(**changes: object) -> UsageObservation:
 
 def _sealed(unit: str, **changes: object) -> UsageObservation:
     """One unit of a physical thread that already reported termination."""
-    return _observation(
-        producer_unit_id=unit,
-        physical_session_id="phys-main",
-        terminal=[
+    fields: dict[str, object] = {
+        "producer_unit_id": unit,
+        "physical_session_id": "phys-main",
+        "terminal": [
             {
                 "physical_session_id": "phys-main",
                 "physical_subagent_id": None,
                 "evidence": "terminal_record",
             }
         ],
-        **changes,
+    }
+    fields.update(changes)
+    harness = str(fields.get("harness", "codex-native"))
+    family = harness.split("-")[0]
+    fields.setdefault("harness_family", family)
+    fields.setdefault(
+        "identity_namespace",
+        "codex/rollout/v1" if family == "codex" else "claude-code/transcript/v1",
     )
+    return _observation(**fields)
 
 
 def _response(unit: str, call: str, **changes: object) -> UsageObservation:
@@ -392,6 +400,431 @@ def test_model_bounds_and_corrupt_row_stops_page(tmp_path: Path) -> None:
     with pytest.raises(UsageExportError) as invalid_limit:
         store.page("alice", limit=0)
     assert invalid_limit.value.status_code == 422
+
+
+def _cutover(tmp_path: Path):
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    return UsageCutoverStore(f"sqlite:///{tmp_path / 'usage.db'}")
+
+
+def _drain_facts(**changes: object) -> dict[str, object]:
+    facts: dict[str, object] = {
+        "detection": {
+            "checkpoint_digest": "0" * 64,
+            "clock_offset_ms": 0,
+            "threshold_at": "2026-01-01T00:00:00Z",
+        },
+        "admissions": [],
+        "calls": [],
+        "counts": {},
+        "failure_codes": [],
+    }
+    facts.update(changes)
+    return facts
+
+
+def _consumer_receipt(drained: dict[str, object], **changes: object) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "kind": "drained",
+        "owner_scope_id": drained["owner_scope_id"],
+        "feed_id": drained["feed_id"],
+        "feed_epoch": drained["feed_epoch"],
+        "domain": drained["domain"],
+        "generation": drained["generation"],
+        "producer_receipt_digest": drained["digest"],
+        "acked_through_sequence": drained["last_committed_sequence"],
+        "usage_read_grant_id": "grant-1",
+        "legacy_frozen": True,
+        "cutover_at": "2026-01-01T00:00:00Z",
+        "authority_revision": 4,
+        "authority_digest": "a" * 64,
+        "authority_published": True,
+        "restored_authority_revision": None,
+        "restored_authority_digest": None,
+    }
+    receipt.update(changes)
+    return receipt
+
+
+def test_cutover_hold_machine_generations_and_admission_refusal(tmp_path: Path) -> None:
+    store = _cutover(tmp_path)
+    host = uuid.uuid4().hex
+    first = store.create_hold("alice", host, "claude-sdk", 1)
+    assert first["state"] == "held"
+    assert first["active"] is True
+    assert first["generation"] == 1
+    assert first["hold_created_at"] is not None
+    resumed = store.create_hold("alice", host, "claude-sdk", 1)
+    assert resumed["hold_created_at"] == first["hold_created_at"]
+    with pytest.raises(UsageExportError) as conflict:
+        store.create_hold("alice", host, "claude-sdk", 2)
+    assert conflict.value.code == "hold_generation_conflict"
+    with pytest.raises(UsageExportError) as active:
+        store.create_hold("alice", host, "claude-sdk", 1, goal_active=True)
+    assert active.value.code == "codex_goal_active"
+    assert store.active_hold(host, "claude-sdk") == {
+        "host_id": host,
+        "harness": "claude-sdk",
+        "generation": 1,
+        "state": "held",
+    }
+    assert store.active_hold(host, "codex-sdk") is None
+    # An undecided harness refuses while any domain of the host is held.
+    assert store.active_hold(host, None) is not None
+    with pytest.raises(UsageExportError) as refused:
+        store.admit_turn(
+            "alice",
+            admission_id=uuid.uuid4().hex,
+            session_id=uuid.uuid4().hex,
+            host_id=host,
+            harness="claude-sdk",
+            source="web",
+        )
+    assert refused.value.status_code == 409
+    assert refused.value.code == "usage_cutover_hold"
+    assert refused.value.detail == {"host_id": host, "harness": "claude-sdk", "generation": 1}
+    other = store.admit_turn(
+        "alice",
+        admission_id=uuid.uuid4().hex,
+        session_id=uuid.uuid4().hex,
+        host_id=uuid.uuid4().hex,
+        harness="claude-sdk",
+        source="web",
+    )
+    assert other["admitted_at"].endswith("Z")
+
+
+def test_receipts_page_shape_pagination_and_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _cutover(tmp_path)
+    host = uuid.uuid4().hex
+    with pytest.raises(UsageExportError) as unknown:
+        store.receipts_page("alice", host, "claude-sdk", 1, 0, 10)
+    assert unknown.value.code == "usage_cutover_domain_not_found"
+    assert unknown.value.status_code == 404
+    store.create_hold("alice", host, "claude-sdk", 3)
+    empty = store.receipts_page("alice", host, "claude-sdk", 3, 2, 10)
+    assert empty == {
+        "receipt_page_schema_version": 1,
+        "domain": {"harness": "claude-sdk", "host_id": host},
+        "generation": 3,
+        "receipts": [],
+        "has_more": False,
+        "next_after_seq": 2,
+    }
+    with pytest.raises(UsageExportError) as no_generation:
+        store.receipts_page("alice", host, "claude-sdk", 2, 0, 10)
+    assert no_generation.value.code == "usage_cutover_generation_not_found"
+    for args, code in (
+        ((host, "claude-sdk", 0, 0, 10), "usage_cutover_bad_request"),
+        ((host, "claude-sdk", 3, -1, 10), "usage_cutover_bad_request"),
+        ((host, "claude-sdk", 3, 0, 0), "usage_cutover_bad_request"),
+        ((host, "claude-sdk", 3, 0, 51), "usage_cutover_bad_request"),
+        (("h" * 257, "claude-sdk", 3, 0, 10), "usage_cutover_bad_request"),
+        ((host, "opencode", 3, 0, 10), "usage_cutover_bad_request"),
+    ):
+        with pytest.raises(UsageExportError) as bad:
+            store.receipts_page("alice", *args)
+        assert bad.value.code == code
+        assert bad.value.status_code == 400
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    drained = store.submit_drain("alice", host, "claude-sdk", 3, _drain_facts())
+    assert drained["result"] == "drained"
+    page = store.receipts_page("alice", host, "claude-sdk", 3, 0, 10)
+    assert page["receipts"][0]["digest"] == drained["digest"]
+    assert page["receipts"][0]["receipt_seq"] == 1
+    assert page["next_after_seq"] == 1
+    assert page["has_more"] is False
+    first = store.receipts_page("alice", host, "claude-sdk", 3, 0, 1)
+    assert [item["receipt_seq"] for item in first["receipts"]] == [1]
+    assert first["has_more"] is False
+    for _ in range(57):
+        store.receipts_page("alice", host, "claude-sdk", 3, 1, 10)
+    with pytest.raises(UsageExportError) as limited:
+        store.receipts_page("alice", host, "claude-sdk", 3, 1, 10)
+    assert limited.value.code == "usage_read_rate_limited"
+    assert limited.value.status_code == 429
+    assert limited.value.retry_after
+
+
+def test_admission_entry_shape_sorted_and_zero_thread_rule() -> None:
+    from omnigent.db.db_models import SqlUsageTurnAdmission
+    from omnigent.usage_export.cutover import _admission_entry
+
+    evidence = {
+        "threads": {
+            "parent/main-child": [
+                {"kind": "stop_hook", "reported_at": "2026-01-01T00:00:02Z", "source_ref": "h2"},
+                {
+                    "kind": "terminal_record",
+                    "reported_at": "2026-01-01T00:00:01Z",
+                    "source_ref": "r1",
+                },
+                {
+                    "kind": "terminal_record",
+                    "reported_at": "2026-01-01T00:00:03Z",
+                    "source_ref": "r2",
+                },
+            ],
+            "parent/": [
+                {"kind": "telemetry", "reported_at": "2026-01-01T00:00:05Z", "source_ref": None},
+            ],
+        },
+        "turn_ended_at": "2026-01-01T00:00:09Z",
+    }
+    row = SqlUsageTurnAdmission(
+        admission_id=uuid.uuid4().hex,
+        session_id=uuid.uuid4().hex,
+        admitted_at=1767225600,
+        source="web",
+        binding_revision=3,
+        binding_digest=b"\x01" * 32,
+        terminal_evidence=json.dumps(evidence),
+    )
+    entry = _admission_entry(row, linked_call=False)
+    assert set(entry) == {
+        "admission_id",
+        "session_id",
+        "admitted_at",
+        "binding_revision",
+        "binding_digest",
+        "terminal",
+        "terminal_state",
+        "turn_ended_at",
+        "threads",
+    }
+    assert entry["admitted_at"] == "2026-01-01T00:00:00Z"
+    assert entry["binding_revision"] == 3
+    assert entry["binding_digest"] == "01" * 32
+    assert entry["terminal"] is True
+    assert [thread["physical_subagent_id"] for thread in entry["threads"]] == [
+        None,
+        "main-child",
+    ]
+    child = entry["threads"][1]
+    assert [item["kind"] for item in child["evidence"]] == [
+        "stop_hook",
+        "terminal_record",
+        "terminal_record",
+    ]
+    assert [item["reported_at"] for item in child["evidence"]] == [
+        "2026-01-01T00:00:02Z",
+        "2026-01-01T00:00:01Z",
+        "2026-01-01T00:00:03Z",
+    ]
+    assert entry["terminal_state"] == ["stop_hook", "telemetry", "terminal_record"]
+    zero = SqlUsageTurnAdmission(
+        admission_id=uuid.uuid4().hex,
+        admitted_at=1767225600,
+        source="web",
+        terminal_evidence=json.dumps({"threads": {}, "turn_ended_at": None}),
+    )
+    idle = _admission_entry(zero, linked_call=False)
+    assert idle["terminal"] is False
+    assert idle["terminal_state"] == []
+    linked = _admission_entry(zero, linked_call=True)
+    assert linked["threads"] == []
+    assert linked["terminal_state"] == []
+    assert linked["terminal"] is False
+    zero.terminal_evidence = json.dumps({"threads": {}, "turn_ended_at": "2026-01-01T00:00:09Z"})
+    done = _admission_entry(zero, linked_call=False)
+    assert done["terminal"] is True
+    assert done["terminal_state"] == ["executor_end"]
+    assert done["turn_ended_at"] == "2026-01-01T00:00:09Z"
+
+
+def test_drain_merges_thread_evidence_and_release_cas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'usage.db'}"
+    feed = UsageEventStore(uri)
+    host = uuid.uuid4().hex
+    feed.append("alice", _sealed("a", host_id=host, harness="claude-sdk"))
+    cutover = UsageCutoverStore(uri)
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    admission = cutover.admit_turn(
+        "alice",
+        admission_id=uuid.uuid4().hex,
+        session_id=uuid.uuid4().hex,
+        host_id=host,
+        harness="claude-sdk",
+        source="web",
+    )
+    cutover.create_hold("alice", host, "claude-sdk", 1)
+    open_drain = cutover.submit_drain(
+        "alice",
+        host,
+        "claude-sdk",
+        1,
+        _drain_facts(
+            admissions=[
+                {
+                    "admission_id": admission["admission_id"],
+                    "threads": [
+                        {
+                            "physical_session_id": "phys-main",
+                            "physical_subagent_id": None,
+                            "evidence": [{"kind": "terminal_record", "source_ref": "r1"}],
+                        }
+                    ],
+                }
+            ]
+        ),
+    )
+    assert open_drain["result"] == "drained"
+    assert open_drain["last_committed_sequence"] == 1
+    assert open_drain["admissions"][0]["terminal"] is True
+    assert open_drain["admissions"][0]["terminal_state"] == ["terminal_record"]
+    assert open_drain["admissions"][0]["threads"][0]["evidence"][0]["kind"] == ("terminal_record")
+    page = feed.page("alice")
+    feed.page("alice", cursor=page["next_cursor"], grant_id="grant-1")
+    consumer = _consumer_receipt(open_drain, acked_through_sequence=1)
+    released = cutover.release(
+        "alice", host, "claude-sdk", 1, consumer, "2026-01-01T00:00:00Z", {}
+    )
+    assert released["kind"] == "release"
+    assert released["result"] == "released"
+    assert released["release"]["cutover_at"] == "2026-01-01T00:00:00Z"
+    assert cutover.active_hold(host, "claude-sdk") is None
+    with pytest.raises(UsageExportError) as done:
+        cutover.submit_drain("alice", host, "claude-sdk", 1, _drain_facts())
+    assert done.value.code == "not_drained"
+
+
+def test_release_refuses_each_condition_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'usage.db'}"
+    feed = UsageEventStore(uri)
+    host = uuid.uuid4().hex
+    feed.append("alice", _sealed("a", host_id=host, harness="claude-sdk"))
+    store = UsageCutoverStore(uri)
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    store.create_hold("alice", host, "claude-sdk", 1)
+    drained = store.submit_drain("alice", host, "claude-sdk", 1, _drain_facts())
+    first_page = feed.page("alice")
+    feed.page("alice", cursor=first_page["next_cursor"], grant_id="grant-1")
+    good = _consumer_receipt(drained)
+    with pytest.raises(UsageExportError) as wrong_generation:
+        store.release("alice", host, "claude-sdk", 2, good, "2026-01-01T00:00:00Z", {})
+    assert wrong_generation.value.code == "generation_mismatch"
+    for change, code in (
+        ({"producer_receipt_digest": "b" * 64}, "consumer_receipt_mismatch"),
+        ({"acked_through_sequence": 0}, "consumer_not_acked"),
+        ({"legacy_frozen": False}, "consumer_not_acked"),
+        ({"authority_published": False}, "consumer_not_acked"),
+    ):
+        with pytest.raises(UsageExportError) as refused:
+            store.release(
+                "alice",
+                host,
+                "claude-sdk",
+                1,
+                _consumer_receipt(drained, **change),
+                "2026-01-01T00:00:00Z",
+                {},
+            )
+        assert refused.value.code == code
+    with pytest.raises(UsageExportError) as bad_time:
+        store.release("alice", host, "claude-sdk", 1, good, "2026-01-01T00:30:00Z", {})
+    assert bad_time.value.code == "cutover_time_invalid"
+    with pytest.raises(UsageExportError) as invalidated:
+        store.release(
+            "alice",
+            host,
+            "claude-sdk",
+            1,
+            good,
+            "2026-01-01T00:00:00Z",
+            {"calls_unadmitted_after_hold": 1},
+        )
+    assert invalidated.value.code == "drain_invalidated"
+    assert store.hold_status("alice", host, "claude-sdk")["state"] == "invalidated"
+    with pytest.raises(UsageExportError) as stuck:
+        store.submit_drain("alice", host, "claude-sdk", 1, _drain_facts())
+    assert stuck.value.code == "not_drained"
+
+
+def test_abandon_requires_a_consumer_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    store = UsageCutoverStore(f"sqlite:///{tmp_path / 'usage.db'}")
+    host = uuid.uuid4().hex
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    store.create_hold("alice", host, "codex-sdk", 5)
+    receipt = {
+        "kind": "abandon",
+        "domain": {"host_id": host, "harness": "codex-sdk"},
+        "generation": 5,
+        "authority_published": False,
+    }
+    with pytest.raises(UsageExportError) as mismatch:
+        store.abandon("alice", host, "codex-sdk", 5, {**receipt, "kind": "drained"}, "no")
+    assert mismatch.value.code == "consumer_receipt_mismatch"
+    with pytest.raises(UsageExportError) as published:
+        store.abandon(
+            "alice",
+            host,
+            "codex-sdk",
+            5,
+            {**receipt, "authority_published": True},
+            "no",
+        )
+    assert published.value.code == "consumer_receipt_mismatch"
+    abandoned = store.abandon("alice", host, "codex-sdk", 5, receipt, "clock")
+    assert abandoned["kind"] == "abandon"
+    assert abandoned["result"] == "abandoned"
+    assert store.active_hold(host, "codex-sdk") is None
+    with pytest.raises(UsageExportError) as burned:
+        store.create_hold("alice", host, "codex-sdk", 5)
+    assert burned.value.code == "hold_generation_conflict"
+
+
+def test_cutover_migration_roundtrip(tmp_path: Path) -> None:
+    from alembic import command
+
+    from omnigent.db.utils import _build_alembic_config
+
+    uri = f"sqlite:///{tmp_path / 'cutover.db'}"
+    config = _build_alembic_config(uri)
+    command.upgrade(config, "a41c20261021")
+    command.upgrade(config, "a42c20261021")
+    engine = create_engine(uri)
+    with engine.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+        columns = {row[1] for row in connection.execute(text("PRAGMA table_info(usage_events)"))}
+    assert {
+        "usage_cutover_holds",
+        "usage_turn_admissions",
+        "usage_cutover_receipts",
+        "usage_account_binding_revisions",
+        "usage_account_binding_activation",
+        "usage_route_attestations",
+    } <= tables
+    assert {"host_id", "harness"} <= columns
+    command.downgrade(config, "a41c20261021")
+    with engine.connect() as connection:
+        after = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+    assert "usage_cutover_holds" not in after
+    command.upgrade(config, "a42c20261021")
 
 
 def test_additive_migration_roundtrip(tmp_path: Path) -> None:

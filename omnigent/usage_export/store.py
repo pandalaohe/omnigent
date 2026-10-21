@@ -423,6 +423,8 @@ class UsageEventStore:
                     sequence=sequence,
                     payload=payload,
                     snapshot=snapshot,
+                    host_id=observation.host_id,
+                    harness=observation.harness,
                 )
             )
             if unit is None:
@@ -523,7 +525,13 @@ class UsageEventStore:
             )
         return position, fence
 
-    def page(self, owner_id: str, cursor: str | None = None, limit: int = 500) -> dict[str, Any]:
+    def page(
+        self,
+        owner_id: str,
+        cursor: str | None = None,
+        limit: int = 500,
+        grant_id: str | None = None,
+    ) -> dict[str, Any]:
         """Read a fixed committed fence, charging the durable owner read budget."""
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise UsageExportError(422, "invalid_usage_limit")
@@ -547,6 +555,10 @@ class UsageEventStore:
                 )
             timestamps.append(now)
             feed.read_timestamps = _json(timestamps)
+            if grant_id is not None:
+                positions = json.loads(feed.grant_positions or "{}")
+                positions[grant_id] = max(int(positions.get(grant_id, 0)), position)
+                feed.grant_positions = _json(positions)
             fence = cursor_fence if cursor_fence is not None else feed.next_sequence - 1
             rows = (
                 session.execute(
