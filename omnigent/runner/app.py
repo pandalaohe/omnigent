@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 import urllib.parse
 import uuid
@@ -4368,6 +4369,33 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
+        recovery_usage_admission = None
+
+        async def admit_recovery_turn() -> bool:
+            nonlocal recovery_usage_admission
+            if harness_name not in {
+                "codex",
+                "codex-sdk",
+                "codex-native",
+                "claude-sdk",
+                "claude-native",
+            }:
+                return True
+            if init_context.envelope is None or init_context.envelope.snapshot.host_id is None:
+                return True
+            response = await server_client.post(
+                "/v1/usage-cutover/admissions",
+                json={"session_id": session_id, "source": "recovery"},
+            )
+            if (
+                response.status_code == 409
+                and response.json().get("error", {}).get("code") == "usage_cutover_hold"
+            ):
+                return False
+            response.raise_for_status()
+            recovery_usage_admission = response.json()
+            return True
+
         recovery_id = (
             init_context.envelope.recovery_id
             if init_context.envelope is not None
@@ -4415,11 +4443,13 @@ def create_runner_app(
                 and recovery_id is None
                 and not _suppress_recovery
                 and session_id not in _active_turns
+                and await admit_recovery_turn()
             ):
                 recovery_turn = "history_resume"
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
+                    "usage_admission": recovery_usage_admission,
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                     # Recovery has no live server dispatch carrying renderer state.
@@ -4456,6 +4486,7 @@ def create_runner_app(
                     harness_name in {"claude-sdk", "codex"}
                     and _trailing_sdk_peer_item(raw_history)
                 )
+                and await admit_recovery_turn()
             ):
                 recovery_turn = "recovery_prompt"
                 if is_native_harness(harness_name):
@@ -4463,6 +4494,7 @@ def create_runner_app(
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 recovery_body: _JsonObject = {
+                    "usage_admission": recovery_usage_admission,
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                     "browser_renderer_available": False,
@@ -7838,6 +7870,7 @@ def create_runner_app(
             "type": "message",
             "role": "user",
             "model": msg_body.get("model", ""),
+            "usage_admission": msg_body.get("usage_admission"),
         }
         if startup_admission.required(conv):
             harness_body["startup_required"] = True
@@ -8368,6 +8401,10 @@ def create_runner_app(
         # A required-terminal exit recorded before this turn belongs to an
         # earlier stream; only exits observed from here on can end this one.
         _required_terminal_exit_errors.pop(conv_id, None)
+        from omnigent.usage_export.runtime import prepare_capture
+
+        if harness_name is not None:
+            await prepare_capture(server_client, conv_id, harness_name)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -8606,6 +8643,19 @@ def create_runner_app(
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
             event_body = _wrap_as_message_event(_instr_body)
+            usage_admission = body.get("usage_admission")
+            if isinstance(usage_admission, dict) and harness_name in {
+                "codex",
+                "codex-sdk",
+                "codex-native",
+                "claude-sdk",
+                "claude-native",
+            }:
+                from omnigent.usage_export.runtime import begin_admitted_turn
+
+                await asyncio.to_thread(
+                    begin_admitted_turn, conv_id, harness_name, usage_admission
+                )
             if startup_admission.required(conv_id):
                 event_body["startup_required"] = True
             _inject_mcp_schemas(event_body, _mcp_schemas)
@@ -9219,6 +9269,21 @@ def create_runner_app(
                     await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
                 if _turn_dispatch_cancellers.get(conv_id) is _dispatch_owner:
                     _turn_dispatch_cancellers.pop(conv_id, None)
+                if isinstance(usage_admission, dict) and harness_name in {
+                    "claude-sdk",
+                    "codex",
+                    "codex-sdk",
+                }:
+                    from omnigent.usage_export.runtime import finish_admitted_turn
+
+                    try:
+                        await finish_admitted_turn(
+                            server_client, conv_id, harness_name, usage_admission["admission_id"]
+                        )
+                    except (OSError, ValueError, sqlite3.Error, httpx.HTTPError):
+                        _logger.warning(
+                            "Usage turn completion remains pending", extra={"session_id": conv_id}
+                        )
 
         async def proxy_stream() -> AsyncIterator[bytes]:
             try:

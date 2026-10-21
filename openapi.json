@@ -20869,11 +20869,9 @@
     },
     "/v1/sessions/{session_id}/policies/evaluate": {
       "post": {
-        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.harnesses.claude_native.hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
         "operationId": "evaluate_policy_v1_sessions__session_id__policies_evaluate_post",
         "parameters": [
           {
-            "description": "Omnigent conversation id from the URL path.",
             "in": "path",
             "name": "session_id",
             "required": true,
@@ -23695,6 +23693,302 @@
           }
         },
         "summary": "Get Usage",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/admissions": {
+      "post": {
+        "operationId": "admit_runner_turn_v1_usage_cutover_admissions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Admit Runner Turn",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/bindings": {
+      "post": {
+        "operationId": "load_bindings_v1_usage_cutover_bindings_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Load Bindings",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/bindings/activate": {
+      "post": {
+        "operationId": "activate_bindings_v1_usage_cutover_bindings_activate_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Activate Bindings",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds": {
+      "post": {
+        "operationId": "create_hold_v1_usage_cutover_holds_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Hold",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds/{host_id}/{harness}": {
+      "get": {
+        "operationId": "read_hold_v1_usage_cutover_holds__host_id___harness__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Hold",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds/{host_id}/{harness}/{generation}/receipts": {
+      "post": {
+        "operationId": "submit_receipt_v1_usage_cutover_holds__host_id___harness___generation__receipts_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "generation",
+            "required": true,
+            "schema": {
+              "title": "Generation",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Receipt",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds/{host_id}/{harness}/{generation}/release": {
+      "post": {
+        "operationId": "release_hold_v1_usage_cutover_holds__host_id___harness___generation__release_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "generation",
+            "required": true,
+            "schema": {
+              "title": "Generation",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Hold",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/receipts": {
+      "get": {
+        "operationId": "read_receipts_v1_usage_cutover_receipts_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Receipts",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/route": {
+      "get": {
+        "operationId": "read_route_v1_usage_cutover_route_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Route",
+        "tags": [
+          "usage"
+        ]
+      },
+      "post": {
+        "operationId": "record_route_v1_usage_cutover_route_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Record Route",
         "tags": [
           "usage"
         ]

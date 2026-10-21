@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import random
 import sqlite3
+import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+import tomllib
 from fastapi import APIRouter, FastAPI
 
 from omnigent.process_logging import data_dir
@@ -35,9 +39,93 @@ def outbox() -> UsageOutbox:
     return _outbox_at(data_dir() / "usage-export")
 
 
+def routing_attestation(harness: str, env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Fingerprint only public routing configuration, never authentication material."""
+    env = os.environ if env is None else env
+    claude = harness.startswith("claude")
+    kind = "anthropic" if claude else "openai"
+    default = "https://api.anthropic.com" if claude else "https://api.openai.com"
+    raw = env.get("ANTHROPIC_BASE_URL" if claude else "OPENAI_BASE_URL", default)
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("invalid_usage_route_origin")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    origin = f"{parsed.scheme}://{parsed.hostname}:{port}"
+    mode = "api" if ("ANTHROPIC_API_KEY" if claude else "OPENAI_API_KEY") in env else "configured"
+    material = [kind, origin, env.get("OMNIGENT_GATEWAY_ROUTE", ""), mode]
+    return {
+        "billing_route": "direct_provider" if raw.rstrip("/") == default else "gateway",
+        "route_ref": "route-v1:"
+        + hashlib.sha256(json.dumps(material, separators=(",", ":")).encode()).hexdigest(),
+    }
+
+
+def begin_admitted_turn(session_id: str, harness: str, admission: Mapping[str, Any]) -> None:
+    if not capture_enabled():
+        return
+    harness = "codex-sdk" if harness == "codex" else harness
+    outbox().begin_admission(session_id, harness, {**admission, "route_check": None})
+
+
+def check_live_route(
+    session_id: str,
+    harness: str,
+    env: Mapping[str, str],
+    *,
+    codex_home: Path | None = None,
+    provider: str | None = None,
+) -> None:
+    if not capture_enabled():
+        return
+    route_env = dict(env)
+    if harness.startswith("codex") and codex_home is not None:
+        document = tomllib.loads((codex_home / "config.toml").read_text())
+        provider = provider or document.get("model_provider", "openai")
+        config = document.get("model_providers", {}).get(provider, {})
+        route_env["OPENAI_BASE_URL"] = config.get("base_url", "https://api.openai.com")
+        route_env["OMNIGENT_GATEWAY_ROUTE"] = provider
+    outbox().record_live_route(session_id, harness, routing_attestation(harness, route_env))
+
+
+def link_codex_turn(session_id: str, harness: str, physical: str, turn_id: str) -> None:
+    if not capture_enabled():
+        return
+    spool = outbox()
+    pending = spool.pending_admission(session_id, harness)
+    if pending is not None:
+        spool.link_admission(
+            session_id,
+            harness,
+            physical,
+            None,
+            turn_id,
+            pending["admission_id"],
+            route_check=pending.get("route_check"),
+        )
+        spool.finish_admission(session_id, harness)
+
+
+async def finish_admitted_turn(
+    client: httpx.AsyncClient, session_id: str, harness: str, admission_id: str
+) -> None:
+    harness = "codex-sdk" if harness == "codex" else harness
+    if capture_enabled():
+        await asyncio.to_thread(outbox().end_admitted_turn, session_id, harness, admission_id)
+    response = await client.post(
+        "/v1/usage-cutover/admissions",
+        json={
+            "session_id": session_id,
+            "admission_id": admission_id,
+            "ended": True,
+        },
+    )
+    response.raise_for_status()
+
+
 def codex_usage_boundary(message: Mapping[str, Any]) -> bool:
     return message.get("method") in {
         "thread/started",
+        "turn/started",
         "thread/tokenUsage/updated",
         "turn/completed",
         "turn/failed",
@@ -52,7 +140,22 @@ async def prepare_capture(client: httpx.AsyncClient, session_id: str, harness: s
         "claude-sdk",
         "claude-native",
     }:
-        await outbox().prepare(client, session_id, "codex-sdk" if harness == "codex" else harness)
+        feed_harness = "codex-sdk" if harness == "codex" else harness
+        await outbox().prepare(client, session_id, feed_harness)
+        outbox().mark_capture(session_id, feed_harness)
+        report = outbox().domain_report(feed_harness)
+        binding = next(
+            item["binding"] for item in report["producers"] if item["session_id"] == session_id
+        )
+        response = await client.post(
+            "/v1/usage-cutover/route",
+            json={
+                "host_id": binding["host_id"],
+                "harness": feed_harness,
+                **routing_attestation(feed_harness),
+            },
+        )
+        response.raise_for_status()
 
 
 def capture_codex_home(
@@ -63,10 +166,12 @@ def capture_codex_home(
     *,
     final: bool = False,
     baseline_existing: bool = False,
+    registered_scan: bool = False,
 ) -> None:
-    if not capture_enabled():
+    if not registered_scan and not capture_enabled():
         return
     spool = outbox()
+    spool.register_root(home, session_id, harness, main_thread)
     for path in home.glob("sessions/**/rollout-*.jsonl"):
         physical: dict[str, Any] = {
             "physical_transcript_path": str(path.resolve()),
@@ -92,6 +197,15 @@ def capture_codex_home(
             raise ValueError("missing_physical_identity")
         physical["physical_session_id"] = payload["id"]
         physical["upstream_thread_id"] = payload["id"]
+        source = payload.get("source")
+        subagent = (
+            source.get("subAgent", source.get("subagent")) if isinstance(source, dict) else None
+        )
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+        if isinstance(parent, str):
+            physical["parent_physical_session_id"] = parent
+            physical["thread_kind"] = "subagent"
         if payload["id"] == main_thread:
             physical["thread_kind"] = "main"
         if not spool.has_source(path):
@@ -187,7 +301,9 @@ def capture_claude_mirror(
             spool.append(session_id, "claude-sdk", physical, record)
 
 
-def capture_claude_hook_path(session_id: str, payload: Mapping[str, Any]) -> None:
+def capture_claude_hook_path(
+    session_id: str, payload: Mapping[str, Any], *, harness: str = "claude-sdk"
+) -> None:
     """Bind the SDK mirror key to the actual path reported by a CLI hook."""
     if not capture_enabled():
         return
@@ -220,7 +336,21 @@ def capture_claude_hook_path(session_id: str, payload: Mapping[str, Any]) -> Non
     if physical["physical_session_id"] != parent or physical["physical_subagent_id"] != child:
         outbox().bind_claude_path(session_id, parent, child, None)
         return
-    outbox().bind_claude_path(session_id, parent, child, str(path))
+    spool = outbox()
+    if harness == "claude-sdk":
+        spool.bind_claude_path(session_id, parent, child, str(path))
+        if not spool.has_source(path):
+            spool.register_source(
+                path, session_id, harness, physical, start_offset=path.stat().st_size
+            )
+    if event in {"Stop", "SubagentStop"}:
+        spool.record_thread_end(
+            session_id,
+            harness,
+            parent,
+            child,
+            str(payload.get("hook_event_id") or uuid.uuid4().hex),
+        )
 
 
 def retry_delay(attempt: int, retry_after: str = "") -> float:
@@ -247,8 +377,16 @@ def usage_capture_router(client: httpx.AsyncClient) -> APIRouter:
 
         async def deliver() -> None:
             attempt = 0
+            reported_routes: dict[tuple[str, str], str] = {}
             while True:
                 try:
+                    for route in spool.live_routes():
+                        key = json.dumps(route, sort_keys=True)
+                        domain = (route["host_id"], route["harness"])
+                        if reported_routes.get(domain) != key:
+                            response = await client.post("/v1/usage-cutover/route", json=route)
+                            response.raise_for_status()
+                            reported_routes[domain] = key
                     await asyncio.to_thread(spool.scan_registered_sources)
                     await spool.drain(client)
                     app.state.usage_export_status = "observed-only"

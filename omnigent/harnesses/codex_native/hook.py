@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.parse
 from pathlib import Path
@@ -198,6 +199,13 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         )
         return _fail_closed()
 
+    if hook_event == "UserPromptSubmit" and isinstance(eval_response.get("usage_admission"), dict):
+        from omnigent.harnesses.codex_native.bridge import record_usage_admission
+        from omnigent.usage_export.runtime import begin_admitted_turn, check_live_route
+
+        record_usage_admission(bridge_dir, eval_response["usage_admission"]["admission_id"])
+        begin_admitted_turn(session_id, "codex-native", eval_response["usage_admission"])
+        check_live_route(session_id, "codex-native", os.environ, codex_home=Path(state.codex_home))
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))

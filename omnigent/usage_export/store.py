@@ -41,7 +41,7 @@ from omnigent.usage_export.models import (
 _MAX_EVENT_BYTES = 32 * 1024
 # Producer association evidence stays on the unit row; it is not part of
 # the committed event the consumer reads.
-_EVIDENCE_FIELDS = ("admission_id", "route_check", "terminal")
+_EVIDENCE_FIELDS = ("admission_id", "turn_key", "route_check", "terminal")
 _MAX_PAGE_BYTES = 1024 * 1024
 _IMMUTABLE_FIELDS = (
     "producer_unit_id",
@@ -162,6 +162,7 @@ class UsageEventStore:
     """Append complete unit revisions and page a committed feed prefix."""
 
     def __init__(self, storage_location: str) -> None:
+        self._storage_location = storage_location
         engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.usage_event_store", immediate=True
@@ -345,16 +346,22 @@ class UsageEventStore:
         measurement_json = _json(measurement)
         call_digest = self._call_digest(observation)
 
+        from omnigent.usage_export.cutover import UsageCutoverStore
+
+        UsageCutoverStore(self._storage_location).ensure_domain(
+            owner_id, observation.host_id, observation.harness
+        )
+
         hold_row: list[Any] = []
 
         def prelock(session: Session, workspace_id: int, _owner_digest: bytes) -> None:
             from omnigent.usage_export.cutover import UsageCutoverStore
 
-            hold_row.append(
+            hold_row[:] = [
                 UsageCutoverStore.lock_domain_hold(
                     session, workspace_id, observation.host_id, observation.harness
                 )
-            )
+            ]
 
         def write(
             session: Session, feed: SqlUsageFeed, workspace_id: int, owner_digest: bytes
@@ -364,15 +371,25 @@ class UsageEventStore:
                 append_receipt,
             )
 
+            unit = session.get(SqlUsageUnit, (workspace_id, owner_digest, unit_digest))
+            evidence = observation
+            if unit is not None:
+                first = json.loads(unit.observation)
+                evidence = observation.model_copy(
+                    update={
+                        "admission_id": unit.admission_id,
+                        "turn_key": first.get("turn_key"),
+                        "turn_id": first.get("turn_id"),
+                    }
+                )
             association = UsageCutoverStore.associate_unit(
                 session,
                 workspace_id,
                 owner_digest,
-                observation,
+                evidence,
                 hold_row[0] if hold_row else None,
                 binding_session_id=observation.session_id,
             )
-            unit = session.get(SqlUsageUnit, (workspace_id, owner_digest, unit_digest))
             if unit is not None:
                 old = json.loads(unit.observation)
                 if any(old[field] != measurement[field] for field in _IMMUTABLE_FIELDS):
@@ -504,9 +521,6 @@ class UsageEventStore:
                 unit.latest_sequence = sequence
                 unit.revision += 1
                 unit.request_count = request_count
-                if association["admission"] is not None:
-                    unit.admission_id = association["admission"].admission_id
-                    unit.association = association["association"]
             hold = hold_row[0] if hold_row else None
             if (
                 hold is not None
@@ -539,6 +553,7 @@ class UsageEventStore:
                                     "revision": event["revision"],
                                 },
                                 "admission_id": None,
+                                "admission": "unadmitted",
                                 "occurred_at": observation.occurred_at,
                                 "ended_at": ended_at,
                                 "state": "unadmitted_after_hold",

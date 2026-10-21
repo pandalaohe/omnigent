@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -66,8 +67,9 @@ class ThreadTerminal(BaseModel):
     physical_session_id: str = Field(min_length=1)
     physical_subagent_id: str | None = None
     evidence: TerminalEvidence
+    source_ref: str | None = Field(default=None, max_length=256)
 
-    @field_validator("physical_session_id", "physical_subagent_id")
+    @field_validator("physical_session_id", "physical_subagent_id", "source_ref")
     @classmethod
     def bounded_identifier(cls, value: str | None) -> str | None:
         if value is not None and (not value or len(value.encode("utf-8")) > 256):
@@ -81,7 +83,9 @@ class ThreadTerminal(BaseModel):
 
 def thread_key(physical_session_id: str, physical_subagent_id: str | None) -> str:
     """Stable key for one physical thread inside an owner's feed."""
-    return f"{physical_session_id}/{physical_subagent_id or ''}"
+    return json.dumps(
+        [physical_session_id, physical_subagent_id], separators=(",", ":"), ensure_ascii=False
+    )
 
 
 class UsageObservation(BaseModel):
@@ -125,6 +129,7 @@ class UsageObservation(BaseModel):
     # Association evidence: the admitted turn this unit belongs to, the
     # runner's route comparison, and per-thread termination evidence.
     admission_id: str | None = None
+    turn_key: str | None = None
     route_check: Literal["match", "mismatch"] | None = None
     terminal: list[ThreadTerminal] = Field(default_factory=list, max_length=32)
 
@@ -144,6 +149,7 @@ class UsageObservation(BaseModel):
         "transcript_session_id",
         "physical_subagent_id",
         "admission_id",
+        "turn_key",
     )
     @classmethod
     def bounded_identifier(cls, value: str | None) -> str | None:
@@ -247,6 +253,7 @@ class UsageEvent(UsageObservation):
     # Association evidence stays on the server's unit row; it is never part of
     # the committed event the consumer reads.
     admission_id: str | None = Field(default=None, exclude=True)
+    turn_key: str | None = Field(default=None, exclude=True)
     route_check: Literal["match", "mismatch"] | None = Field(default=None, exclude=True)
     terminal: list[ThreadTerminal] = Field(default_factory=list, exclude=True)
 
@@ -285,7 +292,8 @@ class UsageEvent(UsageObservation):
         if (
             self.call_started_not_before is not None
             and self.ended_at is not None
-            and self.call_started_not_before > self.ended_at
+            and datetime.fromisoformat(self.call_started_not_before.replace("Z", "+00:00"))
+            > datetime.fromisoformat(self.ended_at.replace("Z", "+00:00"))
         ):
             raise ValueError("call start bound after the end bound")
         return self

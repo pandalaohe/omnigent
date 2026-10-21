@@ -1693,12 +1693,16 @@ def create_app(
 
         shutil.rmtree(_spec_cache_root, ignore_errors=True)
 
+    # Preserve router-owned lifespans, including durable usage delivery.
+    router_lifespan = app.router.lifespan_context
+
     # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await _start_pm()
         try:
-            yield
+            async with router_lifespan(_app):
+                yield
         finally:
             await _stop_pm()
 

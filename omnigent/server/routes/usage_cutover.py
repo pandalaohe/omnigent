@@ -15,6 +15,7 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes.usage_events import _error, _json_body
+from omnigent.stores import ConversationStore
 from omnigent.usage_export.cutover import UsageCutoverStore
 from omnigent.usage_export.store import UsageExportError
 
@@ -34,6 +35,7 @@ def create_usage_cutover_router(
     *,
     auth_provider: AuthProvider | None,
     host_owner: HostOwner | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> APIRouter:
     """Mount the cutover routes.
 
@@ -45,6 +47,92 @@ def create_usage_cutover_router(
     """
     store = UsageCutoverStore(storage_location)
     router = APIRouter()
+
+    @router.post("/usage-cutover/admissions", dependencies=[Depends(require_json_content_type)])
+    async def admit_runner_turn(request: Request) -> JSONResponse:
+        require_trusted_origin(request)
+        body = await _json_body(request)
+        if (
+            body is None
+            or conversation_store is None
+            or not isinstance(body.get("session_id"), str)
+        ):
+            return _error("usage_cutover_bad_request", 400)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, body["session_id"])
+        if conv is None or not conv.host_id:
+            return _error("session_not_found", 404)
+        owner, denied = _authorized(request, conv.host_id)
+        if denied is not None:
+            return denied
+        from omnigent.server.routes.usage import _resolve_session_harness
+        from omnigent.server.usage_cutover import admit_turn
+
+        try:
+            admission_id = body.get("admission_id")
+            if admission_id is None:
+                source = body.get("source")
+                if source not in {"native", "recovery", "plan"}:
+                    return _error("usage_cutover_bad_request", 400)
+                admission_id = await asyncio.to_thread(
+                    admit_turn,
+                    storage_location,
+                    conv,
+                    source=source,
+                    resolve_harness=_resolve_session_harness,
+                    owner_id=owner,
+                )
+            if not isinstance(admission_id, str):
+                return _error("usage_cutover_bad_request", 400)
+            snapshot = await asyncio.to_thread(store.admission_snapshot, owner, admission_id)
+            if snapshot is None or snapshot["session_id"] != conv.id:
+                return _error("usage_admission_not_found", 404)
+            if body.get("ended") is True:
+                await asyncio.to_thread(store.end_admission, owner, admission_id)
+            return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
+        except UsageExportError as exc:
+            return _store_error(exc)
+        except SQLAlchemyError:
+            return _unavailable()
+
+    def domain_sessions(request: Request, host_id: str, harness: str) -> dict[str, Any]:
+        from omnigent.server.routes.usage import _resolve_session_harness
+        from omnigent.server.usage_cutover import feed_harness
+
+        live: list[str] = []
+        owners: set[str] = set()
+        goal_active = False
+        after = None
+        if conversation_store is not None:
+            while ids := conversation_store.list_host_conversation_ids(
+                host_id, after=after, limit=100
+            ):
+                for session_id in ids:
+                    conv = conversation_store.get_conversation(session_id)
+                    if (
+                        conv is None
+                        or conv.archived
+                        or feed_harness(conv, _resolve_session_harness) != harness
+                    ):
+                        continue
+                    goal_active |= conv.labels.get("omnigent.goal_state") in {"active", "paused"}
+                    registry = getattr(request.app.state, "tunnel_registry", None)
+                    if (
+                        conv.runner_id
+                        and registry is not None
+                        and registry.get(conv.runner_id) is not None
+                    ):
+                        live.append(session_id)
+                        authority = conversation_store.get_session_owner_authority(
+                            conv.root_conversation_id or conv.id, owner_only=True
+                        )
+                        if authority is not None:
+                            owners.add(authority.user_id)
+                after = ids[-1]
+        return {
+            "live_session_ids": live,
+            "multi_owner_domain": len(owners) > 1,
+            "goal_active": goal_active,
+        }
 
     def _authorized(request: Request, host_id: str) -> tuple[str, JSONResponse | None]:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
@@ -65,12 +153,16 @@ def create_usage_cutover_router(
         if denied is not None:
             return denied
         try:
+            domain = await asyncio.to_thread(
+                domain_sessions, request, str(body["host_id"]), str(body["harness"])
+            )
             result = await asyncio.to_thread(
                 store.create_hold,
                 owner,
                 str(body["host_id"]),
                 str(body["harness"]),
                 body["generation"],
+                goal_active=domain["goal_active"],
             )
         except UsageExportError as exc:
             return _store_error(exc)
@@ -85,6 +177,7 @@ def create_usage_cutover_router(
             return denied
         try:
             result = await asyncio.to_thread(store.hold_status, owner, host_id, harness)
+            result.update(await asyncio.to_thread(domain_sessions, request, host_id, harness))
         except UsageExportError as exc:
             return _store_error(exc)
         except SQLAlchemyError:
@@ -104,7 +197,7 @@ def create_usage_cutover_router(
             return denied
         if not generation.isascii() or not generation.isdigit() or len(generation) > 9:
             return _error("usage_cutover_bad_request", 400)
-        body = await _json_body(request)
+        body = await _json_body(request, max_bytes=64 * 1024 * 1024)
         if body is None:
             return _error("usage_cutover_bad_request", 400)
         try:

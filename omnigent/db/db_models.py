@@ -13,6 +13,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Double,
     Float,
     Index,
     Integer,
@@ -2797,9 +2798,9 @@ class SqlUsageCutoverHold(OmnigentBase):
     generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # none | held | drained | released | invalidated | abandoned
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
-    created_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    released_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    state_changed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[float | None] = mapped_column(Double, nullable=True)
+    released_at: Mapped[float | None] = mapped_column(Double, nullable=True)
+    state_changed_at: Mapped[float | None] = mapped_column(Double, nullable=True)
     refused_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
@@ -2821,7 +2822,7 @@ class SqlUsageTurnAdmission(OmnigentBase):
     session_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     host_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     harness: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    admitted_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    admitted_at: Mapped[float] = mapped_column(Double, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     binding_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     binding_digest: Mapped[bytes | None] = mapped_column(_CKSUM32, nullable=True)
@@ -2848,7 +2849,7 @@ class SqlUsageCutoverReceipt(OmnigentBase):
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     payload: Mapped[str] = mapped_column(Text, nullable=False)
     digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
-    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
 
 
 class SqlUsageAccountBindingRevision(OmnigentBase):
@@ -2862,7 +2863,7 @@ class SqlUsageAccountBindingRevision(OmnigentBase):
     config_revision: Mapped[int] = mapped_column(Integer, primary_key=True)
     document: Mapped[str] = mapped_column(Text, nullable=False)
     digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
-    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
 
 
 class SqlUsageAccountBindingActivation(OmnigentBase):
@@ -2875,7 +2876,7 @@ class SqlUsageAccountBindingActivation(OmnigentBase):
     owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
     config_revision: Mapped[int] = mapped_column(Integer, nullable=False)
     digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
-    activated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    activated_at: Mapped[float] = mapped_column(Double, nullable=False)
 
 
 class SqlUsageRouteAttestation(OmnigentBase):
@@ -2890,7 +2891,7 @@ class SqlUsageRouteAttestation(OmnigentBase):
     owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
     billing_route: Mapped[str] = mapped_column(String(16), nullable=False)
     route_ref: Mapped[str] = mapped_column(String(256), nullable=False)
-    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Double, nullable=False)
 
 
 class SqlUsageProducer(OmnigentBase):

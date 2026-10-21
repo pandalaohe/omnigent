@@ -5991,6 +5991,20 @@ async def _forward_available_status_events(
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
             continue
+        if record.event_name in {"Stop", "StopFailure"} and record.usage_admission_id:
+            try:
+                ended = await client.post(
+                    "/v1/usage-cutover/admissions",
+                    json={
+                        "session_id": session_id,
+                        "admission_id": record.usage_admission_id,
+                        "ended": True,
+                    },
+                )
+                ended.raise_for_status()
+            except httpx.HTTPError:
+                _logger.warning("Usage admission end remains pending for %s", session_id)
+                return durable
         if status is None:
             if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
                 record, parent_claude_session_ids=parent_claude_session_ids

@@ -273,6 +273,37 @@ class DeviceGrantStore:
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
             return _to_device_grant(row) if row is not None else None
 
+    def list_usage_grants(self, owner_id: str) -> list[dict[str, object]]:
+        """Expose only non-secret owner-scoped metadata for usage consumers."""
+        with self._session("list_usage_grants") as session:
+            generation = require_active_account(session, owner_id)
+            rows = session.execute(
+                select(
+                    SqlDeviceGrant.id,
+                    SqlDeviceGrant.scope,
+                    SqlDeviceGrant.client_id,
+                    SqlDeviceGrant.created_at,
+                    SqlDeviceGrant.expires_at,
+                )
+                .where(
+                    SqlDeviceGrant.workspace_id == current_workspace_id(),
+                    SqlDeviceGrant.user_id == owner_id,
+                    SqlDeviceGrant.account_generation == generation,
+                    SqlDeviceGrant.scope == "usage:read",
+                )
+                .order_by(SqlDeviceGrant.created_at, SqlDeviceGrant.id)
+            ).all()
+            return [
+                dict(
+                    zip(
+                        ("grant_id", "scope", "client_id", "created_at", "expires_at"),
+                        row,
+                        strict=True,
+                    )
+                )
+                for row in rows
+            ]
+
     def get_by_refresh_hash(self, refresh_token_hash: str) -> DeviceGrant | None:
         """Look up the grant currently holding this refresh-token digest.
 

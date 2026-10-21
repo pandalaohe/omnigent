@@ -38,12 +38,12 @@ def feed_harness(
     conv: Conversation, resolve_harness: Callable[[Conversation], str | None] | None
 ) -> str | None:
     """Resolve the session's feed harness, or ``None`` while it is undecided."""
-    harness = conv.harness_override
+    harness = conv.harness_override if conv.harness_override != "auto" else None
     if not harness and resolve_harness is not None:
         harness = resolve_harness(conv)
     if not harness:
         return None
-    return _FEED_HARNESS.get(harness)
+    return _FEED_HARNESS.get(harness, "unsupported") if harness != "auto" else None
 
 
 def active_hold(
@@ -76,11 +76,8 @@ def admit_turn(
         return None
     store = _store(storage_location)
     harness = feed_harness(conv, resolve_harness)
-    if store.active_hold(conv.host_id, harness) is not None:
-        raise OmnigentError(
-            "This session's host is in a usage cutover hold and cannot start new turns.",
-            code=ErrorCode.USAGE_CUTOVER_HOLD,
-        )
+    if harness == "unsupported":
+        return None
     try:
         record = store.admit_turn(
             owner_id or "local",

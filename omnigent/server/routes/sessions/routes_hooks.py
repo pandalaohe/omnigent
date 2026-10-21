@@ -1816,6 +1816,31 @@ def register_hooks_routes(
         request: Request,
         session_id: str,
     ) -> Response:
+        result = await _evaluate_policy_impl(request, session_id)
+        admission = getattr(request.state, "usage_admission", None)
+        if admission is not None and result.body:
+            payload = json.loads(bytes(result.body))
+            if payload.get("result") in {"POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"}:
+                payload.update(admission_id=admission["admission_id"], usage_admission=admission)
+                return Response(
+                    content=json.dumps(payload),
+                    media_type="application/json",
+                    status_code=result.status_code,
+                )
+            if getattr(request.state, "usage_admission_new", False):
+                from omnigent.usage_export.cutover import UsageCutoverStore
+
+                await asyncio.to_thread(
+                    UsageCutoverStore(conversation_store.storage_location).end_admission,
+                    request.state.usage_admission_owner,
+                    admission["admission_id"],
+                )
+        return result
+
+    async def _evaluate_policy_impl(
+        request: Request,
+        session_id: str,
+    ) -> Response:
         """
         Generic policy evaluation endpoint (proto-compatible).
 
@@ -2176,6 +2201,52 @@ def register_hooks_routes(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        if phase == Phase.REQUEST and conv.host_id:
+            from omnigent.server.routes.usage import _resolve_session_harness
+            from omnigent.server.usage_cutover import admit_turn
+            from omnigent.usage_export.cutover import UsageCutoverStore
+
+            location = getattr(conversation_store, "storage_location", None)
+            if isinstance(location, str):
+                authority = await asyncio.to_thread(
+                    conversation_store.get_session_owner_authority,
+                    conv.root_conversation_id or conv.id,
+                    owner_only=True,
+                )
+                owner = authority.user_id if authority else "local"
+                usage_store = UsageCutoverStore(location)
+                admission_id = pending_inputs.oldest_admission_id(session_id)
+                admission = (
+                    await asyncio.to_thread(usage_store.admission_snapshot, owner, admission_id)
+                    if admission_id
+                    else None
+                )
+                if admission is None:
+                    try:
+                        admission_id = await asyncio.to_thread(
+                            admit_turn,
+                            location,
+                            conv,
+                            source="native",
+                            resolve_harness=_resolve_session_harness,
+                            owner_id=owner,
+                        )
+                    except OmnigentError as exc:
+                        if exc.code != ErrorCode.USAGE_CUTOVER_HOLD:
+                            raise
+                        return Response(
+                            content=json.dumps(
+                                {"result": "POLICY_ACTION_DENY", "reason": "usage_cutover_hold"}
+                            ),
+                            media_type="application/json",
+                        )
+                    if admission_id is not None:
+                        request.state.usage_admission_new = True
+                        request.state.usage_admission_owner = owner
+                        admission = await asyncio.to_thread(
+                            usage_store.admission_snapshot, owner, admission_id
+                        )
+                request.state.usage_admission = admission
         # Dedup the native request-phase gate. A native session's
         # ``UserPromptSubmit`` hook posts ``PHASE_REQUEST`` here for *every*
         # prompt, but a web-UI prompt was already gated server-side by
@@ -2618,6 +2689,48 @@ def register_hooks_routes(
                     {"type": "interrupt"},
                 )
         body = codex_request.build_response(result)
+        from omnigent.harnesses.codex_native.forwarder import (
+            _PLAN_IMPLEMENTATION_NO,
+            _is_plan_implementation_request_user_input,
+            _selected_plan_implementation_answer,
+        )
+
+        if _is_plan_implementation_request_user_input(
+            codex_request.codex_params
+        ) and _selected_plan_implementation_answer(body) not in {None, _PLAN_IMPLEMENTATION_NO}:
+            from omnigent.server.routes.usage import _resolve_session_harness
+            from omnigent.server.usage_cutover import admit_turn
+            from omnigent.usage_export.cutover import UsageCutoverStore
+
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            authority = await asyncio.to_thread(
+                conversation_store.get_session_owner_authority, session_id, owner_only=True
+            )
+            owner = authority.user_id if authority else "local"
+            if conv is not None:
+                try:
+                    admission_id = await asyncio.to_thread(
+                        admit_turn,
+                        conversation_store.storage_location,
+                        conv,
+                        source="plan",
+                        resolve_harness=_resolve_session_harness,
+                        owner_id=owner,
+                    )
+                except OmnigentError as exc:
+                    if exc.code != ErrorCode.USAGE_CUTOVER_HOLD:
+                        raise
+                    body = {"answers": {}}
+                else:
+                    if admission_id is not None:
+                        body["admission_id"] = admission_id
+                        body["usage_admission"] = await asyncio.to_thread(
+                            UsageCutoverStore(
+                                conversation_store.storage_location
+                            ).admission_snapshot,
+                            owner,
+                            admission_id,
+                        )
         return Response(
             content=json.dumps(body),
             media_type="application/json",

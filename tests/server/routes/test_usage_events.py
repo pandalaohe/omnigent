@@ -208,6 +208,64 @@ def _cutover_app(conversations: SqlAlchemyConversationStore, *, owner: str = "al
     return app
 
 
+@pytest.mark.asyncio
+async def test_native_hook_and_plan_followup_cannot_bypass_a_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.forwarder import _plan_implementation_request_event
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import create_sessions_router
+    from omnigent.server.schemas import ElicitationResult
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'gates.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    host = "a" * 32
+    conv = conversations.create_conversation(host_id=host, workspace="/opt/work")
+    conversations.update_conversation(conv.id, harness_override="claude-native")
+    SqlAlchemyPermissionStore(uri).grant("alice", conv.id, LEVEL_OWNER)
+    app = _cutover_app(conversations)
+    app.include_router(
+        create_sessions_router(conversations, SqlAlchemyAgentStore(uri)), prefix="/v1"
+    )
+    store = UsageCutoverStore(uri)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://omni.test"
+    ) as client:
+        request = {"event": {"type": "PHASE_REQUEST", "data": {}, "context": {}}}
+        admitted = await client.post(f"/v1/sessions/{conv.id}/policies/evaluate", json=request)
+        assert admitted.status_code == 200, admitted.text
+        admission_id = admitted.json()["admission_id"]
+        pending = pending_inputs.record(conv.id, [], admission_id=admission_id)
+        store.create_hold("alice", host, "claude-native", 1)
+        interleaved = await client.post(f"/v1/sessions/{conv.id}/policies/evaluate", json=request)
+        assert interleaved.json()["admission_id"] == admission_id
+        pending_inputs.resolve(conv.id, pending)
+        denied = await client.post(f"/v1/sessions/{conv.id}/policies/evaluate", json=request)
+        assert denied.json()["result"] == "POLICY_ACTION_DENY"
+        assert denied.json()["reason"] == "usage_cutover_hold"
+
+        conversations.update_conversation(conv.id, harness_override="codex-native")
+        store.create_hold("alice", host, "codex-native", 1)
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions.routes_hooks._publish_and_wait_for_harness_elicitation",
+            AsyncMock(
+                return_value=ElicitationResult(
+                    action="accept", content={"plan_implementation": "Yes, implement this plan"}
+                )
+            ),
+        )
+        plan = await client.post(
+            f"/v1/sessions/{conv.id}/hooks/codex-elicitation-request",
+            json=_plan_implementation_request_event("thread", "turn"),
+        )
+        assert plan.status_code == 200, plan.text
+        assert plan.json() == {"answers": {}}
+
+
 def _drain_body(**changes: object) -> dict[str, object]:
     body: dict[str, object] = {
         "detection": {
@@ -257,6 +315,9 @@ async def test_cutover_gate_refuses_a_held_domain_and_records_nothing(
         assert passed.status_code == 200
         assert passed.json()["admission_id"]
         # Abandoning the hold lifts it.
+        from omnigent.usage_export.store import UsageEventStore
+
+        pins = UsageEventStore(uri).page("alice")
         abandoned = await server.post(
             f"/v1/usage-cutover/holds/{held}/codex-native/1/release",
             json={
@@ -264,9 +325,7 @@ async def test_cutover_gate_refuses_a_held_domain_and_records_nothing(
                 "reason": "clock",
                 "consumer_receipt": {
                     "kind": "abandon",
-                    "owner_scope_id": "0" * 32,
-                    "feed_id": "1" * 32,
-                    "feed_epoch": 1,
+                    **{key: pins[key] for key in ("owner_scope_id", "feed_id", "feed_epoch")},
                     "domain": {"host_id": held, "harness": "codex-native"},
                     "generation": 1,
                     "producer_receipt_digest": "2" * 64,
@@ -373,6 +432,9 @@ async def test_receipts_route_serves_the_r4_page_shape_and_errors(
             2,
             {
                 "kind": "abandon",
+                **{
+                    key: drained.json()[key] for key in ("owner_scope_id", "feed_id", "feed_epoch")
+                },
                 "domain": {"host_id": host, "harness": "codex-native"},
                 "generation": 2,
                 "authority_published": False,

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import secrets
 import time
 import uuid
 from collections.abc import Callable
@@ -16,10 +18,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
+    SqlDeviceGrant,
     SqlUsageAccountBindingActivation,
     SqlUsageAccountBindingRevision,
     SqlUsageCutoverHold,
@@ -31,6 +35,7 @@ from omnigent.db.db_models import (
     SqlUsageUnit,
     current_workspace_id,
 )
+from omnigent.db.enum_codecs import decode_device_grant_status
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -48,20 +53,24 @@ _MAX_RECEIPT_CALLS = 5000
 _MAX_READ_LIMIT = 50
 
 
-def _now() -> int:
-    return int(time.time())
+def _now() -> float:
+    return time.time()
 
 
-def _iso(epoch: int | None) -> str | None:
+def _iso(epoch: float | None) -> str | None:
     if epoch is None:
         return None
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _epoch(value: str | None) -> int | None:
+def _epoch(value: str | None) -> float | None:
     if value is None:
         return None
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.utcoffset() is not None else None
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _json(value: Any) -> str:
@@ -103,7 +112,7 @@ def _admission_entry(row: SqlUsageTurnAdmission, *, linked_call: bool) -> dict[s
     turn_ended_at: str | None = evidence.get("turn_ended_at")
     threads: list[dict[str, Any]] = []
     for key, entries in threads_by_key.items():
-        physical_session_id, _, subagent = key.partition("/")
+        physical_session_id, subagent = json.loads(key)
         threads.append(
             {
                 "physical_session_id": physical_session_id,
@@ -273,7 +282,7 @@ class UsageCutoverStore:
                 owner_scope_id=uuid.uuid4().hex,
                 feed_id=uuid.uuid4().hex,
                 feed_epoch=1,
-                signing_key=b"\0" * 32,
+                signing_key=secrets.token_bytes(32),
                 next_sequence=1,
                 read_timestamps="[]",
                 progress="{}",
@@ -298,8 +307,14 @@ class UsageCutoverStore:
                 refused_count=0,
                 row_version=0,
             )
-            session.add(row)
-            session.flush()
+            try:
+                with session.begin_nested():
+                    session.add(row)
+                    session.flush()
+            except IntegrityError:
+                row = UsageCutoverStore._hold(session, workspace_id, host_id, harness)
+                if row is None:
+                    raise
         return row
 
     @staticmethod
@@ -336,7 +351,7 @@ class UsageCutoverStore:
         session: Session, workspace_id: int, host_id: str, harness: str
     ) -> SqlUsageCutoverHold | None:
         """Take the domain's hold row before the feed row (§2.3 lock order)."""
-        return UsageCutoverStore._hold(session, workspace_id, host_id, harness, for_share=True)
+        return UsageCutoverStore._hold(session, workspace_id, host_id, harness, for_update=True)
 
     @staticmethod
     def _merge_unit_evidence(
@@ -358,10 +373,10 @@ class UsageCutoverStore:
                 (item["kind"], item.get("source_ref"))
                 for item in threads.setdefault(entry.key, [])
             }
-            if (entry.evidence, None) in existing:
+            if (entry.evidence, entry.source_ref) in existing:
                 continue
             threads[entry.key].append(
-                {"kind": entry.evidence, "reported_at": now_iso, "source_ref": None}
+                {"kind": entry.evidence, "reported_at": now_iso, "source_ref": entry.source_ref}
             )
         evidence["threads"] = threads
         terminal = bool(threads) and all(entries for entries in threads.values())
@@ -372,6 +387,8 @@ class UsageCutoverStore:
             row.terminal_state = _json(
                 sorted({item["kind"] for entries in threads.values() for item in entries})
             )
+        else:
+            row.terminal_state = None
         return terminal, evidence.get("turn_ended_at")
 
     @staticmethod
@@ -415,7 +432,9 @@ class UsageCutoverStore:
             ):
                 failure = "admission_precedes_call"
             elif observation.thread_kind == "main":
-                main_key = observation.turn_id or observation.producer_unit_id
+                main_key = (
+                    observation.turn_key or observation.turn_id or observation.producer_unit_id
+                )
                 if row.main_turn_key is None:
                     row.main_turn_key = main_key
                 elif row.main_turn_key != main_key:
@@ -440,7 +459,11 @@ class UsageCutoverStore:
                             observation.physical_subagent_id,
                         )
                         own = threads.get(own_key, [])
-                        if own and all(entries for entries in threads.values()):
+                        if (
+                            own
+                            and all(entries for entries in threads.values())
+                            and any(entry.key == own_key for entry in observation.terminal)
+                        ):
                             ended_at = _iso(_now())
                 if ended_at is not None and row.terminal_state is not None:
                     result["ended_at"] = ended_at
@@ -453,6 +476,21 @@ class UsageCutoverStore:
             else:
                 result["association"] = failure
         if hold is not None and result["admission"] is None:
+            latest = session.execute(
+                select(SqlUsageCutoverReceipt.payload)
+                .where(
+                    SqlUsageCutoverReceipt.workspace_id == workspace_id,
+                    SqlUsageCutoverReceipt.owner_digest == owner_digest,
+                    SqlUsageCutoverReceipt.host_id == hold.host_id,
+                    SqlUsageCutoverReceipt.harness == hold.harness,
+                    SqlUsageCutoverReceipt.generation == hold.generation,
+                )
+                .order_by(SqlUsageCutoverReceipt.receipt_seq.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest:
+                detection = json.loads(latest).get("detection") or {}
+                margin_seconds += abs(detection.get("clock_offset_ms", 0)) / 1000
             hold_time = hold.created_at
             after_hold = observation.occurred_at is None or (
                 hold_time is not None
@@ -474,6 +512,15 @@ class UsageCutoverStore:
         return result
 
     # ---- hold machine ---------------------------------------------------
+
+    def ensure_domain(self, owner_id: str, host_id: str, harness: str) -> None:
+        self._write(
+            owner_id,
+            "ensure_usage_cutover_hold_row",
+            lambda session, workspace_id, owner_digest: self._ensure_hold_row(
+                session, workspace_id, owner_digest, host_id, harness
+            ),
+        )
 
     def hold_status(self, owner_id: str, host_id: str, harness: str) -> dict[str, Any]:
         canonical_host = _identifier(host_id)
@@ -552,6 +599,19 @@ class UsageCutoverStore:
             row = self._hold(session, workspace_id, canonical_host, feed_harness, for_update=True)
             if row is None:
                 raise UsageExportError(409, "hold_generation_conflict")
+            goal = session.execute(
+                select(SqlUsageTurnAdmission.admission_id)
+                .where(
+                    SqlUsageTurnAdmission.workspace_id == workspace_id,
+                    SqlUsageTurnAdmission.host_id == canonical_host,
+                    SqlUsageTurnAdmission.harness == feed_harness,
+                    SqlUsageTurnAdmission.source == "goal",
+                    SqlUsageTurnAdmission.terminal_state.is_(None),
+                )
+                .limit(1)
+            ).first()
+            if goal is not None:
+                raise UsageExportError(409, "codex_goal_active")
             now = _now()
             if row.state in ACTIVE_HOLD_STATES:
                 if row.generation == generation:
@@ -749,7 +809,7 @@ class UsageCutoverStore:
         owner_digest: bytes,
         host_id: str,
         harness: str,
-        admitted_at: int,
+        admitted_at: float,
     ) -> tuple[dict[str, Any] | None, int | None, bytes | None]:
         """Freeze the account hint for one admission at ``admitted_at``."""
         activation = UsageCutoverStore._activation(session, workspace_id, owner_digest)
@@ -784,7 +844,7 @@ class UsageCutoverStore:
         for binding in document.get("bindings", []):
             if binding.get("binding_version") in revoked:
                 continue
-            if any(list(entry) != applies for entry in binding.get("applies_to", [])):
+            if applies not in binding.get("applies_to", []):
                 continue
             valid_from = _epoch(binding.get("valid_from"))
             valid_until = _epoch(binding.get("valid_until"))
@@ -843,33 +903,32 @@ class UsageCutoverStore:
             )
 
         def write(session: Session, workspace_id: int, owner_digest: bytes) -> dict[str, Any]:
-            now = _now()
             if canonical_host is not None:
                 statement = (
                     select(SqlUsageCutoverHold)
                     .where(
                         SqlUsageCutoverHold.workspace_id == workspace_id,
                         SqlUsageCutoverHold.host_id == canonical_host,
-                        SqlUsageCutoverHold.state.in_(ACTIVE_HOLD_STATES),
                         *(
                             [SqlUsageCutoverHold.harness == feed_harness]
                             if feed_harness is not None
                             else []
                         ),
                     )
-                    .with_for_update(read=True)
+                    .with_for_update()
                 )
-                active = session.execute(statement).scalars().first()
+                holds = session.execute(statement).scalars().all()
+                active = next((row for row in holds if row.state in ACTIVE_HOLD_STATES), None)
                 if active is not None:
-                    raise UsageExportError(
-                        409,
-                        "usage_cutover_hold",
-                        {
+                    active.refused_count += 1
+                    return {
+                        "__held__": {
                             "host_id": active.host_id,
                             "harness": active.harness,
                             "generation": active.generation,
-                        },
-                    )
+                        }
+                    }
+            now = _now()
             hint = None
             revision = None
             digest = None
@@ -877,6 +936,18 @@ class UsageCutoverStore:
                 hint, revision, digest = self._hint_at(
                     session, workspace_id, owner_digest, canonical_host, feed_harness, now
                 )
+            if hint is None:
+                revision = digest = None
+            route = (
+                session.get(SqlUsageRouteAttestation, (workspace_id, canonical_host, feed_harness))
+                if canonical_host and feed_harness
+                else None
+            )
+            frozen_route = (
+                {"billing_route": route.billing_route, "route_ref": route.route_ref}
+                if route
+                else None
+            )
             row = SqlUsageTurnAdmission(
                 workspace_id=workspace_id,
                 owner_digest=owner_digest,
@@ -892,7 +963,7 @@ class UsageCutoverStore:
                 route_check=None,
                 main_turn_key=None,
                 terminal_state=None,
-                terminal_evidence="{}",
+                terminal_evidence=_json({"route": frozen_route}),
             )
             session.add(row)
             return {
@@ -900,9 +971,13 @@ class UsageCutoverStore:
                 "admitted_at": _iso(now),
                 "source": source,
                 "account_hint": hint,
+                "route": frozen_route,
             }
 
-        return self._write(owner_id, "admit_usage_turn", write)
+        result = self._write(owner_id, "admit_usage_turn", write)
+        if "__held__" in result:
+            raise UsageExportError(409, "usage_cutover_hold", result["__held__"])
+        return result
 
     def admission_snapshot(self, owner_id: str, admission_id: str) -> dict[str, Any] | None:
         canonical = _identifier(admission_id, "invalid_admission_id")
@@ -922,10 +997,45 @@ class UsageCutoverStore:
                 "account_hint": json.loads(row.account_hint) if row.account_hint else None,
                 "route_check": row.route_check,
                 "main_turn_key": row.main_turn_key,
+                "route": json.loads(row.terminal_evidence or "{}").get("route"),
                 "terminal_state": json.loads(row.terminal_state) if row.terminal_state else None,
             }
 
         return self._read(owner_id, "read_usage_turn_admission", read)
+
+    def end_admission(self, owner_id: str, admission_id: str) -> None:
+        def write(session: Session, workspace_id: int, owner_digest: bytes) -> None:
+            row = session.get(SqlUsageTurnAdmission, (workspace_id, owner_digest, admission_id))
+            if row is None:
+                raise UsageExportError(404, "usage_admission_not_found")
+            evidence = json.loads(row.terminal_evidence or "{}")
+            evidence.setdefault("turn_ended_at", _iso(_now()))
+            row.terminal_evidence = _json(evidence)
+            if not evidence.get("threads"):
+                row.terminal_state = '["executor_end"]'
+
+        self._write(owner_id, "end_usage_turn_admission", write)
+
+    def end_goal_admissions(self, owner_id: str, session_id: str) -> None:
+        def write(session: Session, workspace_id: int, owner_digest: bytes) -> None:
+            rows = (
+                session.execute(
+                    select(SqlUsageTurnAdmission).where(
+                        SqlUsageTurnAdmission.workspace_id == workspace_id,
+                        SqlUsageTurnAdmission.owner_digest == owner_digest,
+                        SqlUsageTurnAdmission.session_id == session_id,
+                        SqlUsageTurnAdmission.source == "goal",
+                        SqlUsageTurnAdmission.terminal_state.is_(None),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                row.terminal_evidence = _json({"turn_ended_at": _iso(_now())})
+                row.terminal_state = '["executor_end"]'
+
+        self._write(owner_id, "end_usage_goal_admissions", write)
 
     def record_route_check(
         self, owner_id: str, admission_id: str, route_check: str
@@ -1037,7 +1147,19 @@ class UsageCutoverStore:
                 .all()
             )
             if not rows and (hold is None or hold.generation != generation):
-                raise UsageExportError(404, "usage_cutover_generation_not_found")
+                existed = session.execute(
+                    select(SqlUsageCutoverReceipt.receipt_seq)
+                    .where(
+                        SqlUsageCutoverReceipt.workspace_id == workspace_id,
+                        SqlUsageCutoverReceipt.owner_digest == owner_digest,
+                        SqlUsageCutoverReceipt.host_id == canonical_host,
+                        SqlUsageCutoverReceipt.harness == feed_harness,
+                        SqlUsageCutoverReceipt.generation == generation,
+                    )
+                    .limit(1)
+                ).first()
+                if existed is None:
+                    raise UsageExportError(404, "usage_cutover_generation_not_found")
             feed = self.feed_row(session, workspace_id, owner_digest)
             self._charge_read(feed)
             page_rows = rows[:limit]
@@ -1102,6 +1224,7 @@ class UsageCutoverStore:
                     codes.append("host_facts_mismatch")
                     continue
                 key = thread_key(physical_session_id, physical_subagent_id)
+                threads.setdefault(key, [])
                 reported: list[dict[str, Any]] = []
                 for item in thread.get("evidence", []):
                     kind = item.get("kind")
@@ -1136,7 +1259,7 @@ class UsageCutoverStore:
                     threads.setdefault(key, []).append(item)
             turn_ended_at = entry.get("turn_ended_at")
             if turn_ended_at is not None and evidence.get("turn_ended_at") is None:
-                evidence["turn_ended_at"] = turn_ended_at
+                evidence["turn_ended_at"] = _iso(_now())
             evidence["threads"] = threads
             row.terminal_evidence = _json(evidence)
             row.terminal_state = _json(
@@ -1145,6 +1268,10 @@ class UsageCutoverStore:
                     zero_thread=not threads,
                 )
             )
+            if not all(threads.values()) or (
+                not threads and evidence.get("turn_ended_at") is None
+            ):
+                row.terminal_state = None
             rows.append(row)
         return rows, codes
 
@@ -1188,6 +1315,13 @@ class UsageCutoverStore:
                 [entry for entry in facts.get("admissions", []) if isinstance(entry, dict)],
             )
             codes.extend(admission_codes)
+            detection = facts.get("detection") or {}
+            offset = detection.get("clock_offset_ms", 0)
+            if isinstance(offset, bool) or not isinstance(offset, (int, float)):
+                raise UsageExportError(400, "invalid_receipt_facts")
+            if abs(offset) > 30_000:
+                codes.append("clock_skew")
+            threshold = (hold.created_at or 0) - 60 - abs(offset) / 1000
             # r5: a call names the server-held association, and only a linked
             # call may name one.
             linked_admissions = {
@@ -1229,7 +1363,7 @@ class UsageCutoverStore:
                 server_block = entry.get("server")
                 admission = entry.get("admission")
                 named_admission = entry.get("admission_id")
-                linked = isinstance(admission, dict) and admission.get("state") == "linked"
+                linked = admission == "linked"
                 if linked != isinstance(named_admission, str):
                     codes.append("host_facts_mismatch")
                     continue
@@ -1254,13 +1388,57 @@ class UsageCutoverStore:
                     if unit.admission_id != named_admission:
                         codes.append("host_facts_mismatch")
                         continue
-                    state = "terminal_acked"
-                elif unit is not None and state in {"unsent", "path_pending"}:
-                    # A lost ACK: the server already holds this observation.
-                    state = "terminal_acked"
+                elif state == "terminal_acked":
+                    codes.append("host_facts_mismatch")
+                    continue
+                if unit is not None:
+                    event_row = session.get(
+                        SqlUsageEvent, (workspace_id, owner_digest, unit.latest_sequence)
+                    )
+                    assert event_row is not None
+                    event = json.loads(event_row.payload)
+                    if unit.admission_id != named_admission:
+                        codes.append("host_facts_mismatch")
+                        continue
+                    # A lost ACK must be corroborated by the complete observation,
+                    # rather than just the presence of a row with the same key.
+                    if server_block is None and entry.get("observation") != json.loads(
+                        unit.observation
+                    ):
+                        codes.append("host_facts_mismatch")
+                        continue
+                    if unit.admission_id is None:
+                        occurred = _epoch(event.get("occurred_at"))
+                        threshold = (
+                            (hold.created_at or 0)
+                            - 60
+                            - abs(int(facts.get("detection", {}).get("clock_offset_ms", 0))) / 1000
+                        )
+                        state = (
+                            "unadmitted_after_hold"
+                            if occurred is None
+                            or occurred >= threshold
+                            or state == "unadmitted_after_hold"
+                            else "unadmitted_before_hold"
+                        )
+                    else:
+                        state = "terminal_acked" if event.get("ended_at") else "open"
+                    server_block = {
+                        "original_event_id": unit.original_event_id,
+                        "latest_event_id": unit.latest_event_id,
+                        "sequence": unit.latest_sequence,
+                        "revision": unit.revision,
+                    }
+                    entry = {**entry, "server": server_block, "ended_at": event.get("ended_at")}
                 if state == "unadmitted_after_hold":
                     codes.append("unadmitted_call_after_hold")
-                verified_calls.append({**entry, "admission_id": named_admission, "state": state})
+                verified_calls.append(
+                    {
+                        **{key: value for key, value in entry.items() if key != "observation"},
+                        "admission_id": named_admission,
+                        "state": state,
+                    }
+                )
 
             admissions = [
                 _admission_entry(row, linked_call=row.admission_id in linked_admissions)
@@ -1286,18 +1464,79 @@ class UsageCutoverStore:
                     _admission_entry(row, linked_call=admission_id in linked_admissions)
                 )
             admissions.sort(key=lambda entry: entry["admitted_at"] or "")
+            open_at_hold = {
+                entry["admission_id"]
+                for entry in admissions
+                if not entry["terminal"]
+                or (_epoch(entry.get("turn_ended_at")) or float("inf")) >= (hold.created_at or 0)
+            }
+            listed_units = {
+                (entry["call_key"]["meter_epoch"], entry["call_key"]["producer_unit_id"])
+                for entry in verified_calls
+            }
+            # Reconcile the host window against committed units. An omitted
+            # open or after-hold unit must not turn an empty report into PASS.
+            domain_units = session.execute(
+                select(SqlUsageUnit, SqlUsageEvent.payload)
+                .join(
+                    SqlUsageEvent,
+                    (SqlUsageEvent.workspace_id == SqlUsageUnit.workspace_id)
+                    & (SqlUsageEvent.owner_digest == SqlUsageUnit.owner_digest)
+                    & (SqlUsageEvent.sequence == SqlUsageUnit.latest_sequence),
+                )
+                .where(
+                    SqlUsageUnit.workspace_id == workspace_id,
+                    SqlUsageUnit.owner_digest == owner_digest,
+                    SqlUsageEvent.host_id == canonical_host,
+                    SqlUsageEvent.harness == feed_harness,
+                )
+            ).all()
+            for unit, payload in domain_units:
+                event = json.loads(payload)
+                occurred = _epoch(event.get("occurred_at"))
+                required = (
+                    not event.get("ended_at")
+                    or unit.admission_id in open_at_hold
+                    or (unit.admission_id is None and (occurred is None or occurred >= threshold))
+                )
+                if (
+                    required
+                    and (event["meter_epoch"], event["producer_unit_id"]) not in listed_units
+                ):
+                    codes.append("host_facts_mismatch")
             counts = facts.get("counts", {}) if isinstance(facts.get("counts"), dict) else {}
             counts = {
-                **counts,
+                **{
+                    key: int(counts.get(key, 0))
+                    for key in ("outbox_pending_observations", "open_threads")
+                },
                 "admissions_open_at_hold": len(admissions),
                 "admissions_terminal": sum(1 for entry in admissions if entry["terminal"]),
+                "admissions_refused_during_hold": hold.refused_count,
                 "calls_window": len(verified_calls),
                 "calls_unadmitted_after_hold": sum(
                     1 for entry in verified_calls if entry["state"] == "unadmitted_after_hold"
                 ),
+                **{
+                    f"calls_{state}": sum(entry["state"] == state for entry in verified_calls)
+                    for state in (
+                        "terminal_acked",
+                        "unadmitted_before_hold",
+                        "open",
+                        "unsent",
+                        "path_pending",
+                    )
+                },
             }
             timed_out = facts.get("timed_out") is True
-            drained = not codes and all(entry["terminal"] for entry in admissions)
+            drained = (
+                not codes
+                and all(entry["terminal"] for entry in admissions)
+                and all(
+                    entry["state"] in {"terminal_acked", "unadmitted_before_hold"}
+                    for entry in verified_calls
+                )
+            )
             if counts.get("outbox_pending_observations"):
                 drained = False
             if counts.get("open_threads"):
@@ -1353,6 +1592,13 @@ class UsageCutoverStore:
                 raise UsageExportError(409, "generation_mismatch")
             if hold.state == "invalidated":
                 return {"__error__": "drain_invalidated"}
+            if (
+                type(rescan.get("outbox_pending_observations")) is not int
+                or type(rescan.get("calls_unadmitted_after_hold")) is not int
+                or not isinstance(rescan.get("checkpoint_digest"), str)
+                or re.fullmatch("[0-9a-f]{64}", rescan["checkpoint_digest"]) is None
+            ):
+                raise UsageExportError(409, "drain_invalidated")
             if rescan.get("calls_unadmitted_after_hold") or rescan.get(
                 "outbox_pending_observations"
             ):
@@ -1375,7 +1621,7 @@ class UsageCutoverStore:
             current = self._domain_sequence(
                 session, workspace_id, owner_digest, canonical_host, feed_harness
             )
-            if last_sequence is not None and current is not None and current > last_sequence:
+            if current is not None and current > (last_sequence or 0):
                 hold.state = "invalidated"
                 hold.state_changed_at = _now()
                 hold.row_version += 1
@@ -1400,6 +1646,8 @@ class UsageCutoverStore:
                 raise UsageExportError(409, "consumer_receipt_mismatch")
             if consumer_receipt.get("producer_receipt_digest") != drained["digest"]:
                 raise UsageExportError(409, "consumer_receipt_mismatch")
+            if consumer_receipt.get("cutover_at") != cutover_at:
+                raise UsageExportError(409, "consumer_receipt_mismatch")
             acked = consumer_receipt.get("acked_through_sequence")
             if last_sequence is not None and (not isinstance(acked, int) or acked < last_sequence):
                 raise UsageExportError(409, "consumer_not_acked")
@@ -1409,10 +1657,23 @@ class UsageCutoverStore:
                 type(consumer_receipt.get("authority_revision")) is not int
                 or consumer_receipt["authority_revision"] < 1
                 or not isinstance(consumer_receipt.get("authority_digest"), str)
-                or len(consumer_receipt["authority_digest"]) != 64
+                or re.fullmatch("[0-9a-f]{64}", consumer_receipt["authority_digest"]) is None
             ):
                 raise UsageExportError(409, "consumer_not_acked")
             grant_id = consumer_receipt.get("usage_read_grant_id")
+            grant = (
+                session.get(SqlDeviceGrant, (workspace_id, grant_id))
+                if isinstance(grant_id, str)
+                else None
+            )
+            if (
+                grant is None
+                or grant.user_id != owner_id
+                or grant.scope != "usage:read"
+                or decode_device_grant_status(grant.status) != "redeemed"
+                or _digest(owner_id, grant.account_generation) != owner_digest
+            ):
+                raise UsageExportError(409, "consumer_not_acked")
             if last_sequence is not None:
                 positions = json.loads(
                     self.feed_row(session, workspace_id, owner_digest).grant_positions or "{}"
@@ -1479,17 +1740,25 @@ class UsageCutoverStore:
                 raise UsageExportError(409, "generation_mismatch")
             if hold.state not in ACTIVE_HOLD_STATES:
                 raise UsageExportError(409, "not_drained")
+            feed = self.feed_row(session, workspace_id, owner_digest)
             if (
                 consumer_receipt.get("kind") != "abandon"
                 or consumer_receipt.get("domain", {}).get("host_id") != canonical_host
                 or consumer_receipt.get("domain", {}).get("harness") != feed_harness
                 or consumer_receipt.get("generation") != generation
+                or consumer_receipt.get("owner_scope_id") != feed.owner_scope_id
+                or consumer_receipt.get("feed_id") != feed.feed_id
+                or consumer_receipt.get("feed_epoch") != feed.feed_epoch
             ):
                 raise UsageExportError(409, "consumer_receipt_mismatch")
             published = consumer_receipt.get("authority_published")
-            restored_ok = isinstance(
-                consumer_receipt.get("restored_authority_revision"), int
-            ) and isinstance(consumer_receipt.get("restored_authority_digest"), str)
+            restored_ok = (
+                type(consumer_receipt.get("restored_authority_revision")) is int
+                and consumer_receipt["restored_authority_revision"] >= 1
+                and isinstance(consumer_receipt.get("restored_authority_digest"), str)
+                and re.fullmatch("[0-9a-f]{64}", consumer_receipt["restored_authority_digest"])
+                is not None
+            )
             if published is not False and not (published is True and restored_ok):
                 raise UsageExportError(409, "consumer_receipt_mismatch")
             hold.state = "abandoned"

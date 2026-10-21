@@ -424,6 +424,33 @@ def _drain_facts(**changes: object) -> dict[str, object]:
     return facts
 
 
+def _rescan() -> dict[str, object]:
+    return {
+        "checkpoint_digest": "0" * 64,
+        "calls_unadmitted_after_hold": 0,
+        "outbox_pending_observations": 0,
+    }
+
+
+def _usage_grant(uri: str) -> None:
+    from omnigent.server.device_grant_store import DeviceGrantStore
+
+    store = DeviceGrantStore(uri)
+    store.create_grant(
+        "grant-1",
+        device_code_hash="test-device-hash",
+        user_code="TEST-READER",
+        client_id="usage-reader",
+        scope="usage:read",
+        created_at=1767225600,
+        expires_at=1767226200,
+    )
+    store.approve("grant-1", user_id="alice", now_epoch_seconds=1767225600)
+    store.redeem_approved(
+        "grant-1", refresh_token_hash="test-refresh-hash", now_epoch_seconds=1767225600
+    )
+
+
 def _consumer_receipt(drained: dict[str, object], **changes: object) -> dict[str, object]:
     receipt: dict[str, object] = {
         "kind": "drained",
@@ -555,7 +582,7 @@ def test_admission_entry_shape_sorted_and_zero_thread_rule() -> None:
 
     evidence = {
         "threads": {
-            "parent/main-child": [
+            '["parent","main-child"]': [
                 {"kind": "stop_hook", "reported_at": "2026-01-01T00:00:02Z", "source_ref": "h2"},
                 {
                     "kind": "terminal_record",
@@ -568,7 +595,7 @@ def test_admission_entry_shape_sorted_and_zero_thread_rule() -> None:
                     "source_ref": "r2",
                 },
             ],
-            "parent/": [
+            '["parent",null]': [
                 {"kind": "telemetry", "reported_at": "2026-01-01T00:00:05Z", "source_ref": None},
             ],
         },
@@ -642,8 +669,12 @@ def test_drain_merges_thread_evidence_and_release_cas(
 
     uri = f"sqlite:///{tmp_path / 'usage.db'}"
     feed = UsageEventStore(uri)
+    _usage_grant(uri)
     host = uuid.uuid4().hex
-    feed.append("alice", _sealed("a", host_id=host, harness="claude-sdk"))
+    feed.append(
+        "alice",
+        _sealed("a", host_id=host, harness="claude-sdk", occurred_at="2025-12-31T23:58:59Z"),
+    )
     cutover = UsageCutoverStore(uri)
     monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
     admission = cutover.admit_turn(
@@ -684,7 +715,7 @@ def test_drain_merges_thread_evidence_and_release_cas(
     feed.page("alice", cursor=page["next_cursor"], grant_id="grant-1")
     consumer = _consumer_receipt(open_drain, acked_through_sequence=1)
     released = cutover.release(
-        "alice", host, "claude-sdk", 1, consumer, "2026-01-01T00:00:00Z", {}
+        "alice", host, "claude-sdk", 1, consumer, "2026-01-01T00:00:00Z", _rescan()
     )
     assert released["kind"] == "release"
     assert released["result"] == "released"
@@ -702,8 +733,12 @@ def test_release_refuses_each_condition_alone(
 
     uri = f"sqlite:///{tmp_path / 'usage.db'}"
     feed = UsageEventStore(uri)
+    _usage_grant(uri)
     host = uuid.uuid4().hex
-    feed.append("alice", _sealed("a", host_id=host, harness="claude-sdk"))
+    feed.append(
+        "alice",
+        _sealed("a", host_id=host, harness="claude-sdk", occurred_at="2025-12-31T23:58:59Z"),
+    )
     store = UsageCutoverStore(uri)
     monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
     store.create_hold("alice", host, "claude-sdk", 1)
@@ -712,7 +747,7 @@ def test_release_refuses_each_condition_alone(
     feed.page("alice", cursor=first_page["next_cursor"], grant_id="grant-1")
     good = _consumer_receipt(drained)
     with pytest.raises(UsageExportError) as wrong_generation:
-        store.release("alice", host, "claude-sdk", 2, good, "2026-01-01T00:00:00Z", {})
+        store.release("alice", host, "claude-sdk", 2, good, "2026-01-01T00:00:00Z", _rescan())
     assert wrong_generation.value.code == "generation_mismatch"
     for change, code in (
         ({"producer_receipt_digest": "b" * 64}, "consumer_receipt_mismatch"),
@@ -728,11 +763,19 @@ def test_release_refuses_each_condition_alone(
                 1,
                 _consumer_receipt(drained, **change),
                 "2026-01-01T00:00:00Z",
-                {},
+                _rescan(),
             )
         assert refused.value.code == code
     with pytest.raises(UsageExportError) as bad_time:
-        store.release("alice", host, "claude-sdk", 1, good, "2026-01-01T00:30:00Z", {})
+        store.release(
+            "alice",
+            host,
+            "claude-sdk",
+            1,
+            {**good, "cutover_at": "2026-01-01T00:30:00Z"},
+            "2026-01-01T00:30:00Z",
+            _rescan(),
+        )
     assert bad_time.value.code == "cutover_time_invalid"
     with pytest.raises(UsageExportError) as invalidated:
         store.release(
@@ -742,7 +785,7 @@ def test_release_refuses_each_condition_alone(
             1,
             good,
             "2026-01-01T00:00:00Z",
-            {"calls_unadmitted_after_hold": 1},
+            {**_rescan(), "calls_unadmitted_after_hold": 1},
         )
     assert invalidated.value.code == "drain_invalidated"
     assert store.hold_status("alice", host, "claude-sdk")["state"] == "invalidated"
@@ -760,7 +803,9 @@ def test_abandon_requires_a_consumer_receipt(
     host = uuid.uuid4().hex
     monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
     store.create_hold("alice", host, "codex-sdk", 5)
+    pins = UsageEventStore(f"sqlite:///{tmp_path / 'usage.db'}").page("alice")
     receipt = {
+        **{key: pins[key] for key in ("owner_scope_id", "feed_id", "feed_epoch")},
         "kind": "abandon",
         "domain": {"host_id": host, "harness": "codex-sdk"},
         "generation": 5,
@@ -821,7 +866,7 @@ def _call_entry(
             "sequence": event["sequence"],
             "revision": event["revision"],
         },
-        "admission": {"state": "linked" if linked else "unadmitted"},
+        "admission": "linked" if linked else "unadmitted",
         "admission_id": admission_id,
         "occurred_at": observation.occurred_at,
         "ended_at": None if event is None else event["ended_at"],
@@ -850,7 +895,7 @@ def test_drain_calls_name_the_server_held_association(
     )
     linked = _linked_observation("unit-linked", admission["admission_id"], host_id=host)
     linked_event = feed.append("alice", linked)
-    unadmitted = _sealed("unit-unadmitted", host_id=host, occurred_at="2025-12-31T23:59:00Z")
+    unadmitted = _sealed("unit-unadmitted", host_id=host, occurred_at="2025-12-31T23:58:59Z")
     unadmitted_event = feed.append("alice", unadmitted)
     cutover.create_hold("alice", host, "codex-native", 1)
     drained = cutover.submit_drain(
@@ -980,7 +1025,7 @@ def test_zero_thread_admission_matches_through_call_admission_id(
         harness="codex-native",
         source="web",
     )
-    unadmitted = _sealed("unit-unadmitted", host_id=host, occurred_at="2025-12-31T23:59:00Z")
+    unadmitted = _sealed("unit-unadmitted", host_id=host, occurred_at="2025-12-31T23:58:59Z")
     unadmitted_event = feed.append("alice", unadmitted)
     cutover.create_hold("alice", host, "codex-native", 1)
     zero_thread_facts = _drain_facts(
@@ -1040,6 +1085,85 @@ def test_zero_thread_admission_matches_through_call_admission_id(
     )
     assert entry["terminal"] is False
     assert entry["terminal_state"] == []
+
+
+def test_drain_rejects_a_terminal_claim_without_a_server_commit(tmp_path: Path) -> None:
+    store = _cutover(tmp_path)
+    host = uuid.uuid4().hex
+    store.create_hold("alice", host, "codex-native", 1)
+    receipt = store.submit_drain(
+        "alice",
+        host,
+        "codex-native",
+        1,
+        _drain_facts(
+            calls=[
+                {
+                    "call_key": {"meter_epoch": "meter", "producer_unit_id": "missing"},
+                    "server": None,
+                    "admission": "unadmitted",
+                    "admission_id": None,
+                    "occurred_at": "2020-01-01T00:00:00Z",
+                    "ended_at": None,
+                    "state": "terminal_acked",
+                }
+            ]
+        ),
+    )
+    assert receipt["result"] == "failed"
+    assert "host_facts_mismatch" in receipt["failure_codes"]
+
+
+def test_release_invalidates_an_empty_boundary_when_the_first_event_arrives(
+    tmp_path: Path,
+) -> None:
+    store = _cutover(tmp_path)
+    host = uuid.uuid4().hex
+    store.create_hold("alice", host, "codex-native", 1)
+    drained = store.submit_drain("alice", host, "codex-native", 1, _drain_facts())
+    assert drained["last_committed_sequence"] is None
+    feed = UsageEventStore(f"sqlite:///{tmp_path / 'usage.db'}")
+    feed.append("alice", _sealed("late", host_id=host, occurred_at="2020-01-01T00:00:00Z"))
+    with pytest.raises(UsageExportError) as refused:
+        store.release(
+            "alice",
+            host,
+            "codex-native",
+            1,
+            _consumer_receipt(drained),
+            "2026-01-01T00:00:00Z",
+            _rescan(),
+        )
+    assert refused.value.code == "drain_invalidated"
+    assert store.hold_status("alice", host, "codex-native")["state"] == "invalidated"
+
+
+def test_goal_reservation_and_hold_serialize_in_both_orders(tmp_path: Path) -> None:
+    store = _cutover(tmp_path)
+    host = uuid.uuid4().hex
+    store.admit_turn(
+        "alice",
+        admission_id="goal",
+        session_id="session",
+        host_id=host,
+        harness="codex-native",
+        source="goal",
+    )
+    with pytest.raises(UsageExportError) as active:
+        store.create_hold("alice", host, "codex-native", 1)
+    assert active.value.code == "codex_goal_active"
+    store.end_goal_admissions("alice", "session")
+    store.create_hold("alice", host, "codex-native", 1)
+    with pytest.raises(UsageExportError) as held:
+        store.admit_turn(
+            "alice",
+            admission_id="new-goal",
+            session_id="session",
+            host_id=host,
+            harness="codex-native",
+            source="goal",
+        )
+    assert held.value.code == "usage_cutover_hold"
 
 
 def test_cutover_migration_roundtrip(tmp_path: Path) -> None:
@@ -1133,3 +1257,14 @@ def test_additive_migration_roundtrip(tmp_path: Path) -> None:
     with engine.connect() as connection:
         final = connection.execute(text("SELECT name FROM sqlite_master WHERE name='usage_feeds'"))
         assert final.scalar_one() == "usage_feeds"
+
+
+def test_drain_rejects_omitted_committed_open_call(tmp_path: Path) -> None:
+    feed = _store(tmp_path)
+    host = uuid.uuid4().hex
+    feed.append("alice", _observation(host_id=host))
+    cutover = _cutover(tmp_path)
+    cutover.create_hold("alice", host, "codex-native", 1)
+    receipt = cutover.submit_drain("alice", host, "codex-native", 1, _drain_facts())
+    assert receipt["result"] == "failed"
+    assert "host_facts_mismatch" in receipt["failure_codes"]

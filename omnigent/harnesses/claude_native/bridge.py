@@ -1166,6 +1166,7 @@ class ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    usage_admission_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3105,6 +3106,22 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     """
     _ensure_secure_dir(bridge_dir)
     with _bridge_metadata_write_lock(bridge_dir):
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+        event_name = payload.get("hook_event_name")
+        parent = state.get("claude_session_id")
+        is_parent = payload.get("agent_id") is None and (
+            not parent or payload.get("session_id") == parent
+        )
+        if (
+            is_parent
+            and event_name == "UserPromptSubmit"
+            and isinstance(payload.get("admission_id"), str)
+        ):
+            state["usage_admission_id"] = payload.get("admission_id")
+        if is_parent and event_name in {"Stop", "StopFailure"}:
+            payload = {**payload, "admission_id": state.get("usage_admission_id")}
         envelope = {
             "recorded_at": time.time(),
             "payload": payload,
@@ -3112,9 +3129,6 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
         with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
 
-        state = _read_json_file(bridge_dir / _STATE_FILE)
-        if not isinstance(state, dict):
-            state = {}
         event_name = payload.get("hook_event_name")
         if isinstance(event_name, str) and event_name:
             state["last_hook_event_name"] = event_name
@@ -4286,6 +4300,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             _display_text(raw_details, is_api_error=True) if raw_details is not None else None
         )
     return ClaudeHookRecord(
+        usage_admission_id=payload.get("admission_id")
+        if isinstance(payload, dict) and isinstance(payload.get("admission_id"), str)
+        else None,
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
         event_name=event_name,

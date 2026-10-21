@@ -2870,11 +2870,20 @@ class ClaudeSDKExecutor(Executor):
         if hook_matcher is None or not capture_enabled():
             return
 
+        usage_route_env = dict(os.environ)
+        usage_route_env.pop("ANTHROPIC_API_KEY", None)
+        usage_route_env.update(getattr(options, "env", None) or {})
+
         async def observe_path(
             payload: object, _tool_use_id: str | None, _context: object
         ) -> _JsonObject:
             if isinstance(payload, dict):
                 try:
+                    from omnigent.usage_export.runtime import check_live_route
+
+                    await asyncio.to_thread(
+                        check_live_route, session_key, "claude-sdk", usage_route_env
+                    )
                     await asyncio.to_thread(capture_claude_hook_path, session_key, payload)
                 except Exception as exc:  # noqa: BLE001 — auxiliary capture hook is fail-open
                     logger.warning("Claude usage path remains pending (%s)", type(exc).__name__)

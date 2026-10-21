@@ -91,7 +91,7 @@ def _resolve_session_harness(conv: Conversation) -> str | None:
     (3) agent-spec resolution via the runtime (works when the server has
     a live agent cache). Returns a display-friendly name or ``None``.
     """
-    if conv.harness_override:
+    if conv.harness_override and conv.harness_override != "auto":
         return conv.harness_override
     wrapper = conv.labels.get(WRAPPER_LABEL_KEY)
     if wrapper:
@@ -271,6 +271,7 @@ def create_usage_router(
             conversation_store.storage_location,
             auth_provider=auth_provider,
             host_owner=_host_owner,
+            conversation_store=conversation_store,
         )
     )
 

@@ -103,6 +103,9 @@ def test_drain_holds_waits_scans_flushes_and_stores_a_receipt(
     monkeypatch.setattr(usage_cli, "_server_base", lambda explicit: "https://omni.test")
     monkeypatch.setattr(usage_cli, "_local_host_id", lambda: _HOST)
     calls: list[str] = []
+    from omnigent.usage_export.runtime import outbox
+
+    outbox().mark_capture("fake-session", "codex-native")
     receipt = {
         "receipt_schema_version": 1,
         "receipt_id": "d" * 32,
@@ -133,7 +136,15 @@ def test_drain_holds_waits_scans_flushes_and_stores_a_receipt(
             return httpx.Response(200, json={"events": []}, headers={"date": _http_date()})
         if request.url.path == f"/v1/usage-cutover/holds/{_HOST}/codex-native":
             assert request.method == "GET"
-            return httpx.Response(200, json={"open_admissions": 0})
+            return httpx.Response(
+                200,
+                json={
+                    "open_admissions": 0,
+                    "hold_created_at": usage_cli._iso_now(),
+                    "live_session_ids": [],
+                    "multi_owner_domain": False,
+                },
+            )
         if request.url.path.endswith("/receipts"):
             body = json.loads(request.content)
             assert body["detection"]["checkpoint_digest"]
@@ -224,3 +235,62 @@ def test_drain_refuses_a_clock_skew_and_keeps_the_hold(
 async def _skewed_offset(client: object, base: str) -> int:
     del client, base
     return 31_000
+
+
+@pytest.mark.parametrize(
+    "failure", ["capture_off", "unregistered_live_session", "multi_owner_domain"]
+)
+def test_drain_records_each_domain_precondition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    import omnigent.usage_export.cli as usage_cli
+    from omnigent.usage_export.runtime import outbox
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(usage_cli, "_local_host_id", lambda: _HOST)
+    if failure != "capture_off":
+        outbox().mark_capture("session", "codex-native")
+    hold_time = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/usage-cutover/holds":
+            return httpx.Response(200, json={"state": "held", "generation": 1})
+        if request.url.path == "/v1/usage-events":
+            return httpx.Response(200, json={"events": []}, headers={"date": _http_date()})
+        if request.url.path.endswith("/receipts"):
+            facts = json.loads(request.content)
+            assert facts["failure_codes"] == [failure]
+            return httpx.Response(200, json={"result": "failed", "failure_codes": [failure]})
+        return httpx.Response(
+            200,
+            json={
+                "hold_created_at": hold_time,
+                "live_session_ids": ["session"] if failure == "unregistered_live_session" else [],
+                "multi_owner_domain": failure == "multi_owner_domain",
+            },
+        )
+
+    monkeypatch.setattr(
+        usage_cli,
+        "_client_factory",
+        lambda base: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    result = _runner().invoke(
+        cli,
+        [
+            "usage-export",
+            "cutover",
+            "drain",
+            "--server",
+            "https://omni.test",
+            "--domain",
+            f"{_HOST},codex-native",
+            "--generation",
+            "1",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 8, result.output
+    assert json.loads(result.output)["failure_codes"] == [failure]

@@ -31,9 +31,9 @@ def upgrade() -> None:
         sa.Column("owner_digest", _DIGEST, nullable=False),
         sa.Column("generation", sa.Integer(), nullable=True),
         sa.Column("state", sa.String(16), nullable=False, server_default="none"),
-        sa.Column("created_at", sa.BigInteger(), nullable=True),
-        sa.Column("released_at", sa.BigInteger(), nullable=True),
-        sa.Column("state_changed_at", sa.BigInteger(), nullable=True),
+        sa.Column("created_at", sa.Double(), nullable=True),
+        sa.Column("released_at", sa.Double(), nullable=True),
+        sa.Column("state_changed_at", sa.Double(), nullable=True),
         sa.Column("refused_count", sa.BigInteger(), nullable=False, server_default="0"),
         sa.Column("row_version", sa.Integer(), nullable=False, server_default="0"),
         sa.PrimaryKeyConstraint("workspace_id", "host_id", "harness"),
@@ -46,7 +46,7 @@ def upgrade() -> None:
         sa.Column("session_id", sa.String(256), nullable=True),
         sa.Column("host_id", sa.String(256), nullable=True),
         sa.Column("harness", sa.String(16), nullable=True),
-        sa.Column("admitted_at", sa.BigInteger(), nullable=False),
+        sa.Column("admitted_at", sa.Double(), nullable=False),
         sa.Column("source", sa.String(32), nullable=False),
         sa.Column("binding_revision", sa.Integer(), nullable=True),
         sa.Column("binding_digest", _DIGEST, nullable=True),
@@ -69,7 +69,7 @@ def upgrade() -> None:
         sa.Column("kind", sa.String(16), nullable=False),
         sa.Column("payload", sa.Text(), nullable=False),
         sa.Column("digest", _DIGEST, nullable=False),
-        sa.Column("created_at", sa.BigInteger(), nullable=False),
+        sa.Column("created_at", sa.Double(), nullable=False),
         sa.PrimaryKeyConstraint(
             "workspace_id", "owner_digest", "host_id", "harness", "generation", "receipt_seq"
         ),
@@ -81,7 +81,7 @@ def upgrade() -> None:
         sa.Column("config_revision", sa.Integer(), nullable=False),
         sa.Column("document", sa.Text(), nullable=False),
         sa.Column("digest", _DIGEST, nullable=False),
-        sa.Column("created_at", sa.BigInteger(), nullable=False),
+        sa.Column("created_at", sa.Double(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "owner_digest", "config_revision"),
     )
     op.create_table(
@@ -90,7 +90,7 @@ def upgrade() -> None:
         sa.Column("owner_digest", _DIGEST, nullable=False),
         sa.Column("config_revision", sa.Integer(), nullable=False),
         sa.Column("digest", _DIGEST, nullable=False),
-        sa.Column("activated_at", sa.BigInteger(), nullable=False),
+        sa.Column("activated_at", sa.Double(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "owner_digest"),
     )
     op.create_table(
@@ -101,7 +101,7 @@ def upgrade() -> None:
         sa.Column("owner_digest", _DIGEST, nullable=False),
         sa.Column("billing_route", sa.String(16), nullable=False),
         sa.Column("route_ref", sa.String(256), nullable=False),
-        sa.Column("updated_at", sa.BigInteger(), nullable=False),
+        sa.Column("updated_at", sa.Double(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "host_id", "harness"),
     )
     op.add_column("usage_events", sa.Column("host_id", sa.String(256), nullable=True))

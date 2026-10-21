@@ -7480,6 +7480,7 @@ async def _ensure_runner_session_initialized(
                 "/v1/sessions",
                 json=build_runner_session_init_payload(
                     conv,
+                    usage_storage_location=getattr(conversation_store, "storage_location", None),
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
                     archive_states=archive_states,
@@ -8026,6 +8027,7 @@ async def _forward_native_terminal_message(
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
+    usage_admission: dict[str, Any] | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -8064,6 +8066,7 @@ async def _forward_native_terminal_message(
         input_delivery=input_delivery,
         agent_revision=agent_revision,
     )
+    event["usage_admission"] = usage_admission
     log_input_event(
         _logger,
         "native_input_forward_started",
@@ -8642,6 +8645,7 @@ async def _forward_event_to_runner(
     startup_input_id: str | None = None,
     startup_attempt: StartupAttemptRef | None = None,
     startup_required: bool = False,
+    usage_admission: dict[str, Any] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8679,7 +8683,9 @@ async def _forward_event_to_runner(
     """
     import uuid
 
-    turn_id = f"turn_{uuid.uuid4().hex}"
+    turn_id = (
+        str(usage_admission["admission_id"]) if usage_admission else f"turn_{uuid.uuid4().hex}"
+    )
     # A web send is persisted under its client stable id (see _web_send_stable_id).
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
@@ -8795,6 +8801,7 @@ async def _forward_event_to_runner(
     runner_body: dict[str, Any] = {
         "type": body.type,
         **forwarded_data,
+        "usage_admission": usage_admission,
         "agent_id": conv.agent_id,
         # model tags the ResponseObject for REPL rendering.
         # Use the human-readable agent name when available.
@@ -9662,6 +9669,7 @@ async def _dispatch_session_event_to_runner_impl(
     """
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+    usage_admission = None
     if body.type == "message":
         # G1 usage cutover gate: refuse while the session's domain (or any
         # domain of its host, while the harness is undecided) is held, and
@@ -9671,14 +9679,28 @@ async def _dispatch_session_event_to_runner_impl(
 
         storage_location = getattr(conversation_store, "storage_location", None)
         if isinstance(storage_location, str) and conv.host_id:
-            await asyncio.to_thread(
+            owner = created_by
+            if (
+                host_registry is not None
+                and (connection := host_registry.get(conv.host_id)) is not None
+            ):
+                owner = connection.owner
+            usage_id = await asyncio.to_thread(
                 admit_turn,
                 storage_location,
                 conv,
                 source="web",
                 resolve_harness=_resolve_session_harness,
-                owner_id=created_by,
+                owner_id=owner,
             )
+            from omnigent.usage_export.cutover import UsageCutoverStore
+
+            if usage_id is not None:
+                usage_admission = await asyncio.to_thread(
+                    UsageCutoverStore(storage_location).admission_snapshot,
+                    owner or "local",
+                    usage_id,
+                )
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
@@ -9817,6 +9839,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                admission_id=usage_admission["admission_id"] if usage_admission else None,
             )
             if queues_message
             else None
@@ -9970,6 +9993,7 @@ async def _dispatch_session_event_to_runner_impl(
                 ),
                 input_delivery=input_delivery,
                 agent_revision=agent_revision,
+                usage_admission=usage_admission,
             )
             forwarded = True
             if pending_id is not None:
@@ -10046,6 +10070,7 @@ async def _dispatch_session_event_to_runner_impl(
         startup_input_id=startup_input.input_id if startup_input is not None else None,
         startup_attempt=startup_input.startup if startup_input is not None else None,
         startup_required=host_registry is not None and host_registry.startup_admitter is not None,
+        usage_admission=usage_admission,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 

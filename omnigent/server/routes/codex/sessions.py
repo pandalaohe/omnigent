@@ -70,9 +70,21 @@ async def _sync_codex_goal_marker(
         # Preserve the last known state if a newer Codex introduces a status
         # whose sidebar semantics have not been defined yet.
         return
-    if conv.labels.get(_GOAL_STATE_LABEL_KEY) == marker:
+    if marker is not None and conv.labels.get(_GOAL_STATE_LABEL_KEY) == marker:
         return
     if marker is None:
+        from omnigent.usage_export.cutover import UsageCutoverStore
+
+        authority = await asyncio.to_thread(
+            conversation_store.get_session_owner_authority,
+            conv.root_conversation_id or conv.id,
+            owner_only=True,
+        )
+        await asyncio.to_thread(
+            UsageCutoverStore(conversation_store.storage_location).end_goal_admissions,
+            authority.user_id if authority else "local",
+            session_id,
+        )
         await asyncio.to_thread(
             conversation_store.delete_label,
             session_id,
@@ -445,6 +457,25 @@ async def _forward_codex_goal_event(
     :returns: Runner forward result, or ``None`` if no runner could be
         reached.
     """
+    if event.get("type") in {"goal_set", "goal_status"} and isinstance(
+        getattr(conversation_store, "storage_location", None), str
+    ):
+        from omnigent.server.routes.usage import _resolve_session_harness
+        from omnigent.server.usage_cutover import admit_turn
+
+        authority = await asyncio.to_thread(
+            conversation_store.get_session_owner_authority,
+            conv.root_conversation_id or conv.id,
+            owner_only=True,
+        )
+        await asyncio.to_thread(
+            admit_turn,
+            conversation_store.storage_location,
+            conv,
+            source="goal",
+            resolve_harness=_resolve_session_harness,
+            owner_id=authority.user_id if authority else "local",
+        )
     runner_result = await _forward_session_change_to_runner(
         session_id,
         runner_router,

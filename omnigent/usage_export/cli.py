@@ -112,9 +112,18 @@ def _checkpoint_digest(sources: list[dict[str, Any]]) -> str:
 async def _clock_offset_ms(client: httpx.AsyncClient, base: str) -> int:
     """Measured host minus server clock offset in milliseconds."""
     response = await client.get(f"{base}/v1/usage-events", params={"limit": 1})
+    if response.status_code != 200:
+        _fail(
+            click.get_current_context(),
+            "clock_unavailable",
+            _raise_message(response),
+            EXIT_UNAVAILABLE,
+        )
     header = response.headers.get("date")
     if not header:
-        return 0
+        _fail(
+            click.get_current_context(), "clock_unavailable", "server Date is missing", EXIT_LOCAL
+        )
     server_time = parsedate_to_datetime(header)
     if server_time.tzinfo is None:
         server_time = server_time.replace(tzinfo=timezone.utc)
@@ -140,7 +149,7 @@ def _local_host_id() -> str | None:
 
 def _require_domain_host(ctx: click.Context, host_id: str) -> None:
     local = _local_host_id()
-    if local is not None and local != host_id:
+    if local != host_id:
         _fail(
             ctx,
             "not_domain_host",
@@ -179,26 +188,83 @@ async def _status(client: httpx.AsyncClient, base: str, host: str, harness: str)
     return payload if isinstance(payload, dict) else {}
 
 
-def _pending_calls(report: dict[str, Any]) -> list[dict[str, Any]]:
+def _pending_calls(
+    report: dict[str, Any],
+    checkpoint: dict[str, int] | None = None,
+    threshold: float | None = None,
+) -> list[dict[str, Any]]:
     """Host-side call window from the outbox's own unit ledger."""
+    from omnigent.usage_export.models import UsageObservation
+
     calls: list[dict[str, Any]] = []
     for unit in report.get("units", []):
         admission_id = unit.get("admission_id")
         observed = unit.get("occurred_at")
+        ack = unit.get("server_ack")
+        server = (
+            {
+                "original_event_id": ack.get("original_event_id") or ack["event_id"],
+                "latest_event_id": ack["event_id"],
+                "sequence": ack["sequence"],
+                "revision": ack["revision"],
+            }
+            if isinstance(ack, dict)
+            else None
+        )
+        origin = unit.get("origin")
+        after_hold = (
+            admission_id is None
+            and checkpoint is not None
+            and (
+                origin is None
+                or origin["path"] not in checkpoint
+                or origin["position"] > checkpoint[origin["path"]]
+                or observed is None
+                or (
+                    threshold is not None
+                    and datetime.fromisoformat(observed.replace("Z", "+00:00")).timestamp()
+                    >= threshold
+                )
+            )
+        )
         calls.append(
             {
                 "call_key": {
                     "meter_epoch": unit.get("meter_epoch"),
                     "producer_unit_id": unit.get("producer_unit_id"),
                 },
-                "server": None,
-                "admission": {
-                    "state": "linked" if isinstance(admission_id, str) else "unadmitted"
-                },
+                "server": server,
+                "admission": "linked" if isinstance(admission_id, str) else "unadmitted",
                 "admission_id": admission_id if isinstance(admission_id, str) else None,
                 "occurred_at": observed,
-                "ended_at": None,
-                "state": "terminal_acked",
+                "ended_at": ack.get("ended_at") if isinstance(ack, dict) else None,
+                "state": (
+                    "unadmitted_after_hold"
+                    if after_hold
+                    else "path_pending"
+                    if not unit.get("physical_transcript_path")
+                    else "unsent"
+                    if server is None
+                    else "terminal_acked"
+                    if ack.get("ended_at")
+                    else "open"
+                ),
+                **(
+                    {
+                        "observation": UsageObservation.model_validate(
+                            {
+                                **{
+                                    key: value
+                                    for key, value in unit.items()
+                                    if key not in {"server_ack", "origin"}
+                                },
+                                "time_quality": "reported" if observed is not None else "unknown",
+                            }
+                        ).model_dump(mode="json")
+                    }
+                    if server is None
+                    else {}
+                ),
             }
         )
     return calls
@@ -260,7 +326,55 @@ async def _run_drain(
                 json=facts,
             )
             return EXIT_FAILED, posted.json() if posted.status_code == 200 else facts
-        checkpoint = _checkpoint_digest(spool.domain_report(harness)["sources"])
+        checkpoint_sources = spool.checkpoint(host, harness, generation)
+        checkpoint = _checkpoint_digest(
+            [{"path": path, "offset": offset} for path, offset in checkpoint_sources.items()]
+        )
+        snapshot = await _status(client, base, host, harness)
+        report = spool.domain_report(harness)
+        hold_time = datetime.fromisoformat(
+            snapshot["hold_created_at"].replace("Z", "+00:00")
+        ).timestamp()
+        captures = report["live_capture"]
+        live_sessions = set(snapshot["live_session_ids"])
+        producers = {
+            item["session_id"] for item in report["producers"] if item["binding"] is not None
+        }
+        sources = {item["session_id"] for item in report["sources"]}
+        preconditions = []
+        if not any(stamp - offset / 1000 < hold_time for stamp in captures.values()) or any(
+            session not in captures or captures[session] - offset / 1000 >= hold_time
+            for session in live_sessions
+        ):
+            preconditions.append("capture_off")
+        if live_sessions - (producers & sources):
+            preconditions.append("unregistered_live_session")
+        if snapshot["multi_owner_domain"]:
+            preconditions.append("multi_owner_domain")
+        if preconditions:
+            facts = {
+                "detection": {
+                    "checkpoint_digest": checkpoint,
+                    "clock_offset_ms": offset,
+                    "threshold_at": _iso_now(),
+                },
+                "calls": _pending_calls(
+                    report, checkpoint_sources, hold_time - 60 - abs(offset) / 1000
+                ),
+                "admissions": [],
+                "counts": {},
+                "failure_codes": preconditions,
+            }
+            posted = await _request(
+                client,
+                "POST",
+                base,
+                f"/v1/usage-cutover/holds/{host}/{harness}/{generation}/receipts",
+                json=facts,
+            )
+            return EXIT_LOCAL, posted.json() if posted.status_code == 200 else {
+                "failure_codes": preconditions
+            }
         terminal = await _wait_terminal(client, base, host, harness, spool, timeout)
         if not terminal:
             facts = {
@@ -270,7 +384,11 @@ async def _run_drain(
                     "threshold_at": _iso_now(),
                 },
                 "admissions": [],
-                "calls": _pending_calls(spool.domain_report(harness)),
+                "calls": _pending_calls(
+                    spool.domain_report(harness),
+                    checkpoint_sources,
+                    hold_time - 60 - abs(offset) / 1000,
+                ),
                 "counts": {
                     "open_threads": spool.domain_report(harness)["open_threads"],
                     "outbox_pending_observations": spool.domain_report(harness)[
@@ -287,9 +405,7 @@ async def _run_drain(
                 json=facts,
             )
             return EXIT_TIMEOUT, posted.json() if posted.status_code == 200 else facts
-        for source in spool.domain_sources(harness):
-            if source.is_file():
-                spool.scan(source, final=True)
+        spool.scan_registered_sources(harness=harness, final=True)
         for _ in range(1000):
             report = spool.domain_report(harness)
             if not report["pending_observations"]:
@@ -303,7 +419,9 @@ async def _run_drain(
                 "threshold_at": _iso_now(),
             },
             "admissions": [],
-            "calls": _pending_calls(report),
+            "calls": _pending_calls(
+                report, checkpoint_sources, hold_time - 60 - abs(offset) / 1000
+            ),
             "counts": {
                 "open_threads": report["open_threads"],
                 "outbox_pending_observations": report["pending_observations"],
@@ -462,6 +580,54 @@ def cutover_release(
     async def run() -> httpx.Response:
         client = _client_factory(base)
         async with client:
+            if not abandon:
+                from omnigent.usage_export.runtime import outbox
+
+                spool = outbox()
+                snapshot = await _status(client, base, host, harness)
+                offset = await _clock_offset_ms(client, base)
+                if abs(offset) > 30_000:
+                    _fail(ctx, "clock_skew", "clock offset exceeds 30 seconds", EXIT_LOCAL)
+                hold_time = datetime.fromisoformat(
+                    snapshot["hold_created_at"].replace("Z", "+00:00")
+                ).timestamp()
+                checkpoint = spool.checkpoint(host, harness, generation)
+                spool.scan_registered_sources(harness=harness, final=True)
+                for _ in range(1000):
+                    if not spool.domain_report(harness)["pending_observations"]:
+                        break
+                    await spool.drain(client, harness=harness, limit=200)
+                report = spool.domain_report(harness)
+                captures = report["live_capture"]
+                if not any(
+                    stamp - offset / 1000 < hold_time for stamp in captures.values()
+                ) or any(
+                    session not in captures or captures[session] - offset / 1000 >= hold_time
+                    for session in snapshot["live_session_ids"]
+                ):
+                    _fail(ctx, "capture_off", "domain capture is not continuous", EXIT_LOCAL)
+                if snapshot["multi_owner_domain"]:
+                    _fail(ctx, "multi_owner_domain", "domain has several owners", EXIT_LOCAL)
+                registered = {
+                    item["session_id"]
+                    for item in report["producers"]
+                    if item["binding"] is not None
+                } & {item["session_id"] for item in report["sources"]}
+                if set(snapshot["live_session_ids"]) - registered:
+                    _fail(
+                        ctx,
+                        "unregistered_live_session",
+                        "live source is not registered",
+                        EXIT_LOCAL,
+                    )
+                calls = _pending_calls(report, checkpoint, hold_time - 60 - abs(offset) / 1000)
+                body["rescan"] = {
+                    "checkpoint_digest": _checkpoint_digest(report["sources"]),
+                    "outbox_pending_observations": report["pending_observations"],
+                    "calls_unadmitted_after_hold": sum(
+                        call["state"] == "unadmitted_after_hold" for call in calls
+                    ),
+                }
             return await _request(
                 client,
                 "POST",
