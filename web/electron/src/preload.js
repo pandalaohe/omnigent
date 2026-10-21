@@ -309,6 +309,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserClose: (conversationId, reason) =>
     ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  getBrowserLoginSetting: () => ipcRenderer.invoke("omnigent:browser-login-setting:get"),
+  setBrowserLoginSetting: (enabled) =>
+    ipcRenderer.invoke("omnigent:browser-login-setting:set", enabled),
+  clearBrowserLogin: () => ipcRenderer.invoke("omnigent:browser-login:clear"),
   /**
    * Subscribe to which conversation's browser view is currently attached to the
    * host window (`{conversationId}` or `{conversationId: null}` when detached).
