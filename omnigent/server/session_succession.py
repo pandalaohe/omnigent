@@ -12,6 +12,8 @@ receipt a resume trigger can pick up:
 Resumers are serialized per receipt with an in-process lock; a runner that
 is not ready yet keeps the receipt at ``moved`` and gets a bounded in-process
 retry on top of the runner-connect and startup triggers.
+Archived successors and offline successor runners park at their current
+phase until a later external trigger; repeated scans do not log failures.
 """
 
 from __future__ import annotations
@@ -68,6 +70,10 @@ _retry_attempts: dict[str, int] = {}
 _retry_tasks: dict[str, asyncio.Task[None]] = {}
 
 
+class _SuccessionParked(RuntimeError):
+    """A lifecycle prerequisite needs an external change before resuming."""
+
+
 @dataclass
 class _RunnerGroup:
     """One runner's client plus the succession sessions it holds."""
@@ -90,7 +96,8 @@ async def advance_succession(
     Each phase commits its result with a phase compare-and-set before the
     next starts. A phase that stops early (runner not ready, transport
     failure) leaves the receipt where it was and records the error; the next
-    trigger resumes there. The returned receipt is the freshest row read.
+    trigger resumes there. Archived or offline successors park without an
+    in-process retry. The returned receipt is the freshest row read.
 
     :param receipt_id: Receipt row id, e.g. ``"3f2a...hex"``.
     :param conversation_store: Store owning the receipt and conversations.
@@ -111,6 +118,12 @@ async def advance_succession(
                 )
             phase = receipt.phase
             try:
+                if phase in {"moved", "rekeyed", "opened"}:
+                    successor = await asyncio.to_thread(
+                        conversation_store.get_conversation, receipt.new_id
+                    )
+                    if successor is not None and successor.archived:
+                        raise _SuccessionParked(f"successor {receipt.new_id!r} is archived")
                 if phase == "moved":
                     receipt = await _phase_rekey(
                         receipt,
@@ -151,6 +164,25 @@ async def advance_succession(
                     return receipt
             except asyncio.CancelledError:
                 raise
+            except _SuccessionParked as exc:
+                if phase == "rekeyed" and receipt.questions is None:
+                    receipt = await _advance(
+                        receipt,
+                        phase,
+                        conversation_store=conversation_store,
+                        questions=_open_questions(receipt.old_id),
+                        error=receipt.error,
+                    )
+                if receipt.error == f"{type(exc).__name__}: {exc}"[:4000]:
+                    return receipt
+                _logger.info(
+                    "Succession %s parked in phase %s: %s",
+                    receipt.id,
+                    phase,
+                    exc,
+                    extra={"session_id": receipt.old_id},
+                )
+                return await _record_phase_error(receipt, exc, conversation_store)
             except Exception as exc:
                 # The failure is stored on the receipt; the next trigger resumes there.
                 _logger.exception(
@@ -412,6 +444,11 @@ async def _phase_open(
     peer_message_store: PeerMessageStore | None,
 ) -> SessionSuccession:
     """``rekeyed → opened``: snapshot questions, re-target peers, post the opening."""
+    successor = await asyncio.to_thread(conversation_store.get_conversation, receipt.new_id)
+    if successor is not None and successor.runner_id is not None:
+        client = await _get_runner_client(receipt.new_id, runner_router, conversation=successor)
+        if client is None:
+            raise _SuccessionParked(f"successor {receipt.new_id!r} runner is offline")
     old_conversation = await asyncio.to_thread(conversation_store.get_conversation, receipt.old_id)
     if old_conversation is None:
         raise RuntimeError(f"session {receipt.old_id!r} vanished during succession")
@@ -635,14 +672,16 @@ async def _runner_groups(
     Group the successor and every moved session by their runner.
 
     Sessions with no runner are skipped (nothing to re-key there); a bound
-    runner that cannot be resolved is an error — skipping it would advance
-    the phase with that runner's state left behind.
+    runner that cannot be resolved blocks the phase — skipping it would
+    leave that runner's state behind. Offline successors park until an
+    external trigger; moved children's runners retain the bounded retry.
 
     :param receipt: The succession receipt.
     :param conversation_store: Store holding the conversation rows.
     :param runner_router: Router resolving each session's runner client.
     :returns: ``{runner_id: _RunnerGroup}``.
-    :raises RuntimeError: When a session with a bound runner has no client.
+    :raises _SuccessionParked: When the successor's bound runner has no client.
+    :raises RuntimeError: When a moved session's bound runner has no client.
     """
     conversations: list[Conversation] = []
     successor = await asyncio.to_thread(conversation_store.get_conversation, receipt.new_id)
@@ -667,9 +706,12 @@ async def _runner_groups(
             conversation=conversation,
         )
         if client is None:
-            raise RuntimeError(
+            message = (
                 f"runner {conversation.runner_id!r} is offline for session {conversation.id!r}"
             )
+            if conversation.id == receipt.new_id:
+                raise _SuccessionParked(message)
+            raise RuntimeError(message)
         groups[conversation.runner_id] = _RunnerGroup(
             client=client,
             session_ids=[conversation.id],
