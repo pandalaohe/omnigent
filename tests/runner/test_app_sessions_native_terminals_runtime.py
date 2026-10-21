@@ -533,7 +533,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     """
     import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.claude_native import bridge as relay_bridge
     from omnigent.runner import app as runner_app_mod
+    from omnigent.runner import tool_dispatch
     from omnigent.runner.native import orchestration
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
@@ -559,6 +561,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     session_labels: dict[str, str] = (
         {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
     )
+    startup_tool_names: set[str] = set()
     launch_snapshot = RunnerSessionInitSnapshot(
         created_at=10,
         updated_at=11,
@@ -655,7 +658,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             self.config_overrides: list[str] = []
 
         async def start(self) -> None:
-            """:returns: None."""
+            """Observe MCP tools before Codex preloads the resumed thread."""
+            listed = relay_bridge._handle_mcp_request("tools/list", {}, {}, bridge_dir)
+            startup_tool_names.update(tool["name"] for tool in listed["tools"])
             assert list(self.codex_home.glob(f"sessions/**/rollout-*-{thread_id}.jsonl")), (
                 "Codex resume rollout must be synthesized in app-server CODEX_HOME "
                 "before app-server start"
@@ -851,6 +856,21 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         ),
     )
 
+    async def _write_resume_relay(sid: str, **kwargs: Any) -> None:
+        """Publish the resumed session's real schemas for MCP enumeration."""
+        assert sid == session_id
+        assert kwargs == {"explicit_bridge_dir": bridge_dir, "await_notify": False}
+        (bridge_dir / "tool_relay.json").write_text(
+            json.dumps(
+                {
+                    "tools": tool_dispatch.build_native_relay_tool_schemas(
+                        agent_spec, peer_messaging_enabled=peer_enabled
+                    )
+                }
+            ),
+            encoding="utf-8",
+        )
+
     # runner.app composes the peer grant into the global text channel; the
     # codex developer-instructions list must not add it a second time.
     expected_global = f"G\n\n{PEER_SESSION_GRANT}" if peer_enabled else "G"
@@ -865,6 +885,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     agent_spec=agent_spec,
                     server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
                     session_init=session_init,
+                    ensure_comment_relay=_write_resume_relay,
                 )
             assert retained_client.closed is retain_subscription
             assert app_server.closed
@@ -881,6 +902,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
             global_instructions=expected_global,
             session_init=session_init,
+            ensure_comment_relay=_write_resume_relay,
         )
         await asyncio.sleep(0)
         remembered_dir = orchestration._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
@@ -890,6 +912,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     assert terminal_view.id == "terminal_codex_main"
     assert app_server.started is True
+    assert "sys_session_get_history" in startup_tool_names
+    assert ("sys_session_send" in startup_tool_names) is peer_enabled
     expected_codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
     assert app_server.codex_home == expected_codex_home
     # The terminal-reuse check reads the app-server's stop record from this directory.
@@ -2253,7 +2277,9 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     """
     import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.claude_native import bridge as relay_bridge
     from omnigent.runner import app as runner_app_mod
+    from omnigent.runner import tool_dispatch
     from omnigent.runner.native import orchestration
 
     session_id = "de154ca6405fb8912623984a14a2b044"
@@ -2272,6 +2298,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     session_labels: dict[str, str] = (
         {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
     )
+    startup_tool_names: set[str] = set()
 
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
@@ -2314,7 +2341,9 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
             self.config_overrides: list[str] = []
 
         async def start(self) -> None:
-            """:returns: None."""
+            """Observe the first MCP tool listing while Codex starts."""
+            listed = relay_bridge._handle_mcp_request("tools/list", {}, {}, bridge_dir)
+            startup_tool_names.update(tool["name"] for tool in listed["tools"])
 
         async def close(self) -> None:
             """:returns: None."""
@@ -2376,6 +2405,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _FakeDiscoveryClient)
     monkeypatch.setattr(runner_app_mod, "_codex_discover_thread_and_forward", _fake_discover)
+    monkeypatch.setattr(runner_app_mod, "get_session_peer_messaging_enabled", lambda _sid: True)
     monkeypatch.setattr(
         startup_config_mod,
         "resolve_harness_config",
@@ -2398,10 +2428,21 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         )
 
     relay_calls: list[dict[str, Any]] = []
+    relay_handle: relay_bridge.ClaudeNativeToolRelay | None = None
 
     async def _spy_ensure_relay(sid: str, **kwargs: Any) -> None:
-        """Record the relay-start invocation."""
+        """Publish the actual relay schemas and record its start."""
+        nonlocal relay_handle
         relay_calls.append({"session_id": sid, **kwargs})
+        relay_handle = relay_bridge.start_tool_relay(
+            bridge_dir=kwargs["explicit_bridge_dir"],
+            tools=tool_dispatch.build_native_relay_tool_schemas(
+                agent_spec, peer_messaging_enabled=True
+            ),
+            tool_executor=lambda _name, _arguments: asyncio.sleep(0),
+            loop=asyncio.get_running_loop(),
+            session_id=sid,
+        )
 
     agent_spec = AgentSpec(
         spec_version=1,
@@ -2425,6 +2466,8 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     finally:
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         orchestration._AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
+        if relay_handle is not None:
+            relay_handle.close()
 
     # Exactly one relay start, at session creation, for this session's bridge
     # dir, and non-blocking (await_notify=False) — the crux of the fix.
@@ -2432,6 +2475,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     assert relay_calls[0]["session_id"] == session_id
     assert relay_calls[0]["explicit_bridge_dir"] == bridge_dir
     assert relay_calls[0]["await_notify"] is False
+    assert {"sys_session_get_history", "sys_session_send"} <= startup_tool_names
     assert len(discover_calls) == 1
     assert discover_calls[0]["bridge_dir"] == bridge_dir
     # A failed marker write falls the forwarder back to the legacy timeout
