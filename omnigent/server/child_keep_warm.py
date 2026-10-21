@@ -71,12 +71,12 @@ from omnigent.server.routes._sessions.helpers import (
     _inherited_placement,
     _prune_session_read_state,
     _publish_child_status_to_parent,
-    _resolve_harness,
     _session_status_from_cache,
     effective_host_id,
 )
 from omnigent.server.session_collab import collab_owner_for, collab_owners_for
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
+from omnigent.server.session_overrides import harness_for_session
 from omnigent.server.user_preferences_store import (
     KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S,
     KEEP_WARM_CODEX_DEFAULT_INTERVAL_S,
@@ -1295,12 +1295,6 @@ class ChildKeepWarmSweeper:
             return None
         return canonicalize(harness) or harness
 
-    async def _harness_for(self, conv: Conversation, cache: dict[str, str | None]) -> str | None:
-        """Resolve the session's harness (honours ``harness_override``)."""
-        if conv.id not in cache:
-            cache[conv.id] = await asyncio.to_thread(_resolve_harness, conv)
-        return cache[conv.id]
-
     async def _process_session(
         self,
         session_id: str,
@@ -1351,7 +1345,7 @@ class ChildKeepWarmSweeper:
             return None
 
         mirrored = conv.labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS
-        harness = await self._harness_for(conv, harness_cache)
+        harness = await asyncio.to_thread(harness_for_session, conv, harness_cache)
         family = _SUPPORTED_HARNESSES.get(harness or "")
         # Stamp the family on every write so later readers derive the warm
         # rule from the label alone.
@@ -1717,7 +1711,7 @@ class ChildKeepWarmSweeper:
         now = self._clock()
         status = _session_status_from_cache(conv.id, conv.live_status)
         busy = status == "running"
-        harness = await asyncio.to_thread(_resolve_harness, conv)
+        harness = await asyncio.to_thread(harness_for_session, conv, {})
         family = _SUPPORTED_HARNESSES.get(harness or "")
         if family is not None:
             state.y = family

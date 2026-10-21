@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
@@ -28,13 +29,19 @@ from omnigent.server.child_idle import (
 )
 from omnigent.server.routes.sessions.routes_peer import register_peer_routes
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
+from omnigent.server.session_overrides import AGENT_TEMPLATE_ID_LABEL, resolve_override
 from omnigent.server.user_preferences_store import (
+    ChildFreezeSettings,
     ChildIdleSettings,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesValidationError,
     read_child_idle_settings,
 )
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+FRESH_AGENT_ID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+DIRECT_AGENT_ID = "cccccccccccccccccccccccccccccccc"
 
 
 class _Harness:
@@ -95,18 +102,27 @@ class _Harness:
         self.prefs.patch_namespace("local", "child_idle", {"enabled": True, **patch})
 
     def child(
-        self, title: str = "work", parent: Conversation | None = None, agent_id: str | None = None
+        self,
+        title: str = "work",
+        parent: Conversation | None = None,
+        agent_id: str | None = None,
+        harness_override: str | None = None,
+        template_id: str | None = None,
     ) -> Conversation:
         if parent is None:
             parent = self.store.create_conversation(title="mother")
         self.owned.add(parent.id)
+        labels = {RUNNING_SINCE_LABEL_KEY: "90000"}
+        if template_id is not None:
+            labels[AGENT_TEMPLATE_ID_LABEL] = template_id
         child = self.store.create_conversation(
             title=title,
             agent_id=agent_id,
             kind="sub_agent",
             parent_conversation_id=parent.id,
             workspace="/opt/work/project",
-            labels={RUNNING_SINCE_LABEL_KEY: "90000"},
+            harness_override=harness_override,
+            labels=labels,
         )
         self.store.set_session_live_status(child.id, "idle")
         if agent_id is not None:
@@ -597,6 +613,135 @@ async def test_freeze_signals_share_notice_batch(harness: _Harness, signal: str)
     assert notice["session_id"] == child.id
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("template", True),
+        ("direct", True),
+        ("harness", True),
+        ("default", True),
+        ("disabled-template", False),
+    ],
+)
+async def test_freeze_exception_tiers_apply_during_observation(
+    harness: _Harness, source: str, expected: bool
+) -> None:
+    rows: dict[str, dict[str, Any]] = {}
+    if source == "template":
+        rows["ca_42"] = {
+            "enabled": True,
+            "checkIntervalSeconds": 60,
+            "freezeThresholdSeconds": 120,
+        }
+        rows["harness:claude-native"] = {"enabled": False}
+    elif source == "direct":
+        rows[DIRECT_AGENT_ID] = {
+            "enabled": True,
+            "checkIntervalSeconds": 60,
+            "freezeThresholdSeconds": 120,
+        }
+        rows["harness:claude-native"] = {"enabled": False}
+    elif source == "harness":
+        rows["harness:claude-native"] = {
+            "enabled": True,
+            "checkIntervalSeconds": 60,
+            "freezeThresholdSeconds": 120,
+        }
+    elif source == "disabled-template":
+        rows["ca_42"] = {"enabled": False}
+        rows["harness:claude-native"] = {
+            "enabled": True,
+            "checkIntervalSeconds": 60,
+            "freezeThresholdSeconds": 120,
+        }
+    harness.settings(
+        enabled=False,
+        mergeWindowSeconds=0,
+        freezeDefault={
+            "enabled": source == "default",
+            "checkIntervalSeconds": 60,
+            "freezeThresholdSeconds": 120,
+        },
+        agents=rows,
+    )
+    child = harness.child(
+        agent_id=DIRECT_AGENT_ID if source == "direct" else FRESH_AGENT_ID,
+        harness_override="claude-native",
+        template_id="ca_42" if source in ("template", "disabled-template") else None,
+    )
+    harness.sweeper._liveness_lookup = lambda ids: {
+        sid: SimpleNamespace(runner_online=False) for sid in ids
+    }
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert (len(harness.calls) == 1) is expected
+    if expected:
+        assert json.loads(harness.calls[0][1].splitlines()[1])["session_id"] == child.id
+
+
+async def test_freeze_harness_resolves_once_per_tick(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import session_overrides
+
+    harness.settings(
+        enabled=False,
+        mergeWindowSeconds=0,
+        agents={
+            "harness:claude-native": {
+                "enabled": True,
+                "checkIntervalSeconds": 60,
+                "freezeThresholdSeconds": 120,
+            }
+        },
+    )
+    child = harness.child(agent_id=FRESH_AGENT_ID, harness_override="claude-native")
+    harness.sweeper._liveness_lookup = lambda ids: {
+        sid: SimpleNamespace(runner_online=False) for sid in ids
+    }
+    resolved: list[str] = []
+    original = session_overrides._resolve_harness
+
+    def resolve(conv: Conversation) -> str | None:
+        resolved.append(conv.id)
+        return original(conv)
+
+    monkeypatch.setattr(session_overrides, "_resolve_harness", resolve)
+    await harness.sweeper._tick()
+    assert resolved == [child.id]
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert resolved == [child.id, child.id]
+    assert len(harness.calls) == 1
+
+
+async def test_harness_exception_uses_current_override_after_switch(harness: _Harness) -> None:
+    harness.settings(
+        enabled=False,
+        mergeWindowSeconds=0,
+        agents={
+            "harness:claude-native": {"enabled": False},
+            "harness:codex-native": {
+                "enabled": True,
+                "checkIntervalSeconds": 60,
+                "freezeThresholdSeconds": 120,
+            },
+        },
+    )
+    child = harness.child(agent_id=FRESH_AGENT_ID, harness_override="claude-native")
+    harness.store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui"})
+    harness.store.update_conversation(child.id, harness_override="codex-native")
+    harness.sweeper._liveness_lookup = lambda ids: {
+        sid: SimpleNamespace(runner_online=False) for sid in ids
+    }
+    await harness.sweeper._tick()
+    harness.now += 120
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+    assert json.loads(harness.calls[0][1].splitlines()[1])["session_id"] == child.id
+
+
 def test_preference_defaults_validation_and_owner_roundtrip(db_uri: str) -> None:
     store = SqlAlchemyUserPreferencesStore(db_uri)
     assert read_child_idle_settings(store, "alice") == ChildIdleSettings()
@@ -613,10 +758,68 @@ def test_preference_defaults_validation_and_owner_roundtrip(db_uri: str) -> None
         {"agents": {"a": {"checkIntervalSeconds": True}}},
         {"agents": {"a": {"freezeThresholdSeconds": 59}}},
         {"agents": {"a": {"resumeOnce": "yes"}}},
+        {"freezeDefault": []},
+        {"freezeDefault": {"enabled": 1}},
+        {"freezeDefault": {"resumeOnce": "yes"}},
+        {"freezeDefault": {"checkIntervalSeconds": 59}},
+        {"freezeDefault": {"freezeThresholdSeconds": True}},
     ):
         with pytest.raises(UserPreferencesValidationError):
             store.patch_namespace("alice", "child_idle", patch)
     assert json.loads(json.dumps(store.get("alice")))["settings"]["child_idle"]["enabled"] is True
+
+
+def test_freeze_default_and_legacy_agent_rows_survive_partial_updates(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "alice",
+        "child_idle",
+        {
+            "freezeDefault": {"enabled": True, "freezeThresholdSeconds": 120},
+            "agents": {"legacy-agent": {"enabled": True, "resumeOnce": True}},
+        },
+    )
+    store.patch_namespace("alice", "child_idle", {"enabled": True})
+    raw = store.get("alice")["settings"]["child_idle"]
+    assert raw["freezeDefault"] == {"enabled": True, "freezeThresholdSeconds": 120}
+    assert raw["agents"] == {"legacy-agent": {"enabled": True, "resumeOnce": True}}
+    parsed = read_child_idle_settings(store, "alice")
+    assert parsed.freeze_default == ChildFreezeSettings(True, 3600, 120, False)
+    assert parsed.agents["legacy-agent"] == ChildFreezeSettings(True, 3600, 3600, True)
+
+
+def test_override_precedence_preserves_explicitly_disabled_rows() -> None:
+    rows = {
+        "ca_42": "template",
+        "direct-agent": "direct",
+        "harness:claude-native": "harness",
+    }
+    assert (
+        resolve_override(
+            rows, "default", template_id="ca_42", agent_id="direct-agent", harness="claude-native"
+        )
+        == "template"
+    )
+    assert (
+        resolve_override(
+            rows, "default", template_id=None, agent_id="direct-agent", harness="claude-native"
+        )
+        == "direct"
+    )
+    assert (
+        resolve_override(
+            rows, "default", template_id=None, agent_id="other-agent", harness="claude-native"
+        )
+        == "harness"
+    )
+    assert (
+        resolve_override(rows, "default", template_id=None, agent_id="other-agent", harness=None)
+        == "default"
+    )
+    assert (
+        resolve_override({"ca_42": False}, True, template_id="ca_42", agent_id=None, harness=None)
+        is False
+    )
 
 
 async def test_running_activity_resets_freeze_and_agent_rows_stay_independent(
@@ -765,7 +968,17 @@ async def test_resume_budget_cannot_be_rearmed_by_local_completion(
 
 
 @pytest.mark.parametrize(
-    "change", ["none", "archive", "card", "busy", "parent-archive", "disable"]
+    "change",
+    [
+        "none",
+        "archive",
+        "card",
+        "busy",
+        "parent-archive",
+        "disable",
+        "template-change",
+        "harness-change",
+    ],
 )
 async def test_resume_entry_rechecks_eligibility(db_uri: str, change: str) -> None:
     harness = _Harness(db_uri)
@@ -804,10 +1017,163 @@ async def test_resume_entry_rechecks_eligibility(db_uri: str, change: str) -> No
         harness.store.set_session_live_status(child.id, "running")
     elif change == "disable":
         harness.settings(enabled=False, agents={})
+    elif change == "template-change":
+        harness.store.set_labels(child.id, {AGENT_TEMPLATE_ID_LABEL: "ca_42"})
+    elif change == "harness-change":
+        harness.store.update_conversation(child.id, harness_override="codex-native")
     assert await idle._resume_child(child, claim) == (
         "accepted" if change == "none" else "deferred"
     )
     assert posts == ([child.id] if change == "none" else [])
+
+
+@pytest.mark.parametrize("source", ["default", "harness", "template"])
+async def test_real_resume_callback_uses_the_resolved_freeze_row(db_uri: str, source: str) -> None:
+    harness = _Harness(db_uri)
+    rows: dict[str, dict[str, Any]] = {}
+    if source == "harness":
+        rows["harness:claude-native"] = {"enabled": True, "resumeOnce": True}
+    elif source == "template":
+        rows["ca_42"] = {"enabled": True, "resumeOnce": True}
+        rows["harness:claude-native"] = {"enabled": False}
+    harness.settings(
+        enabled=False,
+        freezeDefault={"enabled": source == "default", "resumeOnce": source == "default"},
+        agents=rows,
+    )
+    child = harness.child(
+        agent_id=FRESH_AGENT_ID,
+        harness_override="claude-native",
+        template_id="ca_42" if source == "template" else None,
+    )
+    parent = harness.store.get_conversation(child.parent_conversation_id)
+    harness.store.replace_runner_id(parent.id, "runner-a")
+    harness.store.set_session_live_status(child.id, "failed")
+    harness.store.set_labels(child.id, {"omnigent.last_task_error_code": "model_at_capacity"})
+    child = harness.store.get_conversation(child.id)
+    posts: list[tuple[str, str]] = []
+
+    async def post(_request: Any, session_id: str, event: Any, **_kwargs: Any) -> dict[str, Any]:
+        posts.append((session_id, event.data["content"][0]["text"]))
+        return {}
+
+    state = SimpleNamespace(user_preferences_store=harness.prefs)
+    register_peer_routes(
+        APIRouter(),
+        conversation_store=harness.store,
+        post_event_impl=post,
+        runner_router=SimpleNamespace(runner_is_online=lambda _id: True),
+        app_state=state,
+        liveness_lookup=lambda ids: {sid: SimpleNamespace(runner_online=True) for sid in ids},
+    )
+    idle = state.child_idle
+    idle._app = SimpleNamespace(state=state)
+    claim = idle._claim_batch(parent.id)
+    assert claim is not None
+    assert await idle._resume_child(child, claim) == "accepted"
+    assert posts == [
+        (
+            child.id,
+            "[System: child check-in] Resume the work interrupted by the temporary service error.",
+        )
+    ]
+
+
+async def test_default_freeze_sweep_reaches_real_resume_callback(db_uri: str) -> None:
+    harness = _Harness(db_uri)
+    harness.settings(
+        enabled=False,
+        freezeDefault={
+            "enabled": True,
+            "resumeOnce": True,
+            "checkIntervalSeconds": 60,
+            "freezeThresholdSeconds": 120,
+        },
+        agents={},
+    )
+    child = harness.child(agent_id=FRESH_AGENT_ID, harness_override="claude-native")
+    harness.store.replace_runner_id(child.parent_conversation_id, "runner-a")
+    harness.store.set_session_live_status(child.id, "failed")
+    harness.store.set_labels(child.id, {"omnigent.last_task_error_code": "model_at_capacity"})
+    posts: list[str] = []
+
+    async def post(_request: Any, session_id: str, _event: Any, **_kwargs: Any) -> dict[str, Any]:
+        posts.append(session_id)
+        return {}
+
+    state = SimpleNamespace(user_preferences_store=harness.prefs)
+    register_peer_routes(
+        APIRouter(),
+        conversation_store=harness.store,
+        post_event_impl=post,
+        runner_router=SimpleNamespace(runner_is_online=lambda _id: True),
+        app_state=state,
+        liveness_lookup=lambda ids: {sid: SimpleNamespace(runner_online=True) for sid in ids},
+    )
+    idle = state.child_idle
+    idle._app = SimpleNamespace(state=state)
+    now = int(time.time())
+    idle._clock = lambda: now
+    await idle._tick()
+    now += 120
+    await idle._tick()
+    assert posts == [child.id]
+    assert CHILD_RESUME_LABEL in harness.store.get_conversation(child.id).labels
+
+
+async def test_installed_acp_slug_exception_reaches_sweep_and_resume_callback(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_store.create(FRESH_AGENT_ID, "acp-example", "bundle")
+    monkeypatch.setattr("omnigent.runtime._globals._agent_store", agent_store)
+    executor = SimpleNamespace(type="omnigent", config={"harness": "acp:example"})
+    cache = SimpleNamespace(
+        load=lambda *_args, **_kwargs: SimpleNamespace(spec=SimpleNamespace(executor=executor))
+    )
+    monkeypatch.setattr("omnigent.runtime.get_agent_cache", lambda: cache)
+
+    harness = _Harness(db_uri)
+    harness.settings(
+        enabled=False,
+        agents={
+            "harness:acp": {"enabled": False},
+            "harness:acp:example": {
+                "enabled": True,
+                "checkIntervalSeconds": 60,
+                "freezeThresholdSeconds": 120,
+                "resumeOnce": True,
+            },
+        },
+    )
+    child = harness.child(agent_id=FRESH_AGENT_ID)
+    harness.store.replace_runner_id(child.parent_conversation_id, "runner-a")
+    harness.store.set_session_live_status(child.id, "failed")
+    harness.store.set_labels(child.id, {"omnigent.last_task_error_code": "model_at_capacity"})
+    posts: list[str] = []
+
+    async def post(_request: Any, session_id: str, _event: Any, **_kwargs: Any) -> dict[str, Any]:
+        posts.append(session_id)
+        return {}
+
+    state = SimpleNamespace(user_preferences_store=harness.prefs)
+    register_peer_routes(
+        APIRouter(),
+        conversation_store=harness.store,
+        post_event_impl=post,
+        runner_router=SimpleNamespace(runner_is_online=lambda _id: True),
+        app_state=state,
+        liveness_lookup=lambda ids: {sid: SimpleNamespace(runner_online=True) for sid in ids},
+    )
+    idle = state.child_idle
+    idle._app = SimpleNamespace(state=state)
+    now = int(time.time())
+    idle._clock = lambda: now
+    await idle._tick()
+    now += 120
+    await idle._tick()
+    assert posts == [child.id]
+    assert CHILD_RESUME_LABEL in harness.store.get_conversation(child.id).labels
 
 
 async def test_check_interval_limits_tool_inspection(

@@ -2208,6 +2208,7 @@ def register_peer_routes(
     async def _resume_frozen_child(child: Conversation, claim: str) -> NoticeOutcome:
         from omnigent.server.peer_sweeper import PeerSweeper
         from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.session_overrides import AGENT_TEMPLATE_ID_LABEL
         from omnigent.server.user_preferences_store import read_child_idle_settings
 
         fresh = await asyncio.to_thread(conversation_store.get_conversation, child.id)
@@ -2228,7 +2229,11 @@ def register_peer_routes(
             getattr(child_idle._app.state, "user_preferences_store", None),
             owner,
         )
-        row = settings.agents.get(child.agent_id or "")
+        row = (
+            await asyncio.to_thread(child_idle._freeze_for, fresh, settings, {})
+            if fresh is not None
+            else None
+        )
         if (
             fresh is None
             or parent is None
@@ -2243,6 +2248,9 @@ def register_peer_routes(
             or fresh.parent_conversation_id != child.parent_conversation_id
             or fresh.runner_id != child.runner_id
             or fresh.agent_id != child.agent_id
+            or fresh.harness_override != child.harness_override
+            or fresh.labels.get(AGENT_TEMPLATE_ID_LABEL)
+            != child.labels.get(AGENT_TEMPLATE_ID_LABEL)
             or fresh.archive_revision != child.archive_revision
             or fresh.labels.get("omnigent.running_since")
             != child.labels.get("omnigent.running_since")

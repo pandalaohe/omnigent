@@ -14,6 +14,137 @@ from tests.browser_ui.test_sessions_appearance import appearance_url as appearan
 
 
 @pytest.mark.parametrize("width", [1440, 390])
+def test_child_freeze_default_and_exception_stay_compact(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    request: pytest.FixtureRequest,
+) -> None:
+    agents = [
+        {
+            "id": "claude-product",
+            "name": "claude-native-ui",
+            "harness": "claude-native",
+            "builtin": True,
+            "product_of": "claude-native",
+            "integration_mode": "native-tui",
+        },
+        *[
+            {
+                "id": f"agent-{index}",
+                "name": f"agent-{index}",
+                "harness": f"harness-{index}",
+                "builtin": True,
+                "product_of": f"harness-{index}",
+                "integration_mode": "native-tui",
+            }
+            for index in range(18)
+        ],
+    ]
+    harnesses = [
+        {
+            "id": row["harness"],
+            "label": row["name"],
+            "capabilities": {"integration_mode": "native-tui"},
+        }
+        for row in agents
+    ]
+    capabilities = {row["harness"]: {"integration_mode": "native-tui"} for row in agents}
+    browser_contract.json("/v1/agents", {"data": agents, "has_more": False})
+    browser_contract.json(
+        "/v1/harnesses",
+        {"data": harnesses, "capabilities_by_harness": capabilities},
+    )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "example-host",
+                    "name": "Example host",
+                    "owner": "local",
+                    "status": "offline",
+                    "configured_harnesses": {row["harness"]: True for row in agents},
+                }
+            ]
+        },
+    )
+    saved = {"enabled": False, "agents": {}}
+
+    def save(request: Request) -> dict[str, bool]:
+        saved.update(request.post_data_json["value"])
+        return {"ok": True}
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"child_idle": saved}},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/preferences",
+        lambda _: {
+            "user_id": "local",
+            "preferences": {"version": 1, "settings": {"child_idle": saved}},
+        },
+    )
+    browser_contract.json("/v1/me/preferences/child_idle", save, method="PATCH")
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{appearance_url}/settings/general#child-idle")
+    section = page.get_by_test_id("child-idle-settings")
+    expect(section.get_by_text("All agents", exact=True)).to_be_visible()
+    expect(section.get_by_role("switch", name="Monitor all agents children")).to_have_count(1)
+    expect(section.get_by_role("switch", name=re.compile(r"Monitor .* children"))).to_have_count(1)
+    expect(section.get_by_role("button", name="Add exception")).to_have_count(1)
+    expect(section.get_by_role("button", name="Edit Claude Code")).to_have_count(0)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/child_idle")
+        )
+    ):
+        section.get_by_role("switch", name="Monitor all agents children").click()
+        assert (
+            page.evaluate(
+                "JSON.parse(localStorage.getItem('omnigent:child-idle')).freezeDefault.enabled"
+            )
+            is True
+        )
+    section.get_by_role("button", name="Add exception").click()
+    picker = page.get_by_role("dialog", name="Add exception")
+    expect(picker.get_by_role("textbox", name="Search agents")).to_be_focused()
+    picker.get_by_role("textbox", name="Search agents").fill("Claude")
+    expect(
+        picker.get_by_role("button", name=re.compile("Claude Code.*Native CLI"))
+    ).to_be_visible()
+    assert picker.evaluate("element => element.scrollWidth <= element.clientWidth")
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"child-freeze-picker-{width}.png"), full_page=True)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/child_idle")
+        )
+    ):
+        picker.get_by_role("button", name=re.compile("Claude Code.*Native CLI")).click()
+        local_preferences = page.evaluate(
+            "JSON.parse(localStorage.getItem('omnigent:child-idle'))"
+        )
+        assert "harness:claude-native" in local_preferences["agents"]
+    expect(section.get_by_role("button", name="Edit Claude Code")).to_be_visible()
+    assert saved["freezeDefault"]["enabled"] is True
+    assert "harness:claude-native" in saved["agents"]
+    page.reload()
+    expect(section.get_by_role("switch", name="Monitor all agents children")).to_be_checked()
+    expect(section.get_by_role("button", name="Edit Claude Code")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+@pytest.mark.parametrize("width", [1440, 390])
 def test_reserve_width_persists_and_settings_fit(
     page: Page, appearance_url: str, width: int, request: pytest.FixtureRequest
 ) -> None:

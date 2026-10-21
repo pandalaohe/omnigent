@@ -168,6 +168,24 @@ class ChildIdleSettings:
     merge_window_s: int = 1800
     repeat_s: int = 14400
     agents: dict[str, ChildFreezeSettings] = field(default_factory=dict)
+    freeze_default: ChildFreezeSettings = field(default_factory=ChildFreezeSettings)
+
+
+def _parse_child_freeze_row(value: Any, path: str) -> ChildFreezeSettings:
+    if not isinstance(value, dict):
+        raise UserPreferencesValidationError(f"{path} must be an object")
+    enabled = value.get("enabled", False)
+    resume_once = value.get("resumeOnce", False)
+    if type(enabled) is not bool or type(resume_once) is not bool:
+        raise UserPreferencesValidationError(f"{path} switches must be booleans")
+    check_interval = value.get("checkIntervalSeconds", 3600)
+    freeze_threshold = value.get("freezeThresholdSeconds", 3600)
+    if any(
+        type(duration) is not int or not 60 <= duration <= 604800
+        for duration in (check_interval, freeze_threshold)
+    ):
+        raise UserPreferencesValidationError(f"{path} durations must be 60..604800")
+    return ChildFreezeSettings(enabled, check_interval, freeze_threshold, resume_once)
 
 
 def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
@@ -200,21 +218,11 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
     for agent_id, row in raw_agents.items():
         if not isinstance(agent_id, str) or not agent_id or not isinstance(row, dict):
             raise UserPreferencesValidationError("child_idle.agents requires agent objects")
-        switches = [row.get("enabled", False), row.get("resumeOnce", False)]
-        if any(type(switch) is not bool for switch in switches):
-            raise UserPreferencesValidationError("child_idle agent switches must be booleans")
-        durations = [
-            row.get("checkIntervalSeconds", 3600),
-            row.get("freezeThresholdSeconds", 3600),
-        ]
-        if any(
-            type(duration) is not int or not 60 <= duration <= 604800 for duration in durations
-        ):
-            raise UserPreferencesValidationError("child_idle agent durations must be 60..604800")
-        agents[agent_id] = ChildFreezeSettings(
-            switches[0], durations[0], durations[1], switches[1]
-        )
-    return ChildIdleSettings(enabled, numbers[0], numbers[1], numbers[2], agents)
+        agents[agent_id] = _parse_child_freeze_row(row, "child_idle agent")
+    freeze_default = _parse_child_freeze_row(
+        value.get("freezeDefault", {}), "child_idle.freezeDefault"
+    )
+    return ChildIdleSettings(enabled, numbers[0], numbers[1], numbers[2], agents, freeze_default)
 
 
 def read_child_idle_settings(
