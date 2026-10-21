@@ -471,6 +471,7 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 _INSTRUCTION_LAYER_TOOLS = frozenset(
     {"sys_instruction_layers_read", "sys_instruction_layer_update"}
 )
+_PROJECT_SETTINGS_TOOLS = frozenset({"sys_project_settings_read", "sys_project_settings_update"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
@@ -550,6 +551,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
+    | _PROJECT_SETTINGS_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
@@ -1036,6 +1038,7 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
+    | _PROJECT_SETTINGS_TOOLS
     | _SCHEDULED_TASK_TOOLS
     # The panel tool executes HERE, including on the ``dispatch=None`` path;
     # relaying it upstream would skip the artifacts/open POST.
@@ -7014,6 +7017,50 @@ async def _execute_instruction_layer_tool(
         return json.dumps({"error": f"{tool_name}: {exc}"})
 
 
+async def _execute_project_settings_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Forward one authenticated project settings request without caller identity fields."""
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args = json.loads(arguments)
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be an object")
+        required = {"project_id"}
+        fields = (
+            {"project_id", "expected_revision", "project", "host"}
+            if tool_name == "sys_project_settings_update"
+            else {"project_id", "host_id", "harness"}
+        )
+        if tool_name == "sys_project_settings_update":
+            required.add("expected_revision")
+            if not isinstance(args.get("expected_revision"), str):
+                raise ValueError("expected_revision must be the revision returned by read")
+        if not required <= args.keys() or args.keys() - fields:
+            raise ValueError("missing required or unexpected project settings arguments")
+        project_id = args.pop("project_id")
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project_id must be a non-empty string")
+        from urllib.parse import quote
+
+        url = f"/v1/projects/{quote(project_id, safe='')}/settings"
+        if tool_name == "sys_project_settings_update":
+            response = await server_client.put(url, json=args, timeout=30.0)
+        else:
+            response = await server_client.get(url, params=args, timeout=30.0)
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"server returned {response.status_code}", "details": response.text}
+            )
+        return json.dumps(response.json())
+    except (ValueError, httpx.HTTPError) as exc:
+        return json.dumps({"error": f"{tool_name}: {exc}"})
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -10036,6 +10083,10 @@ async def execute_tool(
             )
         elif tool_name in _INSTRUCTION_LAYER_TOOLS:
             output = await _execute_instruction_layer_tool(
+                tool_name, arguments, server_client=server_client
+            )
+        elif tool_name in _PROJECT_SETTINGS_TOOLS:
+            output = await _execute_project_settings_tool(
                 tool_name, arguments, server_client=server_client
             )
         elif tool_name in _POLICY_TOOLS:

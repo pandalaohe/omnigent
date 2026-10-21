@@ -288,7 +288,9 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         def write(session: Session) -> Project | None:
             require_active_account(session, user_id)
-            row = session.get(SqlProject, (current_workspace_id(), project_id))
+            row = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
             if row is None or row.user_id != user_id:
                 return None
             changed = False

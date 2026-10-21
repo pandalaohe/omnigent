@@ -43,7 +43,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
     SqlAlchemyProjectHostBindingStore,
 )
@@ -103,6 +105,8 @@ def _build_app(
     enabled: bool = True,
     auth: bool = False,
     preferences: bool = False,
+    catalogs: bool = False,
+    permissions: bool = False,
 ) -> FastAPI:
     """Build a FastAPI app with the collaboration stores wired."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -119,10 +123,12 @@ def _build_app(
             cache_dir=tmp_path / "cache",
         ),
         host_store=HostStore(db_uri),
+        host_model_catalog_cache_store=HostModelCatalogCacheStore(db_uri) if catalogs else None,
         project_store=SqlAlchemyProjectStore(db_uri),
         project_repository_store=SqlAlchemyProjectRepositoryStore(db_uri),
         project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header") if auth else None,
+        permission_store=SqlAlchemyPermissionStore(db_uri) if permissions else None,
         feature_flags=flags,
         user_preferences_store=SqlAlchemyUserPreferencesStore(db_uri) if preferences else None,
     )

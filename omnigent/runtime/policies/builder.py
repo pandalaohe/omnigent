@@ -115,6 +115,14 @@ _INSTRUCTION_UPDATE_APPROVAL_SPEC = FunctionPolicySpec(
         arguments=None,
     ),
 )
+_PROJECT_SETTINGS_UPDATE_APPROVAL_SPEC = FunctionPolicySpec(
+    name="__ask_on_project_settings_update",
+    on=None,
+    function=FunctionRef(
+        path="omnigent.policies.builtins.safety.ask_on_project_settings_update",
+        arguments=None,
+    ),
+)
 
 # Bounded cache of ``conversation_id -> session owner``. The owner
 # (``LEVEL_OWNER`` grantee) is immutable for a session's lifetime, so
@@ -132,7 +140,7 @@ _SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
 # evaluation while still propagating changes within half a minute.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
-_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, tuple[list[PolicySpec], bool]] = (
+_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, tuple[list[PolicySpec], bool, bool]] = (
     cachetools.TTLCache(maxsize=256, ttl=30)
 )
 
@@ -458,7 +466,8 @@ def any_policies_apply(
     # TOOL_CALL events must always reach it: never fast-path sys_add_policy
     # or the scheduled-task mutation tools.
     if phase == Phase.TOOL_CALL and (
-        tool_name in {"sys_add_policy", "sys_instruction_layer_update"}
+        tool_name
+        in {"sys_add_policy", "sys_instruction_layer_update", "sys_project_settings_update"}
         or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
     ):
         return True
@@ -651,9 +660,11 @@ def build_policy_engine(
     )
     tree = verified.rows
     root_conversation_id = verified.root_conversation_id
-    db_default_policy_specs, instruction_approval_configured = _load_default_policy_configuration(
-        policy_store
-    )
+    (
+        db_default_policy_specs,
+        instruction_approval_configured,
+        project_settings_approval_configured,
+    ) = _load_default_policy_configuration(policy_store)
     admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
@@ -795,6 +806,19 @@ def build_policy_engine(
         )
     if not configured:
         all_policy_specs.append(_INSTRUCTION_UPDATE_APPROVAL_SPEC)
+    assert _PROJECT_SETTINGS_UPDATE_APPROVAL_SPEC.function is not None
+    project_handler = _PROJECT_SETTINGS_UPDATE_APPROVAL_SPEC.function.path
+    project_configured = (
+        any(
+            isinstance(policy, FunctionPolicySpec)
+            and policy.function is not None
+            and policy.function.path == project_handler
+            for policy in admin_policy_specs
+        )
+        or project_settings_approval_configured
+    )
+    if not project_configured:
+        all_policy_specs.append(_PROJECT_SETTINGS_UPDATE_APPROVAL_SPEC)
     root_conv = (
         conv
         if root_conversation_id == conversation_id
@@ -1756,7 +1780,7 @@ def _load_default_policy_specs(
 
 def _load_default_policy_configuration(
     policy_store: PolicyStore | None,
-) -> tuple[list[PolicySpec], bool]:
+) -> tuple[list[PolicySpec], bool, bool]:
     """
     Load enabled server-wide default policies from the store.
 
@@ -1777,7 +1801,7 @@ def _load_default_policy_configuration(
     :raises OmnigentError: If an enabled policy has an unsupported type.
     """
     if policy_store is None:
-        return [], False
+        return [], False, False
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
@@ -1788,9 +1812,12 @@ def _load_default_policy_configuration(
         return cached
     specs: list[PolicySpec] = []
     instruction_approval_configured = False
+    project_settings_approval_configured = False
     for policy in policy_store.list_defaults():
         if policy.handler == "omnigent.policies.builtins.safety.ask_on_instruction_layer_update":
             instruction_approval_configured = True
+        if policy.handler == "omnigent.policies.builtins.safety.ask_on_project_settings_update":
+            project_settings_approval_configured = True
         if not policy.enabled:
             continue
         if policy.type != "python":
@@ -1812,8 +1839,12 @@ def _load_default_policy_configuration(
     with _POLICY_SPECS_CACHE_LOCK:
         # An invalidation during the DB read must also prevent a stale refill.
         if generation == _POLICY_SPECS_CACHE_GENERATION:
-            _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs, instruction_approval_configured
-    return specs, instruction_approval_configured
+            _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = (
+                specs,
+                instruction_approval_configured,
+                project_settings_approval_configured,
+            )
+    return specs, instruction_approval_configured, project_settings_approval_configured
 
 
 def invalidate_default_policy_specs_cache() -> None:

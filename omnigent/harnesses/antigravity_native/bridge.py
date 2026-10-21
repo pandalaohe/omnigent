@@ -367,6 +367,8 @@ _AGY_ENABLED_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_settings_read",
+    "sys_project_settings_update",
     "sys_read_inbox",
     "sys_scheduled_task_create",
     "sys_scheduled_task_delete",
