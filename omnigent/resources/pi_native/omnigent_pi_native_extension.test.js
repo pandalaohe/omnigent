@@ -719,12 +719,103 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   }
 }
 
+async function testPiRotation(fault = "none") {
+  const h = makeHarness({ captureEvents: true });
+  const calls = [];
+  const previousFetch = global.fetch;
+  let failed = false;
+  let prepared = fault === "startup-recovery";
+  let creations = prepared ? 1 : 0;
+  global.fetch = async (url, options) => {
+    const method = options.method;
+    const pathname = new URL(url).pathname;
+    const body = options.body && JSON.parse(options.body);
+    calls.push({ method, pathname, body });
+    let data = {};
+    if (method === "GET") data = {
+      agent_id: "ag_pi", runner_id: "runner_pi",
+      archive_revision: 0,
+      labels: fault === "startup-recovery" ? {
+        "omnigent.rotation_successor": JSON.stringify({ id: "conv_next", revision: 0 }),
+      } : {},
+    };
+    if (pathname.endsWith("/successor")) {
+      if (!prepared) { prepared = true; creations += 1; }
+      if (fault === "lost-response" && !failed) {
+        failed = true;
+        throw new Error("response lost after server commit");
+      }
+      data = { id: "conv_next" };
+    }
+    if (method === "PATCH" && fault === "bind" && !failed) {
+      failed = true;
+      return { status: 503, json: async () => ({}) };
+    }
+    if (pathname.endsWith("/succession")) {
+      if (fault === "pending" && !failed) {
+        failed = true;
+        data = { status: "pending" };
+      } else if (fault === "refused" && !failed) {
+        failed = true;
+        return { status: 409, json: async () => ({}) };
+      } else data = { status: "done" };
+    }
+    return { status: 200, json: async () => data };
+  };
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "pi_new_context" };
+  try {
+    await h.handlers.session_start({ reason: fault === "startup-recovery" ? "startup" : "new" }, ctx);
+    if (["lost-response", "bind", "pending", "refused"].includes(fault)) {
+      assert(`${fault}: keeps old pane until completed`, !calls.some(c => c.method === "DELETE"));
+      assert(`${fault}: no old identity rebound`, !calls.some(c => c.body && c.body.external_session_id));
+      const blocked = await h.handlers.tool_call({ toolCallId: "late", toolName: "write", input: {} }, ctx);
+      assert(`${fault}: pending source tools are fenced`, blocked.block === true);
+      const deadline = Date.now() + 3000;
+      while (!calls.some(c => c.method === "DELETE") && Date.now() < deadline) await sleep(20);
+    }
+    assert(`${fault}: one physical successor`, creations === 1);
+    assert(`${fault}: uses source-scoped preparation`, calls.some(c => c.pathname === "/v1/sessions/conv_test/successor"));
+    assert(`${fault}: no raw-label generic create`, !calls.some(c => c.pathname === "/v1/sessions"));
+    assert(`${fault}: successor bound before succession`, calls.findIndex(c => c.method === "PATCH" && c.body.runner_id) < calls.findIndex(c => c.pathname.endsWith("/succession")));
+    assert(`${fault}: fresh terminal ensured`, calls.some(c => c.body && c.body.ensure_native_terminal === true));
+    assert(`${fault}: fresh pane owns its external identity`, !calls.some(c => c.body && c.body.external_session_id === "pi_new_context"));
+    assert(`${fault}: children and empty mother carried`, calls.some(c => c.pathname.endsWith("/succession") && c.body.allow_empty === true));
+    assert(`${fault}: old pane eventually retires`, calls.some(c => c.method === "DELETE" && c.pathname.endsWith("/resources/terminals/terminal_pi_main")));
+    const config = JSON.parse(fs.readFileSync(path.join(h.bridgeDir, "config.json"), "utf8"));
+    assert(`${fault}: pending marker cleared`, !config.pendingRotationSource && !config.pendingSuccessorId);
+  } finally {
+    clearTimeout(h.pi.__omnigentRotationRetry);
+    global.fetch = previousFetch;
+  }
+}
+
+async function testChildResetDoesNotCreateMother() {
+  const h = makeHarness({ captureEvents: true });
+  const calls = [];
+  const previousFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    calls.push({ method: options.method, pathname: new URL(url).pathname });
+    return { status: 200, json: async () => ({ parent_session_id: "mother" }) };
+  };
+  try {
+    await h.handlers.session_start({ reason: "new" }, makeCtx({ idle: true }));
+    assert("child reset never creates a mother", !calls.some(c => c.pathname.endsWith("/successor")));
+    assert("child reset never reparents or retires itself", !calls.some(c => c.pathname.endsWith("/succession") || c.method === "DELETE"));
+    const config = JSON.parse(fs.readFileSync(path.join(h.bridgeDir, "config.json"), "utf8"));
+    assert("child remains usable after its own reset", !config.pendingRotationSource && !!h.pi.__omnigentInboxPoller);
+  } finally { global.fetch = previousFetch; }
+}
+
 (async () => {
   try {
     await testStartupInstructionsReachEveryAgentStart();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
+    for (const fault of ["none", "lost-response", "bind", "pending", "refused", "startup-recovery"])
+      await testPiRotation(fault);
+    await testChildResetDoesNotCreateMother();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();
@@ -740,6 +831,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   } finally {
     for (const h of harnesses) {
       if (h.pi.__omnigentInboxPoller) clearInterval(h.pi.__omnigentInboxPoller);
+      clearTimeout(h.pi.__omnigentRotationRetry);
       try {
         fs.rmSync(h.bridgeDir, { recursive: true, force: true });
       } catch (_err) {}

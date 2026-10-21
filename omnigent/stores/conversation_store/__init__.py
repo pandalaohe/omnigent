@@ -314,12 +314,14 @@ SUCCEEDED_BY_LABEL_KEY = "omnigent.succeeded_by"
 SUCCEEDS_LABEL_KEY = "omnigent.succeeds"
 HANDOVER_ITEM_LABEL_KEY = "omnigent.handover_item"
 ROTATE_REQUESTED_LABEL_KEY = "omnigent.rotate_requested"
+ROTATION_SUCCESSOR_LABEL_KEY = "omnigent.rotation_successor"
 SUCCESSION_OPERATION_LABEL_KEYS = frozenset(
     {
         SUCCEEDED_BY_LABEL_KEY,
         SUCCEEDS_LABEL_KEY,
         HANDOVER_ITEM_LABEL_KEY,
         ROTATE_REQUESTED_LABEL_KEY,
+        ROTATION_SUCCESSOR_LABEL_KEY,
     }
 )
 
@@ -444,6 +446,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.startup",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         ARTIFACT_LINK_KEY_LABEL,
+        ROTATION_SUCCESSOR_LABEL_KEY,
     }
 )
 
@@ -917,6 +920,16 @@ class ConversationStore(ABC):
             ``conversation_id`` is already in use.
         """
         ...
+
+    def create_session_successor(
+        self,
+        source: Conversation,
+        *,
+        initial_labels: dict[str, str],
+        terminal_launch_args: list[str] | None,
+    ) -> Conversation:
+        """Create or resume the stable successor for one source incarnation."""
+        raise NotImplementedError
 
     @abstractmethod
     def get_conversation(self, conversation_id: str) -> Conversation | None:
