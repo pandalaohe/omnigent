@@ -151,16 +151,22 @@ async def test_spool_survives_home_and_session_delete_and_lost_ack(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_registration_requires_exact_owner_and_harness(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("actual_harness", "registered_harness"),
+    [("claude-code-native", "claude-native"), ("pi-native", "pi-native"), ("pi", "pi")],
+)
+async def test_registration_requires_exact_owner_and_harness(
+    tmp_path: Path, actual_harness: str, registered_harness: str
+) -> None:
     uri = f"sqlite:///{tmp_path / 'server.db'}"
     store = SqlAlchemyConversationStore(uri)
     conv = store.create_conversation(agent_id="a" * 32, host_id="b" * 32, workspace="/opt/work")
     SqlAlchemyPermissionStore(uri).grant("alice", conv.id, LEVEL_OWNER)
-    app = _app(store, "claude-code-native")
+    app = _app(store, actual_harness)
     registration = {
         "producer_id": uuid.uuid4().hex,
         "session_id": conv.id,
-        "harness": "claude-native",
+        "harness": registered_harness,
     }
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="https://omni.example.test"

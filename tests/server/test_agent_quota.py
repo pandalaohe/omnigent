@@ -162,6 +162,15 @@ def test_native_codex_competes_with_external_report(service):
     assert service.quotas(context, now=NOW)[1]["codex"].state == "ok"
 
 
+def test_pi_limits_stay_separate_from_claude_and_codex(service):
+    conv = service.conversations.create_conversation(harness_override="pi")
+    report = {**snapshot(int(time.time()), used=100), "provider": "Anthropic API"}
+    service.report_pi(conv, report)
+    quotas = service.quotas(service.context(conv))[1]
+    assert set(quotas) == {"pi"}
+    assert quotas["pi"].state == "exhausted"
+
+
 @pytest.mark.asyncio
 async def test_report_and_session_read_auth_and_bounds(request, db_uri):
     app = request.getfixturevalue("auth_app")

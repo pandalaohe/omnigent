@@ -15,7 +15,7 @@ import httpx
 from filelock import FileLock, Timeout
 
 from omnigent.usage_export.models import UsageObservation
-from omnigent.usage_export.transcripts import claude_measurement, codex_measurement
+from omnigent.usage_export.transcripts import claude_measurement, codex_measurement, pi_measurement
 
 
 class UsageOutbox:
@@ -62,6 +62,13 @@ class UsageOutbox:
                     session_id TEXT, harness TEXT, physical TEXT, turn_id TEXT,
                     ended_at TEXT NOT NULL,
                     PRIMARY KEY (session_id,harness,physical,turn_id)
+                );
+                CREATE TABLE IF NOT EXISTS pi_roots (
+                    path TEXT PRIMARY KEY, session_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pi_seen (
+                    session_id TEXT NOT NULL, entry_id TEXT NOT NULL,
+                    PRIMARY KEY (session_id, entry_id)
                 );
             """)
 
@@ -151,6 +158,22 @@ class UsageOutbox:
         record: Mapping[str, Any],
     ) -> None:
         """Associate only explicit terminal records with their physical turn."""
+        if harness in {"pi-native", "pi"}:
+            measurement = pi_measurement(record)
+            if measurement is None:
+                return
+            if harness == "pi-native":
+                entry_identity = self._json(
+                    [measurement["producer_unit_id"], record.get("timestamp")]
+                )
+                seen = db.execute(
+                    "INSERT OR IGNORE INTO pi_seen VALUES (?,?)",
+                    (session_id, entry_identity),
+                )
+                if seen.rowcount == 0:
+                    return
+            self._append(db, session_id, harness, {**physical, **measurement})
+            return
         source = self._json(
             [physical.get("physical_session_id"), physical.get("physical_subagent_id")]
         )
@@ -313,6 +336,9 @@ class UsageOutbox:
                     if not isinstance(record, dict):
                         raise ValueError("invalid_usage_source_record")
                     payload = record.get("payload")
+                    if harness == "pi-native" and record.get("type") == "session":
+                        physical["physical_session_id"] = record.get("id")
+                        physical["upstream_thread_id"] = record.get("id")
                     if harness.startswith("codex-") and isinstance(payload, dict):
                         if record.get("type") == "session_meta":
                             physical["physical_session_id"] = payload.get("id")
@@ -337,10 +363,111 @@ class UsageOutbox:
 
     def scan_registered_sources(self) -> None:
         with self._connect() as db:
+            pi_roots = list(db.execute("SELECT path,session_id FROM pi_roots"))
+        for root, session_id in pi_roots:
+            self._discover_pi_sources(Path(root), session_id, baseline=False)
+        with self._connect() as db:
             sources = [Path(row[0]) for row in db.execute("SELECT path FROM sources")]
         for path in sources:
             if path.is_file():
                 self.scan(path)
+
+    def register_pi_root(self, directory: Path, session_id: str) -> None:
+        """Freeze inherited files only on first registration; retain reconnect cursors."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT session_id FROM pi_roots WHERE path=?", (str(directory),)
+            ).fetchone()
+        if row is not None:
+            if row[0] != session_id:
+                raise ValueError("pi_usage_root_changed")
+            self._discover_pi_sources(directory, session_id, baseline=False, rebase=True)
+            return
+        self._discover_pi_sources(directory, session_id, baseline=True, rebase=True)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR IGNORE INTO pi_roots VALUES (?,?)", (str(directory), session_id))
+
+    def _discover_pi_sources(
+        self, directory: Path, session_id: str, *, baseline: bool, rebase: bool = False
+    ) -> None:
+        if not directory.is_dir():
+            return
+        for path in directory.glob("*.jsonl"):
+            if not path.is_file():
+                continue
+            if self.has_source(path):
+                if not rebase:
+                    continue
+                stat = path.stat()
+                with self._connect() as db:
+                    current = db.execute(
+                        "SELECT identity,offset,metadata FROM sources WHERE path=?",
+                        (str(path),),
+                    ).fetchone()
+                identity = self._json([stat.st_dev, stat.st_ino])
+                if current[0] != identity or current[1] > stat.st_size:
+                    offset = self._remember_pi_baseline(path, session_id)
+                    metadata = json.loads(current[2])
+                    physical_id = self._pi_header_id(path)
+                    metadata["physical_session_id"] = physical_id
+                    metadata["upstream_thread_id"] = physical_id
+                    with self._connect() as db:
+                        db.execute(
+                            "UPDATE sources SET identity=?,offset=?,metadata=? WHERE path=?",
+                            (identity, offset, self._json(metadata), str(path)),
+                        )
+                continue
+            physical = {
+                "harness_family": "pi",
+                "identity_namespace": "pi/session/v1",
+                "physical_transcript_path": str(path.resolve()),
+                "thread_kind": "main",
+            }
+            if baseline:
+                physical_id = self._pi_header_id(path)
+                physical["physical_session_id"] = physical_id
+                physical["upstream_thread_id"] = physical_id
+                offset = self._remember_pi_baseline(path, session_id)
+            else:
+                offset = 0
+            self.register_source(
+                path,
+                session_id,
+                "pi-native",
+                physical,
+                start_offset=offset,
+            )
+
+    @staticmethod
+    def _pi_header_id(path: Path) -> str:
+        with path.open("rb") as transcript:
+            header = json.loads(transcript.readline(1024 * 1024))
+        if (
+            not isinstance(header, dict)
+            or header.get("type") != "session"
+            or not isinstance(header.get("id"), str)
+            or not header["id"]
+        ):
+            raise ValueError("missing_physical_identity")
+        return header["id"]
+
+    def _remember_pi_baseline(self, path: Path, session_id: str) -> int:
+        """Exclude inherited usage entries later copied into a Pi branch file."""
+        with path.open("rb") as transcript, self._connect() as db:
+            while True:
+                line = transcript.readline(16 * 1024 * 1024 + 1)
+                if not line or not line.endswith(b"\n"):
+                    break
+                if len(line) > 16 * 1024 * 1024:
+                    raise ValueError("usage_source_line_too_large")
+                record = json.loads(line)
+                if isinstance(record, dict) and pi_measurement(record) is not None:
+                    db.execute(
+                        "INSERT OR IGNORE INTO pi_seen VALUES (?,?)",
+                        (session_id, self._json([record["id"], record.get("timestamp")])),
+                    )
+            return transcript.tell() - (len(line) if line and not line.endswith(b"\n") else 0)
 
     def has_source(self, path: Path) -> bool:
         with self._connect() as db:

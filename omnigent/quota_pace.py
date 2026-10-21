@@ -207,6 +207,25 @@ def claude_windows(
     return result
 
 
+def rate_limit_quota(snapshot: object, *, now: float) -> AgentQuota:
+    """Report a depleted API bucket without inventing a subscription pace."""
+    unknown = AgentQuota("unknown", None, None, ())
+    if not isinstance(snapshot, dict) or not accept_snapshot(snapshot.get("captured_at"), now):
+        return unknown
+    windows = snapshot.get("windows")
+    if not isinstance(windows, list):
+        return unknown
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        used = _number(window.get("used_percent"))
+        reset = _number(window.get("resets_at"))
+        label = window.get("label")
+        if used == 100 and reset is not None and reset > now and isinstance(label, str) and label:
+            return AgentQuota("exhausted", 0, label, ())
+    return unknown
+
+
 def quota_line(quotas: Mapping[str, AgentQuota], tiers: QuotaTiers, now: float) -> str | None:
     if not quotas or _number(now) is None:
         return None

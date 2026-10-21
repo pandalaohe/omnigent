@@ -19,6 +19,7 @@ from omnigent.quota_pace import (
     claude_windows,
     codex_windows,
     quota_line,
+    rate_limit_quota,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostRegistry
@@ -107,6 +108,17 @@ class AgentQuotaService:
         context = self.context(conversation)
         self.report(context.owner_id, context.host_id, "claude", snapshot)
 
+    def report_pi(self, conversation: Conversation, snapshot: dict[str, Any] | None) -> None:
+        """Keep a Pi provider's reported allowance separate from CLI subscriptions."""
+        context = self.context(conversation)
+        if snapshot is None:
+            with self._lock:
+                self._snapshots.pop(
+                    (current_workspace_id(), context.owner_id, context.host_id, "pi"), None
+                )
+            return
+        self.report(context.owner_id, context.host_id, "pi", snapshot)
+
     def quotas(
         self, context: QuotaContext, *, now: float | None = None
     ) -> tuple[QuotaTiers, dict[str, AgentQuota]]:
@@ -138,6 +150,9 @@ class AgentQuotaService:
         for product, snapshots in candidates.items():
             fresh = [s for s in snapshots if accept_snapshot(s.get("captured_at"), now=now)]
             newest = max(fresh or snapshots, key=lambda s: s["captured_at"])
+            if product == "pi" and newest.get("scope") == "API rate limits":
+                result[product] = rate_limit_quota(newest, now=now)
+                continue
             windows = (
                 codex_windows(fresh_codex_rate_limits(newest, now=now), now=now)
                 if product == "codex" and "limits" in newest

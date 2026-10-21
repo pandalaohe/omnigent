@@ -885,8 +885,16 @@ def test_generated_token_command_reports_only_safe_results(
         assert stat.S_IMODE(file.stat().st_mode) == 0o600
 
 
-def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
+def test_provider_launch_returns_env_and_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """pi_native_provider_launch writes config and returns the env + CLI args."""
+    from omnigent.inner import pi_settings
+
+    global_agent = tmp_path / "global-pi-agent"
+    global_agent.mkdir()
+    (global_agent / "settings.json").write_text(json.dumps({"cacheWarming": "off"}))
+    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_agent)
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://api.anthropic.com",
@@ -901,6 +909,8 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
     assert env == {creds.PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     assert args == ["--provider", "omnigent", "--model", "claude-sonnet-4-6"]
     assert (agent_dir / "models.json").exists()
+    assert json.loads((agent_dir / "settings.json").read_text())["cacheWarming"] == "idle"
+    assert json.loads((global_agent / "settings.json").read_text())["cacheWarming"] == "off"
 
 
 def test_provider_launch_passes_reasoning_effort_as_thinking(tmp_path: Path) -> None:

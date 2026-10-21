@@ -100,6 +100,7 @@ _logger = logging.getLogger(__name__)
 KEEP_WARM_LABEL = _KEEP_WARM_LABEL_KEY
 KEEP_WARM_STATS_LABEL = _KEEP_WARM_STATS_LABEL_KEY
 LAST_CACHE_LABEL = _LAST_CACHE_LABEL_KEY
+PI_CACHE_LABEL = "omnigent.pi_cache"
 ARCHIVE_REASON_LABEL = _ARCHIVE_REASON_LABEL_KEY
 ARCHIVED_BY_LABEL = _ARCHIVED_BY_LABEL_KEY
 ARCHIVE_EXEMPT_SINCE_LABEL = _ARCHIVE_EXEMPT_SINCE_LABEL_KEY
@@ -565,16 +566,78 @@ _STOP_REASON_STATUS: dict[str, str] = {
 }
 
 
-def keep_warm_family_for_harness(harness: str | None) -> Literal["claude", "codex"] | None:
+def keep_warm_family_for_harness(harness: str | None) -> Literal["claude", "codex", "pi"] | None:
     """
     Map a canonical harness onto the keep-warm family it belongs to.
 
     :param harness: Canonical harness id, e.g. ``"claude-native"``; ``None``
         for an unresolved session.
-    :returns: ``"claude"`` / ``"codex"`` for a harness with a keep-warm
-        channel, else ``None``.
+    :returns: ``"claude"`` / ``"codex"`` for a server-ping channel,
+        ``"pi"`` for Pi's provider-aware native cache reporting, else ``None``.
     """
+    if harness in ("pi", "pi-native"):
+        return "pi"
     return _SUPPORTED_HARNESSES.get(harness or "")
+
+
+def pi_cache_label(ttl_s: int, observed_at: int, cache_read: int, cache_write: int) -> str:
+    """Store one Pi model's cache lifetime and observed provider usage."""
+    return json.dumps(
+        {"ttl": ttl_s, "at": observed_at, "read": cache_read, "write": cache_write},
+        separators=(",", ":"),
+    )
+
+
+def _pi_warm_state(labels: Mapping[str, str] | None, now: int) -> Literal["warm", "cold"] | None:
+    """Use provider capability and measured cache tokens, never the Pi harness alone."""
+    if not labels:
+        return None
+    try:
+        data = json.loads(labels.get(PI_CACHE_LABEL, ""))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ttl = _as_int(data.get("ttl"))
+    observed_at = _as_int(data.get("at"))
+    read = _as_int(data.get("read"))
+    write = _as_int(data.get("write"))
+    if (
+        ttl is None
+        or ttl <= 0
+        or ttl > 86400
+        or observed_at is None
+        or observed_at < 0
+        or read is None
+        or read < 0
+        or write is None
+        or write < 0
+    ):
+        return None
+    if read + write > 0 and 0 <= now - observed_at < ttl:
+        return "warm"
+    return "cold"
+
+
+def pi_cache_warming_allowed(conv: Conversation, settings: KeepWarmSettings, now: int) -> bool:
+    """Gate Pi's own idle warmer on the live owner switch and fixed episode cap."""
+    if (
+        conv.archived
+        or is_session_closed(conv.labels, conv.title)
+        or conv.labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS
+        or _has_sync_pending(conv.id)
+        or conv.agent_id is None
+    ):
+        return False
+    row = settings.agents.get(conv.agent_id)
+    if row is None or not (row.child if conv.parent_conversation_id else row.main):
+        return False
+    started_at = _running_since(conv)
+    if started_at is None or started_at > now:
+        return False
+    max_low, max_high = KEEP_WARM_MAX_BOUNDS_S
+    cap_s = min(max(row.max_s, max_low), max_high, 1800)
+    return now - started_at < cap_s
 
 
 def keep_warm_family_from_labels(
@@ -599,15 +662,16 @@ def warm_state_for_labels(
     archived: bool,
     busy: bool,
     now: int,
-    family: Literal["claude", "codex"] | None = None,
+    family: Literal["claude", "codex", "pi"] | None = None,
     cold_after_s: int | None = None,
 ) -> Literal["warm", "cold"] | None:
     """
     Derive the rail pill state from raw labels plus a resolved harness family.
 
-    ``None`` only for an archived session, a mirrored native sub-agent row,
-    or a session whose harness has no known keep-warm family. A known family
-    with ``cold_after_s == 0`` reads ``warm`` even with no label. The label's
+    ``None`` for an archived session, a mirrored native sub-agent row,
+    an unsupported harness, or Pi without a cache-capable model observation.
+    Pi reads its own provider TTL and measured cache tokens. Other families
+    with ``cold_after_s == 0`` read ``warm`` even with no label. The label's
     ``y`` stamp wins when present; otherwise the caller's ``family`` —
     resolved from the session's harness — supplies the per-family rule. A
     session outside the sweeper's scan window uses its last real turn's
@@ -627,6 +691,8 @@ def warm_state_for_labels(
         return None
     if labels and labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS:
         return None
+    if family == "pi":
+        return _pi_warm_state(labels, now)
     stamped = keep_warm_family_from_labels(labels)
     if stamped is not None:
         family = stamped
@@ -2064,6 +2130,7 @@ __all__ = [
     "KEEP_WARM_LABEL",
     "KEEP_WARM_STATS_LABEL",
     "LAST_CACHE_LABEL",
+    "PI_CACHE_LABEL",
     "ChildKeepWarmSweeper",
     "cold_after_for_agent",
     "cold_after_for_session",
@@ -2071,6 +2138,8 @@ __all__ = [
     "keep_warm_family_for_harness",
     "keep_warm_family_from_labels",
     "keep_warm_status_from_labels",
+    "pi_cache_label",
+    "pi_cache_warming_allowed",
     "warm_state_for_labels",
     "warm_state_from_label",
 ]

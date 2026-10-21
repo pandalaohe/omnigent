@@ -95,6 +95,7 @@ from omnigent.policies.types import (
 )
 from omnigent.provider_usage_limits import (
     parse_provider_usage_limits_snapshot_json,
+    pi_provider_usage_limits_from_headers,
     validate_provider_usage_limits_snapshot,
 )
 from omnigent.runner.mcp_execution_registry import (
@@ -169,6 +170,7 @@ from omnigent.server.child_keep_warm import (
     ARCHIVE_REASON_LABEL,
     keep_warm_family_for_harness,
     keep_warm_status_from_labels,
+    pi_cache_label,
     warm_state_for_labels,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
@@ -2417,7 +2419,7 @@ def _build_session_list_item(
     agent_template_ids: Mapping[str, str] | None = None,
     last_message_preview: str | None = None,
     keep_warm_families: (
-        Mapping[tuple[str | None, str | None, str | None], Literal["claude", "codex"] | None]
+        Mapping[tuple[str | None, str | None, str | None], Literal["claude", "codex", "pi"] | None]
         | None
     ) = None,
     cold_after_by_session: Mapping[str, int | None] | None = None,
@@ -3501,6 +3503,12 @@ async def _persist_external_session_usage(
         )
     has_provider_usage_limits = "provider_usage_limits" in body.data
     raw_provider_usage_limits = body.data.get("provider_usage_limits")
+    has_pi_provider_headers = "pi_provider_usage_limits_headers" in body.data
+    if has_pi_provider_headers:
+        raw_provider_usage_limits = pi_provider_usage_limits_from_headers(
+            body.data["pi_provider_usage_limits_headers"], captured_at=now_epoch()
+        )
+        has_provider_usage_limits = True
     try:
         provider_usage_limits = validate_provider_usage_limits_snapshot(raw_provider_usage_limits)
     except ValueError as exc:
@@ -3514,6 +3522,34 @@ async def _persist_external_session_usage(
     last_cache_read = _optional_label_int(body.data.get("last_cache_read_input_tokens"))
     last_cache_creation = _optional_label_int(body.data.get("last_cache_creation_input_tokens"))
     last_cache_observed_at = _optional_label_int(body.data.get("last_usage_observed_at"))
+    has_pi_cache = "pi_cache_ttl_seconds" in body.data
+    pi_cache_ttl = body.data.get("pi_cache_ttl_seconds")
+    pi_cache_values: list[int] = []
+    if (
+        has_pi_cache
+        and pi_cache_ttl is not None
+        and (
+            isinstance(pi_cache_ttl, bool)
+            or not isinstance(pi_cache_ttl, int)
+            or not 1 <= pi_cache_ttl <= 86400
+        )
+    ):
+        raise OmnigentError(
+            "external_session_usage has invalid Pi cache data", code=ErrorCode.INVALID_INPUT
+        )
+    if has_pi_cache and pi_cache_ttl is not None:
+        for key in (
+            "pi_cache_observed_at",
+            "pi_cache_read_input_tokens",
+            "pi_cache_write_input_tokens",
+        ):
+            value = body.data.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**53:
+                raise OmnigentError(
+                    "external_session_usage has invalid Pi cache data",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            pi_cache_values.append(value)
     _CUMULATIVE_USAGE_KEYS = (
         "cumulative_cost_usd",
         # ``policy_cost_usd`` alone is a valid post: mid-turn the displayed
@@ -3529,12 +3565,14 @@ async def _persist_external_session_usage(
         and raw_window is None
         and not has_auto_compact_token_limit
         and not has_provider_usage_limits
+        and not has_pi_cache
         and not has_cumulative
     ):
         raise OmnigentError(
             "external_session_usage requires at least one of "
             "data.context_tokens, data.context_window, data.auto_compact_token_limit, "
             "data.provider_usage_limits, "
+            "data.pi_cache_ttl_seconds, "
             "or a cumulative usage field",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -3571,6 +3609,8 @@ async def _persist_external_session_usage(
             )
         )
     label_updates: dict[str, str] = {}
+    if has_pi_cache and pi_cache_ttl is not None:
+        label_updates["omnigent.pi_cache"] = pi_cache_label(pi_cache_ttl, *pi_cache_values)
     if raw_tokens is not None:
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
     if raw_window is not None:
@@ -3597,6 +3637,8 @@ async def _persist_external_session_usage(
             session_id,
             _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
         )
+    if has_pi_cache and pi_cache_ttl is None:
+        await asyncio.to_thread(conversation_store.delete_label, session_id, "omnigent.pi_cache")
     if has_provider_usage_limits:
         await asyncio.to_thread(
             conversation_store.set_provider_usage_limits,
@@ -3604,7 +3646,10 @@ async def _persist_external_session_usage(
             provider_usage_limits,
         )
         if quota_service is not None and conv is not None:
-            await asyncio.to_thread(quota_service.report_claude, conv, provider_usage_limits)
+            report_quota = (
+                quota_service.report_pi if has_pi_provider_headers else quota_service.report_claude
+            )
+            await asyncio.to_thread(report_quota, conv, provider_usage_limits)
         # Remove the legacy label after the metadata write. Old snapshots can
         # exceed conversation_labels.value (256 chars) and become invalid JSON.
         await asyncio.to_thread(

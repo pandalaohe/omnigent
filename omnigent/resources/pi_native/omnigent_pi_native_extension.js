@@ -1037,7 +1037,7 @@ function toInt(value) {
  * full input a turn sent is ``input + cacheRead + cacheWrite``.
  *
  * @returns {{input:number,output:number,cacheRead:number,cacheWrite:number,
- *   total:number,model:(string|null)}|null} the per-message counts, or
+ *   total:number,model:(string|null),provider:(string|null)}|null} the per-message counts, or
  *   ``null`` when ``message`` is not an assistant message carrying usage.
  */
 function extractPiUsage(message) {
@@ -1055,6 +1055,8 @@ function extractPiUsage(message) {
   if (!(input || output || cacheRead || cacheWrite)) return null;
   const rawModel = message.model;
   const model = typeof rawModel === "string" && rawModel ? rawModel : null;
+  const rawProvider = message.provider;
+  const provider = typeof rawProvider === "string" && rawProvider ? rawProvider : null;
   return {
     input,
     output,
@@ -1062,6 +1064,7 @@ function extractPiUsage(message) {
     cacheWrite,
     total: toInt(usage.totalTokens),
     model,
+    provider,
   };
 }
 
@@ -1958,6 +1961,9 @@ module.exports = function (pi) {
   let cumulativeCacheReadTokens = 0;
   let usageModel = null;
   let lastPostedUsageKey = "";
+  let lastCacheUsage = null;
+  let lastCacheWarmEntryId = null;
+  let cacheWarmPoller = null;
 
   // Build a stable fingerprint for one assistant message so the same message
   // arriving on multiple lifecycle events is only counted once. Pi's
@@ -1980,7 +1986,7 @@ module.exports = function (pi) {
       if (typeof message.timestamp === "number")
         return `ts:${message.timestamp}`;
     }
-    return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
+    return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.provider || ""}-${usage.model || ""}`;
   }
 
   // Fold one assistant message's usage into the cumulative session totals,
@@ -2002,6 +2008,13 @@ module.exports = function (pi) {
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
     if (usage.model) usageModel = usage.model;
+    lastCacheUsage = {
+      observedAt: Math.floor(Date.now() / 1000),
+      read: usage.cacheRead,
+      write: usage.cacheWrite,
+      model: usage.model,
+      provider: usage.provider,
+    };
     return true;
   }
 
@@ -2009,18 +2022,73 @@ module.exports = function (pi) {
   // ``session.usage`` event. Cumulative (SET) semantics — the server overwrites
   // its stored totals each flush. Deduped so a flush with no advance is a
   // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
-  async function postSessionUsage() {
-    if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
-    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
-    if (postKey === lastPostedUsageKey) return;
-    lastPostedUsageKey = postKey;
+  async function postSessionUsage(ctx) {
     const data = {
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
     };
     if (usageModel) data.model = usageModel;
+    if (lastCacheUsage) {
+      const currentModel = ctx && ctx.model;
+      const retention = process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
+      const sameModelAndProvider = currentModel &&
+        lastCacheUsage.model && lastCacheUsage.model === currentModel.id &&
+        lastCacheUsage.provider && lastCacheUsage.provider === currentModel.provider;
+      const ttl = sameModelAndProvider && currentModel.promptCache &&
+        currentModel.promptCache[retention];
+      data.pi_cache_ttl_seconds = Number.isInteger(ttl) && ttl > 0 ? ttl : null;
+      if (data.pi_cache_ttl_seconds !== null) {
+        data.pi_cache_observed_at = lastCacheUsage.observedAt;
+        data.pi_cache_read_input_tokens = lastCacheUsage.read;
+        data.pi_cache_write_input_tokens = lastCacheUsage.write;
+      }
+    }
+    if (ctx && typeof ctx.getContextUsage === "function") {
+      try {
+        const snapshot = ctx.getContextUsage();
+        if (snapshot && typeof snapshot === "object") {
+          if (Number.isInteger(snapshot.tokens) && snapshot.tokens >= 0)
+            data.context_tokens = snapshot.tokens;
+          if (Number.isInteger(snapshot.contextWindow) && snapshot.contextWindow > 0)
+            data.context_window = snapshot.contextWindow;
+        }
+      } catch (_err) {
+        // Older Pi versions may not expose a usable context snapshot.
+      }
+    }
+    if (!(cumulativeInputTokens || cumulativeOutputTokens || data.context_window ||
+          data.pi_cache_ttl_seconds !== undefined)) return;
+    const postKey = JSON.stringify(data);
+    if (postKey === lastPostedUsageKey) return;
+    lastPostedUsageKey = postKey;
     await postEvent(config, { type: "external_session_usage", data });
+  }
+
+  async function observeCacheWarmUsage(ctx) {
+    if (!ctx || !ctx.sessionManager ||
+        typeof ctx.sessionManager.getEntries !== "function") return;
+    let entries;
+    try { entries = ctx.sessionManager.getEntries(); }
+    catch (_err) { return; }
+    if (!Array.isArray(entries)) return;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (!entry || entry.type !== "usage" || entry.kind !== "cache_warm") continue;
+      if (entry.id === lastCacheWarmEntryId) return;
+      lastCacheWarmEntryId = entry.id;
+      const observedAt = Math.floor(Date.parse(entry.timestamp) / 1000);
+      const usage = extractPiUsage({ role: "assistant", usage: entry.usage,
+        model: entry.model, provider: entry.provider });
+      if (!Number.isInteger(observedAt) || !usage ||
+          (lastCacheUsage && observedAt < lastCacheUsage.observedAt)) return;
+      lastCacheUsage = {
+        observedAt, read: usage.cacheRead, write: usage.cacheWrite,
+        model: usage.model, provider: usage.provider,
+      };
+      await postSessionUsage(ctx);
+      return;
+    }
   }
 
   function rememberContext(ctx) {
@@ -2289,6 +2357,8 @@ module.exports = function (pi) {
   }
 
   pi.on("session_shutdown", async () => {
+    if (cacheWarmPoller) clearInterval(cacheWarmPoller);
+    cacheWarmPoller = null;
     clearTimeout(pi.__omnigentRotationRetry);
     clearInterval(pi.__omnigentInboxPoller);
     pi.__omnigentInboxPoller = null;
@@ -2296,6 +2366,8 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (event, ctx) => {
     rememberContext(ctx);
+    if (cacheWarmPoller) clearInterval(cacheWarmPoller);
+    cacheWarmPoller = null;
     if (config && config.serverUrl && config.sessionId &&
         event && event.reason === "startup" && !config.pendingRotationSource) {
       try {
@@ -2320,6 +2392,11 @@ module.exports = function (pi) {
       pi.__omnigentInboxPoller = null;
       if (await resumeRotation(ctx)) return;
     }
+    cacheWarmPoller = setInterval(() => {
+      void observeCacheWarmUsage(latestContext);
+    }, 15000);
+    cacheWarmPoller.unref?.();
+    await observeCacheWarmUsage(ctx);
     registerTaskToolIfMissing();
     const permissionState = readPermissionState(config);
     if (permissionState && typeof pi.getActiveTools === "function") {
@@ -2432,14 +2509,63 @@ module.exports = function (pi) {
     // the inbox ``model_change``) round-trips here as a no-op.
     const source =
       event && typeof event.source === "string" ? event.source : "";
-    if (source === "restore") return;
+    if (source === "restore") {
+      await postEvent(config, {
+        type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
+      });
+      return;
+    }
     const model = event && event.model ? event.model : undefined;
     const selectedModel = modelReference(model);
-    if (!selectedModel) return;
+    if (!selectedModel) {
+      await postEvent(config, {
+        type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
+      });
+      return;
+    }
     await postEvent(config, {
       type: "external_model_change",
       data: { model: selectedModel },
     });
+    if (lastCacheUsage) await postSessionUsage(ctx);
+    else await postEvent(config, {
+      type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
+    });
+  });
+
+  pi.on("after_provider_response", async (event) => {
+    const raw = event && event.headers;
+    const headers = {};
+    for (const [name, value] of Object.entries(raw && typeof raw === "object" ? raw : {})) {
+      const normalized = name.toLowerCase();
+      if (
+        /^anthropic-ratelimit-(requests|tokens|input-tokens|output-tokens)-(limit|remaining|reset)$/.test(normalized) &&
+        typeof value === "string" && value.length <= 128
+      ) {
+        headers[normalized] = value;
+      }
+    }
+    await postEvent(config, {
+      type: "external_session_usage",
+      data: { pi_provider_usage_limits_headers: headers },
+    });
+  });
+
+  pi.on("cache_warming_decision", async (event) => {
+    if (!event || event.action !== "warm") return { action: "stop" };
+    // Pi's running-turn policy remains its own. Idle refresh also needs the
+    // owner's live Omnigent switch and cap, checked at each planned refresh.
+    if (event.continuationProbability === 1) return { action: "warm" };
+    try {
+      const response = await postEventChecked(config, {
+        type: "external_session_usage",
+        data: { pi_cache_warming_probe: true },
+      });
+      const policy = response && await response.json();
+      return { action: policy && policy.pi_cache_warming_allowed === true ? "warm" : "stop" };
+    } catch (_err) {
+      return { action: "stop" };
+    }
   });
 
   pi.on("agent_start", async (_event, ctx) => {
@@ -2491,11 +2617,10 @@ module.exports = function (pi) {
     // so a plain forward-scan is safe (no overcount).
     const messages =
       event && Array.isArray(event.messages) ? event.messages : [];
-    let changed = false;
     for (const message of messages) {
-      if (accumulateUsage(message)) changed = true;
+      accumulateUsage(message);
     }
-    if (changed) await postSessionUsage();
+    await postSessionUsage(ctx);
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
     const endResponseId =
@@ -2681,7 +2806,8 @@ module.exports = function (pi) {
     // ``message_end`` is the primary usage-capture site (one completed
     // assistant message per LLM call); fold its token counts into the
     // cumulative session totals and flush to the server for pricing.
-    if (accumulateUsage(message)) await postSessionUsage();
+    accumulateUsage(message);
+    await postSessionUsage(ctx);
     // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
     // unsupported API types) as visible error items in the web UI so users
     // aren't left staring at an empty turn.
@@ -2743,7 +2869,8 @@ module.exports = function (pi) {
     // assistant message but no ``message_end`` carried it, fold it in here.
     // Deduped by fingerprint, so a message already counted on ``message_end``
     // is a no-op.
-    if (accumulateUsage(event && event.message)) await postSessionUsage();
+    accumulateUsage(event && event.message);
+    await postSessionUsage(ctx);
     const results =
       event && Array.isArray(event.toolResults) ? event.toolResults : [];
     for (const result of results) {

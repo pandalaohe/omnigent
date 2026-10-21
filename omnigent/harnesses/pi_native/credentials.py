@@ -1943,7 +1943,9 @@ def pi_native_provider_launch(
     # thinking preference that may belong to a different provider.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
-    overlay: dict[str, object] = {"defaultThinkingLevel": None}
+    # This root is session-scoped; Pi's own warmer still asks Omnigent before
+    # every idle refresh, so the live owner switch and cap remain authoritative.
+    overlay: dict[str, object] = {"defaultThinkingLevel": None, "cacheWarming": "idle"}
     # Only configured shortlists override the user's picker preferences.
     # Qualified refs distinguish managed models from built-in providers.
     enabled_refs = _enabled_model_refs(rendered)

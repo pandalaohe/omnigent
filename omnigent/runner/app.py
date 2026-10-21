@@ -4295,6 +4295,16 @@ def create_runner_app(
 
         permission_tier_ack: str | None = None
         try:
+            if harness_name == "pi":
+                from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+
+                # The RPC Pi extension can report idle usage before any web
+                # turn, so bind its session relay before permission bootstrap.
+                await _ensure_comment_relay_started(
+                    session_id,
+                    explicit_bridge_dir=bridge_dir_for_session_id(session_id),
+                    session_labels=init_context.labels,
+                )
             if (
                 harness_name == "pi"
                 and init_context.envelope is not None
