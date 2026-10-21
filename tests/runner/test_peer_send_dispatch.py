@@ -115,6 +115,8 @@ async def test_flag_off_child_path_still_delivers() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == f"/v1/sessions/{_TARGET}":
             return httpx.Response(200, json=_snapshot(parent=_CALLER))
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{_TARGET}/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "PATCH":
             return httpx.Response(200, json={"id": _TARGET})
         if request.method == "POST":

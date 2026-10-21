@@ -5589,6 +5589,8 @@ async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         """Serve two sends to the same child and policy checks for drains."""
         nonlocal lookup_count
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if (
             request.method == "GET"
             and request.url.path == f"/v1/sessions/{parent_id}/child_sessions"

@@ -117,6 +117,8 @@ async def _dispatch(
             )
         if request.method == "PATCH" and path == f"/v1/sessions/{_CHILD_ID}":
             return httpx.Response(200, json={"id": _CHILD_ID})
+        if request.method == "GET" and path == f"/v1/sessions/{_CHILD_ID}/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and path == f"/v1/hosts/{_MEMBER_HOST}":
             calls["host"] += 1
             return httpx.Response(
@@ -419,6 +421,8 @@ async def test_by_id_continuation_of_a_remote_child_is_marked_started(
         if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
             calls["patch"] += 1
             return httpx.Response(200, json={"id": child_id})
+        if request.method == "GET" and path == f"/v1/sessions/{child_id}/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             calls["events"] += 1
             return httpx.Response(202, json={"queued": True})

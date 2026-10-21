@@ -2020,10 +2020,27 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         executable.write_text(f"#!{sys.executable}\n{body}")
         executable.chmod(0o755)
     parameters = "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\n"
-    timer = (
-        "import threading\noriginal_timer = threading.Timer\n"
-        "threading.Timer = lambda seconds, callback: original_timer(0.2, callback)\n"
-    )
+    timer = ""
+    if mode == "timeout":
+        # Arm the shortened deadline after the controlled executable starts;
+        # interpreter startup under load is not the process-reaping scenario.
+        timer = (
+            "import subprocess, threading, time, os\n"
+            "original_timer = threading.Timer\n"
+            "original_popen = subprocess.Popen\n"
+            "def started(*args, **kwargs):\n"
+            "    process = original_popen(*args, **kwargs)\n"
+            "    deadline = time.monotonic() + 3\n"
+            f"    while not os.path.exists({str(tmp_path / 'pid')!r}):\n"
+            "        if process.poll() is not None or time.monotonic() >= deadline:\n"
+            "            process.kill()\n"
+            "            process.wait()\n"
+            "            raise AssertionError('controlled rg did not become ready')\n"
+            "        time.sleep(0.01)\n"
+            "    return process\n"
+            "subprocess.Popen = started\n"
+            "threading.Timer = lambda seconds, callback: original_timer(0.2, callback)\n"
+        )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
         env={**os.environ, "PATH": str(tmp_path)},

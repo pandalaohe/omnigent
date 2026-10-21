@@ -123,8 +123,9 @@ def test_child_summary_derives_warm_state_from_the_keep_warm_label() -> None:
         is None
     )
     assert _summary({}, harness="opencode-native", live_status="running").warm_state is None
-    # No label, unsupported harness, and archived children read None.
-    assert _summary({}, harness="claude-native").warm_state is None
+    # A supported harness with no usable warm stamp reads cold.
+    assert _summary({}, harness="claude-native").warm_state == "cold"
+    # Unsupported harnesses and archived children read None.
     assert _summary({keep_warm: warm}, harness="opencode-native").warm_state is None
     assert _summary({keep_warm: warm}, harness=None).warm_state is None
     archived = Conversation(

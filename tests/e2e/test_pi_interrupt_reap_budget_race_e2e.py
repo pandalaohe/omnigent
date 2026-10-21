@@ -128,6 +128,9 @@ async def test_rpc_prompt_command_sets_streaming_behavior() -> None:
         async def drain(self) -> None:
             return None
 
+        def close(self) -> None:
+            return None
+
     class _StubReader:
         def __init__(self, lines: list[str]) -> None:
             self._chunks = [(line + "\n").encode() for line in lines]

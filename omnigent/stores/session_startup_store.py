@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from sqlalchemy import case, func, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -66,16 +67,25 @@ class SessionStartupStore:
             .with_for_update()
         )
         if deployment is None:
-            try:
-                with db.begin_nested():
-                    db.add(
-                        SqlStartupBudget(
-                            scope="deployment", resident_limit=0, next_sequence=0, fenced=False
+            if db.get_bind().dialect.name == "mysql":
+                # A deadlock rolls back MySQL's whole transaction, including
+                # savepoints. Let the outer transaction retry see the error.
+                db.execute(
+                    mysql_insert(SqlStartupBudget)
+                    .values(scope="deployment", resident_limit=0, next_sequence=0, fenced=False)
+                    .on_duplicate_key_update(scope="deployment")
+                )
+            else:
+                try:
+                    with db.begin_nested():
+                        db.add(
+                            SqlStartupBudget(
+                                scope="deployment", resident_limit=0, next_sequence=0, fenced=False
+                            )
                         )
-                    )
-                    db.flush()
-            except IntegrityError:
-                pass  # Another replica initialized the singleton.
+                        db.flush()
+                except IntegrityError:
+                    pass  # Another replica initialized the singleton.
             deployment = db.scalar(
                 select(SqlStartupBudget)
                 .where(SqlStartupBudget.scope == "deployment")

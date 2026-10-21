@@ -369,7 +369,7 @@ def _wait_for_prompt_ready(
     # toolbar's ``· ready`` (idle ``state: sleeping``) marker
     # so the next send() lands in prompt_toolkit's live loop
     # instead of racing ahead of it.
-    child.expect(r"·\s*ready", timeout=timeout)
+    child.expect([r"·\s*ready", r"state: sleeping", r"❯ "], timeout=timeout)
 
 
 def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
@@ -395,7 +395,7 @@ def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
     :param child: Active pexpect child.
     :param timeout: Max seconds to wait for the turn to settle.
     """
-    child.expect(r"·\s*ready", timeout=timeout)
+    child.expect([r"·\s*ready", r"state: sleeping", r"❯ "], timeout=timeout)
 
 
 def _read_pending(child: Any, seconds: float = 0.2) -> str:
