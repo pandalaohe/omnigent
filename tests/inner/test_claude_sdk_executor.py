@@ -1435,6 +1435,34 @@ class TestConstructor(unittest.TestCase):
             with self.subTest(speed=speed):
                 _run(_t(speed, expected))
 
+    def test_usage_capture_enables_sdk_transcript_persistence_only_when_enabled(self):
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def inspect_options(enabled: bool) -> None:
+            executor = ClaudeSDKExecutor(gateway=False)
+            captured = {}
+
+            async def stop_before_launch(sdk, *, session_key, options, model):
+                captured["options"] = options
+                raise RuntimeError("stop before CLI launch")
+
+            with patch.object(executor, "_get_or_create_client", side_effect=stop_before_launch):
+                with pytest.raises(RuntimeError, match="stop before CLI launch"):
+                    async for _ in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "session"}], [], ""
+                    ):
+                        pass
+            options = captured["options"]
+            assert isinstance(options, ClaudeAgentOptions)
+            assert options.extra_args == ({} if enabled else {"no-session-persistence": None})
+
+        with patch.dict(os.environ, {"OMNIGENT_USAGE_EXPORT_CAPTURE": "1"}):
+            _run(inspect_options(True))
+        with patch.dict(os.environ, {"OMNIGENT_USAGE_EXPORT_CAPTURE": ""}):
+            _run(inspect_options(False))
+
     def test_force_close_client_uses_process_tree_termination(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
