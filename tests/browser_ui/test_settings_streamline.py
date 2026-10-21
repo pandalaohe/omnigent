@@ -145,6 +145,119 @@ def test_child_freeze_default_and_exception_stay_compact(
 
 
 @pytest.mark.parametrize("width", [1440, 390])
+def test_quota_default_and_registry_product_exception_persist(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    request: pytest.FixtureRequest,
+) -> None:
+    agents = [
+        {
+            "id": f"{harness}-agent",
+            "name": "codex-native-ui" if harness == "codex-native" else "kite",
+            "harness": harness,
+            "builtin": True,
+            "product_of": harness,
+            "integration_mode": "native-tui",
+        }
+        for harness in ("codex-native", "kite-native")
+    ]
+    browser_contract.json("/v1/agents", {"data": agents, "has_more": False})
+    browser_contract.json(
+        "/v1/instruction-layers",
+        {
+            "data": [],
+            "agents": [],
+            "order": [],
+            "route_sizes": [],
+            "size_reminder_chars": 20000,
+        },
+    )
+    browser_contract.json(
+        "/v1/harnesses",
+        {
+            "data": [],
+            "capabilities_by_harness": {
+                "codex-native": {"integration_mode": "native-tui", "native_agent_key": "codex"},
+                "kite-native": {"integration_mode": "native-tui", "native_agent_key": "kite"},
+            },
+        },
+    )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "example-host",
+                    "name": "Example host",
+                    "owner": "local",
+                    "status": "online",
+                    "configured_harnesses": {"codex-native": True, "kite-native": True},
+                }
+            ]
+        },
+    )
+    saved = {"quotaPeriods": {"codex": "7d"}}
+
+    def save(incoming: Request) -> dict[str, bool]:
+        saved.update(incoming.post_data_json["value"])
+        return {"ok": True}
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"session_collab": saved}},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/preferences",
+        lambda _: {
+            "user_id": "local",
+            "preferences": {"version": 1, "settings": {"session_collab": saved}},
+        },
+    )
+    browser_contract.json("/v1/me/preferences/session_collab", save, method="PATCH")
+    page.add_init_script(
+        "if (!localStorage.getItem('omnigent:session-collab')) "
+        f"localStorage.setItem('omnigent:session-collab', {json.dumps(json.dumps(saved))})"
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{appearance_url}/settings/instructions")
+    section = page.locator('section[aria-labelledby="child-sessions-heading"]')
+    expect(section.get_by_role("textbox", name="All products")).to_have_value("")
+    expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
+    section.get_by_role("textbox", name="All products").fill("5h")
+    section.get_by_role("button", name="Add exception").click()
+    picker = page.get_by_role("dialog", name="Add exception")
+    expect(picker.get_by_role("textbox", name="Search agents")).to_be_focused()
+    picker.get_by_role("textbox", name="Search agents").fill("kite")
+    expect(picker.get_by_role("button", name=re.compile("Kite.*Native CLI"))).to_be_visible()
+    assert picker.evaluate("element => element.scrollWidth <= element.clientWidth")
+    picker.get_by_role("button", name=re.compile("Kite.*Native CLI")).click()
+    section.get_by_role("textbox", name="Kite period").fill("month")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/session_collab")
+        )
+    ):
+        section.get_by_role("button", name="Save child settings").click()
+    assert saved["quotaPeriodDefault"] == "5h"
+    assert saved["quotaPeriods"] == {"codex": "7d", "kite": "month"}
+    page.reload()
+    expect(section.get_by_role("textbox", name="All products")).to_have_value("5h")
+    expect(section.get_by_role("button", name="Edit Kite")).to_be_visible()
+    expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"quota-periods-{width}.png"), full_page=True)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
 def test_reserve_width_persists_and_settings_fit(
     page: Page, appearance_url: str, width: int, request: pytest.FixtureRequest
 ) -> None:

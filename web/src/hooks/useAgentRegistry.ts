@@ -13,6 +13,7 @@ import {
 } from "@/hooks/useAvailableAgents";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import {
+  BRAIN_HARNESS_LABELS,
   capitalizeAgentName,
   fetchHarnessCatalog,
   type HarnessCatalog,
@@ -28,6 +29,7 @@ export type RegistryKey = string;
 export interface RegistryItem {
   key: RegistryKey;
   label: string;
+  name?: string;
   section: SectionId;
   harness: string | null;
   description: string | null;
@@ -52,6 +54,51 @@ export const SECTION_GLOSSES: Partial<Record<SectionId, string>> = {
 };
 
 export const SECTION_ORDER: SectionId[] = ["yours", "native", "sdk", "acp", "builtin", "other"];
+
+export interface RegistryHarnessOption {
+  id: string;
+  label: string;
+  section: SectionId;
+  deployed: boolean;
+}
+
+/** Harness menu rows; an allowed list keeps brain-only menus within their catalog. */
+export function registryHarnessOptions(
+  items: readonly RegistryItem[],
+  fallbackLabels: Record<string, string> = {},
+  allowedIds?: readonly string[],
+): RegistryHarnessOption[] {
+  const harnessItems = items.filter((item) => item.key.startsWith("harness:") && item.harness);
+  const byId = new Map(harnessItems.map((item) => [item.harness!, item]));
+  const ids = allowedIds ?? harnessItems.map((item) => item.harness!);
+  return [...new Set(ids)].flatMap((id) => {
+    const item = byId.get(id);
+    if (allowedIds && item?.section === "native") return [];
+    return [
+      {
+        id,
+        label: item?.label ?? fallbackLabels[id] ?? id,
+        section: item?.section ?? "other",
+        deployed: item?.deployed ?? true,
+      },
+    ];
+  });
+}
+
+/** Resolve display names without changing the stored source identity. */
+export function registrySourceLabels(
+  items: readonly RegistryItem[],
+  agentName: string | null | undefined,
+  harness: string | null | undefined,
+): { agentLabel: string; harnessLabel: string } {
+  const agent = items.find((item) => item.name === agentName && item.harness === harness);
+  const harnessItem = harness ? items.find((item) => item.key === `harness:${harness}`) : undefined;
+  return {
+    agentLabel: agent?.label ?? (agentName || "Unknown"),
+    harnessLabel:
+      harnessItem?.label ?? (harness ? (BRAIN_HARNESS_LABELS[harness] ?? harness) : "Unknown"),
+  };
+}
 
 function harnessSection(mode: string | null | undefined, harness: string | null): SectionId {
   if (mode === "native-tui" || mode === "native-server") return "native";
@@ -126,6 +173,7 @@ export function buildRegistry(
     add({
       key: `harness:${harness}`,
       label: agent.display_name,
+      name: agent.name,
       section: harnessSection(
         capabilityFor(harness)?.integration_mode ?? agent.integration_mode,
         harness,
@@ -175,6 +223,7 @@ export function buildRegistry(
       const harness = agent.harness ?? null;
       add({
         key: agent.id,
+        name: "name" in agent ? agent.name : agent.display_name,
         label:
           source === "installed" && "name" in agent
             ? capitalizeAgentName(agent.name)
@@ -221,6 +270,7 @@ export function buildLegacyProductRegistry(
           {
             key: agent.id,
             label: agent.display_name,
+            name: agent.name,
             section: pickerItem?.section ?? harnessSection(agent.integration_mode, harness),
             harness,
             description: agent.description,

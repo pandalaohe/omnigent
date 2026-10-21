@@ -4,7 +4,12 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { HarnessCatalog } from "@/lib/agentLabels";
 import type { CustomAgent } from "@/lib/customAgentsApi";
 import type { Host } from "@/hooks/useHosts";
-import { buildLegacyProductRegistry, buildRegistry } from "./useAgentRegistry";
+import {
+  buildLegacyProductRegistry,
+  buildRegistry,
+  registryHarnessOptions,
+  registrySourceLabels,
+} from "./useAgentRegistry";
 
 function agent(id: string, name: string, harness: string, product_of?: string): AvailableAgent {
   return {
@@ -203,5 +208,59 @@ describe("settings agent registry", () => {
         (item) => item.deployed,
       ),
     ).toBe(true);
+  });
+
+  it("keeps brain harness membership while grouping dynamic worker and source labels", () => {
+    const items = buildRegistry(
+      [agent("native-product", "Native X", "native-x", "native-x")],
+      [],
+      [],
+      {
+        ...harnesses,
+        rows: [
+          {
+            id: "plugin-sdk",
+            label: "Plugin SDK",
+            capabilities: { integration_mode: "sdk-in-process" },
+          },
+        ],
+        capabilitiesByHarness: {
+          "native-x": { integration_mode: "native-tui" },
+          "plugin-sdk": { integration_mode: "sdk-in-process" },
+        },
+      },
+      hosts,
+    );
+    expect(
+      registryHarnessOptions(items, { "plugin-sdk": "Plugin SDK" }, ["plugin-sdk", "native-x"]),
+    ).toEqual([{ id: "plugin-sdk", label: "Plugin SDK", section: "sdk", deployed: false }]);
+    expect(registryHarnessOptions(items).map((item) => item.id)).toContain("native-x");
+    expect(registrySourceLabels(items, "Native X", "native-x").harnessLabel).toBe("Native X");
+  });
+
+  it("carries deployment status into harness menus and fails open for missing registry rows", () => {
+    const items = buildRegistry(
+      [],
+      [],
+      [],
+      {
+        ...harnesses,
+        rows: [{ id: "plugin-sdk", label: "Plugin SDK" }],
+        capabilitiesByHarness: { "plugin-sdk": { integration_mode: "sdk-in-process" } },
+      },
+      [
+        {
+          host_id: "unconfigured-host",
+          name: "Laptop",
+          owner: "me",
+          status: "offline",
+          configured_harnesses: { "plugin-sdk": false },
+        },
+      ],
+    );
+    expect(registryHarnessOptions(items, { absent: "Absent" }, ["plugin-sdk", "absent"])).toEqual([
+      { id: "plugin-sdk", label: "Plugin SDK", section: "sdk", deployed: false },
+      { id: "absent", label: "Absent", section: "other", deployed: true },
+    ]);
   });
 });

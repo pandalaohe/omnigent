@@ -147,7 +147,11 @@ class AgentQuotaService:
                     normalize_claude_labels=str(newest.get("provider", "")).lower() == "claude",
                 )
             )
-            period = settings.quota_periods.get(product) or newest.get("pinned_period")
+            period = (
+                settings.quota_periods.get(product)
+                or settings.quota_period_default
+                or newest.get("pinned_period")
+            )
             result[product] = agent_quota(windows, tiers, now=now, deciding_period=period)
         return tiers, result
 

@@ -901,6 +901,7 @@ def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
             "quotaTightBelowPct": 45.5,
             "quotaLowBelowPct": 15,
             "quotaFloorPct": 2.5,
+            "quotaPeriodDefault": "month",
             "quotaPeriods": {"claude": "5h", "codex": "7d"},
             "unexpectedKey": {"nested": True},
         },
@@ -925,6 +926,7 @@ def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
         quota_tight_below_pct=45.5,
         quota_low_below_pct=15,
         quota_floor_pct=2.5,
+        quota_period_default="month",
         quota_periods={"claude": "5h", "codex": "7d"},
     )
 
@@ -942,6 +944,7 @@ def test_read_collab_settings_defaults_invalid_quota_pair_without_losing_other_f
             "quotaLowBelowPct": 60,
             "quotaTightBelowPct": 50,
             "quotaFloorPct": 0,
+            "quotaPeriodDefault": "bad period",
             "quotaPeriods": {
                 "claude": "5h",
                 "codex": "7d",
@@ -956,6 +959,7 @@ def test_read_collab_settings_defaults_invalid_quota_pair_without_losing_other_f
     assert settings.child_cap is None
     assert (settings.quota_low_below_pct, settings.quota_tight_below_pct) == (20, 50)
     assert settings.quota_floor_pct == 0
+    assert settings.quota_period_default is None
     assert settings.quota_periods == {"claude": "5h", "codex": "7d"}
 
 

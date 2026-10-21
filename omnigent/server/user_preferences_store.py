@@ -475,6 +475,7 @@ class CollabSettings:
     quota_tight_below_pct: float = 50
     quota_low_below_pct: float = 20
     quota_floor_pct: float | None = None
+    quota_period_default: str | None = None
     quota_periods: dict[str, str] = field(default_factory=dict)
 
 
@@ -575,6 +576,9 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     floor = _collab_percentage(value.get("quotaFloorPct"), 0, 100)
     if floor is not None:
         resolved["quota_floor_pct"] = floor
+    period_default = value.get("quotaPeriodDefault")
+    if isinstance(period_default, str) and _QUOTA_PERIOD_PATTERN.fullmatch(period_default):
+        resolved["quota_period_default"] = period_default
     periods = value.get("quotaPeriods")
     if isinstance(periods, dict):
         from omnigent.harness_plugins import native_agents

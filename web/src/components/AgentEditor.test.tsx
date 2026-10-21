@@ -21,6 +21,17 @@ vi.mock("@/lib/customAgentsApi", () => ({
 vi.mock("@/lib/agentLabels", () => ({
   BRAIN_HARNESS_LABELS: { "claude-sdk": "Claude SDK" },
   useBrainHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),
+  fetchHarnessCatalog: vi.fn().mockResolvedValue({}),
+}));
+
+vi.mock("@/hooks/useAgentRegistry", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useAgentRegistry: () => ({
+    items: [
+      { key: "harness:claude-sdk", harness: "claude-sdk", label: "Claude SDK", section: "sdk" },
+      { key: "harness:codex-native", harness: "codex-native", label: "Codex", section: "native" },
+    ],
+  }),
 }));
 
 vi.mock("@/hooks/useHosts", () => ({

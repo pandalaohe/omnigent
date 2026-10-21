@@ -6,6 +6,72 @@ vi.mock("@/lib/userPreferencesSync", () => ({
   queueUserPreferencePatch: queuePatchMock,
   USER_PREFERENCES_PATCH_REJECTED_EVENT: "omnigent:user-preference-rejected",
 }));
+vi.mock("@/lib/agentLabels", () => ({
+  useHarnessCatalog: (select: (catalog: unknown) => unknown) =>
+    select({
+      capabilitiesByHarness: {
+        "claude-native": { native_agent_key: "claude" },
+        "codex-native": { native_agent_key: "codex" },
+        "kite-native": { native_agent_key: "kite" },
+        polly: { native_agent_key: null },
+      },
+    }),
+}));
+vi.mock("@/hooks/useAgentRegistry", () => ({
+  SECTION_LABELS: {
+    yours: "Your agents",
+    native: "Native CLI",
+    sdk: "SDK",
+    acp: "ACP",
+    builtin: "Built-in agents",
+    other: "Other",
+  },
+  SECTION_ORDER: ["yours", "native", "sdk", "acp", "builtin", "other"],
+  SECTION_GLOSSES: {},
+  useAgentRegistry: () => ({
+    items: [
+      {
+        key: "harness:claude-native",
+        label: "Claude Code",
+        section: "native",
+        harness: "claude-native",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+      {
+        key: "harness:codex-native",
+        label: "Codex",
+        section: "native",
+        harness: "codex-native",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+      {
+        key: "harness:kite-native",
+        label: "Kite",
+        section: "native",
+        harness: "kite-native",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+      {
+        key: "harness:polly",
+        label: "Polly",
+        section: "builtin",
+        harness: "polly",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+    ],
+    isLoading: false,
+    isError: false,
+    retry: vi.fn(),
+  }),
+}));
 
 import { ChildSessionsPanel } from "./ChildSessionsPanel";
 import {
@@ -36,8 +102,13 @@ describe("ChildSessionsPanel", () => {
     fireEvent.change(screen.getByRole("textbox", { name: /Remaining quota floor/ }), {
       target: { value: "0" },
     });
-    fireEvent.change(screen.getByRole("textbox", { name: /Claude.*period/ }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "All products" }), {
       target: { value: "5h" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code.*Native CLI/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Claude Code period/ }), {
+      target: { value: "7d" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
 
@@ -47,13 +118,46 @@ describe("ChildSessionsPanel", () => {
       quotaTightBelowPct: 45.5,
       quotaLowBelowPct: 15,
       quotaFloorPct: 0,
-      quotaPeriods: { claude: "5h" },
+      quotaPeriodDefault: "5h",
+      quotaPeriods: { claude: "7d" },
     });
     expect(queuePatchMock).toHaveBeenLastCalledWith(
       "session_collab",
       expect.objectContaining({ relayDepthMax: 3, childCap: 4 }),
     );
     expect(screen.getByRole("status")).toHaveTextContent("Saved preferences.");
+  });
+
+  it("keeps legacy exceptions and offers a registry plugin without twelve inputs", () => {
+    writeSessionCollabPreferences({
+      ...SESSION_COLLAB_DEFAULTS,
+      quotaPeriods: { codex: "7d" },
+    });
+    render(<ChildSessionsPanel />);
+    expect(screen.getByRole("textbox", { name: "All products" })).toHaveValue("");
+    expect(screen.getByText("7d")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit Codex" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /Claude Code period/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
+    fireEvent.click(screen.getByRole("button", { name: /Kite.*Native CLI/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Kite period/ }), {
+      target: { value: "month" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
+    expect(readSessionCollabPreferences()).toMatchObject({
+      quotaPeriodDefault: null,
+      quotaPeriods: { codex: "7d", kite: "month" },
+    });
+  });
+
+  it("requires a period before saving an added exception", () => {
+    render(<ChildSessionsPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
+    fireEvent.click(screen.getByRole("button", { name: /Kite.*Native CLI/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a period for each exception");
+    expect(queuePatchMock).not.toHaveBeenCalled();
   });
 
   it("keeps invalid thresholds in the draft until corrected", () => {
