@@ -2715,6 +2715,43 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
 
 
 @pytest.mark.asyncio
+async def test_pi_bridged_shell_session_identity_is_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.types import AgentSpec
+
+    monkeypatch.delenv("PI_SESSION_ID", raising=False)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    async def session_id(harness: str, conversation_id: str | None) -> str:
+        result = await execute_tool(
+            tool_name="sys_os_shell",
+            arguments=json.dumps({"command": "printf '%s' \"${PI_SESSION_ID-unset}\""}),
+            agent_spec=spec,
+            conversation_id=conversation_id,
+            effective_harness=harness,
+        )
+        parsed = json.loads(result)
+        assert parsed["exit_code"] == 0
+        return parsed["stdout"]
+
+    assert await session_id("pi", "conv_one") == "conv_one"
+    assert await session_id("pi", "conv_two") == "conv_two"
+    assert await session_id("pi", "conv_one") == "conv_one"
+    assert await session_id("pi", None) == "unset"
+    assert await session_id("codex", "conv_one") == "unset"
+
+
+@pytest.mark.asyncio
 async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool

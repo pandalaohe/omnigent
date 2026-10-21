@@ -262,6 +262,23 @@ def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_pat
     assert kwargs["env"] is env
 
 
+def test_rpc_start_keeps_omnigent_identity_without_saving_session(monkeypatch):
+    import omnigent.inner.pi_executor as pi_mod
+
+    spawn = AsyncMock(return_value=_FakeProcess())
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", spawn)
+
+    async def run():
+        rpc = _PiRpcSession()
+        await rpc.start("/usr/bin/pi", env={"PATH": "/usr/bin"}, session_id="conv_one")
+        await rpc.close()
+
+    _run(run())
+    args = spawn.call_args.args
+    assert args[args.index("--session-id") + 1] == "conv_one"
+    assert "--no-session" in args
+
+
 @pytest.mark.parametrize("failure", ["unknown-shim", "missing-script", "missing-node"])
 def test_rpc_start_reports_unusable_windows_shim(monkeypatch, tmp_path, failure):
     import omnigent.harnesses.pi_cli as pi_cli_mod
@@ -1047,6 +1064,7 @@ def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expec
 
     async def fake_start(self, pi_path, **kwargs):
         seen["model"] = kwargs.get("model")
+        seen["session_id"] = kwargs.get("session_id")
 
     async def _test():
         with (
@@ -1063,6 +1081,41 @@ def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expec
     _run(_test())
 
     assert seen["model"] == f"{expected_provider}/{model}"
+    assert seen["session_id"] == "session"
+
+
+def test_ensure_rpc_reasserts_session_identity_after_process_exit():
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    launched: list[str | None] = []
+
+    async def fake_start(self, pi_path, **kwargs):
+        launched.append(kwargs["session_id"])
+        self.process = _FakeProcess()
+
+    async def fake_close(self):
+        self.process = None
+
+    async def run():
+        with (
+            patch.object(_PiRpcSession, "start", fake_start),
+            patch.object(_PiRpcSession, "close", fake_close),
+            patch.object(
+                executor,
+                "_build_env_and_dir",
+                return_value=PiSubprocessConfig(env={}, tmp_dir="", extra_args=[]),
+            ),
+        ):
+            first = await executor._ensure_rpc("conv_one", "system", None, [])
+            assert await executor._ensure_rpc("conv_one", "system", None, []) is first
+            assert first.process is not None
+            first.process.returncode = 1
+            await executor._ensure_rpc("conv_one", "system", None, [])
+            await executor._ensure_rpc("conv_two", "system", None, [])
+            await executor._ensure_rpc("__default__", "system", None, [])
+            await executor.close()
+
+    _run(run())
+    assert launched == ["conv_one", "conv_one", "conv_two", None]
 
 
 class TestGenerateExtensionJs(unittest.TestCase):
@@ -5082,6 +5135,13 @@ def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
 
     # Exactly the executor-built env — nothing merged from os.environ.
     assert captured["env"] == {"PATH": "/usr/bin", "PI_CODING_AGENT_DIR": "/tmp/pi-agent"}
+
+
+def test_clean_pi_env_rejects_inherited_session_identity(monkeypatch) -> None:
+    from omnigent.inner.pi_executor import _clean_pi_env
+
+    monkeypatch.setenv("PI_SESSION_ID", "unrelated")
+    assert "PI_SESSION_ID" not in _clean_pi_env()
 
 
 def test_redact_argv_for_log_hides_system_prompt() -> None:
