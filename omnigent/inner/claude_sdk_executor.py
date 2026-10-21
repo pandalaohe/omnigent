@@ -946,16 +946,23 @@ class _ClaudePeerReceiptStore:
     async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
         from omnigent.usage_export.runtime import capture_claude_mirror, capture_enabled
 
+        capture_error: Exception | None = None
         if capture_enabled():
             slot = self._owner._query_slots.get(self._session_key)
-            await asyncio.to_thread(
-                capture_claude_mirror,
-                self._session_key,
-                key,
-                entries,
-                internal=slot is not None and slot.maintenance,
-            )
+            try:
+                await asyncio.to_thread(
+                    capture_claude_mirror,
+                    self._session_key,
+                    key,
+                    entries,
+                    internal=slot is not None and slot.maintenance,
+                )
+            except Exception as exc:  # noqa: BLE001 — capture must not suppress peer receipts
+                logger.warning("Claude usage mirror remains pending (%s)", type(exc).__name__)
+                capture_error = exc
         await self._owner._observe_peer_mirror(self._session_key, key, entries)
+        if capture_error is not None:
+            raise capture_error
 
 
 class _KeepWarmPingOutcome(NamedTuple):
@@ -2853,6 +2860,33 @@ class ClaudeSDKExecutor(Executor):
         hooks.setdefault("UserPromptSubmit", []).append(hook_matcher(hooks=[add_context]))
         options.hooks = hooks
 
+    def _install_usage_path_hooks(
+        self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str
+    ) -> None:
+        """Use CLI hook path evidence for main and child SessionStore keys."""
+        from omnigent.usage_export.runtime import capture_claude_hook_path, capture_enabled
+
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None or not capture_enabled():
+            return
+
+        async def observe_path(
+            payload: object, _tool_use_id: str | None, _context: object
+        ) -> _JsonObject:
+            if isinstance(payload, dict):
+                try:
+                    await asyncio.to_thread(capture_claude_hook_path, session_key, payload)
+                except Exception as exc:  # noqa: BLE001 — auxiliary capture hook is fail-open
+                    logger.warning("Claude usage path remains pending (%s)", type(exc).__name__)
+            return {}
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        for event in ("UserPromptSubmit", "Stop", "SubagentStop"):
+            entries = list(hooks.get(event) or [])
+            entries.append(hook_matcher(hooks=[observe_path]))
+            hooks[event] = entries
+        options.hooks = hooks
+
     def _install_peer_hooks(self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str) -> None:
         hook_matcher = getattr(sdk, "HookMatcher", None)
         if hook_matcher is None:
@@ -3380,9 +3414,8 @@ class ClaudeSDKExecutor(Executor):
         # NOT passed: bare mode skips CLAUDE.md auto-discovery,
         # plugin sync, and auto-memory — exactly the host config
         # users expect to leak through to a ``claude-sdk`` harness
-        # they explicitly opted into. ``no-session-persistence``
-        # stays because omnigent owns conversation persistence
-        # via its own conversation store.
+        # they explicitly opted into. Usage capture needs the CLI's
+        # physical transcript; otherwise Omnigent owns persistence.
         # OS-environment tools are provided via Omnigent ``sys_os_*``
         # MCP tools (declared via ``os_env`` in the spec), not the
         # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
@@ -3405,6 +3438,8 @@ class ClaudeSDKExecutor(Executor):
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
         if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
+        from omnigent.usage_export.runtime import capture_enabled
+
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
@@ -3419,7 +3454,7 @@ class ClaudeSDKExecutor(Executor):
             "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
-            "extra_args": {"no-session-persistence": None},
+            "extra_args": {} if capture_enabled() else {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
         # Only forward ``setting_sources`` when explicitly set.
@@ -3488,6 +3523,7 @@ class ClaudeSDKExecutor(Executor):
         if claude_peer_receipts_supported() and getattr(sdk, "HookMatcher", None) is not None:
             options.session_store = _ClaudePeerReceiptStore(self, session_key)
             options.session_store_flush = "eager"
+            self._install_usage_path_hooks(sdk, options, session_key)
             self._install_peer_hooks(sdk, options, session_key)
 
         # Log the full configuration for debugging
