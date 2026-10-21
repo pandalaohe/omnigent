@@ -1496,11 +1496,14 @@ def _clean_pi_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
     :returns: Filtered environment dict, ready to extend with the executor's
         own variables (``PI_CODING_AGENT_DIR``, ...).
     """
-    return clean_agent_env(
+    env = clean_agent_env(
         allow_prefixes=_PI_ENV_ALLOW_PREFIXES,
         allow_exact=_PI_ENV_ALLOW_EXACT,
         extra_allowed=extra_allowed or (),
     )
+    # Pi derives this from its own session manager when a native shell runs.
+    env.pop("PI_SESSION_ID", None)
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -1532,6 +1535,7 @@ class _PiRpcSession:
         system_prompt: str | None = None,
         system_prompt_mode: str = "append",
         thinking: str | None = None,
+        session_id: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
         """
@@ -1556,10 +1560,13 @@ class _PiRpcSession:
         :param thinking: Pi thinking level in Pi's own vocabulary
             (``off``/``minimal``/.../``max``), passed as ``--thinking``.
             ``None`` omits the flag so Pi's model default applies.
+        :param session_id: Omnigent session ID for Pi's in-memory session.
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
         """
         args = [*pi_cli_argv(pi_path), "--mode", "rpc", "--no-session"]
+        if session_id:
+            args.extend(["--session-id", session_id])
         if model:
             pi_coding_agent_dir = env.get("PI_CODING_AGENT_DIR")
             args.extend(
@@ -3131,6 +3138,7 @@ class PiExecutor(Executor):
             system_prompt=system_prompt or None,
             system_prompt_mode="append" if permission_bootstrap else self._system_prompt_mode,
             thinking=thinking,
+            session_id=session_key if session_key != "__default__" else None,
             extra_args=extra_args or None,
         )
         if self._permission_controlled:

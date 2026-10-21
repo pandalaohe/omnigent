@@ -356,6 +356,7 @@ class OSEnvironment(ABC):
         command: str,
         timeout: int | None = None,
         max_output: int | None = None,
+        env_overrides: Mapping[str, str | None] | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -1059,6 +1060,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         command: str,
         timeout: int | None = None,
         max_output: int | None = None,
+        env_overrides: Mapping[str, str | None] | None = None,
     ) -> OpResult:
         if not isinstance(command, str) or not command.strip():
             return {"error": "command must be a non-empty string"}
@@ -1072,6 +1074,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
         }
         if max_output is not None:
             request["max_output"] = max_output
+        if env_overrides is not None:
+            request["env_overrides"] = dict(env_overrides)
         cancel_event = threading.Event()
         try:
             result = await run_sync_on_thread(
@@ -1261,12 +1265,22 @@ def _handle_helper_request(
             max_output_raw if isinstance(max_output_raw, int) else _MAX_TOOL_OUTPUT_CHARS,
             5_000_000,
         )
+        env_overrides = request.get("env_overrides")
+        if env_overrides is not None and (
+            not isinstance(env_overrides, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, (str, type(None)))
+                for key, value in env_overrides.items()
+            )
+        ):
+            return {"error": "env_overrides must map names to strings or null"}
         return _shell_impl(
             command=command,
             timeout=timeout,
             shell_path=shell_path,
             cwd=cwd,
             max_output=max_output,
+            env_overrides=env_overrides,
         )
 
     return {"error": f"Unsupported os_env helper operation: {op!r}"}
@@ -1820,6 +1834,7 @@ def _shell_impl(
     shell_path: str,
     cwd: Path,
     max_output: int = _MAX_TOOL_OUTPUT_CHARS,
+    env_overrides: Mapping[str, str | None] | None = None,
 ) -> OpResult:
     """
     Execute a shell command and return its output.
@@ -1837,11 +1852,18 @@ def _shell_impl(
         characters.
     """
     argv = _shell_argv(shell_path, command)
+    env = _child_shell_env()
+    if env_overrides:
+        for key, value in env_overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
     try:
         with subprocess.Popen(
             argv,
             cwd=str(cwd),
-            env=_child_shell_env(),
+            env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
