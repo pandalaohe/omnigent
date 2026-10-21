@@ -184,8 +184,12 @@ def _list_row(app: FastAPI, session_id: str, *, owner: str = ALICE) -> dict:
     return {item["id"]: item for item in resp.json()["data"]}[session_id]
 
 
-def test_tiered_list_and_recent_require_v1(app, stores):
+def test_tiered_list_and_recent_strip_permission_labels_for_old_clients(
+    app, stores, db_uri, monkeypatch
+):
+    import omnigent.cli as cli_module
     from omnigent.stores.conversation_store import touched_label_key
+    from omnigent.stores.host_store import HostStore
 
     session_id = _seed_session(stores, owner=ALICE, title="Tiered")
     stores[0].set_labels(
@@ -195,15 +199,43 @@ def test_tiered_list_and_recent_require_v1(app, stores):
             touched_label_key(ALICE): str(int(time.time())),
         },
     )
+    host = HostStore(db_uri).upsert_on_connect(
+        "6b9c07bfb42f687d53af44f018adebec", "test-host", ALICE
+    )
+    stores[0].set_host_id(
+        session_id, host_id=host.host_id, workspace="/opt/work/omnigent/fork/test"
+    )
     with TestClient(app) as client:
         for url in ("/v1/sessions", "/v1/me/recent-sessions"):
             headers = {"X-Forwarded-Email": ALICE}
             response = client.get(url, headers=headers)
-            assert response.status_code == 426, response.text
+            assert response.status_code == 200, response.text
+            assert response.json()["data"][0]["id"] == session_id
+            assert "omnigent.pi.permission_tier" not in response.json()["data"][0]["labels"]
             headers["X-Omnigent-Permission-Tiers"] = "1"
             response = client.get(url, headers=headers)
             assert response.status_code == 200, response.text
             assert response.json()["data"][0]["labels"]["omnigent.pi.permission_tier"] == "auto"
+
+        def asgi_host_request(**kwargs):
+            response = client.request(
+                kwargs["method"],
+                kwargs["path"],
+                params=kwargs["params"],
+                headers={"X-Forwarded-Email": ALICE},
+            )
+            return cli_module._HostHttpResult(
+                status_code=response.status_code, body=response.json()
+            )
+
+        monkeypatch.setattr(cli_module, "_host_http_json", asgi_host_request)
+        pages = cli_module._fetch_session_pages(
+            base_url="http://testserver", connected_only=True, host_id=host.host_id
+        )
+        assert pages.error is None
+        assert [row["id"] for row in pages.sessions] == [session_id]
+        assert pages.sessions[0]["host_id"] == host.host_id
+        assert "omnigent.pi.permission_tier" not in pages.sessions[0]["labels"]
 
 
 @pytest.mark.usefixtures("fast_rescan")
