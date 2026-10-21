@@ -1734,6 +1734,24 @@ async def _record_subagent_receipt(
         )
 
 
+async def _prepare_child_dispatch(
+    server_client: httpx.AsyncClient, child_session_id: str, work_id: str
+) -> tuple[str | None, str | None]:
+    """Read the preceding result before stamping a continued child's new dispatch."""
+    from omnigent.runner import subagent_work
+
+    try:
+        prior_result = await subagent_work._fetch_latest_assistant_item(
+            server_client, child_session_id
+        )
+    except subagent_work._SubagentRecoveryReadError as exc:
+        return None, f"failed to read preceding child result: {exc}"
+    error = await _patch_subagent_label(
+        server_client, child_session_id, subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+    )
+    return prior_result[0] if prior_result is not None else None, error
+
+
 async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
@@ -4089,12 +4107,13 @@ async def _execute_subagent_tool(
     # title/tool/session_name are known here (we set the title above), so
     # even a cold status update carries a display name. Cleaned up when
     # the child session ends.
+    prior_result_key = None
     if not created_child:
         # A new child carries this turn's id in its create body; a continued
         # child keeps its session, so the id is written first. A missing
         # stamp would let the previous turn's receipt mask this turn's result.
-        stamp_error = await _patch_subagent_label(
-            server_client, child_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        prior_result_key, stamp_error = await _prepare_child_dispatch(
+            server_client, child_session_id, work_id
         )
         if stamp_error is not None:
             return f"Error: failed to record sub-agent dispatch: {stamp_error}"
@@ -4117,6 +4136,7 @@ async def _execute_subagent_tool(
         host_id=remote_host,
         placement_label=_placement_label(member_host_name, remote_workspace),
         registered_by="sys_session_send",
+        prior_result_key=prior_result_key,
     )
     if remote_child_bound:
         # A new remote child's ``running`` edge is emitted on its own host's
@@ -4805,8 +4825,8 @@ async def _send_to_existing_session(
             placement_label=child_placement,
         )
     work_id = _subagent_work.new_subagent_work_id()
-    stamp_error = await _patch_subagent_label(
-        server_client, target_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+    prior_result_key, stamp_error = await _prepare_child_dispatch(
+        server_client, target_session_id, work_id
     )
     if stamp_error is not None:
         return f"Error: failed to record sub-agent dispatch: {stamp_error}"
@@ -4829,6 +4849,7 @@ async def _send_to_existing_session(
         host_id=child_host if remote_child else None,
         placement_label=child_placement,
         registered_by="sys_session_send",
+        prior_result_key=prior_result_key,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,

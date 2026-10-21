@@ -17,6 +17,8 @@ delivery still can't be confirmed on this runner.
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -1982,6 +1984,113 @@ async def _post_terminal(
         f"/v1/sessions/{CHILD_SESSION_ID}/events",
         json={"type": "external_session_status", "data": {"status": status, "output": output}},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("addressing", ["session_id", "named"])
+@pytest.mark.parametrize("stale_after_start", [False, True])
+async def test_user_turn_result_cannot_complete_the_next_parent_dispatch(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    addressing: str,
+    stale_after_start: bool,
+) -> None:
+    """A delayed user-started turn's result cannot spend a fresh dispatch."""
+    from omnigent.runner import tool_dispatch
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    app, server_client = _delivery_app([_assistant_item("item_user", "user answer")])
+    args: dict[str, Any] = {"session_id": CHILD_SESSION_ID, "args": "new task"}
+    if addressing == "named":
+        args = {"agent": "reviewer", "title": "review", "args": "new task"}
+        monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _: "ag_parent")
+        monkeypatch.setattr(
+            tool_dispatch,
+            "_find_existing_child_session",
+            AsyncMock(return_value={"id": CHILD_SESSION_ID}),
+        )
+    async with _runner_client(app) as client:
+        handle = json.loads(
+            await tool_dispatch.execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(args),
+                conversation_id=PARENT_SESSION_ID,
+                server_client=server_client,  # type: ignore[arg-type]
+                session_inbox=inbox,
+                agent_spec=SimpleNamespace(  # type: ignore[arg-type]
+                    sub_agents=[SimpleNamespace(name="reviewer")]
+                ),
+            )
+        )
+        assert handle.get("status") == "launching", handle
+        entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert entry is not None
+
+        if not stale_after_start:
+            stale = await _post_terminal(client, status="completed", output="user answer")
+            assert stale.status_code == 204
+            assert inbox.empty(), "the parent's fresh dispatch received the user's stale answer"
+            assert entry.status == "launching"
+
+        started = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={"type": "external_session_status", "data": {"status": "running"}},
+        )
+        assert started.status_code == 204
+        assert entry.status == "running"
+        if stale_after_start:
+            stale = await _post_terminal(client, status="completed", output="user answer")
+            assert stale.status_code == 204
+            assert inbox.empty(), "the parent's running dispatch received the user's stale answer"
+            assert entry.status == "running"
+        assert (
+            subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 200, timeout_s=180)
+            == []
+        )
+        server_client.items = [_assistant_item("item_parent", "parent answer")]
+        done = await _post_terminal(client, status="completed", output="parent answer")
+        assert done.status_code == 204
+        payload = inbox.get_nowait()
+        assert payload["work_id"] == entry.work_id
+        assert payload["status"] == "completed"
+        assert payload["output"] == "parent answer"
+        assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_continuation_result_read_failure_leaves_prior_work_untouched(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed boundary read cannot stamp or launch an unpaired continuation."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    _, server_client = _delivery_app([])
+    prior = subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+    )
+    prior.status = "completed"
+    patch = AsyncMock()
+    monkeypatch.setattr(server_client, "patch", patch)
+    monkeypatch.setattr(
+        subagent_work,
+        "_fetch_latest_assistant_item",
+        AsyncMock(side_effect=subagent_work._SubagentRecoveryReadError("unavailable")),
+    )
+    result = await execute_tool(
+        tool_name="sys_session_send",
+        arguments=json.dumps({"session_id": CHILD_SESSION_ID, "args": "new task"}),
+        conversation_id=PARENT_SESSION_ID,
+        server_client=server_client,  # type: ignore[arg-type]
+        session_inbox=asyncio.Queue(),
+    )
+    assert "failed to read preceding child result: unavailable" in result
+    assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is prior
+    assert prior.status == "completed"
+    patch.assert_not_awaited()
+    assert server_client.posts == []
 
 
 @pytest.mark.asyncio
