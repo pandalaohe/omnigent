@@ -329,6 +329,46 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("saves and clears desktop browser login for the connected server", async () => {
+    const getBrowserLoginSetting = vi.fn().mockResolvedValue({ ok: true, enabled: false });
+    const setBrowserLoginSetting = vi.fn().mockResolvedValue({ ok: true, enabled: true });
+    const clearBrowserLogin = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      getBrowserLoginSetting,
+      setBrowserLoginSetting,
+      clearBrowserLogin,
+    };
+    renderPage("/settings");
+    const toggle = await screen.findByRole("switch", { name: "Keep in-app browser login" });
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    expect(toggle).not.toBeChecked();
+    expect(
+      screen.getByText(/Each connected server has separate browser storage/),
+    ).toBeInTheDocument();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(setBrowserLoginSetting).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(toggle).toBeChecked());
+    fireEvent.click(screen.getByRole("button", { name: "Clear browser login for this server" }));
+    await waitFor(() => expect(clearBrowserLogin).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/Browser login cleared/)).toBeInTheDocument();
+  });
+
+  it("keeps the browser login switch unchanged when saving fails", async () => {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      getBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: true, enabled: false }),
+      setBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: false, error: "Save failed" }),
+      clearBrowserLogin: vi.fn(),
+    };
+    renderPage("/settings");
+    const toggle = await screen.findByRole("switch", { name: "Keep in-app browser login" });
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    fireEvent.click(toggle);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Save failed");
+    expect(toggle).not.toBeChecked();
+  });
+
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
   });
