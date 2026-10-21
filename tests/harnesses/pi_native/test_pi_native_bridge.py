@@ -248,6 +248,43 @@ def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
     assert payload["tools"] == []
 
 
+@pytest.mark.parametrize("successor", [None, "conv_next"])
+def test_relaunch_keeps_pending_pi_successor_for_same_session(
+    tmp_path: Path, successor: str | None
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    _, cfg = pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_old",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_old",
+    )
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    payload["pendingRotationSource"] = "conv_old"
+    if successor is not None:
+        payload["pendingSuccessorId"] = successor
+    cfg.write_text(json.dumps(payload), encoding="utf-8")
+
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_old",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_old",
+    )
+    relaunched = json.loads(cfg.read_text(encoding="utf-8"))
+    assert relaunched["pendingRotationSource"] == "conv_old"
+    assert relaunched.get("pendingSuccessorId") == successor
+
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_other",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_other",
+    )
+    other = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "pendingSuccessorId" not in other
+
+
 def test_refresh_config_auth_headers_replaces_only_auth(tmp_path: Path) -> None:
     """Refreshing the bearer rewrites only ``authHeaders``, leaving the rest.
 

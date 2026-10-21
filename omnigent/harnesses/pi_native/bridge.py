@@ -394,6 +394,19 @@ def write_extension_files(
             )
         ),
     }
+    # A failed rotation can outlive its Pi process. Keep the successor identity
+    # across relaunches so recovery cannot mint a second replacement.
+    try:
+        previous = json.loads(config_path(bridge_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = None
+    if isinstance(previous, dict) and previous.get("sessionId") == session_id:
+        source = previous.get("pendingRotationSource")
+        successor = previous.get("pendingSuccessorId")
+        if isinstance(source, str) and source:
+            payload["pendingRotationSource"] = source
+            if isinstance(successor, str) and successor:
+                payload["pendingSuccessorId"] = successor
     # A marker left by a previous Pi process would report this launch ready early.
     (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
     source = _extension_source()

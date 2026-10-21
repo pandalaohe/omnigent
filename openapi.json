@@ -20027,7 +20027,7 @@
     },
     "/v1/sessions/{session_id}/handover": {
       "post": {
-        "description": "Record a handover note and optionally request a turn-end rotation.\n\nThe note is a persisted assistant message whose id is stored in\n`omnigent.handover_item`, so the succession engine can open the\nsuccessor with it. With `rotate`, `omnigent.rotate_requested`\ncarries the archive revision and the runner types `/clear` into\nthe session's terminal when the current turn ends.\n\nOnly a top-level claude-native / codex-native session may call\nthis: other harnesses have no rotation this fork can complete.",
+        "description": "Record a handover note and optionally request a turn-end rotation.\n\nThe note is a persisted assistant message whose id is stored in\n`omnigent.handover_item`, so the succession engine can open the\nsuccessor with it. With `rotate`, `omnigent.rotate_requested`\ncarries the archive revision and the runner types `/clear` into\nthe session's terminal when the current turn ends.\n\nOnly a top-level session with a supported rotation harness may call\nthis: other harnesses have no rotation this fork can complete.",
         "operationId": "record_session_handover_v1_sessions__session_id__handover_post",
         "parameters": [
           {
@@ -23142,6 +23142,47 @@
           }
         },
         "summary": "Start Session Succession",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/successor": {
+      "post": {
+        "description": "Create or recover one server-configured successor for a Pi session.",
+        "operationId": "create_session_successor_v1_sessions__session_id__successor_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Successor",
         "tags": [
           "sessions"
         ]

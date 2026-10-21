@@ -88,6 +88,69 @@ function readConfig() {
   }
 }
 
+function writeConfig(config) {
+  const configPath = process.env.OMNIGENT_PI_NATIVE_CONFIG;
+  if (!configPath) throw new Error("Pi bridge config is unavailable");
+  const current = readConfig() || {};
+  const temporary = `${configPath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify({
+    ...current, ...config, authHeaders: current.authHeaders || config.authHeaders,
+  }), { mode: 0o600 });
+  fs.renameSync(temporary, configPath);
+}
+
+async function rotationRequest(config, method, resource, body) {
+  const response = await fetch(`${config.serverUrl}${resource}`, {
+    method,
+    headers: headers(config),
+    signal: AbortSignal.timeout(30000),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  if (!response || response.status < 200 || response.status >= 300)
+    throw new Error(`Pi session rotation ${method} ${resource} returned ${response && response.status}`);
+  return response.status === 204 ? null : response.json();
+}
+
+async function rotateNativeSession(config) {
+  const oldId = config.pendingRotationSource || config.sessionId;
+  config.pendingRotationSource = oldId;
+  writeConfig(config);
+  const oldPath = `/v1/sessions/${encodeURIComponent(oldId)}`;
+  const old = await rotationRequest(config, "GET", oldPath);
+  if (old && old.parent_session_id) {
+    config.pendingRotationSource = null;
+    config.pendingSuccessorId = null;
+    writeConfig(config);
+    return false;
+  }
+  if (!old || typeof old.runner_id !== "string" || !old.runner_id)
+    throw new Error("Pi session rotation source has no runner");
+  const created = await rotationRequest(config, "POST", `${oldPath}/successor`);
+  const successorId = created && created.id;
+  if (typeof successorId !== "string" || !successorId)
+    throw new Error("Pi successor preparation returned no session id");
+  config.pendingSuccessorId = successorId;
+  writeConfig(config);
+  const successorPath = `/v1/sessions/${encodeURIComponent(successorId)}`;
+  await rotationRequest(config, "PATCH", successorPath, { runner_id: old.runner_id });
+  await rotationRequest(config, "POST", `${successorPath}/resources/terminals`, {
+    terminal: "pi", session_key: "main", ensure_native_terminal: true,
+  });
+  const succession = await rotationRequest(config, "POST", `${oldPath}/succession`, {
+    target_session_id: successorId,
+    allow_empty: true,
+  });
+  if (!succession || succession.status !== "done")
+    throw new Error("Pi session succession has not finished");
+  // The successor opens in its own bridge and terminal. Retire the old pane
+  // only after its opening was accepted, so no live pane keeps an archived ID.
+  config.pendingRotationSource = null;
+  config.pendingSuccessorId = null;
+  writeConfig(config);
+  await rotationRequest(config, "DELETE", `${oldPath}/resources/terminals/terminal_pi_main`);
+  return successorId;
+}
+
 const PERMISSION_TIERS = new Set(["ask", "plan", "accept-edits", "auto", "full"]);
 
 function readPermissionState(config) {
@@ -1644,6 +1707,8 @@ module.exports = function (pi) {
   let agentRunning = false;
   let compacting = false;
   let latestContext = null;
+  let rotationInFlight = false;
+  let rotationPending = false;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -2210,8 +2275,57 @@ module.exports = function (pi) {
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  async function resumeRotation(ctx) {
+    if (rotationInFlight) return true;
+    rotationInFlight = true;
+    clearTimeout(pi.__omnigentRotationRetry);
+    try {
+      const successor = await rotateNativeSession(config);
+      if (!successor) rotationPending = false;
+      return !!successor;
+    } catch (error) {
+      if (ctx && ctx.ui && typeof ctx.ui.notify === "function")
+        ctx.ui.notify(`Omnigent handover is pending; retrying: ${error.message}`, "error");
+      pi.__omnigentRotationRetry = setTimeout(() => resumeRotation(ctx), 1000);
+      pi.__omnigentRotationRetry.unref();
+      return true;
+    } finally {
+      rotationInFlight = false;
+    }
+  }
+
+  pi.on("session_shutdown", async () => {
+    clearTimeout(pi.__omnigentRotationRetry);
+    clearInterval(pi.__omnigentInboxPoller);
+    pi.__omnigentInboxPoller = null;
+  });
+
+  pi.on("session_start", async (event, ctx) => {
     rememberContext(ctx);
+    if (config && config.serverUrl && config.sessionId &&
+        event && event.reason === "startup" && !config.pendingRotationSource) {
+      try {
+        const source = await rotationRequest(config, "GET",
+          `/v1/sessions/${encodeURIComponent(config.sessionId)}`);
+        const pending = source && source.labels && source.labels["omnigent.rotation_successor"];
+        if (pending) {
+          const prepared = JSON.parse(pending);
+          if (prepared.revision === source.archive_revision ||
+              source.archived && source.labels["omnigent.succeeded_by"] === prepared.id)
+            config.pendingRotationSource = config.sessionId;
+        }
+      } catch (_error) {
+        // Ordinary startup retains the existing permission bootstrap behavior.
+      }
+    }
+    if (config && config.serverUrl && config.sessionId &&
+        (event && event.reason === "new" || config.pendingRotationSource ||
+        config.pendingSuccessorId)) {
+      rotationPending = true;
+      clearInterval(pi.__omnigentInboxPoller);
+      pi.__omnigentInboxPoller = null;
+      if (await resumeRotation(ctx)) return;
+    }
     registerTaskToolIfMissing();
     const permissionState = readPermissionState(config);
     if (permissionState && typeof pi.getActiveTools === "function") {
@@ -2335,6 +2449,10 @@ module.exports = function (pi) {
   });
 
   pi.on("agent_start", async (_event, ctx) => {
+    if (rotationPending || config && config.pendingRotationSource) {
+      if (ctx && typeof ctx.abort === "function") ctx.abort();
+      return;
+    }
     rememberContext(ctx);
     // A brand-new agent loop must never inherit a replay window armed before it
     // began (e.g. a spuriously-armed window from an interrupt that landed while
@@ -2445,6 +2563,8 @@ module.exports = function (pi) {
 
   pi.on("tool_call", async (event, ctx) => {
     rememberContext(ctx);
+    if (rotationPending || rotationInFlight || config && config.pendingRotationSource)
+      return { block: true, reason: "Session handover is pending" };
     const blocked = replayPendingInterrupt(ctx);
     const responseId = currentResponseId();
     await postToolCall(

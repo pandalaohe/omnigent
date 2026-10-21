@@ -123,6 +123,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    ROTATION_SUCCESSOR_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
     TOUCHED_LABEL_KEY,
@@ -1346,6 +1347,176 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # so the WHERE matches the binary id column.
                 {"id": uuid_to_bytes(conversation_id)},
             )
+
+    def create_session_successor(
+        self,
+        source: Conversation,
+        *,
+        initial_labels: dict[str, str],
+        terminal_launch_args: list[str] | None,
+    ) -> Conversation:
+        """Create a Pi successor once, then finish any interrupted metadata phase."""
+        from omnigent.server.permission_tiers import (
+            PERMISSION_CAPABILITY_LABEL_KEY,
+            PERMISSION_RUNTIME_ID_LABEL_KEY,
+            PERMISSION_STATE_LABEL_KEY,
+            tier_label_key,
+        )
+
+        prepared_labels = _prepare_label_updates(initial_labels)
+        now = now_epoch()
+
+        def insert_conversation(session: Session) -> str:
+            self._lock_conversation(session, source.id)
+            current = session.get(
+                SqlConversation, (current_workspace_id(), source.id), populate_existing=True
+            )
+            if current is None:
+                raise SuccessionRefusedError("not_found", "Source session no longer exists")
+            source_labels = _fetch_labels(session, source.id)
+            if current.parent_conversation_id is not None:
+                raise SuccessionRefusedError("not_top_level", "Child sessions cannot rotate")
+            if current.agent_id != source.agent_id or current.agent_id is None:
+                raise SuccessionRefusedError("source_changed", "Source agent binding changed")
+            if (
+                ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in source_labels
+                and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in source_labels
+            ):
+                raise SuccessionRefusedError(
+                    "source_changed", "Source worktree removal is pending"
+                )
+            permission_keys = (
+                PERMISSION_STATE_LABEL_KEY,
+                PERMISSION_CAPABILITY_LABEL_KEY,
+                PERMISSION_RUNTIME_ID_LABEL_KEY,
+                tier_label_key(source.harness_override or "pi"),
+            )
+            if any(source_labels.get(key) != source.labels.get(key) for key in permission_keys):
+                raise SuccessionRefusedError("source_changed", "Source permission state changed")
+            if not current.archived and current.archive_revision != source.archive_revision:
+                raise SuccessionRefusedError("source_changed", "Source incarnation changed")
+            revision = (
+                current.archive_revision - 1 if current.archived else current.archive_revision
+            )
+            if revision < 0:
+                raise SuccessionRefusedError("archived", "Source session is archived")
+            successor_id = hashlib.sha256(
+                f"session_successor:{source.id}:{revision}".encode()
+            ).hexdigest()[:32]
+            if current.archived and source_labels.get(SUCCEEDED_BY_LABEL_KEY) != successor_id:
+                raise SuccessionRefusedError("archived", "Source session is archived")
+            successor = session.get(SqlConversation, (current_workspace_id(), successor_id))
+            if successor is None:
+                if current.archived:
+                    raise SuccessionRefusedError("archived", "Archived source has no successor")
+                successor = _new_session_conversation_row(
+                    successor_id,
+                    now,
+                    current.title,
+                    agent_id=current.agent_id,
+                    session_overrides=_encode_session_overrides(
+                        {
+                            key: value
+                            for key, value in _decode_session_overrides(
+                                current.session_overrides
+                            ).items()
+                            if key != "reported_model"
+                        }
+                    ),
+                )
+                session.add(successor)
+                _upsert_prepared_labels(session, successor_id, prepared_labels, now)
+            _upsert_prepared_labels(
+                session,
+                source.id,
+                {
+                    ROTATION_SUCCESSOR_LABEL_KEY: json.dumps(
+                        {"id": successor_id, "revision": revision}, separators=(",", ":")
+                    )
+                },
+                now,
+            )
+            return successor_id
+
+        def insert_metadata(session: Session) -> None:
+            if session.get(SqlConversationMetadata, (current_workspace_id(), successor_id)):
+                return
+            grants = list(
+                session.scalars(
+                    select(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.conversation_id == source.id,
+                    )
+                )
+            )
+            generations = dict(
+                session.execute(
+                    select(SqlUser.id, SqlUser.account_generation).where(
+                        SqlUser.workspace_id == current_workspace_id(),
+                        SqlUser.id.in_([grant.user_id for grant in grants]),
+                    )
+                )
+                .tuples()
+                .all()
+            )
+            require_active_account(
+                session,
+                None,
+                related_accounts={
+                    grant.user_id: generations.get(grant.user_id) for grant in grants
+                },
+            )
+            source_stmt = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == source.id,
+            )
+            if self._meta_supports_for_update:
+                source_stmt = source_stmt.with_for_update()
+            source_meta = session.execute(source_stmt).scalar_one_or_none()
+            if (
+                source_meta is None
+                or source_meta.runner_id != source.runner_id
+                or source_meta.host_id != source.host_id
+            ):
+                raise SuccessionRefusedError("source_changed", "Source runner binding changed")
+            target_meta = session.get(
+                SqlConversationMetadata, (current_workspace_id(), successor_id)
+            )
+            if target_meta is None:
+                session.add(
+                    _new_session_metadata_row(
+                        successor_id,
+                        runner_id=source_meta.runner_id,
+                        workspace=source_meta.workspace,
+                        worktree=source_meta.worktree,
+                        git_branch=source_meta.git_branch,
+                        terminal_launch_args=terminal_launch_args,
+                        project_id=source_meta.project_id,
+                        host_id=source_meta.host_id,
+                        inference_snapshot=source_meta.inference_snapshot,
+                    )
+                )
+                for grant in grants:
+                    session.add(
+                        SqlSessionPermission(
+                            user_id=grant.user_id,
+                            conversation_id=successor_id,
+                            level=grant.level,
+                        )
+                    )
+
+        with self._host_admission_lease(source.host_id):
+            successor_id = run_write_transaction(
+                self._conv_session_immediate,
+                "create_session_successor_conversation",
+                insert_conversation,
+            )
+            run_write_transaction(
+                self._session_immediate, "create_session_successor_metadata", insert_metadata
+            )
+        result = self.get_conversation(successor_id)
+        assert result is not None
+        return result
 
     @_host_binding_admission
     def create_conversation(
