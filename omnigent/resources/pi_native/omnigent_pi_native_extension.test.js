@@ -427,7 +427,7 @@ async function testExistingTaskToolIsMirroredWithoutConflict() {
 }
 
 // The executor wraps the session's first injected message with the launch-
-// staged instructions (wrap_agent_instructions); the mirrored "input" event
+// staged instructions (wrap_agent_instructions); the consumed user message
 // must strip that block so the mirrored bubble — and the server's pending-
 // input reconciliation, which matches mirrored text exactly against the
 // queued web message — see only the bare user text.
@@ -435,16 +435,20 @@ async function testInputMirrorStripsAgentInstructionsBlock() {
   const h = makeHarness({ captureEvents: true });
   await h.handlers.session_start({}, {});
 
-  await h.handlers.input(
-    {
-      text:
-        "<omnigent_agent_instructions>\n" +
-        "These are your operating instructions for this session; follow them " +
-        "throughout, not just for this message:\n\n" +
-        "be terse\n" +
-        "</omnigent_agent_instructions>\n\n" +
-        "hello there",
-    },
+  const wrapped =
+    "<omnigent_agent_instructions>\n" +
+    "These are your operating instructions for this session; follow them " +
+    "throughout, not just for this message:\n\n" +
+    "be terse\n" +
+    "</omnigent_agent_instructions>\n\n" +
+    "hello there";
+  await h.handlers.input({ text: wrapped }, {});
+  assert(
+    "input preflight does not mirror a user message",
+    h.postedEvents.filter((item) => item.type === "external_conversation_item").length === 0,
+  );
+  await h.handlers.message_end(
+    { message: { role: "user", content: [{ type: "text", text: wrapped }] } },
     {},
   );
 
@@ -455,6 +459,44 @@ async function testInputMirrorStripsAgentInstructionsBlock() {
     "mirrored input drops the wrapped instructions block",
     !!event && event.data.item_data.content[0].text === "hello there",
     JSON.stringify(event),
+  );
+}
+
+async function testPeerReceiptRequiresConsumedUserMessage() {
+  const h = makeHarness({ captureEvents: true });
+  const envelope =
+    `[Peer message from session ${"a".repeat(32)} msg=${"b".repeat(32)} ` +
+    '"Sender" (Pi) ref=thread]\n\npeer input';
+  const userItems = () => h.postedEvents.filter(
+    (item) => item.type === "external_conversation_item" &&
+      item.data.item_type === "message" && item.data.item_data.role === "user",
+  );
+
+  // A missing model rejects after input; no Pi user message is consumed.
+  await h.handlers.input({ text: envelope }, {});
+  assert("invalid-model preflight has no receipt", userItems().length === 0);
+
+  // A mid-turn steer may remain queued while the current assistant finishes.
+  await h.handlers.input({ text: envelope }, {});
+  await h.handlers.message_end(
+    { message: { role: "assistant", content: [{ type: "text", text: "working" }] } },
+    {},
+  );
+  assert("pending steer has no receipt", userItems().length === 0);
+
+  await h.handlers.message_end(
+    { message: { role: "user", content: [{ type: "text", text: envelope }] } },
+    {},
+  );
+  const consumed = userItems();
+  assert("consumed steer mirrors once", consumed.length === 1, JSON.stringify(consumed));
+  assert(
+    "consumed envelope is exact",
+    consumed[0].data.item_data.content[0].text === envelope,
+  );
+  assert(
+    "receipt names the consumed-user source only",
+    /^pi-consumed-user-/.test(consumed[0].data.response_id),
   );
 }
 
@@ -656,6 +698,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();
     await testInputMirrorStripsAgentInstructionsBlock();
+    await testPeerReceiptRequiresConsumedUserMessage();
     await testToolCallRetryOutlastsTheShortBudget();
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();

@@ -655,7 +655,7 @@ async def test_is_subagent_same_owner(
     [
         ("claude-native", "delivered"),
         ("codex-native", "queued"),
-        ("pi-native", "is_subagent"),
+        ("pi-native", "queued"),
         ("sdk", "is_subagent"),
     ],
     ids=["claude-native", "codex-native", "pi-native", "sdk"],
@@ -667,8 +667,7 @@ async def test_dispatched_child_harness_gate(
     harness: str,
     disposition: str,
 ) -> None:
-    """A dispatched claude/codex native child receives; other harnesses are
-    refused is_subagent."""
+    """Dispatched native children receive; SDK children remain refused."""
     sender = peer_env["sender"]
     parent = _owned_parent(peer_env)
     child = _native_receiver(
@@ -803,16 +802,23 @@ async def test_reply_to_a_child_thread_is_delivered(
     assert replied.replied_at is not None
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "pi-native"])
 async def test_busy_steerable_child_receiver_queues(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
 ) -> None:
     """A busy steerable child queues; the same top-level receiver delivers."""
     sender = peer_env["sender"]
     parent = _owned_parent(peer_env)
     child = _native_receiver(
-        monkeypatch, peer_env, kind="sub_agent", parent_id=parent.id, cached_status="running"
+        monkeypatch,
+        peer_env,
+        kind="sub_agent",
+        parent_id=parent.id,
+        cached_status="running",
+        harness=harness,
     )
     resp = await peer_client.post(
         f"/v1/sessions/{child.id}/peer-messages",
@@ -1599,15 +1605,17 @@ async def test_persisted_elicitation_count_above_local_keeps_receiver_queued(
     assert fake.calls == []
 
 
-async def test_codex_native_running_receiver_waits_for_native_receipt(
+@pytest.mark.parametrize("harness", ["codex-native", "pi-native"])
+async def test_native_running_receiver_waits_for_native_receipt(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
 ) -> None:
     """The runner gets the peer input while the native receipt stays durable."""
     sender = peer_env["sender"]
     fake: _FakePostEvent = peer_env["fake"]
-    receiver = _steerable_receiver(monkeypatch, peer_env, harness="codex-native")
+    receiver = _steerable_receiver(monkeypatch, peer_env, harness=harness)
     resp = await peer_client.post(
         f"/v1/sessions/{receiver.id}/peer-messages",
         json={"sender_session_id": sender.id, "text": f"cx-{uuid.uuid4().hex}"},
@@ -1651,6 +1659,41 @@ async def test_sdk_running_receiver_queues_without_opt_in(
     )
     assert resp.json()["disposition"] == "queued", resp.text
     assert fake.calls == []
+
+
+async def test_pi_rpc_idle_delivers_and_busy_queues(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi RPC has no live peer-steer capability; its idle turn still starts."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    peer_env["conv_store"].update_conversation(receiver.id, harness_override="pi")
+    fake: _FakePostEvent = peer_env["fake"]
+    monkeypatch.setitem(cast(Any, sessions_module._session_status_cache), receiver.id, "running")
+    busy = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"busy-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert busy.json()["disposition"] == "queued", busy.text
+    assert fake.calls == []
+
+    monkeypatch.setitem(cast(Any, sessions_module._session_status_cache), receiver.id, "idle")
+    # A second sender avoids the first sender's queued per-pair FIFO head.
+    other_token, other_runner = _runner_pair()
+    other = peer_env["conv_store"].create_conversation(
+        title="other sender", agent_id=AGENT_ID, runner_id=other_runner
+    )
+    peer_env["perm_store"].grant(ALICE, other.id, LEVEL_OWNER)
+    idle = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": other.id, "text": f"idle-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, other_token),
+    )
+    assert idle.json()["disposition"] == "delivered", idle.text
+    assert len(fake.calls) == 1
 
 
 @pytest.mark.parametrize("harness", ["codex", "claude-sdk"])
