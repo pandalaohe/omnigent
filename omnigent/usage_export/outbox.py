@@ -22,6 +22,14 @@ from omnigent.usage_export.transcripts import (
 )
 
 
+def _terminal_evidence(physical: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "physical_session_id": physical.get("physical_session_id"),
+        "physical_subagent_id": physical.get("physical_subagent_id"),
+        "evidence": "terminal_record",
+    }
+
+
 class UsageOutbox:
     """Commit observed counters before ACK or private-home removal.
 
@@ -67,6 +75,11 @@ class UsageOutbox:
                     session_id TEXT, harness TEXT, physical TEXT, turn_id TEXT,
                     ended_at TEXT NOT NULL,
                     PRIMARY KEY (session_id,harness,physical,turn_id)
+                );
+                CREATE TABLE IF NOT EXISTS admission_links (
+                    session_id TEXT, harness TEXT, physical TEXT, turn_key TEXT,
+                    admission_id TEXT NOT NULL, route_check TEXT,
+                    PRIMARY KEY (session_id,harness,physical,turn_key)
                 );
                 CREATE TABLE IF NOT EXISTS claude_path_proofs (
                     session_id TEXT NOT NULL, harness TEXT NOT NULL,
@@ -133,7 +146,11 @@ class UsageOutbox:
             previous = json.loads(latest[0])
             observation = {
                 **previous,
-                **{key: value for key, value in observation.items() if value is not None},
+                **{
+                    key: value
+                    for key, value in observation.items()
+                    if value is not None and value != []
+                },
                 "occurred_at": previous.get("occurred_at") or observation.get("occurred_at"),
                 "thread_kind": previous.get("thread_kind", observation.get("thread_kind")),
             }
@@ -200,13 +217,22 @@ class UsageOutbox:
             if observation.get("model_id") is None:
                 observation["model_id"] = physical.get("model_id")
             if turn is not None:
+                link = db.execute(
+                    "SELECT admission_id,route_check FROM admission_links "
+                    "WHERE session_id=? AND harness=? AND physical=? AND turn_key=?",
+                    (*scope, turn),
+                ).fetchone()
+                if link is not None:
+                    observation["admission_id"] = link[0]
+                    if link[1] is not None:
+                        observation["route_check"] = link[1]
                 receipt = db.execute(
                     "SELECT ended_at FROM terminal_receipts "
                     "WHERE session_id=? AND harness=? AND physical=? AND turn_id=?",
                     (*scope, turn),
                 ).fetchone()
                 if receipt is not None:
-                    observation["ended_at"] = receipt[0]
+                    observation["terminal"] = [_terminal_evidence(physical)]
             producer, unit = self._append(db, session_id, harness, observation)
             if turn is not None:
                 db.execute(
@@ -244,9 +270,14 @@ class UsageOutbox:
             "WHERE u.session_id=? AND u.harness=? AND u.physical=? AND u.turn_id=?",
             (*scope, turn),
         ).fetchall()
+        del ended_at
         for producer, unit, value in rows:
             self._enqueue(
-                db, producer, unit, {**json.loads(value), "ended_at": ended_at}, (value,)
+                db,
+                producer,
+                unit,
+                {**json.loads(value), "terminal": [_terminal_evidence(physical)]},
+                (value,),
             )
 
     def append(
@@ -355,6 +386,58 @@ class UsageOutbox:
                             "UPDATE latest SET payload=? WHERE producer_id=? AND unit_key=?",
                             (self._json(payload), row[0], row[1]),
                         )
+
+    def link_admission(
+        self,
+        session_id: str,
+        harness: str,
+        physical_session_id: str,
+        physical_subagent_id: str | None,
+        turn_key: str,
+        admission_id: str,
+        *,
+        route_check: str | None = None,
+    ) -> None:
+        """Record the admitted turn before its first observation is enqueued."""
+        if not isinstance(admission_id, str) or not admission_id:
+            raise ValueError("missing_admission_id")
+        physical = self._json([physical_session_id, physical_subagent_id])
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT admission_id FROM admission_links "
+                "WHERE session_id=? AND harness=? AND physical=? AND turn_key=?",
+                (session_id, harness, physical, turn_key),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != admission_id:
+                    raise ValueError("admission_reused")
+                return
+            db.execute(
+                "INSERT INTO admission_links VALUES (?,?,?,?,?,?)",
+                (session_id, harness, physical, turn_key, admission_id, route_check),
+            )
+
+    def admission_for_turn(
+        self,
+        session_id: str,
+        harness: str,
+        physical_session_id: str,
+        physical_subagent_id: str | None,
+        turn_key: str,
+    ) -> str | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT admission_id FROM admission_links "
+                "WHERE session_id=? AND harness=? AND physical=? AND turn_key=?",
+                (
+                    session_id,
+                    harness,
+                    self._json([physical_session_id, physical_subagent_id]),
+                    turn_key,
+                ),
+            ).fetchone()
+            return row[0] if row is not None else None
 
     def register_source(
         self,
@@ -572,12 +655,10 @@ class UsageOutbox:
                             ):
                                 continue
                     observation = {
-                        "ended_at": None,
                         "time_quality": "reported",
                         "cost_usd": None,
                         "cost_basis": "unknown",
                         "cost_estimated": None,
-                        "account_hint": None,
                         **{key: value for key, value in binding.items() if key != "producer_id"},
                         **json.loads(payload),
                     }

@@ -31,9 +31,17 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
-from omnigent.usage_export.models import HostProgress, UsageEvent, UsageObservation
+from omnigent.usage_export.models import (
+    HostProgress,
+    UsageEvent,
+    UsageObservation,
+    thread_key,
+)
 
 _MAX_EVENT_BYTES = 32 * 1024
+# Producer association evidence stays on the unit row; it is not part of
+# the committed event the consumer reads.
+_EVIDENCE_FIELDS = ("admission_id", "route_check", "terminal")
 _MAX_PAGE_BYTES = 1024 * 1024
 _IMMUTABLE_FIELDS = (
     "producer_unit_id",
@@ -349,6 +357,21 @@ class UsageEventStore:
                         if candidate["event_id"] == unit.latest_event_id:
                             return candidate
                     raise UsageExportError(422, "corrupt_usage_feed")
+            recorded_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            previous_ended_at = None
+            if unit is not None:
+                previous = session.get(
+                    SqlUsageEvent, (workspace_id, owner_digest, unit.latest_sequence)
+                )
+                if previous is not None:
+                    previous_ended_at = _event_from_payload(previous.payload)["ended_at"]
+            ended_at = previous_ended_at
+            if ended_at is None and observation.physical_session_id is not None:
+                own_thread = thread_key(
+                    observation.physical_session_id, observation.physical_subagent_id
+                )
+                if any(entry.key == own_thread for entry in observation.terminal):
+                    ended_at = recorded_at
             allocation = None
             if call_digest is not None:
                 allocation = session.get(
@@ -369,21 +392,28 @@ class UsageEventStore:
                 raise UsageExportError(409, "call_identity_conflict")
             event_id = uuid.uuid4().hex
             original_id = unit.original_event_id if unit is not None else event_id
+            sequence = feed.next_sequence
             event = {
-                **measurement,
+                **{
+                    key: value for key, value in measurement.items() if key not in _EVIDENCE_FIELDS
+                },
                 "event_id": event_id,
                 "original_event_id": original_id,
                 "kind": "correction" if unit is not None else "usage",
                 "correction_of": original_id if unit is not None else None,
                 "revision": unit.revision + 1 if unit is not None else 1,
-                "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "sequence": sequence,
+                "recorded_at": recorded_at,
                 "request_count": request_count,
+                "call_started_not_before": None,
+                "call_start_basis": None,
+                "ended_at": ended_at,
+                "account_hint": None,
             }
             payload = _json(event)
             if len(payload.encode("utf-8")) > _MAX_EVENT_BYTES:
                 raise UsageExportError(422, "export_record_too_large")
             snapshot = _advance_progress(feed.progress, event)
-            sequence = feed.next_sequence
             feed.next_sequence += 1
             feed.progress = snapshot
             session.add(
@@ -564,7 +594,7 @@ class UsageEventStore:
                 feed, workspace_id, owner_digest, last_sequence, fence if has_more else None
             )
             result = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "owner_scope_id": feed.owner_scope_id,
                 "feed_id": feed.feed_id,
                 "feed_epoch": feed.feed_epoch,

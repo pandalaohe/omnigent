@@ -44,6 +44,22 @@ def _observation(**changes: object) -> UsageObservation:
     return UsageObservation.model_validate(fields)
 
 
+def _sealed(unit: str, **changes: object) -> UsageObservation:
+    """One unit of a physical thread that already reported termination."""
+    return _observation(
+        producer_unit_id=unit,
+        physical_session_id="phys-main",
+        terminal=[
+            {
+                "physical_session_id": "phys-main",
+                "physical_subagent_id": None,
+                "evidence": "terminal_record",
+            }
+        ],
+        **changes,
+    )
+
+
 def _response(unit: str, call: str, **changes: object) -> UsageObservation:
     return _observation(
         producer_unit_id=unit,
@@ -58,6 +74,35 @@ def _response(unit: str, call: str, **changes: object) -> UsageObservation:
         ],
         **changes,
     )
+
+
+def test_schema_two_sequence_and_server_end_bound(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first = store.append("alice", _sealed("a"))
+    assert first["sequence"] == 1
+    assert first["ended_at"] == first["recorded_at"]
+    assert first["call_started_not_before"] is None
+    assert first["call_start_basis"] is None
+    assert first["account_hint"] is None
+    second = store.append("alice", _sealed("a", input_tokens=5))
+    assert second["sequence"] == 2
+    assert second["ended_at"] == first["ended_at"]
+    page = store.page("alice")
+    assert page["schema_version"] == 2
+    assert [event["sequence"] for event in page["events"]] == [1, 2]
+    # Producer association evidence never reaches the committed event.
+    for event in page["events"]:
+        assert "admission_id" not in event
+        assert "route_check" not in event
+        assert "terminal" not in event
+
+
+def test_unsealed_unit_keeps_a_null_end_bound(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    event = store.append("alice", _observation(producer_unit_id="a", input_tokens=1))
+    assert event["ended_at"] is None
+    later = store.append("alice", _observation(producer_unit_id="a", input_tokens=2))
+    assert later["ended_at"] is None
 
 
 def test_replay_restart_and_full_replacement_even_after_revert(tmp_path: Path) -> None:
@@ -184,15 +229,15 @@ def test_lost_cursor_returns_scoped_genesis_recovery(tmp_path: Path) -> None:
 
 def test_prefix_progress_and_shared_durable_throttle(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.append("alice", _observation(producer_unit_id="a", ended_at="2026-01-01T00:00:00Z"))
-    store.append("alice", _observation(producer_unit_id="b", ended_at="2026-01-02T00:00:00Z"))
-    store.append("alice", _observation(producer_unit_id="c", ended_at=None))
-    store.append("alice", _observation(producer_unit_id="d", host_id="host-2", ended_at=None))
+    store.append("alice", _sealed("a"))
+    store.append("alice", _sealed("b"))
+    store.append("alice", _observation(producer_unit_id="c"))
+    store.append("alice", _observation(producer_unit_id="d", host_id="host-2"))
     first = store.page("alice", limit=1)
     assert first["host_progress"] == [
         {
             "host_id": "host-1",
-            "last_sealed_turn_at": "2026-01-01T00:00:00Z",
+            "last_sealed_turn_at": first["events"][0]["recorded_at"],
             "state": "unknown",
             "observed_at": first["events"][0]["recorded_at"],
         }
@@ -201,7 +246,7 @@ def test_prefix_progress_and_shared_durable_throttle(tmp_path: Path) -> None:
     assert second["host_progress"] == [
         {
             "host_id": "host-1",
-            "last_sealed_turn_at": "2026-01-02T00:00:00Z",
+            "last_sealed_turn_at": second["events"][0]["recorded_at"],
             "state": "unknown",
             "observed_at": second["events"][1]["recorded_at"],
         },
@@ -226,7 +271,7 @@ def test_host_progress_limit_rejects_new_host_without_committing(tmp_path: Path)
     for index in range(32):
         store.append(
             "alice",
-            _observation(producer_unit_id=f"unit-{index}", host_id=f"host-{index}", ended_at=None),
+            _observation(producer_unit_id=f"unit-{index}", host_id=f"host-{index}"),
         )
     with pytest.raises(UsageExportError) as limited:
         store.append("alice", _observation(producer_unit_id="unit-33", host_id="host-33"))
@@ -303,7 +348,14 @@ def test_model_bounds_and_corrupt_row_stops_page(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         _observation(host_id="é" * 129)
     with pytest.raises(ValidationError):
-        _observation(ended_at="2026-01-01T08:00:00+08:00")
+        _observation(occurred_at="2026-01-01T08:00:00+08:00")
+    for server_field, value in (
+        ("ended_at", "2026-01-01T00:00:00Z"),
+        ("call_started_not_before", "2026-01-01T00:00:00Z"),
+        ("account_hint", {}),
+    ):
+        with pytest.raises(ValidationError):
+            _observation(**{server_field: value})
     with pytest.raises(ValidationError):
         _observation(identity_namespace="claude-code/transcript/v1")
     store = _store(tmp_path)

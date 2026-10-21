@@ -37,6 +37,14 @@ def _codex(thread: str, response: str, input_tokens: int) -> dict:
     }
 
 
+def _terminal_evidence(physical_session_id: str, physical_subagent_id: str | None) -> dict:
+    return {
+        "physical_session_id": physical_session_id,
+        "physical_subagent_id": physical_subagent_id,
+        "evidence": "terminal_record",
+    }
+
+
 def _rows(spool: UsageOutbox) -> list[dict]:
     with sqlite3.connect(spool.path) as db:
         return [
@@ -639,11 +647,11 @@ def test_claude_compaction_and_tool_results_keep_the_enclosing_turn(tmp_path: Pa
         UsageOutbox(tmp_path / "spool").append("session", "claude-sdk", physical, record)
     rows = _rows(spool)
     assert len(rows) == 4
-    assert [row.get("ended_at") for row in rows] == [
+    assert [row.get("terminal") for row in rows] == [
         None,
         None,
-        "2026-10-20T00:00:05Z",
-        "2026-10-20T00:00:05Z",
+        [_terminal_evidence("parent", None)],
+        [_terminal_evidence("parent", None)],
     ]
     assert {row["logical_call_id"] for row in rows[2:]} == {"after", "before"}
 
@@ -677,8 +685,8 @@ def test_terminal_receipt_revises_only_its_physical_turn_and_survives_restart(
     rows = _rows(spool)
     assert len(rows) == 3
     assert rows[-1]["producer_unit_id"] == rows[0]["producer_unit_id"]
-    assert rows[-1]["ended_at"] == "2026-10-20T00:00:05Z"
-    assert rows[1].get("ended_at") is None
+    assert rows[-1]["terminal"] == [_terminal_evidence("parent", None)]
+    assert rows[1].get("terminal") is None
     if not codex:
         spool.append(
             "session", harness, physical, {"type": "user", "message": {"content": "next"}}
@@ -687,7 +695,7 @@ def test_terminal_receipt_revises_only_its_physical_turn_and_survives_restart(
     else:
         first["payload"].update(response_id="second", turn_id="turn-2")
     spool.append("session", harness, physical, first)
-    assert _rows(spool)[-1].get("ended_at") is None
+    assert _rows(spool)[-1].get("terminal") is None
 
 
 def test_retry_has_bounded_full_jitter_and_honors_server_delay(
