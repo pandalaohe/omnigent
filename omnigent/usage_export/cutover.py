@@ -147,6 +147,64 @@ def _admission_entry(row: SqlUsageTurnAdmission, *, linked_call: bool) -> dict[s
     }
 
 
+def append_receipt(
+    session: Session,
+    workspace_id: int,
+    owner_digest: bytes,
+    hold: SqlUsageCutoverHold,
+    kind: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Append one receipt to the domain chain; the caller holds the locks."""
+    previous = UsageCutoverStore.latest_receipt(session, workspace_id, owner_digest, hold)
+    generation = hold.generation or 0
+    receipt_seq = (
+        session.execute(
+            select(func.max(SqlUsageCutoverReceipt.receipt_seq)).where(
+                SqlUsageCutoverReceipt.workspace_id == workspace_id,
+                SqlUsageCutoverReceipt.owner_digest == owner_digest,
+                SqlUsageCutoverReceipt.host_id == hold.host_id,
+                SqlUsageCutoverReceipt.harness == hold.harness,
+                SqlUsageCutoverReceipt.generation == generation,
+            )
+        ).scalar_one_or_none()
+        or 0
+    )
+    feed = UsageCutoverStore.feed_row(session, workspace_id, owner_digest)
+    receipt = {
+        **body,
+        "receipt_schema_version": 1,
+        "receipt_id": uuid.uuid4().hex,
+        "receipt_seq": receipt_seq + 1,
+        "kind": kind,
+        "owner_scope_id": feed.owner_scope_id,
+        "feed_id": feed.feed_id,
+        "feed_epoch": feed.feed_epoch,
+        "domain": {"host_id": hold.host_id, "harness": hold.harness},
+        "generation": generation,
+        "hold_created_at": _iso(hold.created_at),
+        "created_at": _iso(_now()),
+        "previous_receipt_digest": previous.digest.hex() if previous is not None else None,
+    }
+    digest = _canonical_digest(receipt)
+    session.add(
+        SqlUsageCutoverReceipt(
+            workspace_id=workspace_id,
+            owner_digest=owner_digest,
+            host_id=hold.host_id,
+            harness=hold.harness,
+            generation=generation,
+            receipt_seq=receipt["receipt_seq"],
+            receipt_id=receipt["receipt_id"],
+            kind=kind,
+            payload=_json(receipt),
+            digest=bytes.fromhex(digest),
+            created_at=_now(),
+        )
+    )
+    return {**receipt, "digest": digest}
+
+
 class UsageCutoverStore:
     """Owner book for holds, admissions, receipts and the release CAS."""
 
@@ -199,7 +257,7 @@ class UsageCutoverStore:
         return session.execute(statement).scalar_one_or_none()
 
     @staticmethod
-    def _feed(session: Session, workspace_id: int, owner_digest: bytes) -> SqlUsageFeed:
+    def feed_row(session: Session, workspace_id: int, owner_digest: bytes) -> SqlUsageFeed:
         feed = session.execute(
             select(SqlUsageFeed)
             .where(
@@ -271,6 +329,150 @@ class UsageCutoverStore:
             "row_version": row.row_version,
         }
 
+    # ---- association and detection (observation append) -----------------
+
+    @staticmethod
+    def lock_domain_hold(
+        session: Session, workspace_id: int, host_id: str, harness: str
+    ) -> SqlUsageCutoverHold | None:
+        """Take the domain's hold row before the feed row (§2.3 lock order)."""
+        return UsageCutoverStore._hold(session, workspace_id, host_id, harness, for_share=True)
+
+    @staticmethod
+    def _merge_unit_evidence(
+        row: SqlUsageTurnAdmission, observation: Any
+    ) -> tuple[bool, str | None]:
+        """Record the unit's terminal evidence on its admission.
+
+        Returns ``(admission_terminal, turn_ended_at)``.
+        """
+        evidence = json.loads(row.terminal_evidence or "{}")
+        threads: dict[str, list[dict[str, Any]]] = evidence.get("threads", {})
+        now_iso = _iso(_now())
+        own_key: str | None = None
+        if observation.physical_session_id is not None:
+            own_key = thread_key(observation.physical_session_id, observation.physical_subagent_id)
+            threads.setdefault(own_key, [])
+        for entry in observation.terminal:
+            existing = {
+                (item["kind"], item.get("source_ref"))
+                for item in threads.setdefault(entry.key, [])
+            }
+            if (entry.evidence, None) in existing:
+                continue
+            threads[entry.key].append(
+                {"kind": entry.evidence, "reported_at": now_iso, "source_ref": None}
+            )
+        evidence["threads"] = threads
+        terminal = bool(threads) and all(entries for entries in threads.values())
+        if terminal and evidence.get("turn_ended_at") is None:
+            evidence["turn_ended_at"] = now_iso
+        row.terminal_evidence = _json(evidence)
+        if terminal:
+            row.terminal_state = _json(
+                sorted({item["kind"] for entries in threads.values() for item in entries})
+            )
+        return terminal, evidence.get("turn_ended_at")
+
+    @staticmethod
+    def associate_unit(
+        session: Session,
+        workspace_id: int,
+        owner_digest: bytes,
+        observation: Any,
+        hold: SqlUsageCutoverHold | None,
+        *,
+        binding_session_id: str | None,
+        margin_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Resolve the unit's admission and detect an after-hold unadmitted call.
+
+        The runner proposes the admission; the server checks it here and never
+        returns an error for a failed check (the producer's delivery loop would
+        stop). A failed check leaves the unit unadmitted.
+        """
+        result: dict[str, Any] = {
+            "admission": None,
+            "association": "unadmitted",
+            "call_started_not_before": None,
+            "call_start_basis": None,
+            "account_hint": None,
+            "ended_at": None,
+            "after_hold": False,
+        }
+        admission_id = observation.admission_id
+        if admission_id is not None:
+            row = session.get(SqlUsageTurnAdmission, (workspace_id, owner_digest, admission_id))
+            failure: str | None = None
+            if row is None:
+                failure = "admission_missing"
+            elif row.session_id != binding_session_id:
+                failure = "admission_session_mismatch"
+            elif row.host_id != observation.host_id or row.harness != observation.harness:
+                failure = "admission_domain_mismatch"
+            elif observation.occurred_at is not None and (
+                (_epoch(observation.occurred_at) or 0) < row.admitted_at - margin_seconds
+            ):
+                failure = "admission_precedes_call"
+            elif observation.thread_kind == "main":
+                main_key = observation.turn_id or observation.producer_unit_id
+                if row.main_turn_key is None:
+                    row.main_turn_key = main_key
+                elif row.main_turn_key != main_key:
+                    failure = "admission_reused"
+            if failure is None:
+                assert row is not None
+                if row.route_check is None and observation.route_check is not None:
+                    row.route_check = observation.route_check
+                    if row.route_check == "mismatch":
+                        row.account_hint = None
+                        row.binding_revision = None
+                        row.binding_digest = None
+                terminal, turn_ended_at = UsageCutoverStore._merge_unit_evidence(row, observation)
+                del terminal
+                ended_at = None
+                if turn_ended_at is not None:
+                    evidence = json.loads(row.terminal_evidence or "{}")
+                    threads = evidence.get("threads", {})
+                    if observation.physical_session_id is not None:
+                        own_key = thread_key(
+                            observation.physical_session_id,
+                            observation.physical_subagent_id,
+                        )
+                        own = threads.get(own_key, [])
+                        if own and all(entries for entries in threads.values()):
+                            ended_at = _iso(_now())
+                if ended_at is not None and row.terminal_state is not None:
+                    result["ended_at"] = ended_at
+                result["admission"] = row
+                result["association"] = "linked"
+                result["call_started_not_before"] = _iso(row.admitted_at)
+                result["call_start_basis"] = "turn_admission"
+                if row.route_check == "match" and row.account_hint:
+                    result["account_hint"] = json.loads(row.account_hint)
+            else:
+                result["association"] = failure
+        if hold is not None and result["admission"] is None:
+            hold_time = hold.created_at
+            after_hold = observation.occurred_at is None or (
+                hold_time is not None
+                and (_epoch(observation.occurred_at) or 0) >= hold_time - margin_seconds
+            )
+            if after_hold and hold.state in {"held", "drained"}:
+                # Continuous detection (§4.2 step 2): the window stays closed.
+                hold.state = "invalidated"
+                hold.state_changed_at = _now()
+                hold.row_version += 1
+                result["after_hold"] = True
+            elif after_hold and hold.state in {"released", "abandoned"}:
+                released_at = hold.released_at
+                if (
+                    released_at is None
+                    or (_epoch(observation.occurred_at) or 0) <= released_at + margin_seconds
+                ):
+                    result["after_hold"] = True
+        return result
+
     # ---- hold machine ---------------------------------------------------
 
     def hold_status(self, owner_id: str, host_id: str, harness: str) -> dict[str, Any]:
@@ -293,7 +495,7 @@ class UsageCutoverStore:
                     "latest_receipt": None,
                     "open_admissions": 0,
                 }
-            receipt = self._latest_receipt(session, workspace_id, owner_digest, row)
+            receipt = self.latest_receipt(session, workspace_id, owner_digest, row)
             open_admissions = session.execute(
                 select(func.count())
                 .select_from(SqlUsageTurnAdmission)
@@ -750,7 +952,7 @@ class UsageCutoverStore:
     # ---- receipts -------------------------------------------------------
 
     @staticmethod
-    def _latest_receipt(
+    def latest_receipt(
         session: Session,
         workspace_id: int,
         owner_digest: bytes,
@@ -836,7 +1038,7 @@ class UsageCutoverStore:
             )
             if not rows and (hold is None or hold.generation != generation):
                 raise UsageExportError(404, "usage_cutover_generation_not_found")
-            feed = self._feed(session, workspace_id, owner_digest)
+            feed = self.feed_row(session, workspace_id, owner_digest)
             self._charge_read(feed)
             page_rows = rows[:limit]
             return {
@@ -861,53 +1063,7 @@ class UsageCutoverStore:
         kind: str,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        previous = self._latest_receipt(session, workspace_id, owner_digest, hold)
-        generation = hold.generation or 0
-        receipt_seq = (
-            session.execute(
-                select(func.max(SqlUsageCutoverReceipt.receipt_seq)).where(
-                    SqlUsageCutoverReceipt.workspace_id == workspace_id,
-                    SqlUsageCutoverReceipt.owner_digest == owner_digest,
-                    SqlUsageCutoverReceipt.host_id == hold.host_id,
-                    SqlUsageCutoverReceipt.harness == hold.harness,
-                    SqlUsageCutoverReceipt.generation == generation,
-                )
-            ).scalar_one_or_none()
-            or 0
-        )
-        feed = self._feed(session, workspace_id, owner_digest)
-        receipt = {
-            **body,
-            "receipt_schema_version": 1,
-            "receipt_id": uuid.uuid4().hex,
-            "receipt_seq": receipt_seq + 1,
-            "kind": kind,
-            "owner_scope_id": feed.owner_scope_id,
-            "feed_id": feed.feed_id,
-            "feed_epoch": feed.feed_epoch,
-            "domain": {"host_id": hold.host_id, "harness": hold.harness},
-            "generation": generation,
-            "hold_created_at": _iso(hold.created_at),
-            "created_at": _iso(_now()),
-            "previous_receipt_digest": previous.digest.hex() if previous is not None else None,
-        }
-        digest = _canonical_digest(receipt)
-        session.add(
-            SqlUsageCutoverReceipt(
-                workspace_id=workspace_id,
-                owner_digest=owner_digest,
-                host_id=hold.host_id,
-                harness=hold.harness,
-                generation=generation,
-                receipt_seq=receipt["receipt_seq"],
-                receipt_id=receipt["receipt_id"],
-                kind=kind,
-                payload=_json(receipt),
-                digest=bytes.fromhex(digest),
-                created_at=_now(),
-            )
-        )
-        return {**receipt, "digest": digest}
+        return append_receipt(session, workspace_id, owner_digest, hold, kind, body)
 
     # ---- drain receipt --------------------------------------------------
 
@@ -1012,7 +1168,7 @@ class UsageCutoverStore:
                 raise UsageExportError(409, "generation_mismatch")
             if hold.state not in {"held", "drained"}:
                 raise UsageExportError(409, "not_drained")
-            feed = self._feed(session, workspace_id, owner_digest)
+            feed = self.feed_row(session, workspace_id, owner_digest)
             del feed
             last_sequence = self._domain_sequence(
                 session, workspace_id, owner_digest, canonical_host, feed_harness
@@ -1032,12 +1188,25 @@ class UsageCutoverStore:
                 [entry for entry in facts.get("admissions", []) if isinstance(entry, dict)],
             )
             codes.extend(admission_codes)
+            # r5: a call names the server-held association, and only a linked
+            # call may name one.
             linked_admissions = {
-                entry.get("admission_id")
+                entry["admission_id"]
                 for entry in calls
-                if isinstance(entry, dict)
-                and isinstance(entry.get("admission"), dict)
-                and entry["admission"].get("state") == "linked"
+                if isinstance(entry, dict) and isinstance(entry.get("admission_id"), str)
+            }
+            known_ids = {
+                row.admission_id
+                for row in session.execute(
+                    select(SqlUsageTurnAdmission).where(
+                        SqlUsageTurnAdmission.workspace_id == workspace_id,
+                        SqlUsageTurnAdmission.owner_digest == owner_digest,
+                        SqlUsageTurnAdmission.host_id == canonical_host,
+                        SqlUsageTurnAdmission.harness == feed_harness,
+                    )
+                )
+                .scalars()
+                .all()
             }
             verified_calls: list[dict[str, Any]] = []
             for entry in calls:
@@ -1058,6 +1227,15 @@ class UsageCutoverStore:
                 unit = session.get(SqlUsageUnit, (workspace_id, owner_digest, unit_digest))
                 state = entry.get("state")
                 server_block = entry.get("server")
+                admission = entry.get("admission")
+                named_admission = entry.get("admission_id")
+                linked = isinstance(admission, dict) and admission.get("state") == "linked"
+                if linked != isinstance(named_admission, str):
+                    codes.append("host_facts_mismatch")
+                    continue
+                if isinstance(named_admission, str) and named_admission not in known_ids:
+                    codes.append("host_facts_mismatch")
+                    continue
                 if isinstance(server_block, dict):
                     if unit is None or (
                         server_block.get("original_event_id"),
@@ -1072,13 +1250,17 @@ class UsageCutoverStore:
                     ):
                         codes.append("host_facts_mismatch")
                         continue
+                    # r5: a committed call equals its unit row's admission.
+                    if unit.admission_id != named_admission:
+                        codes.append("host_facts_mismatch")
+                        continue
                     state = "terminal_acked"
                 elif unit is not None and state in {"unsent", "path_pending"}:
                     # A lost ACK: the server already holds this observation.
                     state = "terminal_acked"
                 if state == "unadmitted_after_hold":
                     codes.append("unadmitted_call_after_hold")
-                verified_calls.append({**entry, "state": state})
+                verified_calls.append({**entry, "admission_id": named_admission, "state": state})
 
             admissions = [
                 _admission_entry(row, linked_call=row.admission_id in linked_admissions)
@@ -1179,7 +1361,7 @@ class UsageCutoverStore:
                 return {"__error__": "drain_invalidated"}
             if hold.state != "drained":
                 raise UsageExportError(409, "not_drained")
-            latest = self._latest_receipt(session, workspace_id, owner_digest, hold)
+            latest = self.latest_receipt(session, workspace_id, owner_digest, hold)
             if (
                 latest is None
                 or latest.kind != "drain"
@@ -1232,7 +1414,7 @@ class UsageCutoverStore:
             grant_id = consumer_receipt.get("usage_read_grant_id")
             if last_sequence is not None:
                 positions = json.loads(
-                    self._feed(session, workspace_id, owner_digest).grant_positions or "{}"
+                    self.feed_row(session, workspace_id, owner_digest).grant_positions or "{}"
                 )
                 presented = positions.get(grant_id) if isinstance(grant_id, str) else None
                 if not isinstance(presented, int) or presented < last_sequence:

@@ -193,13 +193,22 @@ class UsageEventStore:
             session.flush()
         return feed
 
-    def _write(self, owner_id: str, operation: str, callback: Any) -> Any:
+    def _write(
+        self,
+        owner_id: str,
+        operation: str,
+        callback: Any,
+        prelock: Any = None,
+    ) -> Any:
         self._validate_owner(owner_id)
         workspace_id = current_workspace_id()
 
         def locked(session: Session) -> Any:
             generation = require_active_account(session, owner_id)
             owner_digest = self._owner(owner_id, generation)
+            # The hold row is always taken before the feed row (§2.3).
+            if prelock is not None:
+                prelock(session, workspace_id, owner_digest)
             feed = self._feed(session, workspace_id, owner_digest)
             return callback(session, feed, workspace_id, owner_digest)
 
@@ -336,9 +345,33 @@ class UsageEventStore:
         measurement_json = _json(measurement)
         call_digest = self._call_digest(observation)
 
+        hold_row: list[Any] = []
+
+        def prelock(session: Session, workspace_id: int, _owner_digest: bytes) -> None:
+            from omnigent.usage_export.cutover import UsageCutoverStore
+
+            hold_row.append(
+                UsageCutoverStore.lock_domain_hold(
+                    session, workspace_id, observation.host_id, observation.harness
+                )
+            )
+
         def write(
             session: Session, feed: SqlUsageFeed, workspace_id: int, owner_digest: bytes
         ) -> dict[str, Any]:
+            from omnigent.usage_export.cutover import (
+                UsageCutoverStore,
+                append_receipt,
+            )
+
+            association = UsageCutoverStore.associate_unit(
+                session,
+                workspace_id,
+                owner_digest,
+                observation,
+                hold_row[0] if hold_row else None,
+                binding_session_id=observation.session_id,
+            )
             unit = session.get(SqlUsageUnit, (workspace_id, owner_digest, unit_digest))
             if unit is not None:
                 old = json.loads(unit.observation)
@@ -365,7 +398,25 @@ class UsageEventStore:
                 )
                 if previous is not None:
                     previous_ended_at = _event_from_payload(previous.payload)["ended_at"]
-            ended_at = previous_ended_at
+            started: dict[str, Any] = {}
+            if unit is not None:
+                previous_event = session.get(
+                    SqlUsageEvent, (workspace_id, owner_digest, unit.latest_sequence)
+                )
+                if previous_event is not None:
+                    prior = _event_from_payload(previous_event.payload)
+                    started = {
+                        "call_started_not_before": prior["call_started_not_before"],
+                        "call_start_basis": prior["call_start_basis"],
+                        "account_hint": prior["account_hint"],
+                    }
+            if not started:
+                started = {
+                    "call_started_not_before": association["call_started_not_before"],
+                    "call_start_basis": association["call_start_basis"],
+                    "account_hint": association["account_hint"],
+                }
+            ended_at = previous_ended_at or association["ended_at"]
             if ended_at is None and observation.physical_session_id is not None:
                 own_thread = thread_key(
                     observation.physical_session_id, observation.physical_subagent_id
@@ -405,10 +456,10 @@ class UsageEventStore:
                 "sequence": sequence,
                 "recorded_at": recorded_at,
                 "request_count": request_count,
-                "call_started_not_before": None,
-                "call_start_basis": None,
+                "call_started_not_before": started["call_started_not_before"],
+                "call_start_basis": started["call_start_basis"],
                 "ended_at": ended_at,
-                "account_hint": None,
+                "account_hint": started["account_hint"],
             }
             payload = _json(event)
             if len(payload.encode("utf-8")) > _MAX_EVENT_BYTES:
@@ -439,6 +490,12 @@ class UsageEventStore:
                         latest_sequence=sequence,
                         revision=1,
                         request_count=request_count,
+                        admission_id=(
+                            association["admission"].admission_id
+                            if association["admission"] is not None
+                            else None
+                        ),
+                        association=association["association"],
                     )
                 )
             else:
@@ -447,9 +504,53 @@ class UsageEventStore:
                 unit.latest_sequence = sequence
                 unit.revision += 1
                 unit.request_count = request_count
+                if association["admission"] is not None:
+                    unit.admission_id = association["admission"].admission_id
+                    unit.association = association["association"]
+            hold = hold_row[0] if hold_row else None
+            if (
+                hold is not None
+                and association["after_hold"]
+                and association["admission"] is None
+                and hold.state in {"released", "abandoned"}
+            ):
+                append_receipt(
+                    session,
+                    workspace_id,
+                    owner_digest,
+                    hold,
+                    "late_violation",
+                    {
+                        "result": "violation",
+                        "failure_codes": ["unadmitted_call_after_hold"],
+                        "last_committed_sequence": sequence,
+                        "detection": None,
+                        "admissions": [],
+                        "calls": [
+                            {
+                                "call_key": {
+                                    "meter_epoch": observation.meter_epoch,
+                                    "producer_unit_id": observation.producer_unit_id,
+                                },
+                                "server": {
+                                    "original_event_id": original_id,
+                                    "latest_event_id": event_id,
+                                    "sequence": sequence,
+                                    "revision": event["revision"],
+                                },
+                                "admission_id": None,
+                                "occurred_at": observation.occurred_at,
+                                "ended_at": ended_at,
+                                "state": "unadmitted_after_hold",
+                            }
+                        ],
+                        "counts": {"calls_unadmitted_after_hold": 1},
+                        "release": None,
+                    },
+                )
             return event
 
-        return self._write(owner_id, "append_usage_observation", write)
+        return self._write(owner_id, "append_usage_observation", write, prelock=prelock)
 
     @staticmethod
     def _cursor(

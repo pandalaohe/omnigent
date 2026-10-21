@@ -788,6 +788,260 @@ def test_abandon_requires_a_consumer_receipt(
     assert burned.value.code == "hold_generation_conflict"
 
 
+def _linked_observation(unit: str, admission_id: str, **changes: object) -> UsageObservation:
+    fields: dict[str, object] = {
+        "producer_unit_id": unit,
+        "admission_id": admission_id,
+        "occurred_at": "2026-01-01T00:00:00Z",
+        "turn_id": f"turn-{unit}",
+        "thread_kind": "main",
+    }
+    fields.update(changes)
+    return _sealed(unit, **fields)
+
+
+def _call_entry(
+    observation: UsageObservation,
+    event: dict[str, object] | None,
+    *,
+    linked: bool,
+    admission_id: str | None,
+    state: str = "terminal_acked",
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "call_key": {
+            "meter_epoch": observation.meter_epoch,
+            "producer_unit_id": observation.producer_unit_id,
+        },
+        "server": None
+        if event is None
+        else {
+            "original_event_id": event["original_event_id"],
+            "latest_event_id": event["event_id"],
+            "sequence": event["sequence"],
+            "revision": event["revision"],
+        },
+        "admission": {"state": "linked" if linked else "unadmitted"},
+        "admission_id": admission_id,
+        "occurred_at": observation.occurred_at,
+        "ended_at": None if event is None else event["ended_at"],
+        "state": state,
+    }
+    return entry
+
+
+def test_drain_calls_name_the_server_held_association(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'usage.db'}"
+    feed = UsageEventStore(uri)
+    cutover = UsageCutoverStore(uri)
+    host = uuid.uuid4().hex
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    admission = cutover.admit_turn(
+        "alice",
+        admission_id=uuid.uuid4().hex,
+        session_id="session-1",
+        host_id=host,
+        harness="codex-native",
+        source="web",
+    )
+    linked = _linked_observation("unit-linked", admission["admission_id"], host_id=host)
+    linked_event = feed.append("alice", linked)
+    unadmitted = _sealed("unit-unadmitted", host_id=host, occurred_at="2025-12-31T23:59:00Z")
+    unadmitted_event = feed.append("alice", unadmitted)
+    cutover.create_hold("alice", host, "codex-native", 1)
+    drained = cutover.submit_drain(
+        "alice",
+        host,
+        "codex-native",
+        1,
+        _drain_facts(
+            admissions=[
+                {
+                    "admission_id": admission["admission_id"],
+                    "threads": [
+                        {
+                            "physical_session_id": "phys-main",
+                            "physical_subagent_id": None,
+                            "evidence": [{"kind": "terminal_record", "source_ref": "r1"}],
+                        }
+                    ],
+                }
+            ],
+            calls=[
+                _call_entry(
+                    linked,
+                    linked_event,
+                    linked=True,
+                    admission_id=admission["admission_id"],
+                ),
+                _call_entry(
+                    unadmitted,
+                    unadmitted_event,
+                    linked=False,
+                    admission_id=None,
+                    state="unadmitted_before_hold",
+                ),
+            ],
+        ),
+    )
+    assert drained["result"] == "drained"
+    by_unit = {entry["call_key"]["producer_unit_id"]: entry for entry in drained["calls"]}
+    assert by_unit[linked.producer_unit_id]["admission_id"] == admission["admission_id"]
+    assert by_unit[unadmitted.producer_unit_id]["admission_id"] is None
+    assert set(by_unit[unadmitted.producer_unit_id]) >= {"admission_id", "state"}
+
+
+def test_drain_calls_fail_when_the_named_admission_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'usage.db'}"
+    feed = UsageEventStore(uri)
+    cutover = UsageCutoverStore(uri)
+    host = uuid.uuid4().hex
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    first = cutover.admit_turn(
+        "alice",
+        admission_id=uuid.uuid4().hex,
+        session_id="session-1",
+        host_id=host,
+        harness="codex-native",
+        source="web",
+    )
+    second = cutover.admit_turn(
+        "alice",
+        admission_id=uuid.uuid4().hex,
+        session_id="session-1",
+        host_id=host,
+        harness="codex-native",
+        source="peer",
+    )
+    observation = _linked_observation("unit-linked", first["admission_id"], host_id=host)
+    event = feed.append("alice", observation)
+    cutover.create_hold("alice", host, "codex-native", 1)
+    facts = _drain_facts(
+        admissions=[
+            {"admission_id": first["admission_id"], "threads": []},
+            {"admission_id": second["admission_id"], "threads": []},
+        ],
+        calls=[
+            _call_entry(
+                observation,
+                event,
+                linked=True,
+                admission_id=second["admission_id"],
+            )
+        ],
+    )
+    failed = cutover.submit_drain("alice", host, "codex-native", 1, facts)
+    assert failed["result"] == "failed"
+    assert "host_facts_mismatch" in failed["failure_codes"]
+    # An unrecorded admission name fails the same way.
+    unknown = cutover.submit_drain(
+        "alice",
+        host,
+        "codex-native",
+        1,
+        _drain_facts(
+            admissions=[{"admission_id": first["admission_id"], "threads": []}],
+            calls=[
+                _call_entry(
+                    observation,
+                    event,
+                    linked=True,
+                    admission_id=uuid.uuid4().hex,
+                )
+            ],
+        ),
+    )
+    assert "host_facts_mismatch" in unknown["failure_codes"]
+
+
+def test_zero_thread_admission_matches_through_call_admission_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'usage.db'}"
+    feed = UsageEventStore(uri)
+    cutover = UsageCutoverStore(uri)
+    host = uuid.uuid4().hex
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    admission = cutover.admit_turn(
+        "alice",
+        admission_id=uuid.uuid4().hex,
+        session_id="session-1",
+        host_id=host,
+        harness="codex-native",
+        source="web",
+    )
+    unadmitted = _sealed("unit-unadmitted", host_id=host, occurred_at="2025-12-31T23:59:00Z")
+    unadmitted_event = feed.append("alice", unadmitted)
+    cutover.create_hold("alice", host, "codex-native", 1)
+    zero_thread_facts = _drain_facts(
+        admissions=[
+            {
+                "admission_id": admission["admission_id"],
+                "threads": [],
+                "turn_ended_at": "2026-01-01T00:00:00Z",
+            }
+        ],
+        calls=[
+            _call_entry(
+                unadmitted,
+                unadmitted_event,
+                linked=False,
+                admission_id=None,
+                state="unadmitted_before_hold",
+            )
+        ],
+    )
+    drained = cutover.submit_drain("alice", host, "codex-native", 1, zero_thread_facts)
+    assert drained["result"] == "drained"
+    entry = next(
+        item for item in drained["admissions"] if item["admission_id"] == admission["admission_id"]
+    )
+    assert entry["terminal"] is True
+    assert entry["terminal_state"] == ["executor_end"]
+
+    hold = cutover.hold_status("alice", host, "codex-native")
+    assert hold["state"] == "drained"
+    linked_call = _call_entry(
+        unadmitted,
+        unadmitted_event,
+        linked=True,
+        admission_id=admission["admission_id"],
+        state="terminal_acked",
+    )
+    blocked = cutover.submit_drain(
+        "alice",
+        host,
+        "codex-native",
+        1,
+        _drain_facts(
+            admissions=[
+                {
+                    "admission_id": admission["admission_id"],
+                    "threads": [],
+                    "turn_ended_at": "2026-01-01T00:00:00Z",
+                }
+            ],
+            calls=[{**linked_call, "server": None}],
+        ),
+    )
+    assert blocked["result"] == "failed"
+    entry = next(
+        item for item in blocked["admissions"] if item["admission_id"] == admission["admission_id"]
+    )
+    assert entry["terminal"] is False
+    assert entry["terminal_state"] == []
+
+
 def test_cutover_migration_roundtrip(tmp_path: Path) -> None:
     from alembic import command
 
