@@ -15991,7 +15991,13 @@ async def _run_runner_status_probe(
                     _note_running_edge(session_id, previous, raw)
                     _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
+                        session_live_state.persist_live_status(
+                            session_id,
+                            raw,
+                            check_real_turn_settle=(
+                                raw == "idle" and previous in (None, "running", "waiting")
+                            ),
+                        )
                     _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"

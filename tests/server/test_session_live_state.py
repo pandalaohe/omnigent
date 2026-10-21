@@ -115,6 +115,31 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
     ]
 
 
+def test_first_idle_after_restart_settles_only_a_persisted_running_turn(
+    recording_store: _RecordingStore,
+) -> None:
+    recording_store.conversations["turned_idle"] = _FakeConversation(
+        live_status="running", labels={session_live_state.RUNNING_SINCE_LABEL_KEY: "1"}
+    )
+    recording_store.conversations["already_idle"] = _FakeConversation(
+        live_status="idle", labels={session_live_state.RUNNING_SINCE_LABEL_KEY: "1"}
+    )
+    recording_store.conversations["replayed_idle"] = _FakeConversation(
+        live_status="running", labels={session_live_state.RUNNING_SINCE_LABEL_KEY: "1"}
+    )
+
+    session_live_state.persist_live_status("turned_idle", "idle", check_real_turn_settle=True)
+    session_live_state.persist_live_status("already_idle", "idle", check_real_turn_settle=True)
+    session_live_state.persist_live_status("replayed_idle", "idle")
+    _wait_until(lambda: len(recording_store.status_writes) == 3)
+
+    assert len(recording_store.label_writes) == 1
+    assert recording_store.label_writes[0][0] == "turned_idle"
+    assert (
+        session_live_state.LAST_REAL_TURN_SETTLED_LABEL_KEY in recording_store.label_writes[0][1]
+    )
+
+
 def test_persist_running_since_previous_known_writes_label(
     recording_store: _RecordingStore,
 ) -> None:

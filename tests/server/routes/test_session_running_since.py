@@ -311,6 +311,49 @@ async def test_probe_running_on_cache_miss_stamps(
     _session_status_cache.pop(sid, None)
 
 
+@pytest.mark.asyncio
+async def test_probe_idle_after_restart_records_a_persisted_running_turn(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    del client  # The fixture configures the live-state store.
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(
+        agent_id, name="probe-settle-agent", bundle_location="test:///bundle"
+    )
+    conv = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_session_live_status(conv.id, "running")
+    conv_store.set_labels(conv.id, {_RUNNING_SINCE_LABEL_KEY: str(int(time.time()) - 7200)})
+    _session_status_cache.pop(conv.id, None)
+    common._runner_status_probe_backoff.pop(conv.id, None)
+    common._runner_status_probe_inflight.pop(conv.id, None)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"status": "idle"})
+        ),
+        base_url="http://runner",
+    ) as runner_client:
+        try:
+            assert (
+                await orchestration._probe_runner_live_status(runner_client, conv.id, "runner_1")
+                == "idle"
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                loaded = conv_store.get_conversation(conv.id)
+                if loaded is not None and loaded.labels.get(
+                    session_live_state.LAST_REAL_TURN_SETTLED_LABEL_KEY
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("first idle probe did not persist the real-turn settle stamp")
+        finally:
+            _session_status_cache.pop(conv.id, None)
+            _session_running_since_cache.pop(conv.id, None)
+
+
 @pytest_asyncio.fixture()
 async def seeded(db_uri: str) -> str:
     """One session with a visible message, for the snapshot-field tests."""
