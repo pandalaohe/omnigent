@@ -8,11 +8,13 @@ import os
 import shlex
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from builtins import ExceptionGroup
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1181,6 +1183,376 @@ assert.deepEqual(active, process.argv[2] === "safe"
     assert verify_pi_permission_installation(bridge_dir, "plan")
     installed = json.loads((bridge_dir / "permission_installation.json").read_text())
     assert installed["active_tools"] == ["read", "sys_os_read"]
+
+
+@pytest.mark.asyncio
+async def test_rpc_pi_usage_extension_reports_idle_warm_and_checks_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generated RPC extension sends content-free usage while no turn reads stdout."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required for the Pi extension bridge test")
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    server = _ToolServer()
+    await server.start()
+    usage_token = server.issue_pi_usage_token("session-1")
+    received: list[dict] = []
+
+    async def report(session_id: str, data: dict) -> dict:
+        assert session_id == "session-1"
+        received.append(data)
+        return {"pi_cache_warming_allowed": True}
+
+    server._pi_session_event = report
+    extension = tmp_path / "bridge.js"
+    extension.write_text(
+        _generate_extension_js(
+            server.port,
+            [],
+            server.token,
+            usage_session_id="session-1",
+            usage_token=usage_token,
+        )
+    )
+    runner = tmp_path / "run.js"
+    runner.write_text(
+        textwrap.dedent(
+            """
+            const assert = require("assert").strict;
+            let poll;
+            global.setInterval = (callback) => { poll = callback; return 1; };
+            global.clearInterval = () => {};
+            const handlers = {};
+            require(process.argv[2])({
+              on(name, handler) { handlers[name] = handler; },
+              registerTool() {},
+            });
+            const entries = [];
+            const ctx = {
+              model: { id: "model-1", provider: "provider-1", promptCache: { short: 15 } },
+              getContextUsage() { return { tokens: 1201, contextWindow: 8192 }; },
+              sessionManager: { getEntries() { return entries; } },
+            };
+            (async () => {
+              await handlers.session_start({}, ctx);
+              await handlers.message_end({ message: {
+                role: "assistant", model: "model-1", provider: "provider-1",
+                content: "never-forward", usage: {
+                  input: 1, output: 2, cacheRead: 200, cacheWrite: 3,
+                },
+              } }, ctx);
+              await handlers.after_provider_response({ headers: {
+                "anthropic-ratelimit-tokens-remaining": "20",
+                "authorization": "never-forward",
+              } });
+              assert.deepEqual(await handlers.cache_warming_decision({
+                action: "warm", continuationProbability: 0.15,
+              }), { action: "warm" });
+              for (const [index, cacheRead] of [1000, 1100, 1200].entries()) {
+                entries.push({
+                  type: "usage", kind: "cache_warm", id: `warm-${index + 1}`,
+                  timestamp: new Date(Date.now() + 1000 + index * 1000).toISOString(),
+                  model: "model-1", provider: "provider-1", usage: {
+                    input: 0, output: 1, cacheRead, cacheWrite: 0,
+                  },
+                });
+              }
+              await poll();
+              await poll();
+              await handlers.message_end({ message: {
+                role: "assistant", stopReason: "error",
+              } }, ctx);
+              await handlers.session_shutdown();
+            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            """
+        )
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            node,
+            str(runner),
+            str(extension),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await asyncio.wait_for(proc.communicate(), 5)
+        assert proc.returncode == 0, stderr.decode(errors="replace")
+        assert any(
+            data.get("context_tokens") == 1201 and data.get("context_window") == 8192
+            for data in received
+        )
+        assert any(
+            data.get("pi_cache_ttl_seconds") == 15
+            and data.get("pi_cache_read_input_tokens") == 200
+            for data in received
+        )
+        assert any(data.get("pi_cache_read_input_tokens") == 1200 for data in received)
+        assert any(
+            data.get("pi_provider_usage_limits_headers")
+            == {"anthropic-ratelimit-tokens-remaining": "20"}
+            for data in received
+        )
+        assert any(data.get("pi_provider_usage_limits_headers") == {} for data in received)
+        assert {"pi_cache_warming_probe": True} in received
+        assert "never-forward" not in str(received)
+        from omnigent.usage_export.runtime import outbox
+
+        with sqlite3.connect(outbox().path) as db:
+            rows = [
+                json.loads(payload)
+                for (payload,) in db.execute("SELECT payload FROM observations ORDER BY sequence")
+            ]
+        assert rows == []  # The RPC reader owns warm increments, not the Pi extension.
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("emit_on_close", [False, True])
+async def test_rpc_reader_captures_warm_usage_before_and_during_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emit_on_close: bool
+) -> None:
+    """Pi's emitted entries survive a close before the extension's next poll."""
+    import omnigent.inner.pi_executor as module
+    from omnigent.usage_export.runtime import outbox
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    marker = tmp_path / "emitted"
+    entries = [
+        {
+            "type": "entry_appended",
+            "entry": {
+                "type": "usage",
+                "kind": "cache_warm",
+                "id": f"warm-{index}",
+                "timestamp": f"2026-10-21T00:00:0{index}Z",
+                "provider": "provider-1",
+                "model": "model-1",
+                "parentId": "parent",
+                "content": "never-forward",
+                "usage": {
+                    "input": 0,
+                    "output": 1,
+                    "cacheRead": 1000 + index,
+                    "cacheWrite": 0,
+                    "totalTokens": 1001 + index,
+                },
+            },
+        }
+        for index in range(1 if emit_on_close else 3)
+    ]
+    if not emit_on_close:
+        entries.append(entries[0])  # Replayed Pi entry ID must remain one increment.
+    script = tmp_path / "pi_stdout.py"
+    script.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        + ("sys.stdin.read()\n" if emit_on_close else "")
+        + "for line in "
+        + repr([json.dumps(event) for event in entries])
+        + ":\n    print(line, flush=True)\n"
+        + f"Path({str(marker)!r}).write_text('emitted')\n"
+        + ("" if emit_on_close else "sys.stdin.read()\n")
+    )
+
+    async def spawn(*args, **kwargs):
+        return await asyncio.create_subprocess_exec(sys.executable, "-u", str(script), **kwargs)
+
+    monkeypatch.setattr(module, "_create_subprocess_exec", spawn)
+    rpc = _PiRpcSession(usage_session_id="session-1")
+    try:
+        await rpc.start("fixture", env={"PATH": os.environ.get("PATH", "")}, cwd=str(tmp_path))
+        if not emit_on_close:
+            async with asyncio.timeout(3):
+                while not marker.exists():
+                    await asyncio.sleep(0.01)
+        await rpc.close()
+        with sqlite3.connect(outbox().path) as db:
+            rows = [
+                json.loads(payload)
+                for (payload,) in db.execute("SELECT payload FROM observations ORDER BY sequence")
+            ]
+        assert len(rows) == len(entries) - (not emit_on_close)
+        assert all(row["measurement_kind"] == "increment" for row in rows)
+        assert [row["cached_input_tokens"] for row in rows] == [
+            1000 + index for index in range(1 if emit_on_close else 3)
+        ]
+        assert "never-forward" not in str(rows)
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.asyncio
+async def test_rpc_reader_retries_warm_usage_after_transient_outbox_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.usage_export.runtime as usage_runtime
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    real_outbox = usage_runtime.outbox()
+    real_append = real_outbox.append
+    attempts = 0
+
+    def flaky_append(*args):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        real_append(*args)
+
+    monkeypatch.setattr(usage_runtime, "outbox", lambda: SimpleNamespace(append=flaky_append))
+    entries = [
+        {
+            "type": "entry_appended",
+            "entry": {
+                "type": "usage",
+                "kind": "cache_warm",
+                "id": f"warm-{index}",
+                "timestamp": f"2026-10-21T00:00:0{index}Z",
+                "model": "model-1",
+                "usage": {"input": 0, "output": 1, "cacheRead": 100 + index, "cacheWrite": 0},
+            },
+        }
+        for index in range(2)
+    ]
+    rpc = _PiRpcSession(usage_session_id="session-1")
+    rpc.process = _FakeProcess(stdout_lines=[json.dumps(event) for event in entries])
+    await rpc._reader()
+    assert attempts == 3  # The next event retries the first ID, then writes its own.
+    assert rpc._pending_warm_usage == {}
+    with sqlite3.connect(real_outbox.path) as db:
+        rows = [
+            json.loads(payload) for (payload,) in db.execute("SELECT payload FROM observations")
+        ]
+    assert len(rows) == 2
+    assert sorted(row["cached_input_tokens"] for row in rows) == [100, 101]
+
+
+@pytest.mark.asyncio
+async def test_rpc_close_retains_sanitized_warm_source_until_outbox_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.usage_export.runtime as usage_runtime
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    real_outbox = usage_runtime.outbox()
+
+    def locked_append(*args):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(usage_runtime, "outbox", lambda: SimpleNamespace(append=locked_append))
+    entry = {
+        "type": "usage",
+        "kind": "cache_warm",
+        "id": "warm-pending",
+        "timestamp": "2026-10-21T00:00:00Z",
+        "model": "model-1",
+        "content": "never-forward",
+        "usage": {"input": 0, "output": 1, "cacheRead": 100, "cacheWrite": 0},
+    }
+    rpc_dir = tmp_path / "rpc"
+    rpc_dir.mkdir(mode=0o700)
+    (rpc_dir / "omnigent_tools.js").write_text("ephemeral-bridge-credential")
+    rpc = _PiRpcSession(usage_session_id="session-1", _tmp_dir=str(rpc_dir))
+    rpc.process = _FakeProcess(
+        stdout_lines=[json.dumps({"type": "entry_appended", "entry": entry})]
+    )
+    rpc._read_task = asyncio.create_task(rpc._reader())
+    with pytest.raises(RuntimeError, match="Pi warm usage export pending: 1 records") as failure:
+        await rpc.close()
+    source = rpc_dir / "warm-usage-pending.jsonl"
+    assert str(source) in str(failure.value)
+    assert rpc.process is None
+    assert not (rpc_dir / "omnigent_tools.js").exists()
+    assert list(rpc._pending_warm_usage) == ["warm-pending"]
+    records = [json.loads(line) for line in source.read_text().splitlines()]
+    assert records[0] == {"type": "session", "id": "session-1"}
+    assert records[1] == {key: value for key, value in entry.items() if key != "content"}
+    assert "never-forward" not in source.read_text()
+
+    from omnigent.usage_export.outbox import UsageOutbox
+
+    recovery_box = UsageOutbox(tmp_path / "recovery-outbox")
+    recovery_box.register_source(
+        source,
+        "session-1",
+        "pi",
+        {"harness_family": "pi", "identity_namespace": "pi/rpc/v1", "thread_kind": "main"},
+    )
+    recovery_box.scan(source, final=True)
+    with sqlite3.connect(recovery_box.path) as db:
+        recovered_rows = db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    assert recovered_rows == 1
+
+    monkeypatch.setattr(usage_runtime, "outbox", lambda: real_outbox)
+    await rpc.close()
+    assert rpc._pending_warm_usage == {}
+    assert not rpc_dir.exists()
+    with sqlite3.connect(real_outbox.path) as db:
+        rows = [
+            json.loads(payload) for (payload,) in db.execute("SELECT payload FROM observations")
+        ]
+    assert len(rows) == 1
+    assert rows[0]["cached_input_tokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_rpc_pi_usage_bridge_requires_session_token_and_fails_closed() -> None:
+    server = _ToolServer()
+    await server.start()
+    token = server.issue_pi_usage_token("session-1")
+    received: list[tuple[str, dict]] = []
+
+    async def report(session_id: str, data: dict) -> None:
+        received.append((session_id, data))
+
+    server._pi_session_event = report
+
+    async def ask(presented: str, session_id: str, kind: str, data: dict) -> dict:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "id": "request-1",
+                        "token": presented,
+                        "session_id": session_id,
+                        "kind": kind,
+                        "data": data,
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        result = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+        return result
+
+    try:
+        assert (
+            await ask(server.token, "session-1", "pi_warm_probe", {"pi_cache_warming_probe": True})
+        )["error"] == "unauthorized"
+        assert (await ask(token, "session-2", "pi_warm_probe", {"pi_cache_warming_probe": True}))[
+            "error"
+        ] == "unauthorized"
+        assert (await ask(token, "session-1", "pi_warm_probe", {"pi_cache_warming_probe": True}))[
+            "allowed"
+        ] is False
+        assert received == [("session-1", {"pi_cache_warming_probe": True})]
+        server.revoke_pi_usage_token("session-1")
+        assert (await ask(token, "session-1", "pi_warm_probe", {"pi_cache_warming_probe": True}))[
+            "error"
+        ] == "unauthorized"
+    finally:
+        await server.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -2577,6 +2949,7 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         settings = json.loads((managed_dir / "settings.json").read_text(encoding="utf-8"))
         assert settings["extensions"] == ["/ext/demo.ts"]
         assert settings["packages"] == ["npm:@x/y"]
+        assert settings["cacheWarming"] == "idle"
         assert (managed_dir / "npm").is_symlink()
     finally:
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
@@ -4069,6 +4442,23 @@ class TestSessionManagement(unittest.TestCase):
 
         _run(_test())
 
+    def test_close_session_retains_rpc_when_warm_usage_export_is_pending(self):
+        async def _test():
+            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+                executor = PiExecutor()
+
+            mock_rpc = MagicMock()
+            mock_rpc.close = AsyncMock(side_effect=RuntimeError("Pi warm usage export pending"))
+            from omnigent.inner.pi_executor import _PiSessionState
+
+            state = _PiSessionState(rpc=mock_rpc)
+            executor._session_states["test"] = state
+            with pytest.raises(RuntimeError, match="Pi warm usage export pending"):
+                await executor.close_session("test")
+            assert executor._session_states["test"] is state
+
+        _run(_test())
+
     def test_enqueue_session_message(self):
         async def _test():
             with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
@@ -4163,6 +4553,65 @@ class TestClose(unittest.TestCase):
             mock_rpc1.close.assert_called_once()
             mock_rpc2.close.assert_called_once()
             mock_tool_server.stop.assert_called_once()
+
+        _run(_test())
+
+    def test_close_finishes_other_sessions_and_bridge_after_recovery_error(self):
+        async def _test():
+            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+                executor = PiExecutor()
+            from omnigent.inner.pi_executor import _PiSessionState
+
+            source = "/tmp/pi-recovery/warm-usage-pending.jsonl"
+            failed_rpc = MagicMock()
+            failed_rpc.close = AsyncMock(
+                side_effect=RuntimeError(
+                    f"Pi warm usage export pending; recovery source: {source}"
+                )
+            )
+            healthy_rpc = MagicMock()
+            healthy_rpc.close = AsyncMock()
+            failed_state = _PiSessionState(rpc=failed_rpc)
+            executor._session_states["failed"] = failed_state
+            executor._session_states["healthy"] = _PiSessionState(rpc=healthy_rpc)
+            bridge = MagicMock()
+            bridge.stop = AsyncMock()
+            executor._tool_server = bridge
+
+            with pytest.raises(RuntimeError, match=r"warm-usage-pending\.jsonl"):
+                await executor.close()
+            failed_rpc.close.assert_awaited_once()
+            healthy_rpc.close.assert_awaited_once()
+            bridge.stop.assert_awaited_once()
+            assert executor._session_states == {"failed": failed_state}
+            assert executor._tool_server is None
+
+        _run(_test())
+
+    def test_close_preserves_recovery_error_if_bridge_stop_also_fails(self):
+        async def _test():
+            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+                executor = PiExecutor()
+            from omnigent.inner.pi_executor import _PiSessionState
+
+            failed_rpc = MagicMock()
+            failed_rpc.close = AsyncMock(
+                side_effect=RuntimeError(
+                    "recovery source: /tmp/pi-recovery/warm-usage-pending.jsonl"
+                )
+            )
+            executor._session_states["failed"] = _PiSessionState(rpc=failed_rpc)
+            bridge = MagicMock()
+            bridge.stop = AsyncMock(side_effect=OSError("bridge stop failed"))
+            executor._tool_server = bridge
+
+            with pytest.raises(ExceptionGroup) as failure:
+                await executor.close()
+            assert len(failure.value.exceptions) == 2
+            assert "warm-usage-pending.jsonl" in str(failure.value.exceptions[0])
+            assert "bridge stop failed" in str(failure.value.exceptions[1])
+            assert "failed" in executor._session_states
+            assert executor._tool_server is bridge
 
         _run(_test())
 

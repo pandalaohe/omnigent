@@ -45,10 +45,12 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
 from asyncio import Queue, Task
+from builtins import ExceptionGroup
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib.resources import files
@@ -214,6 +216,14 @@ class NativePolicyGate(Protocol):
     ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
 
 
+class PiSessionEventReporter(Protocol):
+    """Post a Pi usage event through the runner's authenticated session client."""
+
+    def __call__(  # type: ignore[explicit-any]
+        self, session_id: str, data: dict[str, Any]
+    ) -> Awaitable[dict[str, Any] | None] | dict[str, Any] | None: ...
+
+
 class _PiProviderConfig(TypedDict):
     baseUrl: str
     apiKey: str
@@ -300,12 +310,16 @@ class _ToolServer:
         # Per-server bearer token required on every request. Minted at
         # construction (never None) so auth is always enforced.
         self.token: str = secrets.token_urlsafe(32)
+        # Separate per-session credentials keep idle usage from being posted
+        # under another Pi process sharing this executor's tool bridge.
+        self._pi_usage_tokens: dict[str, str] = {}
         self._gateway_auth: Callable[[], Awaitable[str]] | None = None
         self._permission_bridge_dir: pathlib.Path | None = None
         self._permission_session_id: str | None = None
         self._permission_finish: (
             Callable[[str, dict[str, Any], dict[str, Any], str, int], Awaitable[bool]] | None
         ) = None
+        self._pi_session_event: PiSessionEventReporter | None = None
         self._clients: set[asyncio.Task[None]] = set()
 
     async def start(self) -> int:
@@ -321,6 +335,7 @@ class _ToolServer:
         return self.port
 
     async def stop(self) -> None:
+        self._pi_usage_tokens.clear()
         if self._server is not None:
             self._server.close()
         clients = list(self._clients)
@@ -355,7 +370,13 @@ class _ToolServer:
                     break
                 # Authenticate before any dispatch; close the connection on
                 # failure (unlike the malformed-frame ``continue`` below).
-                if not self._token_ok(request.get("token")):
+                kind = request.get("kind")
+                authenticated = (
+                    self._pi_usage_token_ok(request.get("session_id"), request.get("token"))
+                    if kind in {"pi_usage_event", "pi_warm_probe"}
+                    else self._token_ok(request.get("token"))
+                )
+                if not authenticated:
                     writer.write(
                         json.dumps(
                             {"id": request.get("id"), "error": "unauthorized"},
@@ -379,6 +400,11 @@ class _ToolServer:
                     writer.write(json.dumps(auth_response).encode() + b"\n")
                     await writer.drain()
                     break
+                if request.get("kind") in {"pi_usage_event", "pi_warm_probe"}:
+                    response = await self._report_pi_session_event(request)
+                    writer.write((_safe_dumps(response, request.get("id")) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    continue
                 raw_req_id = request.get("id")
                 raw_tool_name = request.get("tool")
                 # The Pi extension always supplies ``id`` and ``tool``
@@ -462,6 +488,105 @@ class _ToolServer:
             writer.close()
             self._clients.discard(task)
 
+    async def _report_pi_session_event(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Forward only structured usage to the bound session; probes fail closed."""
+        req_id = request.get("id")
+        session_id = request.get("session_id")
+        data = request.get("data")
+        kind = request.get("kind")
+        if (
+            not isinstance(req_id, str)
+            or not isinstance(session_id, str)
+            or not session_id
+            or session_id == "__default__"
+            or not isinstance(data, dict)
+            or self._pi_session_event is None
+        ):
+            return {"id": req_id, "accepted": False, "allowed": False}
+        if kind == "pi_warm_probe":
+            if data != {"pi_cache_warming_probe": True}:
+                return {"id": req_id, "accepted": False, "allowed": False}
+        elif kind == "pi_usage_event":
+            allowed = {
+                "context_tokens",
+                "context_window",
+                "pi_cache_ttl_seconds",
+                "pi_cache_observed_at",
+                "pi_cache_read_input_tokens",
+                "pi_cache_write_input_tokens",
+                "pi_provider_usage_limits_headers",
+            }
+            if not data or not set(data).issubset(allowed):
+                return {"id": req_id, "accepted": False, "allowed": False}
+        else:
+            return {"id": req_id, "accepted": False, "allowed": False}
+        try:
+            raw = self._pi_session_event(session_id, data)
+            async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                result = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
+        except Exception:  # noqa: BLE001 - unavailable reporting stops idle warming
+            logger.warning("Pi session usage bridge failed")
+            return {"id": req_id, "accepted": False, "allowed": False}
+        return {
+            "id": req_id,
+            "accepted": True,
+            "allowed": kind == "pi_warm_probe"
+            and isinstance(result, dict)
+            and result.get("pi_cache_warming_allowed") is True,
+        }
+
+    @staticmethod
+    def _sanitize_pi_warm_usage(entry: object) -> dict[str, Any] | None:
+        """Drop every non-metering field from a Pi cache-warm entry."""
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("type") != "usage" or entry.get("kind") != "cache_warm":
+            return None
+        if not isinstance(entry.get("id"), str) or not entry["id"]:
+            return None
+        if not isinstance(entry.get("timestamp"), str) or not entry["timestamp"]:
+            return None
+        if entry.get("model") is not None and not isinstance(entry["model"], str):
+            return None
+        usage = entry.get("usage")
+        counters = ("input", "output", "cacheRead", "cacheWrite")
+        if not isinstance(usage, dict):
+            return None
+        if any(type(usage.get(name)) is not int or usage[name] < 0 for name in counters):
+            return None
+        return {
+            "type": "usage",
+            "kind": "cache_warm",
+            "id": entry["id"],
+            "timestamp": entry["timestamp"],
+            "model": entry.get("model"),
+            "usage": {name: usage[name] for name in counters},
+        }
+
+    @staticmethod
+    def _capture_pi_warm_usage(session_id: str, entry: object) -> bool:
+        """Append one sanitized warm increment without changing turn totals."""
+        sanitized = _ToolServer._sanitize_pi_warm_usage(entry)
+        if sanitized is None:
+            return False
+        from omnigent.usage_export.runtime import outbox
+
+        try:
+            outbox().append(
+                session_id,
+                "pi",
+                {
+                    "harness_family": "pi",
+                    "identity_namespace": "pi/rpc/v1",
+                    "thread_kind": "main",
+                },
+                sanitized,
+            )
+        except (OSError, ValueError, sqlite3.Error):
+            logger.warning("Pi warm usage export failed")
+            return False
+        return True
+
     def _token_ok(self, presented: JsonValue) -> bool:
         """
         Validate a request's ``token`` against this server's secret.
@@ -473,6 +598,20 @@ class _ToolServer:
             :attr:`token`, compared in constant time.
         """
         return isinstance(presented, str) and hmac.compare_digest(presented, self.token)
+
+    def issue_pi_usage_token(self, session_id: str) -> str:
+        token = secrets.token_urlsafe(32)
+        self._pi_usage_tokens[session_id] = token
+        return token
+
+    def revoke_pi_usage_token(self, session_id: str) -> None:
+        self._pi_usage_tokens.pop(session_id, None)
+
+    def _pi_usage_token_ok(self, session_id: JsonValue, presented: JsonValue) -> bool:
+        if not isinstance(session_id, str) or not isinstance(presented, str):
+            return False
+        expected = self._pi_usage_tokens.get(session_id)
+        return expected is not None and hmac.compare_digest(presented, expected)
 
     def _permission_state_ready(self) -> bool:
         if self._permission_bridge_dir is None:
@@ -773,6 +912,195 @@ function installPermissionHooks(pi) {
     )
 
 
+def _rpc_usage_extension_setup(session_id: str, token: str) -> str:
+    """Render Pi-owned cache observation and idle-warming policy hooks."""
+    setup = r"""
+const USAGE_SESSION_ID = __USAGE_SESSION_ID__;
+const USAGE_TOKEN = __USAGE_TOKEN__;
+let latestUsageContext = null;
+let lastCacheUsage = null;
+let lastWarmEntryId = null;
+let warmUsagePolling = false;
+let lastPostedUsage = "";
+let warmUsagePoller = null;
+let usageFrameNumber = 0;
+
+function usageCounter(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+function usageSplit(message) {
+  if (!message || message.role !== "assistant" || !message.usage) return null;
+  const usage = message.usage;
+  const split = {
+    read: usageCounter(usage.cacheRead), write: usageCounter(usage.cacheWrite),
+    input: usageCounter(usage.input), output: usageCounter(usage.output),
+  };
+  return split.read || split.write || split.input || split.output ? split : null;
+}
+function bridgeUsage(kind, data) {
+  return new Promise((resolve) => {
+    const id = `pi-usage-${++usageFrameNumber}`;
+    let settled = false;
+    let buffer = "";
+    const client = net.createConnection({ port: PORT, host: "127.0.0.1" });
+    const timer = setTimeout(() => finish(null), 8000);
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.destroy();
+      resolve(result);
+    }
+    client.on("connect", () => client.write(JSON.stringify({
+      id, token: USAGE_TOKEN, kind, session_id: USAGE_SESSION_ID, data,
+    }) + "\n"));
+    client.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        const answer = JSON.parse(buffer.slice(0, newline));
+        finish(answer && answer.id === id ? answer : null);
+      } catch (_err) { finish(null); }
+    });
+    client.on("error", () => finish(null));
+    client.on("close", () => finish(null));
+  });
+}
+function cacheUsageData(ctx) {
+  const data = {};
+  if (lastCacheUsage) {
+    const model = ctx && ctx.model;
+    const retention = process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
+    const sameModel = model && model.id === lastCacheUsage.model &&
+      model.provider === lastCacheUsage.provider;
+    const ttl = sameModel && model.promptCache && model.promptCache[retention];
+    data.pi_cache_ttl_seconds = Number.isInteger(ttl) && ttl > 0 ? ttl : null;
+    if (data.pi_cache_ttl_seconds !== null) {
+      data.pi_cache_observed_at = lastCacheUsage.observedAt;
+      data.pi_cache_read_input_tokens = lastCacheUsage.read;
+      data.pi_cache_write_input_tokens = lastCacheUsage.write;
+    }
+  }
+  if (ctx && typeof ctx.getContextUsage === "function") {
+    try {
+      const snapshot = ctx.getContextUsage();
+      if (snapshot) {
+        if (Number.isSafeInteger(snapshot.tokens) && snapshot.tokens >= 0)
+          data.context_tokens = snapshot.tokens;
+        if (Number.isSafeInteger(snapshot.contextWindow) && snapshot.contextWindow > 0)
+          data.context_window = snapshot.contextWindow;
+      }
+    } catch (_err) {}
+  }
+  return data;
+}
+async function reportPiUsage(ctx, extra) {
+  const data = { ...cacheUsageData(ctx), ...extra };
+  if (!Object.keys(data).length) return false;
+  const key = JSON.stringify(data);
+  if (key === lastPostedUsage) return true;
+  const answer = await bridgeUsage("pi_usage_event", data);
+  if (answer && answer.accepted === true) lastPostedUsage = key;
+  return !!(answer && answer.accepted === true);
+}
+async function observeWarmUsage(ctx) {
+  if (warmUsagePolling) return;
+  if (!ctx || !ctx.sessionManager ||
+      typeof ctx.sessionManager.getEntries !== "function") return;
+  let entries;
+  try { entries = ctx.sessionManager.getEntries(); }
+  catch (_err) { return; }
+  if (!Array.isArray(entries)) return;
+  warmUsagePolling = true;
+  try {
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (!entry || entry.type !== "usage" || entry.kind !== "cache_warm") continue;
+      if (entry.id === lastWarmEntryId) return;
+      const usage = entry.usage;
+      if (!usage || ["input", "output", "cacheRead", "cacheWrite"].some(
+          (name) => !Number.isSafeInteger(usage[name]) || usage[name] < 0)) continue;
+      const split = {
+        input: usage.input, output: usage.output,
+        read: usage.cacheRead, write: usage.cacheWrite,
+      };
+      const observedAt = Math.floor(Date.parse(entry.timestamp) / 1000);
+      if (typeof entry.id !== "string" || !entry.id ||
+          !Number.isSafeInteger(observedAt) || observedAt < 0) continue;
+      lastCacheUsage = {
+        observedAt, read: split.read, write: split.write,
+        model: entry.model, provider: entry.provider,
+      };
+      if (await reportPiUsage(ctx)) lastWarmEntryId = entry.id;
+      return;
+    }
+  } finally {
+    warmUsagePolling = false;
+  }
+}
+function installUsageHooks(pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    latestUsageContext = ctx;
+    if (warmUsagePoller) clearInterval(warmUsagePoller);
+    warmUsagePoller = setInterval(
+      () => observeWarmUsage(latestUsageContext).catch(() => {}), 15000);
+    warmUsagePoller.unref?.();
+    await reportPiUsage(ctx, { pi_cache_ttl_seconds: null });
+  });
+  pi.on("session_shutdown", () => {
+    if (warmUsagePoller) clearInterval(warmUsagePoller);
+    warmUsagePoller = null;
+  });
+  pi.on("message_end", async (event, ctx) => {
+    latestUsageContext = ctx;
+    const message = event && event.message;
+    const split = usageSplit(message);
+    if (split) {
+      lastCacheUsage = {
+        observedAt: Math.floor(Date.now() / 1000), read: split.read,
+        write: split.write, model: message.model, provider: message.provider,
+      };
+    }
+    // No usable provider response leaves no fresh quota headers to display.
+    await reportPiUsage(ctx,
+      message && (message.stopReason === "error" || message.stopReason === "aborted")
+        ? { pi_provider_usage_limits_headers: {} } : undefined);
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    latestUsageContext = ctx;
+    await reportPiUsage(ctx);
+  });
+  pi.on("model_select", async (_event, ctx) => {
+    latestUsageContext = ctx;
+    await reportPiUsage(ctx, { pi_cache_ttl_seconds: null });
+  });
+  pi.on("after_provider_response", async (event) => {
+    const headers = {};
+    const raw = event && event.headers;
+    const rateLimitHeader =
+      /^anthropic-ratelimit-(requests|tokens|input-tokens|output-tokens)-(limit|remaining|reset)$/;
+    for (const [name, value] of Object.entries(raw && typeof raw === "object" ? raw : {})) {
+      const normalized = name.toLowerCase();
+      if (rateLimitHeader.test(normalized) &&
+          typeof value === "string" && value.length <= 128)
+        headers[normalized] = value;
+    }
+    await reportPiUsage(latestUsageContext, { pi_provider_usage_limits_headers: headers });
+  });
+  pi.on("cache_warming_decision", async (event) => {
+    if (!event || event.action !== "warm") return { action: "stop" };
+    if (event.continuationProbability === 1) return { action: "warm" };
+    const answer = await bridgeUsage("pi_warm_probe", { pi_cache_warming_probe: true });
+    return { action: answer && answer.allowed === true ? "warm" : "stop" };
+  });
+}
+"""
+    return setup.replace("__USAGE_SESSION_ID__", json.dumps(session_id)).replace(
+        "__USAGE_TOKEN__", json.dumps(token)
+    )
+
+
 def _generate_extension_js(
     port: int,
     tool_schemas: list[ToolSpec],
@@ -780,6 +1108,8 @@ def _generate_extension_js(
     *,
     permission_bridge_dir: pathlib.Path | None = None,
     session_id: str | None = None,
+    usage_session_id: str | None = None,
+    usage_token: str | None = None,
 ) -> str:
     """Generate a JavaScript Pi extension that registers Omnigent tools.
 
@@ -850,6 +1180,14 @@ def _generate_extension_js(
         if permission_setup
         else ""
     )
+    if usage_session_id is not None and usage_token is None:
+        raise ValueError("usage_token is required for Pi usage hooks")
+    usage_setup = (
+        _rpc_usage_extension_setup(usage_session_id, usage_token)
+        if usage_session_id is not None and usage_token is not None
+        else ""
+    )
+    usage_hook = "installUsageHooks(pi);" if usage_setup else ""
 
     return f"""\
 // Auto-generated Omnigent tool bridge extension for Pi.
@@ -862,6 +1200,7 @@ const PI_NATIVE_TOOLS = new Set(["read", "bash", "write", "edit"]);
 const PORT = {port};
 const TOKEN = {token_json};
 {permission_setup}
+{usage_setup}
 
 /** Send a tool call request over TCP and return the result. */
 function callTool(toolName, args, callId) {{
@@ -975,6 +1314,7 @@ function evalNativePolicy(toolName, args, callId) {{
 
 module.exports = function(pi) {{
   {permission_hook}
+  {usage_hook}
   // Gate native (non-bridged) tool calls through Omnigent policy. Pi's
   // native tools (e.g. ``read``, enabled for skill loading) run in-process
   // and never traverse the bridged /mcp path, so without this hook they
@@ -1512,6 +1852,7 @@ def _clean_pi_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
 class _PiRpcSession:
     """Manages a single Pi subprocess in RPC mode."""
 
+    usage_session_id: str | None = None
     process: asyncio.subprocess.Process | None = None
     _read_task: Task[None] | None = None
     _stderr_task: Task[None] | None = None
@@ -1521,6 +1862,7 @@ class _PiRpcSession:
     _line_queue: Queue[str | None] = field(default_factory=Queue)
     _stderr_lines: list[str] = field(default_factory=list)
     _tmp_dir: str | None = None
+    _pending_warm_usage: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     async def start(
         self,
@@ -1598,12 +1940,19 @@ class _PiRpcSession:
         self._stderr_task = asyncio.create_task(self._stderr_reader())
 
     async def _reader(self) -> None:
-        """Background task: read lines from Pi stdout and enqueue them."""
+        """Read RPC output, capturing emitted warm usage even between turns."""
         assert self.process is not None and self.process.stdout is not None
         try:
             async for raw_line in self._iter_stream_lines(self.process.stdout):
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if line:
+                    if self.usage_session_id is not None and "entry_appended" in line:
+                        try:
+                            event = json.loads(line)
+                            if isinstance(event, dict) and event.get("type") == "entry_appended":
+                                self._capture_warm_entry(event.get("entry"))
+                        except (json.JSONDecodeError, OSError, ValueError, sqlite3.Error):
+                            logger.warning("Pi warm usage capture failed")
                     self._line_queue.put_nowait(line)
         except asyncio.CancelledError:
             return
@@ -1611,6 +1960,57 @@ class _PiRpcSession:
             logger.debug("PiExecutor reader error: %s", exc)
         finally:
             self._line_queue.put_nowait(None)
+
+    def _capture_warm_entry(self, entry: object) -> None:
+        from omnigent.usage_export.runtime import capture_enabled
+
+        if not capture_enabled():
+            return
+        sanitized = _ToolServer._sanitize_pi_warm_usage(entry)
+        if sanitized is None:
+            return
+        self._pending_warm_usage.setdefault(sanitized["id"], sanitized)
+        self._flush_pending_warm_usage()
+
+    def _flush_pending_warm_usage(self) -> None:
+        if self.usage_session_id is None:
+            return
+        for entry_id, entry in list(self._pending_warm_usage.items()):
+            if not _ToolServer._capture_pi_warm_usage(self.usage_session_id, entry):
+                break
+            del self._pending_warm_usage[entry_id]
+
+    def _persist_pending_warm_usage(self) -> pathlib.Path:
+        """Keep a content-free recovery source when the local outbox is unavailable."""
+        if self._tmp_dir is None:
+            self._tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_usage_")
+        root = pathlib.Path(self._tmp_dir)
+        source = root / "warm-usage-pending.jsonl"
+        fd, stage = tempfile.mkstemp(prefix=".warm-usage-", dir=root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps({"type": "session", "id": self.usage_session_id}) + "\n")
+                for entry in self._pending_warm_usage.values():
+                    stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(stage, source)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(stage)
+        # The RPC temp dir can hold generated bridge credentials and copied
+        # settings. Its recovery lifetime must retain only metering data.
+        for name in (
+            "omnigent_tools.js",
+            "models.json",
+            "gateway-auth.json",
+            "gateway-auth.cjs",
+            "settings.json",
+            ".pi/settings.json",
+        ):
+            with contextlib.suppress(FileNotFoundError):
+                (root / name).unlink()
+        return source
 
     async def _stderr_reader(self) -> None:
         """Drain stderr in the background."""
@@ -1722,6 +2122,25 @@ class _PiRpcSession:
         return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
+        if self.process is not None:
+            # Pi's RPC loop treats stdin EOF as shutdown and flushes stdout.
+            # Keep the reader alive until EOF so an already-emitted warm entry
+            # is captured even when the session closes before the next turn.
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+            with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, RuntimeError):
+                await asyncio.wait_for(
+                    self.process.wait(), timeout=_RPC_SESSION_CLOSE_REAP_TIMEOUT_S
+                )
+            _proc.terminate_tree(self.process)
+            _proc.kill_tree(self.process)
+            if self._read_task is not None:
+                with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(
+                        self._read_task, timeout=_RPC_SESSION_CLOSE_REAP_TIMEOUT_S
+                    )
+            close_subprocess_transport(self.process)
+            self.process = None
         for task in (self._read_task, self._stderr_task):
             if task is not None:
                 task.cancel()
@@ -1729,16 +2148,19 @@ class _PiRpcSession:
                     await task
         self._read_task = None
         self._stderr_task = None
-        if self.process is not None:
-            _proc.terminate_tree(self.process)
-            # Cross-loop shutdown can make wait() raise even after termination.
-            with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, RuntimeError):
-                await asyncio.wait_for(
-                    self.process.wait(), timeout=_RPC_SESSION_CLOSE_REAP_TIMEOUT_S
-                )
-            _proc.kill_tree(self.process)
-            close_subprocess_transport(self.process)
-            self.process = None
+        self._flush_pending_warm_usage()
+        if self._pending_warm_usage:
+            try:
+                source = self._persist_pending_warm_usage()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Pi warm usage export pending: {len(self._pending_warm_usage)} records; "
+                    "recovery source unavailable"
+                ) from exc
+            raise RuntimeError(
+                f"Pi warm usage export pending: {len(self._pending_warm_usage)} records; "
+                f"recovery source: {source}"
+            )
         if self._tmp_dir is not None:
             shutil.rmtree(self._tmp_dir, ignore_errors=True)
             self._tmp_dir = None
@@ -2459,6 +2881,10 @@ class PiExecutor(Executor):
 
         self._session_states: dict[str, _PiSessionState] = {}
         self._tool_server: _ToolServer | None = None
+        # Installed by the runner adapter. Must remain callable between turns
+        # so Pi's own idle cache refresh can report its result and ask for a
+        # fresh owner/cap verdict without inventing an agent turn.
+        self._pi_session_event: PiSessionEventReporter | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -2500,19 +2926,30 @@ class PiExecutor(Executor):
             return False
 
     async def close_session(self, session_key: str) -> None:
-        state = self._session_states.pop(session_key, None)
-        if state is not None and state.rpc is not None:
-            await state.rpc.close()
+        state = self._session_states.get(session_key)
+        try:
+            if state is not None and state.rpc is not None:
+                await state.rpc.close()
+        finally:
+            if self._tool_server is not None:
+                self._tool_server.revoke_pi_usage_token(session_key)
+        self._session_states.pop(session_key, None)
 
     async def _evict_rpc(self, session_key: str, rpc: _PiRpcSession) -> None:
         """Drop *rpc* mid-turn so frames it still emits can't reach the next turn."""
         state = self._session_states.get(session_key)
         if state is not None and state.rpc is rpc:
             self._session_states.pop(session_key, None)
+            if self._tool_server is not None:
+                self._tool_server.revoke_pi_usage_token(session_key)
         try:
             await rpc.close()
         except Exception as exc:  # noqa: BLE001 — best-effort teardown on an already-failed turn
-            logger.debug("PiExecutor: evicting the RPC session failed: %s", exc)
+            if rpc._pending_warm_usage and state is not None and state.rpc is rpc:
+                self._session_states[session_key] = state
+                logger.warning("Pi warm usage remains pending after RPC eviction")
+            else:
+                logger.debug("PiExecutor: evicting the RPC session failed: %s", exc)
 
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
@@ -2537,11 +2974,23 @@ class PiExecutor(Executor):
 
     async def close(self) -> None:
         keys = list(self._session_states.keys())
+        errors: list[Exception] = []
         for key in keys:
-            await self.close_session(key)
+            try:
+                await self.close_session(key)
+            except Exception as exc:  # noqa: BLE001 - finish closing independent sessions
+                errors.append(exc)
         if self._tool_server is not None:
-            await self._tool_server.stop()
-            self._tool_server = None
+            try:
+                await self._tool_server.stop()
+            except Exception as exc:  # noqa: BLE001 - retain bridge for a later retry
+                errors.append(exc)
+            else:
+                self._tool_server = None
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("Pi executor close failed", errors)
 
     def _session_key(self, messages: list[Message]) -> str:
         if messages:
@@ -2661,16 +3110,15 @@ class PiExecutor(Executor):
         self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
         return self._gateway_model_wire_apis
 
-    async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
-        """Start the authenticated bridge for tools or gateway credentials."""
-        if not tools and not self._gateway and not self._permission_controlled:
-            return None
+    async def _ensure_tool_server(self, _tools: list[ToolSpec]) -> int | None:
+        """Start the authenticated bridge for tools and Pi session usage."""
         if self._tool_server is None:
             self._tool_server = _ToolServer()
             await self._tool_server.start()
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
         self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
+        self._tool_server._pi_session_event = self._pi_session_event
         if self._permission_controlled and self._permission_session_id:
             self._tool_server._permission_bridge_dir = bridge_dir_for_session_id(
                 self._permission_session_id
@@ -2813,6 +3261,8 @@ class PiExecutor(Executor):
         tool_server_token: str | None,
         models_json: _PiModelsConfig | None,
         permission_session_id: str | None = None,
+        usage_session_id: str | None = None,
+        usage_token: str | None = None,
     ) -> PiSubprocessConfig:
         """Build env dict, temp dir, and extra CLI args for a Pi subprocess.
 
@@ -2854,7 +3304,7 @@ class PiExecutor(Executor):
 
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
-                overlay=self._retry_policy.pi.settings(),
+                overlay={**self._retry_policy.pi.settings(), "cacheWarming": "idle"},
             )
 
         # Pi natively supports retry config via ``.pi/settings.json``
@@ -2884,8 +3334,11 @@ class PiExecutor(Executor):
                 with open(fallback_path, "w") as f:
                     json.dump(retry_settings, f, indent=2)
 
-        # Generate the Omnigent tool bridge extension if tools are available.
-        if tool_server_port is not None and (tools or permission_session_id is not None):
+        # Usage hooks must run even for a tool-less Pi session. The same
+        # authenticated extension carries tools and permission hooks when used.
+        if tool_server_port is not None and (
+            tools or permission_session_id is not None or usage_session_id is not None
+        ):
             if tool_server_token is None:
                 # A port without a token would spawn the bridge
                 # unauthenticated; fail loud instead.
@@ -2906,6 +3359,8 @@ class PiExecutor(Executor):
                         tool_server_token,
                         permission_bridge_dir=permission_bridge_dir,
                         session_id=permission_session_id,
+                        usage_session_id=usage_session_id,
+                        usage_token=usage_token,
                     )
                 )
             if permission_bridge_dir is not None and permission_session_id is not None:
@@ -3095,18 +3550,30 @@ class PiExecutor(Executor):
 
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
-        subprocess_config = self._build_env_and_dir(
-            tools,
-            tool_server_port,
-            tool_server_token,
-            models_json,
-            permission_session_id=session_key if self._permission_controlled else None,
+        usage_token = (
+            self._tool_server.issue_pi_usage_token(session_key)
+            if self._tool_server is not None
+            else None
         )
+        try:
+            subprocess_config = self._build_env_and_dir(
+                tools,
+                tool_server_port,
+                tool_server_token,
+                models_json,
+                permission_session_id=session_key if self._permission_controlled else None,
+                usage_session_id=session_key,
+                usage_token=usage_token,
+            )
+        except Exception:
+            if self._tool_server is not None:
+                self._tool_server.revoke_pi_usage_token(session_key)
+            raise
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
         extra_args = subprocess_config.extra_args
 
-        rpc = _PiRpcSession()
+        rpc = _PiRpcSession(usage_session_id=session_key)
         rpc._tmp_dir = tmp_dir
 
         # For Databricks models, prefix with the provider name so Pi resolves
@@ -3123,22 +3590,24 @@ class PiExecutor(Executor):
         else:
             pi_model = effective_model
 
-        await rpc.start(
-            subprocess_config.executable or self._pi_launch_path,
-            env=env,
-            cwd=self._cwd,
-            model=pi_model or None,
-            system_prompt=system_prompt or None,
-            system_prompt_mode="append" if permission_bootstrap else self._system_prompt_mode,
-            thinking=thinking,
-            extra_args=extra_args or None,
-        )
-        if self._permission_controlled:
-            try:
+        try:
+            await rpc.start(
+                subprocess_config.executable or self._pi_launch_path,
+                env=env,
+                cwd=self._cwd,
+                model=pi_model or None,
+                system_prompt=system_prompt or None,
+                system_prompt_mode="append" if permission_bootstrap else self._system_prompt_mode,
+                thinking=thinking,
+                extra_args=extra_args or None,
+            )
+            if self._permission_controlled:
                 await self._await_permission_installation(session_key)
-            except Exception:
-                await rpc.close()
-                raise
+        except Exception:
+            if self._tool_server is not None:
+                self._tool_server.revoke_pi_usage_token(session_key)
+            await rpc.close()
+            raise
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
