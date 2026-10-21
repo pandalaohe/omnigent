@@ -10,6 +10,7 @@ import math
 import os
 import secrets
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -1789,6 +1790,39 @@ def bind_usage_turn(bridge_dir: Path, turn_id: str) -> None:
         state = read_bridge_state(bridge_dir)
         if state is not None and state.usage_admission_id and state.usage_turn_id is None:
             _write_bridge_state_unlocked(bridge_dir, replace(state, usage_turn_id=turn_id))
+
+
+@contextlib.contextmanager
+def _usage_completion_db(bridge_dir: Path) -> Iterator[sqlite3.Connection]:
+    """Completion retries share the native bridge's storage and retention."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(bridge_dir / "usage-completions.sqlite3")) as db, db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS completions (session_id TEXT, admission_id TEXT, "
+            "PRIMARY KEY (session_id,admission_id))"
+        )
+        yield db
+
+
+def queue_usage_completion(bridge_dir: Path, session_id: str, admission_id: str) -> None:
+    """Retain a terminal report until the server acknowledges it."""
+    with _usage_completion_db(bridge_dir) as db:
+        db.execute("INSERT OR IGNORE INTO completions VALUES (?,?)", (session_id, admission_id))
+
+
+def pending_usage_completions(bridge_dir: Path) -> list[tuple[str, str]]:
+    """Read reports across forwarder restarts and thread rotations."""
+    with _usage_completion_db(bridge_dir) as db:
+        return db.execute("SELECT session_id,admission_id FROM completions").fetchall()
+
+
+def ack_usage_completion(bridge_dir: Path, session_id: str, admission_id: str) -> None:
+    """Remove only the successfully delivered report."""
+    with _usage_completion_db(bridge_dir) as db:
+        db.execute(
+            "DELETE FROM completions WHERE session_id=? AND admission_id=?",
+            (session_id, admission_id),
+        )
 
 
 def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | None = None) -> None:

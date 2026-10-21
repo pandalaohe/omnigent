@@ -2201,7 +2201,7 @@ def register_hooks_routes(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
-        if phase == Phase.REQUEST and conv.host_id:
+        if phase == Phase.REQUEST and conv.host_id and not is_read_only:
             from omnigent.server.routes.usage import _resolve_session_harness
             from omnigent.server.usage_cutover import admit_turn
             from omnigent.usage_export.cutover import UsageCutoverStore

@@ -3436,6 +3436,19 @@ async def _persist_external_goal_state(
             "external_goal_state requires data.state to be active, paused, or null",
             code=ErrorCode.INVALID_INPUT,
         )
+    if raw_state is None:
+        from omnigent.usage_export.cutover import UsageCutoverStore
+
+        authority = await asyncio.to_thread(
+            conversation_store.get_session_owner_authority,
+            conv.root_conversation_id or conv.id,
+            owner_only=True,
+        )
+        await asyncio.to_thread(
+            UsageCutoverStore(conversation_store.storage_location).end_goal_admissions,
+            authority.user_id if authority else "local",
+            session_id,
+        )
     current = conv.labels.get(_GOAL_STATE_LABEL_KEY)
     if current == raw_state:
         return
@@ -3445,12 +3458,14 @@ async def _persist_external_goal_state(
             session_id,
             _GOAL_STATE_LABEL_KEY,
         )
+        conv.labels.pop(_GOAL_STATE_LABEL_KEY, None)
         return
     await asyncio.to_thread(
         conversation_store.set_labels,
         session_id,
         {_GOAL_STATE_LABEL_KEY: raw_state},
     )
+    conv.labels[_GOAL_STATE_LABEL_KEY] = raw_state
 
 
 def _publish_external_conversation_item(

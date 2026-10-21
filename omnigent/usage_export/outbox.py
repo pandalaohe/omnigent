@@ -736,6 +736,24 @@ class UsageOutbox:
                 )
             ]
 
+    def session_route(self, session_id: str, harness: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT p.binding,r.route FROM runtime_routes r JOIN producers p "
+                "ON p.session_id=r.session_id AND p.harness=r.harness "
+                "WHERE r.session_id=? AND r.harness=? AND p.binding IS NOT NULL",
+                (session_id, harness),
+            ).fetchone()
+            return (
+                {
+                    "host_id": json.loads(row[0])["host_id"],
+                    "harness": harness,
+                    **json.loads(row[1]),
+                }
+                if row
+                else None
+            )
+
     def pending_admission(self, session_id: str, harness: str) -> dict[str, Any] | None:
         with self._connect() as db:
             row = db.execute(

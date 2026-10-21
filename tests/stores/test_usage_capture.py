@@ -904,35 +904,81 @@ def test_native_gate_correlation_survives_capture_off_and_child_stop(
 async def test_native_terminal_closes_only_its_bound_admission(tmp_path: Path) -> None:
     from omnigent.harnesses.codex_native.bridge import (
         CodexNativeBridgeState,
+        pending_usage_completions,
         record_usage_admission,
         update_active_turn_id,
         write_bridge_state,
     )
-    from omnigent.harnesses.codex_native.forwarder import _forward_usage_terminal
-    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+    from omnigent.harnesses.codex_native.forwarder import _queue_usage_terminal
 
     bridge = tmp_path / "bridge"
     write_bridge_state(
         bridge, CodexNativeBridgeState("session", "/opt/work/socket", "thread", "/opt/work/home")
     )
     record_usage_admission(bridge, "admitted")
-    client = _RecordingClient()
 
     def event(method, turn):
         return {"method": method, "params": {"threadId": "thread", "turn": {"id": turn}}}
 
-    await _forward_usage_terminal(client, bridge, event("turn/started", "new"))
+    await _queue_usage_terminal(bridge, event("turn/started", "new"))
     update_active_turn_id(bridge, "new")
-    await _forward_usage_terminal(client, bridge, event("turn/completed", "old"))
-    assert client.posts == []
-    await _forward_usage_terminal(client, bridge, event("turn/completed", "new"))
-    assert client.posts == [
-        (
-            "/v1/usage-cutover/admissions",
-            {
-                "session_id": "session",
-                "admission_id": "admitted",
-                "ended": True,
-            },
+    await _queue_usage_terminal(bridge, event("turn/completed", "old"))
+    assert pending_usage_completions(bridge) == []
+    await _queue_usage_terminal(bridge, event("turn/completed", "new"))
+    assert pending_usage_completions(bridge) == [("session", "admitted")]
+
+
+@pytest.mark.asyncio
+async def test_preparation_publishes_effective_codex_route_and_retains_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.runtime import check_live_route, outbox, prepare_capture
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model_provider="openai"\n')
+    check_live_route("session", "codex-native", {}, codex_home=home)
+    published = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/v1/usage-producers":
+            return httpx.Response(
+                200,
+                json={**body, "host_id": "host", "agent_id": "agent", "parent_session_id": None},
+            )
+        published.append(body)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://omni.test"
+    ) as client:
+        await prepare_capture(client, "session", "codex-native")
+        effective = outbox().live_routes()[0]
+        assert published[-1] == effective
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://wrong.example.test/runner-only")
+        await prepare_capture(client, "session", "codex-native")
+        assert published[-1] == effective
+        (home / "config.toml").write_text(
+            'model_provider="gateway"\n[model_providers.gateway]\nbase_url="https://gateway.example.test/account-a/v1"\n'
         )
-    ]
+        check_live_route("session", "codex-native", {}, codex_home=home)
+        await prepare_capture(client, "session", "codex-native")
+        assert published[-1] == outbox().live_routes()[0]
+        assert published[-1] != effective
+
+
+def test_route_fingerprint_distinguishes_gateway_paths_without_auth_material() -> None:
+    from omnigent.usage_export.runtime import routing_attestation
+
+    def route(url):
+        return routing_attestation("claude-sdk", {"ANTHROPIC_BASE_URL": url})
+
+    first = route("https://gateway.example.test/account-a/anthropic")
+    assert first != route("https://gateway.example.test/account-b/anthropic")
+    assert first == route(
+        "https://user:pass@gateway.example.test/account-a/anthropic?key=secret#frag"
+    )
+    assert "secret" not in str(first) and "pass" not in str(first)

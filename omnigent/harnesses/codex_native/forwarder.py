@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable
@@ -2682,6 +2683,11 @@ async def supervise_forwarder(
         )
         await _sleep(0)
         await snapshots.__aenter__()
+        usage_completion_wake = asyncio.Event()
+        usage_completion_task = asyncio.create_task(
+            _retry_usage_completions(ap_client, bridge_dir, usage_completion_wake),
+            name="codex-usage-completions",
+        )
         try:
             async for event in client.iter_events():
                 try:
@@ -2694,44 +2700,11 @@ async def supervise_forwarder(
                         event=event,
                         forwarder_state=forwarder_state,
                     )
-                    await _forward_usage_terminal(ap_client, bridge_dir, event)
-                    if capture_enabled() and (rotated or codex_usage_boundary(event)):
-                        await prepare_capture(ap_client, target.session_id, "codex-native")
-                        usage_state = read_bridge_state(bridge_dir)
-                        if usage_state is not None:
-                            from omnigent.usage_export.runtime import (
-                                check_live_route,
-                                link_codex_turn,
-                            )
-
-                            await asyncio.to_thread(
-                                check_live_route,
-                                target.session_id,
-                                "codex-native",
-                                os.environ,
-                                codex_home=Path(usage_state.codex_home),
-                            )
-                            params = event.get("params")
-                            if event.get("method") == "turn/started" and isinstance(params, dict):
-                                turn_id = _turn_id_from_payload(params.get("turn"))
-                                if (
-                                    turn_id is not None
-                                    and params.get("threadId") == target.thread_id
-                                ):
-                                    await asyncio.to_thread(
-                                        link_codex_turn,
-                                        target.session_id,
-                                        "codex-native",
-                                        target.thread_id,
-                                        turn_id,
-                                    )
-                            await asyncio.to_thread(
-                                capture_codex_home,
-                                Path(usage_state.codex_home),
-                                target.session_id,
-                                "codex-native",
-                                target.thread_id,
-                            )
+                    try:
+                        if await _queue_usage_terminal(bridge_dir, event):
+                            usage_completion_wake.set()
+                    except (OSError, sqlite3.Error):
+                        _logger.warning("Usage completion persistence failed", exc_info=True)
                     if rotated:
                         if (
                             forwarder_state.posted_goal_state_known
@@ -2810,9 +2783,49 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
+                    if capture_enabled() and (rotated or codex_usage_boundary(event)):
+                        await prepare_capture(ap_client, target.session_id, "codex-native")
+                        usage_state = read_bridge_state(bridge_dir)
+                        if usage_state is not None:
+                            from omnigent.usage_export.runtime import (
+                                check_live_route,
+                                link_codex_turn,
+                            )
+
+                            await asyncio.to_thread(
+                                check_live_route,
+                                target.session_id,
+                                "codex-native",
+                                os.environ,
+                                codex_home=Path(usage_state.codex_home),
+                            )
+                            params = event.get("params")
+                            if event.get("method") == "turn/started" and isinstance(params, dict):
+                                turn_id = _turn_id_from_payload(params.get("turn"))
+                                if (
+                                    turn_id is not None
+                                    and params.get("threadId") == target.thread_id
+                                ):
+                                    await asyncio.to_thread(
+                                        link_codex_turn,
+                                        target.session_id,
+                                        "codex-native",
+                                        target.thread_id,
+                                        turn_id,
+                                    )
+                            await asyncio.to_thread(
+                                capture_codex_home,
+                                Path(usage_state.codex_home),
+                                target.session_id,
+                                "codex-native",
+                                target.thread_id,
+                            )
                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
+            usage_completion_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await usage_completion_task
             await snapshots.__aexit__()
             if mcp_settle_timer is not None:
                 mcp_settle_timer.cancel()
@@ -6016,21 +6029,17 @@ def _first_async_question_answer(
     return None
 
 
-async def _forward_usage_terminal(
-    client: httpx.AsyncClient, bridge_dir: Path, event: CodexMessage
-) -> None:
-    """Close only the admission of the exact physical terminal edge."""
-    from omnigent.harnesses.codex_native.bridge import bind_usage_turn
+async def _queue_usage_terminal(bridge_dir: Path, event: CodexMessage) -> bool:
+    """Persist the exact turn's completion without awaiting network delivery."""
+    from omnigent.harnesses.codex_native.bridge import bind_usage_turn, queue_usage_completion
 
     params = event.get("params")
     state = read_bridge_state(bridge_dir)
-    if not isinstance(params, dict) or state is None:
-        return
-    if params.get("threadId") != state.thread_id:
-        return
+    if not isinstance(params, dict) or state is None or params.get("threadId") != state.thread_id:
+        return False
     turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
     if turn_id is None:
-        return
+        return False
     if event.get("method") == "turn/started":
         bind_usage_turn(bridge_dir, turn_id)
     elif (
@@ -6038,15 +6047,37 @@ async def _forward_usage_terminal(
         and state.usage_admission_id
         and state.usage_turn_id == turn_id
     ):
-        response = await client.post(
-            "/v1/usage-cutover/admissions",
-            json={
-                "session_id": state.session_id,
-                "admission_id": state.usage_admission_id,
-                "ended": True,
-            },
+        await asyncio.to_thread(
+            queue_usage_completion, bridge_dir, state.session_id, state.usage_admission_id
         )
-        response.raise_for_status()
+        return True
+    return False
+
+
+async def _retry_usage_completions(
+    client: httpx.AsyncClient, bridge_dir: Path, wake: asyncio.Event
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import (
+        ack_usage_completion,
+        pending_usage_completions,
+    )
+
+    while True:
+        wake.clear()
+        try:
+            pending = await asyncio.to_thread(pending_usage_completions, bridge_dir)
+            for session_id, admission_id in pending:
+                response = await client.post(
+                    "/v1/usage-cutover/admissions",
+                    json={"session_id": session_id, "admission_id": admission_id, "ended": True},
+                    timeout=5,
+                )
+                response.raise_for_status()
+                await asyncio.to_thread(ack_usage_completion, bridge_dir, session_id, admission_id)
+        except (httpx.HTTPError, OSError, sqlite3.Error):
+            _logger.warning("Usage completion delivery remains pending", exc_info=True)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(wake.wait(), timeout=5)
 
 
 async def _start_plan_implementation_turn(

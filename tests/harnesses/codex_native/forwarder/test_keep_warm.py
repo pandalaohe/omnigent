@@ -235,3 +235,98 @@ async def test_keep_warm_fork_stream_is_invisible_and_a_parent_event_still_lands
     assert ("POST", "/v1/sessions") not in requests
     # The fork events did not stop the forwarder's own subscription.
     assert any(method == "thread/resume" for method, _ in client.requests)
+
+
+@pytest.mark.parametrize("method,status", [("turn/completed", "idle"), ("turn/failed", "failed")])
+@pytest.mark.parametrize("fault", ["timeout", "503"])
+@pytest.mark.asyncio
+async def test_usage_completion_outage_preserves_lifecycle_and_retries_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, status: str, fault: str
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.delenv("OMNIGENT_USAGE_EXPORT_CAPTURE", raising=False)
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            "conv_parent",
+            "ws://127.0.0.1:9",
+            _PARENT_THREAD,
+            "/opt/work/codex-home",
+            active_turn_id="turn_parent",
+            usage_admission_id="admitted",
+            usage_turn_id="turn_parent",
+        ),
+    )
+    lifecycle = asyncio.Event()
+    attempted = asyncio.Event()
+    release = asyncio.Event()
+    acknowledged = asyncio.Event()
+    recovered = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/usage-cutover/admissions":
+            attempted.set()
+            if not recovered:
+                if fault == "timeout":
+                    await release.wait()
+                    raise httpx.ReadTimeout("usage offline", request=request)
+                return httpx.Response(503)
+            acknowledged.set()
+            return httpx.Response(200, json={})
+        if request.content:
+            body = json.loads(request.content)
+            if body.get("type") == "external_session_status" and body["data"]["status"] == status:
+                lifecycle.set()
+        return httpx.Response(202, json={"queued": False})
+
+    def start(client):
+        return asyncio.create_task(
+            fwd.supervise_forwarder(
+                base_url="http://127.0.0.1:9",
+                headers={},
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                app_server_url="ws://127.0.0.1:9",
+                thread_id=_PARENT_THREAD,
+                client=client,
+                ap_transport=httpx.MockTransport(handler),
+            )
+        )
+
+    client = _QueueEventsClient()
+    task = start(client)
+    try:
+        client.events.put_nowait(
+            {
+                "method": method,
+                "params": {
+                    "threadId": _PARENT_THREAD,
+                    "turn": {
+                        "id": "turn_parent",
+                        "status": "completed" if status == "idle" else "failed",
+                    },
+                },
+            }
+        )
+        await asyncio.wait_for(lifecycle.wait(), 2)
+        assert bridge.read_bridge_state(tmp_path).active_turn_id is None
+        await asyncio.wait_for(attempted.wait(), 2)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert bridge.pending_usage_completions(tmp_path) == [("conv_parent", "admitted")]
+    recovered = True
+    task = start(_QueueEventsClient())
+    try:
+        await asyncio.wait_for(acknowledged.wait(), 2)
+        for _ in range(100):
+            if not bridge.pending_usage_completions(tmp_path):
+                break
+            await asyncio.sleep(0.01)
+        assert bridge.pending_usage_completions(tmp_path) == []
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

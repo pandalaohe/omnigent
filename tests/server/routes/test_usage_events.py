@@ -492,3 +492,94 @@ async def test_registration_requires_exact_owner_and_harness(tmp_path: Path) -> 
             )
         ).status_code == 409
         assert (await client.post("/v1/usage-producers", json=registration)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_read_only_policy_evaluation_cannot_mutate_admissions(tmp_path: Path) -> None:
+    from sqlalchemy import text
+
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+    from omnigent.server.routes.sessions import create_sessions_router
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    uri = f"sqlite:///{tmp_path / 'read-only.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    host = "a" * 32
+    conv = conversations.create_conversation(host_id=host, workspace="/opt/work")
+    conversations.update_conversation(conv.id, harness_override="claude-native")
+    permissions = SqlAlchemyPermissionStore(uri)
+    permissions.grant("owner", conv.id, LEVEL_OWNER)
+    permissions.grant("reader", conv.id, LEVEL_READ)
+    permissions.grant("editor", conv.id, LEVEL_EDIT)
+    app = _cutover_app(conversations)
+    app.include_router(
+        create_sessions_router(
+            conversations,
+            SqlAlchemyAgentStore(uri),
+            permission_store=permissions,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        ),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://omni.test"
+    ) as client:
+        request = {"event": {"type": "PHASE_REQUEST", "data": {}, "context": {}}}
+        response = await client.post(
+            f"/v1/sessions/{conv.id}/policies/evaluate",
+            json=request,
+            headers={"X-Forwarded-Email": "reader"},
+        )
+        assert response.status_code == 200, response.text
+        assert "admission_id" not in response.json()
+        with get_or_create_engine(uri).connect() as connection:
+            assert (
+                connection.execute(text("SELECT count(*) FROM usage_turn_admissions")).scalar_one()
+                == 0
+            )
+        response = await client.post(
+            f"/v1/sessions/{conv.id}/policies/evaluate",
+            json=request,
+            headers={"X-Forwarded-Email": "editor"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["admission_id"]
+
+
+@pytest.mark.parametrize("initial", [None, "active", "paused"])
+@pytest.mark.asyncio
+async def test_external_goal_completion_closes_goal_admissions(
+    tmp_path: Path, initial: str | None
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _persist_external_goal_state
+    from omnigent.server.schemas import SessionEventInput
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'goal.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    host = "a" * 32
+    conv = conversations.create_conversation(host_id=host, workspace="/opt/work")
+    SqlAlchemyPermissionStore(uri).grant("alice", conv.id, LEVEL_OWNER)
+    if initial is not None:
+        conversations.set_labels(conv.id, {"omnigent.goal_state": initial})
+    store = UsageCutoverStore(uri)
+    store.admit_turn(
+        "alice",
+        admission_id="goal",
+        session_id=conv.id,
+        host_id=host,
+        harness="codex-native",
+        source="goal",
+    )
+    from omnigent.usage_export.store import UsageExportError
+
+    with pytest.raises(UsageExportError, match="codex_goal_active"):
+        store.create_hold("alice", host, "codex-native", 1)
+    await _persist_external_goal_state(
+        conv.id,
+        conversations.get_conversation(conv.id),
+        SessionEventInput(type="external_goal_state", data={"state": None}),
+        conversations,
+    )
+    assert store.create_hold("alice", host, "codex-native", 1)["state"] == "held"

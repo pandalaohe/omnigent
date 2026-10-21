@@ -52,7 +52,7 @@ def routing_attestation(harness: str, env: Mapping[str, str] | None = None) -> d
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     origin = f"{parsed.scheme}://{parsed.hostname}:{port}"
     mode = "api" if ("ANTHROPIC_API_KEY" if claude else "OPENAI_API_KEY") in env else "configured"
-    material = [kind, origin, env.get("OMNIGENT_GATEWAY_ROUTE", ""), mode]
+    material = [kind, origin, parsed.path.rstrip("/"), env.get("OMNIGENT_GATEWAY_ROUTE", ""), mode]
     return {
         "billing_route": "direct_provider" if raw.rstrip("/") == default else "gateway",
         "route_ref": "route-v1:"
@@ -143,19 +143,10 @@ async def prepare_capture(client: httpx.AsyncClient, session_id: str, harness: s
         feed_harness = "codex-sdk" if harness == "codex" else harness
         await outbox().prepare(client, session_id, feed_harness)
         outbox().mark_capture(session_id, feed_harness)
-        report = outbox().domain_report(feed_harness)
-        binding = next(
-            item["binding"] for item in report["producers"] if item["session_id"] == session_id
-        )
-        response = await client.post(
-            "/v1/usage-cutover/route",
-            json={
-                "host_id": binding["host_id"],
-                "harness": feed_harness,
-                **routing_attestation(feed_harness),
-            },
-        )
-        response.raise_for_status()
+        route = outbox().session_route(session_id, feed_harness)
+        if route is not None:
+            response = await client.post("/v1/usage-cutover/route", json=route)
+            response.raise_for_status()
 
 
 def capture_codex_home(
