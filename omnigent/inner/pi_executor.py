@@ -87,6 +87,7 @@ from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_AP
 from omnigent.permission_tiers import plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.json_types import JsonValue
@@ -1521,6 +1522,8 @@ class _PiRpcSession:
     _line_queue: Queue[str | None] = field(default_factory=Queue)
     _stderr_lines: list[str] = field(default_factory=list)
     _tmp_dir: str | None = None
+    extension_ui_handler: Callable[[CodexEvent], Awaitable[None]] | None = None
+    _extension_ui_tasks: set[asyncio.Future[None]] = field(default_factory=set)
 
     async def start(
         self,
@@ -1604,13 +1607,30 @@ class _PiRpcSession:
             async for raw_line in self._iter_stream_lines(self.process.stdout):
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if line:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        event = None
+                    if isinstance(event, dict) and event.get("type") == "extension_ui_request":
+                        if self.extension_ui_handler is not None:
+                            task = asyncio.ensure_future(self.extension_ui_handler(event))
+                            self._extension_ui_tasks.add(task)
+                            task.add_done_callback(self._extension_ui_tasks.discard)
+                        continue
                     self._line_queue.put_nowait(line)
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error
             logger.debug("PiExecutor reader error: %s", exc)
         finally:
+            await self._cancel_extension_ui()
             self._line_queue.put_nowait(None)
+
+    async def _cancel_extension_ui(self) -> None:
+        tasks = list(self._extension_ui_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _stderr_reader(self) -> None:
         """Drain stderr in the background."""
@@ -1722,6 +1742,7 @@ class _PiRpcSession:
         return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
+        await self._cancel_extension_ui()
         for task in (self._read_task, self._stderr_task):
             if task is not None:
                 task.cancel()
@@ -2419,6 +2440,9 @@ class PiExecutor(Executor):
         self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
+        self._raw_elicitation_handler: (
+            Callable[[ElicitationRequestParams], Awaitable[ElicitationResult | None]] | None
+        ) = None
 
         self._databricks_host = self._gateway_host_override or ""
         self._databricks_token = ""
@@ -2452,7 +2476,7 @@ class PiExecutor(Executor):
             self._pi_path,
             os_env,
             cwd,
-            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
+            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR", "OMNIGENT_PI_EXTENSION_UI"],
         )
         self._pi_launch_path = sandboxed.launch_path
         self._sandboxed = sandboxed.sandboxed
@@ -2829,6 +2853,10 @@ class PiExecutor(Executor):
         if self._gateway and models_json is None:
             raise ValueError("Gateway provider configuration must be resolved before startup")
         env = dict(self._env)
+        if self._raw_elicitation_handler is not None:
+            env["OMNIGENT_PI_EXTENSION_UI"] = "1"
+        else:
+            env.pop("OMNIGENT_PI_EXTENSION_UI", None)
         tmp_parent = None
         if self._sandboxed:
             tmp_parent = pathlib.Path.home() / ".pi"
@@ -2964,6 +2992,96 @@ class PiExecutor(Executor):
         return PiSubprocessConfig(
             env=env, tmp_dir=tmp_dir, extra_args=extra_args, executable=executable
         )
+
+    async def _handle_extension_ui(self, rpc: _PiRpcSession, event: CodexEvent) -> None:
+        method = event.get("method")
+        if method == "notify":
+            logger.info(
+                "Pi extension notice (%s): %s",
+                event.get("notifyType", "info"),
+                event.get("message", ""),
+            )
+            return
+        if method not in {"select", "confirm", "input", "editor"}:
+            return
+        request_id = event.get("id")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        response: CodexEvent = {
+            "type": "extension_ui_response",
+            "id": request_id,
+            "cancelled": True,
+        }
+        try:
+            handler = self._raw_elicitation_handler
+            # The shared form currently has no multi-line editor control.
+            if handler is not None and method != "editor":
+                prop: _JsonObject = {"type": "string", "title": str(event.get("title", method))}
+                if method == "select":
+                    options = event.get("options")
+                    if (
+                        not isinstance(options, list)
+                        or not options
+                        or not all(isinstance(option, str) for option in options)
+                    ):
+                        raise ValueError("Pi select requires string options")
+                    prop["enum"] = options
+                elif method == "input" and isinstance(event.get("placeholder"), str):
+                    prop["description"] = event["placeholder"]
+                message = str(event.get("title", method))
+                if isinstance(event.get("message"), str):
+                    message += "\n\n" + event["message"]
+                params = ElicitationRequestParams(
+                    message=message,
+                    requestedSchema={
+                        "type": "object",
+                        "properties": {} if method == "confirm" else {"value": prop},
+                        "required": [] if method == "confirm" else ["value"],
+                    },
+                )
+                timeout = event.get("timeout")
+                timeout_s = (
+                    max(0, timeout / 1000)
+                    if isinstance(timeout, (int, float)) and timeout != 0
+                    else None
+                )
+                deadline = (
+                    asyncio.get_running_loop().time() + timeout_s
+                    if timeout_s is not None
+                    else None
+                )
+                async with asyncio.timeout_at(deadline):
+                    result = await handler(params)
+                # A handler that finishes during timeout cancellation cannot revive the dialog.
+                if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                    return
+                if result is not None:
+                    if method == "confirm" and result.action != "cancel":
+                        response = {
+                            "type": "extension_ui_response",
+                            "id": request_id,
+                            "confirmed": result.action == "accept",
+                        }
+                    elif result.action == "accept":
+                        value = (result.content or {}).get("value")
+                        if isinstance(value, str) and (
+                            method != "select" or value in event["options"]
+                        ):
+                            response = {
+                                "type": "extension_ui_response",
+                                "id": request_id,
+                                "value": value,
+                            }
+        except TimeoutError:
+            return  # Pi owns the timeout result; do not send a late response.
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a broken UI must not permit an operation
+            logger.warning("Pi extension dialog failed; cancelling", exc_info=True)
+        try:
+            await rpc.send_command(response)
+        except (OSError, RuntimeError):
+            logger.debug("Pi extension dialog process is no longer available")
 
     async def _available_thinking_levels(self, rpc: _PiRpcSession) -> list[str] | None:
         """Ask Pi which thinking levels the current model offers.
@@ -3108,6 +3226,7 @@ class PiExecutor(Executor):
 
         rpc = _PiRpcSession()
         rpc._tmp_dir = tmp_dir
+        rpc.extension_ui_handler = lambda event: self._handle_extension_ui(rpc, event)
 
         # For Databricks models, prefix with the provider name so Pi resolves
         # the model from our custom provider in models.json.

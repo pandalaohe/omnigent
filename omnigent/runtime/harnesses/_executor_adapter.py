@@ -57,6 +57,7 @@ from omnigent.sdk_peer_delivery import PeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
+    ElicitationResolvedEvent,
     ElicitationResult,
     InjectionConsumedEvent,
     OutputItemDoneEvent,
@@ -1027,7 +1028,17 @@ class ExecutorAdapter(HarnessApp):
             _logger.error("raw elicitation callback fired with no active turn context; declining")
             return None
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
-        return await ctx.elicit(elicitation_id, params)
+        try:
+            return await ctx.elicit(elicitation_id, params)
+        except asyncio.CancelledError:
+            ctx.emit(
+                ElicitationResolvedEvent(
+                    type="response.elicitation_resolved",
+                    elicitation_id=elicitation_id,
+                    reason="unanswered",
+                )
+            )
+            raise
 
     async def _stable_policy_evaluator(
         self,
