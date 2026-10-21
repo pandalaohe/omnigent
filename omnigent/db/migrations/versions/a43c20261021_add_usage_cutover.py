@@ -119,9 +119,7 @@ def upgrade() -> None:
             "grant_positions",
             sa.Text(),
             nullable=False,
-            server_default=None
-            if op.get_bind().dialect.name == "mysql"
-            else sa.text("'{}'"),
+            server_default=None if op.get_bind().dialect.name == "mysql" else sa.text("'{}'"),
         ),
     )
 

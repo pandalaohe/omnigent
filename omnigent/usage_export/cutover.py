@@ -1296,6 +1296,7 @@ class UsageCutoverStore:
                     1 for entry in verified_calls if entry["state"] == "unadmitted_after_hold"
                 ),
             }
+            timed_out = facts.get("timed_out") is True
             drained = not codes and all(entry["terminal"] for entry in admissions)
             if counts.get("outbox_pending_observations"):
                 drained = False
@@ -1318,7 +1319,7 @@ class UsageCutoverStore:
                 hold,
                 "drain",
                 {
-                    "result": "drained" if drained else "failed",
+                    "result": "drained" if drained else "timeout" if timed_out else "failed",
                     "failure_codes": [] if drained else sorted(set(codes)),
                     "last_committed_sequence": last_sequence,
                     "detection": facts.get("detection"),

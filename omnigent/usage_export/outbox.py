@@ -575,7 +575,53 @@ class UsageOutbox:
                 (self._json(binding), producer_id),
             )
 
-    async def drain(self, client: httpx.AsyncClient, *, limit: int = 100) -> None:
+    def domain_sources(self, harness: str) -> list[Path]:
+        with self._connect() as db:
+            return [
+                Path(row[0])
+                for row in db.execute("SELECT path FROM sources WHERE harness=?", (harness,))
+            ]
+
+    def domain_report(self, harness: str) -> dict[str, Any]:
+        """What the domain still holds locally: pending rows and open threads."""
+        with self._connect() as db:
+            pending = db.execute(
+                "SELECT count(*) FROM observations o JOIN producers p "
+                "ON p.producer_id=o.producer_id WHERE p.harness=?",
+                (harness,),
+            ).fetchone()[0]
+            open_threads = db.execute(
+                "SELECT count(*) FROM unit_turns u JOIN producers p "
+                "ON p.producer_id=u.producer_id WHERE p.harness=? AND NOT EXISTS ("
+                "SELECT 1 FROM terminal_receipts t WHERE t.session_id=u.session_id "
+                "AND t.harness=u.harness AND t.physical=u.physical "
+                "AND t.turn_id=u.turn_id)",
+                (harness,),
+            ).fetchone()[0]
+            units = [
+                json.loads(row[0])
+                for row in db.execute(
+                    "SELECT l.payload FROM latest l JOIN producers p "
+                    "ON p.producer_id=l.producer_id WHERE p.harness=?",
+                    (harness,),
+                )
+            ]
+            sources = [
+                {"path": row[0], "offset": row[1]}
+                for row in db.execute(
+                    "SELECT path,offset FROM sources WHERE harness=?", (harness,)
+                )
+            ]
+        return {
+            "pending_observations": int(pending),
+            "open_threads": int(open_threads),
+            "units": units,
+            "sources": sources,
+        }
+
+    async def drain(
+        self, client: httpx.AsyncClient, *, limit: int = 100, harness: str | None = None
+    ) -> None:
         """ACK in FIFO order; a lost ACK resends the identical measurement."""
         try:
             self._drain_lock.acquire(timeout=0)
@@ -587,15 +633,16 @@ class UsageOutbox:
                     row = db.execute(
                         "SELECT o.sequence,o.producer_id,o.payload FROM observations o "
                         "JOIN producers p ON p.producer_id=o.producer_id "
-                        "WHERE p.harness!='claude-sdk' OR EXISTS ("
+                        "WHERE (? IS NULL OR p.harness=?) AND (p.harness!='claude-sdk' OR EXISTS ("
                         "SELECT 1 FROM claude_path_proofs c WHERE "
                         "c.session_id=p.session_id AND c.harness=p.harness AND "
                         "c.physical_session_id=json_extract("
                         "o.payload,'$.physical_session_id') AND "
                         "c.physical_subagent_id=coalesce(json_extract("
                         "o.payload,'$.physical_subagent_id'),'') AND c.conflicted=0 AND "
-                        "c.path=json_extract(o.payload,'$.physical_transcript_path')) "
-                        "ORDER BY o.sequence LIMIT 1"
+                        "c.path=json_extract(o.payload,'$.physical_transcript_path'))) "
+                        "ORDER BY o.sequence LIMIT 1",
+                        (harness, harness),
                     ).fetchone()
                     if row is None:
                         return
