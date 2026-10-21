@@ -30,6 +30,7 @@ const {
   session,
   shell,
   systemPreferences,
+  webContents: electronWebContents,
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
@@ -5100,12 +5101,15 @@ function registerIpc() {
     }
     clearingBrowserPartitions.add(partition);
     try {
-      const closing = [];
+      const ses = session.fromPartition(partition);
+      // Closed views can leave their registry before Chromium destroys them.
+      const closing = electronWebContents
+        .getAllWebContents()
+        .filter((contents) => !contents.isDestroyed() && contents.session === ses);
       for (const state of windows.values()) {
         closing.push(...(state.browserRegistry?.closePartition(partition, "login-cleared") ?? []));
       }
       await Promise.all(closing.map(waitForBrowserContentsDestroyed));
-      const ses = session.fromPartition(partition);
       await ses.clearStorageData();
       await ses.clearCache();
       return { ok: true };

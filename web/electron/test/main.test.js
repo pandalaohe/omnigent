@@ -328,6 +328,7 @@ function loadNavigationHarness({
   }
 
   const electron = {
+    webContents: { getAllWebContents: () => [] },
     app: {
       isPackaged,
       getPath: () => userData,
@@ -2506,15 +2507,12 @@ describe("desktop browser login IPC", () => {
     assert.equal(get(trusted).enabled, false);
   });
 
-  it("closes only the current server's shared views before clearing storage and cache", async (t) => {
+  it("waits for this server's live and already closing views before clearing storage and cache", async (t) => {
     const h = loadNavigationHarness({ registerFallbacks: false });
     t.after(h.cleanup);
     h.api.registerIpc();
     const clear = h.ipc.get("omnigent:browser-login:clear");
     const partition = require("../src/browserViewRegistry").persistentAgentPartition(origin);
-    const other = require("../src/browserViewRegistry").persistentAgentPartition(
-      "https://other.example",
-    );
     const order = [];
     const contents = new EventEmitter();
     let destroyed = false;
@@ -2523,7 +2521,8 @@ describe("desktop browser login IPC", () => {
       closePartition(target) {
         assert.equal(target, partition);
         order.push("close:first");
-        return [contents];
+        // Ordinary close has already removed this still-live view from its registry.
+        return [];
       },
     };
     h.api.windows.get(h.win).browserRegistry = sameOriginRegistry;
@@ -2540,43 +2539,36 @@ describe("desktop browser login IPC", () => {
         },
       },
     );
-    h.api.windows.set(
-      {},
-      {
-        origin: "https://other.example",
-        browserRegistry: {
-          closePartition(target) {
-            assert.equal(target, partition);
-            assert.notEqual(target, other);
-            order.push("other server unaffected");
-            return [];
-          },
-        },
-      },
-    );
     let finishStorage;
+    const ses = {
+      clearStorageData: () => {
+        order.push("storage");
+        return new Promise((resolve) => {
+          finishStorage = resolve;
+        });
+      },
+      clearCache: async () => {
+        order.push("cache");
+      },
+    };
     h.electron.session.fromPartition = (target) => {
       assert.equal(target, partition);
-      return {
-        clearStorageData: () => {
-          order.push("storage");
-          return new Promise((resolve) => {
-            finishStorage = resolve;
-          });
-        },
-        clearCache: async () => {
-          order.push("cache");
-        },
-      };
+      return ses;
     };
+    contents.session = ses;
+    // A closing window's contents can also outlive its windows entry.
+    h.electron.webContents.getAllWebContents = () => [
+      contents,
+      { session: {}, isDestroyed: () => false },
+    ];
     const first = clear(eventFor(h));
-    assert.deepEqual(order, ["close:first", "close:second", "other server unaffected"]);
+    assert.deepEqual(order, ["close:first", "close:second"]);
     assert.equal((await clear(eventFor(h))).ok, false, "concurrent clear must be refused");
     assert.equal(order.includes("storage"), false, "storage must wait for view destruction");
     destroyed = true;
     contents.emit("destroyed");
     await until(() => typeof finishStorage === "function", "storage clearing");
-    assert.deepEqual(order, ["close:first", "close:second", "other server unaffected", "storage"]);
+    assert.deepEqual(order, ["close:first", "close:second", "storage"]);
     finishStorage();
     assert.equal((await first).ok, true);
     assert.equal(order.at(-1), "cache");
