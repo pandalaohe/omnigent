@@ -3897,6 +3897,8 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         nonlocal create_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_existing/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent":
             return httpx.Response(
                 200,
@@ -4051,6 +4053,11 @@ async def test_sys_session_send_existing_child_retries_without_rejected_actor(
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_existing_retry/items"
+        ):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_existing":
             return httpx.Response(
                 200,
@@ -4122,6 +4129,8 @@ async def test_sys_session_send_existing_offline_child_relaunches_and_reposts(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         nonlocal liveness_reads
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_child":
             if request.url.params.get("include_liveness") == "true":
                 liveness_reads += 1
@@ -4196,6 +4205,8 @@ async def test_sys_session_send_existing_offline_child_reports_relaunch_refusal(
     retry_posts: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_stuck/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_stuck":
             return httpx.Response(
                 200,
@@ -5396,6 +5407,8 @@ async def test_sys_session_send_by_id_names_child_from_snapshot(
     )
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_by_id_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_by_id_child":
             return httpx.Response(
                 200,
@@ -10661,6 +10674,8 @@ async def test_sys_session_send_failed_continuation_receipts_its_dispatch(
     label_patches: list[dict[str, str]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
             return httpx.Response(
                 200,
@@ -10724,6 +10739,8 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
     event_posts: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
             # Target IS a direct child of the caller.
             return httpx.Response(
