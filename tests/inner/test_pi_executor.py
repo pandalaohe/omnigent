@@ -56,6 +56,170 @@ from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+from omnigent.server.schemas import ElicitationResult
+
+
+@pytest.mark.parametrize(
+    ("method", "reply", "expected"),
+    [
+        (
+            "select",
+            ElicitationResult(action="accept", content={"value": "Block"}),
+            {"value": "Block"},
+        ),
+        (
+            "select",
+            ElicitationResult(action="accept", content={"value": "Run once"}),
+            {"value": "Run once"},
+        ),
+        (
+            "select",
+            ElicitationResult(action="accept", content={"value": "other"}),
+            {"cancelled": True},
+        ),
+        ("select", ElicitationResult(action="accept"), {"cancelled": True}),
+        ("select", ElicitationResult(action="decline"), {"cancelled": True}),
+        (
+            "input",
+            ElicitationResult(action="accept", content={"value": "text"}),
+            {"value": "text"},
+        ),
+        ("input", ElicitationResult(action="accept", content={"value": ""}), {"value": ""}),
+        ("confirm", ElicitationResult(action="accept"), {"confirmed": True}),
+        ("confirm", ElicitationResult(action="decline"), {"confirmed": False}),
+        ("confirm", ElicitationResult(action="cancel"), {"cancelled": True}),
+        ("editor", ElicitationResult(action="accept"), {"cancelled": True}),
+    ],
+)
+@pytest.mark.parametrize("timeout", [None, 0])
+async def test_extension_ui_response(method, reply, expected, timeout):
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    handler = AsyncMock(return_value=reply)
+    executor._raw_elicitation_handler = handler
+    rpc = _PiRpcSession()
+    rpc.send_command = AsyncMock()
+    event = {
+        "id": "dialog",
+        "method": method,
+        "title": "Review",
+        "message": "Details",
+        "options": ["Block", "Run once"],
+        "placeholder": "Enter text",
+        "timeout": timeout,
+    }
+    await executor._handle_extension_ui(rpc, event)
+    rpc.send_command.assert_awaited_once_with(
+        {"type": "extension_ui_response", "id": "dialog", **expected}
+    )
+    if method == "select":
+        params = handler.call_args.args[0]
+        assert params.message == "Review\n\nDetails"
+        assert params.requestedSchema["properties"]["value"] == {
+            "type": "string",
+            "title": "Review",
+            "enum": ["Block", "Run once"],
+        }
+    elif method == "input":
+        assert (
+            handler.call_args.args[0].requestedSchema["properties"]["value"]["description"]
+            == "Enter text"
+        )
+    elif method == "editor":
+        handler.assert_not_called()
+
+
+async def test_extension_ui_timeout_closes_prompt_and_drops_late_reply():
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: PiExecutor(pi_path="/usr/bin/pi"))
+    queue = asyncio.Queue()
+    ctx = TurnContext("response", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    executor._raw_elicitation_handler = adapter._stable_raw_elicitation_handler
+    rpc = _PiRpcSession()
+    rpc.send_command = AsyncMock()
+    task = asyncio.create_task(
+        executor._handle_extension_ui(
+            rpc,
+            {"id": "expired", "method": "select", "options": ["Block", "Run once"], "timeout": 20},
+        )
+    )
+    request = await queue.get()
+    await task
+    resolved = await queue.get()
+    assert resolved.type == "response.elicitation_resolved"
+    assert resolved.elicitation_id == request.elicitation_id
+    assert not ctx._complete_elicitation(
+        request.elicitation_id, ElicitationResult(action="accept", content={"value": "Run once"})
+    )
+    assert ctx._pending_human_waits == 0
+    rpc.send_command.assert_not_called()
+
+
+async def test_extension_ui_reader_remains_live_and_cancels_dialog_on_eof():
+    rpc = _PiRpcSession()
+    stream = asyncio.StreamReader()
+    rpc.process = SimpleNamespace(stdout=stream)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handler(event):
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    rpc.extension_ui_handler = handler
+    reader = asyncio.create_task(rpc._reader())
+    stream.feed_data(b'{"type":"extension_ui_request","id":"one","method":"input"}\n')
+    await started.wait()
+    stream.feed_data(b'{"type":"response","command":"get_state","success":true}\n')
+    assert json.loads(await rpc.read_line(timeout=1))["command"] == "get_state"
+    stream.feed_eof()
+    await reader
+    assert cancelled.is_set()
+    assert not rpc._extension_ui_tasks
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "select",
+        "confirm",
+        "input",
+        "editor",
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text",
+    ],
+)
+async def test_extension_ui_without_handler_fails_closed(method):
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    rpc = _PiRpcSession()
+    rpc.send_command = AsyncMock()
+    await executor._handle_extension_ui(rpc, {"id": "unwired", "method": method})
+    if method in {"select", "confirm", "input", "editor"}:
+        rpc.send_command.assert_awaited_once_with(
+            {"type": "extension_ui_response", "id": "unwired", "cancelled": True}
+        )
+    else:
+        rpc.send_command.assert_not_called()
+
+
+def test_extension_ui_launch_signal_requires_handler():
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    for handler in (None, AsyncMock()):
+        executor._raw_elicitation_handler = handler
+        config = executor._build_env_and_dir([], None, None, None)
+        try:
+            assert config.env.get("OMNIGENT_PI_EXTENSION_UI") == ("1" if handler else None)
+        finally:
+            shutil.rmtree(config.tmp_dir)
 
 
 def _cancel_all_tasks(loop):
