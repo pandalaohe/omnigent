@@ -7,6 +7,7 @@ from omnigent.runtime.instruction_layers import (
     agent_key_for_harness,
     compose_route,
     compose_session_text,
+    instruction_agents,
 )
 from omnigent.stores.global_instructions_store import GlobalInstructionRevision
 
@@ -106,7 +107,62 @@ def test_every_declared_harness_maps_to_its_product_or_no_product():
     }
     expected = {name: key for key, names in groups.items() for name in names.split()}
     for harness in accepted_harnesses() | native_harnesses() | expected.keys():
-        assert agent_key_for_harness(harness) == expected.get(harness), harness
+        if harness in expected:
+            assert agent_key_for_harness(harness) == expected[harness], harness
+    for agent in instruction_agents():
+        for harness in agent.harnesses:
+            assert agent_key_for_harness(harness) == agent.key
     assert agent_key_for_harness(None) is None
     assert agent_key_for_harness("unknown-native") is None
+    assert agent_key_for_harness("openai-agents-native") is None
     assert agent_key_for_harness("acp:codex") is None
+
+
+def test_configured_acp_and_deliverable_harnesses_share_one_descriptor_set(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda: [SimpleNamespace(slug="neutral_agent", name="Neutral agent")],
+    )
+    descriptors = {agent.key: agent for agent in instruction_agents()}
+    assert descriptors["acp:neutral_agent"].harnesses == ("acp:neutral_agent",)
+    assert descriptors["acp:neutral_agent"].subject == ("acp:neutral_agent", "acp:neutral_agent")
+    assert agent_key_for_harness("acp:neutral_agent") == "acp:neutral_agent"
+    assert agent_key_for_harness("openai-agents") == "openai-agents"
+    assert all(len(key) <= 64 for key in descriptors)
+    assert "none" not in descriptors
+
+
+def test_instruction_agents_excludes_undelivered_and_unknown_harnesses(monkeypatch):
+    from types import SimpleNamespace
+
+    from omnigent.harness_capabilities import InstructionDelivery
+    from omnigent.runtime import instruction_layers as module
+
+    original = module.capability_for_harness
+    monkeypatch.setattr(module, "valid_harnesses", lambda: {"no-delivery", "uncertain", "x" * 65})
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", list)
+    monkeypatch.setattr(
+        module,
+        "capability_for_harness",
+        lambda h: (
+            SimpleNamespace(
+                instruction_delivery=InstructionDelivery.NOT_DELIVERED
+                if h == "no-delivery"
+                else InstructionDelivery.UNKNOWN
+            )
+            if h in {"no-delivery", "uncertain"}
+            else original(h)
+        ),
+    )
+    keys = {agent.key for agent in instruction_agents()}
+    assert not keys.intersection({"no-delivery", "uncertain", "x" * 65})
+
+
+def test_invalid_acp_config_keeps_existing_native_layers(monkeypatch):
+    def invalid():
+        raise ValueError("invalid ACP option")
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", invalid)
+    assert agent_key_for_harness("codex-native") == "codex"

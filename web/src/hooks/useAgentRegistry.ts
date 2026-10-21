@@ -100,7 +100,7 @@ export function registrySourceLabels(
   };
 }
 
-function harnessSection(mode: string | null | undefined, harness: string | null): SectionId {
+export function harnessSection(mode: string | null | undefined, harness: string | null): SectionId {
   if (mode === "native-tui" || mode === "native-server") return "native";
   if (mode === "sdk-in-process" || mode === "cli-subprocess") return "sdk";
   if (mode === "acp-subprocess") return "acp";
@@ -110,7 +110,7 @@ function harnessSection(mode: string | null | undefined, harness: string | null)
   return "other";
 }
 
-function reportedOnAnyHost(
+export function reportedOnAnyHost(
   harness: string | null,
   capability: HarnessCapability | undefined,
   hosts: readonly Host[],

@@ -800,3 +800,97 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
             tokens.blur()
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         page.screenshot(path=str(output / f"buffer-manual-{width}.png"), full_page=True)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_instruction_columns_add_clear_and_reload(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    request: pytest.FixtureRequest,
+) -> None:
+    layer = {
+        "scope": "agent",
+        "agent_key": "codex",
+        "host_id": "",
+        "text": "Configured",
+        "revision_id": "first",
+        "updated_at": 1,
+        "updated_by": "local",
+        "chars": 10,
+        "host_removed": False,
+        "stale_layers": [],
+    }
+    descriptors = [
+        {"key": "codex", "display_name": "Codex", "harnesses": ["codex-native"]},
+        {"key": "acp:neutral", "display_name": "Neutral ACP", "harnesses": ["acp:neutral"]},
+    ]
+    browser_contract.json(
+        "/v1/instruction-layers",
+        lambda _: {
+            "data": [layer],
+            "agents": descriptors,
+            "order": ["shared", "agent", "host"],
+            "route_sizes": [],
+            "size_reminder_chars": 10000,
+        },
+    )
+
+    def save(incoming: Request) -> dict:
+        layer.update(incoming.post_data_json)
+        layer.update(revision_id="cleared", chars=len(layer["text"]))
+        return {**layer, "over_budget_routes": []}
+
+    browser_contract.json("/v1/instruction-layers", save, method="PUT")
+    browser_contract.json("/v1/instruction-layers/revisions", {"data": []})
+    browser_contract.json(
+        "/v1/harnesses",
+        {
+            "data": [],
+            "capabilities_by_harness": {
+                "codex-native": {"integration_mode": "native-tui"},
+                "acp": {"integration_mode": "generic-acp"},
+            },
+        },
+    )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "example-host",
+                    "name": "Example host",
+                    "owner": "local",
+                    "status": "offline",
+                    "configured_harnesses": {"codex-native": True, "acp:neutral": True},
+                }
+            ]
+        },
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{appearance_url}/settings/instructions")
+    expect(page.get_by_role("button", name="Edit Codex", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Edit Neutral ACP", exact=True)).to_have_count(0)
+    page.get_by_role("button", name="Add agent", exact=True).click()
+    page.get_by_role("button", name=re.compile(r"Neutral ACP.*ACP")).click()
+    expect(page.get_by_role("button", name="Edit Neutral ACP", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Edit Codex", exact=True).click()
+    page.get_by_role("textbox", name="Instruction text").fill("")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PUT" and response.url.endswith("/v1/instruction-layers")
+        )
+    ):
+        page.get_by_role("button", name="Save layer", exact=True).click()
+    assert layer["text"] == ""
+    page.reload()
+    expect(page.get_by_role("button", name="Edit Shared", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Edit Codex", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="Edit Neutral ACP", exact=True)).to_have_count(0)
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.get_by_role(
+        "table", name="Instruction layers by host and agent"
+    ).scroll_into_view_if_needed()
+    page.screenshot(path=str(output / f"instruction-columns-{width}.png"), full_page=True)

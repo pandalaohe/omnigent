@@ -11,9 +11,12 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import StatementError
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_plugins import native_agents
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.instruction_layers import INSTRUCTION_SIZE_REMINDER_CHARS
+from omnigent.runtime.instruction_layers import (
+    INSTRUCTION_SIZE_REMINDER_CHARS,
+    InstructionAgent,
+    instruction_agents,
+)
 from omnigent.server.agent_quota import QuotaContext
 from omnigent.server.auth import LEVEL_READ, AuthProvider
 from omnigent.server.instruction_layers import resolve_instruction_route, route_session_text
@@ -83,7 +86,7 @@ def _key(scope: str, agent_key: str, host_id: str) -> InstructionLayerKey:
         key = InstructionLayerKey(scope, agent_key, host_id)
     except ValueError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-    if key.agent_key and key.agent_key not in {a.key for a in native_agents()}:
+    if key.agent_key and key.agent_key not in {a.key for a in instruction_agents()}:
         raise OmnigentError("Unknown coding agent", code=ErrorCode.INVALID_INPUT)
     return key
 
@@ -187,15 +190,26 @@ def create_global_instructions_router(
                 visible.append(revision)
         return visible
 
-    async def built_in_subject(agent_key: str) -> tuple[str, str | None, Any]:
-        descriptor = next(a for a in native_agents() if a.key == agent_key)
+    async def built_in_subject(
+        agent_key: str, descriptors: list[InstructionAgent] | None = None
+    ) -> tuple[str, str | None, Any]:
+        descriptor = next(
+            (
+                a
+                for a in (descriptors if descriptors is not None else instruction_agents())
+                if a.key == agent_key
+            ),
+            None,
+        )
+        if descriptor is None:
+            raise OmnigentError("Unknown coding agent", code=ErrorCode.INVALID_INPUT)
         if agent_store is None or agent_cache is None:
-            return descriptor.agent_name, descriptor.harness, None
+            return descriptor.subject[0], descriptor.subject[1], None
 
         try:
-            row = await asyncio.to_thread(agent_store.get_by_name, descriptor.agent_name)
+            row = await asyncio.to_thread(agent_store.get_by_name, descriptor.subject[0])
             if row is None:
-                return descriptor.agent_name, descriptor.harness, None
+                return descriptor.subject[0], descriptor.subject[1], None
             loaded = await asyncio.to_thread(
                 agent_cache.load,
                 row.id,
@@ -207,7 +221,7 @@ def create_global_instructions_router(
             return row.name, harness, spec
         except Exception:  # noqa: BLE001 - broken bundles render user layers only
             _logger.warning("instruction-layers/subject-unavailable: agent=%s", agent_key)
-            return descriptor.agent_name, descriptor.harness, None
+            return descriptor.subject[0], descriptor.subject[1], None
 
     async def current_quota(
         request: Request, user_id: str | None, host_id: str | None, conversation: Any = None
@@ -226,6 +240,7 @@ def create_global_instructions_router(
         layers: list[GlobalInstructionRevision],
         subjects: list[tuple[str, str | None, Any]] | None = None,
         request: Request | None = None,
+        descriptors: list[InstructionAgent] | None = None,
     ) -> list[dict[str, Any]]:
         if host_store is None:
             return []
@@ -233,14 +248,15 @@ def create_global_instructions_router(
         host_ids = {host.host_id for host in hosts}
         # A removed host remains visible to the saving admin until its layer is cleared.
         host_ids.update(r.host_id for r in layers if r.host_id)
+        descriptors = descriptors if descriptors is not None else instruction_agents()
         if subjects is None:
             subjects = list(
-                await asyncio.gather(*(built_in_subject(a.key) for a in native_agents()))
+                await asyncio.gather(*(built_in_subject(a.key, descriptors) for a in descriptors))
             )
         results: list[dict[str, Any]] = []
         for host_id in sorted(host_ids):
             line = await current_quota(request, user_id, host_id) if request else ""
-            for descriptor, (name, harness, spec) in zip(native_agents(), subjects, strict=True):
+            for descriptor, (name, harness, spec) in zip(descriptors, subjects, strict=True):
                 sizes = [
                     preview_instructions(
                         layers,
@@ -349,6 +365,7 @@ def create_global_instructions_router(
     async def list_instruction_layers(request: Request) -> dict[str, Any]:
         user_id = authenticated_user(request)
         layers = await visible_layers(user_id)
+        descriptors = instruction_agents()
         by_key = {(r.scope, r.agent_key, r.host_id): r for r in layers}
         data = []
         for revision in layers:
@@ -370,9 +387,11 @@ def create_global_instructions_router(
             data.append(_layer_response(revision, host_removed=host_removed, stale_layers=stale))
         return {
             "data": data,
-            "agents": [{"key": a.key, "display_name": a.display_name} for a in native_agents()],
+            "agents": [a.as_dict() for a in descriptors],
             "order": ["shared", "agent", "host"],
-            "route_sizes": await route_sizes(user_id, layers, request=request),
+            "route_sizes": await route_sizes(
+                user_id, layers, request=request, descriptors=descriptors
+            ),
             "size_reminder_chars": INSTRUCTION_SIZE_REMINDER_CHARS,
         }
 
@@ -385,8 +404,13 @@ def create_global_instructions_router(
         if key.host_id:
             await owned_host(key.host_id, user_id)
         before_layers = await visible_layers(user_id)
-        subjects = list(await asyncio.gather(*(built_in_subject(a.key) for a in native_agents())))
-        before_sizes = await route_sizes(user_id, before_layers, subjects, request=request)
+        descriptors = instruction_agents()
+        subjects = list(
+            await asyncio.gather(*(built_in_subject(a.key, descriptors) for a in descriptors))
+        )
+        before_sizes = await route_sizes(
+            user_id, before_layers, subjects, request=request, descriptors=descriptors
+        )
         revision = await asyncio.to_thread(
             store.save,
             body.text,
@@ -407,7 +431,9 @@ def create_global_instructions_router(
                 "agent_key": size["agent_key"],
                 "total_chars": size["total_chars"],
             }
-            for size in await route_sizes(user_id, after_layers, subjects, request=request)
+            for size in await route_sizes(
+                user_id, after_layers, subjects, request=request, descriptors=descriptors
+            )
             if size["over_budget"] and (size["host_id"], size["agent_key"]) not in before_over
         ]
         return {**_layer_response(revision), "over_budget_routes": warnings}
