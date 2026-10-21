@@ -318,6 +318,7 @@ import {
 } from "@/lib/settingsPortability";
 import {
   type CliStatus,
+  browserLoginBridge,
   getCliStatus,
   isElectronShell,
   resetCliPath,
@@ -2435,6 +2436,109 @@ function OpenLinksInAppControl() {
   );
 }
 
+function BrowserLoginControl() {
+  const bridge = useMemo(browserLoginBridge, []);
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  const [cleared, setCleared] = useState(false);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  useEffect(() => {
+    if (!bridge) return;
+    let mounted = true;
+    void bridge
+      .get()
+      .then((result) => {
+        if (!mounted) return;
+        if (result.ok) setEnabled(result.enabled === true);
+        else setError(result.error ?? "Could not read browser login setting.");
+      })
+      .catch(() => {
+        if (mounted) setError("Could not read browser login setting.");
+      })
+      .finally(() => {
+        if (mounted) setBusy(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [bridge]);
+
+  if (!bridge) return null;
+  const change = async (next: boolean) => {
+    setBusy(true);
+    setError("");
+    setCleared(false);
+    try {
+      const result = await bridge.set(next);
+      if (result.ok) setEnabled(next);
+      else setError(result.error ?? "Could not save browser login setting.");
+    } catch {
+      setError("Could not save browser login setting.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const clear = async () => {
+    setBusy(true);
+    setError("");
+    setCleared(false);
+    try {
+      const result = await bridge.clear();
+      if (result.ok) setCleared(true);
+      else setError(result.error ?? "Could not clear browser login.");
+    } catch {
+      setError("Could not clear browser login.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start justify-between gap-6">
+        <SettingsLabel
+          label="Keep in-app browser login"
+          labelId={labelId}
+          descriptionId={descriptionId}
+          className="flex-1"
+          description="On this desktop app, new Browser views share a login saved on disk across sessions. Each connected server has separate browser storage. Existing views keep their current storage until closed and reopened."
+        />
+        <Switch
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          checked={enabled}
+          disabled={busy}
+          onCheckedChange={(next) => void change(next)}
+          componentId="settings.general.browser_login"
+        />
+      </div>
+      <Button
+        variant="outline"
+        disabled={busy}
+        onClick={() => void clear()}
+        componentId="settings.general.clear_browser_login"
+      >
+        Clear browser login for this server
+      </Button>
+      <p className="text-sm text-muted-foreground">
+        This closes open Browser views using this server&apos;s saved login.
+      </p>
+      {cleared && (
+        <p role="status" className="text-sm text-muted-foreground">
+          Browser login cleared. Open Browser again to sign in.
+        </p>
+      )}
+      {error && (
+        <p role="alert" className="text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
@@ -2625,6 +2729,11 @@ function GeneralSection() {
           <ArtifactSharingSettings />
           {supportsBrowser() && <OpenLinksInAppControl />}
         </SettingsGroup>
+        {browserLoginBridge() && (
+          <SettingsGroup title="In-app browser" testId="settings-group-browser-login">
+            <BrowserLoginControl />
+          </SettingsGroup>
+        )}
       </div>
     </Section>
   );

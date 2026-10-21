@@ -26,6 +26,7 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const crypto = require("node:crypto");
 
 const DEFAULT_CAP = 10;
 
@@ -67,6 +68,10 @@ function agentPartition(scope, viewId) {
   return `omnigent-agent-${scope}-${conversationId}`;
 }
 
+function persistentAgentPartition(origin) {
+  return `persist:omnigent-agent-shared-${crypto.createHash("sha256").update(origin).digest("hex")}`;
+}
+
 // Monotonic per-process counter: each registry (shell window) gets a distinct
 // default partition scope. In-memory partitions never outlive the process, so
 // no cross-run uniqueness is needed.
@@ -100,14 +105,19 @@ function createBrowserViewRegistry({
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
+  partitionForView = (_viewId, defaultPartition) => defaultPartition(),
+  isPartitionUnavailable = () => false,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
+  const partitionFor = (viewId) =>
+    partitionForView(viewId, () => agentPartition(partitionScope, viewId));
 
   function beginAgentNavigation(conversationId) {
     const generation = Symbol();
-    pendingNavigations.set(conversationId, generation);
-    return () => pendingNavigations.get(conversationId) === generation;
+    const partition = entries.get(conversationId)?.partition ?? partitionFor(conversationId);
+    pendingNavigations.set(conversationId, { generation, partition });
+    return () => pendingNavigations.get(conversationId)?.generation === generation;
   }
   let activeConversationId = null;
   // Last bounds size applied to any active entry — the closest thing to the
@@ -249,19 +259,25 @@ function createBrowserViewRegistry({
   function getOrCreate(conversationId) {
     const existing = entries.get(conversationId);
     if (existing) return { ok: true, entry: existing, created: false };
+    const partition =
+      pendingNavigations.get(conversationId)?.partition ?? partitionFor(conversationId);
+    if (isPartitionUnavailable(partition)) {
+      return { ok: false, error: "browser login is being cleared" };
+    }
     if (entries.size >= cap) {
       return { ok: false, error: "browser view cap reached — close one", cap };
     }
     const view = WebContentsViewCtor({
       webPreferences: {
-        // Per-conversation storage isolation — see agentPartition.
-        partition: agentPartition(partitionScope, conversationId),
+        // Existing views keep this partition when the desktop setting changes.
+        partition,
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
       },
     });
     const entry = makeEntry(conversationId, view);
+    entry.partition = partition;
     entries.set(conversationId, entry);
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
@@ -464,7 +480,10 @@ function createBrowserViewRegistry({
   // (literal checks only), so browserIpc awaits this before it: a name that
   // resolves internally fails with an error instead of creating a blank view.
   function checkAgentNavigationFor(conversationId, url, agentContext) {
-    const partition = agentPartition(partitionScope, conversationId);
+    const partition =
+      entries.get(conversationId)?.partition ??
+      pendingNavigations.get(conversationId)?.partition ??
+      partitionFor(conversationId);
     return checkAgentNavigation(url, {
       ...agentNavPolicyOptions(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
@@ -482,6 +501,17 @@ function createBrowserViewRegistry({
       if (id === webContentsId) return entry.agentNavLocked ? entry : null;
     }
     return null;
+  }
+
+  function ownsWebContents(webContentsId) {
+    for (const entry of entries.values()) {
+      try {
+        if (entry.view.webContents.id === webContentsId) return true;
+      } catch {
+        /* destroyed */
+      }
+    }
+    return false;
   }
 
   // SECURITY (SSRF): network-layer half of the agent guard, wired by main.js
@@ -537,7 +567,7 @@ function createBrowserViewRegistry({
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const partition = agentPartition(partitionScope, entry.conversationId);
+    const partition = entry.partition;
     const proxied =
       !!ip &&
       (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
@@ -737,6 +767,20 @@ function createBrowserViewRegistry({
     }
   }
 
+  function closePartition(partition, reason) {
+    for (const [conversationId, pending] of pendingNavigations) {
+      if (pending.partition === partition) pendingNavigations.delete(conversationId);
+    }
+    const closedContents = [];
+    for (const [conversationId, entry] of entries) {
+      if (entry.partition === partition) {
+        closedContents.push(entry.view.webContents);
+        close(conversationId, reason);
+      }
+    }
+    return closedContents;
+  }
+
   return {
     // Lifecycle
     get,
@@ -747,12 +791,14 @@ function createBrowserViewRegistry({
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,
+    ownsWebContents,
     setActive,
     setSuppressed,
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
     close,
     closeAll,
+    closePartition,
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,
@@ -767,5 +813,6 @@ function createBrowserViewRegistry({
 module.exports = {
   createBrowserViewRegistry,
   agentPartition,
+  persistentAgentPartition,
   DEFAULT_CAP,
 };
