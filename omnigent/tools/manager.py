@@ -258,6 +258,13 @@ class ToolManager:
 
         for tool in (SysInstructionLayersReadTool(), SysInstructionLayerUpdateTool()):
             self._tools[tool.name()] = tool
+        from omnigent.tools.builtins.project_settings import (
+            SysProjectSettingsReadTool,
+            SysProjectSettingsUpdateTool,
+        )
+
+        for tool in (SysProjectSettingsReadTool(), SysProjectSettingsUpdateTool()):
+            self._tools[tool.name()] = tool
 
     def _register_scheduled_task_tools(self) -> None:
         """

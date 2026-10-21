@@ -372,6 +372,23 @@ def ask_on_instruction_layer_update(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+def ask_on_project_settings_update(event: PolicyEvent) -> PolicyResponse:
+    """Ask before an agent changes project defaults for future sessions."""
+    if event.get("type") != "tool_call" or event.get("target") != "sys_project_settings_update":
+        return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    args = args if isinstance(args, dict) else {}
+    return {
+        "result": "ASK",
+        "reason": (
+            f"Change project {args.get('project_id', '')!r} future-session defaults. "
+            "A new entry may initialize an Agent template and an online entry change may run "
+            "the project's setup hook after saving. Approve?"
+        ),
+    }
+
+
 # Agent tools that create or reshape unattended work. The builder injects
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
@@ -912,6 +929,14 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "description": "Asks before changing Global Instructions. Enabled by default even without "
         "a stored policy. Add this default policy in Settings, then disable it to allow "
         "updates without this approval; admin authorization and revision checks still apply.",
+        "params_schema": None,
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.ask_on_project_settings_update",
+        "kind": "callable",
+        "name": "Project Settings Update Approval",
+        "description": "Asks before changing future project session defaults. Enabled by default. "
+        "A deployment admin can disable it in default policy settings.",
         "params_schema": None,
     },
     {

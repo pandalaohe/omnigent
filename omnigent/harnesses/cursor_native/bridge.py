@@ -61,6 +61,8 @@ _CURSOR_AUTO_APPROVE_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_settings_read",
+    "sys_project_settings_update",
     "sys_session_archive",
     "sys_session_close",
     "sys_session_create",
