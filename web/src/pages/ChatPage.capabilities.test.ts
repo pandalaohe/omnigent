@@ -225,6 +225,9 @@ describe("shouldShowModelPicker", () => {
     // (nativeCodingAgentForHarness), so the negative cases pin harnesses that
     // map to no picker family.
     expect(shouldShowModelPicker({ labels: {}, harness: "openai-agents" })).toBe(false);
+    // WHY RPC Pi: a model change closes and respawns its Pi process and
+    // replays the transcript as text, so the control would overstate the
+    // switch pi-native does live (Pi's RPC set_model is not wired yet).
     expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
     expect(shouldShowModelPicker({ labels: {}, harness: null })).toBe(false);
     // WHY: a wrapper-looking string is not a resolved harness, and

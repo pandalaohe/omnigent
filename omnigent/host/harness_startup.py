@@ -17,7 +17,10 @@ from omnigent.config import load_global_config
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_startup_config import resolve_harness_config
 
-SUPPORTED_HARNESSES = {"claude-native", "codex-native"}
+# Native harnesses whose launch defaults the settings page reports. The
+# command name is the id without the -native suffix, the binary the harness
+# spawns, so pi-native and the headless pi share OMNIGENT_PI_PATH.
+SUPPORTED_HARNESSES = {"claude-native", "codex-native", "pi-native"}
 
 
 # ``env -S`` expands only the braced form.
