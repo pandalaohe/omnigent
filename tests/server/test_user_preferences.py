@@ -870,6 +870,7 @@ def test_read_collab_settings_defaults_on_missing_store_owner_or_namespace(
     assert empty.open_rate_count == 10
     assert empty.open_rate_window_s == 60
     assert empty.keep_warm_enabled is False
+    assert empty.session_restrictions == "subagents"
 
     store.patch_namespace("alice@example.com", "agent_badges", {"enabled": False})
     assert read_collab_settings(store, "alice@example.com") == default
@@ -893,6 +894,7 @@ def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
             "duplicateWindowSeconds": 300,
             "undeliveredTtlSeconds": 7200,
             "flowTimerEnabled": False,
+            "sessionRestrictions": "all",
             "childKeepWarmEnabled": True,
             "childKeepWarmClaudeIntervalSeconds": 3000,
             "childKeepWarmCodexIntervalSeconds": 1200,
@@ -917,6 +919,7 @@ def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
         duplicate_window_s=300,
         undelivered_ttl_s=7200,
         flow_timer_enabled=False,
+        session_restrictions="all",
         keep_warm_enabled=True,
         keep_warm_claude_interval_s=3000,
         keep_warm_codex_interval_s=1200,

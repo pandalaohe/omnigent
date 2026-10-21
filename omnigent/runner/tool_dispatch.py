@@ -1629,7 +1629,10 @@ async def _find_existing_child_session(
                     "message": (
                         "this (agent, title) sub-agent session is archived; "
                         "unarchive it with sys_session_unarchive to continue, "
-                        "or sys_session_close it to free the name."
+                        "or sys_session_close it to free the name. "
+                        "If the session restriction setting prevents recovery, "
+                        "open a new session with a handover; if you are a sub-agent, "
+                        "report this need to your parent in your final output."
                     ),
                 }
             )
@@ -1760,6 +1763,7 @@ async def _post_child_message_event(
     created_by: str | None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
+    from omnigent.server.session_collab import AGENT_SESSION_HEADER
 
     def _payload(actor: str | None) -> _JsonObject:
         return {
@@ -1774,6 +1778,7 @@ async def _post_child_message_event(
     resp = await server_client.post(
         f"{_session_url(session_id)}/events",
         json=_payload(created_by),
+        headers={AGENT_SESSION_HEADER: "agent"},
         # This message is gated at the recipient's REQUEST phase, which can
         # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
         # ``ask_timeout``. A 30s read budget severed that park → fail-closed
@@ -1791,6 +1796,7 @@ async def _post_child_message_event(
     return await server_client.post(
         f"{_session_url(session_id)}/events",
         json=_payload(None),
+        headers={AGENT_SESSION_HEADER: "agent"},
         timeout=_ASK_GATE_DELIVERY_TIMEOUT,
     )
 
@@ -8946,7 +8952,8 @@ def _archive_error(tool_name: str, resp: httpx.Response, session_id: str) -> str
             {
                 "error": "access_denied",
                 "session_id": session_id,
-                "message": "only the session owner can archive or unarchive it.",
+                "message": _omnigent_error_message(resp)
+                or "only the session owner can archive or unarchive it.",
             }
         )
     detail = _omnigent_error_message(resp)
@@ -9036,6 +9043,8 @@ async def _session_archive_via_rest(
     if not isinstance(raw_target, str) or not raw_target:
         return json.dumps({"error": f"{tool_name} requires a non-empty 'session_id' string"})
     target_id = raw_target
+    from omnigent.server.session_collab import AGENT_SESSION_HEADER
+
     # The PATCH is the owner gate and maps 404/401/403, so no snapshot read is
     # needed. The deferral intent is always recomputed from the caller lineage
     # and always sent: a GET's archived flag could have gone stale before the
@@ -9048,7 +9057,10 @@ async def _session_archive_via_rest(
         patch_body["stop_when_idle"] = True
     try:
         resp = await server_client.patch(
-            f"/v1/sessions/{target_id}", json=patch_body, timeout=30.0
+            f"/v1/sessions/{target_id}",
+            json=patch_body,
+            headers={AGENT_SESSION_HEADER: conversation_id},
+            timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{tool_name} failed: {exc}"})

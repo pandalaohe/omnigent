@@ -11,6 +11,7 @@ export const QUOTA_PERIOD_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 export interface SessionCollabPreferences {
   /** Master switch: off hides the collaboration tools and refuses peer routes. */
   enabled: boolean;
+  sessionRestrictions: "off" | "subagents" | "all";
   openRateCount: number;
   openRateWindowSeconds: number;
   relayDepthMax: number;
@@ -67,6 +68,7 @@ export const SESSION_COLLAB_BOUNDS: Record<
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   enabled: true,
+  sessionRestrictions: "subagents",
   openRateCount: 10,
   openRateWindowSeconds: 60,
   relayDepthMax: 30,
@@ -126,6 +128,10 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
   const validThresholds = low !== null && tight !== null && low > 0 && low < tight;
   return {
     enabled: normalizeBoolean(raw.enabled, SESSION_COLLAB_DEFAULTS.enabled),
+    sessionRestrictions:
+      raw.sessionRestrictions === "off" || raw.sessionRestrictions === "all"
+        ? raw.sessionRestrictions
+        : "subagents",
     openRateCount: normalizeInteger(raw.openRateCount, "openRateCount"),
     openRateWindowSeconds: normalizeInteger(raw.openRateWindowSeconds, "openRateWindowSeconds"),
     relayDepthMax: normalizeInteger(raw.relayDepthMax, "relayDepthMax"),

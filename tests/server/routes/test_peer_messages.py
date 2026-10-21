@@ -2831,3 +2831,43 @@ async def test_redirected_reply_marks_the_successor_thread(
     replied = peer_env["peer_store"].get(earlier.id)
     assert replied is not None
     assert replied.replied_at is not None
+
+
+@pytest.mark.parametrize("mode", ["off", "subagents", "all"])
+async def test_archived_peer_send_restrictions_preserve_other_modes(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any], db_uri: str, mode: str
+) -> None:
+    """Only All changes the existing archived-send refusal and blocks archived redirects."""
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    peer_env["app"].state.user_preferences_store = preferences
+    preferences.patch_namespace(ALICE, "session_collab", {"sessionRestrictions": mode})
+    receiver = peer_env["receiver"]
+    peer_env["conv_store"].update_conversation(receiver.id, archived=True)
+    response = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": peer_env["sender"].id, "text": "continue"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    if mode == "all":
+        assert response.status_code == 403, response.text
+        assert "handover" in response.text
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json()["disposition"] == "failed"
+        assert response.json()["reason"] == "closed"
+    assert peer_env["fake"].calls == []
+    successor = _successor(peer_env, title="active-successor")
+    peer_env["conv_store"].set_labels(receiver.id, {SUCCEEDED_BY_LABEL_KEY: successor.id})
+    redirected = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": peer_env["sender"].id, "text": "continue successor"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    if mode == "all":
+        assert redirected.status_code == 403, redirected.text
+        assert peer_env["fake"].calls == []
+    else:
+        assert redirected.status_code == 200, redirected.text
+        assert redirected.json()["redirected_to"] == successor.id

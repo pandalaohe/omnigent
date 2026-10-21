@@ -99,6 +99,32 @@ export function SessionCollabSettings() {
 
       <h2 className="mt-3 text-ui font-medium">Opening sessions</h2>
       <div className="rounded-xl border border-border bg-card p-4">
+        <SettingRow
+          label="Session open/unarchive restrictions"
+          hint="Sub-agent sessions: sessions with a parent cannot create, open or restore sessions. All agent sessions: also prevents any agent from restoring or messaging archived sessions. You can always restore sessions manually."
+        >
+          <select
+            aria-label="Session open/unarchive restrictions"
+            value={preferences.sessionRestrictions}
+            onChange={(event) => {
+              const sessionRestrictions = event.target.value;
+              if (
+                sessionRestrictions === "off" ||
+                sessionRestrictions === "subagents" ||
+                sessionRestrictions === "all"
+              ) {
+                update({ sessionRestrictions });
+              }
+            }}
+            className="h-9 min-w-0 rounded-lg border border-input bg-background px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <option value="off">Off</option>
+            <option value="subagents">Sub-agent sessions</option>
+            <option value="all">All agent sessions</option>
+          </select>
+        </SettingRow>
+      </div>
+      <div className="rounded-xl border border-border bg-card p-4">
         <SettingRow label="Session open rate limit" hint={HINTS.openRate}>
           <NumericField
             ariaLabel="Session open rate limit"

@@ -365,6 +365,50 @@ class _Preferences:
         return {"version": 1, "settings": {"session_collab": self.settings}}
 
 
+@pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize("mode", ["off", "subagents", "all"])
+async def test_subagent_create_switch_and_manual_exemption(
+    client: httpx.AsyncClient, app: FastAPI, bundled: bool, mode: str
+) -> None:
+    """Both agent create shapes follow the live root-owner switch; UI creates remain allowed."""
+    project_id = await _project(client, "guard", {"agent_id": AGENT_ID})
+    parent = await client.post("/v1/sessions", json={"project_id": project_id}, headers=_headers())
+    assert parent.status_code == 201, parent.text
+    child = await client.post(
+        "/v1/sessions",
+        json={"agent_id": AGENT_ID, "parent_session_id": parent.json()["id"]},
+        headers=_agent_headers(),
+    )
+    assert child.status_code == 201, child.text
+    child_id = child.json()["id"]
+    metadata = {"agent_id": AGENT_ID, "parent_session_id": child_id}
+
+    async def create(headers: dict[str, str]) -> httpx.Response:
+        if bundled:
+            return await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps({"parent_session_id": child_id})},
+                files={
+                    "bundle": (
+                        "agent.tar.gz",
+                        build_agent_bundle(name="helper"),
+                        "application/gzip",
+                    )
+                },
+                headers=headers,
+            )
+        return await client.post("/v1/sessions", json=metadata, headers=headers)
+
+    app.state.user_preferences_store = _Preferences({"sessionRestrictions": mode})
+    response = await create(_agent_headers())
+    if mode == "off":
+        assert response.status_code == 201, response.text
+    else:
+        assert response.status_code == 403, response.text
+        assert "parent session in your final output" in response.text
+    assert (await create(_headers())).status_code == 201
+
+
 async def test_only_agent_child_creates_spend_the_open_rate_budget(
     client: httpx.AsyncClient,
 ) -> None:

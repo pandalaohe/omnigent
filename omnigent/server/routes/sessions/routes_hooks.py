@@ -1868,6 +1868,34 @@ def register_hooks_routes(
                 request, session_id, preloaded=(access, user_id, conv, agent)
             )
 
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return await independent_policy()
+        event = payload.get("event") if isinstance(payload, dict) else None
+        if isinstance(event, dict) and event.get("type") == "PHASE_TOOL_CALL":
+            data = event.get("data")
+            if isinstance(data, dict):
+                from omnigent.server.session_collab import require_session_tool_allowed
+
+                try:
+                    await asyncio.to_thread(
+                        require_session_tool_allowed,
+                        conv,
+                        data.get("name"),
+                        data.get("arguments"),
+                        conversation_store,
+                        permission_store,
+                        getattr(request.app.state, "user_preferences_store", None),
+                    )
+                except OmnigentError as exc:
+                    return Response(
+                        content=json.dumps(
+                            {"result": "POLICY_ACTION_DENY", "reason": exc.message}
+                        ),
+                        media_type="application/json",
+                    )
+
         if harness is None and any(
             key in conv.labels
             for key in (

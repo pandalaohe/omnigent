@@ -1624,7 +1624,10 @@ def register_core_routes(
         # agent-initiated; without the header there is no budget to spend,
         # so the access check and the charge are both skipped.
         origin = request.headers.get(CREATE_ORIGIN_HEADER, "")
-        if origin.strip().lower() != CREATE_ORIGIN_AGENT:
+        if (
+            origin.strip().lower() != CREATE_ORIGIN_AGENT
+            and RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
+        ):
             yield
             return
         # Authorize the caller on the parent before charging its owner's
@@ -1644,6 +1647,23 @@ def register_core_routes(
             )
             if parent is None:
                 raise _session_not_found()
+            from omnigent.server.routes.sessions.routes_peer import _runner_authorized_for_sender
+            from omnigent.server.session_collab import require_session_action_allowed
+
+            if RUNNER_TUNNEL_TOKEN_HEADER in request.headers and not _runner_authorized_for_sender(
+                request, parent, runner_tunnel_tokens
+            ):
+                raise OmnigentError(
+                    "Runner tunnel token is not bound to the calling session's runner",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                parent,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+            )
             cap, _ = await asyncio.to_thread(
                 child_cap_for,
                 parent,
@@ -4435,6 +4455,42 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        from omnigent.server.session_collab import (
+            AGENT_SESSION_HEADER,
+            require_session_action_allowed,
+        )
+
+        if body.archived is False and (
+            AGENT_SESSION_HEADER in request.headers
+            or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+        ):
+            caller_id = request.headers.get(AGENT_SESSION_HEADER)
+            if not caller_id:
+                raise OmnigentError(
+                    "Agent unarchive requires the calling session identity",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            await _require_access(
+                user_id, caller_id, LEVEL_READ, permission_store, conversation_store
+            )
+            caller = await asyncio.to_thread(conversation_store.get_conversation, caller_id)
+            if caller is None:
+                raise _session_not_found()
+            from omnigent.server.routes.sessions.routes_peer import _runner_authorized_for_sender
+
+            if not _runner_authorized_for_sender(request, caller, runner_tunnel_tokens):
+                raise OmnigentError(
+                    "Runner tunnel token is not bound to the calling session's runner",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                caller,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+                action="unarchive",
+            )
         from omnigent.server.permission_tiers import require_permission_protocol
 
         conv_for_protocol = await asyncio.to_thread(

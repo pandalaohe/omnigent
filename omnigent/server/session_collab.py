@@ -13,7 +13,7 @@ accessor's defaults, never an error.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -33,6 +33,76 @@ _logger = logging.getLogger(__name__)
 COLLAB_DISABLED_MESSAGE = (
     "Session collaboration is turned off in Settings > Session collaboration."
 )
+
+AGENT_SESSION_HEADER = "X-Omnigent-Agent-Session"
+SUBAGENT_OPEN_DISABLED_MESSAGE = (
+    "Sub-agent sessions may not open or unarchive sessions (Session open/unarchive restrictions). "
+    "Report this need to your parent session in your final output."
+)
+ARCHIVED_SESSION_DISABLED_MESSAGE = (
+    "The session restriction setting prevents agents from restoring or messaging "
+    "archived sessions. "
+    "Open a new session with a handover instead."
+)
+
+
+def require_session_action_allowed(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    prefs_store: SqlAlchemyUserPreferencesStore | None,
+    *,
+    action: Literal["open", "unarchive", "send"] = "open",
+    target: Conversation | None = None,
+) -> None:
+    """Enforce session restrictions from the caller's stored parent and owner's preferences."""
+    owner = collab_owner_for(conv, conversation_store, permission_store)
+    mode = read_collab_settings(prefs_store, owner).session_restrictions
+    if mode == "off":
+        return
+    if conv.parent_conversation_id is not None and action in {"open", "unarchive"}:
+        message = SUBAGENT_OPEN_DISABLED_MESSAGE
+        if mode == "all" and action == "unarchive":
+            message += " " + ARCHIVED_SESSION_DISABLED_MESSAGE
+        raise OmnigentError(message, code=ErrorCode.FORBIDDEN)
+    if mode == "all" and (
+        action == "unarchive" or (action == "send" and target is not None and target.archived)
+    ):
+        raise OmnigentError(ARCHIVED_SESSION_DISABLED_MESSAGE, code=ErrorCode.FORBIDDEN)
+
+
+def require_session_tool_allowed(
+    conv: Conversation,
+    name: object,
+    arguments: object,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    prefs_store: SqlAlchemyUserPreferencesStore | None,
+) -> None:
+    """Apply the mandatory restriction before optional tool policies or harness checks."""
+    if not isinstance(name, str):
+        return
+    name = name.removeprefix("mcp__omnigent__")
+    if name in {"sys_session_create", "sys_session_open", "sys_session_unarchive"}:
+        require_session_action_allowed(
+            conv,
+            conversation_store,
+            permission_store,
+            prefs_store,
+            action="unarchive" if name == "sys_session_unarchive" else "open",
+        )
+    elif name == "sys_session_send" and isinstance(arguments, dict):
+        target_id = arguments.get("session_id")
+        if isinstance(target_id, str):
+            target = conversation_store.get_conversation(target_id)
+            require_session_action_allowed(
+                conv,
+                conversation_store,
+                permission_store,
+                prefs_store,
+                action="send",
+                target=target,
+            )
 
 
 def collab_owner_for(

@@ -760,12 +760,18 @@ def register_open_routes(
     ) -> dict[str, Any]:
         """Open a plain top-level session on a project host."""
         sender = await runner_auth(request, sender_id)
-        if sender.parent_conversation_id is not None:
-            return _problem(
-                "refused",
-                "is_subagent",
-                "Only a top-level session can open another session.",
+        from omnigent.server.session_collab import require_session_action_allowed
+
+        try:
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                sender,
+                conversation_store,
+                permission_store,
+                getattr(app_state, "user_preferences_store", None),
             )
+        except OmnigentError as exc:
+            return _problem("refused", "is_subagent", exc.message)
         request_user_id = _get_user_id(request, auth_provider)
         owner = (
             await asyncio.to_thread(
