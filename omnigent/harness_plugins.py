@@ -11,7 +11,7 @@ import importlib
 import importlib.metadata
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TypeVar, cast
 
 from omnigent._wrapper_labels import (
@@ -34,6 +34,7 @@ from omnigent._wrapper_labels import (
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
+    CallingDefaultsSupport,
     EffortFamily,
     Elicitation,
     ForkHistory,
@@ -44,6 +45,11 @@ from omnigent.harness_capabilities import (
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.session_default_modes import (
+    BUILTIN_MODE_HANDLERS,
+    BUILTIN_SESSION_MODES,
+    ModeHandler,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -138,6 +144,7 @@ class HarnessContribution:
     capabilities: dict[str, HarnessCapabilities] = field(default_factory=dict)
     # Harness id -> seeded product agent name. Native products use native_agents.
     product_agents: dict[str, str] = field(default_factory=dict)
+    mode_handlers: dict[str, ModeHandler] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -760,6 +767,29 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
+# The capability record owns the settings affordance; these values match the
+# pre-registry model-options and SDK fallback paths.
+for _harness, _parent in {
+    "codex-native": None,
+    "codex": "codex-native",
+    "claude-native": None,
+    "claude-sdk": "claude-native",
+    "pi-native": None,
+    "pi": "pi-native",
+    "devin-native": None,
+    "antigravity-native": None,
+    "acp": None,
+    **dict.fromkeys(ACP_CLI_HARNESSES),
+}.items():
+    _BUILTIN_CAPABILITIES[_harness] = replace(
+        _BUILTIN_CAPABILITIES[_harness],
+        calling_defaults=CallingDefaultsSupport(model_options=True, inherits_from=_parent),
+    )
+for _harness, _modes in BUILTIN_SESSION_MODES.items():
+    _BUILTIN_CAPABILITIES[_harness] = replace(
+        _BUILTIN_CAPABILITIES[_harness], session_modes=_modes
+    )
+
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
@@ -952,6 +982,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
+    mode_handlers=BUILTIN_MODE_HANDLERS,
     product_agents={
         "claude-sdk": "claude-sdk",
         "codex": "codex-sdk",
@@ -1091,6 +1122,30 @@ def _validate_community_contribution(
             f"community harness plugin {entry_point_name!r} attempts to override "
             f"existing native-agent keys: {sorted(native_agent_collisions)}"
         )
+
+    existing_handlers = {name for item in existing for name in item.mode_handlers}
+    handler_collisions = existing_handlers.intersection(contribution.mode_handlers)
+    if handler_collisions:
+        return (
+            f"community harness plugin {entry_point_name!r} attempts to override "
+            f"existing mode handlers: {sorted(handler_collisions)}"
+        )
+    for name, handler in contribution.mode_handlers.items():
+        if not name or not callable(handler):
+            return (
+                f"community harness plugin {entry_point_name!r} has invalid mode handler {name!r}"
+            )
+    available_handlers = existing_handlers | set(contribution.mode_handlers)
+    for harness, capability in contribution.capabilities.items():
+        modes = capability.session_modes
+        if modes is None:
+            continue
+        for mode in (modes.permission, modes.speed):
+            if mode is not None and mode.handler not in available_handlers:
+                return (
+                    f"community harness plugin {entry_point_name!r} declares unregistered "
+                    f"mode handler {mode.handler!r} for {harness!r}"
+                )
 
     allowed_targets = set(contribution.valid_harnesses)
     for harness, spec in contribution.background_title_generators.items():
@@ -1281,6 +1336,21 @@ def harness_capabilities() -> dict[str, HarnessCapabilities]:
     harness do?".
     """
     return _merge_dict(lambda contribution: contribution.capabilities)
+
+
+def capability_for_harness(harness: str | None) -> HarnessCapabilities | None:
+    """Read a concrete harness, retaining generic ACP agents' base capability."""
+    capabilities = harness_capabilities()
+    if harness is None:
+        return None
+    return capabilities.get(harness) or (
+        capabilities.get("acp") if harness.startswith("acp:") else None
+    )
+
+
+def mode_handlers() -> dict[str, ModeHandler]:
+    """Return handlers from accepted contributions only."""
+    return _merge_dict(lambda contribution: contribution.mode_handlers)
 
 
 def product_agent_harnesses() -> dict[str, str]:

@@ -1,10 +1,14 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CustomAgent } from "@/lib/customAgentsApi";
+import type { HarnessCapability } from "@/lib/agentLabels";
+import type * as AgentLabels from "@/lib/agentLabels";
+import type * as AgentRegistry from "@/hooks/useAgentRegistry";
 import type * as CustomAgentsApi from "@/lib/customAgentsApi";
 
 const mocks = vi.hoisted(() => ({
   hosts: [] as Record<string, unknown>[],
+  capabilities: {} as Record<string, HarnessCapability>,
   catalogRows: [] as Record<string, unknown>[],
   listCatalogs: vi.fn(),
   sync: vi.fn(),
@@ -38,6 +42,33 @@ vi.mock("@/lib/callingDefaultsApi", () => ({
 }));
 vi.mock("@/lib/userPreferencesSync", () => ({
   queueUserPreferencePatch: (...args: unknown[]) => mocks.queuePatch(...args),
+}));
+
+vi.mock("@/lib/agentLabels", async (original) => ({
+  ...(await original<typeof AgentLabels>()),
+  useHarnessCapabilities: () => mocks.capabilities,
+}));
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<typeof AgentRegistry>()),
+  useAgentRegistry: () => ({
+    items: Object.keys(mocks.hosts[0]?.configured_harnesses ?? {}).map((harness) => ({
+      key: `harness:${harness}`,
+      harness,
+      label:
+        harness === "codex-native"
+          ? "Codex"
+          : harness.startsWith("acp:")
+            ? `ACP · ${harness.slice(4)}`
+            : harness,
+      section: harness.startsWith("acp:") ? "acp" : "native",
+      source: "builtin",
+      deployed: true,
+      description: null,
+    })),
+    isLoading: false,
+    isError: false,
+    retry: vi.fn(),
+  }),
 }));
 
 import { CallingDefaultsSection } from "./CallingDefaultsSection";
@@ -97,6 +128,7 @@ beforeEach(() => {
   mocks.sync.mockReset().mockResolvedValue(mocks.catalogRows);
   mocks.queuePatch.mockReset();
   mocks.customAgents = [];
+  mocks.capabilities = {};
 });
 
 afterEach(() => {
@@ -119,7 +151,7 @@ describe("CallingDefaultsSection", () => {
     ]);
     render(<CallingDefaultsSection />);
     fireEvent.click(screen.getByTestId("calling-defaults-add-row"));
-    await pickOption("calling-defaults-add-harness", "ACP · neutral");
+    fireEvent.click(await screen.findByRole("button", { name: /ACP · neutral.*ACP/ }));
     expect(await screen.findByTestId("calling-defaults-row-acp:neutral")).toBeInTheDocument();
     fireEvent.click(await screen.findByTestId("calling-defaults-effort-acp:neutral"));
     expect(screen.getByRole("option", { name: /deliberate/i })).toBeInTheDocument();
@@ -229,8 +261,7 @@ describe("CallingDefaultsSection", () => {
     expect(screen.getByTestId("calling-defaults-follows-claude-sdk")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("calling-defaults-add-row"));
-    fireEvent.click(screen.getByTestId("calling-defaults-add-harness"));
-    fireEvent.click(await screen.findByRole("option", { name: "Codex" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Codex.*Native CLI/ }));
     await waitFor(() => expect(readMaster()).toEqual({ "host-a": { "codex-native": {} } }));
 
     await pickOption("calling-defaults-model-codex-native", "GPT-6-Astra");
@@ -338,4 +369,33 @@ describe("CallingDefaultsSection", () => {
     expect(JSON.parse(localStorage.getItem(LAST_KEY)!)).toEqual({ enabled: true });
     expect(mocks.queuePatch).toHaveBeenCalledWith("calling_last", { enabled: true });
   });
+});
+
+it("adds a plugin declared setting and saves its mode", async () => {
+  mocks.hosts = [{ ...HOST, configured_harnesses: { custom: true } }];
+  mocks.capabilities = {
+    custom: {
+      calling_defaults: { model_options: false, inherits_from: null },
+      session_modes: {
+        permission: {
+          handler: "plugin-review",
+          options: [
+            {
+              value: "review",
+              label: "Review",
+              concept: "manual",
+              contexts: ["default", "create"],
+            },
+          ],
+        },
+        speed: null,
+      },
+    },
+  };
+  render(<CallingDefaultsSection />);
+  fireEvent.click(screen.getByTestId("calling-defaults-add-row"));
+  fireEvent.click(await screen.findByRole("button", { name: /custom.*Native CLI/ }));
+  await pickOption("calling-defaults-permission-custom", "Review");
+  expect(readMaster()["host-a"].custom).toEqual({ permission: "review" });
+  expect(screen.queryByTestId("calling-defaults-model-custom")).not.toBeInTheDocument();
 });

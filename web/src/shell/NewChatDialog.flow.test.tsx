@@ -33,6 +33,7 @@ vi.mock("@/hooks/useSkills", () => ({
 }));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
+import type * as AgentRegistryModule from "@/hooks/useAgentRegistry";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
@@ -268,8 +269,21 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 }));
 // Dynamic harness-label fetching is covered separately. Keep it synchronous
 // here so exact create-POST call-count assertions only observe the POST.
+const emptyHarnessCapabilities = vi.hoisted(() => ({}));
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<typeof AgentRegistryModule>()),
+  useAgentRegistry: () => ({
+    items: [],
+    legacyProducts: {},
+    legacyLabels: {},
+    isLoading: false,
+    isError: false,
+    retry: vi.fn(),
+  }),
+}));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
+  useHarnessCapabilities: () => emptyHarnessCapabilities,
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",

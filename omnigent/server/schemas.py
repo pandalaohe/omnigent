@@ -3184,6 +3184,7 @@ class SessionForkRequest(BaseModel):
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_tier: PermissionTierRequest | None = None
+    permission_mode: str | None = None
     terminal_launch_args: list[str] | None = None
     codex_bypass_sandbox: bool = False
     host_type: Literal["external", "managed"] = "external"

@@ -6395,6 +6395,30 @@ def register_core_routes(
                 "permission_tier is only supported by Pi and Antigravity forks",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if body.permission_mode is not None:
+            from omnigent.session_default_modes import apply_mode, valid_mode
+
+            if not valid_mode(body.permission_mode, target_harness, "permission", "create"):
+                raise OmnigentError(
+                    "Unsupported fork permission mode", code=ErrorCode.INVALID_INPUT
+                )
+            application = apply_mode(target_harness, "permission", body.permission_mode)
+            if application.tier is not None:
+                raise OmnigentError(
+                    "Use permission_tier for tiered forks", code=ErrorCode.INVALID_INPUT
+                )
+            extra_labels.update(application.labels)
+            if application.args:
+                override_launch_args = _validate_terminal_launch_args(
+                    [*(override_launch_args or []), *application.args]
+                )
+                launch_args_set = True
+                dropped_label_keys_set.update(
+                    {
+                        _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+                        _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+                    }
+                )
         if source_harness in TIER_HARNESSES or target_harness in TIER_HARNESSES:
             dropped_label_keys_set.update(PERMISSION_LABEL_KEYS)
         tier = None

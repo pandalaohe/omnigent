@@ -3,12 +3,15 @@ from __future__ import annotations
 import importlib
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import omnigent.harness_plugins as hp
+from omnigent.harness_capabilities import CallingDefaultsSupport, ModeOption, ModeSet, SessionModes
 from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.session_default_modes import ModeApplication, apply_mode, mode_values
 
 
 class _EntryPoint:
@@ -64,6 +67,74 @@ def test_community_harness_contribution_is_merged(monkeypatch: pytest.MonkeyPatc
     assert foo_row["label"] == "Foo"
     # Every catalog row now also carries a setup_steps checklist.
     assert "setup_steps" in foo_row
+
+
+def test_plugin_mode_handler_is_registered_with_its_contribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    option = ModeOption("review", "Review", "manual", frozenset({"default", "create"}))
+
+    def handler(_harness: str, value: str) -> ModeApplication:
+        return ModeApplication(args=("--review", value), labels={"plugin.mode": value})
+
+    plugin = hp.HarnessContribution(
+        name="omnigent-foo",
+        valid_harnesses=frozenset({"foo"}),
+        capabilities={
+            "foo": replace(
+                hp._BUILTIN_CAPABILITIES["claude-native"],
+                calling_defaults=CallingDefaultsSupport(model_options=True),
+                session_modes=SessionModes(permission=ModeSet("foo-review", (option,))),
+            )
+        },
+        mode_handlers={"foo-review": handler},
+    )
+    _install_entry_points(monkeypatch, _EntryPoint("foo", lambda: plugin))
+
+    assert hp.plugin_state().load_errors == {}
+    assert mode_values("foo", "permission", "default") == {"review"}
+    assert apply_mode("foo", "permission", "review").args == ("--review", "review")
+    assert hp.harness_capabilities()["foo"].as_dict()["session_modes"] == {
+        "permission": {
+            "handler": "foo-review",
+            "options": [
+                {
+                    "value": "review",
+                    "label": "Review",
+                    "concept": "manual",
+                    "contexts": ["create", "default"],
+                }
+            ],
+        },
+        "speed": None,
+    }
+
+
+@pytest.mark.parametrize("handler_name", ["unused", "claude-permission-mode"])
+def test_plugin_mode_handler_load_failure_is_atomic(
+    monkeypatch: pytest.MonkeyPatch, handler_name: str
+) -> None:
+    plugin = hp.HarnessContribution(
+        name="omnigent-foo",
+        valid_harnesses=frozenset({"foo"}),
+        capabilities={
+            "foo": replace(
+                hp._BUILTIN_CAPABILITIES["claude-native"],
+                session_modes=SessionModes(
+                    permission=ModeSet(
+                        "missing",
+                        (ModeOption("review", "Review", "manual", frozenset({"default"})),),
+                    )
+                ),
+            )
+        },
+        mode_handlers={handler_name: lambda _harness, _value: ModeApplication()},
+    )
+    _install_entry_points(monkeypatch, _EntryPoint("foo", lambda: plugin))
+
+    assert "foo" in hp.plugin_state().load_errors
+    assert "foo" not in hp.harness_capabilities()
+    assert handler_name not in hp.mode_handlers() or handler_name == "claude-permission-mode"
 
 
 def test_community_harness_rejects_non_community_import_path(

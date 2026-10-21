@@ -9,6 +9,8 @@ drift.
 
 from __future__ import annotations
 
+import json
+
 from omnigent import harness_plugins as hp
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
@@ -205,9 +207,8 @@ def test_catalog_rows_include_capabilities() -> None:
     for row in rows:
         if row["id"] in caps:
             assert "capabilities" in row, row["id"]
-            # JSON-serializable: values are primitives, not enums.
-            for value in row["capabilities"].values():
-                assert value is None or isinstance(value, (str, bool))
+            # Nested session-mode and calling-default declarations are wire objects.
+            json.dumps(row["capabilities"])
 
 
 def test_catalog_includes_hermes() -> None:

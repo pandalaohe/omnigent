@@ -15,7 +15,7 @@ from __future__ import annotations
 import io
 import tarfile
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,14 @@ _HOST_ID = "4b653f6031f35d168cc0b37caa1306d1"
 _WORKER_HOST_ID = "8e7d6c5b4a39281706f5e4d3c2b1a09f"
 _VALID_RRULE = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0"
 _TEMPLATE_LABEL = "omnigent:agent-template-id"
+_PLUGIN_HARNESS = "test-mode"
+
+
+@pytest.fixture()
+def mode_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests._helpers.session_mode_plugin import install_test_mode_plugin
+
+    install_test_mode_plugin(monkeypatch)
 
 
 def _bundle(*, harness: str = "claude-native", name: str = "library-runner") -> bytes:
@@ -204,6 +212,47 @@ def _task_body(**overrides: object) -> dict[str, object]:
     }
     body.update(overrides)
     return body
+
+
+@pytest.mark.parametrize(
+    "harness,permission,speed,expected_args",
+    [
+        (_PLUGIN_HARNESS, "review", None, ["--review", "review"]),
+        (_PLUGIN_HARNESS, "review", "quiet", ["--review", "review", "--speed", "quiet"]),
+        ("codex", "default", None, None),
+    ],
+)
+async def test_plugin_mode_applies_to_library_launch(
+    mode_plugin: None,
+    client: httpx.AsyncClient,
+    library_server: _LibraryServer,
+    harness: str,
+    permission: str,
+    speed: str | None,
+    expected_args: list[str] | None,
+) -> None:
+    library_agent_id = await _create_agent(client, harness=harness)
+    task_id = await _create_library_task(
+        client, library_agent_id, permission_mode=permission, **({"speed": speed} if speed else {})
+    )
+    dispatched: list[Any] = []
+
+    async def dispatch(conv: Any, task: Any) -> None:
+        dispatched.append(conv)
+
+    on_fire = build_on_fire(_fire_deps(library_server), launch_dispatch=dispatch)
+    await on_fire(0, task_id)
+    await _drain()
+    assert len(dispatched) == 1
+    library_session = library_server.conversations.get_conversation(dispatched.pop().id)
+    assert library_session is not None
+    assert library_session.terminal_launch_args == expected_args
+    if harness == "codex":
+        assert library_session.labels["omnigent.codex_sdk.approval_mode"] == "ask-for-approval"
+    else:
+        assert library_session.labels["plugin.mode"] == "review"
+    if speed:
+        assert library_session.labels["plugin.speed"] == speed
 
 
 async def test_create_with_owned_library_agent(
@@ -526,3 +575,64 @@ async def test_fire_after_library_agent_deleted_records_failed_run(
     assert [run.status for run in runs] == ["failed"]
     assert runs[0].error_code == ErrorCode.NOT_FOUND
     assert f"Agent not found: {agent_id!r}" in (runs[0].error or "")
+
+
+@pytest.mark.parametrize(
+    "harness,permission,speed,expected_args",
+    [
+        (_PLUGIN_HARNESS, "review", "quiet", ["--review", "review", "--speed", "quiet"]),
+        ("codex", "default", None, None),
+    ],
+)
+async def test_plugin_mode_interactive_and_stored_agent_schedule(
+    mode_plugin: None,
+    client: httpx.AsyncClient,
+    library_server: _LibraryServer,
+    harness: str,
+    permission: str,
+    speed: str | None,
+    expected_args: list[str] | None,
+) -> None:
+    seed = await client.post(
+        "/v1/sessions",
+        headers=_headers(),
+        files={"bundle": ("agent.tar.gz", _bundle(harness=harness))},
+        data={"metadata": '{"title": "Plugin source"}'},
+    )
+    assert seed.status_code == 201, seed.text
+    agent_id = seed.json()["agent_id"]
+    interactive = await client.post(
+        "/v1/sessions",
+        headers=_headers(),
+        json={
+            "agent_id": agent_id,
+            "permission_mode": permission,
+            **({"labels": {"omnigent.speed_tier": speed}} if speed else {}),
+        },
+    )
+    assert interactive.status_code == 201, interactive.text
+    conv = library_server.conversations.get_conversation(interactive.json()["id"])
+    assert conv is not None
+    assert conv.terminal_launch_args == expected_args
+    assert conv.labels[
+        "plugin.mode" if harness == _PLUGIN_HARNESS else "omnigent.codex_sdk.approval_mode"
+    ] == ("review" if harness == _PLUGIN_HARNESS else "ask-for-approval")
+
+    task = await client.post(
+        "/v1/scheduled-tasks",
+        headers=_headers(),
+        json=_task_body(
+            agent_id=agent_id, permission_mode=permission, **({"speed": speed} if speed else {})
+        ),
+    )
+    assert task.status_code == 200, task.text
+    from omnigent.server.scheduled.fire import _create_session
+
+    deps = replace(_fire_deps(library_server), agent_cache=library_server.app.state.agent_cache)
+    scheduled = library_server.tasks.get(task.json()["id"])
+    assert scheduled is not None
+    fired = await _create_session(deps, scheduled)
+    assert fired.terminal_launch_args == expected_args
+    assert fired.labels[
+        "plugin.mode" if harness == _PLUGIN_HARNESS else "omnigent.codex_sdk.approval_mode"
+    ] == ("review" if harness == _PLUGIN_HARNESS else "ask-for-approval")

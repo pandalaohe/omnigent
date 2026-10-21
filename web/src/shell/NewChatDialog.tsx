@@ -197,7 +197,7 @@ import {
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { callingLastContext, resolveCallingSeed } from "@/lib/callingDefaultsSeed";
-import { recordCallingLast } from "@/lib/callingDefaults";
+import { recordCallingLast, callingDefaultHasModels } from "@/lib/callingDefaults";
 import type { CallingDefaultsProblem } from "@/lib/callingDefaultsApi";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
@@ -245,7 +245,13 @@ import {
   isAutoHarness,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useHarnessCapabilities,
 } from "@/lib/agentLabels";
+import {
+  sessionDefaultModeOptions,
+  sessionModeHandler,
+  type HarnessCapabilityMap,
+} from "@/lib/sessionDefaultModes";
 import {
   SMART_ROUTING_ARMS,
   hostBacksHarnessWithGateway,
@@ -436,6 +442,7 @@ function createdHarnessOptions({
   supportsApprovalMode,
   supportsCursorMode,
   supportsAgyPermissionTier,
+  supportsGenericPermission,
   supportsDevinMode,
   supportsModelPicker,
   supportsEffortPicker,
@@ -456,6 +463,7 @@ function createdHarnessOptions({
   supportsApprovalMode: boolean;
   supportsCursorMode: boolean;
   supportsAgyPermissionTier: boolean;
+  supportsGenericPermission: boolean;
   supportsDevinMode: boolean;
   supportsModelPicker: boolean;
   supportsEffortPicker: boolean;
@@ -488,6 +496,8 @@ function createdHarnessOptions({
     options.mode = agySkipMode;
     options.model = pickedModel;
     options.effort = pickedEffort;
+  } else if (supportsGenericPermission) {
+    options.mode = permissionMode;
   } else if (supportsDevinMode) {
     // Devin's permission mode rides `terminal_launch_args`, not the gated
     // `permission_mode` field, so it is remembered like any other mode knob.
@@ -1373,12 +1383,15 @@ function visibleModelLabel(label: string): string {
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
-function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
+function agentHasModelSettings(
+  agent: AvailableAgent | undefined,
+  capabilities: HarnessCapabilityMap,
+): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
     // devinMode owns Devin's own Model + Effort rows (see nativeCodingAgents).
     nativeAgentHasCapability(agent, "devinMode") ||
-    nativeAgentHasCapability(agent, "agyMode") ||
+    (agent?.harness != null && callingDefaultHasModels(agent.harness, capabilities)) ||
     nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
   );
 }
@@ -1393,7 +1406,6 @@ function agentHasAdvancedSettings(
     !nativeAgentHasCapability(agent, "permissionMode") &&
     !nativeAgentHasCapability(agent, "approvalMode") &&
     !nativeAgentHasCapability(agent, "cursorMode") &&
-    !nativeAgentHasCapability(agent, "agyPermissionTier") &&
     !nativeAgentHasCapability(agent, "devinPermission")
   );
 }
@@ -2374,6 +2386,7 @@ export function resetLandingDraft(): void {
 }
 
 export function NewChatLandingScreen() {
+  const harnessCapabilities = useHarnessCapabilities();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -3574,7 +3587,14 @@ export function NewChatLandingScreen() {
       ? activeSdk
       : null;
   const selectionHarness =
-    selectedNativeHarness ?? sdkHarness ?? (activeSdk === "pi" ? "pi" : null);
+    selectedNativeHarness ??
+    sdkHarness ??
+    (activeSdk &&
+    (sessionModeHandler(activeSdk, "permission", harnessCapabilities) ||
+      sessionModeHandler(activeSdk, "speed", harnessCapabilities) ||
+      callingDefaultHasModels(activeSdk, harnessCapabilities))
+      ? activeSdk
+      : null);
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings.
   const canLoadHostModels = (harness: string) =>
@@ -3792,13 +3812,40 @@ export function NewChatLandingScreen() {
     [availablePiModels, sandboxSelected, sandboxCatalog],
   );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
-  const supportsAgyMode = nativeAgentHasCapability(selectedAgent, "agyMode");
+  const supportsAgyMode =
+    selectionHarness !== null && callingDefaultHasModels(selectionHarness, harnessCapabilities);
   const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsDevinPermission = nativeAgentHasCapability(selectedAgent, "devinPermission");
   const supportsAgyPermissionTier =
-    nativeAgentHasCapability(selectedAgent, "agyPermissionTier") || activeSdk === "pi";
+    selectionHarness !== null &&
+    sessionModeHandler(selectionHarness, "permission", harnessCapabilities) === "agy-tier";
+  const declaredPermissionOptions = useMemo(
+    () =>
+      selectionHarness
+        ? sessionDefaultModeOptions(
+            selectionHarness,
+            "permission",
+            [],
+            null,
+            "create",
+            harnessCapabilities,
+          )
+        : [],
+    [selectionHarness, harnessCapabilities],
+  );
+  const hasDeclaredPermissionMode =
+    selectionHarness !== null &&
+    harnessCapabilities[selectionHarness]?.session_modes?.permission != null;
+  const hasGenericPermissionMode =
+    hasDeclaredPermissionMode &&
+    !supportsPermissionMode &&
+    !supportsApprovalMode &&
+    !supportsCursorMode &&
+    !supportsAgyPermissionTier &&
+    !supportsDevinPermission &&
+    sdkHarness === null;
   const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // Smart Routing as a Model choice is offered on the two native harnesses
@@ -3842,7 +3889,7 @@ export function NewChatLandingScreen() {
     // exposes no run-config knobs and gets no gear.
     !agent.id.startsWith("ca_") &&
     ((sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
-      agentHasModelSettings(agent) ||
+      agentHasModelSettings(agent, harnessCapabilities) ||
       agentHasAdvancedSettings(agent, brainHarnessLabelsAll));
   // Only an eligible harness can display active per-turn Smart Routing.
   const routingOn = smartRoutingEligible && costControlMode === "on";
@@ -4069,8 +4116,18 @@ export function NewChatLandingScreen() {
       row.label === "Effort" ||
       row.label === "Thinking level",
   );
-  const permissionConfigRow = configSummary.find(
-    (row) => row.label === "Permission mode" || row.label === "Mode",
+  const permissionConfigRow = useMemo(
+    () =>
+      configSummary.find((row) => row.label === "Permission mode" || row.label === "Mode") ??
+      (hasGenericPermissionMode
+        ? {
+            label: "Permission mode",
+            value:
+              declaredPermissionOptions.find((option) => option.value === permissionMode)?.label ??
+              "Default",
+          }
+        : null),
+    [configSummary, hasGenericPermissionMode, declaredPermissionOptions, permissionMode],
   );
   const pickerModelOptions: readonly NativeModelOption[] = sandboxHasModelCatalog
     ? (sandboxCatalog ?? [])
@@ -4704,21 +4761,25 @@ export function NewChatLandingScreen() {
   );
   const directModeOptions = smartRoutingHarnessSelected
     ? []
-    : sdkHarness !== null
-      ? (sdkPermissionOptions(sdkHarness) ?? [])
-      : supportsPermissionMode
-        ? CLAUDE_NATIVE_PERMISSION_MODES
-        : supportsApprovalMode
-          ? selectedNativeHarness === "codex-native"
-            ? codexCreateApprovalOptions()
-            : CODEX_NATIVE_APPROVAL_MODES
-          : supportsCursorMode
-            ? CURSOR_NATIVE_EXEC_MODES
-            : supportsAgyPermissionTier
-              ? AGY_NATIVE_PERMISSION_TIERS
-              : supportsDevinPermission
-                ? DEVIN_NATIVE_PERMISSION_MODES
-                : [];
+    : hasDeclaredPermissionMode
+      ? selectedNativeHarness === "codex-native"
+        ? [...declaredPermissionOptions, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
+        : declaredPermissionOptions
+      : sdkHarness !== null
+        ? (sdkPermissionOptions(sdkHarness) ?? [])
+        : supportsPermissionMode
+          ? CLAUDE_NATIVE_PERMISSION_MODES
+          : supportsApprovalMode
+            ? selectedNativeHarness === "codex-native"
+              ? codexCreateApprovalOptions()
+              : CODEX_NATIVE_APPROVAL_MODES
+            : supportsCursorMode
+              ? CURSOR_NATIVE_EXEC_MODES
+              : supportsAgyPermissionTier
+                ? AGY_NATIVE_PERMISSION_TIERS
+                : supportsDevinPermission
+                  ? DEVIN_NATIVE_PERMISSION_MODES
+                  : [];
   const selectDirectMode = (mode: string) => {
     setPermissionTouched(true);
     if (sdkHarness !== null) {
@@ -4727,7 +4788,7 @@ export function NewChatLandingScreen() {
       rememberPickerOptions(sdkHarness, { mode });
       return;
     }
-    if (!selectedNativeHarness && selectionHarness !== "pi") return;
+    if (!selectionHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
     else if (supportsApprovalMode) {
       if (selectedNativeHarness === "codex-native") {
@@ -4748,6 +4809,7 @@ export function NewChatLandingScreen() {
       setTierFullChosen(mode === "full");
       tierFullChoiceHarness.current = mode === "full" ? selectionHarness : null;
     } else if (supportsDevinPermission) setDevinPermissionMode(mode);
+    else if (hasGenericPermissionMode) setPermissionMode(mode);
     rememberPickerOptions(selectionHarness!, { mode });
   };
   // Clear shared state on agent changes; the harness seed restores its own
@@ -4957,6 +5019,8 @@ export function NewChatLandingScreen() {
       setDevinPermissionMode(
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
+    } else if (hasGenericPermissionMode) {
+      setPermissionMode(seededPermission ?? resolve(declaredPermissionOptions, ""));
     }
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
@@ -4972,6 +5036,7 @@ export function NewChatLandingScreen() {
     piModelOptions,
     agyModelOptions,
     configProjectId,
+    harnessCapabilities,
   ]);
   useEffect(() => {
     if (!sandboxDefaultModelsEnabled || !previewHarness || projectVisit) return;
@@ -6404,7 +6469,8 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgyPermissionTier =
-        nativeAgentHasCapability(agent, "agyPermissionTier") || selectionHarness === "pi";
+        selectionHarness !== null &&
+        sessionModeHandler(selectionHarness, "permission", harnessCapabilities) === "agy-tier";
       const agentSupportsDevinPermission = nativeAgentHasCapability(agent, "devinPermission");
       const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
@@ -6755,7 +6821,9 @@ export function NewChatLandingScreen() {
           reasoning_effort:
             normalizedReasoningEffort ??
             (createProjectId !== null && effortTouchedRef.current ? null : undefined),
-          ...(sdkHarness === "claude-sdk" ? { permission_mode: permissionMode } : {}),
+          ...(sdkHarness === "claude-sdk" || hasGenericPermissionMode
+            ? { permission_mode: permissionMode || undefined }
+            : {}),
           ...(sdkHarness === "codex" ? { approval_mode: approvalMode } : {}),
           ...(agentSupportsAgyPermissionTier && !smartRoutingHarnessSelected
             ? { permission_tier: agySkipMode === "full" && !tierFullChosen ? "auto" : agySkipMode }
@@ -6862,6 +6930,7 @@ export function NewChatLandingScreen() {
           supportsApprovalMode: agentSupportsApprovalMode || sdkHarness === "codex",
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgyPermissionTier: agentSupportsAgyPermissionTier,
+          supportsGenericPermission: hasGenericPermissionMode,
           supportsModelPicker:
             agentSupportsModelPicker ||
             nativeAgent?.harness === "codex-native" ||
@@ -8222,7 +8291,9 @@ export function NewChatLandingScreen() {
                                       ? agySkipMode
                                       : selectedNativeHarness === "devin-native"
                                         ? devinPermissionMode
-                                        : undefined
+                                        : hasGenericPermissionMode
+                                          ? permissionMode
+                                          : undefined
                         }
                         loading={pickerLoading}
                         interactiveWhileLoading={interactiveWhileLoading}

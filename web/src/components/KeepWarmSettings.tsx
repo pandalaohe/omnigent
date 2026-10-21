@@ -12,6 +12,7 @@ import {
   clampKeepWarmColdAfterSeconds,
   keepWarmFamilyForHarness,
   keepWarmIntervalBoundsSeconds,
+  resolveKeepWarmAgent,
   setKeepWarmAgent,
   setKeepWarmDefault,
   writeKeepWarmPreferences,
@@ -165,7 +166,14 @@ export function KeepWarmSettings() {
           )}
           <KeepWarmControls
             label={item?.label ?? registry.legacyLabels[key] ?? key}
-            row={row}
+            row={
+              familyFor(item)
+                ? {
+                    ...resolveKeepWarmAgent(preferences, key, familyFor(item)!),
+                    coldAfterSeconds: row.coldAfterSeconds,
+                  }
+                : row
+            }
             family={familyFor(item)}
             onPatch={patch}
             onClearCold={() => patchException(key, { coldAfterSeconds: null })}
@@ -173,7 +181,7 @@ export function KeepWarmSettings() {
         </>
       );
     },
-    [byKey, familyFor, patchException, registry.legacyLabels],
+    [byKey, familyFor, patchException, preferences, registry.legacyLabels],
   );
 
   return (

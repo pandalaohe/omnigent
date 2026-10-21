@@ -29,6 +29,8 @@ export function AgentPicker({
   isLoading = false,
   isError = false,
   onRetry,
+  title = "Add exception",
+  description = "Choose an agent or harness for a different setting.",
 }: {
   items: RegistryItem[];
   taken: ReadonlySet<RegistryKey>;
@@ -38,6 +40,8 @@ export function AgentPicker({
   isLoading?: boolean;
   isError?: boolean;
   onRetry?: () => void;
+  title?: string;
+  description?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -92,11 +96,11 @@ export function AgentPicker({
     <>
       {isMobile ? (
         <DialogHeader className="border-b px-5 py-4">
-          <DialogTitle>Add exception</DialogTitle>
-          <DialogDescription>Choose an agent or harness for a different setting.</DialogDescription>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
       ) : (
-        <div className="border-b px-4 py-3 text-sm font-medium">Add exception</div>
+        <div className="border-b px-4 py-3 text-sm font-medium">{title}</div>
       )}
       <div className="px-5 py-3">
         <Input
@@ -176,7 +180,7 @@ export function AgentPicker({
         align="start"
         sideOffset={6}
         role="dialog"
-        aria-label="Add exception"
+        aria-label={title}
         className="max-h-[min(640px,80dvh)] w-[min(560px,calc(100vw-2rem))] gap-0 overflow-hidden p-0"
         onOpenAutoFocus={(event) => {
           event.preventDefault();

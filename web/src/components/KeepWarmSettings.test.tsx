@@ -228,3 +228,13 @@ describe("KeepWarmSettings", () => {
     expect(registryState.retry).toHaveBeenCalledOnce();
   });
 });
+
+it("shows the effective family interval for a saved row with no interval", () => {
+  localStorage.setItem(
+    KEEP_WARM_STORAGE_KEY,
+    JSON.stringify({ agents: { "old-product": { main: true, child: false, maxSeconds: 14400 } } }),
+  );
+  render(<KeepWarmSettings />);
+  fireEvent.click(screen.getByRole("button", { name: /Edit Old Claude Code/ }));
+  expect(screen.getByRole("spinbutton", { name: /Keep-warm interval/ })).toHaveValue(55);
+});

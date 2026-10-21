@@ -31,6 +31,9 @@ import { useHosts } from "@/hooks/useHosts";
 import { useProjects } from "@/hooks/useConversations";
 import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useHarnessCapabilities } from "@/lib/agentLabels";
+import { callingDefaultHasModels } from "@/lib/callingDefaults";
+import { sessionModeHandler } from "@/lib/sessionDefaultModes";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import {
@@ -207,16 +210,22 @@ export function CreateScheduledTaskDialog({
   // interactive. Resolved from the full agent list so a task bound to an agent
   // the picker hides still gates on its real capabilities.
   const modelEffortAgent = agents?.find((a) => a.id === effectiveAgentId);
+  const harnessCapabilities = useHarnessCapabilities();
   const nativePermissionMode = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
-  const modelEffortHarness: "claude-native" | "claude-sdk" | "codex" | "codex-native" | null =
-    nativePermissionMode
-      ? "claude-native"
-      : nativeCodingAgentForAvailableAgent(modelEffortAgent)?.harness === "codex-native"
-        ? "codex-native"
-        : modelEffortAgent?.harness === "claude-sdk" || modelEffortAgent?.harness === "codex"
-          ? modelEffortAgent.harness
-          : null;
-  const showModelEffort = modelEffortHarness !== null;
+  const modelEffortHarness: string | null = nativePermissionMode
+    ? "claude-native"
+    : nativeCodingAgentForAvailableAgent(modelEffortAgent)?.harness === "codex-native"
+      ? "codex-native"
+      : (modelEffortAgent?.harness ?? null);
+  const hasModelOptions =
+    modelEffortHarness !== null && callingDefaultHasModels(modelEffortHarness, harnessCapabilities);
+  const hasPermissionOptions =
+    modelEffortHarness !== null &&
+    sessionModeHandler(modelEffortHarness, "permission", harnessCapabilities) !== null;
+  const hasSpeedOptions =
+    modelEffortHarness !== null &&
+    sessionModeHandler(modelEffortHarness, "speed", harnessCapabilities) !== null;
+  const showModelEffort = hasModelOptions || hasPermissionOptions || hasSpeedOptions;
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
   // The agent picker and host/schedule Selects portal dropdowns OUTSIDE DialogContent.
@@ -622,7 +631,9 @@ export function CreateScheduledTaskDialog({
           {showModelEffort && (
             <div data-testid="task-model-effort-field">
               <ModelEffortFields
-                harness={modelEffortHarness}
+                harness={modelEffortHarness!}
+                capabilities={harnessCapabilities}
+                showModel={hasModelOptions}
                 model={pickedModel}
                 effort={pickedEffort}
                 speed={pickedSpeed}

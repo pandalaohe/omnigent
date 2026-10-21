@@ -133,7 +133,6 @@ from omnigent.runtime.policies.builder import (
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.sdk_permission_modes import (
-    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODES,
 )
@@ -198,7 +197,6 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import agent_removed as _agent_removed
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
-    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
     _authorize_host_for_workspace,
     validate_session_agent,
     validate_session_model_metadata,
@@ -450,9 +448,10 @@ from omnigent.server.subagent_activity import (
 )
 from omnigent.server.user_preferences_store import read_worktree_path_template
 from omnigent.session_default_modes import (
-    CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
-    PERMISSION_DEFAULT_VALUES,
     SPEED_TIER_LABEL_KEY,
+    apply_mode,
+    mode_values,
+    valid_mode,
     valid_speed_tier,
 )
 from omnigent.spec.types import (
@@ -13629,29 +13628,35 @@ async def _create_session_from_existing_agent(
         )
 
     sdk_permission_labels: dict[str, str] = {}
+    explicit_permission_application = None
     if body.permission_mode is not None or body.approval_mode is not None:
-        if body.sub_agent_name is not None or body.parent_session_id is not None:
+        if body.sub_agent_name is not None:
             raise OmnigentError(
-                "permission_mode and approval_mode are only supported for top-level sessions",
+                "permission_mode and approval_mode are not supported for named sub-agent sessions",
                 code=ErrorCode.INVALID_INPUT,
             )
         resolved_harness = await asyncio.to_thread(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
         if body.permission_mode is not None:
-            if resolved_harness != "claude-sdk":
+            if not valid_mode(body.permission_mode, resolved_harness, "permission", "create"):
                 raise OmnigentError(
-                    "permission_mode is only supported for claude-sdk sessions, "
-                    f"not {resolved_harness!r}",
+                    f"permission_mode {body.permission_mode!r} is not supported "
+                    f"for {resolved_harness!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            if body.permission_mode not in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES:
+            explicit_permission_application = apply_mode(
+                resolved_harness, "permission", body.permission_mode
+            )
+            if (
+                explicit_permission_application.tier is not None
+                and body.permission_tier is not None
+            ):
                 raise OmnigentError(
-                    "permission_mode must be one of "
-                    f"{sorted(CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES)}",
+                    "permission_mode and permission_tier cannot both select a tier",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            sdk_permission_labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = body.permission_mode
+            sdk_permission_labels.update(explicit_permission_application.labels)
         if body.approval_mode is not None:
             if resolved_harness != "codex":
                 raise OmnigentError(
@@ -14131,7 +14136,11 @@ async def _create_session_from_existing_agent(
     # spec-level reasoning effort and, when the body carried no launch args,
     # its explicit native-bypass opt-ins; one tolerant load serves both.
     own_spec: AgentSpec | None = None
-    needs_launch_args_from_spec = not body.sub_agent_name and validated_launch_args is None
+    needs_launch_args_from_spec = (
+        not body.sub_agent_name
+        and validated_launch_args is None
+        and not (explicit_permission_application and explicit_permission_application.args)
+    )
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
     needs_speed_from_spec = sub_spec is None and SPEED_TIER_LABEL_KEY not in (body.labels or {})
     if (
@@ -14166,6 +14175,17 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    if explicit_permission_application is not None and explicit_permission_application.args:
+        try:
+            validated_launch_args = _validate_terminal_launch_args(
+                [*(validated_launch_args or []), *explicit_permission_application.args]
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args with permission mode: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     if body.sub_agent_name is None and (
         project_resolution.speed is not None or project_resolution.permission is not None
     ):
@@ -14174,34 +14194,26 @@ async def _create_session_from_existing_agent(
         )
         permission = project_resolution.permission
         if permission is not None:
-            if permission not in PERMISSION_DEFAULT_VALUES.get(
-                resolved_harness or "", frozenset()
-            ):
+            if permission not in mode_values(resolved_harness, "permission", "default"):
                 _logger.warning(
                     "Ignoring unsupported permission default %r for %s",
                     permission,
                     resolved_harness,
                 )
             elif (
-                resolved_harness != "antigravity-native"
-                and body.permission_mode is None
+                body.permission_mode is None
                 and body.approval_mode is None
                 and CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in (body.labels or {})
                 and not _launch_args_set_permission(validated_launch_args, resolved_harness)
             ):
-                if resolved_harness == "codex":
-                    sdk_permission_labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission
-                elif resolved_harness == "claude-sdk":
-                    sdk_permission_labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = permission
-                else:
-                    preset_args = (
-                        CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[permission]
-                        if resolved_harness == "codex-native"
-                        else ["--permission-mode", permission]
-                    )
+                application = apply_mode(
+                    resolved_harness, "permission", permission, context="default"
+                )
+                sdk_permission_labels.update(application.labels)
+                if application.args:
                     try:
                         validated_launch_args = _validate_terminal_launch_args(
-                            [*(validated_launch_args or []), *preset_args]
+                            [*(validated_launch_args or []), *application.args]
                         )
                     except ValueError as exc:
                         raise OmnigentError(
@@ -14210,12 +14222,26 @@ async def _create_session_from_existing_agent(
                         ) from exc
         speed = project_resolution.speed
         if speed is not None:
-            if not valid_speed_tier(speed, resolved_harness):
+            speed_context: Literal["default", "create"] = (
+                "create" if SPEED_TIER_LABEL_KEY in (body.labels or {}) else "default"
+            )
+            if not valid_mode(speed, resolved_harness, "speed", speed_context):
                 _logger.warning(
                     "Ignoring unsupported speed default %r for %s", speed, resolved_harness
                 )
-            elif SPEED_TIER_LABEL_KEY not in (body.labels or {}):
-                sdk_permission_labels[SPEED_TIER_LABEL_KEY] = speed
+            else:
+                application = apply_mode(resolved_harness, "speed", speed, context=speed_context)
+                sdk_permission_labels.update(application.labels)
+                if application.args:
+                    try:
+                        validated_launch_args = _validate_terminal_launch_args(
+                            [*(validated_launch_args or []), *application.args]
+                        )
+                    except ValueError as exc:
+                        raise OmnigentError(
+                            f"invalid terminal_launch_args with speed default: {exc}",
+                            code=ErrorCode.INVALID_INPUT,
+                        ) from exc
 
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
@@ -14229,10 +14255,25 @@ async def _create_session_from_existing_agent(
 
     selected_spec = sub_spec if sub_spec is not None else own_spec
     spec_speed = selected_spec.executor.config.get("service_tier") if selected_spec else None
-    if spec_speed is not None and SPEED_TIER_LABEL_KEY not in (body.labels or {}):
+    if (
+        spec_speed is not None
+        and project_resolution.speed is None
+        and SPEED_TIER_LABEL_KEY not in (body.labels or {})
+    ):
         spec_harness = selected_spec.executor.harness_kind if selected_spec else None
         if valid_speed_tier(spec_speed, spec_harness):
-            sdk_permission_labels[SPEED_TIER_LABEL_KEY] = spec_speed
+            application = apply_mode(spec_harness, "speed", spec_speed, context="default")
+            sdk_permission_labels.update(application.labels)
+            if application.args:
+                try:
+                    validated_launch_args = _validate_terminal_launch_args(
+                        [*(validated_launch_args or []), *application.args]
+                    )
+                except ValueError as exc:
+                    raise OmnigentError(
+                        f"invalid terminal_launch_args with spec speed: {exc}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
@@ -14332,7 +14373,13 @@ async def _create_session_from_existing_agent(
                     ) from exc
         tier = creation_permission_tier(
             harness=create_harness,
-            explicit=body.permission_tier,
+            explicit=(
+                body.permission_tier
+                if body.permission_tier is not None
+                else explicit_permission_application.tier
+                if explicit_permission_application is not None
+                else None
+            ),
             default=project_resolution.permission if body.sub_agent_name is None else None,
             inherited=inherited_tier,
         )

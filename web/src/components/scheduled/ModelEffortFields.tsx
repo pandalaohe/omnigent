@@ -35,6 +35,7 @@ import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { normalizeSdkPermissionMode, sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { useHostModelOptions } from "@/hooks/useHosts";
 
@@ -49,6 +50,8 @@ export function ModelEffortFields({
   permissionMode,
   speed,
   harness,
+  capabilities,
+  showModel,
   hostId,
   onModelChange,
   onEffortChange,
@@ -63,7 +66,9 @@ export function ModelEffortFields({
   /** Selected permission mode, or "" = agent default (nothing overridden). */
   permissionMode: string;
   speed: string;
-  harness: "claude-native" | "claude-sdk" | "codex" | "codex-native";
+  harness: string;
+  capabilities?: HarnessCapabilityMap;
+  showModel?: boolean;
   /** Pinned host id, or "" when unset (task resolves a host at fire time). */
   hostId: string;
   onModelChange: (model: string) => void;
@@ -88,98 +93,114 @@ export function ModelEffortFields({
   const modelOptions =
     rows.length > 0
       ? rows.map((o) => ({ id: o.id, label: o.displayName ?? o.id }))
-      : harness === "codex" || harness === "codex-native"
-        ? []
-        : CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }));
+      : harness === "claude-sdk" || harness === "claude-native"
+        ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
+        : [];
   if (model !== "" && !modelOptions.some((option) => option.id === model)) {
     modelOptions.push({ id: model, label: model });
   }
-  const levels = effortLevelsFor(harness, rows, model);
-  const effortOptions =
-    harness === "codex" || harness === "codex-native"
-      ? (levels ?? []).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-      : levels === null
-        ? [...CLAUDE_NATIVE_EFFORTS]
-        : CLAUDE_NATIVE_EFFORTS.filter((option) => levels.includes(option.value));
+  const selected = rows.find((row) => row.id === model) ?? rows.find((row) => row.isDefault);
+  const levels =
+    effortLevelsFor(harness, rows, model) ??
+    selected?.efforts ??
+    selected?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ??
+    [];
+  const effortOptions = (levels ?? []).map((value) => ({
+    value,
+    label:
+      CLAUDE_NATIVE_EFFORTS.find((option) => option.value === value)?.label ??
+      normalizeEffortLabel(value),
+  }));
   if (effort !== "" && !effortOptions.some((option) => option.value === effort)) {
     effortOptions.push({ value: effort, label: normalizeEffortLabel(effort) });
   }
   const permissionOptions =
-    harness === "claude-native"
-      ? CLAUDE_NATIVE_PERMISSION_MODES
-      : harness === "codex-native"
-        ? (sdkPermissionOptions("codex") ?? [])
-        : (sdkPermissionOptions(harness) ?? []);
-  const speedOptions = sessionDefaultModeOptions(harness, "speed", rows, model);
+    capabilities?.[harness] && "session_modes" in capabilities[harness]
+      ? sessionDefaultModeOptions(harness, "permission", rows, model, "create", capabilities)
+      : harness === "claude-native"
+        ? CLAUDE_NATIVE_PERMISSION_MODES
+        : harness === "codex-native"
+          ? (sdkPermissionOptions("codex") ?? [])
+          : (sdkPermissionOptions(harness) ?? []);
+  const speedOptions = sessionDefaultModeOptions(
+    harness,
+    "speed",
+    rows,
+    model,
+    "create",
+    capabilities,
+  );
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
-      <div className="grid gap-3 sm:grid-cols-2 sm:gap-6" data-testid="task-model-effort-row">
-        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-model-control">
-          <Label htmlFor="task-model">Model</Label>
-          <Select
-            value={model === "" ? MODEL_SELECT_DEFAULT : model}
-            componentId="tasks.scheduled.model"
-            valueHasNoPii
-            onValueChange={(v) => {
-              const nextModel = v === MODEL_SELECT_DEFAULT ? "" : v;
-              onModelChange(nextModel);
-              if (speed && (harness === "codex" || harness === "codex-native")) {
-                onSpeedChange(reconcileSpeed(speed, rows, nextModel) ?? "");
-              }
-              if ((harness === "codex" || harness === "codex-native") && effort !== "") {
-                onEffortChange(
-                  reconcileEffortOnModelChange(harness, rows, nextModel, effort) ?? "",
-                );
-              }
-            }}
-            onOpenChange={onSelectOpenChange}
-          >
-            <SelectTrigger id="task-model" data-testid="task-model-trigger" className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent
-              position="popper"
-              align="start"
-              className="w-(--radix-select-trigger-width)"
+      {showModel !== false && (
+        <div className="grid gap-3 sm:grid-cols-2 sm:gap-6" data-testid="task-model-effort-row">
+          <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-model-control">
+            <Label htmlFor="task-model">Model</Label>
+            <Select
+              value={model === "" ? MODEL_SELECT_DEFAULT : model}
+              componentId="tasks.scheduled.model"
+              valueHasNoPii
+              onValueChange={(v) => {
+                const nextModel = v === MODEL_SELECT_DEFAULT ? "" : v;
+                onModelChange(nextModel);
+                if (speed && (harness === "codex" || harness === "codex-native")) {
+                  onSpeedChange(reconcileSpeed(speed, rows, nextModel) ?? "");
+                }
+                if ((harness === "codex" || harness === "codex-native") && effort !== "") {
+                  onEffortChange(
+                    reconcileEffortOnModelChange(harness, rows, nextModel, effort) ?? "",
+                  );
+                }
+              }}
+              onOpenChange={onSelectOpenChange}
             >
-              <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
-              {modelOptions.map((m) => (
-                <SelectItem key={m.id} value={m.id}>
-                  {m.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
+              <SelectTrigger id="task-model" data-testid="task-model-trigger" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent
+                position="popper"
+                align="start"
+                className="w-(--radix-select-trigger-width)"
+              >
+                <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+                {modelOptions.map((m) => (
+                  <SelectItem key={m.id} value={m.id}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
 
-        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-effort-control">
-          <Label htmlFor="task-effort">Effort</Label>
-          <Select
-            value={effort === "" ? EFFORT_SELECT_NONE : effort}
-            componentId="tasks.scheduled.effort"
-            valueHasNoPii
-            onValueChange={(v) => onEffortChange(v === EFFORT_SELECT_NONE ? "" : v)}
-            onOpenChange={onSelectOpenChange}
-          >
-            <SelectTrigger id="task-effort" data-testid="task-effort-trigger" className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent
-              position="popper"
-              align="start"
-              className="w-(--radix-select-trigger-width)"
+          <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-effort-control">
+            <Label htmlFor="task-effort">Effort</Label>
+            <Select
+              value={effort === "" ? EFFORT_SELECT_NONE : effort}
+              componentId="tasks.scheduled.effort"
+              valueHasNoPii
+              onValueChange={(v) => onEffortChange(v === EFFORT_SELECT_NONE ? "" : v)}
+              onOpenChange={onSelectOpenChange}
             >
-              <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-              {effortOptions.map((e) => (
-                <SelectItem key={e.value} value={e.value}>
-                  {e.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+              <SelectTrigger id="task-effort" data-testid="task-effort-trigger" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent
+                position="popper"
+                align="start"
+                className="w-(--radix-select-trigger-width)"
+              >
+                <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                {effortOptions.map((e) => (
+                  <SelectItem key={e.value} value={e.value}>
+                    {e.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
-      </div>
+      )}
 
       {speedOptions.length > 0 && (
         <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-speed-control">
@@ -213,42 +234,44 @@ export function ModelEffortFields({
         </div>
       )}
 
-      <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
-        <Label htmlFor="task-permission">Permission mode</Label>
-        <Select
-          value={
-            permissionMode === ""
-              ? PERMISSION_SELECT_DEFAULT
-              : normalizeSdkPermissionMode(harness, permissionMode)
-          }
-          componentId="tasks.scheduled.permission_mode"
-          valueHasNoPii
-          onValueChange={(v) => onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v)}
-          onOpenChange={onSelectOpenChange}
-        >
-          <SelectTrigger
-            id="task-permission"
-            data-testid="task-permission-trigger"
-            className="w-full"
+      {permissionOptions.length > 0 && (
+        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
+          <Label htmlFor="task-permission">Permission mode</Label>
+          <Select
+            value={
+              permissionMode === ""
+                ? PERMISSION_SELECT_DEFAULT
+                : normalizeSdkPermissionMode(harness, permissionMode)
+            }
+            componentId="tasks.scheduled.permission_mode"
+            valueHasNoPii
+            onValueChange={(v) => onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v)}
+            onOpenChange={onSelectOpenChange}
           >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent
-            position="popper"
-            align="start"
-            className="w-(--radix-select-trigger-width)"
-          >
-            <SelectItem value={PERMISSION_SELECT_DEFAULT}>
-              {harness === "codex" ? "Agent default" : "Default"}
-            </SelectItem>
-            {permissionOptions.map((m) => (
-              <SelectItem key={m.value} value={m.value}>
-                {m.label}
+            <SelectTrigger
+              id="task-permission"
+              data-testid="task-permission-trigger"
+              className="w-full"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent
+              position="popper"
+              align="start"
+              className="w-(--radix-select-trigger-width)"
+            >
+              <SelectItem value={PERMISSION_SELECT_DEFAULT}>
+                {harness === "codex" ? "Agent default" : "Default"}
               </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+              {permissionOptions.map((m) => (
+                <SelectItem key={m.value} value={m.value}>
+                  {m.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
     </div>
   );
 }

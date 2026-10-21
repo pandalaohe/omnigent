@@ -51,6 +51,18 @@ export interface HarnessCapability {
   integration_mode?: string | null;
   keep_warm_family?: string | null;
   native_agent_key?: string | null;
+  calling_defaults?: { model_options: boolean; inherits_from: string | null } | null;
+  session_modes?: {
+    permission: SessionModeSet | null;
+    speed: SessionModeSet | null;
+  } | null;
+}
+
+export interface SessionModeSet {
+  handler: string;
+  options:
+    | "per-model"
+    | { value: string; label: string; concept: string; contexts: ("default" | "create")[] }[];
 }
 
 /** ``capabilities.integration_mode`` of every generic-ACP harness. */
@@ -130,6 +142,13 @@ export function useHarnessCatalog<T>(
     select,
   });
   return data ?? fallback;
+}
+
+const NO_HARNESS_CAPABILITIES: Record<string, HarnessCapability> = {};
+
+/** The complete declared capability map, including native harnesses absent from picker rows. */
+export function useHarnessCapabilities(): Record<string, HarnessCapability> {
+  return useHarnessCatalog((catalog) => catalog.capabilitiesByHarness, NO_HARNESS_CAPABILITIES);
 }
 
 /**
