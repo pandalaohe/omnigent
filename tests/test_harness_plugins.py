@@ -144,6 +144,66 @@ def test_community_harness_rejects_community_collision(
     assert hp.harness_modules()["foo"] == "omnigent.community.harness.foo.inner.foo_harness"
 
 
+@pytest.mark.parametrize("product_name", ["claude-sdk", "codex-native-ui"])
+def test_community_product_cannot_replace_builtin_product_or_native_agent(
+    monkeypatch: pytest.MonkeyPatch, product_name: str
+) -> None:
+    def _contribution() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-foo",
+            valid_harnesses=frozenset({"foo"}),
+            product_agents={"foo": product_name},
+        )
+
+    _install_entry_points(monkeypatch, _EntryPoint("foo", _contribution))
+
+    state = hp.plugin_state()
+    assert product_name in state.load_errors["foo"]
+    assert "foo" not in hp.valid_harnesses()
+    assert hp.product_agent_harnesses()["claude-sdk"] == "claude-sdk"
+    assert hp.product_agent_harnesses()["codex-native-ui"] == "codex-native"
+
+
+def test_community_products_require_distinct_names_within_and_across_plugins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _first() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-foo",
+            valid_harnesses=frozenset({"foo"}),
+            product_agents={"foo": "foo-agent"},
+        )
+
+    def _duplicate_within() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-bar",
+            valid_harnesses=frozenset({"bar", "baz"}),
+            product_agents={"bar": "bar-agent", "baz": "bar-agent"},
+        )
+
+    def _duplicate_across() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-qux",
+            valid_harnesses=frozenset({"qux"}),
+            product_agents={"qux": "foo-agent"},
+        )
+
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint("foo", _first),
+        _EntryPoint("bar", _duplicate_within),
+        _EntryPoint("qux", _duplicate_across),
+    )
+
+    state = hp.plugin_state()
+    assert "foo" not in state.load_errors
+    assert "bar-agent" in state.load_errors["bar"]
+    assert "foo-agent" in state.load_errors["qux"]
+    assert hp.product_agent_harnesses()["foo-agent"] == "foo"
+    assert "bar" not in hp.valid_harnesses()
+    assert "qux" not in hp.valid_harnesses()
+
+
 def test_community_harness_rejects_native_terminal_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

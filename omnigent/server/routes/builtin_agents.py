@@ -34,6 +34,8 @@ from starlette.types import Message
 from omnigent.db.utils import builtin_agent_id, installed_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_plugins import harness_capabilities, product_agent_harnesses
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider, local_single_user_enabled
@@ -134,6 +136,11 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
             agent.id,
             exc_info=True,
         )
+    canonical_harness = canonicalize_harness(harness) if harness is not None else None
+    capability = harness_capabilities().get(canonical_harness or "")
+    builtin = agent.session_id is None and agent.id == builtin_agent_id(agent.name)
+    declared_product = product_agent_harnesses().get(agent.name) if builtin else None
+    product_of = declared_product if declared_product == canonical_harness else None
     return AgentObject(
         id=agent.id,
         name=agent.name,
@@ -142,6 +149,8 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
+        integration_mode=capability.integration_mode.value if capability else None,
+        product_of=product_of,
         mcp_servers=mcp_servers,
         mcp_servers_editable=False,
         skills=skills,
@@ -152,7 +161,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # random id. The picker protects the former from being shadowed
         # by a same-named ``omnigent run`` upload, but lets a newer
         # upload supersede the latter.
-        builtin=agent.session_id is None and agent.id == builtin_agent_id(agent.name),
+        builtin=builtin,
     )
 
 

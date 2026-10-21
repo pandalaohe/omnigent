@@ -161,8 +161,11 @@ class HarnessCapabilities:
     shell_tool_name: str | None = None
     shell_tool_prompt: str | None = None
     instruction_delivery: InstructionDelivery = InstructionDelivery.UNKNOWN
+    keep_warm_family: str | None = None
+    calling_defaults: dict[str, str | bool | None] | None = None
+    session_modes: dict[str, object] | None = None
 
-    def as_dict(self) -> dict[str, str | bool | None]:
+    def as_dict(self) -> dict[str, object]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
         return {
             "integration_mode": self.integration_mode.value,
@@ -182,4 +185,7 @@ class HarnessCapabilities:
             "shell_tool_name": self.shell_tool_name,
             "shell_tool_prompt": self.shell_tool_prompt,
             "instruction_delivery": self.instruction_delivery.value,
+            "keep_warm_family": self.keep_warm_family,
+            "calling_defaults": self.calling_defaults,
+            "session_modes": self.session_modes,
         }

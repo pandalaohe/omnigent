@@ -241,6 +241,17 @@
             "title": "Id",
             "type": "string"
           },
+          "integration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Integration Mode"
+          },
           "mcp_registry_editable": {
             "default": false,
             "title": "Mcp Registry Editable",
@@ -288,6 +299,17 @@
             },
             "title": "Policies",
             "type": "array"
+          },
+          "product_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Of"
           },
           "skills": {
             "items": {
@@ -539,6 +561,18 @@
             "title": "Id",
             "type": "string"
           },
+          "integration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the agent's harness runs, when declared.",
+            "title": "Integration Mode"
+          },
           "mcp_registry_editable": {
             "default": false,
             "description": "Whether this caller owns the session and can select managed MCP services independently of agent ownership.",
@@ -593,6 +627,18 @@
             },
             "title": "Policies",
             "type": "array"
+          },
+          "product_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Harness id represented by this seeded product row, if any.",
+            "title": "Product Of"
           },
           "skills": {
             "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session exists. `GET /skills` discovers host skills and, when given `session_id`, merges the session's bundled skills. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",

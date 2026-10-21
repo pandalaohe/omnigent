@@ -20,6 +20,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.utils import builtin_agent_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -224,6 +225,38 @@ async def test_list_builtin_agents_projects_members_from_spec(
             "lead": False,
         },
     ]
+
+
+async def test_product_identity_is_declared_for_seeded_sdk_bundles_only(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    for name, harness in (
+        ("claude-sdk", "claude-sdk"),
+        ("codex-sdk", "codex"),
+        ("polly", "claude-sdk"),
+    ):
+        bundle = build_agent_bundle(
+            name=name,
+            executor={"type": "omnigent", "config": {"harness": harness}},
+        )
+        _register_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_id=builtin_agent_id(name),
+            name=name,
+            bundle=bundle,
+        )
+
+    response = await agents_client.get("/v1/agents?limit=100")
+    assert response.status_code == 200, response.text
+    rows = {row["name"]: row for row in response.json()["data"]}
+    assert rows["claude-sdk"]["product_of"] == "claude-sdk"
+    assert rows["codex-sdk"]["product_of"] == "codex"
+    assert rows["polly"]["product_of"] is None
+    assert rows["claude-sdk"]["integration_mode"] == "sdk-in-process"
+    assert rows["codex-sdk"]["integration_mode"] == "cli-subprocess"
 
 
 @pytest.mark.parametrize(
