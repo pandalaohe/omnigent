@@ -76,6 +76,54 @@ def _no_archive_stop_grace() -> object:
 # ── Archive / unarchive lifecycle ────────────────────────
 
 
+@pytest.mark.parametrize("caller_is_child", [False, True])
+@pytest.mark.parametrize("mode", ["off", "subagents", "all"])
+async def test_unarchive_uses_callers_parent_and_live_owner_switch(
+    app, client: httpx.AsyncClient, db_uri: str, caller_is_child: bool, mode: str
+) -> None:
+    """Top-level callers and the UI may restore; sub-agents need the owner's opt-in."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.session_collab import AGENT_SESSION_HEADER
+
+    root = await create_test_session(client, name="unarchive-caller-guard")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(agent_id=root["agent_id"], parent_conversation_id=root["id"])
+    target = store.create_conversation(
+        agent_id=root["agent_id"], parent_conversation_id=root["id"]
+    )
+    caller_id = child.id if caller_is_child else root["id"]
+    token = "c" * 32
+    store.set_runner_id(caller_id, token_bound_runner_id(token))
+    store.update_conversation(target.id, archived=True)
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL, "session_collab", {"sessionRestrictions": mode}
+    )
+    headers = {AGENT_SESSION_HEADER: caller_id, RUNNER_TUNNEL_TOKEN_HEADER: token}
+    response = await client.patch(
+        f"/v1/sessions/{target.id}", json={"archived": False}, headers=headers
+    )
+    if mode == "all" or (caller_is_child and mode == "subagents"):
+        assert response.status_code == 403, response.text
+        assert ("final output" if caller_is_child else "handover") in response.text
+        assert store.get_conversation(target.id).archived
+    else:
+        assert response.status_code == 200, response.text
+        assert not store.get_conversation(target.id).archived
+    store.update_conversation(target.id, archived=True)
+    forged = await client.patch(
+        f"/v1/sessions/{target.id}",
+        json={"archived": False},
+        headers={**headers, RUNNER_TUNNEL_TOKEN_HEADER: "d" * 32},
+    )
+    assert forged.status_code == 403, forged.text
+    assert store.get_conversation(target.id).archived
+    manual = await client.patch(f"/v1/sessions/{target.id}", json={"archived": False})
+    assert manual.status_code == 200, manual.text
+    assert not store.get_conversation(target.id).archived
+
+
 async def test_large_archive_cascade_survives_label_limits_and_undo(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -277,6 +325,7 @@ async def test_tool_archive_and_undo_cascade_through_the_real_route(
 ) -> None:
     import json
 
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from omnigent.runner.tool_dispatch import _session_archive_via_rest
 
     parent = await create_test_session(client, name="tool-archive-family")
@@ -285,6 +334,9 @@ async def test_tool_archive_and_undo_cascade_through_the_real_route(
         agent_id=parent["agent_id"], parent_conversation_id=parent["id"]
     )
     leaf = store.create_conversation(agent_id=parent["agent_id"], parent_conversation_id=child.id)
+    token = "archive-test-runner"
+    store.set_runner_id(leaf.id, token_bound_runner_id(token))
+    client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = token
     with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 3600):
         result = json.loads(
             await _session_archive_via_rest(
@@ -305,7 +357,11 @@ async def test_tool_archive_and_undo_cascade_through_the_real_route(
                 server_client=client,
             )
         )
-        assert result["archived"] is False
+        assert result["error"] == "access_denied", result
+        assert "final output" in result["message"]
+        del client.headers[RUNNER_TUNNEL_TOKEN_HEADER]
+        manual = await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": False})
+        assert manual.status_code == 200, manual.text
         for session_id in (parent["id"], child.id, leaf.id):
             assert not store.get_conversation(session_id).archived
 
@@ -2445,3 +2501,31 @@ async def test_child_sessions_include_archived(
     assert included.status_code == 200
     rows = {row["id"]: row for row in included.json()["data"]}
     assert rows[child.id]["archived"] is True
+
+
+@pytest.mark.parametrize("mode", ["off", "subagents", "all"])
+async def test_archived_child_message_keeps_existing_behavior_except_all(
+    app, client: httpx.AsyncClient, db_uri: str, mode: str
+) -> None:
+    from omnigent.server.session_collab import AGENT_SESSION_HEADER
+
+    store = SqlAlchemyConversationStore(db_uri)
+    target = store.create_conversation()
+    store.update_conversation(target.id, archived=True)
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL, "session_collab", {"sessionRestrictions": mode}
+    )
+    response = await client.post(
+        f"/v1/sessions/{target.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        },
+        headers={AGENT_SESSION_HEADER: "agent"},
+    )
+    assert response.status_code == (403 if mode == "all" else 409), response.text
+    if mode == "all":
+        assert "handover" in response.text
+    assert store.get_conversation(target.id).archived

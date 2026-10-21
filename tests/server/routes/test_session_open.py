@@ -307,8 +307,12 @@ async def test_runner_token_is_required(open_env: dict[str, Any]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_sender_refused(open_env: dict[str, Any]) -> None:
-    """A child session may not open another session."""
+@pytest.mark.parametrize("mode", ["off", "subagents", "all"])
+@pytest.mark.parametrize("caller_is_child", [False, True])
+async def test_child_sender_open_switch(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, mode: str, caller_is_child: bool
+) -> None:
+    """The root owner's opt-in controls a child's open request."""
     env = open_env
     child_token = secrets.token_hex(16)
     child = env["conversations"].create_conversation(
@@ -318,10 +322,22 @@ async def test_child_sender_refused(open_env: dict[str, Any]) -> None:
         runner_id=token_bound_runner_id(child_token),
     )
     env["permissions"].grant(ALICE, child.id, LEVEL_OWNER)
+    env["app"].state.user_preferences_store = _FakePreferences({"sessionRestrictions": mode})
+    captured = _patch_create(env, monkeypatch)
     async with await _client(env) as client:
-        data = await _post(client, child.id, child_token)
-    assert data["state"] == "refused"
-    assert data["reason"] == "is_subagent"
+        data = await _post(
+            client,
+            child.id if caller_is_child else env["sender"].id,
+            child_token if caller_is_child else env["sender_token"],
+        )
+    if mode == "off" or not caller_is_child:
+        assert data["state"] == "opened", data
+        assert captured["body"].parent_session_id is None
+    else:
+        assert data["state"] == "refused"
+        assert data["reason"] == "is_subagent"
+        assert "final output" in data["message"]
+        assert captured == {}
 
 
 @pytest.mark.asyncio

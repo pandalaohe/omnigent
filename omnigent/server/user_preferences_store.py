@@ -427,6 +427,7 @@ class CollabSettings:
     Resolved session-collaboration settings for one session owner.
 
     :param enabled: Whether session collaboration features are on.
+    :param session_restrictions: Which agent sessions may open or unarchive sessions.
     :param open_rate_count: Sessions one owner may open (open + child create) per window.
     :param open_rate_window_s: Open-rate window in seconds.
     :param relay_depth_max: Maximum relay hops before a message is parked.
@@ -449,6 +450,7 @@ class CollabSettings:
     """
 
     enabled: bool = True
+    session_restrictions: Literal["off", "subagents", "all"] = "subagents"
     open_rate_count: int = 10
     open_rate_window_s: int = 60
     relay_depth_max: int = 30
@@ -552,6 +554,9 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     if not isinstance(value, dict):
         return CollabSettings()
     resolved: dict[str, Any] = {}
+    mode = value.get("sessionRestrictions")
+    if isinstance(mode, str) and mode in {"off", "subagents", "all"}:
+        resolved["session_restrictions"] = mode
     for json_key, field_name, kind in _COLLAB_SETTING_FIELDS:
         parsed = _parse_collab_value(kind, value.get(json_key))
         if parsed is not None:

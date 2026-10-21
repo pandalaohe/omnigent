@@ -17,6 +17,7 @@ vi.mock("@/hooks/useHosts", () => ({
 
 const LABELS = [
   "Enable session collaboration",
+  "Session open/unarchive restrictions",
   "Session open rate limit",
   "Relay depth limit",
   "Rate per session pair",
@@ -38,6 +39,25 @@ beforeEach(() => localStorage.clear());
 afterEach(cleanup);
 
 describe("SessionCollabSettings", () => {
+  it("defaults to sub-agent restrictions and saves all modes independently", () => {
+    renderSettings();
+    const select = screen.getByRole("combobox", { name: "Session open/unarchive restrictions" });
+    expect(select).toHaveValue("subagents");
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Off", "Sub-agent sessions", "All agent sessions"]);
+    for (const mode of ["off", "all", "subagents"]) {
+      fireEvent.change(select, { target: { value: mode } });
+      expect(readSessionCollabPreferences().sessionRestrictions).toBe(mode);
+    }
+    fireEvent.click(screen.getByRole("switch", { name: "Enable session collaboration" }));
+    expect(select).not.toBeDisabled();
+    fireEvent.change(select, { target: { value: "all" } });
+    expect(readSessionCollabPreferences().sessionRestrictions).toBe("all");
+    expect(readSessionCollabPreferences().enabled).toBe(false);
+  });
   it("renders the setting labels", () => {
     renderSettings();
 

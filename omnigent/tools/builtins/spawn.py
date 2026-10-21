@@ -307,6 +307,9 @@ def _build_sys_session_send_schema(
             )
         )
     )
+    description += (
+        " May be refused by the session restriction setting when the target is archived."
+    )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
     # at least one declared sub-agent opts in via
     # ``executor.config.allowed_harnesses``. Specs without the opt-in keep the
@@ -1086,7 +1089,8 @@ class SysSessionCreateTool(Tool):
             "use sys_session_send with the returned conversation_id to retry. "
             "The session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send."
+            "with sys_session_send. May be refused by the session restriction setting; "
+            "when refused, report the need to your parent in your final output."
         )
 
     def get_schema(self) -> dict[str, Any]:

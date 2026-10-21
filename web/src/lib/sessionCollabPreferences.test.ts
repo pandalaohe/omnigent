@@ -19,6 +19,7 @@ describe("session collab preferences", () => {
   it("defaults to the server defaults with nothing stored", () => {
     expect(SESSION_COLLAB_DEFAULTS.openRateCount).toBe(10);
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmEnabled).toBe(false);
+    expect(SESSION_COLLAB_DEFAULTS.sessionRestrictions).toBe("subagents");
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmClaudeIntervalSeconds).toBe(3300);
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmCodexIntervalSeconds).toBe(1500);
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmMaxSeconds).toBe(28800);
@@ -77,6 +78,7 @@ describe("session collab preferences", () => {
         duplicateWindowSeconds: 0,
         undeliveredTtlSeconds: 300,
         flowTimerEnabled: 1,
+        sessionRestrictions: "invalid",
       }),
     );
 

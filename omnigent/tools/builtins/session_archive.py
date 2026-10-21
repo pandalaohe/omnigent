@@ -76,7 +76,9 @@ class SysSessionUnarchiveTool(Tool):
             "action: it returns to the default session list and a pending archive "
             "teardown is cancelled. It does not send anything; the next message to "
             "the session restarts it as usual. Find archived sessions with "
-            "sys_session_list archived='only'."
+            "sys_session_list archived='only'. May be refused by the session restriction setting. "
+            "If refused as a sub-agent, report the need to your parent in your final output. "
+            "If all agent sessions are restricted, open a new session with a handover instead."
         )
 
     def get_schema(self) -> dict[str, Any]:

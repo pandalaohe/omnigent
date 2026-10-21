@@ -1354,6 +1354,19 @@ def register_peer_routes(
             wait_seconds=wait_seconds,
         )
         async with _PEER_ADMISSION._lock_for(sender.id):
+            from omnigent.server.session_collab import require_session_action_allowed
+
+            addressed = await asyncio.to_thread(conversation_store.get_conversation, receiver_id)
+            if addressed is not None and addressed.archived:
+                await asyncio.to_thread(
+                    require_session_action_allowed,
+                    sender,
+                    conversation_store,
+                    permission_store,
+                    getattr(app_state, "user_preferences_store", None),
+                    action="send",
+                    target=addressed,
+                )
             target_id = await asyncio.to_thread(
                 resolve_succeeded_by, conversation_store, receiver_id
             )
@@ -1447,6 +1460,10 @@ def register_peer_routes(
         cfg = await asyncio.to_thread(
             read_collab_settings, prefs_store, owner or RESERVED_USER_LOCAL
         )
+        if cfg.session_restrictions == "all" and receiver.archived:
+            from omnigent.server.session_collab import ARCHIVED_SESSION_DISABLED_MESSAGE
+
+            raise OmnigentError(ARCHIVED_SESSION_DISABLED_MESSAGE, code=ErrorCode.FORBIDDEN)
         # A pending record never outlives the owner's undelivered-message
         # lifetime: an explicit wait_seconds is capped by it.
         effective_wait = min(body.wait_seconds, cfg.undelivered_ttl_s)

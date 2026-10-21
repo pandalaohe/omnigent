@@ -236,14 +236,23 @@ async def test_archive_patch_404_maps_to_session_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unarchive_patches_archived_false_without_snapshot() -> None:
-    """Unarchive always PATCHes the false flag and reads no snapshot."""
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_unarchive_transports_agent_identity_and_server_refusal(allowed: bool) -> None:
+    """Unarchive sends its caller marker and preserves the server's refusal."""
     patch_bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_other":
             patch_bodies.append(json.loads(request.content))
-            return httpx.Response(200, json={"id": "conv_other"})
+            assert request.headers["X-Omnigent-Agent-Session"] == "conv_caller"
+            if allowed:
+                return httpx.Response(200, json={"id": "conv_other"})
+            return httpx.Response(
+                403,
+                json={
+                    "error": {"message": "Report this need to your parent in your final output."}
+                },
+            )
         raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
     async with _client(handler) as client:
@@ -254,7 +263,11 @@ async def test_unarchive_patches_archived_false_without_snapshot() -> None:
             conversation_id="conv_caller",
         )
     assert patch_bodies == [{"archived": False}]
-    assert out == {"archived": False, "session_id": "conv_other"}
+    if allowed:
+        assert out == {"archived": False, "session_id": "conv_other"}
+    else:
+        assert out["error"] == "access_denied"
+        assert "final output" in out["message"]
 
 
 @pytest.mark.asyncio
@@ -402,7 +415,7 @@ async def test_find_existing_child_session_reports_archived_child() -> None:
     payload = json.loads(out)
     assert payload["error"] == "session_archived"
     assert payload["conversation_id"] == "conv_kid"
-    assert "sys_session_unarchive" in payload["message"]
+    assert "final output" in payload["message"]
     assert seen_params[0]["include_archived"] == "true"
 
 

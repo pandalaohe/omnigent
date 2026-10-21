@@ -691,11 +691,14 @@ def _seed_succession_pair(db_uri: str) -> tuple[str, str]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bound_to", ["successor", "old"])
+@pytest.mark.parametrize("mode", [None, "off", "subagents", "all"])
 async def test_post_event_forwards_a_runner_wake_to_the_successor(
     auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     bound_to: str,
+    mode: str | None,
 ) -> None:
     """A runner wake posted to ``old`` lands on ``new``.
 
@@ -715,6 +718,18 @@ async def test_post_event_forwards_a_runner_wake_to_the_successor(
 
     old_id, new_id = _seed_succession_pair(db_uri)
     runner_headers = _bind_runner(db_uri, new_id if bound_to == "successor" else old_id)
+    if mode is not None:
+        from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+        preferences = SqlAlchemyUserPreferencesStore(db_uri)
+        auth_app.state.user_preferences_store = preferences
+        permissions = SqlAlchemyPermissionStore(db_uri)
+        permissions.grant("alice@example.com", old_id, LEVEL_OWNER)
+        permissions.grant("alice@example.com", new_id, LEVEL_OWNER)
+        preferences.patch_namespace(
+            "alice@example.com", "session_collab", {"sessionRestrictions": mode}
+        )
+        SqlAlchemyConversationStore(db_uri).update_conversation(old_id, archived=True)
     notice = _format_subagent_wake_notice(
         agent="researcher", title="auth", status="completed", pending=1
     )
@@ -730,6 +745,11 @@ async def test_post_event_forwards_a_runner_wake_to_the_successor(
         },
         headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
     )
+    if mode == "all":
+        assert resp.status_code == 403, resp.text
+        assert "handover" in resp.text
+        assert SqlAlchemyConversationStore(db_uri).list_items(new_id).data == []
+        return
     assert resp.status_code == 202, resp.text
     assert resp.json()["queued"] is True
 

@@ -1502,6 +1502,19 @@ def register_events_routes(
         if not authorized:
             return session_id
 
+        if addressed.archived:
+            from omnigent.server.session_collab import require_session_action_allowed
+
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                addressed,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+                action="send",
+                target=addressed,
+            )
+
         def _chain_has_pre_release_link() -> bool:
             current = session_id
             for _ in range(_SUCCESSOR_MAX_HOPS):
@@ -2017,6 +2030,28 @@ def register_events_routes(
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
         }
+        from omnigent.server.session_collab import (
+            AGENT_SESSION_HEADER,
+            require_session_action_allowed,
+        )
+
+        if (
+            archived_user_work
+            and conv.archived
+            and (
+                AGENT_SESSION_HEADER in request.headers
+                or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+            )
+        ):
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                conv,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+                action="send",
+                target=conv,
+            )
         if (
             archived_user_work or archived_start_work
         ) and await _archive_blocks_external_user_work(
@@ -2233,6 +2268,24 @@ def register_events_routes(
                 else:
                     return _output_verdict
         elif body.type == "function_call" and body.data.get("evaluate_policy"):
+            from omnigent.server.session_collab import require_session_tool_allowed
+
+            arguments = body.data.get("arguments")
+            if isinstance(arguments, str):
+                with contextlib.suppress(ValueError):
+                    arguments = json.loads(arguments)
+            try:
+                await asyncio.to_thread(
+                    require_session_tool_allowed,
+                    conv,
+                    body.data.get("name"),
+                    arguments,
+                    conversation_store,
+                    permission_store,
+                    getattr(request.app.state, "user_preferences_store", None),
+                )
+            except OmnigentError as exc:
+                return {"verdict": "deny", "reason": exc.message}
             _tool_verdict = await _evaluate_tool_call_policy(
                 session_id,
                 conv,
