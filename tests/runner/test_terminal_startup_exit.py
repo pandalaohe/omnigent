@@ -150,7 +150,8 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
     message = error["message"]
     if capture == "1":
         assert "Agent CLI rejected its launch arguments" in message
-        assert "unexpected argument" not in message
+        assert "Unexpected argument: --invalid." in message
+        assert "error: unexpected argument" not in message
         assert "startup terminal output:" not in message
     else:
         assert (
