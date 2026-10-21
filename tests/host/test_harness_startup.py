@@ -36,6 +36,9 @@ def config(monkeypatch, tmp_path):
         ("codex-native", "tool", "other", False, "tool", "config"),
         ("codex-native", None, "tool", False, "tool", "env"),
         ("codex-native", None, "missing", False, "codex", "default"),
+        ("pi-native", None, None, False, "pi", "default"),
+        ("pi-native", "tool", "missing", False, "tool", "config"),
+        ("pi-native", None, "missing", False, "pi", "default"),
     ],
 )
 def test_launch_precedence(
@@ -293,7 +296,7 @@ def test_no_config_reports_defaults_without_exporting_inherited_values(config, m
 
 
 @pytest.mark.parametrize(
-    "harness", ["pi-native", "antigravity-native", "opencode-native", "unknown"]
+    "harness", ["devin-native", "antigravity-native", "opencode-native", "unknown"]
 )
 def test_unsupported_harness(config, harness):
     with pytest.raises(ValueError):

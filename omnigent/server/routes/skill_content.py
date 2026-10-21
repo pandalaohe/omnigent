@@ -70,6 +70,9 @@ def create_skill_content_router(
             host_store=host_store,
         )
         harness = canonicalize_harness(harness) or harness
+        # Harnesses the Harnesses settings catalog lists host skills for. Pi is
+        # absent because its provider enumerates none (pi_host_skills), so the
+        # host would answer every name with a lookup failure.
         if harness not in {"claude-native", "codex-native", "cursor-native"}:
             raise HTTPException(
                 status_code=404, detail="skill contents unavailable for this harness"
