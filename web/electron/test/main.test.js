@@ -326,6 +326,7 @@ function loadNavigationHarness({
   }
 
   const electron = {
+    webContents: { getAllWebContents: () => [] },
     app: {
       isPackaged,
       getPath: () => userData,
@@ -593,11 +594,13 @@ function loadNavigationHarness({
     "./browserViewRegistry": realBrowserRegistry
       ? require("../src/browserViewRegistry")
       : {
+          persistentAgentPartition: require("../src/browserViewRegistry").persistentAgentPartition,
           createBrowserViewRegistry: (deps) => {
             browserRegistryDeps = deps;
             return {
               closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
               setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+              ownsWebContents: () => false,
             };
           },
         },
@@ -2502,6 +2505,7 @@ describe("browser permission wiring", () => {
         return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
       };
       const registry = h.api.createBrowserRegistryForWindow(h.win);
+      h.api.windows.get(h.win).browserRegistry = registry;
       const agent = registry.openOrNavigate("conv", "https://example.com/", undefined, {
         agent: true,
       }).entry.view.webContents;
@@ -2579,9 +2583,170 @@ describe("browser permission wiring", () => {
         await decide("headers", { url: next, ip: "127.0.0.1" }, otherSession, otherAgent),
         { cancel: true },
       );
+      const secondWindowCalls = [];
+      h.api.windows.set(
+        {},
+        {
+          browserRegistry: {
+            ownsWebContents: (id) => id === 99,
+            shouldCancelAgentRequest: async () => {
+              secondWindowCalls.push("request");
+              return false;
+            },
+            agentRequestHeaders: () => {
+              secondWindowCalls.push("sendHeaders");
+              return { requestHeaders: { "X-Window": "second" } };
+            },
+            shouldCancelAgentResponse: async () => {
+              secondWindowCalls.push("headers");
+              return false;
+            },
+          },
+        },
+      );
+      const secondView = { id: 99 };
+      assert.deepEqual(await decide("request", { url: "http://lvh.me:8899/" }, ses, secondView), {
+        cancel: false,
+      });
+      assert.deepEqual(
+        await decide("sendHeaders", { url: next, requestHeaders: {} }, ses, secondView),
+        { requestHeaders: { "X-Window": "second" } },
+      );
+      assert.deepEqual(await decide("headers", { url: next, ip: "127.0.0.1" }, ses, secondView), {
+        cancel: false,
+      });
+      assert.deepEqual(secondWindowCalls, ["request", "sendHeaders", "headers"]);
+      assert.deepEqual(await decide("request", { url: next }, ses, { id: 404 }), {
+        cancel: true,
+      });
+      assert.deepEqual(
+        await decide("headers", { url: next, ip: "93.184.215.14" }, ses, { id: 404 }),
+        {
+          cancel: true,
+        },
+      );
     } finally {
       h.cleanup();
     }
+  });
+});
+
+describe("desktop browser login IPC", () => {
+  const origin = "https://host.example";
+  const eventFor = (h, frameUrl = `${origin}/settings`) => ({
+    sender: h.webContents,
+    senderFrame: { url: frameUrl },
+  });
+
+  it("requires the pinned sender and a boolean, with the setting off by default", async (t) => {
+    const h = loadNavigationHarness({ registerFallbacks: false });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const get = h.ipc.get("omnigent:browser-login-setting:get");
+    const set = h.ipc.get("omnigent:browser-login-setting:set");
+    const clear = h.ipc.get("omnigent:browser-login:clear");
+    const trusted = eventFor(h);
+    const foreign = eventFor(h, "https://foreign.example/settings");
+    assert.equal(get(foreign).ok, false);
+    assert.equal(set(foreign, true).ok, false);
+    assert.equal((await clear(foreign)).ok, false);
+    assert.equal(get(trusted).enabled, false);
+    assert.equal(set(trusted, "true").ok, false);
+    assert.equal(set(trusted, 1).ok, false);
+    assert.equal(set(trusted, true).ok, true);
+    assert.equal(get(trusted).enabled, true);
+    assert.equal(
+      JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).browser_persistent_login,
+      true,
+    );
+    assert.equal(set(trusted, false).ok, true);
+    assert.equal(get(trusted).enabled, false);
+  });
+
+  it("waits for this server's live and already closing views before clearing storage and cache", async (t) => {
+    const h = loadNavigationHarness({ registerFallbacks: false });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const clear = h.ipc.get("omnigent:browser-login:clear");
+    const partition = require("../src/browserViewRegistry").persistentAgentPartition(origin);
+    const order = [];
+    const contents = new EventEmitter();
+    let destroyed = false;
+    contents.isDestroyed = () => destroyed;
+    const sameOriginRegistry = {
+      closePartition(target) {
+        assert.equal(target, partition);
+        order.push("close:first");
+        // Ordinary close has already removed this still-live view from its registry.
+        return [];
+      },
+    };
+    h.api.windows.get(h.win).browserRegistry = sameOriginRegistry;
+    h.api.windows.set(
+      {},
+      {
+        origin,
+        browserRegistry: {
+          closePartition(target) {
+            assert.equal(target, partition);
+            order.push("close:second");
+            return [{ isDestroyed: () => true }];
+          },
+        },
+      },
+    );
+    let finishStorage;
+    const ses = {
+      clearStorageData: () => {
+        order.push("storage");
+        return new Promise((resolve) => {
+          finishStorage = resolve;
+        });
+      },
+      clearCache: async () => {
+        order.push("cache");
+      },
+    };
+    h.electron.session.fromPartition = (target) => {
+      assert.equal(target, partition);
+      return ses;
+    };
+    contents.session = ses;
+    // A closing window's contents can also outlive its windows entry.
+    h.electron.webContents.getAllWebContents = () => [
+      contents,
+      { session: {}, isDestroyed: () => false },
+    ];
+    const first = clear(eventFor(h));
+    assert.deepEqual(order, ["close:first", "close:second"]);
+    assert.equal((await clear(eventFor(h))).ok, false, "concurrent clear must be refused");
+    assert.equal(order.includes("storage"), false, "storage must wait for view destruction");
+    destroyed = true;
+    contents.emit("destroyed");
+    await until(() => typeof finishStorage === "function", "storage clearing");
+    assert.deepEqual(order, ["close:first", "close:second", "storage"]);
+    finishStorage();
+    assert.equal((await first).ok, true);
+    assert.equal(order.at(-1), "cache");
+  });
+
+  it("releases the clear lock after a storage failure", async (t) => {
+    const h = loadNavigationHarness({ registerFallbacks: false });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.windows.get(h.win).browserRegistry = { closePartition: () => [] };
+    let attempts = 0;
+    h.electron.session.fromPartition = () => ({
+      clearStorageData: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("fixture failure");
+      },
+      clearCache: async () => {},
+    });
+    const clear = h.ipc.get("omnigent:browser-login:clear");
+    assert.equal((await clear(eventFor(h))).ok, false);
+    assert.equal((await clear(eventFor(h))).ok, true);
+    assert.equal(attempts, 2);
   });
 });
 
