@@ -1050,7 +1050,7 @@ def test_cutover_migration_roundtrip(tmp_path: Path) -> None:
     uri = f"sqlite:///{tmp_path / 'cutover.db'}"
     config = _build_alembic_config(uri)
     command.upgrade(config, "a41c20261021")
-    command.upgrade(config, "a42c20261021")
+    command.upgrade(config, "a43c20261021")
     engine = create_engine(uri)
     with engine.connect() as connection:
         tables = {
@@ -1078,7 +1078,7 @@ def test_cutover_migration_roundtrip(tmp_path: Path) -> None:
             )
         }
     assert "usage_cutover_holds" not in after
-    command.upgrade(config, "a42c20261021")
+    command.upgrade(config, "a43c20261021")
 
 
 def test_additive_migration_roundtrip(tmp_path: Path) -> None:

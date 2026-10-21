@@ -249,6 +249,9 @@ class ErrorCode:
     INVALID_INPUT = "invalid_input"
     ALREADY_EXISTS = "already_exists"
     CONFLICT = "conflict"
+    # A usage cutover holds the session's (host, harness) domain: the server
+    # refuses new turns until the domain is released.
+    USAGE_CUTOVER_HOLD = "usage_cutover_hold"
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
@@ -287,6 +290,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.INVALID_INPUT: 400,
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
+    ErrorCode.USAGE_CUTOVER_HOLD: 409,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the
     # harness implementation — surface as 500 (no client action

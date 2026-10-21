@@ -2752,6 +2752,17 @@ def register_events_routes(
             )
             return {"queued": False, "elicitation_id": elicit_id}
         if body.type == _COMPACT_TYPE:
+            # G2 usage cutover gate: refuse compaction while the domain is held.
+            from omnigent.server.routes.usage import _resolve_session_harness
+            from omnigent.server.usage_cutover import refuse_if_held
+
+            _cutover_location = getattr(conversation_store, "storage_location", None)
+            if isinstance(_cutover_location, str) and conv.host_id:
+                refuse_if_held(
+                    _cutover_location,
+                    conv,
+                    resolve_harness=_resolve_session_harness,
+                )
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact
             # to the bound runner first, regardless of harness. The

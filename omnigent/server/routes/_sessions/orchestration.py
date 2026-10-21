@@ -9663,6 +9663,23 @@ async def _dispatch_session_event_to_runner_impl(
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
+        # G1 usage cutover gate: refuse while the session's domain (or any
+        # domain of its host, while the harness is undecided) is held, and
+        # otherwise write the admission before the input leaves the server.
+        from omnigent.server.routes.usage import _resolve_session_harness
+        from omnigent.server.usage_cutover import admit_turn
+
+        storage_location = getattr(conversation_store, "storage_location", None)
+        if isinstance(storage_location, str) and conv.host_id:
+            await asyncio.to_thread(
+                admit_turn,
+                storage_location,
+                conv,
+                source="web",
+                resolve_harness=_resolve_session_harness,
+                owner_id=created_by,
+            )
+    if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the

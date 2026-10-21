@@ -8383,6 +8383,16 @@ async def _dispatch_skill_slash_command_to_runner(
     :raises OmnigentError: If the skill is not exposed for the
         session, or the runner is unreachable while resolving it.
     """
+    from omnigent.server.routes.usage import _resolve_session_harness
+    from omnigent.server.usage_cutover import refuse_if_held
+
+    storage_location = getattr(conversation_store, "storage_location", None)
+    if isinstance(storage_location, str) and conv.host_id:
+        refuse_if_held(
+            storage_location,
+            conv,
+            resolve_harness=_resolve_session_harness,
+        )
     import uuid
 
     skill_name, arguments = _parse_skill_slash_command(body)
