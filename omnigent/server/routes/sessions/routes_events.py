@@ -108,6 +108,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.child_keep_warm import pi_cache_warming_allowed
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.native_subagent_watchdog import (
@@ -310,6 +311,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
+from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -317,6 +319,7 @@ from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
 )
+from omnigent.server.user_preferences_store import read_keep_warm_settings
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     MAX_SESSION_EVENT_REQUEST_BYTES,
@@ -3501,6 +3504,24 @@ def register_events_routes(
             _publish_mcp_startup(session_id, mcp_servers)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
+            if body.data.get("pi_cache_warming_probe") is True:
+                harness = await asyncio.to_thread(
+                    _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                allowed = False
+                if harness in ("pi", "pi-native"):
+                    owner = await asyncio.to_thread(
+                        collab_owner_for, conv, conversation_store, permission_store
+                    )
+                    settings = await asyncio.to_thread(
+                        read_keep_warm_settings,
+                        getattr(request.app.state, "user_preferences_store", None),
+                        owner,
+                    )
+                    allowed = pi_cache_warming_allowed(conv, settings, int(time.time()))
+                    if pending_elicitations.snapshot_for(session_id):
+                        allowed = False
+                return {"queued": False, "pi_cache_warming_allowed": allowed}
             # Persist the harness-reported cumulative usage so the
             # tool-call cost gate can read the running
             # ``total_cost_usd`` on the next tool call. (Cost budgets

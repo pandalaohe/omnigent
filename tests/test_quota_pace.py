@@ -10,6 +10,7 @@ from omnigent.quota_pace import (
     claude_windows,
     codex_windows,
     quota_line,
+    rate_limit_quota,
 )
 
 NOW = 2_000_000.0
@@ -187,6 +188,23 @@ def test_quota_line_uses_current_tiers_and_reports_unknown_and_exhausted() -> No
     assert "Claude: unknown" in line
     assert "tight <70%, low <30%, floor <5% remaining" in line
     assert quota_line({}, tiers, NOW) is None
+
+
+@pytest.mark.parametrize(
+    ("used", "reset", "state"),
+    [(100, NOW + 60, "exhausted"), (100, NOW, "unknown"), (80, NOW + 60, "unknown")],
+)
+def test_api_buckets_do_not_invent_subscription_pace(used, reset, state) -> None:
+    quota = rate_limit_quota(
+        {
+            "captured_at": NOW,
+            "windows": [{"label": "tokens", "used_percent": used, "resets_at": reset}],
+        },
+        now=NOW,
+    )
+    assert quota.state == state
+    assert quota.pace_pct == (0 if state == "exhausted" else None)
+    assert quota.windows == ()
 
 
 @pytest.mark.parametrize(

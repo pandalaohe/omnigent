@@ -4,10 +4,66 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime
 from typing import Any
 
 _MAX_WINDOWS = 8
 _MAX_TEXT = 64
+
+
+def pi_provider_usage_limits_from_headers(
+    headers: object, *, captured_at: int
+) -> dict[str, Any] | None:
+    """Read only documented Anthropic API rate limits, never plan allowances."""
+    if not isinstance(headers, dict):
+        return None
+    windows: list[dict[str, Any]] = []
+    for key, label in (
+        ("requests", "requests"),
+        ("tokens", "tokens"),
+        ("input-tokens", "input"),
+        ("output-tokens", "output"),
+    ):
+        prefix = f"anthropic-ratelimit-{key}"
+        raw_limit, raw_remaining = (
+            headers.get(f"{prefix}-limit"),
+            headers.get(f"{prefix}-remaining"),
+        )
+        if not isinstance(raw_limit, str) or not isinstance(raw_remaining, str):
+            continue
+        if not all(
+            value.isascii() and value.isdecimal() and len(value) <= 16
+            for value in (raw_limit, raw_remaining)
+        ):
+            continue
+        limit, remaining = int(raw_limit), int(raw_remaining)
+        if not 0 <= remaining <= limit or limit == 0:
+            continue
+        window: dict[str, Any] = {
+            "label": label,
+            "aria_label": f"{key.replace('-', ' ')} rate limit",
+            "used_percent": (limit - remaining) / limit * 100,
+        }
+        reset = headers.get(f"{prefix}-reset")
+        if isinstance(reset, str) and len(reset) <= 64:
+            try:
+                parsed = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+                timestamp = int(parsed.timestamp()) if parsed.tzinfo is not None else 0
+                if timestamp > 0:
+                    window["resets_at"] = timestamp
+            except (ValueError, OverflowError, OSError):
+                pass
+        windows.append(window)
+    if not windows:
+        return None
+    return validate_provider_usage_limits_snapshot(
+        {
+            "provider": "Anthropic API",
+            "scope": "API rate limits",
+            "captured_at": captured_at,
+            "windows": windows,
+        }
+    )
 
 
 def validate_provider_usage_limits_snapshot(snapshot: object) -> dict[str, Any] | None:
@@ -107,5 +163,6 @@ def parse_provider_usage_limits_snapshot_json(
 
 __all__ = [
     "parse_provider_usage_limits_snapshot_json",
+    "pi_provider_usage_limits_from_headers",
     "validate_provider_usage_limits_snapshot",
 ]

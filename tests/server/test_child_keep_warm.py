@@ -14,7 +14,7 @@ import asyncio
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -42,7 +42,11 @@ from omnigent.server.child_keep_warm import (
 from omnigent.server.routes._sessions import helpers as helpers_module
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
-from omnigent.server.user_preferences_store import read_keep_warm_settings
+from omnigent.server.user_preferences_store import (
+    AgentKeepWarm,
+    KeepWarmSettings,
+    read_keep_warm_settings,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import Host
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -3000,6 +3004,8 @@ async def test_keep_warm_family_helpers_read_harness_and_label() -> None:
     assert child_keep_warm.keep_warm_family_for_harness("claude-native") == "claude"
     assert child_keep_warm.keep_warm_family_for_harness("claude-sdk") == "claude"
     assert child_keep_warm.keep_warm_family_for_harness("codex") == "codex"
+    assert child_keep_warm.keep_warm_family_for_harness("pi") == "pi"
+    assert child_keep_warm.keep_warm_family_for_harness("pi-native") == "pi"
     assert child_keep_warm.keep_warm_family_for_harness("opencode-native") is None
     assert child_keep_warm.keep_warm_family_for_harness(None) is None
     assert (
@@ -3008,6 +3014,94 @@ async def test_keep_warm_family_helpers_read_harness_and_label() -> None:
     )
     assert child_keep_warm.keep_warm_family_from_labels({KEEP_WARM_LABEL: _label(s="w")}) is None
     assert child_keep_warm.keep_warm_family_from_labels({}) is None
+
+
+async def test_pi_warm_state_requires_cache_capability_and_measured_tokens() -> None:
+    """An unsupported model or a zero-cache call cannot masquerade as warm."""
+    now = 1_800_000_000
+
+    def state(labels: dict[str, str], *, archived: bool = False) -> str | None:
+        return warm_state_for_labels(
+            labels, archived=archived, busy=True, now=now, family="pi", cold_after_s=0
+        )
+
+    assert state({}) is None
+    invalid_ttl = '{"ttl":0,"at":1800000000,"read":1,"write":0}'
+    assert state({child_keep_warm.PI_CACHE_LABEL: invalid_ttl}) is None
+    no_cache = child_keep_warm.pi_cache_label(300, now - 1, 0, 0)
+    assert state({child_keep_warm.PI_CACHE_LABEL: no_cache}) == "cold"
+    cached = child_keep_warm.pi_cache_label(300, now - 299, 12, 0)
+    assert state({child_keep_warm.PI_CACHE_LABEL: cached}) == "warm"
+    expired = child_keep_warm.pi_cache_label(300, now - 300, 0, 12)
+    assert state({child_keep_warm.PI_CACHE_LABEL: expired}) == "cold"
+    future = child_keep_warm.pi_cache_label(300, now + 1, 12, 0)
+    assert state({child_keep_warm.PI_CACHE_LABEL: future}) == "cold"
+    assert state({child_keep_warm.PI_CACHE_LABEL: cached}, archived=True) is None
+    assert (
+        warm_state_for_labels(
+            {child_keep_warm.PI_CACHE_LABEL: cached},
+            archived=False,
+            busy=False,
+            now=now,
+            family="claude",
+        )
+        == "cold"
+    )
+
+
+async def test_pi_idle_warming_obeys_owner_switch_and_30_minute_cap(harness: _Harness) -> None:
+    now = harness.now
+    main = _main(harness, harness_override="pi", running_since=now - 1799)
+    child = _child(harness, main.id, harness_override="pi-native", running_since=now - 100)
+
+    def settings(*, main_on: bool, child_on: bool) -> KeepWarmSettings:
+        return KeepWarmSettings(
+            agents={
+                _CLAUDE_AGENT: AgentKeepWarm(
+                    main=main_on, child=child_on, interval_s=None, max_s=7200
+                )
+            },
+            host_offline_archive_s=14400,
+            migrated_from_legacy_at=None,
+            present=True,
+        )
+
+    assert child_keep_warm.pi_cache_warming_allowed(
+        main, settings(main_on=True, child_on=False), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        main, settings(main_on=False, child_on=True), now
+    )
+    assert child_keep_warm.pi_cache_warming_allowed(
+        child, settings(main_on=False, child_on=True), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        child, settings(main_on=True, child_on=False), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        main, KeepWarmSettings({}, 14400, None, True), now
+    )
+    _set_running_since(harness, main.id, now - 1800)
+    capped = harness.store.get_conversation(main.id)
+    assert capped is not None
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        capped, settings(main_on=True, child_on=True), now
+    )
+    _set_running_since(harness, main.id, now + 1)
+    future = harness.store.get_conversation(main.id)
+    assert future is not None
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        future, settings(main_on=True, child_on=True), now
+    )
+    harness.store.set_labels(child.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    closed = harness.store.get_conversation(child.id)
+    assert closed is not None
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        closed, settings(main_on=True, child_on=True), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        replace(main, archived=True), settings(main_on=True, child_on=True), now
+    )
 
 
 async def test_sweeper_stamps_the_family_on_label_writes(harness: _Harness) -> None:

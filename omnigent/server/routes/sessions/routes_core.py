@@ -3478,7 +3478,7 @@ def register_core_routes(
 
     def _keep_warm_families_for(
         convs: list[Conversation],
-    ) -> dict[tuple[str | None, str | None, str | None], Literal["claude", "codex"] | None]:
+    ) -> dict[tuple[str | None, str | None, str | None], Literal["claude", "codex", "pi"] | None]:
         """
         Resolve keep-warm families for rows with no family-stamped label.
 

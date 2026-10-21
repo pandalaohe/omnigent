@@ -3537,6 +3537,9 @@ class PiExecutor(Executor):
                         captured = _extract_pi_turn_usage(m, model)
                         if captured is not None:
                             message_usages.append(captured)
+                            from omnigent.usage_export.runtime import capture_pi_rpc_message
+
+                            capture_pi_rpc_message(session_key, m)
                             break
                 if settled_boundary:
                     continue
@@ -3574,6 +3577,9 @@ class PiExecutor(Executor):
                     captured = _extract_pi_turn_usage(msg, model)
                     if captured is not None:
                         message_usages.append(captured)
+                        from omnigent.usage_export.runtime import capture_pi_rpc_message
+
+                        capture_pi_rpc_message(session_key, msg)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
                     if stop == "aborted":

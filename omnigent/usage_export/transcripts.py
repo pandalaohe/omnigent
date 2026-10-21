@@ -122,3 +122,60 @@ def codex_measurement(record: Mapping[str, Any]) -> dict[str, Any] | None:
         if input_tokens is not None and output is not None and reasoning is not None
         else "partial",
     }
+
+
+def pi_measurement(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Extract one Pi request or auxiliary usage entry without retaining content."""
+    entry_id = _text(record.get("id"))
+    if entry_id is None:
+        return None
+    kind = record.get("type")
+    if kind == "message":
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return None
+        usage = message.get("usage")
+        model = _text(message.get("model"))
+        response_id = _text(message.get("responseId"))
+        measurement_kind = "request"
+    elif kind in {"usage", "compaction", "branch_summary"}:
+        usage = record.get("usage")
+        model = _text(record.get("model"))
+        response_id = None
+        measurement_kind = "increment"
+    else:
+        return None
+    if not isinstance(usage, dict):
+        return None
+    counters = {
+        "input_tokens": _counter(usage, "input"),
+        "cached_input_tokens": _counter(usage, "cacheRead"),
+        "cache_write_input_tokens": _counter(usage, "cacheWrite"),
+        "output_tokens": _counter(usage, "output"),
+        "reasoning_tokens": _counter(usage, "reasoning"),
+    }
+    return {
+        "measurement_kind": measurement_kind,
+        "producer_unit_id": entry_id,
+        "logical_call_id": response_id,
+        "source_refs": (
+            [{"kind": "response", "namespace": "pi/response-id/v1", "id": response_id}]
+            if response_id
+            else []
+        ),
+        "model_id": model,
+        "occurred_at": _text(record.get("timestamp")),
+        **counters,
+        "call_identity_coverage": "complete" if response_id else "none",
+        "usage_status": "complete"
+        if all(
+            counters[name] is not None
+            for name in (
+                "input_tokens",
+                "cached_input_tokens",
+                "cache_write_input_tokens",
+                "output_tokens",
+            )
+        )
+        else "partial",
+    }

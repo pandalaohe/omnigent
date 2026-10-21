@@ -2714,6 +2714,9 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
+    from omnigent.usage_export.runtime import register_pi_native_sessions
+
+    register_pi_native_sessions(session_dir, session_id)
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,

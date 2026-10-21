@@ -102,6 +102,36 @@ def test_canonical_call_allocation_and_unit_conflicts(tmp_path: Path) -> None:
     assert len(store.page("alice")["events"]) == 3
 
 
+def test_pi_response_identity_counts_once_and_unknown_call_stays_null(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    shared = {
+        "harness": "pi-native",
+        "harness_family": "pi",
+        "identity_namespace": "pi/session/v1",
+        "measurement_kind": "request",
+        "logical_call_id": "pi-response-1",
+        "call_identity_coverage": "complete",
+        "source_refs": [
+            {"kind": "response", "namespace": "pi/response-id/v1", "id": "pi-response-1"}
+        ],
+    }
+    first = store.append("alice", _observation(**shared))
+    second = store.append("alice", _observation(producer_unit_id="unit-2", **shared))
+    warm = store.append(
+        "alice",
+        _observation(
+            producer_unit_id="warm-1",
+            harness="pi-native",
+            harness_family="pi",
+            identity_namespace="pi/session/v1",
+            measurement_kind="increment",
+            input_tokens=0,
+            cached_input_tokens=8,
+        ),
+    )
+    assert [first["request_count"], second["request_count"], warm["request_count"]] == [1, 0, None]
+
+
 def test_cursor_scope_tampering_and_stable_pagination_fence(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.append("alice", _observation(producer_unit_id="a"))

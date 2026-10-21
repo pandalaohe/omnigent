@@ -10,6 +10,9 @@ double-counted the shared baseline once the active model changed).
 
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 
 from omnigent.llms.context_window import ModelPricing
@@ -417,6 +420,131 @@ async def test_flush_stores_the_last_cache_label_from_forwarder_fields(db_uri: s
     stored = store.get_conversation(conv.id)
     assert stored is not None
     assert stored.labels["omnigent.last_cache"] == "30,5,1727000000"
+
+
+@pytest.mark.asyncio
+async def test_pi_rate_limits_reach_session_and_own_quota_row(db_uri: str) -> None:
+    from datetime import datetime, timezone
+
+    from omnigent.server.agent_quota import AgentQuotaService
+    from omnigent.server.routes._sessions.orchestration import _persist_external_session_usage
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(agent_id=_AGENT_ID, harness_override="pi-native")
+    quotas = AgentQuotaService(store, None, None, None, None)
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(
+            type="external_session_usage",
+            data={
+                "pi_provider_usage_limits_headers": {
+                    "anthropic-ratelimit-requests-limit": "100",
+                    "anthropic-ratelimit-requests-remaining": "0",
+                    "anthropic-ratelimit-requests-reset": datetime.fromtimestamp(
+                        int(time.time()) + 60, tz=timezone.utc
+                    ).isoformat(),
+                }
+            },
+        ),
+        store,
+        conv,
+        quota_service=quotas,
+    )
+    stored = store.get_conversation(conv.id)
+    assert stored is not None and stored.provider_usage_limits is not None
+    assert stored.provider_usage_limits["provider"] == "Anthropic API"
+    assert stored.provider_usage_limits["windows"][0]["used_percent"] == 100
+    reported = quotas.quotas(quotas.context(conv))[1]
+    assert set(reported) == {"pi"}
+    assert reported["pi"].state == "exhausted"
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(
+            type="external_session_usage", data={"pi_provider_usage_limits_headers": {}}
+        ),
+        store,
+        conv,
+        quota_service=quotas,
+    )
+    stored = store.get_conversation(conv.id)
+    assert stored is not None and stored.provider_usage_limits is None
+    assert "pi" not in quotas.quotas(quotas.context(conv))[1]
+
+
+@pytest.mark.asyncio
+async def test_pi_cache_observation_persists_and_unsupported_model_clears(db_uri: str) -> None:
+    from omnigent.errors import OmnigentError
+    from omnigent.server.routes._sessions.orchestration import _persist_external_session_usage
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(agent_id=_AGENT_ID, harness_override="pi-native")
+    data = {
+        "pi_cache_ttl_seconds": 300,
+        "pi_cache_observed_at": 1_900_000_000,
+        "pi_cache_read_input_tokens": 9000,
+        "pi_cache_write_input_tokens": 0,
+    }
+    await _persist_external_session_usage(
+        conv.id, SessionEventInput(type="external_session_usage", data=data), store, conv
+    )
+    stored = store.get_conversation(conv.id)
+    assert stored is not None
+    assert json.loads(stored.labels["omnigent.pi_cache"]) == {
+        "ttl": 300,
+        "at": 1_900_000_000,
+        "read": 9000,
+        "write": 0,
+    }
+    for invalid in (-1, True, 10**100):
+        with pytest.raises(OmnigentError, match="invalid Pi cache"):
+            await _persist_external_session_usage(
+                conv.id,
+                SessionEventInput(
+                    type="external_session_usage",
+                    data={**data, "pi_cache_read_input_tokens": invalid},
+                ),
+                store,
+                conv,
+            )
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(type="external_session_usage", data={"pi_cache_ttl_seconds": None}),
+        store,
+        conv,
+    )
+    stored = store.get_conversation(conv.id)
+    assert stored is not None and "omnigent.pi_cache" not in stored.labels
+
+
+@pytest.mark.asyncio
+async def test_pi_idle_warming_probe_obeys_live_owner_switch(client, app, db_uri: str) -> None:
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(agent_id=_AGENT_ID, harness_override="pi-native")
+    store.set_labels(conv.id, {"omnigent.running_since": str(int(time.time()))})
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = prefs
+    prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "keep_warm",
+        {"agents": {_AGENT_ID: {"main": True, "child": False, "max_s": 1800}}},
+    )
+    event = {"type": "external_session_usage", "data": {"pi_cache_warming_probe": True}}
+    response = await client.post(f"/v1/sessions/{conv.id}/events", json=event)
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": False, "pi_cache_warming_allowed": True}
+    prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "keep_warm",
+        {"agents": {_AGENT_ID: {"main": False, "child": False, "max_s": 1800}}},
+    )
+    response = await client.post(f"/v1/sessions/{conv.id}/events", json=event)
+    assert response.status_code == 202, response.text
+    assert response.json()["pi_cache_warming_allowed"] is False
 
 
 @pytest.mark.asyncio

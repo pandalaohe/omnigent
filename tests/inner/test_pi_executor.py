@@ -5625,7 +5625,9 @@ def _pi_assistant_message_with_usage(
     return msg
 
 
-def test_pi_usage_captured_from_message_end() -> None:
+def test_pi_usage_captured_from_message_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     A ``message_end`` event whose assistant message carries a ``usage``
     object surfaces on ``TurnComplete.usage`` with each pi field mapped to
@@ -5634,7 +5636,13 @@ def test_pi_usage_captured_from_message_end() -> None:
     fails loud rather than passing on mere presence.
     """
 
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+
     async def _test() -> None:
+        message = _pi_assistant_message_with_usage()
+        message["responseId"] = "pi-response-1"
+        message["timestamp"] = 123456789
         executor = _executor_with_scripted_rpc(
             [
                 json.dumps({"type": "response", "success": True}),
@@ -5644,7 +5652,7 @@ def test_pi_usage_captured_from_message_end() -> None:
                         "assistantMessageEvent": {"type": "text_delta", "delta": "Done."},
                     }
                 ),
-                json.dumps({"type": "message_end", "message": _pi_assistant_message_with_usage()}),
+                json.dumps({"type": "message_end", "message": message}),
                 json.dumps({"type": "agent_end", "messages": []}),
             ]
         )
@@ -5652,7 +5660,7 @@ def test_pi_usage_captured_from_message_end() -> None:
         events = [
             e
             async for e in executor.run_turn(
-                [{"role": "user", "content": "hello"}],
+                [{"role": "user", "content": "hello", "session_id": "session-1"}],
                 [],
                 "system",
             )
@@ -5674,6 +5682,18 @@ def test_pi_usage_captured_from_message_end() -> None:
         assert usage["model"] == "claude-sonnet-4-6"
         # The text still streams through unaffected by usage capture.
         assert turn_complete[0].response == "Done."
+        import sqlite3
+
+        from omnigent.usage_export.outbox import UsageOutbox
+
+        spool = UsageOutbox(tmp_path / "runtime" / "usage-export")
+        with sqlite3.connect(spool.path) as db:
+            rows = [json.loads(row[0]) for row in db.execute("SELECT payload FROM observations")]
+        assert len(rows) == 1
+        assert rows[0]["logical_call_id"] == "pi-response-1"
+        assert rows[0]["input_tokens"] == 1200
+        assert rows[0]["cached_input_tokens"] == 800
+        assert "Done." not in str(rows)
 
     _run(_test())
 
