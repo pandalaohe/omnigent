@@ -2515,20 +2515,6 @@ module.exports = function (pi) {
   pi.on("input", async (event, ctx) => {
     rememberContext(ctx);
     setOmnigentStatus(config, ctx, "running");
-    const rawText = event && typeof event.text === "string" ? event.text : "";
-    const text = rawText.trim();
-    if (!text) return;
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
-        response_id: `pi-user-${Date.now()}-${++sequence}`,
-        item_type: "message",
-        item_data: {
-          role: "user",
-          content: [{ type: "input_text", text }],
-        },
-      },
-    });
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -2537,6 +2523,24 @@ module.exports = function (pi) {
     setOmnigentStatus(config, ctx, undefined);
     let message = event ? event.message : undefined;
     const role = messageRole(message);
+    if (role === "user") {
+      // Pi emits input before preflight and while steering is still queued;
+      // message_end is the first durable signal that it consumed the prompt.
+      const text = textFromMessage(message).trim();
+      if (!text) return;
+      await postEvent(config, {
+        type: "external_conversation_item",
+        data: {
+          response_id: `pi-consumed-user-${Date.now()}-${++sequence}`,
+          item_type: "message",
+          item_data: {
+            role: "user",
+            content: [{ type: "input_text", text }],
+          },
+        },
+      });
+      return;
+    }
     if (role !== "assistant") return;
     const authFailure = nativeAuthFailure(message, ctx);
     if (authFailure) {

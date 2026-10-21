@@ -782,12 +782,14 @@ async def test_uncertain_delivery_reconciles_to_pending_without_marker(
     assert harness.post_event.calls == []
 
 
+@pytest.mark.parametrize("reason", [None, f"native_attempt:{'a' * 32}"])
 async def test_uncertain_delivery_past_expiry_expires_with_notice(
-    harness: _Harness,
+    harness: _Harness, reason: str | None
 ) -> None:
     """An uncertain delivery past its deadline ends as expired, not re-pended."""
     record = harness.seed_record(
         state="delivering",
+        reason=reason,
         updated_at=harness._now - 200,
         expires_at=harness._now - 10,
     )
@@ -823,7 +825,10 @@ async def test_codex_refused_attempt_requeues_without_trusting_failed_user_item(
     assert _row(harness.store, record.id).state == "queued"
 
 
-async def test_codex_ambiguous_attempt_waits_for_mirror_or_expiry(harness: _Harness) -> None:
+@pytest.mark.parametrize("native_response_id", ["codex_turn_accepted", "pi-consumed-user-123"])
+async def test_native_ambiguous_attempt_waits_for_mirror_or_expiry(
+    harness: _Harness, native_response_id: str
+) -> None:
     attempt = "b" * 32
     record = harness.seed_record(
         id="f" * 32,
@@ -835,11 +840,26 @@ async def test_codex_ambiguous_attempt_waits_for_mirror_or_expiry(harness: _Harn
     await harness.sweeper._reconcile_stale_delivering(harness._now)
     assert _row(harness.store, record.id).state == "delivering"
 
+    # A server-side optimistic input item is not a native receipt.
+    optimistic = ConversationItem(
+        id="optimistic",
+        type="message",
+        status="completed",
+        response_id=(
+            "pi-user-123" if native_response_id.startswith("pi-") else "server_forwarded"
+        ),
+        created_at=0,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": _envelope(record)}]),
+    )
+    harness.conv_store.items[optimistic.id] = optimistic
+    await harness.sweeper._reconcile_stale_delivering(harness._now)
+    assert _row(harness.store, record.id).state == "delivering"
+
     mirror = ConversationItem(
         id="native_mirror",
         type="message",
         status="completed",
-        response_id="codex_turn_accepted",
+        response_id=native_response_id,
         created_at=0,
         data=MessageData(role="user", content=[{"type": "input_text", "text": _envelope(record)}]),
     )

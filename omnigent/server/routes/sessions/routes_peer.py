@@ -109,11 +109,11 @@ PEER_HOLD_LIFETIME = 24 * 3600
 # an identical resend is still a duplicate while the earlier copy sits here.
 _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 
-_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native"})
+_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
 
 # A dispatched child runs its own terminal turn, so a peer message reaches it;
-# other native harnesses are mirrors or SDK children without a result key.
-_PEER_REACHABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native"})
+# native mirrors and SDK children without a result key remain refused.
+_PEER_REACHABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
 
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
@@ -429,9 +429,9 @@ def _is_steerable_harness(conv: Conversation) -> bool:
     return harness in _STEERABLE_NATIVE_HARNESSES
 
 
-def _is_codex_native_harness(conv: Conversation) -> bool:
+def _needs_native_peer_receipt(conv: Conversation) -> bool:
     try:
-        return _native_terminal_runtime(conv)[2] == "codex-native"
+        return _native_terminal_runtime(conv)[2] in {"codex-native", "pi-native"}
     except OmnigentError:
         return False
 
@@ -439,7 +439,7 @@ def _is_codex_native_harness(conv: Conversation) -> bool:
 def _peer_reachable_child(conv: Conversation) -> bool:
     """Whether a child session may receive peer messages.
 
-    A dispatched Claude Code / Codex child runs its own terminal turn on the
+    A dispatched Claude Code / Codex / Pi child runs its own terminal turn on the
     envelope. Native mirrors route input through their parent's runtime, and
     SDK / other harnesses have no result key, so both stay refused. A read
     error refuses rather than admitting an unreachable child.
@@ -1252,10 +1252,10 @@ def register_peer_routes(
             return "failed", "not_ready"
         if sdk_delivery:
             return "uncertain", "awaiting_sdk_receipt"
-        if native_receiver and _is_codex_native_harness(receiver):
+        if native_receiver and _needs_native_peer_receipt(receiver):
             # The events POST only confirms that the runner has the message.
-            # Codex accepts it later through turn/start or turn/steer; the
-            # durable peer record settles from the native transcript mirror.
+            # The native terminal accepts it later; the durable record settles
+            # from the terminal-originated transcript mirror.
             return "uncertain", "awaiting_native_receipt"
         return "delivered", None
 
@@ -1735,7 +1735,7 @@ def register_peer_routes(
                         sdk_attempt_reason(secrets.token_hex(16), "wait")
                         if _sdk_capable(receiver)
                         else f"{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
-                        if _is_codex_native_harness(receiver)
+                        if _needs_native_peer_receipt(receiver)
                         else None
                     ),
                     correlation_id=body.correlation_id,
