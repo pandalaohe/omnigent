@@ -5774,6 +5774,10 @@ async def _auto_create_codex_terminal(
         server_client=server_client,
         turn_routing=launch_config.turn_routing,
     )
+    # Codex may list MCP tools as soon as the app-server starts. Publish the
+    # relay first so its initial tools/list sees the session's tool surface.
+    if ensure_comment_relay is not None:
+        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
@@ -5996,14 +6000,6 @@ async def _auto_create_codex_terminal(
         bridge_dir=bridge_dir,
         server_client=server_client,
     )
-
-    # Start the relay now (into codex's serve-mcp bridge dir) so tool_relay.json
-    # is on disk and the relay recorded before codex connects on its first turn:
-    # the first-turn `_ensure_comment_relay_started` then fast-paths, avoiding
-    # the ~30s stall (see its docstring for the lazy-bridge / await_notify=False
-    # rationale).
-    if ensure_comment_relay is not None:
-        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
 
     _logger.info(
         "Auto-created codex terminal + forwarder for session %s",
