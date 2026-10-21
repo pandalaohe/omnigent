@@ -1267,8 +1267,12 @@ def test_keep_warm_for_agent_resolves_family_defaults_and_clamps(db_uri: str) ->
         },
     )
     settings = read_keep_warm_settings(store, "resolve@example.com")
-    assert keep_warm_for_agent(settings, None, "claude") is None
-    assert keep_warm_for_agent(settings, "absent", "claude") is None
+    assert keep_warm_for_agent(settings, None, "claude") == ResolvedAgentKeepWarm(
+        main=False, child=False, interval_s=3300, max_s=14400
+    )
+    assert keep_warm_for_agent(settings, "absent", "claude") == ResolvedAgentKeepWarm(
+        main=False, child=False, interval_s=3300, max_s=14400
+    )
     assert keep_warm_for_agent(settings, "defaulted", "claude") == ResolvedAgentKeepWarm(
         main=True, child=True, interval_s=3300, max_s=14400
     )
@@ -1281,6 +1285,46 @@ def test_keep_warm_for_agent_resolves_family_defaults_and_clamps(db_uri: str) ->
     assert keep_warm_for_agent(settings, "wide-codex", "codex") == ResolvedAgentKeepWarm(
         main=False, child=True, interval_s=1740, max_s=3600
     )
+
+
+def test_keep_warm_default_and_exception_precedence_survive_shallow_patch(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "resolve@example.com",
+        "keep_warm",
+        {
+            "default": {
+                "main": True,
+                "child": True,
+                "maxSeconds": 7200,
+                "coldAfterSeconds": 45,
+                "intervalSeconds": 100,
+            },
+            "agents": {
+                "harness:codex-native": {"main": True, "child": False},
+                "legacy-agent": {"main": False, "child": True, "intervalSeconds": 1200},
+                "ca_42": {"main": False, "child": False},
+            },
+        },
+    )
+    store.patch_namespace("resolve@example.com", "keep_warm", {"hostOfflineArchiveSeconds": 0})
+    stored = store.get("resolve@example.com")["settings"]["keep_warm"]
+    assert stored["default"]["maxSeconds"] == 7200
+    assert set(stored["agents"]) == {"harness:codex-native", "legacy-agent", "ca_42"}
+    settings = read_keep_warm_settings(store, "resolve@example.com")
+    assert settings.default == AgentKeepWarm(True, True, None, 7200, 60)
+    assert settings.host_offline_archive_s == 0
+    assert keep_warm_for_agent(settings, None, "claude").interval_s == 3300
+    assert keep_warm_for_agent(settings, None, "codex").interval_s == 1500
+    assert keep_warm_for_agent(
+        settings, "new-agent", "codex", harness="codex-native"
+    ) == ResolvedAgentKeepWarm(True, False, 1500, 14400)
+    assert keep_warm_for_agent(
+        settings, "legacy-agent", "codex", harness="codex-native"
+    ) == ResolvedAgentKeepWarm(False, True, 1200, 14400)
+    assert keep_warm_for_agent(
+        settings, "legacy-agent", "codex", template_id="ca_42", harness="codex-native"
+    ) == ResolvedAgentKeepWarm(False, False, 1500, 14400)
 
 
 def test_clamp_host_offline_archive_s_keeps_zero_and_clamps() -> None:
@@ -1385,7 +1429,9 @@ def test_migrate_legacy_keep_warm_leaves_later_agents_off(db_uri: str) -> None:
     store.patch_namespace("late@example.com", "session_collab", {"childKeepWarmEnabled": True})
     assert migrate_legacy_keep_warm(store, "late@example.com", [("agent-old", "claude")], now=7)
     settings = read_keep_warm_settings(store, "late@example.com")
-    assert keep_warm_for_agent(settings, "agent-new", "claude") is None
+    assert keep_warm_for_agent(settings, "agent-new", "claude") == ResolvedAgentKeepWarm(
+        main=False, child=False, interval_s=3300, max_s=14400
+    )
     assert keep_warm_for_agent(settings, "agent-old", "claude") == ResolvedAgentKeepWarm(
         main=False, child=True, interval_s=3300, max_s=14400
     )
@@ -1937,7 +1983,9 @@ async def test_preferences_api_accepts_the_keep_warm_namespace(
     assert keep_warm_for_agent(settings, "agent-a", "claude") == ResolvedAgentKeepWarm(
         main=True, child=False, interval_s=300, max_s=7200
     )
-    assert keep_warm_for_agent(settings, "agent-b", "codex") is None
+    assert keep_warm_for_agent(settings, "agent-b", "codex") == ResolvedAgentKeepWarm(
+        main=False, child=False, interval_s=1500, max_s=14400
+    )
 
 
 _ENTRY_TEMPLATE = "{entry}/.worktrees/{repo}/{branch}"

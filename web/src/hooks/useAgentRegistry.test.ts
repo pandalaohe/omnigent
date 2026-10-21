@@ -4,7 +4,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { HarnessCatalog } from "@/lib/agentLabels";
 import type { CustomAgent } from "@/lib/customAgentsApi";
 import type { Host } from "@/hooks/useHosts";
-import { buildRegistry } from "./useAgentRegistry";
+import { buildLegacyProductRegistry, buildRegistry } from "./useAgentRegistry";
 
 function agent(id: string, name: string, harness: string, product_of?: string): AvailableAgent {
   return {
@@ -152,17 +152,12 @@ describe("settings agent registry", () => {
   });
 
   it("keeps same-name harness forms and declares SDK products once", () => {
-    const items = buildRegistry(
-      [
-        agent("cursor-agent", "Cursor", "cursor-native", "cursor-native"),
-        agent("sdk-agent", "Codex SDK", "codex", "codex"),
-        agent("polly-agent", "Polly", "claude-native"),
-      ],
-      [],
-      [],
-      harnesses,
-      hosts,
-    );
+    const catalog = [
+      agent("cursor-agent", "Cursor", "cursor-native", "cursor-native"),
+      agent("sdk-agent", "Codex SDK", "codex", "codex"),
+      agent("polly-agent", "Polly", "claude-native"),
+    ];
+    const items = buildRegistry(catalog, [], [], harnesses, hosts);
     expect(
       items.filter((item) => item.label === "Cursor").map((item) => [item.key, item.section]),
     ).toEqual([
@@ -172,6 +167,15 @@ describe("settings agent registry", () => {
     expect(items.filter((item) => item.key === "harness:codex")).toHaveLength(1);
     expect(items.find((item) => item.key === "polly-agent")?.section).toBe("builtin");
     expect(items.some((item) => item.key === "sdk-agent")).toBe(false);
+    const savedProducts = buildLegacyProductRegistry(catalog, [], items);
+    expect(savedProducts["cursor-agent"]).toMatchObject({
+      key: "cursor-agent",
+      harness: "cursor-native",
+      section: "native",
+      deployed: true,
+    });
+    expect(savedProducts["sdk-agent"]).toMatchObject({ harness: "codex", section: "sdk" });
+    expect(savedProducts["polly-agent"]).toBeUndefined();
   });
 
   it("uses offline reports, SDK auth state, unknown maps and distinct library ids", () => {

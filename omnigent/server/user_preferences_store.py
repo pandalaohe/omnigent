@@ -657,12 +657,17 @@ class AgentKeepWarm:
     cold_after_s: int | None = None
 
 
+def _default_keep_warm_row() -> AgentKeepWarm:
+    return AgentKeepWarm(False, False, None, KEEP_WARM_DEFAULT_MAX_S)
+
+
 @dataclass(frozen=True)
 class KeepWarmSettings:
     """
     Resolved ``keep_warm`` namespace for one session owner.
 
-    :param agents: Per-agent rows keyed by agent id; an absent agent is off.
+    :param agents: Exception rows keyed by template, agent, or harness id.
+    :param default: Fallback row for sessions without an exception.
     :param host_offline_archive_s: Seconds a host stays offline before its
         children auto-archive; ``0`` disables auto-archive.
     :param migrated_from_legacy_at: Unix time of the one-time legacy
@@ -675,6 +680,7 @@ class KeepWarmSettings:
     host_offline_archive_s: int
     migrated_from_legacy_at: int | None
     present: bool
+    default: AgentKeepWarm = field(default_factory=_default_keep_warm_row)
 
 
 @dataclass(frozen=True)
@@ -704,6 +710,26 @@ def _default_keep_warm_settings(*, present: bool = False) -> KeepWarmSettings:
     )
 
 
+def _parse_keep_warm_row(value: dict[str, Any], *, default: bool = False) -> AgentKeepWarm:
+    raw_cold = value.get("coldAfterSeconds")
+    interval_s = (
+        None if default else _parse_collab_value("positive_int", value.get("intervalSeconds"))
+    )
+    max_s = _parse_collab_value("positive_int", value.get("maxSeconds"))
+    if isinstance(raw_cold, int) and not isinstance(raw_cold, bool) and raw_cold >= 0:
+        low, high = KEEP_WARM_COLD_AFTER_BOUNDS_S
+        cold_after_s = 0 if raw_cold == 0 else min(max(raw_cold, low), high)
+    else:
+        cold_after_s = None
+    return AgentKeepWarm(
+        main=value.get("main") is True,
+        child=value.get("child") is True,
+        interval_s=interval_s,
+        max_s=max_s if max_s is not None else KEEP_WARM_DEFAULT_MAX_S,
+        cold_after_s=cold_after_s,
+    )
+
+
 def read_keep_warm_settings(
     store: SqlAlchemyUserPreferencesStore | None,
     owner: str | None,
@@ -721,7 +747,8 @@ def read_keep_warm_settings(
     default); ``coldAfterSeconds`` accepts a non-negative int and clamps to
     the cold-after bounds (``0`` stays ``0`` = never cold, anything else
     invalid reads ``None`` = the per-family rule); a row that is not an
-    object is skipped.
+    object is skipped. The sibling ``default`` row uses the same fields, but
+    its interval always uses the harness family's default.
     ``hostOfflineArchiveSeconds`` accepts a non-negative int and clamps to the
     shared keep-warm bounds (``0`` stays ``0`` = disabled). A namespace that
     exists but holds garbage still reports ``present=True``, so the legacy
@@ -758,23 +785,13 @@ def read_keep_warm_settings(
         for agent_id, row in raw_agents.items():
             if not isinstance(row, dict):
                 continue
-            raw_main = row.get("main")
-            raw_child = row.get("child")
-            raw_cold = row.get("coldAfterSeconds")
-            interval_s = _parse_collab_value("positive_int", row.get("intervalSeconds"))
-            max_s = _parse_collab_value("positive_int", row.get("maxSeconds"))
-            if isinstance(raw_cold, int) and not isinstance(raw_cold, bool) and raw_cold >= 0:
-                low, high = KEEP_WARM_COLD_AFTER_BOUNDS_S
-                cold_after_s = 0 if raw_cold == 0 else min(max(raw_cold, low), high)
-            else:
-                cold_after_s = None
-            agents[agent_id] = AgentKeepWarm(
-                main=raw_main if isinstance(raw_main, bool) else False,
-                child=raw_child if isinstance(raw_child, bool) else False,
-                interval_s=interval_s,
-                max_s=max_s if max_s is not None else KEEP_WARM_DEFAULT_MAX_S,
-                cold_after_s=cold_after_s,
-            )
+            agents[agent_id] = _parse_keep_warm_row(row)
+    raw_default = value.get("default")
+    default = (
+        _parse_keep_warm_row(raw_default, default=True)
+        if isinstance(raw_default, dict)
+        else _default_keep_warm_row()
+    )
     raw_host = value.get("hostOfflineArchiveSeconds")
     if isinstance(raw_host, int) and not isinstance(raw_host, bool) and raw_host >= 0:
         host_offline_archive_s = clamp_host_offline_archive_s(raw_host)
@@ -791,6 +808,7 @@ def read_keep_warm_settings(
         host_offline_archive_s=host_offline_archive_s,
         migrated_from_legacy_at=migrated_from_legacy_at,
         present=True,
+        default=default,
     )
 
 
@@ -798,25 +816,31 @@ def keep_warm_for_agent(
     settings: KeepWarmSettings,
     agent_id: str | None,
     family: Literal["claude", "codex"],
-) -> ResolvedAgentKeepWarm | None:
+    *,
+    template_id: str | None = None,
+    harness: str | None = None,
+) -> ResolvedAgentKeepWarm:
     """
-    Resolve one agent's keep-warm row, or ``None`` when the agent is off.
+    Resolve one session's keep-warm row, falling through to the owner default.
 
-    A ``None`` agent id and an agent absent from the settings both resolve to
-    ``None`` (absent = off). A stored interval of ``None`` takes the family
-    default; the interval clamps to the family bounds and the cap to the
-    shared keep-warm bounds.
+    An absent exception takes the default (off unless enabled). A stored
+    interval of ``None`` takes the family default; the interval clamps to the
+    family bounds and the cap to the shared keep-warm bounds.
 
     :param settings: The owner's resolved keep-warm settings.
     :param agent_id: Agent whose row applies, or ``None``.
     :param family: Model family, selecting the default and interval bounds.
-    :returns: The resolved row, or ``None`` when keep-warm is off.
+    :returns: The resolved row; its main/child switch may be off.
     """
-    if agent_id is None:
-        return None
-    row = settings.agents.get(agent_id)
-    if row is None:
-        return None
+    from omnigent.server.session_overrides import resolve_override
+
+    row = resolve_override(
+        settings.agents,
+        settings.default,
+        template_id=template_id,
+        agent_id=agent_id,
+        harness=harness,
+    )
     if family == "claude":
         default_interval = KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S
         bounds = KEEP_WARM_CLAUDE_INTERVAL_BOUNDS_S

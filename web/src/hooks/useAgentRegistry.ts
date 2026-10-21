@@ -201,6 +201,38 @@ export function buildRegistry(
   );
 }
 
+/** Product ids remain direct-session exceptions even though their picker row is the harness. */
+export function buildLegacyProductRegistry(
+  catalog: readonly AvailableAgent[],
+  userAgents: readonly AvailableAgent[],
+  items: readonly RegistryItem[],
+): Record<string, RegistryItem> {
+  const userIds = new Set(userAgents.map((agent) => agent.id));
+  const byKey = new Map(items.map((item) => [item.key, item]));
+  return Object.fromEntries(
+    catalog.flatMap((agent) => {
+      if (userIds.has(agent.id)) return [];
+      const harness = productHarnessForAgent(agent);
+      if (!harness) return [];
+      const pickerItem = byKey.get(`harness:${harness}`);
+      return [
+        [
+          agent.id,
+          {
+            key: agent.id,
+            label: agent.display_name,
+            section: pickerItem?.section ?? harnessSection(agent.integration_mode, harness),
+            harness,
+            description: agent.description,
+            source: "builtin" as const,
+            deployed: pickerItem?.deployed ?? true,
+          },
+        ],
+      ];
+    }),
+  );
+}
+
 export function useAgentRegistry() {
   const info = useServerInfo();
   const catalog = useQuery({
@@ -244,16 +276,13 @@ export function useAgentRegistry() {
     harnesses.isError ||
     (user.isError && user.isEnabled) ||
     (library.isError && library.isEnabled);
+  const legacyProducts = buildLegacyProductRegistry(catalog.data ?? [], user.data ?? [], items);
   const legacyLabels = Object.fromEntries(
-    (catalog.data ?? [])
-      .filter(
-        (agent) =>
-          !user.data?.some((own) => own.id === agent.id) && !!productHarnessForAgent(agent),
-      )
-      .map((agent) => [agent.id, agent.display_name]),
+    Object.entries(legacyProducts).map(([key, item]) => [key, item.label]),
   );
   return {
     items,
+    legacyProducts,
     legacyLabels,
     isLoading: catalog.isPending || harnesses.isPending,
     isError,

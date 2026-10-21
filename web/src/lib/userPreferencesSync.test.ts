@@ -14,7 +14,11 @@ import {
   writeApprovalTimeoutPreferences,
 } from "./approvalTimeoutPreferences";
 import { patchHostColor, readHostColorPreferences } from "./hostColorPreferences";
-import { KEEP_WARM_STORAGE_KEY, writeKeepWarmPreferences } from "./keepWarmPreferences";
+import {
+  KEEP_WARM_DEFAULTS,
+  KEEP_WARM_STORAGE_KEY,
+  writeKeepWarmPreferences,
+} from "./keepWarmPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "./worktreeDefaultPreferences";
 
 beforeEach(() => {
@@ -280,6 +284,7 @@ describe("user preference synchronization", () => {
     await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
 
     const preferences = {
+      default: KEEP_WARM_DEFAULTS.default,
       agents: {
         "claude-native-ui": { main: true, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
       },
@@ -310,6 +315,9 @@ describe("user preference synchronization", () => {
       ...preferences,
       hostOfflineArchiveSeconds: 3600,
     });
+    expect(JSON.parse(localStorage.getItem(KEEP_WARM_STORAGE_KEY) ?? "null").default).toEqual(
+      KEEP_WARM_DEFAULTS.default,
+    );
   });
 
   it("announces an acknowledged patch with its namespace", async () => {
@@ -321,6 +329,7 @@ describe("user preference synchronization", () => {
 
     writeKeepWarmPreferences(
       {
+        default: KEEP_WARM_DEFAULTS.default,
         agents: {
           "claude-native-ui": {
             main: true,

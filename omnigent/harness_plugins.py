@@ -371,6 +371,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        keep_warm_family="claude",
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
@@ -386,6 +387,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        keep_warm_family="codex",
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -594,6 +596,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
         instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
+        keep_warm_family="claude",
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
@@ -606,6 +609,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
+        keep_warm_family="codex",
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,

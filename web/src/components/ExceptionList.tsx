@@ -5,11 +5,13 @@ import { Button } from "@/components/ui/button";
 import { SECTION_LABELS, type RegistryItem, type RegistryKey } from "@/hooks/useAgentRegistry";
 
 const EMPTY_LABELS: Record<string, string> = {};
+const EMPTY_SAVED_ITEMS: Record<string, RegistryItem> = {};
 
 export function ExceptionList<T>({
   rows,
   items,
   legacyLabels = EMPTY_LABELS,
+  savedItems = EMPTY_SAVED_ITEMS,
   summary,
   editor,
   onAdd,
@@ -23,6 +25,7 @@ export function ExceptionList<T>({
   rows: Record<RegistryKey, T>;
   items: RegistryItem[];
   legacyLabels?: Record<string, string>;
+  savedItems?: Record<string, RegistryItem>;
   summary: (row: T) => string;
   editor: (row: T, patch: (next: Partial<T>) => void, key: RegistryKey) => ReactNode;
   onAdd: (key: RegistryKey) => void;
@@ -61,7 +64,7 @@ export function ExceptionList<T>({
         <p className="text-xs text-muted-foreground">All agents use the default.</p>
       )}
       {Object.entries(rows).map(([key, value]) => {
-        const item = byKey.get(key);
+        const item = byKey.get(key) ?? savedItems[key];
         const isLegacyProduct = Object.hasOwn(legacyLabels, key);
         const label = isLegacyProduct
           ? `${legacyLabels[key]} · direct sessions only`

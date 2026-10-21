@@ -196,16 +196,42 @@ def test_legacy_links_open_the_new_group(
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_keep_warm_copy_skips_incompatible_interval(
+def test_keep_warm_default_and_exception_persist_with_support_reasons(
     page: Page, appearance_url: str, browser_contract: BrowserContract, width: int
 ) -> None:
     agents = [
-        {"id": "claude-agent", "name": "claude", "harness": "claude-native"},
-        {"id": "codex-agent", "name": "codex", "harness": "codex-native"},
-        {"id": "other-agent", "name": "other", "harness": "openai-agents"},
+        {
+            "id": "claude-agent",
+            "name": "claude-native-ui",
+            "harness": "claude-native",
+            "builtin": True,
+            "product_of": "claude-native",
+            "integration_mode": "native-tui",
+        },
+        {
+            "id": "codex-agent",
+            "name": "codex-native-ui",
+            "harness": "codex-native",
+            "builtin": True,
+            "product_of": "codex-native",
+            "integration_mode": "native-tui",
+        },
+        {"id": "other-agent", "name": "other", "harness": "openai-agents", "builtin": False},
     ]
     browser_contract.json("/v1/agents", {"data": agents, "has_more": False})
+    browser_contract.json(
+        "/v1/harnesses",
+        {
+            "data": [],
+            "capabilities_by_harness": {
+                "claude-native": {"integration_mode": "native-tui", "keep_warm_family": "claude"},
+                "codex-native": {"integration_mode": "native-tui", "keep_warm_family": "codex"},
+                "openai-agents": {"integration_mode": "sdk-in-process", "keep_warm_family": None},
+            },
+        },
+    )
     preferences = {
+        "default": {"main": False, "child": False, "maxSeconds": 14400},
         "agents": {
             "claude-agent": {
                 "main": True,
@@ -213,43 +239,77 @@ def test_keep_warm_copy_skips_incompatible_interval(
                 "intervalSeconds": 3300,
                 "maxSeconds": 7200,
             },
-            "codex-agent": {
-                "main": False,
-                "child": False,
-                "intervalSeconds": 600,
-                "maxSeconds": 14400,
-            },
         },
         "hostOfflineArchiveSeconds": 0,
     }
+
+    def save(request: Request) -> dict[str, bool]:
+        preferences.update(request.post_data_json["value"])
+        return {"ok": True}
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"keep_warm": preferences}},
+        },
+    )
     browser_contract.json(
         "/v1/me/preferences",
-        {
+        lambda _: {
             "user_id": "local",
             "preferences": {"version": 1, "settings": {"keep_warm": preferences}},
         },
     )
-    browser_contract.response("/v1/me/preferences/keep_warm", method="PATCH")
+    browser_contract.json("/v1/me/preferences/keep_warm", save, method="PATCH")
     browser_contract.response("/v1/me/preferences/session_collab", method="PATCH")
     page.add_init_script(
         f"localStorage.setItem('omnigent:keep-warm', {json.dumps(json.dumps(preferences))})"
     )
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{appearance_url}/settings/keep-warm")
-    expect(page.get_by_role("combobox", name="Keep-warm Agent")).to_be_visible()
-    expect(page.get_by_test_id("keep-warm-agent-row")).to_have_count(1)
-    page.get_by_role("button", name="Apply to other deployed agents", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Apply to other deployed agents", exact=True)
-    expect(dialog.get_by_text("Skip: Every (Outside 5–29 min for this agent)")).to_be_visible()
-    expect(dialog.get_by_text("This agent has no keep-warm channel", exact=False)).to_be_visible()
-    assert dialog.evaluate("element => element.scrollWidth <= element.clientWidth")
-    dialog.get_by_role("button", name="Apply selected fields", exact=True).click()
+    section = page.get_by_test_id("keep-warm-settings")
+    expect(section.get_by_text("All agents", exact=True)).to_be_visible()
+    expect(section.get_by_role("switch")).to_have_count(2)
+    expect(section.get_by_text("Claude Code · direct sessions only", exact=False)).to_be_visible()
+    section.get_by_role("switch", name="Keep main sessions warm for all agents").click()
+    section.get_by_role("button", name="Add exception").click()
+    picker = page.get_by_role("dialog", name="Add exception")
+    picker.get_by_role("button", name="Not supported here (1)").click()
+    expect(
+        picker.get_by_role("button", name=re.compile("Other.*no declared keep-warm channel"))
+    ).to_be_disabled()
+    assert picker.evaluate("element => element.scrollWidth <= element.clientWidth")
+    picker.get_by_role("button", name=re.compile("Codex.*Native CLI")).click()
+    section.get_by_role("switch", name="Keep children warm for Codex").click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/keep_warm")
+            and response.request.post_data_json["value"]["agents"]
+            .get("harness:codex-native", {})
+            .get("intervalSeconds")
+            == 600
+        )
+    ):
+        section.get_by_role("spinbutton", name="Keep-warm interval for Codex in minutes").fill(
+            "10"
+        )
     saved = page.evaluate("JSON.parse(localStorage.getItem('omnigent:keep-warm'))")
-    assert saved["agents"]["codex-agent"]["intervalSeconds"] == 600
-    assert saved["agents"]["codex-agent"]["main"] is True
-    assert saved["agents"]["codex-agent"]["maxSeconds"] == 7200
+    assert saved["default"] == {"main": True, "child": False, "maxSeconds": 14400}
+    assert saved["agents"]["harness:codex-native"]["intervalSeconds"] == 600
+    assert saved["agents"]["harness:codex-native"]["child"] is True
+    assert saved["agents"]["claude-agent"]["intervalSeconds"] == 3300
     assert "other-agent" not in saved["agents"]
     assert saved["hostOfflineArchiveSeconds"] == 0
+    assert preferences["agents"]["harness:codex-native"]["intervalSeconds"] == 600
+    page.reload()
+    expect(
+        section.get_by_role("switch", name="Keep main sessions warm for all agents")
+    ).to_be_checked()
+    expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
 @pytest.mark.parametrize("width", [1440, 390])
