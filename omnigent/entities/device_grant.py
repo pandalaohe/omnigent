@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 
-DEVICE_GRANT_SCOPES = frozenset({"sessions", "usage:read"})
+DEVICE_GRANT_SCOPES = frozenset({"sessions", "usage:read", "annotations:write"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,8 +31,8 @@ class DeviceGrant:
     :param client_id: RFC 8628 client identifier — a public string naming
         the requesting application (e.g. ``"slack"``); display + audit
         only, not an authorization key.
-    :param scope: Granted authority: ``sessions`` or ``usage:read`` for a
-        device client; ``None`` for a first-party login grant.
+    :param scope: Granted device authority (``sessions``, ``usage:read`` or
+        ``annotations:write``); ``None`` for a first-party login grant.
     :param user_id: Omnigent identity that approved it; ``None`` while
         pending.
     :param created_at: Unix epoch seconds when created.
@@ -55,3 +55,5 @@ class DeviceGrant:
     last_polled_at: int | None
     account_generation: str | None = None
     scope: str | None = None
+    label: str | None = None
+    last_used_at: int | None = None

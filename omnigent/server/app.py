@@ -5212,6 +5212,24 @@ def create_app(
 
             device_grant_store = DeviceGrantStore(permission_store.storage_location)
             auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            from omnigent.server.auth import env_var_is_truthy
+
+            annotation_enabled = (
+                auth_provider._source == "accounts"
+                and env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+                and env_var_is_truthy("OMNIGENT_CHROME_ANNOTATIONS_ENABLED", default=False)
+            )
+            auth_provider.set_annotation_origin(
+                os.environ.get("OMNIGENT_CHROME_EXTENSION_ORIGIN") if annotation_enabled else None
+            )
+            auth_provider.set_annotation_grant_check(
+                lambda grant_id, user_id, generation: (
+                    annotation_enabled
+                    and device_grant_store.authorize_annotation_request(
+                        grant_id, user_id, generation
+                    )
+                )
+            )
 
         if (
             isinstance(auth_provider, UnifiedAuthProvider)

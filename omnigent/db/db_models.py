@@ -558,7 +558,7 @@ class SqlDeviceGrant(OmnigentBase):
         and recorded in the issued token's ``act`` claim for audit.
         Display/audit only — not a security-decision key.
     :param scope: Persisted authority; ``NULL`` only for first-party login
-        grants, ``sessions`` or ``usage:read`` for device grants.
+        grants, with device scopes including ``annotations:write``.
     :param user_id: The Omnigent identity that approved the grant, set at
         consent time. ``NULL`` while pending. The delegated token's ``sub``.
     :param refresh_token_hash: HMAC-SHA256 hex digest of the current
@@ -596,6 +596,7 @@ class SqlDeviceGrant(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     client_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     scope: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    label: Mapped[str | None] = mapped_column(String(80), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Digest of the just-superseded refresh token, kept only so a replay
@@ -606,6 +607,7 @@ class SqlDeviceGrant(OmnigentBase):
     expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_used_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
