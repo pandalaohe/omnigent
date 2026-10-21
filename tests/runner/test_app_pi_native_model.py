@@ -111,6 +111,9 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     # Redirect the bridge tree into tmp so the generated managed Pi config dir
     # (and its models.json) lands somewhere isolated and inspectable.
     monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    from omnigent.native.native_bridge_common import write_agent_instructions_preamble
+
+    write_agent_instructions_preamble(pi_bridge.bridge_dir_for_session_id(session_id), "stale")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
@@ -178,6 +181,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     spec = AgentSpec(
         spec_version=1,
         name="pi-model-e2e",
+        instructions="Author brief.",
         executor=ExecutorSpec(
             type="omnigent",
             config={"harness": "pi-native"},
@@ -192,7 +196,20 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
         lambda _sid, _event: None,
         server_client=_SnapshotClient(),  # type: ignore[arg-type]
         agent_spec=spec,
+        global_instructions="GLOBAL-MARKER",
     )
+
+    from omnigent.harnesses.pi_native.bridge import config_path
+    from omnigent.native.native_bridge_common import read_agent_instructions_preamble
+    from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+
+    bridge_dir = pi_bridge.bridge_dir_for_session_id(session_id)
+    extension_config = json.loads(config_path(bridge_dir).read_text(encoding="utf-8"))
+    instructions = extension_config["startupInstructions"]
+    assert "Author brief." in instructions
+    assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION in instructions
+    assert instructions.endswith("GLOBAL-MARKER")
+    assert read_agent_instructions_preamble(bridge_dir) is None
 
     # The runner threaded the spec model into resolve_pi_native_provider.
     assert captured["model"] == "claude-opus-4-7"

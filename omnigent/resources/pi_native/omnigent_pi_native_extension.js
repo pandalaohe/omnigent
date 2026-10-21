@@ -909,21 +909,6 @@ function textFromMessage(message) {
   );
 }
 
-// Mirrors native_bridge_common.strip_agent_instructions_block: the executor's
-// first-message instruction block must not reach the mirrored user turn, or
-// pending-input reconciliation never matches. Also strips an unterminated block.
-const AGENT_INSTRUCTIONS_OPEN_TAG = "<omnigent_agent_instructions>";
-const AGENT_INSTRUCTIONS_CLOSE_TAG = "</omnigent_agent_instructions>";
-const _AGENT_INSTRUCTIONS_BLOCK_RE = new RegExp(
-  `${AGENT_INSTRUCTIONS_OPEN_TAG}[\\s\\S]*?${AGENT_INSTRUCTIONS_CLOSE_TAG}|${AGENT_INSTRUCTIONS_OPEN_TAG}[\\s\\S]*`,
-);
-
-function stripAgentInstructionsBlock(text) {
-  return typeof text === "string"
-    ? text.replace(_AGENT_INSTRUCTIONS_BLOCK_RE, "")
-    : text;
-}
-
 function safeJsonStringify(value) {
   try {
     return JSON.stringify(value ?? {});
@@ -2210,6 +2195,15 @@ module.exports = function (pi) {
     },
   });
 
+  pi.on("before_agent_start", (event) => {
+    const instructions = config && config.startupInstructions;
+    if (typeof instructions !== "string" || !instructions.trim()) return;
+    const nativePrompt = event && typeof event.systemPrompt === "string"
+      ? event.systemPrompt : "";
+    if (nativePrompt === instructions || nativePrompt.endsWith(`\n\n${instructions}`)) return;
+    return { systemPrompt: nativePrompt ? `${nativePrompt}\n\n${instructions}` : instructions };
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
     registerTaskToolIfMissing();
@@ -2522,7 +2516,7 @@ module.exports = function (pi) {
     rememberContext(ctx);
     setOmnigentStatus(config, ctx, "running");
     const rawText = event && typeof event.text === "string" ? event.text : "";
-    const text = stripAgentInstructionsBlock(rawText).trim();
+    const text = rawText.trim();
     if (!text) return;
     await postEvent(config, {
       type: "external_conversation_item",

@@ -18,6 +18,7 @@ import pytest
 
 from omnigent.inner import pi_native_executor as pne
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.native.native_bridge_common import write_agent_instructions_preamble
 
 
 def test_supports_flags(tmp_path: Path) -> None:
@@ -77,6 +78,22 @@ async def test_run_turn_enqueues_latest_user_message(tmp_path: Path, monkeypatch
     # pi-native does not synthesize an assistant response — the extension
     # mirrors Pi's output back over HTTP, so the executor returns no response.
     assert events[0].response is None
+
+
+async def test_run_turn_never_prefixes_user_text(tmp_path: Path, monkeypatch) -> None:
+    enqueued: list[str] = []
+    monkeypatch.setattr(
+        pne, "enqueue_user_message", lambda bridge_dir, content: enqueued.append(content)
+    )
+    # A stale first-message file from a previous launch must not leak into
+    # Pi's user argument now that instructions use the native system prompt.
+    write_agent_instructions_preamble(tmp_path, "old instructions")
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+
+    events = [e async for e in ex.run_turn([{"role": "user", "content": "run now"}], [], "")]
+
+    assert enqueued == ["run now"]
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
 
 
 async def test_run_turn_errors_with_no_user_text(tmp_path: Path, monkeypatch) -> None:
