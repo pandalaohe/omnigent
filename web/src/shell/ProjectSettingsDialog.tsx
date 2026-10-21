@@ -955,7 +955,14 @@ export function ProjectSettingsDialog({
   };
 
   const addOtherHarness = (rowHostId: string, harness: string) => {
-    setHarnessField(rowHostId, harness, "model", null);
+    setHostRows((rows) =>
+      rows.map((row) => {
+        if (row.hostId !== rowHostId || harness in row.harnesses) return row;
+        const set: HarnessSetDraft = { model: null, effort: null };
+        for (const field of CALLING_FIELDS) set[field] = inheritedFor(row, harness, field).value;
+        return { ...row, harnesses: { ...row.harnesses, [harness]: set } };
+      }),
+    );
     ensureCatalog(rowHostId, harness);
   };
 
@@ -1234,16 +1241,19 @@ export function ProjectSettingsDialog({
       buildCallingDefaults(seedHostRows([], stored ?? {})) ?? {},
     );
 
-  const inheritedFor = (row: HostRowDraft, harness: string, field: CallingDefaultField) =>
-    resolveProjectInheritedField(
+  const inheritedFor = (row: HostRowDraft, harness: string, field: CallingDefaultField) => {
+    const effectiveAgentId = row.agentId ?? agentId;
+    const agent = agentList.find((candidate) => candidate.id === effectiveAgentId);
+    return resolveProjectInheritedField(
       draftConfig,
       masterDefaults,
       row.hostId,
       harness,
       field,
-      row.agentId ?? agentId,
+      agent && selectedHarnessFor(agent) === harness ? effectiveAgentId : null,
       capabilities,
     );
+  };
 
   const inheritedFieldLabel = (row: HostRowDraft, harness: string, field: CallingDefaultField) => {
     const inherited = inheritedFor(row, harness, field).value ?? null;

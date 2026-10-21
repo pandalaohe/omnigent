@@ -4,7 +4,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
-import { readCallingDefaults } from "@/lib/callingDefaults";
+import {
+  callingDefaultHarnesses,
+  callingHarnessLabel,
+  readCallingDefaults,
+} from "@/lib/callingDefaults";
 import { writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   createProject,
@@ -20,10 +24,10 @@ import {
 } from "@/lib/projectsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-const emptyCapabilities = vi.hoisted(() => ({}));
+const harnessCapabilitiesMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/agentLabels", async (original) => ({
   ...(await original<typeof AgentLabelsModule>()),
-  useHarnessCapabilities: () => emptyCapabilities,
+  useHarnessCapabilities: harnessCapabilitiesMock,
 }));
 
 vi.mock("@/lib/projectsApi", () => ({
@@ -209,6 +213,7 @@ function renderDialog(projectId: string | null = "p_1", onOpenChangeSpy?: (open:
 }
 
 beforeEach(() => {
+  harnessCapabilitiesMock.mockReturnValue({});
   getProjectMock.mockReset();
   getCollaborationMock.mockReset();
   getCollaborationMock.mockResolvedValue({ repositories: [], bindings: [], problems: [] });
@@ -1809,6 +1814,99 @@ describe("ProjectSettingsDialog", () => {
     } finally {
       restoreViewport();
     }
+  });
+
+  const offeredHarnesses = [...callingDefaultHarnesses(), "pi", "acp", "grok", "jcode"];
+  it.each(offeredHarnesses)(
+    "adds %s with its calling defaults and saves without reselecting a model",
+    async (harness) => {
+      harnessCapabilitiesMock.mockReturnValue(
+        Object.fromEntries(
+          offeredHarnesses.map((id) => [
+            id,
+            { calling_defaults: { model_options: true, inherits_from: null } },
+          ]),
+        ),
+      );
+      listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      const defaults = {
+        model: "shared-model",
+        effort: "high",
+        ...(harness === "codex" || harness === "codex-native"
+          ? { speed: "standard", permission: "read-only" }
+          : {}),
+      };
+      localStorage.setItem(
+        "omnigent:calling-defaults",
+        JSON.stringify({ h1: { [harness]: defaults }, h2: { [harness]: { model: "other-host" } } }),
+      );
+      const rows = [
+        catalogRow("h1", harness, [{ id: "shared-model", displayName: "Shared model" }]),
+      ];
+      listCatalogsMock.mockResolvedValue(rows);
+      syncCatalogsMock.mockResolvedValue(rows);
+      renderDialog();
+      await screen.findByTestId("project-settings-host-detail-h1");
+      fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
+      await pickOption("project-settings-host-other-add-h1", callingHarnessLabel(harness));
+      expect(
+        screen.getByTestId(`project-settings-host-other-model-h1-${harness}`),
+      ).toHaveTextContent("Shared model");
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          calling_defaults: { h1: { harnesses: { [harness]: defaults } } },
+        }),
+      );
+    },
+  );
+
+  it("adds an SDK harness from unsaved native defaults without copying the primary agent model", async () => {
+    harnessCapabilitiesMock.mockReturnValue({
+      codex: { calling_defaults: { model_options: true, inherits_from: "codex-native" } },
+    });
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        agent_id: "ag_claude",
+        model: "opus",
+        calling_defaults: {
+          h1: { harnesses: { "codex-native": { model: "old-model", effort: "high" } } },
+        },
+      },
+    });
+    const rows = [
+      catalogRow("h1", "codex-native", [{ id: "new-model", displayName: "New model" }]),
+    ];
+    listCatalogsMock.mockResolvedValue(rows);
+    syncCatalogsMock.mockResolvedValue(rows);
+    renderDialog();
+    await screen.findByTestId("project-settings-host-detail-h1");
+    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
+    await pickOption("project-settings-host-other-model-h1-codex-native", "New model");
+    await pickOption("project-settings-host-other-add-h1", "Codex SDK");
+    expect(screen.getByTestId("project-settings-host-other-model-h1-codex")).toHaveTextContent(
+      "new-model",
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        model: "opus",
+        calling_defaults: {
+          h1: {
+            harnesses: {
+              "codex-native": { model: "new-model", effort: "high" },
+              codex: { model: "new-model", effort: "high" },
+            },
+          },
+        },
+      }),
+    );
   });
 
   it("adds and deletes an other-harness model row", async () => {
