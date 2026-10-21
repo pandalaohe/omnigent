@@ -355,6 +355,23 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+def ask_on_instruction_layer_update(event: PolicyEvent) -> PolicyResponse:
+    """Ask before changing instructions delivered to future sessions."""
+    if event.get("type") != "tool_call" or event.get("target") != "sys_instruction_layer_update":
+        return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    args = args if isinstance(args, dict) else {}
+    key = {name: args.get(name, "") for name in ("scope", "agent_key", "host_id")}
+    return {
+        "result": "ASK",
+        "reason": (
+            f"Replace Global Instructions layer {key}. "
+            "Applies after session start or relaunch. Approve?"
+        ),
+    }
+
+
 # Agent tools that create or reshape unattended work. The builder injects
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
@@ -886,6 +903,15 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "opencode native tools (bash, edit, read, grep, glob), "
         "Goose native tools (developer__shell and the developer__* file tools), "
         "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
+        "params_schema": None,
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.ask_on_instruction_layer_update",
+        "kind": "callable",
+        "name": "Global Instructions Update Approval",
+        "description": "Asks before changing Global Instructions. Enabled by default even without "
+        "a stored policy. Add this default policy in Settings, then disable it to allow "
+        "updates without this approval; admin authorization and revision checks still apply.",
         "params_schema": None,
     },
     {

@@ -359,6 +359,8 @@ _AGY_ENABLED_TOOLS = [
     "sys_flow_cancel",
     "sys_flow_list",
     "sys_flow_start",
+    "sys_instruction_layer_update",
+    "sys_instruction_layers_read",
     "sys_list_models",
     "sys_os_edit",
     "sys_os_read",

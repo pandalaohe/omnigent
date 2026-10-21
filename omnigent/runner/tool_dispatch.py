@@ -468,6 +468,9 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # Priority 5l: Policy management — sys_add_policy.
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
+_INSTRUCTION_LAYER_TOOLS = frozenset(
+    {"sys_instruction_layers_read", "sys_instruction_layer_update"}
+)
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
@@ -546,6 +549,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _INSTRUCTION_LAYER_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
@@ -1031,6 +1035,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _INSTRUCTION_LAYER_TOOLS
     | _SCHEDULED_TASK_TOOLS
     # The panel tool executes HERE, including on the ``dispatch=None`` path;
     # relaying it upstream would skip the artifacts/open POST.
@@ -6933,6 +6938,55 @@ def _browser_screenshot_output(output: str) -> str:
     )
 
 
+async def _execute_instruction_layer_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Proxy the authenticated settings API without accepting identity arguments."""
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args = json.loads(arguments)
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be an object")
+        if tool_name == "sys_instruction_layer_update":
+            if not {"scope", "text", "expected_revision_id"} <= args.keys():
+                raise ValueError(
+                    "scope, text and expected_revision_id are required; read the layer first"
+                )
+            fields = {"scope", "agent_key", "host_id", "text", "expected_revision_id"}
+            if args.keys() - fields:
+                raise ValueError("unexpected update arguments")
+            response = await server_client.put("/v1/instruction-layers", json=args, timeout=30.0)
+        else:
+            mode = args.pop("mode", None)
+            routes = {
+                "layers": ("", set()),
+                "revisions": ("/revisions", {"scope", "agent_key", "host_id", "limit"}),
+                "preview": (
+                    "/preview",
+                    {"host_id", "agent_key", "session_id", "child", "spawn", "peer"},
+                ),
+            }
+            if mode not in routes:
+                raise ValueError("mode must be layers, revisions or preview")
+            suffix, fields = routes[mode]
+            if args.keys() - fields:
+                raise ValueError("unexpected arguments for read mode")
+            response = await server_client.get(
+                "/v1/instruction-layers" + suffix, params=args, timeout=30.0
+            )
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"server returned {response.status_code}", "details": response.text}
+            )
+        return json.dumps(response.json())
+    except (ValueError, httpx.HTTPError) as exc:
+        return json.dumps({"error": f"{tool_name}: {exc}"})
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -9945,6 +9999,10 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
+            )
+        elif tool_name in _INSTRUCTION_LAYER_TOOLS:
+            output = await _execute_instruction_layer_tool(
+                tool_name, arguments, server_client=server_client
             )
         elif tool_name in _POLICY_TOOLS:
             output = await _execute_policy_tool(
