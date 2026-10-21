@@ -27,6 +27,11 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
+from omnigent.server.session_overrides import (
+    AGENT_TEMPLATE_ID_LABEL,
+    harness_for_session,
+    resolve_override,
+)
 from omnigent.server.user_preferences_store import (
     ChildFreezeSettings,
     ChildIdleSettings,
@@ -227,9 +232,24 @@ class ChildIdleSweeper:
         live = turn_activity.snapshot_for(conv.id)
         return live is None or not live.active or bool(live.tools)
 
-    def _signal(self, conv: Conversation, settings: ChildIdleSettings) -> str | None:
+    def _freeze_for(
+        self,
+        conv: Conversation,
+        settings: ChildIdleSettings,
+        harness_cache: dict[str, str | None],
+    ) -> ChildFreezeSettings:
+        return resolve_override(
+            settings.agents,
+            settings.freeze_default,
+            template_id=conv.labels.get(AGENT_TEMPLATE_ID_LABEL),
+            agent_id=conv.agent_id,
+            harness=harness_for_session(conv, harness_cache),
+        )
+
+    def _signal(
+        self, conv: Conversation, settings: ChildIdleSettings, row: ChildFreezeSettings
+    ) -> str | None:
         status = _session_status_from_cache(conv.id, conv.live_status)
-        row = settings.agents.get(conv.agent_id or "", ChildFreezeSettings())
         if row.enabled:
             try:
                 live = (
@@ -260,7 +280,11 @@ class ChildIdleSweeper:
         return None
 
     def _observe(
-        self, conv: Conversation, settings: ChildIdleSettings, now: int
+        self,
+        conv: Conversation,
+        settings: ChildIdleSettings,
+        now: int,
+        harness_cache: dict[str, str | None],
     ) -> _IdleState | None:
         fresh = self._store.get_conversation(conv.id)
         if fresh is None or self._parent(fresh) is None:
@@ -268,7 +292,7 @@ class ChildIdleSweeper:
         conv = fresh
         raw = conv.labels.get(CHILD_IDLE_LABEL)
         state = _IdleState.parse(raw)
-        row = settings.agents.get(conv.agent_id or "", ChildFreezeSettings())
+        row = self._freeze_for(conv, settings, harness_cache)
         eligible = (
             (settings.enabled or row.enabled)
             and not conv.archived
@@ -296,7 +320,7 @@ class ChildIdleSweeper:
             and not state.queued
         ):
             return None
-        signal = self._signal(conv, settings) if eligible else None
+        signal = self._signal(conv, settings, row) if eligible else None
         eligible = eligible and signal is not None
         if not eligible:
             if raw is not None:
@@ -338,6 +362,7 @@ class ChildIdleSweeper:
 
     async def _tick(self) -> None:
         async with self._tick_lock:
+            harness_cache: dict[str, str | None] = {}
             groups: dict[str, list[Conversation]] = {}
             settings_by_owner: dict[str, ChildIdleSettings] = {}
             settings_by_parent: dict[str, ChildIdleSettings] = {}
@@ -357,6 +382,7 @@ class ChildIdleSweeper:
                     settings = settings_by_owner[owner]
                     if (
                         settings.enabled
+                        or settings.freeze_default.enabled
                         or any(row.enabled for row in settings.agents.values())
                         or CHILD_IDLE_LABEL in child.labels
                         or CHILD_RESUME_LABEL in child.labels
@@ -368,7 +394,7 @@ class ChildIdleSweeper:
             for parent_id, children in groups.items():
                 settings = settings_by_parent[parent_id]
                 try:
-                    await self._notify(parent_id, children, settings)
+                    await self._notify(parent_id, children, settings, harness_cache)
                 except Exception:
                     _logger.exception("Could not notify mother %s of idle children", parent_id)
 
@@ -377,12 +403,13 @@ class ChildIdleSweeper:
         parent_id: str,
         children: list[Conversation],
         settings: ChildIdleSettings,
+        harness_cache: dict[str, str | None],
     ) -> None:
         claim = await asyncio.to_thread(self._claim_batch, parent_id)
         if claim is None:
             return
         try:
-            await self._notify_claimed(parent_id, children, settings, claim)
+            await self._notify_claimed(parent_id, children, settings, claim, harness_cache)
         finally:
             await asyncio.to_thread(
                 self._store.compare_and_set_label, parent_id, CHILD_IDLE_BATCH_LABEL, claim, None
@@ -410,6 +437,7 @@ class ChildIdleSweeper:
         children: list[Conversation],
         settings: ChildIdleSettings,
         claim: str,
+        harness_cache: dict[str, str | None],
     ) -> None:
         now = self._clock()
         current: list[tuple[Conversation, _IdleState]] = []
@@ -420,9 +448,9 @@ class ChildIdleSweeper:
             parent = await asyncio.to_thread(self._parent, fresh)
             if parent is None:
                 continue
-            state = await asyncio.to_thread(self._observe, fresh, settings, now)
+            state = await asyncio.to_thread(self._observe, fresh, settings, now, harness_cache)
             if state is not None and state.queued:
-                row = settings.agents.get(fresh.agent_id or "", ChildFreezeSettings())
+                row = await asyncio.to_thread(self._freeze_for, fresh, settings, harness_cache)
                 if (
                     state.signal == "transient_error"
                     and row.resume_once

@@ -202,7 +202,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Pi",
     iconKind: "pi",
     sortRank: 40,
-    capabilities: ["modelPicker", "agyPermissionTier"],
+    capabilities: ["modelPicker"],
   },
   {
     key: "kiro",
@@ -227,7 +227,6 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,
-    capabilities: ["agyPermissionTier", "agyMode"],
   },
   {
     key: "goose",

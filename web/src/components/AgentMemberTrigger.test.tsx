@@ -89,4 +89,49 @@ describe("AgentMemberTrigger", () => {
     openTrigger();
     expect(screen.queryByTestId("agent-member-host")).toBeNull();
   });
+
+  it("groups registry harness choices by their declared section", () => {
+    renderTrigger("plugin-sdk", {
+      harnessOptions: [
+        { id: "native-x", label: "Native X", section: "native" },
+        { id: "plugin-sdk", label: "Plugin SDK", section: "sdk" },
+      ],
+    });
+    openTrigger();
+    fireEvent.click(screen.getByTestId("agent-member-harness"));
+    expect(screen.getByTestId("agent-member-harness-options-native")).toHaveTextContent("Native X");
+    expect(screen.getByTestId("agent-member-harness-options-sdk")).toHaveTextContent("Plugin SDK");
+  });
+
+  it("hides undeployed choices until revealed while keeping the saved choice visible", () => {
+    const onChange = vi.fn();
+    renderTrigger("saved-sdk", {
+      harnessOptions: [
+        { id: "ready-sdk", label: "Ready SDK", section: "sdk", deployed: true },
+        { id: "saved-sdk", label: "Saved SDK", section: "sdk", deployed: false },
+        { id: "other-sdk", label: "Other SDK", section: "sdk", deployed: false },
+      ],
+      onChange,
+    });
+    openTrigger();
+    fireEvent.click(screen.getByTestId("agent-member-harness"));
+    expect(screen.getByTestId("agent-member-harness-saved-sdk")).toHaveTextContent(
+      "Saved SDK · not deployed",
+    );
+    expect(screen.queryByTestId("agent-member-harness-other-sdk")).toBeNull();
+    expect(screen.getByTestId("agent-member-show-undeployed")).toHaveTextContent(
+      "Show 1 not deployed",
+    );
+    fireEvent.click(screen.getByTestId("agent-member-show-undeployed"));
+    expect(screen.getByTestId("agent-member-harness-other-sdk")).toHaveTextContent(
+      "Other SDK · not deployed",
+    );
+    fireEvent.click(screen.getByTestId("agent-member-harness-other-sdk"));
+    expect(onChange).toHaveBeenCalledWith({
+      harness: "other-sdk",
+      model: null,
+      effort: null,
+      hostId: null,
+    });
+  });
 });

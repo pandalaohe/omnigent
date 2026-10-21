@@ -4,6 +4,12 @@ import { PinIcon, PinOffIcon, PlusIcon } from "lucide-react";
 
 import { AgentEditor, BuiltinAgentView, memberSettings } from "@/components/AgentEditor";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  SECTION_LABELS,
+  SECTION_ORDER,
+  useAgentRegistry,
+  type SectionId,
+} from "@/hooks/useAgentRegistry";
 import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import {
   readAgentBadgePreferences,
@@ -141,6 +147,7 @@ export function AgentsSettings() {
   const queryClient = useQueryClient();
   const catalog = useCustomAgents();
   const available = useAvailableAgents();
+  const registry = useAgentRegistry();
   const harnessLabels = useBrainHarnessLabels();
   // The Built-in list is the picker's built-in partition, harness rows
   // included; only the member-Agent rows carry the layer's controls.
@@ -206,6 +213,41 @@ export function AgentsSettings() {
   const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const query = search.trim().toLocaleLowerCase();
+  const matches = (name: string, description?: string | null, harness?: string | null) =>
+    query === "" ||
+    `${name} ${description ?? ""} ${harness ?? ""}`.toLocaleLowerCase().includes(query);
+  const registryItemFor = (agent: AvailableAgent) =>
+    registry.legacyProducts[agent.id] ??
+    registry.items.find((item) => item.key === agent.id) ??
+    (agent.product_of
+      ? registry.items.find((item) => item.key === `harness:${agent.product_of}`)
+      : undefined);
+  const sectionForBuiltin = (agent: AvailableAgent): SectionId =>
+    registryItemFor(agent)?.section ??
+    (isNativeCodingAgent(agent)
+      ? "native"
+      : isSdkAgent(agent)
+        ? "sdk"
+        : isAcpHarnessAgent(agent)
+          ? "acp"
+          : "builtin");
+  const visibleBuiltinAgents = builtinAgents.filter((agent) =>
+    matches(agent.display_name, agent.description, agent.harness),
+  );
+  const builtinSections = SECTION_ORDER.filter((section) => section !== "yours")
+    .map((section) => ({
+      section,
+      agents: visibleBuiltinAgents.filter((agent) => sectionForBuiltin(agent) === section),
+    }))
+    .filter((group) => group.agents.length > 0);
+  const visibleInstalledAgents = installedAgents.filter((agent) =>
+    matches(agent.display_name, agent.description, agent.harness),
+  );
+  const visibleCustomAgents = customAgentRows.filter((agent) =>
+    matches(agent.name, agent.description, agent.harness),
+  );
 
   async function refresh() {
     await Promise.all([
@@ -217,6 +259,9 @@ export function AgentsSettings() {
   const importedNames = new Set(catalog.data?.map((agent) => agent.name));
   const sessionAgents = (available.data ?? []).filter(
     (agent) => agent.sessionId && !agent.templateId && !importedNames.has(agent.name),
+  );
+  const visibleSessionAgents = sessionAgents.filter((agent) =>
+    matches(agent.display_name, agent.description, agent.harness),
   );
 
   async function importAgent(agent: AvailableAgent) {
@@ -255,6 +300,12 @@ export function AgentsSettings() {
       <div>
         <h1 className="settings-page-title text-2xl font-semibold">Custom agents</h1>
       </div>
+      <Input
+        aria-label="Search agents"
+        placeholder="Search agents"
+        value={search}
+        onChange={(event) => setSearch(event.target.value)}
+      />
       <div>
         <h2 className="mb-2 text-sm text-muted-foreground">Built-in</h2>
         {available.isLoading && (
@@ -267,70 +318,77 @@ export function AgentsSettings() {
             {errorText(available.error)}
           </p>
         )}
-        {builtinAgents.map((agent) => {
-          const memberControls = isMemberBuiltin(agent);
-          return (
-            <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
-              <AgentBadge agentId={agent.id} />
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm">{agent.display_name}</div>
-                {memberControls && (
-                  <div className="truncate text-xs text-muted-foreground">
-                    {builtinSubtitle(agent)}
+        {builtinSections.map(({ section, agents }) => (
+          <div key={section}>
+            <h3 className="border-b py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              {SECTION_LABELS[section]}
+            </h3>
+            {agents.map((agent) => {
+              const memberControls = isMemberBuiltin(agent);
+              return (
+                <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
+                  <AgentBadge agentId={agent.id} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm">{agent.display_name}</div>
+                    {memberControls && (
+                      <div className="truncate text-xs text-muted-foreground">
+                        {builtinSubtitle(agent)}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-              {memberControls && !isSdkAgent(agent) && (
-                <PinToggle
-                  agentId={agent.id}
-                  name={agent.display_name}
-                  pinned={pinnedIdSet.has(agent.id)}
-                  canPin={!atPinLimit}
-                  ready={pinsReady}
-                  onToggle={togglePin}
-                />
-              )}
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
-                aria-label={`Edit badge for ${agent.display_name}`}
-              >
-                Edit badge
-              </Button>
-              {memberControls && (
-                <>
+                  {memberControls && !isSdkAgent(agent) && (
+                    <PinToggle
+                      agentId={agent.id}
+                      name={agent.display_name}
+                      pinned={pinnedIdSet.has(agent.id)}
+                      canPin={!atPinLimit}
+                      ready={pinsReady}
+                      onToggle={togglePin}
+                    />
+                  )}
                   <Button
                     variant="ghost"
                     size="sm"
-                    aria-label={`View ${agent.display_name}`}
-                    disabled={duplicatingId !== null}
-                    onClick={() => {
-                      setError(null);
-                      setViewing(agent);
-                    }}
+                    onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
+                    aria-label={`Edit badge for ${agent.display_name}`}
                   >
-                    View
+                    Edit badge
                   </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    aria-label={`Duplicate ${agent.display_name}`}
-                    disabled={duplicatingId !== null}
-                    onClick={() => void duplicateBuiltin(agent)}
-                  >
-                    Duplicate
-                  </Button>
-                </>
-              )}
-            </div>
-          );
-        })}
+                  {memberControls && (
+                    <>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`View ${agent.display_name}`}
+                        disabled={duplicatingId !== null}
+                        onClick={() => {
+                          setError(null);
+                          setViewing(agent);
+                        }}
+                      >
+                        View
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`Duplicate ${agent.display_name}`}
+                        disabled={duplicatingId !== null}
+                        onClick={() => void duplicateBuiltin(agent)}
+                      >
+                        Duplicate
+                      </Button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ))}
       </div>
-      {installedAgents.length > 0 && (
+      {visibleInstalledAgents.length > 0 && (
         <div>
           <h2 className="mb-2 text-sm text-muted-foreground">Installed agents</h2>
-          {installedAgents.map((agent) => (
+          {visibleInstalledAgents.map((agent) => (
             <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
               <AgentBadge agentId={agent.id} />
               <div className="min-w-0 flex-1">
@@ -380,10 +438,10 @@ export function AgentsSettings() {
             </Button>
           </div>
         )}
-        {catalog.data?.length === 0 && (
+        {catalog.data?.length === 0 && query === "" && (
           <p className="py-4 text-sm text-muted-foreground">No custom agents yet.</p>
         )}
-        {catalog.data?.map((agent) => {
+        {visibleCustomAgents.map((agent) => {
           const members = agent.members;
           return (
             <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
@@ -444,12 +502,21 @@ export function AgentsSettings() {
           );
         })}
       </div>
-      {sessionAgents.length > 0 && !catalog.error && (
+      {query !== "" &&
+        visibleBuiltinAgents.length === 0 &&
+        visibleInstalledAgents.length === 0 &&
+        visibleCustomAgents.length === 0 &&
+        visibleSessionAgents.length === 0 && (
+          <p role="status" className="text-sm text-muted-foreground">
+            No agents match your search.
+          </p>
+        )}
+      {visibleSessionAgents.length > 0 && !catalog.error && (
         <details className="text-sm">
           <summary className="cursor-pointer text-muted-foreground">
             Import from existing sessions
           </summary>
-          {sessionAgents.map((agent) => (
+          {visibleSessionAgents.map((agent) => (
             <div key={agent.id} className="mt-2 flex items-center gap-2 border-b py-2">
               <AgentBadge agentId={agent.id} />
               <span className="min-w-0 flex-1 truncate">{agent.display_name}</span>

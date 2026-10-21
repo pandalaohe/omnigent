@@ -8,7 +8,12 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
 import { HelpTip } from "@/components/HelpTip";
-import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import {
+  sessionDefaultModeOptions,
+  sessionModeHandler,
+  type HarnessCapabilityMap,
+} from "@/lib/sessionDefaultModes";
+import { useHarnessCapabilities } from "@/lib/agentLabels";
 import { normalizeAgyPermissionTier } from "@/lib/nativeHarnessModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
@@ -44,13 +49,13 @@ import { useHosts, type Host } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isSdkAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
-  CALLING_DEFAULT_HARNESSES,
+  callingDefaultHarnesses,
+  callingDefaultParent,
   callingHarnessLabel,
   resolveProjectInheritedField,
   setCallingDefaultField,
   useCallingDefaults,
   type CallingDefaultField,
-  SDK_NATIVE_PARENT,
 } from "@/lib/callingDefaults";
 import {
   listCallingDefaultCatalogs,
@@ -107,8 +112,10 @@ const DEFAULT_LABELS = {
   confirm: "Save host defaults",
 } as const;
 
-function resetDefaultsHelp(harness: string): string {
-  const native = SDK_NATIVE_PARENT[harness] ? ", then Native project and host defaults" : "";
+function resetDefaultsHelp(harness: string, capabilities?: HarnessCapabilityMap): string {
+  const native = callingDefaultParent(harness, capabilities)
+    ? ", then Native project and host defaults"
+    : "";
   return `Clears this row; model first tries All hosts for the same agent, then all values use this host's Settings defaults${native}, then the agent's own default.`;
 }
 
@@ -623,6 +630,7 @@ export function ProjectSettingsDialog({
   projectName: string;
 }) {
   const queryClient = useQueryClient();
+  const capabilities = useHarnessCapabilities();
   // A label-only folder has no row to read; its config starts empty and the
   // save promotes it. Fetch only runs for a first-class project.
   const { data: stored, isLoading, isError } = useProjectConfig(open ? projectId : null);
@@ -928,7 +936,10 @@ export function ProjectSettingsDialog({
         if (row.hostId !== rowHostId) return row;
         const current = row.harnesses[harness] ?? { model: null, effort: null };
         const next = { ...current, [field]: value };
-        if (field === "model" && (harness === "codex" || harness === "codex-native")) {
+        if (
+          field === "model" &&
+          sessionModeHandler(harness, "speed", capabilities) === "codex-service-tier"
+        ) {
           const models = catalogFor(catalogs, rowHostId, harness)?.models ?? [];
           if (next.speed) {
             const effectiveModel = value ?? inheritedFor(row, harness, "model").value;
@@ -1231,13 +1242,14 @@ export function ProjectSettingsDialog({
       harness,
       field,
       row.agentId ?? agentId,
+      capabilities,
     );
 
   const inheritedFieldLabel = (row: HostRowDraft, harness: string, field: CallingDefaultField) => {
     const inherited = inheritedFor(row, harness, field).value ?? null;
     const normalizedPermission = normalizeAgyPermissionTier(inherited);
     const value =
-      field === "permission" && ["antigravity-native", "pi", "pi-native"].includes(harness)
+      field === "permission" && sessionModeHandler(harness, field, capabilities) === "agy-tier"
         ? normalizedPermission === "full"
           ? "auto"
           : (normalizedPermission ?? null)
@@ -1249,9 +1261,14 @@ export function ProjectSettingsDialog({
     const effectiveModel =
       row.harnesses[harness]?.model ?? inheritedFor(row, harness, "model").value;
     return (
-      sessionDefaultModeOptions(harness, field, models, effectiveModel).find(
-        (option) => option.value === value,
-      )?.label ?? value
+      sessionDefaultModeOptions(
+        harness,
+        field,
+        models,
+        effectiveModel,
+        "default",
+        capabilities,
+      ).find((option) => option.value === value)?.label ?? value
     );
   };
 
@@ -1313,6 +1330,7 @@ export function ProjectSettingsDialog({
       harness,
       "model",
       targetAgent,
+      capabilities,
     ).value;
     let targetModel = targetSet.model ?? inheritedModel;
     for (const field of CALLING_FIELDS) {
@@ -1329,10 +1347,22 @@ export function ProjectSettingsDialog({
           : field === "effort"
             ? (effortLevelsFor(harness, options, targetModel ?? null)?.length ?? 0) > 0 &&
               effortLevelsFor(harness, options, targetModel ?? null)?.includes(value) === true
-            : sessionDefaultModeOptions(harness, field, options, targetModel ?? null).length > 0 &&
-              sessionDefaultModeOptions(harness, field, options, targetModel ?? null).some(
-                (option) => option.value === value,
-              );
+            : sessionDefaultModeOptions(
+                harness,
+                field,
+                options,
+                targetModel ?? null,
+                "default",
+                capabilities,
+              ).length > 0 &&
+              sessionDefaultModeOptions(
+                harness,
+                field,
+                options,
+                targetModel ?? null,
+                "default",
+                capabilities,
+              ).some((option) => option.value === value);
       if (!supported) {
         skipped.push(`${field} unavailable`);
         continue;
@@ -1720,7 +1750,8 @@ export function ProjectSettingsDialog({
           </div>
         </Field>
         {(["speed", "permission"] as const).map((field) =>
-          sessionDefaultModeOptions(harness, field, models, effectiveModel).length > 0 ? (
+          sessionDefaultModeOptions(harness, field, models, effectiveModel, "default", capabilities)
+            .length > 0 ? (
             <Field key={field} label={field === "speed" ? "Speed" : "Permission"}>
               <div className="flex min-w-0 gap-1">
                 <SessionDefaultModeSelect
@@ -1729,6 +1760,7 @@ export function ProjectSettingsDialog({
                   value={set[field]}
                   models={models}
                   model={effectiveModel}
+                  capabilities={capabilities}
                   inheritLabel={inheritedFieldLabel(row, harness, field)}
                   label={field === "speed" ? "Speed" : "Permission"}
                   testId={`project-settings-host-${field}-${row.hostId}`}
@@ -1759,7 +1791,9 @@ export function ProjectSettingsDialog({
           >
             {DEFAULT_LABELS.reset}
           </Button>
-          <HelpTip label={DEFAULT_LABELS.resetHelp}>{resetDefaultsHelp(harness)}</HelpTip>
+          <HelpTip label={DEFAULT_LABELS.resetHelp}>
+            {resetDefaultsHelp(harness, capabilities)}
+          </HelpTip>
         </div>
         <DropdownMenu
           open={moreOpenFor === pairKey(row.hostId, harness)}
@@ -1962,7 +1996,7 @@ export function ProjectSettingsDialog({
     const otherRows = Object.entries(row.harnesses).filter(
       ([harness]) => harness !== selectedHarness,
     );
-    const candidates = CALLING_DEFAULT_HARNESSES.filter(
+    const candidates = callingDefaultHarnesses(capabilities).filter(
       (harness) => harness !== selectedHarness && !(harness in row.harnesses),
     );
     if (otherRows.length === 0 && candidates.length === 0) return null;

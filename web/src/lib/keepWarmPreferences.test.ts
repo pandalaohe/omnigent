@@ -4,16 +4,15 @@ const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
 vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatchMock }));
 
 import {
-  clampHostOfflineArchiveSeconds,
-  clampKeepWarmColdAfterSeconds,
-  clampKeepWarmIntervalSeconds,
-  clampKeepWarmMaxSeconds,
   KEEP_WARM_DEFAULTS,
   KEEP_WARM_STORAGE_KEY,
-  planKeepWarmCopy,
+  clampHostOfflineArchiveSeconds,
+  clampKeepWarmIntervalSeconds,
+  keepWarmFamilyForHarness,
   readKeepWarmPreferences,
   resolveKeepWarmAgent,
   setKeepWarmAgent,
+  setKeepWarmDefault,
   writeKeepWarmPreferences,
 } from "./keepWarmPreferences";
 import { SESSION_COLLAB_STORAGE_KEY } from "./sessionCollabPreferences";
@@ -23,374 +22,165 @@ afterEach(() => {
   queuePatchMock.mockReset();
 });
 
-const NATIVE_CLAUDE = [{ id: "claude-native-ui", harness: "claude-native" }];
-
 describe("keep-warm preferences", () => {
-  it("defaults to no agent rows with a four-hour host archive delay", () => {
+  it("uses one off default, no exception rows, and a four-hour archive delay", () => {
     expect(readKeepWarmPreferences()).toEqual(KEEP_WARM_DEFAULTS);
-    expect(readKeepWarmPreferences()).toEqual({ agents: {}, hostOfflineArchiveSeconds: 14400 });
+    expect(readKeepWarmPreferences().default).toEqual({
+      main: false,
+      child: false,
+      maxSeconds: 14400,
+    });
     expect(localStorage.getItem(KEEP_WARM_STORAGE_KEY)).toBeNull();
   });
 
-  it("clamps intervals per family and the shared cap and archive bounds", () => {
-    expect(clampKeepWarmIntervalSeconds("claude", 100)).toBe(300);
-    expect(clampKeepWarmIntervalSeconds("claude", 99999)).toBe(3540);
-    expect(clampKeepWarmIntervalSeconds("codex", 100)).toBe(300);
+  it("recognizes only declared keep-warm families", () => {
+    const capabilities = {
+      "plugin-cli": { keep_warm_family: "claude" },
+      codex: { keep_warm_family: "codex" },
+      "claude-native": { keep_warm_family: null },
+      other: { keep_warm_family: "unknown" },
+    };
+    expect(keepWarmFamilyForHarness("plugin-cli", capabilities)).toBe("claude");
+    expect(keepWarmFamilyForHarness("codex", capabilities)).toBe("codex");
+    expect(keepWarmFamilyForHarness("claude-native", capabilities)).toBeNull();
+    expect(keepWarmFamilyForHarness("other", capabilities)).toBeNull();
+    expect(keepWarmFamilyForHarness("missing", capabilities)).toBeNull();
+  });
+
+  it("stores the shared default without an interval and resolves absent exceptions by family", () => {
+    const next = setKeepWarmDefault(KEEP_WARM_DEFAULTS, {
+      main: true,
+      child: true,
+      maxSeconds: 7200,
+      coldAfterSeconds: 0,
+    });
+    expect(next.default).toEqual({
+      main: true,
+      child: true,
+      maxSeconds: 7200,
+      coldAfterSeconds: 0,
+    });
+    expect(resolveKeepWarmAgent(next, "missing", "claude")).toEqual({
+      main: true,
+      child: true,
+      intervalSeconds: 3300,
+      maxSeconds: 7200,
+      coldAfterSeconds: 0,
+    });
+    expect(resolveKeepWarmAgent(next, "missing", "codex").intervalSeconds).toBe(1500);
+    writeKeepWarmPreferences(next);
+    expect(readKeepWarmPreferences()).toEqual(next);
+    expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", next);
+  });
+
+  it("keeps raw, ca_, and harness exception keys with per-family interval bounds", () => {
+    let next = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "raw-id", "claude", {
+      main: true,
+      intervalSeconds: 99999,
+    });
+    next = setKeepWarmAgent(next, "ca_custom", "codex", { child: true, intervalSeconds: 60 });
+    next = setKeepWarmAgent(next, "harness:codex-native", "codex", { main: true });
+    expect(next.agents["raw-id"].intervalSeconds).toBe(3540);
+    expect(next.agents.ca_custom.intervalSeconds).toBe(300);
+    expect(next.agents["harness:codex-native"].intervalSeconds).toBe(1500);
+    writeKeepWarmPreferences(next);
+    expect(readKeepWarmPreferences().agents).toEqual(next.agents);
     expect(clampKeepWarmIntervalSeconds("codex", 99999)).toBe(1740);
-    expect(clampKeepWarmMaxSeconds(1)).toBe(3600);
-    expect(clampKeepWarmMaxSeconds(999999)).toBe(172800);
-    expect(clampHostOfflineArchiveSeconds(0)).toBe(0);
-    expect(clampHostOfflineArchiveSeconds(60)).toBe(3600);
-    expect(clampHostOfflineArchiveSeconds(999999)).toBe(172800);
   });
 
-  it("treats an absent agent row as off with the platform cold rule", () => {
-    expect(resolveKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude")).toEqual({
-      main: false,
-      child: false,
-      intervalSeconds: 3300,
-      maxSeconds: 14400,
-      coldAfterSeconds: null,
-    });
-    expect(resolveKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "codex").intervalSeconds).toBe(1500);
-  });
-
-  it("clamps cold-after bounds while 0 stays never cold", () => {
-    expect(clampKeepWarmColdAfterSeconds(0)).toBe(0);
-    expect(clampKeepWarmColdAfterSeconds(30)).toBe(60);
-    expect(clampKeepWarmColdAfterSeconds(3600)).toBe(3600);
-    expect(clampKeepWarmColdAfterSeconds(999999)).toBe(172800);
-  });
-
-  it("applies the family defaults when an agent row is first switched on", () => {
-    const claude = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-claude", "claude", { main: true });
-    expect(claude.agents["agent-claude"]).toEqual({
-      main: true,
-      child: false,
-      intervalSeconds: 3300,
-      maxSeconds: 14400,
-    });
-    const codex = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-codex", "codex", { child: true });
-    expect(codex.agents["agent-codex"]).toEqual({
-      main: false,
-      child: true,
-      intervalSeconds: 1500,
-      maxSeconds: 14400,
-    });
-  });
-
-  it("clamps edited intervals and caps into the family bounds", () => {
-    const next = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude", {
-      main: true,
-      intervalSeconds: 60,
-      maxSeconds: 10,
-    });
-    expect(next.agents["agent-x"]).toMatchObject({ intervalSeconds: 300, maxSeconds: 3600 });
-  });
-
-  it("sets, keeps, and clears coldAfterSeconds", () => {
-    const zero = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude", {
-      coldAfterSeconds: 0,
-    });
-    expect(zero.agents["agent-x"]).toEqual({
-      main: false,
-      child: false,
-      intervalSeconds: 3300,
-      maxSeconds: 14400,
-      coldAfterSeconds: 0,
-    });
-
-    const clamped = setKeepWarmAgent(zero, "agent-x", "claude", { coldAfterSeconds: 30 });
-    expect(clamped.agents["agent-x"].coldAfterSeconds).toBe(60);
-
-    const unrelated = setKeepWarmAgent(clamped, "agent-x", "claude", { main: true });
-    expect(unrelated.agents["agent-x"].coldAfterSeconds).toBe(60);
-
-    const cleared = setKeepWarmAgent(unrelated, "agent-x", "claude", { coldAfterSeconds: null });
-    expect(cleared.agents["agent-x"]).toEqual({
-      main: true,
-      child: false,
-      intervalSeconds: 3300,
-      maxSeconds: 14400,
-    });
-  });
-
-  it("copies only selected compatible values without clamping a Claude interval for Codex", () => {
-    const preferences = {
-      agents: {
-        source: {
-          main: true,
-          child: true,
-          intervalSeconds: 3300,
-          maxSeconds: 7200,
-          coldAfterSeconds: 0,
-        },
-        codex: {
-          main: false,
-          child: false,
-          intervalSeconds: 600,
-          maxSeconds: 3600,
-          coldAfterSeconds: 120,
-        },
-        excluded: { main: false, child: false, intervalSeconds: 600, maxSeconds: 3600 },
-      },
-      hostOfflineArchiveSeconds: 0,
-    };
-    const plan = planKeepWarmCopy(
-      preferences,
-      "source",
-      resolveKeepWarmAgent(preferences, "source", "claude"),
-      [
-        { id: "codex", harness: "codex-native" },
-        { id: "unsupported", harness: "opencode-native" },
-        { id: "excluded", harness: "claude-sdk" },
-      ],
-      new Set(["codex", "unsupported"]),
-      new Set(["main", "child", "intervalSeconds", "maxSeconds", "coldAfterSeconds"] as const),
-    );
-
-    expect(plan.results).toEqual([
-      {
-        agentId: "codex",
-        applied: ["main", "child", "maxSeconds", "coldAfterSeconds"],
-        skipped: [{ field: "intervalSeconds", reason: "Outside 5–29 min for this agent" }],
-      },
-      {
-        agentId: "unsupported",
-        applied: [],
-        skipped: ["main", "child", "intervalSeconds", "maxSeconds", "coldAfterSeconds"].map(
-          (field) => ({ field, reason: "This agent has no keep-warm channel" }),
-        ),
-      },
-    ]);
-    expect(plan.preferences.agents.codex).toEqual({
-      main: true,
-      child: true,
-      intervalSeconds: 600,
-      maxSeconds: 7200,
-      coldAfterSeconds: 0,
-    });
-    expect(plan.preferences.agents.excluded).toEqual(preferences.agents.excluded);
-    expect(plan.preferences.agents.unsupported).toBeUndefined();
-    expect(plan.preferences.hostOfflineArchiveSeconds).toBe(0);
-  });
-
-  it("keeps unchecked fields and can copy auto cold-after to an existing row", () => {
-    const preferences = {
-      agents: {
-        source: { main: false, child: false, intervalSeconds: 1500, maxSeconds: 14400 },
-        target: {
-          main: true,
-          child: true,
-          intervalSeconds: 900,
-          maxSeconds: 7200,
-          coldAfterSeconds: 0,
-        },
-      },
-      hostOfflineArchiveSeconds: 14400,
-    };
-    const plan = planKeepWarmCopy(
-      preferences,
-      "source",
-      resolveKeepWarmAgent(preferences, "source", "codex"),
-      [{ id: "target", harness: "claude-native" }],
-      new Set(["target"]),
-      new Set(["main", "coldAfterSeconds"] as const),
-    );
-    expect(plan.results[0].applied).toEqual(["main", "coldAfterSeconds"]);
-    expect(plan.preferences.agents.target).toEqual({
-      main: false,
-      child: true,
-      intervalSeconds: 900,
-      maxSeconds: 7200,
-    });
-  });
-
-  it("normalizes a stored namespace and clamps the archive delay", () => {
+  it("normalizes a legacy namespace without a default and preserves unsupported rows", () => {
     localStorage.setItem(
       KEEP_WARM_STORAGE_KEY,
       JSON.stringify({
         agents: {
-          good: { main: true, child: "yes", intervalSeconds: 5000, maxSeconds: 10 },
-          garbage: "nope",
+          "old-product": { main: true, child: false, intervalSeconds: 5000, maxSeconds: 10 },
+          "harness:unknown": { child: true, maxSeconds: 7200 },
+          garbage: "invalid",
         },
         hostOfflineArchiveSeconds: 60,
         migratedFromLegacyAt: 123,
       }),
     );
-
     const stored = readKeepWarmPreferences();
-    expect(stored).toEqual({
-      agents: { good: { main: true, child: false, intervalSeconds: 5000, maxSeconds: 10 } },
-      hostOfflineArchiveSeconds: 3600,
-      migratedFromLegacyAt: 123,
-    });
-    expect(resolveKeepWarmAgent(stored, "good", "claude")).toEqual({
-      main: true,
+    expect(stored.default).toEqual(KEEP_WARM_DEFAULTS.default);
+    expect(Object.keys(stored.agents)).toEqual(["old-product", "harness:unknown"]);
+    expect(stored.hostOfflineArchiveSeconds).toBe(3600);
+    expect(stored.migratedFromLegacyAt).toBe(123);
+    expect(resolveKeepWarmAgent(stored, "old-product", "claude").intervalSeconds).toBe(3540);
+    expect(clampHostOfflineArchiveSeconds(0)).toBe(0);
+  });
+
+  it("clamps and clears cold-after on defaults and exceptions", () => {
+    const withCold = setKeepWarmDefault(KEEP_WARM_DEFAULTS, { coldAfterSeconds: 30 });
+    expect(withCold.default.coldAfterSeconds).toBe(60);
+    const created = setKeepWarmAgent(withCold, "agent", "claude", {});
+    expect(created.agents.agent).toEqual({
+      main: false,
       child: false,
-      intervalSeconds: 3540,
-      maxSeconds: 3600,
-      coldAfterSeconds: null,
+      intervalSeconds: 3300,
+      maxSeconds: 14400,
+      coldAfterSeconds: 60,
     });
+    const exception = setKeepWarmAgent(created, "agent", "claude", { coldAfterSeconds: 0 });
+    expect(resolveKeepWarmAgent(exception, "agent", "claude").coldAfterSeconds).toBe(0);
+    const cleared = setKeepWarmAgent(exception, "agent", "claude", { coldAfterSeconds: null });
+    expect(cleared.agents.agent.coldAfterSeconds).toBeUndefined();
+    expect(resolveKeepWarmAgent(cleared, "agent", "claude").coldAfterSeconds).toBeNull();
+    expect(resolveKeepWarmAgent(withCold, "missing", "claude").coldAfterSeconds).toBe(60);
+    expect(
+      setKeepWarmDefault(withCold, { coldAfterSeconds: null }).default.coldAfterSeconds,
+    ).toBeUndefined();
   });
 
-  it("normalizes coldAfterSeconds values from storage", () => {
-    localStorage.setItem(
-      KEEP_WARM_STORAGE_KEY,
-      JSON.stringify({
-        agents: {
-          zero: { coldAfterSeconds: 0 },
-          low: { coldAfterSeconds: 30 },
-          high: { coldAfterSeconds: 999999 },
-          negative: { coldAfterSeconds: -1 },
-          string: { coldAfterSeconds: "5" },
-          float: { coldAfterSeconds: 1.5 },
-          bool: { coldAfterSeconds: true },
-        },
-        hostOfflineArchiveSeconds: 14400,
-      }),
-    );
-
-    const stored = readKeepWarmPreferences();
-    expect(stored.agents.zero.coldAfterSeconds).toBe(0);
-    expect(stored.agents.low.coldAfterSeconds).toBe(60);
-    expect(stored.agents.high.coldAfterSeconds).toBe(172800);
-    expect(resolveKeepWarmAgent(stored, "zero", "claude").coldAfterSeconds).toBe(0);
-    for (const id of ["negative", "string", "float", "bool"]) {
-      expect(stored.agents[id]).toEqual({ main: false, child: false, maxSeconds: 14400 });
-    }
-  });
-
-  it("round-trips a cold-after value through storage", () => {
-    const written = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude", {
-      coldAfterSeconds: 7200,
+  it("mirrors child keep-warm for a native harness exception and the shared default", () => {
+    const exception = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "harness:claude-native", "claude", {
+      child: true,
     });
-    writeKeepWarmPreferences(written, NATIVE_CLAUDE);
-
-    expect(readKeepWarmPreferences()).toEqual(written);
-    expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", written);
-  });
-
-  it("treats a non-object payload as defaults", () => {
-    localStorage.setItem(KEEP_WARM_STORAGE_KEY, '"nope"');
-    expect(readKeepWarmPreferences()).toEqual(KEEP_WARM_DEFAULTS);
-  });
-
-  it("writes the namespace and queues the patch", () => {
-    const next = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude", { main: true });
-    writeKeepWarmPreferences(next, NATIVE_CLAUDE);
-
-    expect(JSON.parse(localStorage.getItem(KEEP_WARM_STORAGE_KEY) ?? "null")).toEqual(next);
-    expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", next);
-  });
-
-  it("clears storage and queues null at defaults", () => {
-    writeKeepWarmPreferences(KEEP_WARM_DEFAULTS);
-
-    expect(localStorage.getItem(KEEP_WARM_STORAGE_KEY)).toBeNull();
-    expect(queuePatchMock).toHaveBeenCalledWith("keep_warm", null);
-  });
-
-  it("mirrors a native child row into the legacy session_collab switch", () => {
-    writeKeepWarmPreferences(
-      {
-        agents: {
-          "claude-native-ui": {
-            main: false,
-            child: true,
-            intervalSeconds: 3300,
-            maxSeconds: 14400,
-          },
-          "claude-sdk": { main: true, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
-        },
-        hostOfflineArchiveSeconds: 14400,
-      },
-      NATIVE_CLAUDE,
-    );
-
+    writeKeepWarmPreferences(exception);
     expect(
       JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").childKeepWarmEnabled,
     ).toBe(true);
-    expect(queuePatchMock).toHaveBeenCalledWith(
-      "session_collab",
-      expect.objectContaining({ childKeepWarmEnabled: true }),
-    );
+    writeKeepWarmPreferences(setKeepWarmDefault(KEEP_WARM_DEFAULTS, { child: true }));
+    expect(
+      JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").childKeepWarmEnabled,
+    ).toBe(true);
   });
 
-  it("mirrors the legacy switch off when only non-native children are warm", () => {
-    writeKeepWarmPreferences(
-      {
-        agents: {
-          "claude-sdk": { main: false, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
-        },
-        hostOfflineArchiveSeconds: 14400,
-      },
-      NATIVE_CLAUDE,
-    );
-
+  it("turns the legacy mirror off when both native harness exceptions override an on default", () => {
+    let preferences = setKeepWarmDefault(KEEP_WARM_DEFAULTS, { child: true });
+    preferences = setKeepWarmAgent(preferences, "harness:claude-native", "claude", {
+      child: false,
+    });
+    preferences = setKeepWarmAgent(preferences, "harness:codex-native", "codex", { child: false });
+    writeKeepWarmPreferences(preferences);
     expect(
       JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").childKeepWarmEnabled,
     ).toBe(false);
-  });
 
-  it("keeps the legacy mirror on an archive-delay save while the only child row is unresolved", () => {
-    localStorage.setItem(
-      SESSION_COLLAB_STORAGE_KEY,
-      JSON.stringify({ childKeepWarmEnabled: true }),
-    );
-
-    writeKeepWarmPreferences(
-      {
-        agents: {
-          "uploaded-agent": { main: false, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
-        },
-        hostOfflineArchiveSeconds: 7200,
-      },
-      [{ id: "uploaded-agent", harness: null }],
-    );
-
+    preferences = setKeepWarmAgent(preferences, "old-product", "claude", { child: true });
+    writeKeepWarmPreferences(preferences, [{ id: "old-product", harness: "claude-native" }]);
     expect(
       JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").childKeepWarmEnabled,
     ).toBe(true);
   });
 
-  it("keeps the legacy mirror when a stored child row is absent from the agent list", () => {
+  it("retains the legacy mirror when an enabled saved row cannot be classified", () => {
     localStorage.setItem(
       SESSION_COLLAB_STORAGE_KEY,
-      JSON.stringify({ childKeepWarmEnabled: true }),
+      JSON.stringify({ childKeepWarmEnabled: true, childKeepWarmClaudeIntervalSeconds: 3000 }),
     );
-
     writeKeepWarmPreferences(
-      {
-        agents: {
-          "removed-agent": { main: false, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
-        },
-        hostOfflineArchiveSeconds: 7200,
-      },
-      NATIVE_CLAUDE,
+      setKeepWarmAgent(KEEP_WARM_DEFAULTS, "removed-agent", "claude", { child: true }),
     );
-
-    expect(
-      JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").childKeepWarmEnabled,
-    ).toBe(true);
-  });
-
-  it("preserves every existing legacy key while mirroring", () => {
-    localStorage.setItem(
-      SESSION_COLLAB_STORAGE_KEY,
-      JSON.stringify({
-        enabled: false,
-        childKeepWarmEnabled: true,
-        childKeepWarmClaudeIntervalSeconds: 3000,
-      }),
-    );
-
-    writeKeepWarmPreferences(KEEP_WARM_DEFAULTS, NATIVE_CLAUDE);
-
-    expect(JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}")).toEqual({
-      enabled: false,
+    expect(JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}")).toMatchObject({
+      childKeepWarmEnabled: true,
+      childKeepWarmClaudeIntervalSeconds: 3000,
+    });
+    writeKeepWarmPreferences(KEEP_WARM_DEFAULTS);
+    expect(JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}")).toMatchObject({
       childKeepWarmEnabled: false,
       childKeepWarmClaudeIntervalSeconds: 3000,
     });
+    expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", null);
   });
 });

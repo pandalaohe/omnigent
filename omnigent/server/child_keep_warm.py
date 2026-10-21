@@ -6,7 +6,7 @@ a full prompt rewrite. This background loop keeps an eligible session warm by
 forwarding one ``keep_warm_ping`` control to its runner at last-cache-touch +
 interval, for at most the configured cap after the session's last real turn.
 It covers main sessions and sub-agent children on harnesses with a keep-warm
-channel (``_SUPPORTED_HARNESSES``), runs server-side (independent of any
+channel (declared in the harness registry), runs server-side (independent of any
 browser connection), and gates every ping on the owner's per-agent keep-warm
 settings, the runner's liveness, the host's ``keep_warm_v1`` capability, and
 a server pre-filter that skips sessions with a pending synchronous card.
@@ -51,6 +51,7 @@ from typing import Any, Literal, NamedTuple
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
+from omnigent.harness_plugins import harness_capabilities
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runtime.pending_elicitations import snapshot_for
 from omnigent.server.routes._sessions.common import (
@@ -71,7 +72,6 @@ from omnigent.server.routes._sessions.helpers import (
     _inherited_placement,
     _prune_session_read_state,
     _publish_child_status_to_parent,
-    _resolve_harness,
     _session_status_from_cache,
     effective_host_id,
 )
@@ -79,6 +79,11 @@ from omnigent.server.session_collab import collab_owner_for, collab_owners_for
 from omnigent.server.session_live_state import (
     LAST_REAL_TURN_SETTLED_LABEL_KEY,
     RUNNING_SINCE_LABEL_KEY,
+)
+from omnigent.server.session_overrides import (
+    AGENT_TEMPLATE_ID_LABEL,
+    harness_for_session,
+    resolve_override,
 )
 from omnigent.server.user_preferences_store import (
     KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S,
@@ -117,17 +122,9 @@ _MAX_PARENT_HOPS = 32
 _CLAUDE_TTL_S = 3600
 #: Codex reports no cache TTL; an observation older than this proves nothing.
 _CODEX_DEFAULT_STALENESS_S = 1800
-#: Only Claude and Codex sessions have a provider cache worth keeping. This
-#: map is the single place a later keep-warm channel registers.
-_SUPPORTED_HARNESSES: dict[str, Literal["claude", "codex"]] = {
-    "claude-native": "claude",
-    "claude-sdk": "claude",
-    "codex-native": "codex",
-    "codex": "codex",
-}
 #: The legacy settings predate keep-warm channels beyond the two native
 #: CLIs, so the one-time migration only ever covers those agents — never an
-#: SDK harness that joined ``_SUPPORTED_HARNESSES`` later.
+#: SDK harness that joined the registry later.
 _MIGRATION_HARNESSES: dict[str, Literal["claude", "codex"]] = {
     "claude-native": "claude",
     "codex-native": "codex",
@@ -514,9 +511,9 @@ def warm_state_from_label(
     if archived:
         return None
     if family is None:
-        if harness not in _SUPPORTED_HARNESSES:
+        family = _server_keep_warm_family_for_harness(harness)
+        if family is None:
             return None
-        family = _SUPPORTED_HARNESSES[harness]
     if cold_after_s == 0:
         return "warm"
     if busy:
@@ -577,7 +574,18 @@ def keep_warm_family_for_harness(harness: str | None) -> Literal["claude", "code
     """
     if harness in ("pi", "pi-native"):
         return "pi"
-    return _SUPPORTED_HARNESSES.get(harness or "")
+    return _server_keep_warm_family_for_harness(harness)
+
+
+def _server_keep_warm_family_for_harness(
+    harness: str | None,
+) -> Literal["claude", "codex"] | None:
+    """Pi reports its own cache state and never joins server control pings."""
+    if harness is None:
+        return None
+    record = harness_capabilities().get(harness)
+    family = record.keep_warm_family if record is not None else None
+    return family if family == "claude" or family == "codex" else None
 
 
 def pi_cache_label(ttl_s: int, observed_at: int, cache_read: int, cache_write: int) -> str:
@@ -626,11 +634,16 @@ def pi_cache_warming_allowed(conv: Conversation, settings: KeepWarmSettings, now
         or is_session_closed(conv.labels, conv.title)
         or conv.labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS
         or _has_sync_pending(conv.id)
-        or conv.agent_id is None
     ):
         return False
-    row = settings.agents.get(conv.agent_id)
-    if row is None or not (row.child if conv.parent_conversation_id else row.main):
+    row = resolve_override(
+        settings.agents,
+        settings.default,
+        template_id=conv.labels.get(AGENT_TEMPLATE_ID_LABEL),
+        agent_id=conv.agent_id,
+        harness=harness_for_session(conv, {}),
+    )
+    if not (row.child if conv.parent_conversation_id else row.main):
         return False
     started_at = _running_since(conv)
     if started_at is None or started_at > now:
@@ -726,20 +739,28 @@ def warm_state_for_labels(
     )
 
 
-def cold_after_for_agent(settings: KeepWarmSettings, agent_id: str | None) -> int | None:
+def cold_after_for_agent(
+    settings: KeepWarmSettings,
+    agent_id: str | None,
+    *,
+    template_id: str | None = None,
+    harness: str | None = None,
+) -> int | None:
     """
-    Return the agent row's cold-after seconds, ignoring the main/child switches.
+    Return the selected row's cold-after seconds, ignoring its switches.
 
     :param settings: The owner's resolved keep-warm settings.
     :param agent_id: Agent whose row applies, or ``None``.
     :returns: The stored ``cold_after_s`` (``0`` = never cold), or ``None``
-        when the agent id or its row is absent.
+        for the per-family rule.
     """
-    if agent_id is None:
-        return None
-    row = settings.agents.get(agent_id)
-    if row is None:
-        return None
+    row = resolve_override(
+        settings.agents,
+        settings.default,
+        template_id=template_id,
+        agent_id=agent_id,
+        harness=harness,
+    )
     return row.cold_after_s
 
 
@@ -896,14 +917,14 @@ _sweeper: ChildKeepWarmSweeper | None = None
 
 def cold_after_for_session(conv: Conversation) -> int | None:
     """
-    Read the session agent's cold-after seconds for an off-request publisher.
+    Read the session's cold-after seconds for an off-request publisher.
 
     Blocking: the caller is the live-state worker thread, which already does
     the store reads for its publish. Reads as the per-family rule (``None``)
     when no sweeper is started, it has no app, or the lookup fails.
 
     :param conv: The session row whose agent setting applies.
-    :returns: The agent row's ``cold_after_s`` (``0`` = never cold), or
+    :returns: The selected row's ``cold_after_s`` (``0`` = never cold), or
         ``None``.
     """
     sweeper = _sweeper
@@ -1258,7 +1279,7 @@ class ChildKeepWarmSweeper:
                 self._migrated_owners.add(owner)
         settings = await asyncio.to_thread(read_keep_warm_settings, preferences_store, owner)
         max_low, max_high = KEEP_WARM_MAX_BOUNDS_S
-        for row in settings.agents.values():
+        for row in (*settings.agents.values(), settings.default):
             clamped = min(max(row.max_s, max_low), max_high)
             self._scan_window_s = max(self._scan_window_s, clamped + _SLACK_S)
             # A session untouched for N can still need a tick when its N edge
@@ -1270,7 +1291,7 @@ class ChildKeepWarmSweeper:
 
     def cold_after_for(self, conv: Conversation, preferences_store: Any) -> int | None:
         """
-        Read the session agent's cold-after seconds; ``None`` on any failure.
+        Read the session's cold-after seconds; ``None`` on any failure.
 
         Blocking: callers run it in a thread. The owner's main/child switches
         never apply here. Any read failure logs and reads as the platform
@@ -1278,7 +1299,7 @@ class ChildKeepWarmSweeper:
 
         :param conv: The session row whose agent setting applies.
         :param preferences_store: Preferences store, or ``None``.
-        :returns: The agent row's ``cold_after_s`` (``0`` = never cold), or
+        :returns: The selected row's ``cold_after_s`` (``0`` = never cold), or
             ``None``.
         """
         return self.cold_after_for_many([conv], preferences_store).get(conv.id)
@@ -1298,7 +1319,7 @@ class ChildKeepWarmSweeper:
 
         :param convs: Session rows whose agent settings apply.
         :param preferences_store: Preferences store, or ``None``.
-        :returns: Map from conversation id to the agent row's ``cold_after_s``
+        :returns: Map from conversation id to the selected row's ``cold_after_s``
             (``0`` = never cold), or ``None``.
         """
         by_session: dict[str, int | None] = {}
@@ -1310,6 +1331,8 @@ class ChildKeepWarmSweeper:
             _logger.warning("Keep-warm cold-after owner batch failed", exc_info=True)
             return {conv.id: None for conv in convs}
         settings_by_owner: dict[str, KeepWarmSettings | None] = {}
+        harness_cache: dict[str, str | None] = {}
+        bundles: dict[str, Any | None] = {}
         for conv in convs:
             owner = owner_by_session.get(conv.id)
             if owner is None:
@@ -1324,8 +1347,29 @@ class ChildKeepWarmSweeper:
                     )
                     settings_by_owner[owner] = None
             settings = settings_by_owner[owner]
-            by_session[conv.id] = (
-                None if settings is None else cold_after_for_agent(settings, conv.agent_id)
+            if settings is None:
+                by_session[conv.id] = None
+                continue
+            template_id = conv.labels.get(AGENT_TEMPLATE_ID_LABEL)
+            if template_id in settings.agents:
+                by_session[conv.id] = settings.agents[template_id].cold_after_s
+                continue
+            if conv.agent_id in settings.agents:
+                by_session[conv.id] = settings.agents[conv.agent_id].cold_after_s
+                continue
+            if not any(key.startswith("harness:") for key in settings.agents):
+                by_session[conv.id] = settings.default.cold_after_s
+                continue
+            try:
+                harness = harness_for_session(conv, harness_cache, bundles=bundles)
+            except Exception:  # noqa: BLE001 — one bundle must not sink the batch
+                _logger.warning("Keep-warm harness read failed for %s", conv.id, exc_info=True)
+                harness = None
+            by_session[conv.id] = cold_after_for_agent(
+                settings,
+                conv.agent_id,
+                template_id=template_id,
+                harness=harness,
             )
         return by_session
 
@@ -1373,12 +1417,6 @@ class ChildKeepWarmSweeper:
         except Exception:  # noqa: BLE001 — an unloadable bundle migrates nothing
             return None
         return canonicalize(harness) or harness
-
-    async def _harness_for(self, conv: Conversation, cache: dict[str, str | None]) -> str | None:
-        """Resolve the session's harness (honours ``harness_override``)."""
-        if conv.id not in cache:
-            cache[conv.id] = await asyncio.to_thread(_resolve_harness, conv)
-        return cache[conv.id]
 
     async def _process_session(
         self,
@@ -1430,8 +1468,8 @@ class ChildKeepWarmSweeper:
             return None
 
         mirrored = conv.labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS
-        harness = await self._harness_for(conv, harness_cache)
-        family = _SUPPORTED_HARNESSES.get(harness or "")
+        harness = await asyncio.to_thread(harness_for_session, conv, harness_cache)
+        family = _server_keep_warm_family_for_harness(harness)
         # Stamp the family on every write so later readers derive the warm
         # rule from the label alone.
         if state is not None and family is not None:
@@ -1444,9 +1482,18 @@ class ChildKeepWarmSweeper:
         is_child = conv.parent_conversation_id is not None
         owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
         settings = await self._settings_for(owner, now, settings_cache)
-        cold_after = cold_after_for_agent(settings, conv.agent_id)
-        resolved = keep_warm_for_agent(settings, conv.agent_id, family) if family else None
-        # Absent agent = off; the session's class picks the row's switch.
+        template_id = conv.labels.get(AGENT_TEMPLATE_ID_LABEL)
+        cold_after = cold_after_for_agent(
+            settings, conv.agent_id, template_id=template_id, harness=harness
+        )
+        resolved = (
+            keep_warm_for_agent(
+                settings, conv.agent_id, family, template_id=template_id, harness=harness
+            )
+            if family
+            else None
+        )
+        # The session's class picks the selected row's switch.
         switch_on = resolved is not None and (resolved.child if is_child else resolved.main)
         if resolved is not None:
             interval = resolved.interval_s
@@ -1796,15 +1843,24 @@ class ChildKeepWarmSweeper:
         now = self._clock()
         status = _session_status_from_cache(conv.id, conv.live_status)
         busy = status == "running"
-        harness = await asyncio.to_thread(_resolve_harness, conv)
-        family = _SUPPORTED_HARNESSES.get(harness or "")
+        harness = await asyncio.to_thread(harness_for_session, conv, {})
+        family = _server_keep_warm_family_for_harness(harness)
         if family is not None:
             state.y = family
         is_child = conv.parent_conversation_id is not None
         owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
         settings = await self._settings_for(owner, now, {})
-        cold_after = cold_after_for_agent(settings, conv.agent_id)
-        resolved = keep_warm_for_agent(settings, conv.agent_id, family) if family else None
+        template_id = conv.labels.get(AGENT_TEMPLATE_ID_LABEL)
+        cold_after = cold_after_for_agent(
+            settings, conv.agent_id, template_id=template_id, harness=harness
+        )
+        resolved = (
+            keep_warm_for_agent(
+                settings, conv.agent_id, family, template_id=template_id, harness=harness
+            )
+            if family
+            else None
+        )
         if resolved is not None:
             interval = resolved.interval_s
             staleness_s = resolved.interval_s + _SLACK_S

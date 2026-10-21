@@ -647,3 +647,69 @@ async def test_preview_loads_real_builtin_bundle_and_session_route(
     )
     assert legacy.status_code == 200, legacy.text
     assert legacy.json()["text"] == "Shared marker\n\nHost marker\n\nMother marker"
+
+
+async def test_acp_descriptor_drives_save_preview_size_and_runtime(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.runtime.instruction_layers import agent_key_for_harness
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda: [SimpleNamespace(slug="kilocode", name="Kilo Code")],
+    )
+    _make_user(db_uri, "admin@example.com", is_admin=True)
+    headers = _headers("admin@example.com")
+    auth_client.headers.update(headers)
+    HostStore(db_uri).upsert_on_connect(_OWN_HOST, "laptop", "admin@example.com")
+    text = "x" * 10001
+    saved = await auth_client.put(
+        "/v1/instruction-layers",
+        headers=headers,
+        json={"scope": "agent", "agent_key": "acp:kilocode", "text": text},
+    )
+    assert saved.status_code == 200, saved.text
+    assert any(row["agent_key"] == "acp:kilocode" for row in saved.json()["over_budget_routes"])
+    revision = saved.json()["revision_id"]
+    for expected_revision, succeeds in [(revision, True), (revision, False)]:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_instruction_layer_update",
+                arguments=json.dumps(
+                    {
+                        "scope": "agent",
+                        "agent_key": "acp:kilocode",
+                        "text": text,
+                        "expected_revision_id": expected_revision,
+                    }
+                ),
+                server_client=auth_client,
+            )
+        )
+        if succeeds:
+            assert "revision_id" in result, result
+            assert result["revision_id"] != revision, result
+        else:
+            assert result["error"] == "server returned 409", result
+    listing = (await auth_client.get("/v1/instruction-layers", headers=headers)).json()
+    descriptor = next(a for a in listing["agents"] if a["key"] == "acp:kilocode")
+    assert descriptor["harnesses"] == ["acp:kilocode"]
+    assert descriptor["display_name"] == "Kilo Code"
+    preview = await auth_client.get(
+        "/v1/instruction-layers/preview",
+        headers=headers,
+        params={"host_id": _OWN_HOST, "agent_key": "acp:kilocode"},
+    )
+    assert preview.status_code == 200, preview.text
+    assert text in preview.json()["text"]
+    assert preview.json()["subject"]["harness"] == "acp:kilocode"
+    assert agent_key_for_harness("acp:kilocode") == "acp:kilocode"
+    for key in ["none", "missing", "acp:" + "x" * 65]:
+        rejected = await auth_client.put(
+            "/v1/instruction-layers",
+            headers=headers,
+            json={"scope": "agent", "agent_key": key, "text": "refused"},
+        )
+        assert rejected.status_code == 400, rejected.text

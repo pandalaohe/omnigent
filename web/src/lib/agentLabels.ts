@@ -37,13 +37,32 @@ export interface SetupStepWire {
   status_key: string | null;
 }
 
-interface HarnessCatalogRow {
+export interface HarnessCatalogRow {
   id?: string;
   label?: string;
   // Declared capability profile: ``integration_mode`` recognizes the
   // generic-ACP family and ``effort`` names the reasoning-effort ladder, so
   // neither needs vendor ids hardcoded here.
   capabilities?: { integration_mode?: string | null; effort?: string | null } | null;
+}
+
+export interface HarnessCapability {
+  label?: string | null;
+  integration_mode?: string | null;
+  keep_warm_family?: string | null;
+  native_agent_key?: string | null;
+  calling_defaults?: { model_options: boolean; inherits_from: string | null } | null;
+  session_modes?: {
+    permission: SessionModeSet | null;
+    speed: SessionModeSet | null;
+  } | null;
+}
+
+export interface SessionModeSet {
+  handler: string;
+  options:
+    | "per-model"
+    | { value: string; label: string; concept: string; contexts: ("default" | "create")[] }[];
 }
 
 /** ``capabilities.integration_mode`` of every generic-ACP harness. */
@@ -54,9 +73,12 @@ interface HarnessCatalogWire {
   // Setup steps keyed by EVERY harness spelling a session may declare (native
   // wrappers + installable non-picker ids), not just the picker rows in `data`.
   setup_steps?: Record<string, SetupStepWire[]>;
+  capabilities_by_harness?: Record<string, HarnessCapability>;
 }
 
 export interface HarnessCatalog {
+  rows: HarnessCatalogRow[];
+  capabilitiesByHarness: Record<string, HarnessCapability>;
   /** harness id → picker label, merged over the built-in defaults. */
   labels: Record<string, string>;
   /** harness spelling → ordered setup steps (install/auth) the server describes. */
@@ -95,6 +117,8 @@ export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   const setupSteps =
     body.setup_steps && typeof body.setup_steps === "object" ? body.setup_steps : {};
   return {
+    rows: body.data ?? [],
+    capabilitiesByHarness: body.capabilities_by_harness ?? {},
     labels,
     setupSteps,
     acpHarnesses,
@@ -105,7 +129,11 @@ export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
 // Every hook below shares one request + cache entry, each selecting its own
 // slice. ``enabled`` lets a caller that is itself disabled avoid provoking the
 // request (the agent picker keeps its catalog read in step with its own fetch).
-function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T, enabled = true): T {
+export function useHarnessCatalog<T>(
+  select: (c: HarnessCatalog) => T,
+  fallback: T,
+  enabled = true,
+): T {
   const { data } = useQuery({
     queryKey: ["harness-labels"],
     queryFn: fetchHarnessCatalog,
@@ -114,6 +142,13 @@ function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T, ena
     select,
   });
   return data ?? fallback;
+}
+
+const NO_HARNESS_CAPABILITIES: Record<string, HarnessCapability> = {};
+
+/** The complete declared capability map, including native harnesses absent from picker rows. */
+export function useHarnessCapabilities(): Record<string, HarnessCapability> {
+  return useHarnessCatalog((catalog) => catalog.capabilitiesByHarness, NO_HARNESS_CAPABILITIES);
 }
 
 /**

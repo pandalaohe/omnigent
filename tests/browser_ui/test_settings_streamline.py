@@ -14,6 +14,250 @@ from tests.browser_ui.test_sessions_appearance import appearance_url as appearan
 
 
 @pytest.mark.parametrize("width", [1440, 390])
+def test_child_freeze_default_and_exception_stay_compact(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    request: pytest.FixtureRequest,
+) -> None:
+    agents = [
+        {
+            "id": "claude-product",
+            "name": "claude-native-ui",
+            "harness": "claude-native",
+            "builtin": True,
+            "product_of": "claude-native",
+            "integration_mode": "native-tui",
+        },
+        *[
+            {
+                "id": f"agent-{index}",
+                "name": f"agent-{index}",
+                "harness": f"harness-{index}",
+                "builtin": True,
+                "product_of": f"harness-{index}",
+                "integration_mode": "native-tui",
+            }
+            for index in range(18)
+        ],
+    ]
+    harnesses = [
+        {
+            "id": row["harness"],
+            "label": row["name"],
+            "capabilities": {"integration_mode": "native-tui"},
+        }
+        for row in agents
+    ]
+    capabilities = {row["harness"]: {"integration_mode": "native-tui"} for row in agents}
+    browser_contract.json("/v1/agents", {"data": agents, "has_more": False})
+    browser_contract.json(
+        "/v1/harnesses",
+        {"data": harnesses, "capabilities_by_harness": capabilities},
+    )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "example-host",
+                    "name": "Example host",
+                    "owner": "local",
+                    "status": "offline",
+                    "configured_harnesses": {row["harness"]: True for row in agents},
+                }
+            ]
+        },
+    )
+    saved = {"enabled": False, "agents": {}}
+
+    def save(request: Request) -> dict[str, bool]:
+        saved.update(request.post_data_json["value"])
+        return {"ok": True}
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"child_idle": saved}},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/preferences",
+        lambda _: {
+            "user_id": "local",
+            "preferences": {"version": 1, "settings": {"child_idle": saved}},
+        },
+    )
+    browser_contract.json("/v1/me/preferences/child_idle", save, method="PATCH")
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{appearance_url}/settings/general#child-idle")
+    section = page.get_by_test_id("child-idle-settings")
+    expect(section.get_by_text("All agents", exact=True)).to_be_visible()
+    expect(section.get_by_role("switch", name="Monitor all agents children")).to_have_count(1)
+    expect(section.get_by_role("switch", name=re.compile(r"Monitor .* children"))).to_have_count(1)
+    expect(section.get_by_role("button", name="Add exception")).to_have_count(1)
+    expect(section.get_by_role("button", name="Edit Claude Code")).to_have_count(0)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/child_idle")
+        )
+    ):
+        section.get_by_role("switch", name="Monitor all agents children").click()
+        assert (
+            page.evaluate(
+                "JSON.parse(localStorage.getItem('omnigent:child-idle')).freezeDefault.enabled"
+            )
+            is True
+        )
+    section.get_by_role("button", name="Add exception").click()
+    picker = page.get_by_role("dialog", name="Add exception")
+    expect(picker.get_by_role("textbox", name="Search agents")).to_be_focused()
+    picker.get_by_role("textbox", name="Search agents").fill("Claude")
+    expect(
+        picker.get_by_role("button", name=re.compile("Claude Code.*Native CLI"))
+    ).to_be_visible()
+    assert picker.evaluate("element => element.scrollWidth <= element.clientWidth")
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"child-freeze-picker-{width}.png"), full_page=True)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/child_idle")
+        )
+    ):
+        picker.get_by_role("button", name=re.compile("Claude Code.*Native CLI")).click()
+        local_preferences = page.evaluate(
+            "JSON.parse(localStorage.getItem('omnigent:child-idle'))"
+        )
+        assert "harness:claude-native" in local_preferences["agents"]
+    expect(section.get_by_role("button", name="Edit Claude Code")).to_be_visible()
+    assert saved["freezeDefault"]["enabled"] is True
+    assert "harness:claude-native" in saved["agents"]
+    page.reload()
+    expect(section.get_by_role("switch", name="Monitor all agents children")).to_be_checked()
+    expect(section.get_by_role("button", name="Edit Claude Code")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_quota_default_and_registry_product_exception_persist(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    request: pytest.FixtureRequest,
+) -> None:
+    agents = [
+        {
+            "id": f"{harness}-agent",
+            "name": "codex-native-ui" if harness == "codex-native" else "kite",
+            "harness": harness,
+            "builtin": True,
+            "product_of": harness,
+            "integration_mode": "native-tui",
+        }
+        for harness in ("codex-native", "kite-native")
+    ]
+    browser_contract.json("/v1/agents", {"data": agents, "has_more": False})
+    browser_contract.json(
+        "/v1/instruction-layers",
+        {
+            "data": [],
+            "agents": [],
+            "order": [],
+            "route_sizes": [],
+            "size_reminder_chars": 20000,
+        },
+    )
+    browser_contract.json(
+        "/v1/harnesses",
+        {
+            "data": [],
+            "capabilities_by_harness": {
+                "codex-native": {"integration_mode": "native-tui", "native_agent_key": "codex"},
+                "kite-native": {"integration_mode": "native-tui", "native_agent_key": "kite"},
+            },
+        },
+    )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "example-host",
+                    "name": "Example host",
+                    "owner": "local",
+                    "status": "online",
+                    "configured_harnesses": {"codex-native": True, "kite-native": True},
+                }
+            ]
+        },
+    )
+    saved = {"quotaPeriods": {"codex": "7d"}}
+
+    def save(incoming: Request) -> dict[str, bool]:
+        saved.update(incoming.post_data_json["value"])
+        return {"ok": True}
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"session_collab": saved}},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/preferences",
+        lambda _: {
+            "user_id": "local",
+            "preferences": {"version": 1, "settings": {"session_collab": saved}},
+        },
+    )
+    browser_contract.json("/v1/me/preferences/session_collab", save, method="PATCH")
+    page.add_init_script(
+        "if (!localStorage.getItem('omnigent:session-collab')) "
+        f"localStorage.setItem('omnigent:session-collab', {json.dumps(json.dumps(saved))})"
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{appearance_url}/settings/instructions")
+    section = page.locator('section[aria-labelledby="child-sessions-heading"]')
+    expect(section.get_by_role("textbox", name="All products")).to_have_value("")
+    expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
+    section.get_by_role("textbox", name="All products").fill("5h")
+    section.get_by_role("button", name="Add exception").click()
+    picker = page.get_by_role("dialog", name="Add exception")
+    expect(picker.get_by_role("textbox", name="Search agents")).to_be_focused()
+    picker.get_by_role("textbox", name="Search agents").fill("kite")
+    expect(picker.get_by_role("button", name=re.compile("Kite.*Native CLI"))).to_be_visible()
+    assert picker.evaluate("element => element.scrollWidth <= element.clientWidth")
+    picker.get_by_role("button", name=re.compile("Kite.*Native CLI")).click()
+    section.get_by_role("textbox", name="Kite period").fill("month")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/session_collab")
+        )
+    ):
+        section.get_by_role("button", name="Save child settings").click()
+    assert saved["quotaPeriodDefault"] == "5h"
+    assert saved["quotaPeriods"] == {"codex": "7d", "kite": "month"}
+    page.reload()
+    expect(section.get_by_role("textbox", name="All products")).to_have_value("5h")
+    expect(section.get_by_role("button", name="Edit Kite")).to_be_visible()
+    expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"quota-periods-{width}.png"), full_page=True)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
 def test_reserve_width_persists_and_settings_fit(
     page: Page, appearance_url: str, width: int, request: pytest.FixtureRequest
 ) -> None:
@@ -65,16 +309,42 @@ def test_legacy_links_open_the_new_group(
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_keep_warm_copy_skips_incompatible_interval(
+def test_keep_warm_default_and_exception_persist_with_support_reasons(
     page: Page, appearance_url: str, browser_contract: BrowserContract, width: int
 ) -> None:
     agents = [
-        {"id": "claude-agent", "name": "claude", "harness": "claude-native"},
-        {"id": "codex-agent", "name": "codex", "harness": "codex-native"},
-        {"id": "other-agent", "name": "other", "harness": "openai-agents"},
+        {
+            "id": "claude-agent",
+            "name": "claude-native-ui",
+            "harness": "claude-native",
+            "builtin": True,
+            "product_of": "claude-native",
+            "integration_mode": "native-tui",
+        },
+        {
+            "id": "codex-agent",
+            "name": "codex-native-ui",
+            "harness": "codex-native",
+            "builtin": True,
+            "product_of": "codex-native",
+            "integration_mode": "native-tui",
+        },
+        {"id": "other-agent", "name": "other", "harness": "openai-agents", "builtin": False},
     ]
     browser_contract.json("/v1/agents", {"data": agents, "has_more": False})
+    browser_contract.json(
+        "/v1/harnesses",
+        {
+            "data": [],
+            "capabilities_by_harness": {
+                "claude-native": {"integration_mode": "native-tui", "keep_warm_family": "claude"},
+                "codex-native": {"integration_mode": "native-tui", "keep_warm_family": "codex"},
+                "openai-agents": {"integration_mode": "sdk-in-process", "keep_warm_family": None},
+            },
+        },
+    )
     preferences = {
+        "default": {"main": False, "child": False, "maxSeconds": 14400},
         "agents": {
             "claude-agent": {
                 "main": True,
@@ -82,43 +352,77 @@ def test_keep_warm_copy_skips_incompatible_interval(
                 "intervalSeconds": 3300,
                 "maxSeconds": 7200,
             },
-            "codex-agent": {
-                "main": False,
-                "child": False,
-                "intervalSeconds": 600,
-                "maxSeconds": 14400,
-            },
         },
         "hostOfflineArchiveSeconds": 0,
     }
+
+    def save(request: Request) -> dict[str, bool]:
+        preferences.update(request.post_data_json["value"])
+        return {"ok": True}
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"keep_warm": preferences}},
+        },
+    )
     browser_contract.json(
         "/v1/me/preferences",
-        {
+        lambda _: {
             "user_id": "local",
             "preferences": {"version": 1, "settings": {"keep_warm": preferences}},
         },
     )
-    browser_contract.response("/v1/me/preferences/keep_warm", method="PATCH")
+    browser_contract.json("/v1/me/preferences/keep_warm", save, method="PATCH")
     browser_contract.response("/v1/me/preferences/session_collab", method="PATCH")
     page.add_init_script(
         f"localStorage.setItem('omnigent:keep-warm', {json.dumps(json.dumps(preferences))})"
     )
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{appearance_url}/settings/keep-warm")
-    expect(page.get_by_role("combobox", name="Keep-warm Agent")).to_be_visible()
-    expect(page.get_by_test_id("keep-warm-agent-row")).to_have_count(1)
-    page.get_by_role("button", name="Apply to other deployed agents", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Apply to other deployed agents", exact=True)
-    expect(dialog.get_by_text("Skip: Every (Outside 5–29 min for this agent)")).to_be_visible()
-    expect(dialog.get_by_text("This agent has no keep-warm channel", exact=False)).to_be_visible()
-    assert dialog.evaluate("element => element.scrollWidth <= element.clientWidth")
-    dialog.get_by_role("button", name="Apply selected fields", exact=True).click()
+    section = page.get_by_test_id("keep-warm-settings")
+    expect(section.get_by_text("All agents", exact=True)).to_be_visible()
+    expect(section.get_by_role("switch")).to_have_count(2)
+    expect(section.get_by_text("Claude Code · direct sessions only", exact=False)).to_be_visible()
+    section.get_by_role("switch", name="Keep main sessions warm for all agents").click()
+    section.get_by_role("button", name="Add exception").click()
+    picker = page.get_by_role("dialog", name="Add exception")
+    picker.get_by_role("button", name="Not supported here (1)").click()
+    expect(
+        picker.get_by_role("button", name=re.compile("Other.*no declared keep-warm channel"))
+    ).to_be_disabled()
+    assert picker.evaluate("element => element.scrollWidth <= element.clientWidth")
+    picker.get_by_role("button", name=re.compile("Codex.*Native CLI")).click()
+    section.get_by_role("switch", name="Keep children warm for Codex").click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/keep_warm")
+            and response.request.post_data_json["value"]["agents"]
+            .get("harness:codex-native", {})
+            .get("intervalSeconds")
+            == 600
+        )
+    ):
+        section.get_by_role("spinbutton", name="Keep-warm interval for Codex in minutes").fill(
+            "10"
+        )
     saved = page.evaluate("JSON.parse(localStorage.getItem('omnigent:keep-warm'))")
-    assert saved["agents"]["codex-agent"]["intervalSeconds"] == 600
-    assert saved["agents"]["codex-agent"]["main"] is True
-    assert saved["agents"]["codex-agent"]["maxSeconds"] == 7200
+    assert saved["default"] == {"main": True, "child": False, "maxSeconds": 14400}
+    assert saved["agents"]["harness:codex-native"]["intervalSeconds"] == 600
+    assert saved["agents"]["harness:codex-native"]["child"] is True
+    assert saved["agents"]["claude-agent"]["intervalSeconds"] == 3300
     assert "other-agent" not in saved["agents"]
     assert saved["hostOfflineArchiveSeconds"] == 0
+    assert preferences["agents"]["harness:codex-native"]["intervalSeconds"] == 600
+    page.reload()
+    expect(
+        section.get_by_role("switch", name="Keep main sessions warm for all agents")
+    ).to_be_checked()
+    expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
 @pytest.mark.parametrize("width", [1440, 390])
@@ -496,3 +800,97 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
             tokens.blur()
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         page.screenshot(path=str(output / f"buffer-manual-{width}.png"), full_page=True)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_instruction_columns_add_clear_and_reload(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    request: pytest.FixtureRequest,
+) -> None:
+    layer = {
+        "scope": "agent",
+        "agent_key": "codex",
+        "host_id": "",
+        "text": "Configured",
+        "revision_id": "first",
+        "updated_at": 1,
+        "updated_by": "local",
+        "chars": 10,
+        "host_removed": False,
+        "stale_layers": [],
+    }
+    descriptors = [
+        {"key": "codex", "display_name": "Codex", "harnesses": ["codex-native"]},
+        {"key": "acp:neutral", "display_name": "Neutral ACP", "harnesses": ["acp:neutral"]},
+    ]
+    browser_contract.json(
+        "/v1/instruction-layers",
+        lambda _: {
+            "data": [layer],
+            "agents": descriptors,
+            "order": ["shared", "agent", "host"],
+            "route_sizes": [],
+            "size_reminder_chars": 10000,
+        },
+    )
+
+    def save(incoming: Request) -> dict:
+        layer.update(incoming.post_data_json)
+        layer.update(revision_id="cleared", chars=len(layer["text"]))
+        return {**layer, "over_budget_routes": []}
+
+    browser_contract.json("/v1/instruction-layers", save, method="PUT")
+    browser_contract.json("/v1/instruction-layers/revisions", {"data": []})
+    browser_contract.json(
+        "/v1/harnesses",
+        {
+            "data": [],
+            "capabilities_by_harness": {
+                "codex-native": {"integration_mode": "native-tui"},
+                "acp": {"integration_mode": "generic-acp"},
+            },
+        },
+    )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "example-host",
+                    "name": "Example host",
+                    "owner": "local",
+                    "status": "offline",
+                    "configured_harnesses": {"codex-native": True, "acp:neutral": True},
+                }
+            ]
+        },
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{appearance_url}/settings/instructions")
+    expect(page.get_by_role("button", name="Edit Codex", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Edit Neutral ACP", exact=True)).to_have_count(0)
+    page.get_by_role("button", name="Add agent", exact=True).click()
+    page.get_by_role("button", name=re.compile(r"Neutral ACP.*ACP")).click()
+    expect(page.get_by_role("button", name="Edit Neutral ACP", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Edit Codex", exact=True).click()
+    page.get_by_role("textbox", name="Instruction text").fill("")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PUT" and response.url.endswith("/v1/instruction-layers")
+        )
+    ):
+        page.get_by_role("button", name="Save layer", exact=True).click()
+    assert layer["text"] == ""
+    page.reload()
+    expect(page.get_by_role("button", name="Edit Shared", exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name="Edit Codex", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="Edit Neutral ACP", exact=True)).to_have_count(0)
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.get_by_role(
+        "table", name="Instruction layers by host and agent"
+    ).scroll_into_view_if_needed()
+    page.screenshot(path=str(output / f"instruction-columns-{width}.png"), full_page=True)

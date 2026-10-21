@@ -1,29 +1,30 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { ExceptionList } from "@/components/ExceptionList";
+import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useAgentRegistry, type RegistryItem } from "@/hooks/useAgentRegistry";
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
+import { useHarnessCatalog, type HarnessCapability } from "@/lib/agentLabels";
 import {
   QUOTA_PERIOD_PATTERN,
-  QUOTA_PRODUCTS,
   readSessionCollabPreferences,
   writeSessionCollabPreferences,
-  type QuotaProduct,
   type SessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
 import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
-import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
 interface Draft {
   childCap: string;
   quotaTightBelowPct: string;
   quotaLowBelowPct: string;
   quotaFloorPct: string;
-  quotaPeriods: Partial<Record<QuotaProduct, string>>;
+  quotaPeriodDefault: string;
+  quotaPeriods: Record<string, { period: string }>;
 }
 
-const PRODUCT_NAMES = Object.fromEntries(
-  NATIVE_CODING_AGENTS.map((agent) => [agent.key, agent.displayName]),
-);
+const EMPTY_CAPABILITIES: Record<string, HarnessCapability> = {};
 
 function draftFromPreferences(preferences: SessionCollabPreferences): Draft {
   return {
@@ -31,8 +32,9 @@ function draftFromPreferences(preferences: SessionCollabPreferences): Draft {
     quotaTightBelowPct: preferences.quotaTightBelowPct.toString(),
     quotaLowBelowPct: preferences.quotaLowBelowPct.toString(),
     quotaFloorPct: preferences.quotaFloorPct?.toString() ?? "",
+    quotaPeriodDefault: preferences.quotaPeriodDefault ?? "",
     quotaPeriods: Object.fromEntries(
-      QUOTA_PRODUCTS.map((product) => [product, preferences.quotaPeriods[product] ?? ""]),
+      Object.entries(preferences.quotaPeriods).map(([product, period]) => [product, { period }]),
     ),
   };
 }
@@ -45,9 +47,27 @@ function parsePercentage(text: string): number | null {
 
 export function ChildSessionsPanel() {
   const preferences = useSessionCollabPreferences();
+  const registry = useAgentRegistry();
+  const capabilities = useHarnessCatalog(
+    (catalog) => catalog.capabilitiesByHarness,
+    EMPTY_CAPABILITIES,
+  );
   const [draft, setDraft] = useState(() => draftFromPreferences(preferences));
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+
+  const productKeys = new Set<string>();
+  const quotaItems = registry.items.map((item): RegistryItem => {
+    const harness = item.harness;
+    if (!harness || item.key !== `harness:${harness}`) return item;
+    // Older servers have no capability map; retain their known native products.
+    const product = capabilities[harness]
+      ? capabilities[harness].native_agent_key
+      : nativeCodingAgentForHarness(harness)?.key;
+    if (!product) return item;
+    productKeys.add(product);
+    return { ...item, key: product };
+  });
 
   useEffect(() => setDraft(draftFromPreferences(preferences)), [preferences]);
   useEffect(() => {
@@ -66,6 +86,23 @@ export function ChildSessionsPanel() {
     setError(null);
     setSaved(false);
   };
+
+  const renderPeriodEditor = useCallback(
+    (row: { period: string }, patch: (next: Partial<{ period: string }>) => void, key: string) => (
+      <label className="block text-sm font-medium">
+        {quotaItems.find((item) => item.key === key)?.label ?? key} period
+        <Input
+          className="mt-1"
+          type="text"
+          maxLength={32}
+          placeholder="e.g. 5h"
+          value={row.period}
+          onChange={(event) => patch({ period: event.target.value })}
+        />
+      </label>
+    ),
+    [quotaItems],
+  );
 
   const save = () => {
     const capText = draft.childCap.trim();
@@ -86,14 +123,23 @@ export function ChildSessionsPanel() {
       setError("Remaining quota floor must be between 0 and 100, or blank.");
       return;
     }
+    const defaultPeriod = draft.quotaPeriodDefault.trim();
+    if (defaultPeriod && !QUOTA_PERIOD_PATTERN.test(defaultPeriod)) {
+      setError("Period names must use 1–32 letters, digits, underscores or hyphens.");
+      return;
+    }
     const periods: SessionCollabPreferences["quotaPeriods"] = {};
-    for (const product of QUOTA_PRODUCTS) {
-      const period = (draft.quotaPeriods[product] ?? "").trim();
-      if (period !== "" && !QUOTA_PERIOD_PATTERN.test(period)) {
+    for (const [product, row] of Object.entries(draft.quotaPeriods)) {
+      const period = row.period.trim();
+      if (period === "") {
+        setError("Enter a period for each exception, or remove it.");
+        return;
+      }
+      if (!QUOTA_PERIOD_PATTERN.test(period)) {
         setError("Period names must use 1–32 letters, digits, underscores or hyphens.");
         return;
       }
-      if (period) periods[product] = period;
+      periods[product] = period;
     }
     writeSessionCollabPreferences({
       ...readSessionCollabPreferences(),
@@ -101,6 +147,7 @@ export function ChildSessionsPanel() {
       quotaTightBelowPct: tight,
       quotaLowBelowPct: low,
       quotaFloorPct: floor,
+      quotaPeriodDefault: defaultPeriod || null,
       quotaPeriods: periods,
     });
     setError(null);
@@ -112,15 +159,17 @@ export function ChildSessionsPanel() {
       aria-labelledby="child-sessions-heading"
       className="rounded-xl border border-border bg-card p-4 sm:p-5"
     >
-      <h2 id="child-sessions-heading" className="text-lg font-semibold">
-        Child sessions
-      </h2>
+      <div className="flex items-center gap-1.5">
+        <h2 id="child-sessions-heading" className="text-lg font-semibold">
+          Child sessions
+        </h2>
+        <HelpTip label="About child-session quota">
+          Pace compares remaining quota per time left with the plan's average rate. These thresholds
+          guide agent choices; they do not move running children.
+        </HelpTip>
+      </div>
       <p className="mt-1 text-sm text-muted-foreground">
         Set your child-session limit and choose which quota window guides new child sessions.
-      </p>
-      <p className="mt-1 text-xs text-muted-foreground">
-        Pace compares remaining quota per time left with the plan's average rate. These thresholds
-        guide agent choices; they do not move running children.
       </p>
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         <label className="block text-sm font-medium">
@@ -172,32 +221,66 @@ export function ChildSessionsPanel() {
           />
         </label>
       </div>
-      <p className="mt-4 text-sm font-medium">Deciding period by product</p>
-      <p className="mt-1 text-xs text-muted-foreground">
-        Leave blank to use the source-pinned window, or the tightest window when none is pinned.
-        Examples: 5h, 7d, month.
-      </p>
-      <div className="mt-3 grid gap-4 sm:grid-cols-2">
-        {QUOTA_PRODUCTS.map((product) => (
-          <label key={product} className="block text-sm font-medium">
-            {PRODUCT_NAMES[product]} period
-            <Input
-              className="mt-1"
-              type="text"
-              maxLength={32}
-              placeholder="Automatic"
-              value={draft.quotaPeriods[product] ?? ""}
-              onChange={(event) => {
-                setDraft((current) => ({
-                  ...current,
-                  quotaPeriods: { ...current.quotaPeriods, [product]: event.target.value },
-                }));
-                setError(null);
-                setSaved(false);
-              }}
-            />
-          </label>
-        ))}
+      <div className="mt-5 rounded-lg border border-border p-3">
+        <div className="flex items-center gap-1.5 text-sm font-medium">
+          Deciding period
+          <HelpTip label="About deciding periods">
+            Automatic uses the source-pinned window, or the tightest window when none is pinned.
+            Period names can be 5h, 7d or month. An exception takes precedence for its product.
+          </HelpTip>
+        </div>
+        <label className="mt-3 block text-sm font-medium">
+          All products
+          <Input
+            className="mt-1"
+            type="text"
+            maxLength={32}
+            placeholder="Automatic"
+            value={draft.quotaPeriodDefault}
+            onChange={(event) => update("quotaPeriodDefault", event.target.value)}
+          />
+        </label>
+        <div className="mt-4 border-t border-border pt-3">
+          <ExceptionList
+            rows={draft.quotaPeriods}
+            items={quotaItems}
+            summary={(row) => row.period || "Choose a period"}
+            editor={renderPeriodEditor}
+            supports={(item) =>
+              productKeys.has(item.key) ? null : "Quota periods apply only to native products"
+            }
+            onAdd={(key) => {
+              setDraft((current) => ({
+                ...current,
+                quotaPeriods: { ...current.quotaPeriods, [key]: { period: "" } },
+              }));
+              setSaved(false);
+            }}
+            onPatch={(key, patch) => {
+              setDraft((current) => ({
+                ...current,
+                quotaPeriods: {
+                  ...current.quotaPeriods,
+                  [key]: { ...current.quotaPeriods[key], ...patch },
+                },
+              }));
+              setError(null);
+              setSaved(false);
+            }}
+            onRemove={(key) => {
+              setDraft((current) => ({
+                ...current,
+                quotaPeriods: Object.fromEntries(
+                  Object.entries(current.quotaPeriods).filter(([product]) => product !== key),
+                ),
+              }));
+              setSaved(false);
+            }}
+            isLoading={registry.isLoading}
+            isError={registry.isError}
+            onRetry={registry.retry}
+          />
+        </div>
       </div>
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <Button type="button" onClick={save}>

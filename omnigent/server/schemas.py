@@ -539,6 +539,8 @@ class AgentObject(BaseModel):
         a user-registered template is superseded by a newer
         same-named upload. Always ``False`` for session-scoped
         agents.
+    :param integration_mode: How the agent's harness runs, when declared.
+    :param product_of: Harness id represented by this seeded product row, if any.
     """
 
     id: str
@@ -549,6 +551,8 @@ class AgentObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     harness: str | None = None
+    integration_mode: str | None = None
+    product_of: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
     mcp_registry_editable: bool = False
@@ -3180,6 +3184,7 @@ class SessionForkRequest(BaseModel):
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_tier: PermissionTierRequest | None = None
+    permission_mode: str | None = None
     terminal_launch_args: list[str] | None = None
     codex_bypass_sandbox: bool = False
     host_type: Literal["external", "managed"] = "external"

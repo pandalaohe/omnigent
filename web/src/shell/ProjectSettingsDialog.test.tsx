@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+import type * as AgentLabelsModule from "@/lib/agentLabels";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { readCallingDefaults } from "@/lib/callingDefaults";
 import { writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
@@ -18,6 +19,12 @@ import {
   updateProjectConfig,
 } from "@/lib/projectsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
+
+const emptyCapabilities = vi.hoisted(() => ({}));
+vi.mock("@/lib/agentLabels", async (original) => ({
+  ...(await original<typeof AgentLabelsModule>()),
+  useHarnessCapabilities: () => emptyCapabilities,
+}));
 
 vi.mock("@/lib/projectsApi", () => ({
   createProject: vi.fn(),

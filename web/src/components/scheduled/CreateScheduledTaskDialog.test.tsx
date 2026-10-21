@@ -53,6 +53,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({}),
+  useHarnessCapabilities: () => ({}),
 }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),

@@ -19,7 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { Host } from "@/hooks/useHosts";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { registrySourceLabels, type RegistryItem } from "@/hooks/useAgentRegistry";
 import {
   deleteUsageContextOverrides,
   fixedBufferFitsCapacity,
@@ -61,14 +61,21 @@ interface SavedContextSourceRow {
   rowLabel: string;
 }
 
-function describeSource(source: UsageContextSource, hosts: Host[]) {
+const NO_REGISTRY_ITEMS: readonly RegistryItem[] = [];
+
+function describeSource(
+  source: UsageContextSource,
+  hosts: Host[],
+  registryItems: readonly RegistryItem[],
+) {
   const hostLabel = source.hostId
     ? (hosts.find((host) => host.host_id === source.hostId)?.name ?? source.hostId)
     : "Server";
-  const agentLabel = source.agentName || "Unknown agent";
-  const harnessLabel = source.harness
-    ? (BRAIN_HARNESS_LABELS[source.harness] ?? source.harness)
-    : "Unknown";
+  const { agentLabel, harnessLabel } = registrySourceLabels(
+    registryItems,
+    source.agentName,
+    source.harness,
+  );
   const modelLabel = source.model || "Auto model";
   return { hostLabel, agentLabel, harnessLabel, modelLabel };
 }
@@ -77,12 +84,14 @@ export function SavedContextSources({
   preferences,
   currentSourceKey,
   hosts,
+  registryItems = NO_REGISTRY_ITEMS,
   currentOverride,
   reportedContextWindow = null,
 }: {
   preferences: UsageContextPreferences;
   currentSourceKey: string;
   hosts: Host[];
+  registryItems?: readonly RegistryItem[];
   currentOverride: UsageContextOverride;
   reportedContextWindow?: number | null;
 }) {
@@ -90,7 +99,7 @@ export function SavedContextSources({
     ([key, override]) => {
       const source = usageContextSourceFromKey(key);
       if (!source) return [];
-      const labels = describeSource(source, hosts);
+      const labels = describeSource(source, hosts, registryItems);
       return [
         {
           key,

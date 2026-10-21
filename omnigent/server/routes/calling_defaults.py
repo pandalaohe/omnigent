@@ -22,9 +22,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from omnigent.calling_defaults import (
-    MODEL_OPTION_HARNESSES,
     check_calling_defaults,
     load_master,
+    model_option_harnesses,
     resolve_calling,
 )
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
@@ -196,7 +196,7 @@ def create_calling_defaults_router(
                 and harness_filter not in acp_harnesses
             ):
                 acp_harnesses.append(harness_filter)
-            for harness in (*MODEL_OPTION_HARNESSES, *acp_harnesses):
+            for harness in (*model_option_harnesses(), *acp_harnesses):
                 if harness_filter is not None and harness != harness_filter:
                     continue
                 if not _harness_configured(host, harness):

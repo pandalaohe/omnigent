@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { AgentPicker } from "@/components/AgentPicker";
+import { useHarnessCapabilities } from "@/lib/agentLabels";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -6,13 +8,14 @@ import { useHosts } from "@/hooks/useHosts";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import {
   layerId,
+  instructionRegistryItems,
+  visibleInstructionAgents,
   useInstructionLayers,
   useInstructionPreview,
   type LayerKey,
 } from "@/hooks/useInstructionLayers";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { useSearchParams } from "@/lib/routing";
 import { LayerEditor } from "./instructions/LayerEditor";
 import { ChildSessionsPanel } from "./instructions/ChildSessionsPanel";
@@ -27,7 +30,8 @@ export function InstructionsPage() {
   const info = useServerInfo();
   const canEdit = isAdmin || isSingleUserMode(info);
   const [params, setParams] = useSearchParams();
-  const [showAll, setShowAll] = useState(false);
+  const capabilities = useHarnessCapabilities();
+  const [addedAgents, setAddedAgents] = useState<Set<string>>(() => new Set());
   const [editor, setEditor] = useState<{
     key: LayerKey;
     title: string;
@@ -55,18 +59,12 @@ export function InstructionsPage() {
   const context = session ? preview.data?.route : undefined;
   const selectedHost = session ? (context?.host_id ?? "") : hostId;
   const selectedAgent = session ? (context?.agent_key ?? "") : agentKey;
-  const configured = new Set<string | undefined>(
-    (hosts.data ?? []).flatMap((host) =>
-      Object.entries(host.configured_harnesses ?? {})
-        .filter(([, state]) => state !== false)
-        .map(([harness]) => nativeCodingAgentForHarness(harness)?.key)
-        .filter(Boolean),
-    ),
+  const agents = data.data ? visibleInstructionAgents(data.data, addedAgents) : [];
+  const pickerItems = instructionRegistryItems(
+    data.data?.agents ?? [],
+    capabilities,
+    hosts.data ?? [],
   );
-  const agents =
-    data.data?.agents.filter(
-      (agent) => showAll || configured.size === 0 || configured.has(agent.key),
-    ) ?? [];
 
   const route = (changes: Record<string, string>) =>
     setParams((previous) => {
@@ -153,14 +151,14 @@ export function InstructionsPage() {
               <TabsTrigger value="route">Route total</TabsTrigger>
             </TabsList>
             <TabsContent value="overview" className="mt-4 space-y-4">
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={showAll}
-                  onChange={(event) => setShowAll(event.target.checked)}
-                />{" "}
-                Show all agent products
-              </label>
+              <AgentPicker
+                items={pickerItems}
+                taken={new Set(agents.map((agent) => agent.key))}
+                onPick={(key) => setAddedAgents((current) => new Set([...current, key]))}
+                title="Add agent"
+                description="Show an agent's instruction layer for this visit."
+                trigger={<Button variant="outline">Add agent</Button>}
+              />
               <LayerGrid
                 data={data.data}
                 hosts={hosts.data ?? []}

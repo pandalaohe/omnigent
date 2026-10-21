@@ -120,6 +120,38 @@ def test_pinned_and_user_selected_period_keep_other_evidence(service):
     assert len(quota.windows) == 2
 
 
+def test_product_exception_then_default_then_pinned_then_tightest(service):
+    report = snapshot(used=85)
+    report["windows"].append(
+        {
+            "label": "month",
+            "used_percent": 0,
+            "duration_mins": 43200,
+            "resets_at": NOW + 30 * 86400,
+        }
+    )
+    report["pinned_period"] = "month"
+    context = QuotaContext(OWNER, HOST)
+    for product in ("codex", "claude", "opencode"):
+        assert service.report(OWNER, None, product, report, now=NOW)
+    service.preferences.patch_namespace(
+        OWNER,
+        "session_collab",
+        {"quotaPeriodDefault": "5h", "quotaPeriods": {"codex": "month"}},
+    )
+    quotas = service.quotas(context, now=NOW)[1]
+    assert quotas["codex"].deciding_window == "month"
+    assert quotas["claude"].deciding_window == "5h"
+
+    service.preferences.patch_namespace(
+        OWNER, "session_collab", {"quotaPeriodDefault": None, "quotaPeriods": {}}
+    )
+    assert service.quotas(context, now=NOW)[1]["opencode"].deciding_window == "month"
+    unpinned = {key: value for key, value in report.items() if key != "pinned_period"}
+    assert service.report(OWNER, None, "opencode", {**unpinned, "captured_at": NOW + 1}, now=NOW)
+    assert service.quotas(context, now=NOW)[1]["opencode"].deciding_window == "5h"
+
+
 def test_claude_capture_uses_ancestor_owner_and_inherited_host(service, db_uri):
     _make_user(db_uri, OWNER, is_admin=False)
     root = service.conversations.create_conversation(host_id=HOST, workspace="/opt/work/project")

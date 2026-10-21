@@ -6,6 +6,11 @@ import { HarnessPicker, HarnessPickerConfigRow } from "@/components/composer/Har
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { useHostModelOptions, type Host } from "@/hooks/useHosts";
+import {
+  SECTION_LABELS,
+  SECTION_ORDER,
+  type RegistryHarnessOption,
+} from "@/hooks/useAgentRegistry";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
@@ -51,7 +56,7 @@ export function AgentMemberTrigger({
   effort: string | null;
   speed?: string | null;
   /** `{id, label}` rows for the Harness submenu, in menu order. */
-  harnessOptions: readonly { id: string; label: string }[];
+  harnessOptions: readonly (RegistryHarnessOption | { id: string; label: string })[];
   /** The member's saved host; null = the session host (the catalog fallback). */
   hostId: string | null;
   /** The New Chat host, used as the catalog source when no member host is set. */
@@ -63,6 +68,7 @@ export function AgentMemberTrigger({
 }) {
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<Section | null>(null);
+  const [showUndeployed, setShowUndeployed] = useState(false);
   const [modelDraft, setModelDraft] = useState("");
   const [manualModelEntry, setManualModelEntry] = useState(false);
   const modelInputRef = useRef<HTMLInputElement>(null);
@@ -106,6 +112,14 @@ export function AgentMemberTrigger({
     speed &&
     (speedOptions.find((option) => option.value === speed)?.label ?? `Unavailable (${speed})`);
   const harnessLabel = harnessOptions.find((option) => option.id === harness)?.label ?? harness;
+  const isUndeployed = (option: (typeof harnessOptions)[number]) =>
+    "deployed" in option && option.deployed === false;
+  const hiddenUndeployedCount = harnessOptions.filter(
+    (option) => isUndeployed(option) && option.id !== harness,
+  ).length;
+  const visibleHarnessOptions = harnessOptions.filter(
+    (option) => showUndeployed || !isUndeployed(option) || option.id === harness,
+  );
   const modelLabel =
     model === null
       ? "Default"
@@ -172,6 +186,7 @@ export function AgentMemberTrigger({
         if (!next) {
           setSection(null);
           setModelDraft("");
+          setShowUndeployed(false);
         }
       }}
       configOpen={section !== null}
@@ -230,20 +245,53 @@ export function AgentMemberTrigger({
         {...submenuProps("harness")}
       >
         <ComposerConfigSections
-          extra={[
-            {
-              testId: "agent-member-harness-options",
-              header: "Harness",
-              choices: harnessOptions.map((option) => ({
-                key: option.id,
-                label: option.label,
-                checked: option.id === harness,
-                onSelect: () => selectHarness(option.id),
-                testId: `agent-member-harness-${option.id}`,
-              })),
-            },
-          ]}
+          extra={
+            visibleHarnessOptions.some((option) => "section" in option)
+              ? SECTION_ORDER.filter((group) =>
+                  visibleHarnessOptions.some(
+                    (option) => "section" in option && option.section === group,
+                  ),
+                ).map((group) => ({
+                  testId: `agent-member-harness-options-${group}`,
+                  header: SECTION_LABELS[group],
+                  choices: visibleHarnessOptions
+                    .filter((option) => "section" in option && option.section === group)
+                    .map((option) => ({
+                      key: option.id,
+                      label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
+                      checked: option.id === harness,
+                      onSelect: () => selectHarness(option.id),
+                      testId: `agent-member-harness-${option.id}`,
+                    })),
+                }))
+              : [
+                  {
+                    testId: "agent-member-harness-options",
+                    header: "Harness",
+                    choices: visibleHarnessOptions.map((option) => ({
+                      key: option.id,
+                      label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
+                      checked: option.id === harness,
+                      onSelect: () => selectHarness(option.id),
+                      testId: `agent-member-harness-${option.id}`,
+                    })),
+                  },
+                ]
+          }
         />
+        {hiddenUndeployedCount > 0 && (
+          <DropdownMenuItem
+            data-testid="agent-member-show-undeployed"
+            onSelect={(event) => {
+              event.preventDefault();
+              setShowUndeployed((current) => !current);
+            }}
+          >
+            {showUndeployed
+              ? `Hide ${hiddenUndeployedCount} not deployed`
+              : `Show ${hiddenUndeployedCount} not deployed`}
+          </DropdownMenuItem>
+        )}
       </HarnessPickerConfigRow>
       <HarnessPickerConfigRow
         label="Model"

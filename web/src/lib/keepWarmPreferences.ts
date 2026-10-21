@@ -1,6 +1,6 @@
 // Keep-warm preferences (`keep_warm` namespace).
 //
-// One row per agent plus the host-offline archive delay. The server reader
+// One default, agent/harness exceptions, and the host-offline archive delay. The server reader
 // (`omnigent/server/user_preferences_store.py`) owns the wire contract and the
 // clamps, so the constants below mirror it in one place.
 
@@ -15,18 +15,12 @@ export const KEEP_WARM_CHANGED_EVENT = "omnigent:keep-warm-changed";
 
 export type KeepWarmFamily = "claude" | "codex";
 
-/** Harnesses with a server keep-warm channel, mapped to their cache family. */
-export const KEEP_WARM_HARNESS_FAMILIES: Record<string, KeepWarmFamily> = {
-  "claude-native": "claude",
-  "claude-sdk": "claude",
-  "codex-native": "codex",
-  codex: "codex",
-};
-
 export function keepWarmFamilyForHarness(
   harness: string | null | undefined,
+  capabilitiesByHarness: Record<string, { keep_warm_family?: string | null }>,
 ): KeepWarmFamily | null {
-  return (harness && KEEP_WARM_HARNESS_FAMILIES[harness]) || null;
+  const family = harness ? capabilitiesByHarness[harness]?.keep_warm_family : null;
+  return family === "claude" || family === "codex" ? family : null;
 }
 
 /** The legacy migration and mirror only ever cover the native CLIs. */
@@ -98,9 +92,17 @@ export interface AgentKeepWarmPreferences {
 }
 
 export interface KeepWarmPreferences {
+  default: KeepWarmDefaultPreferences;
   agents: Record<string, AgentKeepWarmPreferences>;
   hostOfflineArchiveSeconds: number;
   migratedFromLegacyAt?: number;
+}
+
+export interface KeepWarmDefaultPreferences {
+  main: boolean;
+  child: boolean;
+  maxSeconds: number;
+  coldAfterSeconds?: number;
 }
 
 export interface ResolvedAgentKeepWarm {
@@ -120,93 +122,28 @@ export interface AgentKeepWarmPatch {
   coldAfterSeconds?: number | null;
 }
 
-export type KeepWarmCopyField = keyof ResolvedAgentKeepWarm;
+export type KeepWarmDefaultPatch = Omit<Partial<KeepWarmDefaultPreferences>, "coldAfterSeconds"> & {
+  coldAfterSeconds?: number | null;
+};
 
-export const KEEP_WARM_COPY_FIELDS: readonly KeepWarmCopyField[] = [
-  "main",
-  "child",
-  "intervalSeconds",
-  "maxSeconds",
-  "coldAfterSeconds",
-];
+export const KEEP_WARM_DEFAULT_ROW: KeepWarmDefaultPreferences = {
+  main: false,
+  child: false,
+  maxSeconds: KEEP_WARM_DEFAULT_MAX_SECONDS,
+};
 
-export interface KeepWarmCopyResult {
-  agentId: string;
-  applied: KeepWarmCopyField[];
-  skipped: { field: KeepWarmCopyField; reason: string }[];
-}
-
-/** Preview and apply exactly the same selected, target-valid fields. */
-export function planKeepWarmCopy(
-  preferences: KeepWarmPreferences,
-  sourceId: string,
-  source: ResolvedAgentKeepWarm,
-  targets: readonly KeepWarmAgentIdentity[],
-  selectedTargetIds: ReadonlySet<string>,
-  selectedFields: ReadonlySet<KeepWarmCopyField>,
-): { preferences: KeepWarmPreferences; results: KeepWarmCopyResult[] } {
-  let next = preferences;
-  const results: KeepWarmCopyResult[] = [];
-  for (const target of targets) {
-    if (target.id === sourceId || !selectedTargetIds.has(target.id)) continue;
-    const family = keepWarmFamilyForHarness(target.harness);
-    const result: KeepWarmCopyResult = { agentId: target.id, applied: [], skipped: [] };
-    const patch: AgentKeepWarmPatch = {};
-    for (const field of KEEP_WARM_COPY_FIELDS) {
-      if (!selectedFields.has(field)) continue;
-      const value = source[field];
-      let reason: string | null = null;
-      if (!family) reason = "This agent has no keep-warm channel";
-      else if (field === "intervalSeconds") {
-        const { min, max } = keepWarmIntervalBoundsSeconds(family);
-        if (!Number.isInteger(value) || (value as number) < min || (value as number) > max)
-          reason = `Outside ${min / 60}–${max / 60} min for this agent`;
-      } else if (field === "maxSeconds") {
-        if (
-          !Number.isInteger(value) ||
-          (value as number) < KEEP_WARM_MAX_BOUNDS_SECONDS.min ||
-          (value as number) > KEEP_WARM_MAX_BOUNDS_SECONDS.max
-        )
-          reason = "Outside the supported keep-warm duration";
-      } else if (field === "coldAfterSeconds" && value !== null) {
-        if (
-          !Number.isInteger(value) ||
-          (value as number) < 0 ||
-          ((value as number) !== 0 &&
-            ((value as number) < KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS.min ||
-              (value as number) > KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS.max))
-        )
-          reason = "Outside the supported cold-after duration";
-      }
-      if (reason) result.skipped.push({ field, reason });
-      else {
-        result.applied.push(field);
-        Object.assign(patch, { [field]: value });
-      }
-    }
-    if (family && result.applied.length > 0) {
-      const current = next.agents[target.id];
-      if (!current) {
-        next = setKeepWarmAgent(next, target.id, family, patch);
-      } else {
-        const row = { ...current, ...patch } as AgentKeepWarmPreferences;
-        if (patch.coldAfterSeconds === null) delete row.coldAfterSeconds;
-        next = { ...next, agents: { ...next.agents, [target.id]: row } };
-      }
-    }
-    results.push(result);
-  }
-  return { preferences: next, results };
-}
-
-/** An absent agent row is off; the row is only written when it is first used. */
 export const KEEP_WARM_DEFAULTS: KeepWarmPreferences = {
+  default: KEEP_WARM_DEFAULT_ROW,
   agents: {},
   hostOfflineArchiveSeconds: KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_SECONDS,
 };
 
 function defaultKeepWarmPreferences(): KeepWarmPreferences {
-  return { agents: {}, hostOfflineArchiveSeconds: KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_SECONDS };
+  return {
+    default: { ...KEEP_WARM_DEFAULT_ROW },
+    agents: {},
+    hostOfflineArchiveSeconds: KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_SECONDS,
+  };
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -228,6 +165,25 @@ function normalizeAgentRow(value: unknown): AgentKeepWarmPreferences | null {
     child: typeof raw.child === "boolean" ? raw.child : false,
     ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
     maxSeconds: positiveInteger(raw.maxSeconds) ?? KEEP_WARM_DEFAULT_MAX_SECONDS,
+    ...(coldAfterSeconds !== undefined ? { coldAfterSeconds } : {}),
+  };
+}
+
+function normalizeDefaultRow(value: unknown): KeepWarmDefaultPreferences {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return { ...KEEP_WARM_DEFAULT_ROW };
+  const raw = value as Record<string, unknown>;
+  const rawCold = raw.coldAfterSeconds;
+  const coldAfterSeconds =
+    typeof rawCold === "number" && Number.isInteger(rawCold) && rawCold >= 0
+      ? clampKeepWarmColdAfterSeconds(rawCold)
+      : undefined;
+  return {
+    main: typeof raw.main === "boolean" ? raw.main : false,
+    child: typeof raw.child === "boolean" ? raw.child : false,
+    maxSeconds: clampKeepWarmMaxSeconds(
+      positiveInteger(raw.maxSeconds) ?? KEEP_WARM_DEFAULT_MAX_SECONDS,
+    ),
     ...(coldAfterSeconds !== undefined ? { coldAfterSeconds } : {}),
   };
 }
@@ -254,6 +210,7 @@ function normalizeKeepWarmPreferences(value: unknown): KeepWarmPreferences {
   const migratedFromLegacyAt =
     typeof rawMigrated === "number" && Number.isInteger(rawMigrated) ? rawMigrated : undefined;
   return {
+    default: normalizeDefaultRow(raw.default),
     agents,
     hostOfflineArchiveSeconds,
     ...(migratedFromLegacyAt !== undefined ? { migratedFromLegacyAt } : {}),
@@ -263,6 +220,10 @@ function normalizeKeepWarmPreferences(value: unknown): KeepWarmPreferences {
 function isKeepWarmPreferencesDefault(preferences: KeepWarmPreferences): boolean {
   return (
     Object.keys(preferences.agents).length === 0 &&
+    !preferences.default.main &&
+    !preferences.default.child &&
+    preferences.default.maxSeconds === KEEP_WARM_DEFAULT_MAX_SECONDS &&
+    preferences.default.coldAfterSeconds === undefined &&
     preferences.hostOfflineArchiveSeconds === KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_SECONDS
   );
 }
@@ -277,7 +238,7 @@ export function readKeepWarmPreferences(): KeepWarmPreferences {
   }
 }
 
-/** Effective row for display: absent is off and takes the family defaults. */
+/** Effective row for a direct agent key, falling back to the shared default. */
 export function resolveKeepWarmAgent(
   preferences: KeepWarmPreferences,
   agentId: string,
@@ -285,18 +246,20 @@ export function resolveKeepWarmAgent(
 ): ResolvedAgentKeepWarm {
   const row = preferences.agents[agentId];
   return {
-    main: row?.main ?? false,
-    child: row?.child ?? false,
+    main: row?.main ?? preferences.default.main,
+    child: row?.child ?? preferences.default.child,
     intervalSeconds: clampKeepWarmIntervalSeconds(
       family,
       row?.intervalSeconds ?? defaultKeepWarmIntervalSeconds(family),
     ),
-    maxSeconds: clampKeepWarmMaxSeconds(row?.maxSeconds ?? KEEP_WARM_DEFAULT_MAX_SECONDS),
-    coldAfterSeconds: row?.coldAfterSeconds ?? null,
+    maxSeconds: clampKeepWarmMaxSeconds(row?.maxSeconds ?? preferences.default.maxSeconds),
+    coldAfterSeconds: row
+      ? (row.coldAfterSeconds ?? null)
+      : (preferences.default.coldAfterSeconds ?? null),
   };
 }
 
-/** Merge one agent row; a first write materializes the family defaults. */
+/** Merge one exception row; a first write materializes the effective defaults. */
 export function setKeepWarmAgent(
   preferences: KeepWarmPreferences,
   agentId: string,
@@ -306,23 +269,47 @@ export function setKeepWarmAgent(
   const current = preferences.agents[agentId];
   const coldAfterSeconds =
     patch.coldAfterSeconds === undefined
-      ? current?.coldAfterSeconds
+      ? current
+        ? current.coldAfterSeconds
+        : preferences.default.coldAfterSeconds
       : patch.coldAfterSeconds === null
         ? undefined
         : clampKeepWarmColdAfterSeconds(patch.coldAfterSeconds);
   const row: AgentKeepWarmPreferences = {
-    main: patch.main ?? current?.main ?? false,
-    child: patch.child ?? current?.child ?? false,
+    main: patch.main ?? current?.main ?? preferences.default.main,
+    child: patch.child ?? current?.child ?? preferences.default.child,
     intervalSeconds: clampKeepWarmIntervalSeconds(
       family,
       patch.intervalSeconds ?? current?.intervalSeconds ?? defaultKeepWarmIntervalSeconds(family),
     ),
     maxSeconds: clampKeepWarmMaxSeconds(
-      patch.maxSeconds ?? current?.maxSeconds ?? KEEP_WARM_DEFAULT_MAX_SECONDS,
+      patch.maxSeconds ?? current?.maxSeconds ?? preferences.default.maxSeconds,
     ),
     ...(coldAfterSeconds !== undefined ? { coldAfterSeconds } : {}),
   };
   return { ...preferences, agents: { ...preferences.agents, [agentId]: row } };
+}
+
+export function setKeepWarmDefault(
+  preferences: KeepWarmPreferences,
+  patch: KeepWarmDefaultPatch,
+): KeepWarmPreferences {
+  const current = preferences.default;
+  const coldAfterSeconds =
+    patch.coldAfterSeconds === undefined
+      ? current.coldAfterSeconds
+      : patch.coldAfterSeconds === null
+        ? undefined
+        : clampKeepWarmColdAfterSeconds(patch.coldAfterSeconds);
+  return {
+    ...preferences,
+    default: {
+      main: patch.main ?? current.main,
+      child: patch.child ?? current.child,
+      maxSeconds: clampKeepWarmMaxSeconds(patch.maxSeconds ?? current.maxSeconds),
+      ...(coldAfterSeconds !== undefined ? { coldAfterSeconds } : {}),
+    },
+  };
 }
 
 export interface KeepWarmAgentIdentity {
@@ -343,9 +330,15 @@ export function writeKeepWarmPreferences(
   const normalized = normalizeKeepWarmPreferences(preferences);
   const harnessById = new Map(agentIdentities.map((agent) => [agent.id, agent.harness]));
   let hasUnclassifiableChild = false;
-  let hasNativeChild = false;
+  let hasNativeChild = ["claude-native", "codex-native"].some(
+    (harness) => normalized.agents[`harness:${harness}`]?.child ?? normalized.default.child,
+  );
   for (const [agentId, row] of Object.entries(normalized.agents)) {
     if (!row.child) continue;
+    if (agentId.startsWith("harness:")) {
+      if (isLegacyNativeKeepWarmHarness(agentId.slice("harness:".length))) hasNativeChild = true;
+      continue;
+    }
     if (!harnessById.has(agentId) || harnessById.get(agentId) == null) {
       hasUnclassifiableChild = true;
       continue;

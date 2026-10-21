@@ -8,7 +8,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import {
+  sessionDefaultModeOptions,
+  sessionModeHandler,
+  type HarnessCapabilityMap,
+} from "@/lib/sessionDefaultModes";
 import { normalizeAgyPermissionTier } from "@/lib/nativeHarnessModes";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -23,6 +27,7 @@ export function SessionDefaultModeSelect({
   disabled,
   models = EMPTY_MODELS,
   model = null,
+  capabilities,
   onOpenChange,
   onChange,
   inheritLabel = "Default",
@@ -35,14 +40,15 @@ export function SessionDefaultModeSelect({
   disabled?: boolean;
   models?: readonly NativeModelOption[];
   model?: string | null;
+  capabilities?: HarnessCapabilityMap;
   onOpenChange?: (open: boolean) => void;
   onChange: (value: string | null) => void;
   inheritLabel?: string;
 }) {
-  const options = sessionDefaultModeOptions(harness, field, models, model);
+  const options = sessionDefaultModeOptions(harness, field, models, model, "default", capabilities);
   if (options.length === 0) return null;
   const tierDefault =
-    field === "permission" && ["antigravity-native", "pi", "pi-native"].includes(harness);
+    field === "permission" && sessionModeHandler(harness, field, capabilities) === "agy-tier";
   const legacyTier = tierDefault ? normalizeAgyPermissionTier(value) : null;
   const selected = tierDefault
     ? legacyTier === "full"
