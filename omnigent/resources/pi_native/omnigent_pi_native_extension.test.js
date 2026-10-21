@@ -602,7 +602,7 @@ async function testSessionStartupDoesNotCompleteATurn() {
 
 async function testSessionStartMarksInputReady() {
   const h = makeHarness();
-  const marker = path.join(h.inboxDir, "input_ready");
+  const marker = path.join(h.bridgeDir, "input_ready");
   assert("input-ready marker is absent before session_start", !fs.existsSync(marker));
 
   await h.handlers.session_start({}, makeCtx({ idle: true }));
