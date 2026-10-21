@@ -15707,6 +15707,91 @@ async def test_external_goal_state_rejects_unknown_value(
     assert response.status_code == 400, response.text
 
 
+@pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
+async def test_old_client_lists_tiered_sessions_for_host_update(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    tier_agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    ordinary_agent = await create_test_agent(client)
+    tier_id = tier_agent["_session_id"]
+    ordinary_id = ordinary_agent["_session_id"]
+    other_id = (await _create_session(client, ordinary_agent["id"]))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(
+        tier_id,
+        {
+            "list-note": "visible",
+            "omnigent.permission_tier.capability": "permission_tiers_v1",
+            "omnigent.permission_tier.migrated_from": "legacy",
+            "omnigent.permission_tier.runtime_id": "runtime-test",
+        },
+    )
+    host = HostStore(db_uri).upsert_on_connect(
+        "6b9c07bfb42f687d53af44f018adebec", "test-host", "owner@example.com"
+    )
+    other_host = HostStore(db_uri).upsert_on_connect(
+        "f0fe482da77219c969cdf3b32c88781a", "other-host", "owner@example.com"
+    )
+    for session_id in (tier_id, ordinary_id):
+        store.set_host_id(
+            session_id, host_id=host.host_id, workspace="/opt/work/omnigent/fork/test"
+        )
+    store.set_host_id(other_id, host_id=other_host.host_id, workspace="/opt/work/other")
+    monkeypatch.setitem(sessions_module._session_status_cache, tier_id, "running")
+
+    client.headers.pop("X-Omnigent-Permission-Tiers")
+    pages = []
+    after = None
+    for _ in range(2):
+        params = {"host_id": host.host_id, "limit": 1, "order": "asc"}
+        if after is not None:
+            params["after"] = after
+        response = await client.get("/v1/sessions", params=params)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        assert len(page["data"]) == 1
+        pages.append(page)
+        after = page["data"][0]["id"]
+    assert pages[0]["has_more"] is True
+    assert pages[1]["has_more"] is False
+    legacy_rows = {page["data"][0]["id"]: page["data"][0] for page in pages}
+    assert set(legacy_rows) == {tier_id, ordinary_id}
+    assert legacy_rows[tier_id]["host_id"] == host.host_id
+    assert legacy_rows[tier_id]["status"] == "running"
+    assert legacy_rows[ordinary_id]["host_id"] == host.host_id
+    assert legacy_rows[ordinary_id]["status"] == "idle"
+    assert legacy_rows[tier_id]["labels"]["list-note"] == "visible"
+    assert "omnigent.pi.permission_tier" not in legacy_rows[tier_id]["labels"]
+    assert "omnigent.antigravity_native.permission_tier" not in legacy_rows[tier_id]["labels"]
+    assert "omnigent.permission_tier.state" not in legacy_rows[tier_id]["labels"]
+    assert "omnigent.permission_tier.capability" not in legacy_rows[tier_id]["labels"]
+    assert "omnigent.permission_tier.migrated_from" not in legacy_rows[tier_id]["labels"]
+    assert "omnigent.permission_tier.runtime_id" not in legacy_rows[tier_id]["labels"]
+
+    from tests.server.helpers import PERMISSION_TIERS_HEADERS
+
+    capable = await client.get(
+        "/v1/sessions", params={"host_id": host.host_id}, headers=PERMISSION_TIERS_HEADERS
+    )
+    assert capable.status_code == 200, capable.text
+    capable_rows = {row["id"]: row for row in capable.json()["data"]}
+    assert set(capable_rows) == {tier_id, ordinary_id}
+    tier_key = (
+        "omnigent.antigravity_native.permission_tier"
+        if harness == "antigravity-native"
+        else "omnigent.pi.permission_tier"
+    )
+    assert capable_rows[tier_id]["labels"][tier_key] == "auto"
+    assert "omnigent.permission_tier.state" in capable_rows[tier_id]["labels"]
+    assert capable_rows[tier_id]["labels"]["omnigent.permission_tier.capability"] == (
+        "permission_tiers_v1"
+    )
+
+
 @pytest.mark.parametrize(
     "harness", ["pi", "pi-native", "antigravity-native", "claude-sdk", "codex"]
 )
@@ -15726,6 +15811,9 @@ async def test_permission_protocol_only_gates_affected_sessions(client, harness)
     assert (
         await client.patch(f"/v1/sessions/{sid}", json={"title": "Updated"})
     ).status_code == 200
+    assert (
+        await client.post(f"/v1/sessions/{sid}/events", json={"type": "stop_session", "data": {}})
+    ).status_code == 202
 
 
 @pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
@@ -15737,6 +15825,17 @@ async def test_permission_protocol_only_gates_affected_sessions(client, harness)
         ("GET", "/stream", None),
         ("PATCH", "", {"title": "Must not change"}),
         ("POST", "/events", {"type": "message", "data": {"text": "Must not run"}}),
+        ("POST", "/events", {"type": "stop_session", "data": {}}),
+        ("POST", "/events", {"type": "interrupt", "data": {}}),
+        ("POST", "/events", {"type": "retry_session", "data": {}}),
+        (
+            "POST",
+            "/events",
+            [
+                {"type": "external_goal_state", "data": {"state": "active"}},
+                {"type": "stop_session", "data": {}},
+            ],
+        ),
         ("POST", "/elicitations/missing/resolve", {"action": "accept"}),
     ],
 )

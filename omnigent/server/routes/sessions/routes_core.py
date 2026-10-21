@@ -2991,13 +2991,13 @@ def register_core_routes(
         }
 
     async def _require_list_permission_protocol(
-        connection: Request | WebSocket, conversations: list[Conversation]
+        connection: WebSocket, conversations: list[Conversation]
     ) -> None:
         from omnigent.server.permission_tiers import require_permission_protocol
 
-        if connection.headers.get("X-Omnigent-Permission-Tiers") == "1" or (
-            isinstance(connection, WebSocket)
-            and connection.query_params.get("permission_tiers") == "1"
+        if (
+            connection.headers.get("X-Omnigent-Permission-Tiers") == "1"
+            or connection.query_params.get("permission_tiers") == "1"
         ):
             return
         for conv in conversations:
@@ -3012,10 +3012,8 @@ def register_core_routes(
             try:
                 require_permission_protocol(connection, harness=harness)
             except HTTPException:
-                if isinstance(connection, WebSocket):
-                    await connection.close(code=4406, reason="permission_tiers_refresh_required")
-                    raise WebSocketDisconnect(code=4406) from None
-                raise
+                await connection.close(code=4406, reason="permission_tiers_refresh_required")
+                raise WebSocketDisconnect(code=4406) from None
 
     async def _session_list_page(
         request: Request,
@@ -3041,7 +3039,6 @@ def register_core_routes(
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).
         page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
-        await _require_list_permission_protocol(request, page.data)
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -3208,8 +3205,20 @@ def register_core_routes(
         # single-session snapshot, the WS stream, and the /health poll, not
         # from list rows. Skipping it here removes the session-connectivity
         # and hosts-table queries from every GET /v1/sessions.
+        data = [item.model_dump(exclude_none=True) for item in items]
+        # Host self-update needs this inventory before it can upgrade its client.
+        # Keep every row available without exposing tier controls to old clients.
+        if request.headers.get("X-Omnigent-Permission-Tiers") != "1":
+            from omnigent.server.permission_tiers import is_permission_label_key
+
+            for row in data:
+                row["labels"] = {
+                    key: value
+                    for key, value in row["labels"].items()
+                    if not is_permission_label_key(key)
+                }
         return PaginatedList(
-            data=[item.model_dump(exclude_none=True) for item in items],
+            data=data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
