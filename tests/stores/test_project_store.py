@@ -96,6 +96,29 @@ def test_list_empty(store: SqlAlchemyProjectStore) -> None:
     assert store.list(user_id="alice@example.com") == []
 
 
+def test_archive_visibility_and_reserved_name(store: SqlAlchemyProjectStore) -> None:
+    """An archive hides its project but preserves its owner's name and settings."""
+    project = store.create(_uid("archived"), "Archived", None, {"icon": "A"})
+    op = store.begin_archive_op(project.id, user_id=None, kind="archive")
+
+    assert store.list(user_id=None) == []
+    assert [item.id for item in store.list(user_id=None, archived="only")] == [project.id]
+    archived = store.get(project.id, user_id=None)
+    assert archived is not None
+    assert archived.archived_at is not None
+    assert archived.config == {"icon": "A"}
+    assert archived.archive_state["batch"] == op.batch
+    with pytest.raises(OmnigentError) as exc:
+        store.create(_uid("duplicate-archived"), project.name, None)
+    assert exc.value.code == ErrorCode.PROJECT_NAME_ARCHIVED
+
+    assert store.finish_archive_op(project.id, op.id, user_id=None)
+    restore = store.begin_archive_op(project.id, user_id=None, kind="unarchive")
+    assert restore.batch == op.batch
+    assert store.finish_archive_op(project.id, restore.id, user_id=None, clear_batch=True)
+    assert [item.id for item in store.list(user_id=None)] == [project.id]
+
+
 # ── single-user (None owner) vs multi-user isolation ────────────────────────
 
 

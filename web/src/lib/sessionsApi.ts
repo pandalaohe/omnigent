@@ -629,7 +629,7 @@ export async function createSession(
  * the one-click health check so the ops session is an ordinary project session.
  */
 export async function createProjectSession(opts: {
-  projectId: string;
+  projectId?: string | null;
   hostId: string;
   title: string;
 }): Promise<Session> {
@@ -642,7 +642,7 @@ export async function createProjectSession(opts: {
       ...backgroundSessionTitlesRequestHeaders(),
     },
     body: JSON.stringify({
-      project_id: opts.projectId,
+      ...(opts.projectId ? { project_id: opts.projectId } : {}),
       host_id: opts.hostId,
       title: opts.title,
       initial_items: [],

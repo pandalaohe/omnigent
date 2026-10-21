@@ -155,6 +155,47 @@ async def test_explicit_null_is_not_defaulted(
     assert "agent_id is required" in response.text
 
 
+@pytest.mark.parametrize("membership", ["id", "legacy_label"])
+@pytest.mark.parametrize("transport", ["json", "bundle"])
+async def test_archived_owner_project_rejects_session_creation(
+    project_create_client: httpx.AsyncClient,
+    membership: str,
+    transport: str,
+) -> None:
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    archived = await project_create_client.post(
+        f"/v1/projects/{project_id}/archive",
+        headers=_headers(),
+    )
+    assert archived.status_code == 200
+    fields = (
+        {"project_id": project_id}
+        if membership == "id"
+        else {"labels": {"omni_project": f"project-{ALICE}"}}
+    )
+    if transport == "json":
+        response = await project_create_client.post(
+            "/v1/sessions",
+            json={"agent_id": CUSTOM_AGENT_ID, **fields},
+            headers=_headers(),
+        )
+    else:
+        response = await project_create_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(fields)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="archived-project-admission"),
+                    "application/gzip",
+                )
+            },
+            headers=_headers(),
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "project_archived"
+
+
 async def test_unknown_and_unowned_project_are_404(
     project_create_client: httpx.AsyncClient,
 ) -> None:

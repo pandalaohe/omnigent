@@ -5815,6 +5815,8 @@ class ProjectObject(BaseModel):
     name: str
     created_at: int
     updated_at: int | None = None
+    archived_at: int | None = None
+    archive_summary: dict[str, int] = Field(default_factory=lambda: {"sessions": 0, "tasks": 0})
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -5846,6 +5848,8 @@ class SessionProjectSummary(BaseModel):
     id: str | None = None
     name: str
     icon: str | None = None
+    archived_at: int | None = None
+    archive_summary: dict[str, int] = Field(default_factory=lambda: {"sessions": 0, "tasks": 0})
 
 
 class CreateProjectRequest(BaseModel):

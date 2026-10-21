@@ -264,6 +264,12 @@ ARCHIVE_REMOVED_WORKTREE_LABEL_KEY = "omnigent.archive_removed_worktree"
 ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY = "omnigent.archive_worktree_admission_fence"
 ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX = f"{ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY}."
 ARCHIVE_CASCADE_LABEL_KEY = "omnigent.archive_cascade"
+PROJECT_ARCHIVE_LABEL_KEY = "omnigent.project_archive"
+
+
+def project_archive_batch_label_key(batch: str) -> str:
+    """A project's own provenance survives later archives by other projects."""
+    return f"{PROJECT_ARCHIVE_LABEL_KEY}.{batch}"
 
 
 def archive_cascade_members(conv: Conversation) -> dict[str, int]:
@@ -507,6 +513,7 @@ class ConversationUpdateResult:
     conversation: Conversation
     reasoning_effort_changed: bool
     model_override_changed: bool
+    archive_outcome: Literal["applied", "already", "conflict"] | None = None
 
 
 @dataclass(frozen=True)
@@ -835,6 +842,8 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
+        project_owner_user_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
@@ -1635,6 +1644,13 @@ class ConversationStore(ABC):
         worktree_archive_mode: str | None = None,
         override_keep_worktree: bool = False,
         reported_model: str | None = None,
+        expect_archived: bool | None = None,
+        expect_revision: int | None = None,
+        set_labels: dict[str, str] | None = None,
+        remove_labels: list[str] | None = None,
+        project_archive_batch: str | None = None,
+        archive_project_id: str | None = None,
+        archive_op_id: str | None = None,
     ) -> ConversationUpdateResult | None:
         """Update a conversation and report requested model-setting changes.
 
@@ -1661,6 +1677,24 @@ class ConversationStore(ABC):
             teardown runs. Deletes any prior label on a transition without
             it (including unarchive).
         """
+        ...
+
+    @abstractmethod
+    def list_project_archive_sessions(
+        self,
+        project_id: str,
+        project_name: str,
+        user_id: str | None,
+        batch: str | None = None,
+    ) -> list[Conversation]:
+        """List owned project members and descendants, or members tagged by a batch."""
+        ...
+
+    @abstractmethod
+    def clear_project_archive_labels(
+        self, conversation_id: str, project_id: str, op_id: str, batch: str
+    ) -> bool:
+        """Remove only this batch's markers while its project operation is current."""
         ...
 
     @abstractmethod
@@ -2701,6 +2735,7 @@ class ConversationStore(ABC):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
@@ -2784,6 +2819,7 @@ class ConversationStore(ABC):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
     ) -> Conversation:

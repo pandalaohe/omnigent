@@ -199,6 +199,7 @@ def _to_response(
         "host_id": task.host_id,
         "execution_target": task.execution_target,
         "state": task.state,
+        "paused_by_archive_batch": task.paused_by_archive_batch,
         "last_run_at": task.last_run_at,
         "last_run_status": last_run_status,
         "last_run_conversation_id": task.last_run_conversation_id,
@@ -713,6 +714,12 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
         run_now = getattr(request.app.state, "scheduled_task_run_now", None)
+        if task.project_id is not None and project_store is not None:
+            project = await asyncio.to_thread(project_store.get, task.project_id, user_id=owner_id)
+            if project is not None and project.archived_at is not None:
+                from omnigent.errors import ProjectArchivedError
+
+                raise ProjectArchivedError(project.id, project.name)
         if run_now is None:
             raise OmnigentError(
                 "scheduled task scheduler is not running",

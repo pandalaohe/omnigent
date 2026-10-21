@@ -28,7 +28,8 @@ import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
-import { useProjects } from "@/hooks/useConversations";
+import { useProjects, useProjectsWithArchived } from "@/hooks/useConversations";
+import { ProjectSinglePicker } from "@/components/ProjectSinglePicker";
 import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
@@ -85,6 +86,7 @@ export function CreateScheduledTaskDialog({
   const { data: customAgents } = useCustomAgents(open);
   const { data: hosts } = useHosts({ enabled: open });
   const { data: projects } = useProjects();
+  const { data: allProjects } = useProjectsWithArchived();
   const info = useServerInfo();
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
@@ -341,9 +343,11 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // Label-only folders have no first-class id, so they cannot key a task's
   // project (the server default-fills those from the creating session).
-  const projectOptions = (projects ?? []).flatMap((project) =>
-    project.id === null ? [] : [{ id: project.id, name: project.name }],
-  );
+  const projectOptions =
+    allProjects ??
+    (projects ?? []).flatMap((project) =>
+      project.id === null ? [] : [{ id: project.id, name: project.name }],
+    );
   const preservePinnedHost = isEdit && editingTask?.hostId != null;
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
@@ -676,32 +680,16 @@ export function CreateScheduledTaskDialog({
               from the surrounding context (or the edited task) until the user
               changes it; "No project" leaves the master table in charge. */}
           <div className="flex flex-col gap-1.5" data-testid="task-project-field">
-            <Label htmlFor="task-project">Project (optional)</Label>
-            <Select
-              value={effectiveProjectId === "" ? UNSET_PROJECT : effectiveProjectId}
-              componentId="tasks.scheduled.project"
-              onValueChange={(v) => {
+            <ProjectSinglePicker
+              projects={projectOptions}
+              value={effectiveProjectId || null}
+              onChange={(id) => {
                 setProjectTouched(true);
-                setProjectId(v === UNSET_PROJECT ? "" : v);
+                setProjectId(id ?? "");
               }}
-              onOpenChange={handleSelectOpenChange}
-            >
-              <SelectTrigger
-                id="task-project"
-                data-testid="task-project-trigger"
-                className="w-full"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value={UNSET_PROJECT}>No project</SelectItem>
-                {projectOptions.map((project) => (
-                  <SelectItem key={project.id} value={project.id}>
-                    {project.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              label="Project (optional)"
+              testId="task-project-trigger"
+            />
             <p className="text-sm text-muted-foreground">
               Runs on this project&apos;s calling defaults for the host; no project uses the master
               table.
@@ -851,7 +839,6 @@ export function CreateScheduledTaskDialog({
 const UNSET_HOST = "__unset_host__";
 
 /** Sentinel Select value for "no project" — Radix Select disallows "". */
-const UNSET_PROJECT = "__unset_project__";
 
 /** Sentinel Select value for the "New Sandbox" option (execution_target=managed_sandbox). */
 const SANDBOX_HOST = "__sandbox__";

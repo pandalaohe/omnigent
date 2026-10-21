@@ -11,6 +11,7 @@
  */
 
 import { useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { useSearchParams } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
@@ -19,6 +20,8 @@ import { Input } from "@/components/ui/input";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
+import { restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
+import { listProjects } from "@/lib/projectsApi";
 import {
   SCHEDULED_TASK_SUGGESTIONS,
   type ScheduledTaskSuggestion,
@@ -34,12 +37,13 @@ import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
-type FilterTab = "all" | "active" | "paused";
+type FilterTab = "all" | "active" | "paused" | "archived";
 
 const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "all", label: "All" },
   { value: "active", label: "Active" },
   { value: "paused", label: "Paused" },
+  { value: "archived", label: "Archived" },
 ];
 
 export function TasksPage() {
@@ -48,6 +52,22 @@ export function TasksPage() {
   // pre-fills the create dialog's Project select.
   const currentProjectName = searchParams.get("project");
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
+  const queryClient = useQueryClient();
+  const { data: projects = [] } = useQuery({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => listProjects({ includeArchived: true }),
+  });
+  const archivedProjects = useMemo(
+    () =>
+      new Map(
+        projects.filter((project) => !!project.archived_at).map((project) => [project.id, project]),
+      ),
+    [projects],
+  );
+  const activeProjects = useMemo(
+    () => projects.filter((project) => !project.archived_at),
+    [projects],
+  );
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
   // each row (rather than each row owning a timer) keeps the relative next-run
@@ -90,6 +110,8 @@ export function TasksPage() {
     const all = tasks ?? [];
     const q = search.trim().toLowerCase();
     const matches = all.filter((t) => {
+      const archived = !!(t.projectId && archivedProjects.has(t.projectId));
+      if (filter === "archived" ? !archived : archived) return false;
       if (filter === "active" && t.state !== "active") return false;
       if (filter === "paused" && t.state !== "paused") return false;
       if (q && !t.name.toLowerCase().includes(q)) return false;
@@ -116,7 +138,7 @@ export function TasksPage() {
       if (bNext == null) return -1;
       return aNext - bNext;
     });
-  }, [tasks, search, filter]);
+  }, [tasks, search, filter, archivedProjects]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
   // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be
@@ -256,6 +278,15 @@ export function TasksPage() {
               onPauseToggle={handlePauseToggle}
               onRunNow={handleRunNow}
               onDelete={handleDelete}
+              archivedProject={task.projectId ? archivedProjects.get(task.projectId) : undefined}
+              activeProjects={activeProjects}
+              onRestoreProject={(id) => {
+                const project = archivedProjects.get(id);
+                if (project) void restoreProjectWithNotice(id, project.name, queryClient);
+              }}
+              onMoveAndResume={(candidate, projectId) =>
+                updateMutation.mutate({ id: candidate.id, input: { projectId, state: "active" } })
+              }
             />
           ))}
         </div>

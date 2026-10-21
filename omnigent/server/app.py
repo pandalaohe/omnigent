@@ -2272,6 +2272,7 @@ def create_app(
     app.state.project_host_binding_store = project_host_binding_store
     app.state.project_repository_store = project_repository_store
     app.state.project_store = project_store
+    app.state.scheduled_task_store = scheduled_task_store
     # The create-time calling-defaults resolver reads these four stores off
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
@@ -2785,7 +2786,17 @@ def create_app(
             )
         return JSONResponse(
             status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    **{
+                        key: getattr(exc, key)
+                        for key in ("project_id", "project_name", "op_kind")
+                        if hasattr(exc, key)
+                    },
+                }
+            },
         )
 
     @app.exception_handler(RequestValidationError)
@@ -4181,6 +4192,10 @@ def create_app(
             create_projects_router(
                 project_store=project_store,
                 auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                scheduled_task_store=scheduled_task_store,
+                runner_router=runner_router,
             ),
             prefix="/v1",
             tags=["projects"],

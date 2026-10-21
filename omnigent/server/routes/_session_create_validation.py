@@ -300,6 +300,13 @@ async def resolve_project_session_create(
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if project.archived_at is not None:
+            from omnigent.errors import ProjectArchivedError
+
+            raise ProjectArchivedError(project.id, project.name)
+
+    if parent_project is not None and parent_project.archived_at is not None:
+        parent_project = None
 
     updates: dict[str, Any] = {}
     bindings: Any = []
