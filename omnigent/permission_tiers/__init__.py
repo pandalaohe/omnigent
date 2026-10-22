@@ -77,6 +77,7 @@ class TrustedHostContext:
     resolver: Callable[[str], ResolvedPath]
     drive_cwds: Mapping[str, str] = field(default_factory=dict)
     environment: Mapping[str, str] = field(default_factory=dict)
+    extension_tools: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -410,6 +411,16 @@ def _adapt_unbound_call(
         )
     try:
         digest = _digest(arguments)
+        if name in context.extension_tools:
+            reason = context.extension_tools[name]
+            return ToolIntent(
+                ToolKind.UNKNOWN if reason else ToolKind.OTHER,
+                name,
+                digest,
+                context,
+                status="unknown" if reason else "ok",
+                detail=reason or "user-extension",
+            )
         if name == "call_mcp_tool":
             server = _required_text(arguments, "ServerName")
             tool = _required_text(arguments, "ToolName")

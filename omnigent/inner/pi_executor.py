@@ -62,6 +62,7 @@ from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.bridge import (
     bridge_dir_for_session_id,
     clear_inbox,
+    permission_tool_registry_source,
     prepare_bridge_dir,
     prepare_permission_installation,
     verify_pi_permission_installation,
@@ -756,6 +757,8 @@ const PERMISSION_BRIDGE_DIR = __BRIDGE_DIR__;
 const PERMISSION_SESSION_ID = __SESSION_ID__;
 const PLAN_VISIBLE_TOOLS = new Set(__PLAN_TOOLS__);
 const PERMISSION_LEASES = new Map();
+const permissionToolSources = __TOOL_REGISTRY_SOURCE__;
+let permissionToolRegistry = null;
 let baselineActiveTools = null;
 
 function permissionPath(name) { return path.join(PERMISSION_BRIDGE_DIR, name); }
@@ -817,6 +820,14 @@ function writePermissionInstallation(pi) {
   const active = applyPermissionTools(pi, state.tier);
   if (!active) return;
   try {
+    if (state.tier !== "full") {
+      permissionToolRegistry = permissionToolSources.capture(pi, {
+        version: 1, installation_id: expected.installation_id,
+        session_id: PERMISSION_SESSION_ID, harness: "pi",
+        extension_sha256: expected.extension_sha256,
+      });
+      writePermissionJson("permission_tools.json", permissionToolRegistry);
+    }
     writePermissionJson("permission_installation.json", {
       version: 1, installation_id: expected.installation_id,
       session_id: PERMISSION_SESSION_ID, harness: "pi",
@@ -910,6 +921,7 @@ function installPermissionHooks(pi) {
         setup.replace("__BRIDGE_DIR__", json.dumps(str(bridge_dir)))
         .replace("__SESSION_ID__", json.dumps(session_id))
         .replace("__PLAN_TOOLS__", json.dumps(plan_tools))
+        .replace("__TOOL_REGISTRY_SOURCE__", permission_tool_registry_source())
     )
 
 
@@ -1168,6 +1180,20 @@ def _generate_extension_js(
     permission_revision_capture = (
         "const permissionRevisionAtCall = permissionRevision();" if permission_setup else ""
     )
+    permission_source_guard = (
+        'if (permissionState().tier !== "full" && permissionToolRegistry && '
+        "!permissionToolSources.matches(pi, permissionToolRegistry, event.toolName)) "
+        'return { block: true, reason: "Pi extension registration changed; '
+        'restart to verify its source" };'
+        if permission_setup
+        else ""
+    )
+    permission_bridge_origin = (
+        "(!permissionToolRegistry || "
+        "permissionToolSources.isBridge(permissionToolRegistry, event.toolName, __filename))"
+        if permission_setup
+        else "true"
+    )
     permission_post_guard = (
         "if (permissionRevision() !== permissionRevisionAtCall) return "
         '{ block: true, reason: "permission revision changed" };'
@@ -1326,7 +1352,9 @@ module.exports = function(pi) {{
       return {{ block: true, reason: "invalid tool call" }};
     }}
     {permission_guard}
-    if (BRIDGED.has(event.toolName) && !PI_NATIVE_TOOLS.has(event.toolName)) return;
+    {permission_source_guard}
+    if (BRIDGED.has(event.toolName) && !PI_NATIVE_TOOLS.has(event.toolName) &&
+        {permission_bridge_origin}) return;
     {permission_revision_capture}
     const verdict = await evalNativePolicy(event.toolName, event.input, event.toolCallId);
     if (verdict.block) {{

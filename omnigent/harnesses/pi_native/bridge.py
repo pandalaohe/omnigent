@@ -70,6 +70,7 @@ _SESSIONS_DIR = "sessions"
 PERMISSION_INSTALLATION_FILE = "permission_installation.json"
 PERMISSION_EXPECTED_FILE = "permission_expected.json"
 PERMISSION_ACK_FILE = "permission_ack.json"
+PERMISSION_TOOLS_FILE = "permission_tools.json"
 
 
 def bridge_root() -> Path:
@@ -437,6 +438,7 @@ def prepare_permission_installation(
     installation_id = uuid.uuid4().hex
     (bridge_dir / PERMISSION_INSTALLATION_FILE).unlink(missing_ok=True)
     (bridge_dir / PERMISSION_ACK_FILE).unlink(missing_ok=True)
+    (bridge_dir / PERMISSION_TOOLS_FILE).unlink(missing_ok=True)
     expected: _JsonObject = {
         "version": 1,
         "installation_id": installation_id,
@@ -444,6 +446,7 @@ def prepare_permission_installation(
         "harness": harness,
         "extension_path": str(extension),
         "extension_sha256": hashlib.sha256(extension.read_bytes()).hexdigest(),
+        "tool_registry_version": 1,
     }
     _atomic_json(bridge_dir / PERMISSION_EXPECTED_FILE, expected)
     return installation_id
@@ -618,7 +621,15 @@ def _extension_source() -> str:
     reviewable without embedding JS syntax in a Python raw string.
     """
     resource = files(_EXTENSION_PACKAGE).joinpath(_EXTENSION_FILE)
-    return resource.read_text(encoding="utf-8")
+    return resource.read_text(encoding="utf-8").replace(
+        'require("./permission_tool_registry.cjs")', permission_tool_registry_source()
+    )
+
+
+def permission_tool_registry_source() -> str:
+    """Inline the same registry implementation into both generated Pi bridges."""
+    source = files(_EXTENSION_PACKAGE).joinpath("permission_tool_registry.cjs").read_text()
+    return "(() => { const module = { exports: {} };\n" + source + "\nreturn module.exports; })()"
 
 
 def _atomic_json(path: Path, payload: _JsonObject) -> None:

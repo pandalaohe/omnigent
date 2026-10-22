@@ -53,6 +53,7 @@ class PermissionTierRuntime:
         self._leases: dict[str, dict[str, PermissionLease]] = {}
         self._inspected: dict[str, dict[str, tuple[BoundToolCall, dict[str, object], bool]]] = {}
         self._finished: dict[str, set[str]] = {}
+        self._pi_control_paths: dict[str, set[str]] = {}
 
     @staticmethod
     def state_path(session_id: str, harness: str, labels: Mapping[str, str]) -> Path:
@@ -112,6 +113,7 @@ class PermissionTierRuntime:
         self._harnesses[envelope.session_id] = harness
         self._inspected.pop(envelope.session_id, None)
         self._leases.pop(envelope.session_id, None)
+        self._pi_control_paths.pop(envelope.session_id, None)
 
     def install(
         self, envelope: RunnerSessionInitEnvelope | None, harness: str
@@ -238,15 +240,20 @@ class PermissionTierRuntime:
                 (
                     package_root / "harnesses" / "pi_native" / "bridge.py",
                     package_root / "resources" / "pi_native" / "omnigent_pi_native_extension.js",
+                    package_root / "resources" / "pi_native" / "permission_tool_registry.cjs",
                     package_root / "inner" / "pi_executor.py",
                     package_root / "inner" / "pi_harness.py",
-                    Path.home() / ".pi" / "agent" / "settings.json",
-                    Path.home() / ".pi" / "agent" / "extensions",
-                    Path.home() / ".pi" / "agent" / "npm",
-                    Path.home() / ".pi" / "agent" / "git",
-                    Path(state.workspace) / ".pi" / "settings.json",
+                    Path.home() / ".pi",
+                    Path.home() / ".agents",
+                    Path(state.workspace) / ".pi",
+                    Path(state.workspace) / ".agents",
                 )
             )
+            from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
+
+            protected = self._pi_control_paths.setdefault(session_id, set())
+            protected.update(read_pi_tool_registry(state_path.parent, state).control_paths)
+            installed.extend(Path(path) for path in sorted(protected))
             if harness == "pi":
                 from omnigent.harnesses.pi_native.bridge import PERMISSION_EXPECTED_FILE
 
@@ -281,6 +288,49 @@ class PermissionTierRuntime:
             raise ValueError("Unknown permission harness")
         return trusted_permission_control_paths(state_path, installed_paths=tuple(installed))
 
+    def _evaluate(
+        self,
+        session_id: str,
+        state: HostPermissionState,
+        name: str,
+        arguments: Mapping[str, object],
+        local_execution: bool,
+    ) -> TierDecision:
+        control_paths = self._control_paths(session_id, state)
+        extensions = {}
+        if (
+            state.tier != "full"
+            and local_execution
+            and self._harnesses.get(session_id) in ("pi", "pi-native")
+        ):
+            from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
+
+            bridge = self._paths[session_id].parent
+            registry = read_pi_tool_registry(bridge, state)
+            if name in registry.invalid_tools:
+                return TierDecision(Verdict.DENY, registry.extensions[name])
+            if registry.reason:
+                # Older launches have no registry protocol; never grant them extension trust.
+                try:
+                    required = (
+                        json.loads((bridge / "permission_expected.json").read_text()).get(
+                            "tool_registry_version"
+                        )
+                        == 1
+                    )
+                except (OSError, ValueError, TypeError, AttributeError):
+                    required = True
+                if required:
+                    return TierDecision(Verdict.DENY, registry.reason)
+            extensions = registry.extensions
+        return evaluate_host_tool(
+            state,
+            name if local_execution else "__omnigent_remote_tool__",
+            arguments,
+            control_paths=control_paths,
+            extension_tools=extensions,
+        )
+
     def inspect(
         self,
         session_id: str,
@@ -309,13 +359,7 @@ class PermissionTierRuntime:
         saved_arguments = json.loads(
             json.dumps(dict(arguments), sort_keys=True, separators=(",", ":"), allow_nan=False)
         )
-        control_paths = self._control_paths(session_id, state)
-        decision = evaluate_host_tool(
-            state,
-            name if local_execution else "__omnigent_remote_tool__",
-            arguments,
-            control_paths=control_paths,
-        )
+        decision = self._evaluate(session_id, state, name, arguments, local_execution)
         inspected = self._inspected.setdefault(session_id, {})
         prior = inspected.get(call_id)
         if prior is not None and prior[0] != binding:
@@ -368,15 +412,9 @@ class PermissionTierRuntime:
         if inspected is None or inspected[0] != binding:
             return False
         try:
-            control_paths = self._control_paths(session_id, state)
+            refreshed = self._evaluate(session_id, state, name, inspected[1], inspected[2])
         except (OSError, ValueError, TypeError, KeyError):
             return False
-        refreshed = evaluate_host_tool(
-            state,
-            name if inspected[2] else "__omnigent_remote_tool__",
-            inspected[1],
-            control_paths=control_paths,
-        )
         if refreshed.action == Verdict.DENY:
             self._inspected.get(session_id, {}).pop(call_id, None)
             return False
