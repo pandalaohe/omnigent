@@ -883,8 +883,9 @@ def profile_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.mark.parametrize(
     "linked,subdirectory", [(False, False), (True, False), (False, True), (True, True)]
 )
+@pytest.mark.parametrize("extra_root", [None, "ancestor", "common", "unrelated", "alias"])
 def test_workspace_profile_repository_entries(
-    profile_repo: Path, linked: bool, subdirectory: bool
+    profile_repo: Path, linked: bool, subdirectory: bool, extra_root: str | None
 ) -> None:
     import subprocess
 
@@ -919,11 +920,27 @@ def test_workspace_profile_repository_entries(
     if subdirectory:
         workspace = workspace / "src"
         workspace.mkdir()
+    roots = []
+    if extra_root is not None:
+        root = {
+            "ancestor": repo.parent,
+            "common": common,
+            "unrelated": repo.parent / "other",
+            "alias": repo.parent / "alias",
+        }[extra_root]
+        if extra_root == "alias":
+            root.symlink_to(repo, target_is_directory=True)
+        roots.append(str(root))
+        if extra_root != "unrelated":
+            del expected[str(common / "worktrees")]
+            del expected[str(common / "modules")]
+        if extra_root != "common":
+            expected[str(root)] = "write"
     profile = launch_args.codex_workspace_profile(
         workspace,
         launch_args=["--approve-for-me"],
         server_overrides=[],
-        private_config={},
+        private_config={"sandbox_workspace_write": {"writable_roots": roots}},
         codex_version=(0, 162, 1),
     )
     assert profile is not None

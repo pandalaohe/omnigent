@@ -7,10 +7,13 @@ import contextlib
 import http.server
 import json
 import re
+import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -145,8 +148,17 @@ def _loopback_overrides(provider: _ScriptedProvider) -> list[str]:
     ]
 
 
+@pytest.fixture
+def sibling_repo() -> Iterator[Path]:
+    # Codex also grants OS temp directories; put the denial probe outside them.
+    scratch_root = Path(__file__).resolve().parents[2] / "tmp"
+    scratch_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="codex-sibling-", dir=scratch_root) as directory:
+        yield Path(directory)
+
+
 def _git_probe_workspace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool, sibling_repo: Path
 ) -> tuple[Path, Path, list[str]]:
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
@@ -182,23 +194,44 @@ def _git_probe_workspace(
         commands[2] = f"echo x > {common / 'hooks' / 'probe'}"
         commands[3] = f"git config --file {common / 'config'} omniprobe.flag 1"
         commands.append(f"echo x > {common / 'worktrees' / 'linked-workspace' / 'commondir'}")
-    sibling = tmp_path / "sibling"
-    sibling.mkdir()
-    subprocess.run(["git", "-C", str(sibling), "init"], check=True, capture_output=True)
-    commands.append(f"echo x > {sibling / '.git' / 'probe'}")
+    subprocess.run(["git", "-C", str(sibling_repo), "init"], check=True, capture_output=True)
+    commands.append(f"echo x > {shlex.quote(str(sibling_repo / '.git' / 'probe'))}")
     return workspace, common, commands
 
 
-@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("linked,broad_root", [(False, False), (True, False), (True, True)])
 async def test_native_codex_git_write_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    linked: bool,
+    broad_root: bool,
+    sibling_repo: Path,
 ) -> None:
     reason = cli_unavailable_reason("codex")
     if reason is not None:
         pytest.skip(reason)
     codex_path = shutil.which("codex")
     assert codex_path is not None
-    workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked)
+    workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked, sibling_repo)
+    successful_probes = 2
+    if broad_root:
+        (tmp_path / "source-codex-home" / "config.toml").write_text(
+            f"[sandbox_workspace_write]\nwritable_roots = [{json.dumps(str(common.parent))}]\n"
+        )
+        sibling = tmp_path / "sibling-worktree"
+        subprocess.run(
+            ["git", "-C", str(workspace), "worktree", "add", str(sibling)],
+            check=True,
+            capture_output=True,
+        )
+        commands[2:2] = [
+            f"git -C {shlex.quote(str(sibling))} commit --allow-empty -m sibling",
+            f"git -C {shlex.quote(str(sibling))} fetch origin",
+        ]
+        successful_probes += 2
+        for name in ("gitdir", "config.worktree"):
+            target = common / "worktrees" / "linked-workspace" / name
+            commands.append(f"echo x > {shlex.quote(str(target))}")
     child_tmp = tmp_path / "child-tmp"
     child_tmp.mkdir()
     child_home = tmp_path / "child-home"
@@ -261,10 +294,10 @@ async def test_native_codex_git_write_profile(
         assert len(provider.requests) == len(commands) + 3
         exits = _probe_exit_codes(provider, [0, *range(2, len(commands) + 2)])
         assert exits[0] != 0, exits
-        assert exits[1:3] == [0, 0], exits
-        assert all(code != 0 for code in exits[3:]), exits
+        assert exits[1 : successful_probes + 1] == [0] * successful_probes, exits
+        assert all(code != 0 for code in exits[successful_probes + 1 :]), exits
         assert not (common / "hooks" / "probe").exists()
-        assert not (tmp_path / "sibling" / ".git" / "probe").exists()
+        assert not (sibling_repo / ".git" / "probe").exists()
         configured = subprocess.run(
             ["git", "-C", str(workspace), "config", "--get", "omniprobe.flag"],
             capture_output=True,
@@ -282,7 +315,7 @@ async def test_native_codex_git_write_profile(
 
 @pytest.mark.parametrize("linked", [False, True])
 async def test_sdk_codex_git_write_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool, sibling_repo: Path
 ) -> None:
     reason = cli_unavailable_reason("codex")
     if reason is not None:
@@ -292,7 +325,7 @@ async def test_sdk_codex_git_write_profile(
     version = await _codex_cli_version(codex_path)
     if version is None or version < (0, 139, 0):
         pytest.skip("SDK Git profile requires Codex >= 0.139.0")
-    workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked)
+    workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked, sibling_repo)
     child_home = tmp_path / "child-home"
     child_home.mkdir()
     child_tmp = tmp_path / "child-tmp"
@@ -323,12 +356,14 @@ async def test_sdk_codex_git_write_profile(
                 ]
             assert isinstance(events[-1], TurnComplete), events
         assert len(provider.requests) == len(commands) + 3
+        session = executor._live_app_session()
+        assert session is not None and session._workspace_profile is not None, version
         exits = _probe_exit_codes(provider, [0, *range(2, len(commands) + 2)])
         assert exits[0] != 0, exits
         assert exits[1:3] == [0, 0], exits
         assert all(code != 0 for code in exits[3:]), exits
         assert not (common / "hooks" / "probe").exists()
-        assert not (tmp_path / "sibling" / ".git" / "probe").exists()
+        assert not (sibling_repo / ".git" / "probe").exists()
         configured = subprocess.run(
             ["git", "-C", str(workspace), "config", "--get", "omniprobe.flag"],
             capture_output=True,

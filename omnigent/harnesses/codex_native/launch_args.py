@@ -714,11 +714,21 @@ def codex_workspace_profile(
             return None
         if any(not Path(root).is_absolute() and not root.startswith("~") for root in roots):
             return None
+        writable_roots = [
+            *(absolute_codex_path(root, effective_cwd) for root in roots),
+            *additional_roots,
+        ]
+        # Preserve access to sibling worktrees/submodules already granted by an extra root.
+        common_already_writable = any(
+            common.resolve().is_relative_to(Path(root).resolve()) for root in writable_roots
+        )
         entries = {str(directory): "write" for directory in opened}
-        for name in ("hooks", "config", "config.worktree", "modules", "worktrees"):
+        for name in ("hooks", "config", "config.worktree"):
             entries[str(common / name)] = "read"
+        if not common_already_writable:
+            for name in ("modules", "worktrees"):
+                entries[str(common / name)] = "read"
         if git_dir is not None:
-            entries[str(common / "worktrees")] = "read"
             for name in ("commondir", "gitdir", "config.worktree"):
                 entries[str(git_dir / name)] = "read"
         # More-specific entries re-open only this linked worktree's metadata.
@@ -726,10 +736,6 @@ def codex_workspace_profile(
             (candidate, access)
             for path, access in entries.items()
             for candidate in (Path(path), Path(path).resolve())
-        ]
-        writable_roots = [
-            *(absolute_codex_path(root, effective_cwd) for root in roots),
-            *additional_roots,
         ]
         for root in writable_roots:
             covered = False
