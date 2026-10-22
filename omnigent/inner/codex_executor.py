@@ -4904,11 +4904,11 @@ class _CodexAppServerSession:
         except Exception as exc:  # noqa: BLE001 — tool errors are surfaced to Codex via the JSON response envelope
             return {"error": str(exc)}
 
-    async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
-        """Read only an existing initialized stdio owner; never start or repair it."""
+    def _resident_transport_guard(self) -> Callable[[], bool]:
+        """Capture this initialized stdio pair for reads and later reconciliation."""
         proc, reader, incarnation = self._proc, self._reader_task, self.resident_incarnation_id
         if proc is None or reader is None or proc.stdin is None:
-            return None
+            return lambda: False
         stdin = proc.stdin
         loop = asyncio.get_running_loop()
 
@@ -4928,10 +4928,17 @@ class _CodexAppServerSession:
                 and not reader.cancelling()
             )
 
+        return current
+
+    async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
+        """Read only an existing initialized stdio owner; never start or repair it."""
+        current = self._resident_transport_guard()
+        reader = self._reader_task
+
         async def request(method: str, params: CodexParams) -> CodexMessage:
             return await self._request(method, params, transport_guard=current)
 
-        if not 0 < timeout_s <= 5.0 or not current():
+        if reader is None or not 0 < timeout_s <= 5.0 or not current():
             return None
         # Keep the bound after timeout: the shared stdout reader may still hold
         # an unfinished reply. This owner now shares native's frame budget.
@@ -5333,6 +5340,14 @@ class _CodexSessionState:
     signature: tuple[str | None, str, str, str] | None = None
     closing: bool = False
     close_task: asyncio.Task[None] | None = None
+
+
+@dataclass(frozen=True)
+class CodexThreadInventorySnapshot:
+    """Loaded IDs aligned with registered owners; None is unknown, () is empty."""
+
+    inventory: ExecutorResidentInventory | None
+    thread_ids: tuple[tuple[str, ...] | None, ...] | None
 
 
 class _AppSessionFactory(Protocol):
@@ -5864,6 +5879,85 @@ class CodexExecutor(Executor):
                 )
             ),
         )
+
+    async def prepare_resident_thread_inventory(
+        self, *, timeout_s: float = 5.0
+    ) -> Callable[[], CodexThreadInventorySnapshot]:
+        """Read registered clients; reconcile synchronously after other sources await.
+
+        Loaded IDs establish neither independent-context nor alias coverage.
+        Maintenance attempts retain separate unknown evidence.
+        """
+        selected = self.resident_inventory()
+        candidates: dict[
+            str, tuple[ExecutorResidentOwner, _CodexAppServerSession, Callable[[], bool]]
+        ] = {}
+        if selected is not None:
+            for owner in selected.owners:
+                state = self._session_states.get(owner.session_keys[0])
+                app = state.app_session if state is not None else None
+                if (
+                    isinstance(app, _CodexAppServerSession)
+                    and app.resident_incarnation_id == owner.incarnation_id
+                    and owner.started
+                    and not owner.closing
+                    and not owner.cleanup_complete
+                ):
+                    candidates[owner.incarnation_id] = (
+                        owner,
+                        app,
+                        app._resident_transport_guard(),
+                    )
+
+        def current(
+            candidate: tuple[ExecutorResidentOwner, _CodexAppServerSession, Callable[[], bool]],
+        ) -> bool:
+            owner, app, guard = candidate
+            return guard() and all(
+                (state := self._session_states.get(key)) is not None and state.app_session is app
+                for key in owner.session_keys
+            )
+
+        reads: dict[str, tuple[str, ...]] = {}
+        pending = iter(candidates.values())
+
+        async def read_owners() -> None:
+            for candidate in pending:
+                owner, app, _ = candidate
+                inventory = self.resident_inventory()
+                if not current(candidate) or inventory is None or owner not in inventory.owners:
+                    continue
+                ids = await app.read_loaded_thread_ids(timeout_s=timeout_s)
+                if ids is not None:
+                    reads[owner.incarnation_id] = ids
+
+        if 0 < timeout_s <= 5.0:
+            try:
+                async with asyncio.timeout(timeout_s), asyncio.TaskGroup() as workers:
+                    for _ in range(min(4, len(candidates))):
+                        workers.create_task(read_owners())
+            except TimeoutError:
+                pass
+
+        def reconcile() -> CodexThreadInventorySnapshot:
+            inventory = self.resident_inventory()
+            ids = (
+                tuple(
+                    reads.get(owner.incarnation_id)
+                    if (
+                        (candidate := candidates.get(owner.incarnation_id)) is not None
+                        and candidate[0] == owner
+                        and current(candidate)
+                    )
+                    else None
+                    for owner in inventory.owners
+                )
+                if inventory is not None
+                else None
+            )
+            return CodexThreadInventorySnapshot(inventory, ids)
+
+        return reconcile
 
     def _live_app_session(self) -> _CodexAppServerSession | None:
         """

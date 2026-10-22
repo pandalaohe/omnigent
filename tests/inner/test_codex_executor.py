@@ -546,6 +546,207 @@ async def test_sdk_inventory_normalizes_real_subprocess_stdin_eio(sdk_inventory_
         stdin.close()
 
 
+@pytest.fixture
+async def sdk_inventory_owners():
+    executor = CodexExecutor(codex_path="/opt/work/bin/codex")
+    apps, readers = [], []
+
+    def add(key, ids):
+        app = _CodexAppServerSession(
+            codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+        )
+        app._resident_incarnation_id = f"{len(apps) + 1:032x}"
+        app.thread_id = key
+        app._proc = proc = _FakeProcess()
+        proc.stdout = _QueuedStdoutPipe()
+        app._loop = asyncio.get_running_loop()
+        app._started, app._cleaned = True, False
+        app._reader_task = reader = asyncio.create_task(app._reader_loop())
+        apps.append(app)
+        readers.append(reader)
+        executor._session_states[key] = _CodexSessionState(app_session=app)
+        app.start = AsyncMock(side_effect=AssertionError("inventory must not start"))
+        app.close = AsyncMock(side_effect=AssertionError("inventory must not close"))
+
+        async def respond():
+            message = json.loads(proc.stdin.writes[-1])
+            proc.stdout.feed({"id": message["id"], "result": {"data": ids, "nextCursor": None}})
+
+        proc.stdin.drain = respond
+        return app
+
+    try:
+        yield executor, add
+    finally:
+        for app in apps:
+            app._closing = True
+            app.start.assert_not_called()
+            app.close.assert_not_called()
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+
+
+@pytest.mark.parametrize("case", ["union", "empty", "collision", "maintenance", "unsupported"])
+async def test_sdk_executor_thread_inventory_collects_registered_owners(
+    sdk_inventory_owners, case
+):
+    executor, add = sdk_inventory_owners
+    apps = []
+    if case != "empty":
+        main, side = add("main", ["main", "sub"]), add("side", [])
+        apps = [main, side]
+        executor._session_states["alias"] = _CodexSessionState(app_session=main)
+        if case == "collision":
+            side._resident_incarnation_id = main.resident_incarnation_id
+        elif case == "maintenance":
+            main._resident_maintenance["maintenance"] = "sub"
+        elif case == "unsupported":
+            executor._session_states["foreign"] = _CodexSessionState(app_session=object())
+    reconcile = await executor.prepare_resident_thread_inventory(timeout_s=0.1)
+    result = reconcile()
+    if case in {"collision", "unsupported"}:
+        assert result.inventory is None and result.thread_ids is None
+        assert all(not app._proc.stdin.writes for app in apps)
+        return
+    assert result.inventory == executor.resident_inventory()
+    assert not result.inventory.aliases_complete and not result.inventory.context_coverage_complete
+    assert (
+        result.thread_ids
+        == {
+            "union": (("main", "sub"), ()),
+            "empty": (),
+            "maintenance": (("main", "sub"), (), None),
+        }[case]
+    )
+    if apps:
+        assert result.inventory.owners[0].session_keys == ("alias", "main")
+        assert all(len(app._proc.stdin.writes) == 1 for app in apps)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "proc",
+        "stdin",
+        "reader",
+        "incarnation",
+        "loop",
+        "closing",
+        "cleaned",
+        "exit",
+        "error",
+        "remove",
+        "replace",
+        "alias",
+        "thread",
+        "collision",
+    ],
+)
+async def test_sdk_executor_thread_inventory_reconciles_after_later_awaits(
+    sdk_inventory_owners, change
+):
+    executor, add = sdk_inventory_owners
+    first, second = add("first", ["first"]), add("second", ["second"])
+    reconcile = await executor.prepare_resident_thread_inventory(timeout_s=0.1)
+    before = reconcile()
+    assert before.thread_ids == (("first",), ("second",))
+    if change == "proc":
+        first._proc = _FakeProcess()
+    elif change == "stdin":
+        first._proc.stdin = _FakePipe()
+    elif change == "reader":
+        first._reader_task = second._reader_task
+    elif change == "incarnation":
+        first._resident_incarnation_id = "changed"
+    elif change == "loop":
+        first._loop = None
+    elif change == "closing":
+        executor._session_states["first"].closing = True
+    elif change == "cleaned":
+        first._cleaned = True
+    elif change == "exit":
+        first._proc.returncode = 0
+    elif change == "error":
+        first._transport_error = HarnessTransportClosedError("gone")
+    elif change == "remove":
+        del executor._session_states["first"]
+    elif change == "replace":
+        replacement = add("first", ["replacement"])
+        replacement._resident_incarnation_id = first.resident_incarnation_id
+    elif change == "alias":
+        executor._session_states["alias"] = _CodexSessionState(app_session=first)
+    elif change == "thread":
+        first.thread_id = "new-thread"
+    elif change == "collision":
+        second._resident_incarnation_id = first.resident_incarnation_id
+    await asyncio.sleep(0)
+    after = reconcile()
+    assert before.thread_ids == (("first",), ("second",))
+    if change == "collision":
+        assert after.inventory is None and after.thread_ids is None
+    else:
+        evidence = dict(
+            zip((o.incarnation_id for o in after.inventory.owners), after.thread_ids, strict=True)
+        )
+        assert evidence.pop(second.resident_incarnation_id) == ("second",)
+        assert all(ids is None for ids in evidence.values())
+
+
+@pytest.mark.parametrize("case", ["deadline", "cancel", "invalid", "not-ready", "rpc-error"])
+async def test_sdk_executor_thread_inventory_bounds_reads_and_preserves_unknowns(
+    sdk_inventory_owners, case
+):
+    executor, add = sdk_inventory_owners
+    apps = [add(f"owner-{i}", [f"owner-{i}"]) for i in range(6)]
+    entered, active = asyncio.Event(), []
+
+    async def stall():
+        active.append(True)
+        if len(active) == 4:
+            entered.set()
+        await asyncio.Event().wait()
+
+    if case in {"deadline", "cancel"}:
+        for app in apps:
+            app._proc.stdin.drain = stall
+    elif case == "not-ready":
+        for app in apps:
+            app._started = False
+    elif case == "rpc-error":
+
+        async def fail():
+            proc = apps[0]._proc
+            message = json.loads(proc.stdin.writes[-1])
+            proc.stdout.feed({"id": message["id"], "error": {"code": -1, "message": "unknown"}})
+
+        apps[0]._proc.stdin.drain = fail
+    read = asyncio.create_task(
+        executor.prepare_resident_thread_inventory(timeout_s=0 if case == "invalid" else 0.1)
+    )
+    try:
+        if case in {"deadline", "cancel"}:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert len(active) == 4
+        if case == "cancel":
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        else:
+            reconcile = await asyncio.wait_for(read, 2)
+            assert reconcile().thread_ids == (
+                (None, *((f"owner-{i}",) for i in range(1, 6)))
+                if case == "rpc-error"
+                else (None,) * 6
+            )
+        assert all(not app._pending_requests for app in apps)
+        if case in {"invalid", "not-ready"}:
+            assert all(not app._proc.stdin.writes for app in apps)
+    finally:
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
 class TestCodexExecutor(unittest.TestCase):
     def test_databricks_codex_config_overrides(self):
         overrides = _databricks_codex_config_overrides(
