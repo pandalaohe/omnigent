@@ -4932,6 +4932,18 @@
       "KeepWarmStatus": {
         "description": "Keep-warm status object for a session row.\n\nBuilt from the `omnigent.keep_warm` / `omnigent.keep_warm_stats`\nlabels with no settings read. `None` is used at the field level when a\nsession has no keep-warm label or is archived.",
         "properties": {
+          "blocked_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "First eligibility blocker observed in a due ping window, retained after the episode closes. `None` if unobserved.",
+            "title": "Blocked By"
+          },
           "episode": {
             "$ref": "#/components/schemas/KeepWarmEpisode",
             "description": "Pings / cost since the last real turn."
@@ -4980,7 +4992,11 @@
                   "card",
                   "host",
                   "switch_off",
-                  "runner_version"
+                  "runner_version",
+                  "expired",
+                  "archive_revision",
+                  "policy",
+                  "parent_inactive"
                 ],
                 "type": "string"
               },

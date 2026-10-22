@@ -32,24 +32,35 @@ export function formatKeepWarmCounters(pings: number, costUsd: number, estimated
  * so the pause names its cause.
  */
 export function keepWarmStopReason(status: KeepWarmStatus): string | null {
-  switch (status.stop_reason) {
-    case "cap":
-      return "cap reached";
-    case "misses":
-      return "cache misses";
-    case "failures":
-      return status.last_reason ? `failures (${status.last_reason})` : "failures";
-    case "card":
-      return "pending card";
-    case "host":
-      return "host offline";
-    case "switch_off":
-      return "switched off";
-    case "runner_version":
-      return "runner too old";
-    default:
-      return null;
-  }
+  if (status.stop_reason === null) return null;
+  const reasons: Record<NonNullable<KeepWarmStatus["stop_reason"]>, string> = {
+    cap: "cap reached",
+    misses: "cache misses",
+    failures: status.last_reason ? `failures (${status.last_reason})` : "failures",
+    card: "pending card",
+    host: "host offline",
+    switch_off: "switched off",
+    runner_version: "runner too old",
+    expired: "window expired",
+    archive_revision: "archive state changed",
+    policy: "policy stopped warming",
+    parent_inactive: "parent inactive",
+  };
+  const reason = reasons[status.stop_reason];
+  if (!reason) return null;
+  const blockers: Record<string, string> = {
+    not_inspectable: "unsupported session",
+    switch_off: "switched off",
+    missing_running_since: "missing turn start",
+    session_closed: "session closed",
+    ancestor_archived: "ancestor archived",
+    runner_offline: "runner offline",
+    host_unavailable: "host unavailable",
+    status_not_idle: "session not idle",
+    pending_card: "pending card",
+  };
+  const blocker = status.blocked_by && (blockers[status.blocked_by] ?? status.blocked_by);
+  return blocker ? `${reason} (blocked by ${blocker})` : reason;
 }
 
 /**

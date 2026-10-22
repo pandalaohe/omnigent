@@ -237,7 +237,17 @@ export interface KeepWarmLastReturn {
 
 /** Why warming stopped or paused, mirroring the server's vocabulary. */
 export type KeepWarmStopReason =
-  "cap" | "misses" | "failures" | "card" | "host" | "switch_off" | "runner_version";
+  | "cap"
+  | "misses"
+  | "failures"
+  | "card"
+  | "host"
+  | "switch_off"
+  | "runner_version"
+  | "expired"
+  | "archive_revision"
+  | "policy"
+  | "parent_inactive";
 
 /** Mirrors the server's `KeepWarmStatus`. */
 export interface KeepWarmStatus {
@@ -247,6 +257,7 @@ export interface KeepWarmStatus {
   total: KeepWarmTotal;
   last_return: KeepWarmLastReturn | null;
   last_reason: string | null;
+  blocked_by?: string | null;
 }
 
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */

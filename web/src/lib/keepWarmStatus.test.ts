@@ -80,6 +80,20 @@ describe("keepWarmStopReason", () => {
     expect(keepWarmStopReason(status({ stop_reason: "switch_off" }))).toBe("switched off");
     expect(keepWarmStopReason(status({ stop_reason: "runner_version" }))).toBe("runner too old");
   });
+
+  it("names closed episodes and preserves their first blocker", () => {
+    expect(keepWarmStopReason(status({ stop_reason: "expired" }))).toBe("window expired");
+    expect(keepWarmStopReason(status({ stop_reason: "archive_revision" }))).toBe(
+      "archive state changed",
+    );
+    expect(keepWarmStopReason(status({ stop_reason: "policy" }))).toBe("policy stopped warming");
+    expect(keepWarmStopReason(status({ stop_reason: "parent_inactive" }))).toBe("parent inactive");
+    expect(
+      keepWarmTooltipLine(
+        status({ state: "stopped", stop_reason: "expired", blocked_by: "status_not_idle" }),
+      ),
+    ).toBe("Keep-warm stopped: window expired (blocked by session not idle) · 0 pings $0.00");
+  });
 });
 
 describe("keepWarmTooltipLine", () => {

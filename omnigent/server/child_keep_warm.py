@@ -132,6 +132,17 @@ _MIGRATION_HARNESSES: dict[str, Literal["claude", "codex"]] = {
 #: Reasons a cold / paused label may carry. ``pol`` and ``mom`` are legacy
 #: (SCC19) codes — never written any more, still parsed from old labels.
 _WHY_CODES = frozenset({"cap", "exp", "fail", "pol", "miss", "rev", "mom"})
+_BLOCKER_STATUS: dict[str, str] = {
+    "i": "not_inspectable",
+    "s": "switch_off",
+    "t": "missing_running_since",
+    "c": "session_closed",
+    "a": "ancestor_archived",
+    "r": "runner_offline",
+    "h": "host_unavailable",
+    "n": "status_not_idle",
+    "p": "pending_card",
+}
 _RECEIPT_OUTCOMES = frozenset({"ok", "skipped", "failed"})
 #: Mirrored native sub-agent rows describe another harness's internal
 #: sub-agent, not an Omnigent session with its own cache.
@@ -200,7 +211,7 @@ class _WarmState:
     baseline, ``v`` ``archive_revision`` at a miss pause, ``w``
     warm-until, ``o`` latest cache observation ``[epoch, 1=hit|0=miss]``,
     ``r`` late-usage retry pending, ``e`` pending late reading may count
-    as a miss, ``k`` stop reason.
+    as a miss, ``k`` stop reason, ``g`` first window blocker.
 
     :param s: Episode state.
     :param why: Reason for a cold / paused state — one of ``cap``, ``exp``,
@@ -228,6 +239,8 @@ class _WarmState:
         re-derived once the episode's own state replaces the previous one.
     :param k: Why warming currently does not ping — the first failing
         eligibility gate or a receipt's reason code, else ``None``.
+    :param g: First eligibility blocker observed when a ping was due in
+        this episode; retained until the next real-turn episode.
     """
 
     s: str
@@ -247,6 +260,7 @@ class _WarmState:
     r: bool = False
     e: bool = False
     k: str | None = None
+    g: str | None = None
 
     def to_label(self) -> str:
         """Serialize to the compact JSON label value."""
@@ -283,6 +297,8 @@ class _WarmState:
             data["e"] = 1
         if self.k is not None:
             data["k"] = self.k
+        if self.g is not None:
+            data["g"] = self.g
         return json.dumps(data, separators=(",", ":"))
 
     @classmethod
@@ -325,6 +341,7 @@ class _WarmState:
             observation = None
         attempt_id = data.get("a")
         stop_reason = data.get("k")
+        blocker = data.get("g")
         return cls(
             s=state,
             why=why if isinstance(why, str) and why in _WHY_CODES else None,
@@ -343,6 +360,7 @@ class _WarmState:
             r=bool(data.get("r")),
             e=bool(data.get("e")),
             k=stop_reason if isinstance(stop_reason, str) else None,
+            g=blocker if isinstance(blocker, str) and blocker in _BLOCKER_STATUS else None,
         )
 
 
@@ -554,6 +572,10 @@ _WARM_GATE_STATUS: dict[str, str] = {
 #: runner-liveness gate; ``runner_version`` stays schema-only, never produced.
 _STOP_REASON_STATUS: dict[str, str] = {
     "cap": "cap",
+    "exp": "expired",
+    "rev": "archive_revision",
+    "pol": "policy",
+    "mom": "parent_inactive",
     "miss": "misses",
     "fail": "failures",
     "card": "card",
@@ -828,6 +850,7 @@ def keep_warm_status_from_labels(
         },
         "last_return": last_return,
         "last_reason": state.k,
+        "blocked_by": _BLOCKER_STATUS.get(state.g or ""),
     }
 
 
@@ -1534,19 +1557,27 @@ class ChildKeepWarmSweeper:
         runner_online = self._runner_online(session_id)
         host_ok = self._host_okay(conv)
         sync_pending = _has_sync_pending(session_id)
-        base_eligible = (
-            inspectable
-            and switch_on
-            and running_since is not None
-            and not is_session_closed(conv.labels, conv.title)
-            and not ancestor_archived
-            and runner_online is True
-            and host_ok
-            and status == "idle"
-            and not sync_pending
-        )
-        # The stop reason names the first gate, in the order the checks run,
-        # that blocks a ping right now; ``None`` means none blocks.
+        # Keep the blocker order identical to ping eligibility.
+        blocker: str | None = None
+        if not inspectable:
+            blocker = "i"
+        elif not switch_on:
+            blocker = "s"
+        elif running_since is None:
+            blocker = "t"
+        elif is_session_closed(conv.labels, conv.title):
+            blocker = "c"
+        elif ancestor_archived:
+            blocker = "a"
+        elif runner_online is not True:
+            blocker = "r"
+        elif not host_ok:
+            blocker = "h"
+        elif status != "idle":
+            blocker = "n"
+        elif sync_pending:
+            blocker = "p"
+        base_eligible = blocker is None
         gate: str | None = None
         if not switch_on:
             gate = "switch"
@@ -1720,6 +1751,19 @@ class ChildKeepWarmSweeper:
         ):
             state.s, state.why = "p", "fail"
             notices.append(("fail", {}))
+
+        # Record once, only inside the due window, before a close can erase
+        # eligibility evidence. Quiet ticks and later blockers leave it alone.
+        if (
+            state is not None
+            and state.s == "w"
+            and state.g is None
+            and blocker is not None
+            and state.u is not None
+            and state.w is not None
+            and state.u + interval <= now <= state.w
+        ):
+            state.g = blocker
 
         # Rule 7: cap and expiry settle tracked sessions whether or not they
         # are eligible to be pinged. An expired window under an archived
