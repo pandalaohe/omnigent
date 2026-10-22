@@ -94,6 +94,18 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                 not owner.session_ids or not all(owner.session_ids)
                 for owner in snapshot.native_backends.owners
             )
+            or any(
+                owner.transport_generation is not None
+                and (
+                    owner.transport_generation < 0
+                    or owner.harness != "codex-native"
+                    or not owner.registered
+                    or owner.closing
+                    or owner.process_exit_confirmed
+                    or owner.exit_confirmed
+                )
+                for owner in snapshot.native_backends.owners
+            )
         ):
             return None
         harnesses = snapshot.harnesses

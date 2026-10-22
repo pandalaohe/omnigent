@@ -97,6 +97,7 @@ async def test_reader_keeps_shared_backend_aliases_as_evidence_without_probing(
                 "process_exit_confirmed": False,
                 "exit_confirmed": False,
                 "aliases_complete": False,
+                "transport_generation": None,
             }
         ],
         "exit_coverage_complete": True,
@@ -108,6 +109,63 @@ async def test_reader_keeps_shared_backend_aliases_as_evidence_without_probing(
     assert response.json()["executor_contexts_complete"] is False
     backend.close.assert_not_called()
     backend.is_alive.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "bound",
+        "unretained",
+        "reconnected",
+        "closed",
+        "replaced",
+        "incarnation",
+        "closing",
+        "restart-before-binding",
+    ],
+)
+async def test_native_inventory_keeps_only_same_backend_transport_binding(monkeypatch, state):
+    backend = SimpleNamespace(
+        resident_incarnation_id="backend-bound",
+        process_exit_confirmed=False,
+        exit_confirmed=False,
+        close=AsyncMock(),
+    )
+    client = SimpleNamespace(resident_connection_generation=3)
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {"main": backend, "ui": backend})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CODEX_INVENTORY_CLIENTS", {}, raising=False)
+    if state == "restart-before-binding":
+        backend.resident_incarnation_id = "replacement-incarnation"
+    if state != "unretained":
+        orchestration._bind_codex_inventory_client(
+            "main", backend, client, incarnation_id="backend-bound"
+        )
+    if state == "reconnected":
+        client.resident_connection_generation = 4
+    elif state == "closed":
+        client.resident_connection_generation = None
+    elif state == "replaced":
+        backend = SimpleNamespace(**vars(backend))
+        orchestration._AUTO_CODEX_APP_SERVERS.update(main=backend, ui=backend)
+    elif state == "incarnation":
+        backend.resident_incarnation_id = "replacement-incarnation"
+    elif state == "closing":
+        orchestration._CLOSING_NATIVE_BACKENDS[object()] = orchestration._ClosingNativeBackend(
+            backend.resident_incarnation_id, "main", "codex-native", backend
+        )
+    inventory = orchestration.native_backend_resident_inventory()
+    (owner,) = inventory.owners
+    assert owner.session_ids == ("main", "ui")
+    assert owner.transport_generation == (3 if state == "bound" else None)
+    assert not owner.aliases_complete and not inventory.aliases_complete
+    assert orchestration.native_backend_resident_inventory() == inventory
+    backend.close.assert_not_called()
+    if state == "bound":
+        await orchestration._close_native_backend("main", "codex-native", backend)
+        assert not orchestration._CODEX_INVENTORY_CLIENTS
 
 
 @pytest.mark.parametrize(

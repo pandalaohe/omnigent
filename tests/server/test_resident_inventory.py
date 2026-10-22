@@ -1373,6 +1373,9 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "unknown",
         "ambiguous",
         "native-valid",
+        "native-transport",
+        "native-negative-transport",
+        "native-closing-transport",
         "native-empty-sessions",
         "native-empty-session-id",
         "harness-empty-session-id",
@@ -1441,12 +1444,17 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 "process_exit_confirmed": False,
                 "exit_confirmed": False,
                 "aliases_complete": False,
+                "transport_generation": None,
             }
         ]
         if case == "native-empty-sessions":
             payload["native_backends"]["owners"][0]["session_ids"] = []
         elif case == "native-empty-session-id":
             payload["native_backends"]["owners"][0]["session_ids"] = ["native-main", ""]
+        elif "transport" in case:
+            native = payload["native_backends"]["owners"][0]
+            native["transport_generation"] = -1 if case == "native-negative-transport" else 3
+            native["closing"] = case == "native-closing-transport"
     if case == "empty":
         contexts["owners"] = []
     elif case == "unknown":
@@ -1481,7 +1489,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
         owner["closing"] = True
         payload["harnesses"]["contexts"][0]["owner"]["closing"] = True
     result = _decode_runner_context_inventory(payload)
-    if case not in {"valid", "empty", "unknown", "ambiguous", "native-valid"}:
+    if case not in {"valid", "empty", "unknown", "ambiguous", "native-valid", "native-transport"}:
         assert result is None
     else:
         assert result is not None
@@ -1498,3 +1506,5 @@ def test_runner_context_inventory_strict_wire_decode(case):
             assert read.inventory.owners[0].session_keys == ("main", "ui")
         if case == "native-valid":
             assert result.native_backends.owners[0].session_ids == ("native-main", "native-ui")
+        elif case == "native-transport":
+            assert result.native_backends.owners[0].transport_generation == 3

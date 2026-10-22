@@ -1204,28 +1204,37 @@ class CodexAppServerClient:
                 self._ws = None
                 self._reader_task = None
 
+    def _current_established_connection(
+        self,
+    ) -> tuple[int, ClientConnection, asyncio.Task[None]] | None:
+        connection = self._established_connection
+        if connection is None:
+            return None
+        generation, websocket, reader = connection
+        if (
+            self._ws is not websocket
+            or self._reader_task is not reader
+            or self._connection_generation != generation
+            or reader.done()
+            or reader.cancelling()
+        ):
+            return None
+        return connection
+
+    @property
+    def resident_connection_generation(self) -> int | None:
+        """Current established transport identity; this does not probe vendor state."""
+        connection = self._current_established_connection()
+        return connection[0] if connection is not None else None
+
     async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
         """Read bounded loaded-thread evidence on the current connection only.
 
         None means unknown, including interrupted or incomplete pagination. IDs
         alone establish neither Omnigent ownership nor aliases or context absence.
         """
-        connection = self._established_connection
-        if connection is None:
-            return None
-        generation, websocket, reader = connection
-
-        def current() -> bool:
-            return (
-                self._established_connection is connection
-                and self._ws is websocket
-                and self._reader_task is reader
-                and self._connection_generation == generation
-                and not reader.done()
-                and not reader.cancelling()
-            )
-
-        if not 0 < timeout_s <= 5.0 or not current():
+        connection = self._current_established_connection()
+        if not 0 < timeout_s <= 5.0 or connection is None:
             return None
         ids: list[str] = []
         cursors: set[str] = set()
@@ -1233,13 +1242,13 @@ class CodexAppServerClient:
         try:
             async with asyncio.timeout(timeout_s):
                 for _ in range(10):
-                    if not current():
+                    if self._current_established_connection() is not connection:
                         return None
                     params: CodexParams = {"limit": 100}
                     if cursor is not None:
                         params["cursor"] = cursor
                     response = await self.request("thread/list/loaded", params)
-                    if not current():
+                    if self._current_established_connection() is not connection:
                         return None
                     result = response.get("result")
                     if not isinstance(result, dict) or "nextCursor" not in result:

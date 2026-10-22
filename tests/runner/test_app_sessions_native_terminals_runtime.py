@@ -675,6 +675,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             self.closed = True
 
     app_server = _FakeCodexAppServer()
+    association_incarnation_id = app_server.resident_incarnation_id
     build_calls: list[dict[str, Any]] = []
     resolve_calls: list[dict[str, Any]] = []
     real_resolve_launch = codex_app_mod.resolve_native_codex_launch
@@ -818,6 +819,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         assert session_id == app_server.session_id
         assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
+        if retain_client and provider_profile == "configured-workspace":
+            app_server.resident_incarnation_id = "restarted-after-resume-preload"
         return retained_client if retain_client else None
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -906,6 +909,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             global_instructions=expected_global,
             session_init=session_init,
             ensure_comment_relay=_write_resume_relay,
+            startup_required=retain_subscription,
         )
         await asyncio.sleep(0)
         remembered_dir = orchestration._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
@@ -1003,6 +1007,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
             "client": retained_client if retain_subscription else None,
+            "inventory_incarnation_id": (
+                association_incarnation_id if retain_subscription else None
+            ),
             # The forwarder tears down only the app-server this launch started.
             "app_server": app_server,
         }
@@ -1719,9 +1726,11 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_required", [False, True])
 async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    startup_required: bool,
 ) -> None:
     """
     Codex-native launches in the session worktree, not the bundle dir.
@@ -1747,6 +1756,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native import orchestration
 
     session_id = "54e4d4410c43954c11e702f5a8646483"
     # Three distinct dirs so the assertion can only pass for the worktree:
@@ -1837,6 +1847,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             """:returns: None."""
 
     app_server = _FakeCodexAppServer()
+    association_incarnation_id = app_server.resident_incarnation_id
     build_calls: list[dict[str, Any]] = []
 
     def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
@@ -1862,6 +1873,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
         async def connect(self) -> None:
             """:returns: None."""
+            app_server.resident_incarnation_id = "restarted-after-client-connect"
 
         async def close(self) -> None:
             """:returns: None."""
@@ -1927,7 +1939,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _FakeDiscoveryClient)
     monkeypatch.setattr(
-        runner_app_mod,
+        orchestration,
         "_codex_discover_thread_and_forward",
         _fake_discover_thread_and_forward,
     )
@@ -1966,12 +1978,15 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     )
 
     try:
-        await _auto_create_codex_terminal(
-            session_id,
-            _FakeResourceRegistry(),  # type: ignore[arg-type]
-            lambda _sid, event: None,
-            agent_spec=agent_spec,
-            server_client=_WorktreeSnapshotClient(),  # type: ignore[arg-type]
+        await orchestration._launch_codex(
+            orchestration.NativeLaunchContext(
+                session_id,
+                _FakeResourceRegistry(),  # type: ignore[arg-type]
+                lambda _sid, event: None,
+                agent_spec=agent_spec,
+                server_client=_WorktreeSnapshotClient(),  # type: ignore[arg-type]
+                startup_required=startup_required,
+            )
         )
         await asyncio.sleep(0)
     finally:
@@ -1979,6 +1994,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
     assert len(discovery_observations) == 1
     discover_kwargs, observed_state, observed_timeout = discovery_observations[0]
+    assert discover_kwargs["inventory_incarnation_id"] == (
+        association_incarnation_id if startup_required else None
+    )
     assert discover_kwargs["bridge_dir"] == bridge_dir
     assert observed_state is None, (
         "fresh Codex launch must clear stale bridge state before the "
@@ -4270,16 +4288,23 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("forwarder", ["discovery", "known_thread"])
+@pytest.mark.parametrize("inventory_mode", ["enabled", "disabled", "restart-before-binding"])
 async def test_codex_forwarder_client_close_keeps_backend_visible_on_second_cancel(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, forwarder: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, forwarder: str, inventory_mode: str
 ) -> None:
     from omnigent.harnesses.codex_native import forwarder as codex_forwarder
     from omnigent.runner.native import orchestration
 
     entered, close_client, wait_thread = asyncio.Event(), asyncio.Event(), asyncio.Event()
     closed: list[str] = []
+    metadata_reads: list[int] = []
 
     class _Client:
+        @property
+        def resident_connection_generation(self):
+            metadata_reads.append(3)
+            return 3
+
         async def close(self) -> None:
             entered.set()
             try:
@@ -4302,6 +4327,7 @@ async def test_codex_forwarder_client_close_keeps_backend_visible_on_second_canc
     backend = _Backend()
     session_id = "closing_client"
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {session_id: backend})
+    monkeypatch.setattr(orchestration, "_CODEX_INVENTORY_CLIENTS", {}, raising=False)
     monkeypatch.setattr(codex_forwarder, "wait_for_thread_started", wait)
     monkeypatch.setattr(codex_forwarder, "supervise_forwarder", wait)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://server.test")
@@ -4311,7 +4337,12 @@ async def test_codex_forwarder_client_close_keeps_backend_visible_on_second_canc
         "bridge_dir": tmp_path,
         "codex_ws_url": "ws://127.0.0.1:1",
         "app_server": backend,
+        "inventory_incarnation_id": (
+            backend.resident_incarnation_id if inventory_mode != "disabled" else None
+        ),
     }
+    if inventory_mode == "restart-before-binding":
+        backend.resident_incarnation_id = "restarted-backend"
     if forwarder == "discovery":
         operation = orchestration._codex_discover_thread_and_forward(
             **common,
@@ -4329,11 +4360,20 @@ async def test_codex_forwarder_client_close_keeps_backend_visible_on_second_canc
     task = asyncio.create_task(operation)
     try:
         await asyncio.wait_for(wait_thread.wait(), timeout=1)
+        if inventory_mode == "disabled":
+            assert not orchestration._CODEX_INVENTORY_CLIENTS
+            assert not metadata_reads
+        before_close = orchestration.native_backend_resident_inventory()
+        assert before_close.owners[0].transport_generation == (
+            3 if inventory_mode == "enabled" else None
+        )
         task.cancel()
         await asyncio.wait_for(entered.wait(), timeout=1)
         snapshot = orchestration.native_backend_resident_inventory()
         assert len(snapshot.owners) == 1
         assert snapshot.owners[0].closing
+        assert snapshot.owners[0].transport_generation is None
+        assert not orchestration._CODEX_INVENTORY_CLIENTS
         task.cancel()
     finally:
         close_client.set()

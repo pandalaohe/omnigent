@@ -305,6 +305,21 @@ async def test_loaded_thread_inventory_uses_only_current_connected_channel(case)
             }.get(case)
             assert result == expected
         assert client._pending_requests == {}
+        assert client.resident_connection_generation == (
+            None
+            if case
+            in {
+                "reader-exit",
+                "replaced-websocket",
+                "replaced-reader",
+                "connection-generation",
+                "close",
+                "no-connection",
+                "no-reader",
+                "dead-reader",
+            }
+            else 0
+        )
         client.connect.assert_not_called()
         if case != "close":
             websocket.close.assert_not_called()
