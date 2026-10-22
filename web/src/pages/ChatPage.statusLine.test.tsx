@@ -264,6 +264,11 @@ describe("Composer status line (branch + context ring)", () => {
     fireEvent.pointerDown(picker, { button: 0 });
     expect(screen.getByTestId("composer-permission-option-full")).toBeVisible();
     expect(screen.getByTestId("composer-permission-option-ask")).toBeVisible();
+    const unavailable = screen.getByTestId(
+      `composer-permission-option-${tier === "full" ? "ask" : "full"}`,
+    );
+    expect(unavailable).toHaveAttribute("data-disabled");
+    expect(unavailable).toHaveTextContent("Needs a new session");
   });
 
   it("shows a refused Antigravity permission change and keeps the confirmed tier", async () => {

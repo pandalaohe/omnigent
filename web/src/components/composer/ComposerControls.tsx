@@ -243,7 +243,9 @@ export function ComposerPermissionPicker({
             >
               {option.label}
               {disabledOptions.includes(option.value) && (
-                <span className="ml-1 text-xs text-muted-foreground">Start a new session</span>
+                <span className="ml-1 text-xs text-muted-foreground">
+                  {harness === "antigravity-native" ? "Needs a new session" : "Start a new session"}
+                </span>
               )}
             </DropdownMenuRadioItem>
           ))}

@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -2550,6 +2551,17 @@ def test_generated_pi_rpc_extension_switches_into_and_out_of_full(tmp_path: Path
             session_id="test-session",
         )
     )
+    from omnigent.harnesses.pi_native.bridge import verify_pi_permission_installation
+
+    expected = json.loads((bridge / "permission_expected.json").read_text())
+    expected.update(
+        {
+            "version": 1,
+            "extension_path": str(extension),
+            "extension_sha256": hashlib.sha256(extension.read_bytes()).hexdigest(),
+        }
+    )
+    (bridge / "permission_expected.json").write_text(json.dumps(expected))
     script = r"""
 const assert = require("assert").strict;
 const fs = require("fs");
@@ -2582,6 +2594,10 @@ function switchTier(target, revision) {
   assert.equal(ack.id, `switch-${revision}`);
   assert.equal(ack.ok, true, JSON.stringify(ack));
   assert.deepEqual(ack.active_tools, ["read", "bash"]);
+  const installed = JSON.parse(fs.readFileSync(
+    path.join(bridgeDir, "permission_installation.json"), "utf8"));
+  assert.equal(installed.tier, target);
+  assert.equal(installed.revision, revision + 1);
   state.tier = target;
   state.revision = revision + 1;
   state.status = "ready";
@@ -2600,6 +2616,7 @@ switchTier("ask", 2);
         timeout=10,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert verify_pi_permission_installation(bridge, "ask")
 
 
 @pytest.mark.asyncio

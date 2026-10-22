@@ -804,18 +804,21 @@ function applyPermissionTools(pi, tier) {
       actual.every((name, index) => name === desired[index]) ? actual : null;
   } catch (_err) { return null; }
 }
-function writePermissionInstallation(pi) {
-  const state = permissionState();
+function writePermissionInstallation(pi, confirmedState, confirmedTools) {
+  const state = confirmedState || permissionState();
   const expected = readPermissionJson("permission_expected.json");
   if (!state || !expected || expected.session_id !== PERMISSION_SESSION_ID ||
       expected.harness !== "pi" || typeof expected.installation_id !== "string" ||
       !expected.installation_id ||
       (state.tier !== "full" && !permissionExtensionOrderProven())) return;
-  const tools = pi.getActiveTools();
-  if (!Array.isArray(tools) || !tools.every((name) => typeof name === "string")) return;
-  baselineActiveTools = tools;
-  const active = applyPermissionTools(pi, state.tier);
-  if (!active) return;
+  let active = confirmedTools;
+  if (!active) {
+    const tools = pi.getActiveTools();
+    if (!Array.isArray(tools) || !tools.every((name) => typeof name === "string")) return false;
+    baselineActiveTools = tools;
+    active = applyPermissionTools(pi, state.tier);
+  }
+  if (!active) return false;
   try {
     writePermissionJson("permission_installation.json", {
       version: 1, installation_id: expected.installation_id,
@@ -825,7 +828,8 @@ function writePermissionInstallation(pi) {
       tier: state.tier, revision: state.revision,
       tools_verified: true, active_tools: active,
     });
-  } catch (_err) {}
+    return true;
+  } catch (_err) { return false; }
 }
 function permissionExtensionOrderProven() {
   if (process.env.OMNIGENT_PI_PERMISSION_INLINE) {
@@ -866,11 +870,17 @@ function pollPermissionInbox(pi, ctx) {
         ["ask", "plan", "accept-edits", "auto", "full"].includes(payload.target_tier) &&
         (payload.target_tier === "full" || permissionExtensionOrderProven());
       const active = valid ? applyPermissionTools(pi, payload.target_tier) : null;
+      const attested = active && writePermissionInstallation(
+        pi,
+        { ...state, tier: payload.target_tier,
+          revision: state.revision + (payload.target_tier === state.tier ? 0 : 1) },
+        active,
+      );
       try { writePermissionJson("permission_ack.json", {
         id: payload.id, session_id: PERMISSION_SESSION_ID,
         target_tier: payload.target_tier,
         expected_revision: payload.expected_revision,
-        ok: !!active, active_tools: active || [],
+        ok: !!attested, active_tools: active || [],
       }); } catch (_err) {}
       try { fs.unlinkSync(file); } catch (_err) {}
     }

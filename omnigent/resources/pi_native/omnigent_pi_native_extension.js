@@ -2456,13 +2456,19 @@ module.exports = function (pi) {
         const active = valid
           ? activeToolsForTier(pi, config, baselineActiveTools, target)
           : null;
+        const attested = active && markPermissionInstallation(
+          config,
+          { ...state, tier: target,
+            revision: state.revision + (target === state.tier ? 0 : 1) },
+          active,
+        );
         try {
           writePermissionControlFile(config, "permission_ack.json", {
             id: payload.id,
             session_id: config.sessionId,
             target_tier: target,
             expected_revision: payload.expected_revision,
-            ok: !!active,
+            ok: !!attested,
             active_tools: active || [],
           });
         } catch (_err) {}

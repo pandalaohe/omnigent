@@ -2860,11 +2860,18 @@ def test_live_pi_tier_changes_resume_tools_after_commit(tmp_path: Path) -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for the pi-native extension policy test")
+    from omnigent.harnesses.pi_native.bridge import (
+        prepare_permission_installation,
+        verify_pi_permission_installation,
+    )
     from omnigent.permission_tiers.host import (
         HostPermissionState,
         write_host_permission_state,
     )
 
+    installation_id = prepare_permission_installation(
+        tmp_path, session_id="session-1", harness="pi-native", extension=_extension_path()
+    )
     write_host_permission_state(
         tmp_path / "permission_state.json",
         HostPermissionState("session-1", "test-host", str(tmp_path), "auto", 1, "ready"),
@@ -2875,12 +2882,13 @@ const fs = require("fs");
 const path = require("path");
 const extensionPath = process.argv[1];
 const bridgeDir = process.argv[2];
+const installationId = process.argv[3];
 const inboxDir = path.join(bridgeDir, "inbox");
 const statePath = path.join(bridgeDir, "permission_state.json");
 fs.mkdirSync(inboxDir);
 fs.writeFileSync(path.join(bridgeDir, "config.json"), JSON.stringify({
   serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir,
-  planVisibleTools: [],
+  planVisibleTools: [], permissionInstallationId: installationId,
 }));
 process.env.OMNIGENT_PI_NATIVE_CONFIG = path.join(bridgeDir, "config.json");
 process.env.OMNIGENT_PI_PERMISSION_INLINE = extensionPath;
@@ -2916,6 +2924,11 @@ async function switchTier(target, revision) {
   const ack = JSON.parse(fs.readFileSync(path.join(bridgeDir, "permission_ack.json"), "utf8"));
   assert.equal(ack.id, `switch-${revision}`);
   assert.equal(ack.ok, true, JSON.stringify(ack));
+  const installed = JSON.parse(fs.readFileSync(
+    path.join(bridgeDir, "permission_installation.json"), "utf8"));
+  assert.equal(installed.installation_id, installationId);
+  assert.equal(installed.tier, target);
+  assert.equal(installed.revision, revision + 1);
   state.tier = target;
   state.revision = revision + 1;
   state.status = "ready";
@@ -2933,13 +2946,19 @@ async function switchTier(target, revision) {
 })().catch((error) => { console.error(error); process.exit(1); });
 """
     result = subprocess.run(
-        [node, "-e", script, str(_extension_path()), str(tmp_path)],
+        [node, "-e", script, str(_extension_path()), str(tmp_path), installation_id],
         capture_output=True,
         check=False,
         text=True,
         timeout=15,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert verify_pi_permission_installation(tmp_path, "ask")
+    proof_path = tmp_path / "permission_installation.json"
+    stale_proof = json.loads(proof_path.read_text())
+    stale_proof["revision"] = 3
+    proof_path.write_text(json.dumps(stale_proof))
+    assert not verify_pi_permission_installation(tmp_path, "ask")
 
 
 def test_policy_deny_blocks(tmp_path: Path) -> None:
