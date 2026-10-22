@@ -118,7 +118,7 @@ export function AgentBadgeEditor({
               aria-describedby={labelError ? errorId : undefined}
               autoComplete="off"
               spellCheck={false}
-              placeholder="A or 助"
+              placeholder="A or AI"
               className="w-28"
             />
           </label>

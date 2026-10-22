@@ -50,13 +50,7 @@ export function SessionDefaultModeSelect({
   const tierDefault =
     field === "permission" && sessionModeHandler(harness, field, capabilities) === "agy-tier";
   const legacyTier = tierDefault ? normalizeAgyPermissionTier(value) : null;
-  const selected = tierDefault
-    ? legacyTier === "full"
-      ? "auto"
-      : legacyTier
-    : value === "priority"
-      ? "fast"
-      : value;
+  const selected = tierDefault ? legacyTier : value === "priority" ? "fast" : value;
   const available = selected == null || options.some((option) => option.value === selected);
   const select = (
     <Select
@@ -85,22 +79,12 @@ export function SessionDefaultModeSelect({
       </SelectContent>
     </Select>
   );
-  if (tierDefault && legacyTier === "full") {
-    return (
-      <div className="min-w-0 flex-1">
-        {select}
-        <p role="status" className="mt-1 text-xs text-muted-foreground">
-          原有全放开默认值已迁为自动；新会话不会继承全放开。
-        </p>
-      </div>
-    );
-  }
   if (tierDefault && ["auto-strict", "auto-standard"].includes(value ?? "")) {
     return (
       <div className="min-w-0 flex-1">
         {select}
         <p role="status" className="mt-1 text-xs text-muted-foreground">
-          旧自动档现使用固定的宽松危险规则。
+          Legacy Auto modes now use the fixed, relaxed rules for risky actions.
         </p>
       </div>
     );

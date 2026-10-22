@@ -334,10 +334,8 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["terminal_name"] == "pi"
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
-    assert captured["spec"].command == (
-        "pi" if permission_tier == "full" else "/opt/launchers/controlled-pi"
-    )
-    assert bool(ordered_calls) is (permission_tier != "full")
+    assert captured["spec"].command == "/opt/launchers/controlled-pi"
+    assert len(ordered_calls) == 1
     # Preserve the exited pane so the idle watcher can report its output.
     assert captured["spec"].keep_alive_after_exit is True
     assert captured["spec"].env_unset == expected_env_unset

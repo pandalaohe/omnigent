@@ -102,34 +102,31 @@ export const AGY_NATIVE_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native
 export const AGY_NATIVE_DEFAULT_PERMISSION_TIER = "auto";
 export const AGY_NATIVE_FULL_PERMISSION_TIER = "full";
 export const AGY_RESTRICTED_HOOK_RULE =
-  'AG 受限档启动前会检查第三方 PreToolUse hooks；发现启用的 hook 或配置不可读时拒绝启动，并提示名称和文件。可新建全放开会话，或在源文件把该 hook 设为 "enabled": false。插件筛选规则不豁免这项检查。其他事件不阻止启动；所有档位仍执行 Omnigent 独立策略。';
+  'Restricted Antigravity modes check third-party PreToolUse hooks before launch. Enabled hooks or unreadable configuration block launch and identify the hook and file. Choose Full access or set the hook to "enabled": false in its source file. Plugin filters do not bypass this check. Other events do not block launch. Independent Omnigent policies still apply in every mode.';
 export const AGY_NATIVE_PERMISSION_TIERS: NativeHarnessMode[] = [
-  { value: "ask", label: "每次都问", description: "工具执行前逐次询问", args: [] },
-  { value: "plan", label: "只规划", description: "仅规划与只读操作", args: [] },
+  { value: "ask", label: "Ask every time", description: "Ask before each tool call", args: [] },
+  { value: "plan", label: "Plan", description: "Planning and read-only tools only", args: [] },
   {
     value: "accept-edits",
-    label: "自动改文件",
-    description: "工作区内编辑自动通过，其他操作询问",
+    label: "Accept edits",
+    description: "Approve workspace edits automatically; ask for other actions",
     args: [],
   },
   {
     value: "auto",
-    label: "自动（只拦可怕的事）",
-    description: "按固定危险规则拦截，不是 OS 沙箱",
+    label: "Auto",
+    description: "Allow tools except actions blocked by fixed risk rules; no OS sandbox",
     args: [],
   },
   {
     value: "full",
-    label: "全放开",
-    description: "跳过本套审批与规则；仅创建时可选",
+    label: "Full access",
+    description: "Skip tier approvals and rules",
     args: [],
   },
 ];
 export const PI_PERMISSION_TIERS = AGY_NATIVE_PERMISSION_TIERS;
 export const PI_DEFAULT_PERMISSION_TIER = AGY_NATIVE_DEFAULT_PERMISSION_TIER;
-export const NON_FULL_PERMISSION_TIERS = AGY_NATIVE_PERMISSION_TIERS.filter(
-  (tier) => tier.value !== "full",
-);
 
 export function agyPermissionTierFromSession(
   session:

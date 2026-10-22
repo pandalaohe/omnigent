@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -139,3 +140,48 @@ def test_native_picker_hides_sdk_kimi(
     expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
     expect(page.get_by_test_id("new-chat-landing-agent-ag_kimi_sdk")).to_have_count(0)
     expect(page.locator("[data-harness-menu-row]")).to_have_count(1)
+
+
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize("tier", ["auto", "full"])
+def test_permission_menu_offers_full_and_restricted_tiers(
+    page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path, harness: str, tier: str
+) -> None:
+    chat = chat_session_contract
+    chat.set_catalog(harness=harness, models=[], selected_model="browser-model")
+    chat.update_session(
+        permission_tier=tier,
+        permission_tier_revision=3,
+        permission_tier_state="ready",
+        permission_tiers_capability=True,
+    )
+    page.goto(chat.url)
+    picker = page.get_by_test_id("composer-permission-chip")
+    expect(picker).to_be_enabled()
+    picker.click()
+    for value, label in (
+        ("ask", "Ask every time"),
+        ("plan", "Plan"),
+        ("accept-edits", "Accept edits"),
+        ("auto", "Auto"),
+        ("full", "Full access"),
+    ):
+        option = page.get_by_test_id(f"composer-permission-option-{value}")
+        expect(option).to_be_visible()
+        expect(option).to_have_text(label)
+    page.screenshot(path=tmp_path / f"{harness}-{tier}-permissions.png")
+
+    target = "ask" if tier == "full" else "full"
+    patches: list[dict[str, Any]] = []
+
+    def patch(request: Request) -> dict[str, Any]:
+        patches.append(request.post_data_json)
+        chat.update_session(permission_tier=target, permission_tier_revision=4)
+        return chat.session_snapshot()
+
+    chat.contract.json(f"/v1/sessions/{chat.session_id}", patch, method="PATCH")
+    page.get_by_test_id(f"composer-permission-option-{target}").click()
+    expect(picker).to_have_attribute(
+        "aria-label", f"Permission mode: {'Ask every time' if target == 'ask' else 'Full access'}"
+    )
+    assert patches == [{"permission_mode": target, "expected_permission_tier_revision": 3}]

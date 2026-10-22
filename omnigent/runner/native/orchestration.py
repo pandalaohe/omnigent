@@ -2827,13 +2827,12 @@ async def _auto_create_pi_terminal(
     permission_state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
     if permission_state.session_id != session_id:
         raise ValueError("Pi launch permission state belongs to another session")
-    if permission_state.tier != "full":
-        pi_command, pi_args = await asyncio.to_thread(
-            ordered_pi_launch,
-            pi_command,
-            pi_args,
-            extension=pi_extension,
-        )
+    pi_command, pi_args = await asyncio.to_thread(
+        ordered_pi_launch,
+        pi_command,
+        pi_args,
+        extension=pi_extension,
+    )
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to

@@ -1267,9 +1267,7 @@ export function ProjectSettingsDialog({
     const normalizedPermission = normalizeAgyPermissionTier(inherited);
     const value =
       field === "permission" && sessionModeHandler(harness, field, capabilities) === "agy-tier"
-        ? normalizedPermission === "full"
-          ? "auto"
-          : (normalizedPermission ?? null)
+        ? (normalizedPermission ?? null)
         : inherited;
     if (value === null) return "Default";
     if (field === "model") return catalogModelLabel(catalogs, row.hostId, harness, value) ?? value;

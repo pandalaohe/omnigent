@@ -11,6 +11,106 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"id": "old-change"},
+        {"session_id": "other-session"},
+        {"target_tier": "full"},
+        {"expected_revision": 1},
+        {"ok": False},
+        {"active_tools": ["read", 1]},
+    ],
+)
+def test_permission_ack_rejects_replayed_or_mismatched_switch(changed):
+    ack = {
+        "id": "current-change",
+        "session_id": "session-1",
+        "target_tier": "ask",
+        "expected_revision": 2,
+        "ok": True,
+        "active_tools": ["read"],
+    }
+    assert pi_native_bridge._pi_permission_ack_matches(
+        ack,
+        change_id="current-change",
+        session_id="session-1",
+        target_tier="ask",
+        revision=2,
+    )
+    assert not pi_native_bridge._pi_permission_ack_matches(
+        {**ack, **changed},
+        change_id="current-change",
+        session_id="session-1",
+        target_tier="ask",
+        revision=2,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "proof_tier,proof_revision,accepted", [("auto", 1, False), ("ask", 2, True)]
+)
+async def test_permission_switch_requires_current_installation_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    proof_tier: str,
+    proof_revision: int,
+    accepted: bool,
+) -> None:
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+
+    pi_bridge.prepare_permission_installation(
+        tmp_path, session_id="session-1", harness="pi-native", extension=Path(__file__)
+    )
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState(
+            "session-1", "test-host", str(tmp_path), "auto", 1, "switching", "switch-transaction"
+        ),
+    )
+    expected = json.loads((tmp_path / "permission_expected.json").read_text())
+    (tmp_path / "permission_installation.json").write_text(
+        json.dumps(
+            {
+                **{
+                    key: expected[key]
+                    for key in (
+                        "version",
+                        "installation_id",
+                        "session_id",
+                        "harness",
+                        "extension_sha256",
+                    )
+                },
+                "tier": proof_tier,
+                "revision": proof_revision,
+                "tools_verified": True,
+                "active_tools": ["read"],
+            }
+        )
+    )
+    (tmp_path / "permission_ack.json").write_text(
+        json.dumps(
+            {
+                "id": "switch-1",
+                "session_id": "session-1",
+                "target_tier": "ask",
+                "expected_revision": 1,
+                "ok": True,
+                "active_tools": ["read"],
+            }
+        )
+    )
+    monkeypatch.setattr(pi_bridge, "bridge_dir_for_session_id", lambda _session_id: tmp_path)
+    monkeypatch.setattr(
+        pi_bridge, "enqueue_permission_tier_change", lambda *_args, **_kwargs: "switch-1"
+    )
+
+    assert await pi_bridge.apply_pi_permission_tier("session-1", "pi-native", "ask") is accepted
 
 
 @pytest.mark.parametrize("harness", ["pi-native", "pi"])

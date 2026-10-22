@@ -31,10 +31,10 @@ describe("permission tier switch gate", () => {
       permissionTierSwitchDisabledReason({ ...ready, pendingElicitations: [{}] }),
     ).toBeDefined();
   });
-  it("keeps full creation-only and names blocked recovery", () => {
-    expect(permissionTierSwitchDisabledReason({ ...ready, permissionTier: "full" })).toContain(
-      "创建",
-    );
+  it("allows a confirmed idle full tier and names blocked recovery", () => {
+    expect(
+      permissionTierSwitchDisabledReason({ ...ready, permissionTier: "full" }),
+    ).toBeUndefined();
     expect(permissionTierSwitchDisabledReason({ ...ready, permissionTierState: "blocked" })).toBe(
       PERMISSION_TIER_BLOCKED,
     );

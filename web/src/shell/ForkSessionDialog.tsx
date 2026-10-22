@@ -748,7 +748,8 @@ function ForkRunConfig({
           {sourceSession?.permissionTier === "full" &&
             mode === AGY_NATIVE_DEFAULT_PERMISSION_TIER && (
               <p role="status" className="text-xs text-muted-foreground">
-                来源会话为全放开；新会话默认使用自动。若确需全放开，请在此明确选择。
+                The source session used Full access. This session defaults to Auto. Select Full
+                access here if needed.
               </p>
             )}
           <ForkConfigRow label="Permissions">
@@ -774,7 +775,7 @@ function ForkRunConfig({
               className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
             >
               <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-              <span>全放开会跳过本套审批与规则；仅本次创建时可选。</span>
+              <span>Full access bypasses tier approvals and risk rules for this session.</span>
             </div>
           )}
         </>

@@ -119,7 +119,7 @@ def test_explicit_speed_wins_over_project_default(speed: str | None) -> None:
 
 
 @pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
-def test_legacy_full_project_permission_resolves_to_auto_before_master(harness: str) -> None:
+def test_full_project_permission_resolves_before_master(harness: str) -> None:
     result = _resolve(
         explicit={"harness_override": harness},
         explicit_fields={"harness_override"},
@@ -128,7 +128,7 @@ def test_legacy_full_project_permission_resolves_to_auto_before_master(harness: 
         },
         master={"HDS": {harness: {"permission": "ask"}}},
     )
-    assert result.permission == "auto"
+    assert result.permission == "full"
     assert result.sources["permission"] == "project_host"
 
 
@@ -647,6 +647,9 @@ def test_session_modes_fall_back_to_the_agent_harness_for_a_null_override(
                 "codex-native": ["ask-for-approval", "approve-for-me", "full-access", "read-only"],
                 "claude-sdk": ["acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"],
                 "claude-native": ["acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"],
+                "pi": ["ask", "plan", "accept-edits", "auto", "full"],
+                "pi-native": ["ask", "plan", "accept-edits", "auto", "full"],
+                "antigravity-native": ["ask", "plan", "accept-edits", "auto", "full"],
             }.items()
             for value in values
         ],
@@ -662,7 +665,7 @@ def test_validate_session_default_modes(harness: str, field: str, value: str) ->
     [
         ("codex", "speed", "priority;bad"),
         ("claude-native", "speed", "priority"),
-        ("pi-native", "permission", "full"),
+        ("pi-native", "permission", "unknown"),
         ("codex", "permission", "plan"),
         ("claude-sdk", "permission", "read-only"),
         ("codex", "speed", None),

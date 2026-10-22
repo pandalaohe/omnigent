@@ -122,11 +122,11 @@ CODEX_PERMISSION_OPTIONS = _options(
     )
 )
 _TIER_LABELS = {
-    "ask": "每次都问",
-    "plan": "只规划",
-    "accept-edits": "自动改文件",
-    "auto": "自动（只拦可怕的事）",
-    "full": "全放开",
+    "ask": "Ask every time",
+    "plan": "Plan",
+    "accept-edits": "Accept edits",
+    "auto": "Auto",
+    "full": "Full access",
 }
 _TIER_CONCEPTS = {
     "ask": "manual",
@@ -137,7 +137,6 @@ _TIER_CONCEPTS = {
 }
 TIER_OPTIONS = _options(
     tuple((tier, _TIER_LABELS[tier], _TIER_CONCEPTS[tier]) for tier in (*NON_FULL_TIERS, "full")),
-    create_only=frozenset({"full"}),
 )
 SPEED_OPTIONS = _options((("standard", "Standard", "default"), ("fast", "Fast", "automatic")))
 

@@ -458,6 +458,18 @@ def verify_pi_permission_installation(bridge_dir: Path, tier: PermissionTier) ->
         state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
         if state.tier != tier:
             return False
+        return _pi_permission_installation_matches(
+            bridge_dir, tier=tier, revision=state.revision, session_id=state.session_id
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _pi_permission_installation_matches(
+    bridge_dir: Path, *, tier: PermissionTier, revision: int, session_id: str
+) -> bool:
+    """Check the extension's proof against the expected launch and active tools."""
+    try:
         expected_path = bridge_dir / PERMISSION_EXPECTED_FILE
         installed_path = bridge_dir / PERMISSION_INSTALLATION_FILE
         if expected_path.is_symlink() or installed_path.is_symlink():
@@ -469,9 +481,9 @@ def verify_pi_permission_installation(bridge_dir: Path, tier: PermissionTier) ->
         for field in ("version", "installation_id", "session_id", "harness", "extension_sha256"):
             if installed.get(field) != expected.get(field):
                 return False
-        if expected.get("version") != 1 or expected.get("session_id") != state.session_id:
+        if expected.get("version") != 1 or expected.get("session_id") != session_id:
             return False
-        if installed.get("tier") != tier or installed.get("revision") != state.revision:
+        if installed.get("tier") != tier or installed.get("revision") != revision:
             return False
         if installed.get("tools_verified") is not True:
             return False
@@ -505,6 +517,24 @@ def enqueue_permission_tier_change(
     return change_id
 
 
+def _pi_permission_ack_matches(
+    ack: object, *, change_id: str, session_id: str, target_tier: PermissionTier, revision: int
+) -> bool:
+    if not isinstance(ack, dict):
+        return False
+    active = ack.get("active_tools")
+    return (
+        ack.get("id") == change_id
+        and ack.get("ok") is True
+        and ack.get("session_id") == session_id
+        and ack.get("target_tier") == target_tier
+        and ack.get("expected_revision") == revision
+        and isinstance(active, list)
+        and all(isinstance(name, str) for name in active)
+        and (target_tier != "plan" or tuple(active) == plan_visible_tool_names(active))
+    )
+
+
 async def apply_pi_permission_tier(
     session_id: str, harness: str, target_tier: PermissionTier
 ) -> bool:
@@ -532,15 +562,21 @@ async def apply_pi_permission_tier(
             if not isinstance(ack, dict) or ack.get("id") != change_id:
                 await asyncio.sleep(0.05)
                 continue
-            active = ack.get("active_tools")
-            return (
-                ack.get("ok") is True
-                and ack.get("session_id") == session_id
-                and ack.get("target_tier") == target_tier
-                and ack.get("expected_revision") == state.revision
-                and isinstance(active, list)
-                and all(isinstance(name, str) for name in active)
-                and (target_tier != "plan" or tuple(active) == plan_visible_tool_names(active))
+            accepted = _pi_permission_ack_matches(
+                ack,
+                change_id=change_id,
+                session_id=session_id,
+                target_tier=target_tier,
+                revision=state.revision,
+            )
+            if not accepted:
+                return False
+            result_revision = state.revision + (target_tier != state.tier)
+            return _pi_permission_installation_matches(
+                bridge_dir,
+                tier=target_tier,
+                revision=result_revision,
+                session_id=session_id,
             )
         return False
     except (OSError, ValueError, TypeError):

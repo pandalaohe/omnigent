@@ -16248,6 +16248,64 @@ async def test_antigravity_live_full_is_create_only(client, previous, requested)
     assert "Full permission is create-only" in response.text
 
 
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize("previous,requested", [("auto", "ask"), ("ask", "full"), ("full", "ask")])
+async def test_pi_permission_patch_commits_live_tier(client, harness, previous, requested):
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+
+    agent = await create_test_agent(client)
+    created_response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": harness, "permission_tier": previous},
+    )
+    assert created_response.status_code == 201, created_response.text
+    session_id = created_response.json()["id"]
+    get_conversation_store().set_labels(
+        session_id,
+        {
+            **ConfirmedPermissionState(previous, 1, "ready").labels(harness),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    events = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(204)
+        body = json.loads(request.content)
+        if body.get("type", "").startswith("permission_tier_"):
+            events.append(body["type"])
+            return httpx.Response(
+                200,
+                json={
+                    "prepared": True,
+                    "committed": True,
+                    "transaction_id": body.get("transaction_id"),
+                    "permission_tier": requested,
+                    "tier_revision": body.get("revision", 1),
+                    "permission_tiers_capability": "permission_tiers_v1",
+                },
+            )
+        return httpx.Response(204)
+
+    async with _runtime_runner(handler):
+        response = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"permission_mode": requested, "expected_permission_tier_revision": 1},
+        )
+    assert response.status_code == 200, response.text
+    snapshot = response.json()
+    state = json.loads(snapshot["labels"]["omnigent.permission_tier.state"])
+    assert snapshot["labels"]["omnigent.pi.permission_tier"] == requested
+    assert (state["revision"], state["status"]) == (2, "ready")
+    assert events == ["permission_tier_prepare", "permission_tier_commit"]
+
+
 @pytest.mark.parametrize(
     "status,confirmed", [(200, True), (200, False), (204, False), (503, False), (504, False)]
 )
