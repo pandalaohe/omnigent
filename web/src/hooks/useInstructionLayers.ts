@@ -82,19 +82,24 @@ export function instructionGridAxes(
   const agentKeys = new Set(data.agents.map((agent) => agent.key));
   const agentLayers = new Map<string, InstructionLayer[]>();
   const hostLayers = new Map<string, InstructionLayer[]>();
-  const heldHosts = new Set<string>();
+  const eligibleLayers = data.data.filter((layer) => {
+    if (!hasInstructionText(layer.text)) return false;
+    if (layer.scope === "agent") return agentKeys.has(layer.agent_key);
+    const existingHost = hostIds.has(layer.host_id) && !layer.host_removed;
+    return (
+      existingHost &&
+      (layer.scope === "host" || (layer.scope === "independent" && agentKeys.has(layer.agent_key)))
+    );
+  });
   const append = (map: Map<string, InstructionLayer[]>, id: string, layer: InstructionLayer) => {
     map.set(id, [...(map.get(id) ?? []), layer]);
   };
-  for (const layer of data.data) {
-    if (!hasInstructionText(layer.text)) continue;
-    const existingHost = hostIds.has(layer.host_id) && !layer.host_removed;
-    if (layer.scope === "agent" || (layer.scope === "independent" && existingHost)) {
+  for (const layer of eligibleLayers) {
+    if (layer.scope === "agent" || layer.scope === "independent") {
       append(agentLayers, layer.agent_key, layer);
     }
-    if (existingHost && (layer.scope === "host" || layer.scope === "independent")) {
+    if (layer.scope === "host" || layer.scope === "independent") {
       append(hostLayers, layer.host_id, layer);
-      if (layer.scope === "host" || agentKeys.has(layer.agent_key)) heldHosts.add(layer.host_id);
     }
   }
   const ordered = <T>(items: T[], ids: string[], key: (item: T) => string, held: Set<string>) => {
@@ -107,7 +112,7 @@ export function instructionGridAxes(
   };
   return {
     agents: ordered(data.agents, layout.agents, (agent) => agent.key, new Set(agentLayers.keys())),
-    hosts: ordered(hosts, layout.hosts, (host) => host.host_id, heldHosts),
+    hosts: ordered(hosts, layout.hosts, (host) => host.host_id, new Set(hostLayers.keys())),
     agentLayers,
     hostLayers,
   };
@@ -187,7 +192,7 @@ export function useInstructionRevisions(layer: LayerKey) {
 export function useSaveInstructionLayer() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (layer: LayerKey & { text: string }) =>
+    mutationFn: (layer: LayerKey & { text: string; expected_revision_id?: string | null }) =>
       read<InstructionLayer & { over_budget_routes: InstructionRouteSize[] }>(
         "/v1/instruction-layers",
         {

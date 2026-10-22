@@ -30,41 +30,45 @@ function setup() {
 beforeEach(() => fetch.mockReset());
 afterEach(cleanup);
 
-it("sends the exact scoped text and invalidates totals and history after a save", async () => {
-  const { client, wrapper } = setup();
-  client.setQueryData(["instruction-layers"], { data: [] });
-  client.setQueryData(["instruction-layers", "preview", "host-a"], { text: "old" });
-  client.setQueryData(["instruction-layers", "revisions", { scope: "host", host_id: "host-a" }], {
-    data: [],
-  });
-  fetch.mockResolvedValue(
-    new Response(
-      JSON.stringify({
-        over_budget_routes: [{ host_id: "host-a", agent_key: "codex", total_chars: 10001 }],
-      }),
-      { status: 200 },
-    ),
-  );
-  const { result } = renderHook(useSaveInstructionLayer, { wrapper });
-  const body = {
-    scope: "host" as const,
-    agent_key: "",
-    host_id: "host-a",
-    text: "😀".repeat(10001),
-  };
-  await act(async () => {
-    await result.current.mutateAsync(body);
-  });
-  const [path, request] = fetch.mock.calls[0]!;
-  expect(path).toBe("/v1/instruction-layers");
-  expect(request?.method).toBe("PUT");
-  expect(JSON.parse(request?.body as string)).toEqual(body);
-  expect(client.getQueryState(["instruction-layers", "preview", "host-a"])?.isInvalidated).toBe(
-    true,
-  );
-  await waitFor(() => expect(result.current.data?.over_budget_routes).toHaveLength(1));
-  client.clear();
-});
+it.each([undefined, "revision-a", null])(
+  "sends the exact scoped text with expected revision %j and invalidates totals and history",
+  async (expected_revision_id) => {
+    const { client, wrapper } = setup();
+    client.setQueryData(["instruction-layers"], { data: [] });
+    client.setQueryData(["instruction-layers", "preview", "host-a"], { text: "old" });
+    client.setQueryData(["instruction-layers", "revisions", { scope: "host", host_id: "host-a" }], {
+      data: [],
+    });
+    fetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          over_budget_routes: [{ host_id: "host-a", agent_key: "codex", total_chars: 10001 }],
+        }),
+        { status: 200 },
+      ),
+    );
+    const { result } = renderHook(useSaveInstructionLayer, { wrapper });
+    const body = {
+      scope: "host" as const,
+      agent_key: "",
+      host_id: "host-a",
+      text: "😀".repeat(10001),
+      ...(expected_revision_id !== undefined ? { expected_revision_id } : {}),
+    };
+    await act(async () => {
+      await result.current.mutateAsync(body);
+    });
+    const [path, request] = fetch.mock.calls[0]!;
+    expect(path).toBe("/v1/instruction-layers");
+    expect(request?.method).toBe("PUT");
+    expect(JSON.parse(request?.body as string)).toEqual(body);
+    expect(client.getQueryState(["instruction-layers", "preview", "host-a"])?.isInvalidated).toBe(
+      true,
+    );
+    await waitFor(() => expect(result.current.data?.over_budget_routes).toHaveLength(1));
+    client.clear();
+  },
+);
 it("keeps the route identity in the query and exposes safe API errors", async () => {
   const { client, wrapper } = setup();
   fetch.mockResolvedValue(
@@ -131,6 +135,28 @@ it("orders explicit axes first, then held axes, skipping unknown and removed hos
   expect(axes.agentLayers.get("claude")).toEqual([data.data[1]]);
   expect(axes.hostLayers.get("host-b")).toEqual([data.data[6]]);
   expect(axes.hostLayers.get("host-a")).toEqual([data.data[1]]);
+});
+it("excludes unknown-agent layers from a held host row's clear set", () => {
+  const hostLayer = { scope: "host", host_id: "host-a", text: "Host text" };
+  const unknownLayer = {
+    scope: "independent",
+    host_id: "host-a",
+    agent_key: "unknown",
+    text: "Independent text",
+  };
+  const data = {
+    data: [hostLayer, unknownLayer, { scope: "agent", agent_key: "unknown", text: "Agent text" }],
+    agents: [{ key: "agent-a", display_name: "Agent A" }],
+  } as InstructionLayers;
+  const axes = instructionGridAxes(data, [{ host_id: "host-a" }] as Host[], {
+    hosts: [],
+    agents: [],
+  });
+  expect(axes.hosts.map((host) => host.host_id)).toEqual(["host-a"]);
+  expect(axes.hostLayers.get("host-a")).toEqual([hostLayer]);
+  expect(axes.agentLayers.size).toBe(0);
+  expect(axes.agents).toEqual([]);
+  expect(unknownLayer.text).toBe("Independent text");
 });
 it.each([
   [null, false],

@@ -20,7 +20,10 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { useSearchParams } from "@/lib/routing";
-import { useInstructionGridPreferences } from "@/lib/instructionGridPreferences";
+import {
+  readInstructionGridPreferences,
+  useInstructionGridPreferences,
+} from "@/lib/instructionGridPreferences";
 import { HostPicker } from "./instructions/HostPicker";
 import { RemoveAxisDialog } from "./instructions/RemoveAxisDialog";
 import { LayerEditor } from "./instructions/LayerEditor";
@@ -79,8 +82,10 @@ export function InstructionsPage() {
     hosts.data ?? [],
     layout,
   );
-  const removeFromLayout = (axis: "hosts" | "agents", id: string) =>
-    setLayout({ ...layout, [axis]: layout[axis].filter((value) => value !== id) });
+  const removeFromLayout = (axis: "hosts" | "agents", id: string) => {
+    const latest = readInstructionGridPreferences();
+    setLayout({ ...latest, [axis]: latest[axis].filter((value) => value !== id) });
+  };
   const remove = (axis: "hosts" | "agents", id: string, name: string) => {
     const layers = (axis === "hosts" ? axes.hostLayers : axes.agentLayers).get(id) ?? [];
     if (layers.length === 0) removeFromLayout(axis, id);
@@ -101,7 +106,16 @@ export function InstructionsPage() {
           agent_key: layer.agent_key,
           host_id: layer.host_id,
           text: "",
+          expected_revision_id: layer.revision_id,
         });
+        setRemoval((pending) =>
+          pending
+            ? {
+                ...pending,
+                layers: pending.layers.filter((item) => layerId(item) !== layerId(layer)),
+              }
+            : null,
+        );
       }
       removeFromLayout(removal.axis, removal.id);
       setRemoval(null);
@@ -214,7 +228,10 @@ export function InstructionsPage() {
                   <AgentPicker
                     items={pickerItems}
                     taken={new Set(axes.agents.map((agent) => agent.key))}
-                    onPick={(key) => setLayout({ ...layout, agents: [...layout.agents, key] })}
+                    onPick={(key) => {
+                      const latest = readInstructionGridPreferences();
+                      setLayout({ ...latest, agents: [...latest.agents, key] });
+                    }}
                     title="Add agent"
                     description="Give one agent its own instruction text."
                     trigger={<Button variant="outline">Add agent</Button>}
@@ -224,7 +241,10 @@ export function InstructionsPage() {
                   <HostPicker
                     hosts={hosts.data ?? []}
                     taken={new Set(axes.hosts.map((host) => host.host_id))}
-                    onPick={(id) => setLayout({ ...layout, hosts: [...layout.hosts, id] })}
+                    onPick={(id) => {
+                      const latest = readInstructionGridPreferences();
+                      setLayout({ ...latest, hosts: [...latest.hosts, id] });
+                    }}
                   />
                 }
                 canEdit={canEdit}

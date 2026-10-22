@@ -576,8 +576,16 @@ it("confirms every held layer in a column and clears only those keys sequentiall
   await act(async () => finish({ over_budget_routes: [] }));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(mocks.save.mock.calls).toEqual([
-    [{ scope: "agent", agent_key: "codex", host_id: "", text: "" }],
-    [{ scope: "independent", agent_key: "codex", host_id: "host-a", text: "" }],
+    [{ scope: "agent", agent_key: "codex", host_id: "", text: "", expected_revision_id: "agent" }],
+    [
+      {
+        scope: "independent",
+        agent_key: "codex",
+        host_id: "host-a",
+        text: "",
+        expected_revision_id: "independent",
+      },
+    ],
   ]);
   expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual({
     hosts: ["host-a"],
@@ -585,7 +593,7 @@ it("confirms every held layer in a column and clears only those keys sequentiall
   });
 });
 
-it("keeps the removal dialog and layout when a later clear fails", async () => {
+it("keeps only failed layers in the removal dialog and retries them with their revisions", async () => {
   mocks.layers!.data.push(layer("independent", "Independent text", "codex", "host-a"));
   const layout = { hosts: ["host-a"], agents: ["codex"] };
   localStorage.setItem("omnigent:instruction-grid", JSON.stringify(layout));
@@ -601,6 +609,81 @@ it("keeps the removal dialog and layout when a later clear fails", async () => {
     screen.getByRole("button", { name: "Remove Codex column", hidden: true }),
   ).toBeInTheDocument();
   expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual(layout);
+  expect(
+    within(screen.getByRole("dialog"))
+      .getAllByRole("listitem")
+      .map((item) => item.textContent),
+  ).toEqual(["Laptop / Codex · 16 chars"]);
+  expect(mocks.save).toHaveBeenCalledTimes(2);
+  fireEvent.click(screen.getByRole("button", { name: "Clear text and remove" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  const independentClear = {
+    scope: "independent",
+    agent_key: "codex",
+    host_id: "host-a",
+    text: "",
+    expected_revision_id: "independent",
+  };
+  expect(mocks.save.mock.calls).toEqual([
+    [{ scope: "agent", agent_key: "codex", host_id: "", text: "", expected_revision_id: "agent" }],
+    [independentClear],
+    [independentClear],
+  ]);
+  expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual({
+    hosts: ["host-a"],
+    agents: [],
+  });
+});
+
+it.each([
+  { axis: "hosts", button: "Remove Laptop row", remaining: ["host-cloud"] },
+  { axis: "agents", button: "Remove Codex column", remaining: ["agent-b"] },
+])(
+  "preserves layout additions while clearing a $axis axis",
+  async ({ axis, button, remaining }) => {
+    localStorage.setItem(
+      "omnigent:instruction-grid",
+      JSON.stringify({ hosts: ["host-a"], agents: ["codex"] }),
+    );
+    let finish: (value: unknown) => void = () => {};
+    mocks.save.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    page();
+    fireEvent.click(screen.getByRole("button", { name: button }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear text and remove" }));
+    expect(mocks.save).toHaveBeenCalledTimes(1);
+    const latest = { hosts: ["host-a", "host-cloud"], agents: ["codex", "agent-b"] };
+    act(() => {
+      localStorage.setItem("omnigent:instruction-grid", JSON.stringify(latest));
+      window.dispatchEvent(new Event("omnigent:instruction-grid-changed"));
+    });
+    await act(async () => finish({ over_budget_routes: [] }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual({
+      ...latest,
+      [axis]: remaining,
+    });
+  },
+);
+
+it.each([
+  { picker: "Add host", choice: /Cloud.*offline/, axis: "hosts", id: "host-cloud" },
+  { picker: "Add agent", choice: /Agent B/, axis: "agents", id: "agent-b" },
+])("uses the latest stored layout when choosing $picker", async ({ picker, choice, axis, id }) => {
+  mocks.layers!.agents.push({ key: "agent-b", display_name: "Agent B" });
+  page();
+  fireEvent.click(screen.getByRole("button", { name: picker }));
+  const latest = { hosts: ["host-a"], agents: ["codex"] };
+  localStorage.setItem("omnigent:instruction-grid", JSON.stringify(latest));
+  fireEvent.click(await screen.findByRole("button", { name: choice }));
+  expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual({
+    ...latest,
+    [axis]: [...latest[axis as keyof typeof latest], id],
+  });
 });
 
 it("disables removing a held row for readers", () => {
