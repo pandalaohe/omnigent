@@ -9,7 +9,10 @@ import { useIsAdmin } from "@/hooks/useIsAdmin";
 import {
   layerId,
   instructionRegistryItems,
-  visibleInstructionAgents,
+  instructionGridAxes,
+  hasInstructionText,
+  useSaveInstructionLayer,
+  type InstructionLayer,
   useInstructionLayers,
   useInstructionPreview,
   type LayerKey,
@@ -17,6 +20,9 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { useSearchParams } from "@/lib/routing";
+import { useInstructionGridPreferences } from "@/lib/instructionGridPreferences";
+import { HostPicker } from "./instructions/HostPicker";
+import { RemoveAxisDialog } from "./instructions/RemoveAxisDialog";
 import { LayerEditor } from "./instructions/LayerEditor";
 import { ChildSessionsPanel } from "./instructions/ChildSessionsPanel";
 import { LayerGrid } from "./instructions/LayerGrid";
@@ -31,7 +37,16 @@ export function InstructionsPage() {
   const canEdit = isAdmin || isSingleUserMode(info);
   const [params, setParams] = useSearchParams();
   const capabilities = useHarnessCapabilities();
-  const [addedAgents, setAddedAgents] = useState<Set<string>>(() => new Set());
+  const [layout, setLayout] = useInstructionGridPreferences();
+  const save = useSaveInstructionLayer();
+  const [removal, setRemoval] = useState<{
+    axis: "hosts" | "agents";
+    id: string;
+    name: string;
+    layers: InstructionLayer[];
+  } | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const [editor, setEditor] = useState<{
     key: LayerKey;
     title: string;
@@ -59,7 +74,43 @@ export function InstructionsPage() {
   const context = session ? preview.data?.route : undefined;
   const selectedHost = session ? (context?.host_id ?? "") : hostId;
   const selectedAgent = session ? (context?.agent_key ?? "") : agentKey;
-  const agents = data.data ? visibleInstructionAgents(data.data, addedAgents) : [];
+  const axes = instructionGridAxes(
+    data.data ?? { data: [], agents: [], order: [], route_sizes: [], size_reminder_chars: 10000 },
+    hosts.data ?? [],
+    layout,
+  );
+  const removeFromLayout = (axis: "hosts" | "agents", id: string) =>
+    setLayout({ ...layout, [axis]: layout[axis].filter((value) => value !== id) });
+  const remove = (axis: "hosts" | "agents", id: string, name: string) => {
+    const layers = (axis === "hosts" ? axes.hostLayers : axes.agentLayers).get(id) ?? [];
+    if (layers.length === 0) removeFromLayout(axis, id);
+    else if (canEdit) {
+      setRemoveError(null);
+      setRemoval({ axis, id, name, layers });
+    }
+  };
+  const confirmRemoval = async () => {
+    if (!removal || removing || !canEdit) return;
+    setRemoving(true);
+    setRemoveError(null);
+    try {
+      for (const layer of removal.layers) {
+        // eslint-disable-next-line no-await-in-loop -- Clear each revision before starting the next save.
+        await save.mutateAsync({
+          scope: layer.scope,
+          agent_key: layer.agent_key,
+          host_id: layer.host_id,
+          text: "",
+        });
+      }
+      removeFromLayout(removal.axis, removal.id);
+      setRemoval(null);
+    } catch (error) {
+      setRemoveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRemoving(false);
+    }
+  };
   const pickerItems = instructionRegistryItems(
     data.data?.agents ?? [],
     capabilities,
@@ -87,7 +138,7 @@ export function InstructionsPage() {
     if (!canEdit) return;
     const existing = data.data?.data.find((layer) => layerId(layer) === layerId(key));
     const stack =
-      key.scope === "independent" && !existing?.text.trim()
+      key.scope === "independent" && !hasInstructionText(existing?.text)
         ? [
             { scope: "shared", agent_key: "", host_id: "" },
             { scope: "agent", agent_key: key.agent_key, host_id: "" },
@@ -102,7 +153,7 @@ export function InstructionsPage() {
                     layer.host_id === source.host_id,
                 )?.text,
             )
-            .filter((text) => text?.trim())
+            .filter(hasInstructionText)
             .join("\n\n")
         : undefined;
     setEditor({ key, title, initialText: stack ?? existing?.text ?? "" });
@@ -151,18 +202,31 @@ export function InstructionsPage() {
               <TabsTrigger value="route">Route total</TabsTrigger>
             </TabsList>
             <TabsContent value="overview" className="mt-4 space-y-4">
-              <AgentPicker
-                items={pickerItems}
-                taken={new Set(agents.map((agent) => agent.key))}
-                onPick={(key) => setAddedAgents((current) => new Set([...current, key]))}
-                title="Add agent"
-                description="Show an agent's instruction layer for this visit."
-                trigger={<Button variant="outline">Add agent</Button>}
-              />
               <LayerGrid
                 data={data.data}
-                hosts={hosts.data ?? []}
-                agents={agents}
+                hosts={axes.hosts}
+                allHosts={hosts.data ?? []}
+                agents={axes.agents}
+                agentLayers={axes.agentLayers}
+                hostLayers={axes.hostLayers}
+                onRemove={remove}
+                addAgent={
+                  <AgentPicker
+                    items={pickerItems}
+                    taken={new Set(axes.agents.map((agent) => agent.key))}
+                    onPick={(key) => setLayout({ ...layout, agents: [...layout.agents, key] })}
+                    title="Add agent"
+                    description="Give one agent its own instruction text."
+                    trigger={<Button variant="outline">Add agent</Button>}
+                  />
+                }
+                addHost={
+                  <HostPicker
+                    hosts={hosts.data ?? []}
+                    taken={new Set(axes.hosts.map((host) => host.host_id))}
+                    onPick={(id) => setLayout({ ...layout, hosts: [...layout.hosts, id] })}
+                  />
+                }
                 canEdit={canEdit}
                 onEdit={edit}
                 onRoute={(host, agent) => route({ host, agent })}
@@ -272,6 +336,27 @@ export function InstructionsPage() {
           they next reconnect to the server.
           {!canEdit ? " Only administrators can edit these layers." : ""}
         </p>
+        {removal && (
+          <RemoveAxisDialog
+            name={removal.name}
+            layers={removal.layers.map((layer) => ({
+              id: layerId(layer),
+              label:
+                layer.scope === "agent"
+                  ? (data.data?.agents.find((agent) => agent.key === layer.agent_key)
+                      ?.display_name ?? layer.agent_key)
+                  : layer.scope === "host"
+                    ? (hosts.data?.find((host) => host.host_id === layer.host_id)?.name ??
+                      layer.host_id)
+                    : `${hosts.data?.find((host) => host.host_id === layer.host_id)?.name ?? layer.host_id} / ${data.data?.agents.find((agent) => agent.key === layer.agent_key)?.display_name ?? layer.agent_key}`,
+              chars: layer.chars,
+            }))}
+            loading={removing}
+            error={removeError}
+            onCancel={() => setRemoval(null)}
+            onConfirm={() => void confirmRemoval()}
+          />
+        )}
         {editor && canEdit && (
           <LayerEditor
             key={layerId(editor.key)}

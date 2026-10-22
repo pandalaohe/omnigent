@@ -1648,6 +1648,29 @@ async def test_preferences_api_accepts_the_host_colors_namespace(
 
 
 @pytest.mark.asyncio
+async def test_preferences_api_replaces_instruction_grid_lists(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "grid@example.test"}
+        for value in (
+            {"hosts": ["h1"], "agents": ["codex"]},
+            {"hosts": [], "agents": ["codex", "claude"]},
+        ):
+            patched = await client.patch(
+                "/v1/me/preferences/instruction_grid",
+                headers=headers,
+                json={"value": value},
+            )
+            assert patched.status_code == 200, patched.text
+            assert patched.json()["settings"]["instruction_grid"] == value
+
+
+@pytest.mark.asyncio
 async def test_preferences_api_merges_stale_device_dismissals_and_prunes_old_ones(
     db_uri: str,
     runtime_init: None,

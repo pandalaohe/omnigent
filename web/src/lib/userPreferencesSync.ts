@@ -11,6 +11,7 @@ export type UserPreferenceNamespace =
   | "project_host_agents"
   | "calling_last"
   | "session_collab"
+  | "instruction_grid"
   | "host_colors"
   | "keep_warm"
   | "child_idle"
@@ -85,6 +86,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     session_collab: {
       storageKey: "omnigent:session-collab",
       eventName: "omnigent:session-collab-changed",
+    },
+    instruction_grid: {
+      storageKey: "omnigent:instruction-grid",
+      eventName: "omnigent:instruction-grid-changed",
     },
     host_colors: {
       storageKey: "omnigent:host-colors",

@@ -47,9 +47,14 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: (options: { includeSandbox?: boolean } = {}) => ({
     data: [
-      { host_id: "host-a", name: "Laptop", configured_harnesses: { "codex-native": true } },
+      {
+        host_id: "host-a",
+        name: "Laptop",
+        status: "online",
+        configured_harnesses: { "codex-native": true },
+      },
       ...(options.includeSandbox
-        ? [{ host_id: "host-cloud", name: "Cloud", sandbox_provider: "managed" }]
+        ? [{ host_id: "host-cloud", name: "Cloud", status: "offline", sandbox_provider: "managed" }]
         : []),
     ],
     isError: false,
@@ -110,6 +115,7 @@ function page(url = "/settings/instructions") {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   mocks.admin = true;
   mocks.ios = false;
   mocks.layers = {
@@ -197,7 +203,11 @@ describe("InstructionsPage", () => {
   });
   it("includes managed hosts in the matrix and route picker", async () => {
     page();
-    expect(screen.getByRole("button", { name: "Edit Cloud / Codex" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add host" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Cloud.*offline/ }));
+    expect(
+      screen.getByRole("button", { name: "Make Cloud / Codex independent" }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: "Route total" }));
     fireEvent.click(screen.getByRole("combobox", { name: "Host" }));
     expect(await screen.findByRole("option", { name: "Cloud" })).toBeInTheDocument();
@@ -308,7 +318,7 @@ describe("InstructionsPage", () => {
   });
   it("prefills an independent setting from shared → agent → host", () => {
     page();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Laptop / Codex" }));
+    fireEvent.click(screen.getByRole("button", { name: "Make Laptop / Codex independent" }));
     expect(screen.getByLabelText("Instruction text")).toHaveValue(
       "Shared text\n\nAgent text\n\nHost text",
     );
@@ -332,7 +342,7 @@ describe("InstructionsPage", () => {
   });
   it.each(["Close", "Escape"])("closes an untouched independent draft with %s", async (action) => {
     page();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Laptop / Codex" }));
+    fireEvent.click(screen.getByRole("button", { name: "Make Laptop / Codex independent" }));
     expect(screen.getByLabelText("Instruction text")).toHaveValue(
       "Shared text\n\nAgent text\n\nHost text",
     );
@@ -343,7 +353,7 @@ describe("InstructionsPage", () => {
   });
   it("keeps the discard prompt above long edited text and discards only on request", async () => {
     page();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Laptop / Codex" }));
+    fireEvent.click(screen.getByRole("button", { name: "Make Laptop / Codex independent" }));
     const editor = screen.getByLabelText("Instruction text");
     fireEvent.change(editor, { target: { value: "Edited instructions\n".repeat(500) } });
     await userEvent.keyboard("{Escape}");
@@ -463,7 +473,7 @@ describe("InstructionsPage", () => {
   });
 });
 
-it("adds a blank ACP column for this visit and drops blank latest layers on reload", async () => {
+it("persists an added ACP column while a blank latest layer alone stays hidden", async () => {
   mocks.layers!.agents.push({
     key: "acp:plugin",
     display_name: "Plugin",
@@ -477,5 +487,126 @@ it("adds a blank ACP column for this visit and drops blank latest layers on relo
   expect(screen.getByRole("button", { name: "Edit Plugin" })).toBeInTheDocument();
   view.unmount();
   page();
-  expect(screen.queryByRole("button", { name: "Edit Plugin" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Edit Plugin" })).toBeInTheDocument();
+});
+
+it("starts with Shared and the axis pickers when no layers hold text", () => {
+  mocks.layers!.data = [];
+  page();
+  const table = screen.getByRole("table");
+  expect(within(table).getByRole("button", { name: "Edit Shared" })).toBeInTheDocument();
+  expect(within(table).getByRole("button", { name: "Add agent" })).toBeInTheDocument();
+  expect(within(table).getByRole("button", { name: "Add host" })).toBeInTheDocument();
+  expect(
+    within(table).queryByRole("button", { name: /^Edit (Laptop|Cloud|Codex)/ }),
+  ).not.toBeInTheDocument();
+  expect(within(table).queryByRole("button", { name: /^Make / })).not.toBeInTheDocument();
+  expect(
+    screen.getByText(
+      "Add an agent column or a host row to give one agent or one host its own text.",
+    ),
+  ).toBeInTheDocument();
+  expect(
+    within(table)
+      .getAllByRole("row")
+      .map((row) => row.children.length),
+  ).toEqual([2, 2]);
+});
+
+it("adds and removes an empty host row without saving and persists the removal", async () => {
+  mocks.admin = false;
+  const view = page();
+  fireEvent.click(screen.getByRole("button", { name: "Add host" }));
+  expect(
+    await screen.findByRole("button", { name: /Laptop.*online.*already listed/ }),
+  ).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: /Cloud.*offline/ }));
+  expect(screen.getByRole("button", { name: "Edit Cloud" })).toBeInTheDocument();
+  expect(screen.getAllByRole("row").map((row) => row.children.length)).toEqual([3, 3, 3, 3]);
+  view.unmount();
+  const remounted = page();
+  expect(screen.getByRole("button", { name: "Edit Cloud" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Remove Cloud row" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Edit Cloud" })).not.toBeInTheDocument();
+  expect(mocks.save).not.toHaveBeenCalled();
+  remounted.unmount();
+  page();
+  expect(screen.queryByRole("button", { name: "Edit Cloud" })).not.toBeInTheDocument();
+});
+
+it("confirms every held layer in a column and clears only those keys sequentially", async () => {
+  mocks.layers!.data.push(layer("independent", "Independent text", "codex", "host-a"), {
+    ...layer("independent", "Retained", "codex", "removed"),
+    host_removed: true,
+  });
+  localStorage.setItem(
+    "omnigent:instruction-grid",
+    JSON.stringify({ hosts: ["host-a"], agents: ["codex"] }),
+  );
+  page();
+  expect(screen.getByRole("button", { name: "Edit Laptop / Codex" })).toHaveTextContent(
+    "Independent16 chars",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Remove Codex column" }));
+  const dialog = screen.getByRole("dialog");
+  expect(within(dialog).getByRole("heading", { name: "Remove Codex?" })).toBeInTheDocument();
+  expect(
+    within(dialog)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent),
+  ).toEqual(["Codex · 10 chars", "Laptop / Codex · 16 chars"]);
+  fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  expect(mocks.save).not.toHaveBeenCalled();
+  expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual({
+    hosts: ["host-a"],
+    agents: ["codex"],
+  });
+  let finish: (value: unknown) => void = () => {};
+  mocks.save.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Remove Codex column" }));
+  fireEvent.click(screen.getByRole("button", { name: "Clear text and remove" }));
+  expect(mocks.save).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+  await act(async () => finish({ over_budget_routes: [] }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(mocks.save.mock.calls).toEqual([
+    [{ scope: "agent", agent_key: "codex", host_id: "", text: "" }],
+    [{ scope: "independent", agent_key: "codex", host_id: "host-a", text: "" }],
+  ]);
+  expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual({
+    hosts: ["host-a"],
+    agents: [],
+  });
+});
+
+it("keeps the removal dialog and layout when a later clear fails", async () => {
+  mocks.layers!.data.push(layer("independent", "Independent text", "codex", "host-a"));
+  const layout = { hosts: ["host-a"], agents: ["codex"] };
+  localStorage.setItem("omnigent:instruction-grid", JSON.stringify(layout));
+  mocks.save
+    .mockResolvedValueOnce({ over_budget_routes: [] })
+    .mockRejectedValueOnce(new Error("Save failed"));
+  page();
+  fireEvent.click(screen.getByRole("button", { name: "Remove Codex column" }));
+  fireEvent.click(screen.getByRole("button", { name: "Clear text and remove" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Save failed");
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Remove Codex column", hidden: true }),
+  ).toBeInTheDocument();
+  expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual(layout);
+});
+
+it("disables removing a held row for readers", () => {
+  mocks.admin = false;
+  page();
+  const remove = screen.getByRole("button", { name: "Remove Laptop row" });
+  expect(remove).toBeDisabled();
+  expect(remove).toHaveAttribute("title", "Only administrators can clear saved text.");
 });
