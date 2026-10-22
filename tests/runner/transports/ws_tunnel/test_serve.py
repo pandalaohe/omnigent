@@ -3754,41 +3754,39 @@ async def test_serve_tunnel_keeps_escalating_after_brief_connection(
 @pytest.mark.parametrize("late_request", [False, True])
 @pytest.mark.parametrize("blocked_pong", [False, True])
 @pytest.mark.parametrize(
-    ("method", "path", "protected", "finishes", "quick_request"),
+    ("method", "path", "finishes", "quick_request"),
     [
-        ("GET", "/v1/sessions/conv/stream", False, False, False),
-        ("POST", "/v1/sessions/conv/events", True, True, False),
-        ("GET", "/unknown-operation", True, True, False),
-        ("POST", "/v1/sessions/conv/events", True, False, False),
-        ("POST", "/v1/sessions/conv/events", True, False, True),
-        ("WS", "/unknown-websocket", True, True, False),
-        ("WS", "/unknown-websocket", True, False, False),
+        ("GET", "/v1/sessions/conv/stream", False, False),
+        ("POST", "/v1/sessions/conv/events", True, False),
+        ("GET", "/unknown-operation", True, False),
+        ("POST", "/v1/sessions/conv/events", False, False),
+        ("POST", "/v1/sessions/conv/events", False, True),
+        ("WS", "/unknown-websocket", True, False),
+        ("WS", "/unknown-websocket", False, False),
     ],
 )
-async def test_application_silence_preserves_connection_owned_requests(
+async def test_application_progress_bounds_connection_owned_requests(
     monkeypatch: pytest.MonkeyPatch,
     graceful_shutdown: bool,
     late_request: bool,
     blocked_pong: bool,
     method: str,
     path: str,
-    protected: bool,
     finishes: bool,
     quick_request: bool,
 ) -> None:
-    """A silent peer cannot cancel request-owned work at the subscription deadline."""
+    """Work outlives the silence budget only while the application peer makes progress."""
     import websockets
     from websockets.asyncio.client import ClientConnection
 
-    monkeypatch.setattr(serve_module, "RUNNER_TUNNEL_SILENCE_TIMEOUT_S", 0.15)
-    monkeypatch.setattr(serve_module, "_RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(serve_module, "RUNNER_TUNNEL_SILENCE_TIMEOUT_S", 0.5)
+    finishes = finishes and not blocked_pong
     started = asyncio.Event()
     cancelled = asyncio.Event()
     finish = asyncio.Event()
     checked = asyncio.Event()
     pong_started = asyncio.Event()
     pong_cancelled = asyncio.Event()
-    release_pong = asyncio.Event()
     original_send = ClientConnection.send
 
     async def send_with_backpressure(self, data, *args, **kwargs):
@@ -3796,7 +3794,7 @@ async def test_application_silence_preserves_connection_owned_requests(
             if not pong_started.is_set():
                 pong_started.set()
                 try:
-                    await release_pong.wait()
+                    await asyncio.Future()
                 except asyncio.CancelledError:
                     pong_cancelled.set()
                     raise
@@ -3840,21 +3838,22 @@ async def test_application_silence_preserves_connection_owned_requests(
             finish.set()
             while json.loads(await ws.recv())["kind"] not in {"response.end", "ws.close"}:
                 pass
-            await asyncio.wait_for(ws.wait_closed(), timeout=0.6)
+            await asyncio.wait_for(ws.wait_closed(), timeout=2)
             checked.set()
             return
-        await asyncio.sleep(0.3)
-        if protected:
-            assert not cancelled.is_set()
-            assert not pong_cancelled.is_set()
         if finishes:
-            release_pong.set()
-            await ws.send(encode_frame(PingFrame(ts=123)))
+            for ts in range(3):
+                await asyncio.sleep(0.2)
+                assert not cancelled.is_set()
+                await ws.send(encode_frame(PingFrame(ts=ts)))
+                assert json.loads(await ws.recv()) == {"kind": "pong", "ts": ts}
             finish.set()
             while json.loads(await ws.recv())["kind"] not in {"response.end", "ws.close"}:
                 pass
         else:
             await asyncio.wait_for(cancelled.wait(), timeout=2)
+            if blocked_pong:
+                assert pong_cancelled.is_set()
         checked.set()
         await ws.close()
 
@@ -3883,6 +3882,89 @@ async def test_application_silence_preserves_connection_owned_requests(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, ConnectionError):
                 await task
+
+
+@pytest.mark.parametrize("with_shutdown", [False, True])
+@pytest.mark.parametrize("late_frame", [False, True])
+@pytest.mark.parametrize("work", ["idle", "request", "websocket"])
+async def test_server_silence_deadline_survives_delayed_loop(
+    monkeypatch: pytest.MonkeyPatch, with_shutdown: bool, late_frame: bool, work: str
+) -> None:
+    """A stalled loop cannot extend a silent socket past the reconnect budget."""
+    import websockets
+
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    real_wait = asyncio.wait
+    offset = 0.0
+    checks = 0
+    receives = 0
+    aborted: list[bool] = []
+    dispatched: list[str] = []
+    cancelled = asyncio.Event()
+    tasks_before = asyncio.all_tasks()
+
+    class SilentWS(_CleanCloseWS):
+        transport = SimpleNamespace(abort=lambda: aborted.append(True))
+
+        async def send(self, data: str) -> None:
+            pass
+
+        async def recv(self) -> str:
+            nonlocal receives
+            receives += 1
+            if receives == 1:
+                if work == "request":
+                    return encode_frame(RequestFrame(id="work", method="POST", path="/work"))
+                if work == "websocket":
+                    return encode_frame(WSOpenFrame(ch_id="work", path="/work"))
+                return encode_frame(PingFrame(ts=1))
+            if late_frame:
+                return encode_frame(RequestFrame(id="late", method="POST", path="/late"))
+            await asyncio.Future()
+            raise AssertionError("Silent receive must be canceled")
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        yield SilentWS()
+
+    async def app(scope, receive, send):
+        dispatched.append(scope["path"])
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    async def delayed_wait(tasks, *, timeout=None, **kwargs):
+        nonlocal offset, checks
+        if timeout is None:
+            return await real_wait(tasks, **kwargs)
+        checks += 1
+        assert checks <= 2, "An expired connection was allowed to renew its deadline"
+        if checks == 2:
+            # Advance monotonic time without sleeping or using a real network.
+            offset += 61.0
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        done = {task for task in tasks if task.done()}
+        return done, set(tasks) - done
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(loop, "time", lambda: real_time() + offset)
+    monkeypatch.setattr(asyncio, "wait", delayed_wait)
+    with pytest.raises(ConnectionError, match="server application ping timeout"):
+        await _serve_tunnel_once(
+            app,
+            tunnel_url="ws://example.test/tunnel",
+            server_url="http://example.test",
+            runner_id="runner-delayed",
+            runner_version="test",
+            shutdown_event=asyncio.Event() if with_shutdown else None,
+        )
+    assert aborted == [True]
+    assert dispatched == ([] if work == "idle" else ["/work"])
+    assert cancelled.is_set() == (work != "idle")
+    assert asyncio.all_tasks() == tasks_before
 
 
 @pytest.mark.asyncio
