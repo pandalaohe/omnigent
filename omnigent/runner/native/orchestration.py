@@ -5722,6 +5722,7 @@ async def _auto_create_codex_terminal(
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
         terminal_launch_args=launch_config.terminal_launch_args or (),
+        permission_launch_args=launch_config.terminal_launch_args or (),
         reasoning_effort=launch_config.reasoning_effort,
         service_tier=launch_config.service_tier,
         model_catalog_rows=_fresh_codex_catalog,
@@ -5794,6 +5795,9 @@ async def _auto_create_codex_terminal(
                 codex_ws_url,
                 launch_config.external_session_id,
                 terminal_launch_args=launch_config.terminal_launch_args,
+                permission_profile=app_server.workspace_profile.profile_id
+                if app_server.workspace_profile
+                else None,
                 cwd=Path(workspace),
                 model_provider=(
                     _session_meta_provider
@@ -5905,6 +5909,9 @@ async def _auto_create_codex_terminal(
                     # The session workspace: without it the executor falls back
                     # to the runner process's own cwd when starting turns.
                     cwd=workspace,
+                    permission_profile=app_server.workspace_profile.profile_id
+                    if app_server.workspace_profile
+                    else None,
                 ),
             )
         launched = await _launch_codex_native_tui(
@@ -6253,6 +6260,7 @@ async def _codex_discover_thread_and_forward(
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
     """
+    from omnigent.harnesses.codex_native.app_server import apply_codex_thread_permissions
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
         CodexNativeBridgeState,
@@ -6489,6 +6497,14 @@ async def _codex_discover_thread_and_forward(
                     )
                 return
 
+        if app_server is not None and app_server.workspace_profile is not None:
+            try:
+                await apply_codex_thread_permissions(
+                    codex_ws_url, thread_id, app_server.workspace_profile.profile_id
+                )
+            except Exception:  # noqa: BLE001 - keep the launched thread usable on rejection.
+                _logger.warning("Failed to apply Codex thread permissions", exc_info=True)
+
         if login_required or startup_pending_recorded:
             # The user signed in (or the TUI otherwise started a thread):
             # the pre-recorded fail-fast cause no longer applies.
@@ -6503,6 +6519,9 @@ async def _codex_discover_thread_and_forward(
                 # The session workspace: without it the executor falls back
                 # to the runner process's own cwd when starting turns.
                 cwd=workspace,
+                permission_profile=app_server.workspace_profile.profile_id
+                if app_server is not None and app_server.workspace_profile
+                else None,
             ),
         )
 

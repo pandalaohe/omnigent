@@ -7638,7 +7638,15 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
     "service_tier,expected_tier",
     [(None, None), ("fast", "priority"), ("standard", "default"), ("ultrafast", "ultrafast")],
 )
-@pytest.mark.parametrize("configured_network", [None, False, True])
+@pytest.mark.parametrize(
+    "profile_cwd,configured_network",
+    [
+        (profile_cwd, network)
+        for profile_cwd in ("same", "other", None)
+        for network in (None, False, True)
+    ]
+    + [("root-added", True), ("network-flipped", True)],
+)
 async def test_codex_turn_start_applies_approval_mode(
     approval_mode: str | None,
     approval_policy: str | None,
@@ -7648,7 +7656,10 @@ async def test_codex_turn_start_applies_approval_mode(
     expected_tier: str | None,
     tmp_path: Path,
     configured_network: bool | None,
+    profile_cwd: str | None,
 ) -> None:
+    from omnigent.harnesses.codex_native.launch_args import CodexWorkspaceProfile
+
     gitdir = tmp_path / "repo" / ".git" / "worktrees" / "feature"
     gitdir.mkdir(parents=True)
     workspace = tmp_path / "workspace"
@@ -7660,6 +7671,22 @@ async def test_codex_turn_start_applies_approval_mode(
     session = _CodexAppServerSession(
         codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
     )
+    if profile_cwd is not None:
+        profile_roots = (
+            (str(gitdir), str(workspace), "/opt/work/cache", "/opt/work/shared")
+            if configured_network is not None
+            else (str(workspace),)
+        )
+        session._workspace_profile = CodexWorkspaceProfile(
+            "omnigent-workspace",
+            (),
+            profile_roots[:-1] if profile_cwd == "root-added" else profile_roots,
+            configured_network is True and profile_cwd != "network-flipped",
+        )
+        session._workspace_profile_cwd = (
+            tmp_path / "other" if profile_cwd == "other" else workspace
+        ).resolve()
+    uses_profile = profile_cwd == "same" and sandbox_type == "workspaceWrite"
     session.start = AsyncMock()
     session.__dict__["_proc"] = _FakeProcess()
     session.thread_id = "thread-1"
@@ -7671,7 +7698,7 @@ async def test_codex_turn_start_applies_approval_mode(
                         "sandbox_workspace_write": None
                         if configured_network is None
                         else {
-                            "writable_roots": ["/opt/work/shared"],
+                            "writable_roots": ["/opt/work/shared", "/opt/work/cache"],
                             "network_access": configured_network,
                         }
                     }
@@ -7714,6 +7741,11 @@ async def test_codex_turn_start_applies_approval_mode(
         assert "approvalPolicy" not in turn_params
         assert "approvalsReviewer" not in turn_params
         assert "sandboxPolicy" not in turn_params
+    elif uses_profile:
+        assert turn_params["approvalPolicy"] == approval_policy
+        assert turn_params["approvalsReviewer"] == approvals_reviewer
+        assert turn_params["permissions"] == "omnigent-workspace"
+        assert "sandboxPolicy" not in turn_params
     else:
         assert turn_params["approvalPolicy"] == approval_policy
         assert turn_params["approvalsReviewer"] == approvals_reviewer
@@ -7722,22 +7754,35 @@ async def test_codex_turn_start_applies_approval_mode(
             expected_sandbox["writableRoots"] = [str(workspace)]
             if configured_network is not None:
                 expected_sandbox.update(
-                    writableRoots=[str(workspace), "/opt/work/shared", str(gitdir)],
+                    writableRoots=[
+                        str(workspace),
+                        "/opt/work/shared",
+                        "/opt/work/cache",
+                        str(gitdir),
+                    ],
                     networkAccess=configured_network,
                 )
         assert turn_params["sandboxPolicy"] == expected_sandbox
     config_reads = [
         call for call in session._request.await_args_list if call.args[0] == "config/read"
     ]
+    assert ("permissions" in turn_params) == uses_profile
     assert len(config_reads) == (1 if sandbox_type == "workspaceWrite" else 0)
 
 
+@pytest.mark.parametrize("profile", [False, True])
 async def test_codex_turn_start_ignores_unknown_approval_mode(
     caplog: pytest.LogCaptureFixture,
+    profile: bool,
 ) -> None:
     session = _CodexAppServerSession(
         codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
     )
+    if profile:
+        from omnigent.harnesses.codex_native.launch_args import CodexWorkspaceProfile
+
+        session._workspace_profile = CodexWorkspaceProfile("omnigent-workspace", ())
+        session._workspace_profile_cwd = Path("/tmp/workspace").resolve()
     session.start = AsyncMock()
     session.__dict__["_proc"] = _FakeProcess()
     session.thread_id = "thread-1"
@@ -7769,6 +7814,7 @@ async def test_codex_turn_start_ignores_unknown_approval_mode(
     assert "approvalPolicy" not in turn_params
     assert "approvalsReviewer" not in turn_params
     assert "sandboxPolicy" not in turn_params
+    assert "permissions" not in turn_params
     assert any(
         record.name == "omnigent.inner.codex_executor"
         and record.levelname == "WARNING"
@@ -8501,3 +8547,196 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
         assert session._certificate_failure is None
 
     _run(_t())
+
+
+@pytest.mark.parametrize(
+    "sandbox,containment",
+    [
+        ("workspace-write", False),
+        ("read-only", False),
+        ("danger-full-access", False),
+        ("workspace-write", True),
+    ],
+)
+@pytest.mark.parametrize("profile_cwd", ["same", "other", None])
+async def test_codex_thread_start_workspace_profile(
+    tmp_path: Path, sandbox: str, containment: bool, profile_cwd: str | None
+) -> None:
+    from omnigent.harnesses.codex_native.launch_args import CodexWorkspaceProfile
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _CodexAppServerSession(
+        codex_path="/fixture/codex", cwd=str(workspace), env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session._containment_confirmed = containment
+    if profile_cwd is not None:
+        session._workspace_profile = CodexWorkspaceProfile("omnigent-workspace", ())
+        session._workspace_profile_cwd = (
+            workspace if profile_cwd == "same" else tmp_path
+        ).resolve()
+
+    async def request(method: str, params: dict) -> dict:
+        if method == "thread/start":
+            return {"result": {"thread": {"id": "thread-1"}}}
+        if method == "turn/start":
+            asyncio.get_running_loop().call_later(
+                0.01,
+                session._events.put_nowait,
+                {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}},
+            )
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=request)
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="mock-model",
+            cwd=".",
+            sandbox=sandbox,
+        )
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    thread_params = session._request.await_args_list[0].args[1]
+    expected = {"approvalPolicy": "never", "cwd": ".", "model": "mock-model"}
+    if sandbox == "workspace-write" and not containment and profile_cwd == "same":
+        expected["permissions"] = "omnigent-workspace"
+    else:
+        expected["sandbox"] = "danger-full-access" if containment else sandbox
+    assert thread_params == expected
+    turn_params = session._request.await_args.args[1]
+    assert turn_params == {"threadId": "thread-1", "input": [{"type": "text", "text": "hi"}]}
+
+
+@pytest.mark.parametrize(
+    "gate", ["open", "private-default", "windows", "unknown", "old", "non-repo", "error"]
+)
+async def test_codex_spawn_workspace_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    import subprocess
+    import threading
+
+    from omnigent.inner import codex_executor as module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if gate != "non-repo":
+        subprocess.run(["git", "-C", str(workspace), "init"], check=True, capture_output=True)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'default_permissions="custom"\n'
+        if gate == "private-default"
+        else 'sandbox_mode="read-only"\n[sandbox_workspace_write]\nnetwork_access=true\n'
+    )
+    monkeypatch.setattr(module, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(module, "codex_home_staging_root", lambda: tmp_path)
+    monkeypatch.setattr(module, "populate_codex_skills_from_bundle", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        module,
+        "prepare_codex_worker",
+        lambda **kw: CodexWorkerLaunch(launch_path="/fixture/codex", sandboxed=False),
+    )
+    if gate == "windows":
+        monkeypatch.setattr(module, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    version = None if gate == "unknown" else (0, 138, 9) if gate == "old" else (0, 139, 0)
+    probe = AsyncMock(return_value=version)
+    monkeypatch.setattr(module, "_codex_cli_version", probe)
+    original = module.codex_workspace_profile
+    main_thread = threading.get_ident()
+
+    def build(*args: Any, **kwargs: Any):
+        assert threading.get_ident() != main_thread
+        assert kwargs["launch_args"] == ()
+        assert kwargs["server_overrides"] == ["sandbox_workspace_write.network_access=false"]
+        if gate == "error":
+            raise RuntimeError("profile discovery failed")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "codex_workspace_profile", build)
+    spawn = AsyncMock(side_effect=RuntimeError("stop before worker spawn"))
+    monkeypatch.setattr(module, "_create_subprocess_exec", spawn)
+    session = _CodexAppServerSession(
+        codex_path="/fixture/codex",
+        cwd=str(workspace),
+        env={},
+        tool_executor=None,
+        codex_config_overrides=["sandbox_workspace_write.network_access=false"],
+    )
+    with pytest.raises(RuntimeError, match="stop before worker spawn"):
+        await session.start()
+    assert probe.await_count == (0 if gate in {"windows", "non-repo"} else 1)
+    argv = list(spawn.await_args.args)
+    baseline = [
+        "/fixture/codex",
+        "app-server",
+        "-c",
+        "sandbox_workspace_write.network_access=false",
+    ]
+    if gate == "open":
+        assert session._workspace_profile is not None
+        assert session._workspace_profile_cwd == workspace.resolve()
+        overrides = session._workspace_profile.config_overrides
+        assert not any("network.enabled=true" in value for value in overrides)
+        assert argv == baseline + [token for override in overrides for token in ("-c", override)]
+    else:
+        assert session._workspace_profile is None
+        assert argv == baseline
+    if gate == "error":
+        assert "Failed to build Codex workspace permission profile" in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="workspace profiles require POSIX")
+@pytest.mark.parametrize("repository", [False, True])
+async def test_codex_workspace_profile_version_probe_requires_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository: bool
+) -> None:
+    import subprocess
+    import threading
+
+    from omnigent.inner import codex_executor as module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if repository:
+        subprocess.run(["git", "-C", str(workspace), "init"], check=True, capture_output=True)
+    nested = workspace / "nested"
+    nested.mkdir()
+    monkeypatch.chdir(nested)
+    discover = module.detect_git_root
+    main_thread = threading.get_ident()
+
+    def detect(path: Path) -> Path | None:
+        assert threading.get_ident() != main_thread
+        assert path == nested.resolve()
+        return discover(path)
+
+    monkeypatch.setattr(module, "detect_git_root", detect)
+    monkeypatch.setattr(module, "_codex_home_config_source_from_env", lambda: None)
+    monkeypatch.setattr(module, "_populate_codex_home_config", Mock())
+    monkeypatch.setattr(module, "codex_home_staging_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        module,
+        "prepare_codex_worker",
+        lambda **kw: CodexWorkerLaunch(launch_path="/fixture/codex", sandboxed=False),
+    )
+    probe = AsyncMock(return_value=None)
+    monkeypatch.setattr(module, "_codex_cli_version", probe)
+    spawn = AsyncMock(side_effect=RuntimeError("stop before worker spawn"))
+    monkeypatch.setattr(module, "_create_subprocess_exec", spawn)
+    session = _CodexAppServerSession(
+        codex_path="/fixture/codex", cwd=None, env={}, tool_executor=None
+    )
+    with pytest.raises(RuntimeError, match="stop before worker spawn"):
+        await session.start()
+    if repository:
+        probe.assert_awaited_once_with("/fixture/codex")
+    else:
+        probe.assert_not_called()
+    spawn.assert_awaited_once()

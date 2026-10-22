@@ -3265,13 +3265,18 @@ def _merge_codex_permission_launch_args(
     index = 0
     while index < len(args):
         arg = args[index]
-        if arg == "--dangerously-bypass-approvals-and-sandbox":
+        if arg in {
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--approve-for-me",
+            "--not-so-yolo",
+            "--yolo",
+        }:
             index += 1
             continue
         if arg in value_options:
             index += 2
             continue
-        if arg.startswith(("--ask-for-approval=", "-a=", "--sandbox=", "-s=")):
+        if arg.startswith(("--ask-for-approval=", "--sandbox=", "-a", "-s")):
             index += 1
             continue
         if arg in {"--config", "-c"} and index + 1 < len(args):
@@ -3282,8 +3287,13 @@ def _merge_codex_permission_launch_args(
             merged.extend(args[index : index + 2])
             index += 2
             continue
-        if arg.startswith(("--config=", "-c=")):
-            key = arg.split("=", 1)[1].partition("=")[0].strip()
+        if arg.startswith("--config=") or (arg.startswith("-c") and not arg.startswith("--")):
+            assignment = (
+                arg.removeprefix("--config=")
+                if arg.startswith("--config=")
+                else arg[2:].removeprefix("=")
+            )
+            key = assignment.partition("=")[0].strip()
             if key in config_keys:
                 index += 1
                 continue

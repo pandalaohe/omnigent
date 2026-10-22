@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -694,3 +695,128 @@ def test_remote_resume_preserves_settings_not_applied_by_preload(args: tuple[str
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
     ) == [*args, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (
+            ["--approve-for-me"],
+            {
+                "permissions": "omnigent-workspace",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+            },
+        ),
+        (
+            ["--sandbox", "workspace-write", "-a", "never"],
+            {"permissions": "omnigent-workspace", "approvalPolicy": "never"},
+        ),
+        (["--sandbox", "read-only"], {"sandbox": "read-only"}),
+        (["--yolo"], {"sandbox": "danger-full-access", "approvalPolicy": "never"}),
+        (
+            ["-c", 'default_permissions="custom"', "-a", "on-request"],
+            {"permissions": "custom", "approvalPolicy": "on-request"},
+        ),
+    ],
+)
+def test_resume_generated_profile_only_replaces_workspace(
+    args: list[str], expected: dict[str, Any]
+) -> None:
+    assert (
+        codex_native_app_server._codex_resume_permission_params(args, "omnigent-workspace")
+        == expected
+    )
+
+
+async def test_preload_carries_generated_permission_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    client = _FakeCodexAppServerClient()
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: client)
+    await codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:1234",
+        "thread",
+        terminal_launch_args=["--approve-for-me"],
+        permission_profile="omnigent-workspace",
+    )
+    assert client.requests[0][1]["permissions"] == "omnigent-workspace"
+    assert "sandbox" not in client.requests[0][1]
+    rejected = AsyncMock()
+    rejected.request.return_value = {"error": {"message": "rejected"}}
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: rejected)
+    with pytest.raises(RuntimeError, match="rejected"):
+        await codex_native_app_server.apply_codex_thread_permissions(
+            "ws://127.0.0.1:1234", "thread", "omnigent-workspace"
+        )
+    rejected.close.assert_awaited_once()
+    rejected.request.assert_awaited_once_with(
+        "thread/settings/update", {"threadId": "thread", "permissions": "omnigent-workspace"}
+    )
+
+
+@pytest.mark.parametrize("profile", ["omnigent-workspace", None])
+def test_bridge_permission_profile_survives_updates_and_relaunch(
+    tmp_path: Path, profile: str | None
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import (
+        clear_active_turn_id_if_matches,
+        update_active_turn_id,
+        update_thread_id,
+    )
+
+    for value in [None, "omnigent-workspace", profile]:
+        write_bridge_state(
+            tmp_path,
+            CodexNativeBridgeState(
+                session_id="conv",
+                socket_path="ws://127.0.0.1:1234",
+                thread_id="old",
+                codex_home=str(tmp_path / "home"),
+                permission_profile=value,
+            ),
+        )
+        payload = json.loads((tmp_path / "state.json").read_text())
+        assert ("permission_profile" in payload) == (value is not None)
+    update_active_turn_id(tmp_path, "turn")
+    assert read_bridge_state(tmp_path).permission_profile == profile
+    assert clear_active_turn_id_if_matches(tmp_path, "turn")
+    update_thread_id(tmp_path, "new")
+    assert read_bridge_state(tmp_path).permission_profile == profile
+
+
+@pytest.mark.parametrize("stage", ["connect", "request"])
+async def test_permission_update_timeout_closes_client(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from unittest.mock import AsyncMock
+
+    client = AsyncMock()
+    getattr(client, stage).side_effect = TimeoutError
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: client)
+    with pytest.raises(TimeoutError):
+        await codex_native_app_server.apply_codex_thread_permissions(
+            "ws://127.0.0.1:1234", "thread", "omnigent-workspace"
+        )
+    client.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (["--", "--approve-for-me"], {}),
+        (["--sandbox", "read-only", "--", "--approve-for-me"], {"sandbox": "read-only"}),
+        (
+            ["--approve-for-me", "--", "--sandbox", "read-only"],
+            {
+                "sandbox": "workspace-write",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+            },
+        ),
+    ],
+)
+def test_resume_permissions_stop_at_option_terminator(args: list[str], expected: dict) -> None:
+    assert codex_native_app_server._codex_resume_permission_params(args) == expected

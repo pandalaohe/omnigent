@@ -881,6 +881,37 @@ def build_native_controls(
                     ),
                 },
             )
+        if preset.value in {"ask-for-approval", "approve-for-me"}:
+            try:
+                bridge = await _codex_native_bridge_state_for_session(
+                    conv_id, action="permission profile"
+                )
+            except Exception:  # noqa: BLE001 - the preset switch already succeeded.
+                _logger.warning("Failed to read Codex permission profile", exc_info=True)
+                bridge = None
+            if bridge is not None and bridge.permission_profile:
+                from omnigent.harnesses.codex_native.app_server import (
+                    apply_codex_thread_permissions,
+                )
+
+                try:
+                    selected = await asyncio.to_thread(
+                        _inject_codex_permission_mode,
+                        str(instance.socket_path),
+                        instance.tmux_target,
+                        label="omnigent-workspace",
+                        needs_confirm=False,
+                    )
+                    if not selected:
+                        _logger.warning("Codex permissions popup did not list omnigent-workspace")
+                except Exception:  # noqa: BLE001 - the confirmed preset switch already succeeded.
+                    _logger.warning("Failed to select Codex permission profile row", exc_info=True)
+                try:
+                    await apply_codex_thread_permissions(
+                        bridge.socket_path, bridge.thread_id, bridge.permission_profile
+                    )
+                except Exception:  # noqa: BLE001 - preserve the preset switch response.
+                    _logger.warning("Failed to apply Codex permission profile", exc_info=True)
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
@@ -2188,7 +2219,20 @@ def build_native_controls(
         known_labels = {preset.label for preset in CODEX_NATIVE_PERMISSION_PRESETS}
 
         def _read_menu() -> dict[str, str]:
-            return codex_permissions_menu(_capture_pane(socket_path, target))
+            pane = _capture_pane(socket_path, target)
+            menu = codex_permissions_menu(pane)
+            if label == "omnigent-workspace":
+                rows = [
+                    row
+                    for line in pane.splitlines()
+                    for row in codex_permissions_menu(line).items()
+                ]
+                matches = [digit for name, digit in rows if name == label]
+                if len(matches) != 1 or any(
+                    name != label and digit == matches[0] for name, digit in rows
+                ):
+                    menu.pop(label, None)
+            return menu
 
         deadline = time.monotonic() + _CODEX_PERMISSION_MENU_BUDGET_S
         options: dict[str, str] = {}
@@ -2227,6 +2271,7 @@ def build_native_controls(
                 None,
             )
             if digit is None:
+                _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
                 return False
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, digit)
         if needs_confirm:

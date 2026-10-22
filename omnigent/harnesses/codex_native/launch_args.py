@@ -3,20 +3,31 @@
 from __future__ import annotations
 
 import copy
+import json
+import logging
 import os
 import re
+import shlex
+import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import tomlkit
 from tomlkit.exceptions import ParseError, TOMLKitError
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime.filesystem_registry import linked_worktree_git_dir
+from omnigent.runtime.filesystem_registry import (
+    _anchored_git_env,
+    _git_common_dir,
+    detect_git_root,
+    linked_worktree_git_dir,
+)
+
+_logger = logging.getLogger(__name__)
 
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
@@ -352,6 +363,409 @@ def codex_launch_args_set_permission(args: Sequence[str]) -> bool:
     :raises ValueError: when the args hold an invalid ``--profile`` selector.
     """
     return codex_permission_stance(args).explicit
+
+
+def normalize_codex_permission_launch_args(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Complete permission launch args into their effective stance.
+
+    Two normalizations:
+
+    - Legacy Full Access args (a ``default_permissions=":danger-full-access"``
+      profile with no approval policy) gain ``approval_policy="never"``.
+    - The bare default stance — no approval policy, sandbox, permission
+      profile, reviewer, or bypass flag — gains
+      ``approvals_reviewer="auto_review"``. Codex's built-in default routes
+      escalated approvals (e.g. an out-of-workspace write) to the human,
+      which parks web turns on an approval card even though the default
+      permission mode is presented as automatic. ``auto_review`` keeps the
+      workspace-write sandbox and approval boundaries but lets Codex's
+      automatic reviewer settle eligible requests instead of prompting.
+      Any explicit approval/sandbox/reviewer/profile choice wins untouched.
+    """
+    args = canonical_codex_launch_args(terminal_launch_args or ())
+    stance = codex_permission_stance(args)
+    if stance.full_access_profile and not stance.approval_policy:
+        args.extend(["-c", 'approval_policy="never"'])
+    elif not stance.explicit:
+        args.extend(["-c", 'approvals_reviewer="auto_review"'])
+    return args
+
+
+def _codex_resume_permission_params(
+    terminal_launch_args: Sequence[str] | None, permission_profile: str | None = None
+) -> dict[str, Any]:
+    """Convert persisted Codex permission args into thread-resume overrides."""
+    params: dict[str, Any] = {}
+    typed_params: dict[str, Any] = {}
+    args = normalize_codex_permission_launch_args(terminal_launch_args)
+    index = 0
+    approve_for_me = False
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        value: str | None = None
+        if arg == "--approve-for-me":
+            approve_for_me = True
+        elif arg == "--dangerously-bypass-approvals-and-sandbox":
+            typed_params.update(approvalPolicy="never", sandbox="danger-full-access")
+        elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
+            if index + 1 < len(args):
+                value = args[index + 1]
+                index += 1
+            if value is not None:
+                field = "approvalPolicy" if arg in {"--ask-for-approval", "-a"} else "sandbox"
+                typed_params[field] = value
+        elif arg.startswith(("--ask-for-approval=", "-a=")):
+            typed_params["approvalPolicy"] = arg.split("=", 1)[1]
+        elif arg.startswith(("--sandbox=", "-s=")):
+            typed_params["sandbox"] = arg.split("=", 1)[1]
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            key, _, value = args[index].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        elif arg.startswith(("--config=", "-c=")):
+            key, _, value = arg.split("=", 1)[1].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        index += 1
+    if approve_for_me:
+        if "sandbox" in typed_params:
+            raise ValueError("--approve-for-me conflicts with sandbox and bypass flags")
+        params.update(
+            approvalsReviewer="auto_review", approvalPolicy="on-request", sandbox="workspace-write"
+        )
+    params.update(typed_params)
+    if "permissions" in params:
+        params.pop("sandbox", None)
+    if (
+        permission_profile
+        and (
+            params.get("permissions") == ":workspace"
+            or (
+                "permissions" not in params
+                and params.get("sandbox", "workspace-write") == "workspace-write"
+            )
+        )
+        and codex_config_profile(args) is None
+    ):
+        params.pop("sandbox", None)
+        params["permissions"] = permission_profile
+    return params
+
+
+_CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {
+    "approval_policy": "approvalPolicy",
+    "approvals_reviewer": "approvalsReviewer",
+    "default_permissions": "permissions",
+    "sandbox_mode": "sandbox",
+}
+
+
+def _set_codex_resume_config_param(params: dict[str, Any], key: str, raw_value: str) -> bool:
+    key = key.strip()
+    field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key)
+    if field is not None:
+        value = codex_config_string(raw_value)
+        if not value:
+            return False
+        params[field] = value
+        return True
+    if key.split(".", 1)[0] not in {"sandbox_workspace_write", "network", "permissions"}:
+        return False
+    try:
+        config_value = tomlkit.parse(f"value = {raw_value}").unwrap()["value"]
+    except tomlkit.exceptions.TOMLKitError:
+        config_value = raw_value.strip().strip("\"'")
+    try:
+        json.dumps(config_value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    config = cast(dict[str, Any], params.setdefault("config", {}))
+    _set_codex_resume_config_value(config, key, config_value)
+    return True
+
+
+def _set_codex_resume_config_value(config: dict[str, Any], key: str, value: object) -> None:
+    """Preserve CLI order without overlapping keys in the app-server's unordered config map."""
+    for existing_key in list(config):
+        if existing_key.startswith(f"{key}."):
+            del config[existing_key]
+    segments = key.split(".")
+    for prefix_length in range(1, len(segments)):
+        ancestor = ".".join(segments[:prefix_length])
+        if ancestor not in config:
+            continue
+        target = config
+        for segment in (ancestor, *segments[prefix_length:-1]):
+            if not isinstance(target.get(segment), dict):
+                target[segment] = {}
+            target = cast(dict[str, Any], target[segment])
+        target[segments[-1]] = value
+        return
+    config[key] = value
+
+
+PROFILE_ID = "omnigent-workspace"
+MIN_PROFILE_CODEX_VERSION = (0, 139, 0)
+MIN_NATIVE_PROFILE_CODEX_VERSION = (0, 162, 0)
+
+
+@dataclass(frozen=True)
+class CodexWorkspaceProfile:
+    """Overrides that define and select the generated profile."""
+
+    profile_id: str
+    config_overrides: tuple[str, ...]
+    writable_roots: tuple[str, ...] = ()
+    network_access: bool = False
+
+
+def _workspace_profile_options(args: Sequence[str]) -> Iterator[tuple[str, ...]]:
+    canonical = canonical_codex_launch_args(args)
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            yield tuple(canonical[index:])
+            return
+        option, separator, value = arg.partition("=")
+        if option in _CODEX_VALUE_FLAGS:
+            if separator:
+                yield option, value
+            elif index + 1 < len(canonical):
+                index += 1
+                yield option, canonical[index]
+            else:
+                yield (arg,)
+        else:
+            yield (arg,)
+        index += 1
+
+
+def codex_stance_is_workspace_write(
+    args: Sequence[str], *, configured_sandbox_mode: str | None, bypass_sandbox: bool
+) -> bool:
+    """Use the resume parser's typed-selector precedence for the launch stance."""
+    if bypass_sandbox or codex_config_profile(args) is not None:
+        return False
+    for option in _workspace_profile_options(args):
+        if option[0] == "--dangerously-bypass-approvals-and-sandbox":
+            return False
+        if option[0] in {"--sandbox", "-s"} and option[1:] != ("workspace-write",):
+            return False
+    try:
+        params = _codex_resume_permission_params(args)
+    except ValueError:
+        return False
+    if "permissions" in params:
+        return params["permissions"] == ":workspace"
+    return params.get("sandbox", configured_sandbox_mode or "workspace-write") == "workspace-write"
+
+
+def _git_profile_config_is_safe(top: Path, opened: Sequence[Path]) -> bool:
+    def read_config(*args: str, missing_ok: bool = False) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(top), "config", *args],
+            capture_output=True,
+            env=_anchored_git_env(),
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0 and not (missing_ok and result.returncode == 1):
+            raise ValueError("Git config could not be read")
+        return result.stdout
+
+    local_files = {opened[0] / "config", *(directory / "config.worktree" for directory in opened)}
+    for config_file in local_files:
+        if config_file.exists() and read_config(
+            "--no-includes",
+            "--file",
+            str(config_file),
+            "--get-regexp",
+            r"^include(if\..*)?\.path$",
+            missing_ok=True,
+        ):
+            return False
+    records = read_config("--null", "--list", "--show-origin").split("\0")
+    for index in range(0, len(records) - 1, 2):
+        origin, assignment = records[index : index + 2]
+        key, _, value = assignment.partition("\n")
+        targets = [path for directory in opened for path in (directory, directory.resolve())]
+        words = [value, *shlex.split(value)]
+        for word in words:
+            if any(character.isspace() for character in word):
+                nested_words = shlex.split(word)
+                if nested_words != [word]:
+                    words.extend(nested_words)
+        relative_targets = [Path(absolute_codex_path(word, top)).resolve() for word in words]
+        if (
+            re.search(r"(?<![\w.-])\.git(?![\w.-])", value)
+            or re.search(r"\$\{?GIT_(?:COMMON_)?DIR", value)
+            or (
+                "rev-parse" in value
+                and re.search(r"--(?:git-dir|git-common-dir|absolute-git-dir|git-path)\b", value)
+            )
+            or any(str(directory) in value for directory in targets)
+            or any(
+                target.is_relative_to(directory)
+                for target in relative_targets
+                for directory in targets
+            )
+        ):
+            return False
+        if re.fullmatch(r"include(if\..*)?\.path", key, re.IGNORECASE):
+            source = Path(origin.removeprefix("file:"))
+            target = Path(absolute_codex_path(value, source.parent)).resolve()
+            if any(target.is_relative_to(directory) for directory in opened):
+                return False
+    return True
+
+
+def codex_workspace_profile(
+    workspace: Path,
+    *,
+    launch_args: Sequence[str],
+    server_overrides: Sequence[str],
+    private_config: Mapping[str, Any],
+    codex_version: tuple[int, int, int] | None,
+    workspace_write_stance: bool | None = None,
+) -> CodexWorkspaceProfile | None:
+    """Gate and build a repository permission profile; failures keep legacy behavior."""
+    try:
+        if (
+            os.name != "posix"
+            or codex_version is None
+            or codex_version < MIN_PROFILE_CODEX_VERSION
+        ):
+            return None
+        if private_config.get("default_permissions", ":workspace") != ":workspace":
+            return None
+        options = list(_workspace_profile_options(launch_args))
+        layers = [dict(private_config)]
+        for tokens in [*(("-c", override) for override in server_overrides), *options]:
+            if len(tokens) == 2 and tokens[0] in {"-c", "--config"}:
+                key = tokens[1].partition("=")[0]
+                if key.strip().split(".", 1)[0].strip("\"'") != "permissions":
+                    continue
+                layers.append(tomlkit.parse(tokens[1]).unwrap())
+        for layer in layers:
+            permissions = layer.get("permissions", {})
+            if (isinstance(permissions, dict) and PROFILE_ID in permissions) or any(
+                key == f"permissions.{PROFILE_ID}" or key.startswith(f"permissions.{PROFILE_ID}.")
+                for key in layer
+            ):
+                return None
+        for tokens in options:
+            if len(tokens) == 2 and tokens[0] in {"-c", "--config"}:
+                key, _, value = tokens[1].partition("=")
+                if (
+                    key.strip() == "default_permissions"
+                    and codex_config_string(value) != ":workspace"
+                ):
+                    return None
+        if workspace_write_stance is False or (
+            workspace_write_stance is None
+            and not codex_stance_is_workspace_write(
+                launch_args,
+                configured_sandbox_mode=private_config.get("sandbox_mode"),
+                bypass_sandbox=False,
+            )
+        ):
+            return None
+        effective_cwd, additional_roots = codex_workspace_roots(launch_args, workspace)
+        top = detect_git_root(effective_cwd)
+        if top is None:
+            return None
+        common = _git_common_dir(top)
+        opened = [common]
+        git_dir = None
+        if (top / ".git").is_file():
+            git_dir = linked_worktree_git_dir(top)
+            if (
+                git_dir is None
+                or git_dir.resolve().parent != (common / "worktrees").resolve()
+                or not all((common / name).exists() for name in ("HEAD", "objects", "refs"))
+            ):
+                return None
+            opened.append(git_dir)
+        if not _git_profile_config_is_safe(top, opened):
+            return None
+        effective_config = {
+            "sandbox_workspace_write": copy.deepcopy(
+                private_config.get("sandbox_workspace_write", {})
+            )
+        }
+        for tokens in [*(("-c", override) for override in server_overrides), *options]:
+            if len(tokens) != 2 or tokens[0] not in {"-c", "--config"}:
+                continue
+            key, _, raw_value = tokens[1].partition("=")
+            key = key.strip()
+            if key == "sandbox_workspace_write" or key.startswith("sandbox_workspace_write."):
+                value = tomlkit.parse(f"v = {raw_value}").unwrap()["v"]
+                _set_codex_resume_config_value(effective_config, key, value)
+        sandbox = effective_config["sandbox_workspace_write"]
+        if not isinstance(sandbox, dict):
+            return None
+        roots = sandbox.get("writable_roots", [])
+        if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
+            return None
+        if any(not Path(root).is_absolute() and not root.startswith("~") for root in roots):
+            return None
+        entries = {str(directory): "write" for directory in opened}
+        for name in ("hooks", "config", "config.worktree", "modules", "worktrees"):
+            entries[str(common / name)] = "read"
+        if git_dir is not None:
+            entries[str(common / "worktrees")] = "read"
+            for name in ("commondir", "gitdir", "config.worktree"):
+                entries[str(git_dir / name)] = "read"
+        # More-specific entries re-open only this linked worktree's metadata.
+        access_paths = [
+            (candidate, access)
+            for path, access in entries.items()
+            for candidate in (Path(path), Path(path).resolve())
+        ]
+        writable_roots = [
+            *(absolute_codex_path(root, effective_cwd) for root in roots),
+            *additional_roots,
+        ]
+        for root in writable_roots:
+            covered = False
+            for path in (Path(root), Path(root).resolve()):
+                matches = [
+                    (len(directory.parts), access)
+                    for directory, access in access_paths
+                    if path.is_relative_to(directory)
+                ]
+                if matches:
+                    access = max(matches)[1]
+                    if access == "read":
+                        return None
+                    covered = True
+            if not covered:
+                entries[root] = "write"
+        filesystem = ",".join(
+            f"{json.dumps(path, ensure_ascii=False)}={json.dumps(access)}"
+            for path, access in entries.items()
+        )
+        overrides = [
+            f'permissions.{PROFILE_ID}.extends=":workspace"',
+            f"permissions.{PROFILE_ID}.filesystem={{{filesystem}}}",
+        ]
+        if sandbox.get("network_access") is True:
+            overrides.append(f"permissions.{PROFILE_ID}.network.enabled=true")
+        overrides.append(f"default_permissions={json.dumps(PROFILE_ID)}")
+        return CodexWorkspaceProfile(
+            PROFILE_ID,
+            tuple(overrides),
+            tuple(str(Path(root).resolve()) for root in writable_roots),
+            sandbox.get("network_access") is True,
+        )
+    except Exception:  # noqa: BLE001 - Discovery/config failures must preserve the legacy launch.
+        _logger.warning("Failed to build Codex workspace permission profile", exc_info=True)
+        return None
 
 
 def codex_workspace_roots(args: Sequence[str], cwd: Path) -> tuple[Path, list[str]]:

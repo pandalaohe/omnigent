@@ -203,6 +203,7 @@ class CodexNativeBridgeState:
     codex_home: str
     active_turn_id: str | None = None
     cwd: str | None = None
+    permission_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1206,6 +1207,11 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
                     "cwd": state.cwd,
+                    **(
+                        {"permission_profile": state.permission_profile}
+                        if state.permission_profile is not None
+                        else {}
+                    ),
                 },
                 handle,
                 sort_keys=True,
@@ -1690,6 +1696,7 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
     cwd = raw.get("cwd")
+    permission_profile = raw.get("permission_profile")
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -1712,6 +1719,9 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             codex_home=codex_home,
             active_turn_id=parsed_active_turn_id,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
+            permission_profile=permission_profile
+            if isinstance(permission_profile, str) and permission_profile
+            else None,
         ),
         "ready",
     )
@@ -1758,6 +1768,7 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
                 codex_home=state.codex_home,
                 active_turn_id=active_turn_id,
                 cwd=state.cwd,
+                permission_profile=state.permission_profile,
             ),
         )
 
@@ -1788,6 +1799,7 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
                 codex_home=state.codex_home,
                 active_turn_id=active_turn_id,
                 cwd=state.cwd,
+                permission_profile=state.permission_profile,
             ),
         )
 
@@ -1861,6 +1873,7 @@ def clear_active_turn_id_if_matches(
                 codex_home=state.codex_home,
                 active_turn_id=None,
                 cwd=state.cwd,
+                permission_profile=state.permission_profile,
             ),
         )
         _run_on_cleared()

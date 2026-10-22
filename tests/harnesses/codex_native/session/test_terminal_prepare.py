@@ -164,20 +164,29 @@ async def test_prepare_codex_terminal_forwards_profile_to_launch_resolution(
         (None, [], None),
     ],
 )
+@pytest.mark.parametrize("profile_enabled", [False, True])
 async def test_prepare_codex_terminal_resumes_with_launch_provider(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     profile: str | None,
     overrides: list[str],
     expected_provider: str | None,
+    profile_enabled: bool,
 ) -> None:
     """CLI cold resume applies the configured provider before attaching the TUI."""
     from unittest.mock import AsyncMock
 
     from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
+    from omnigent.harnesses.codex_native.launch_args import CodexWorkspaceProfile
 
     server = SimpleNamespace(
-        start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 156, 1), agent_pid=None
+        start=AsyncMock(),
+        close=AsyncMock(),
+        codex_cli_version=(0, 156, 1),
+        agent_pid=None,
+        workspace_profile=CodexWorkspaceProfile("omnigent-workspace", ())
+        if profile_enabled
+        else None,
     )
     preload = AsyncMock(side_effect=RuntimeError("stop after resume"))
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
@@ -216,6 +225,10 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
     preload.assert_awaited_once()
     assert preload.await_args.kwargs["model_provider"] == expected_provider
     server.close.assert_awaited_once()
+
+    assert preload.await_args.kwargs["permission_profile"] == (
+        "omnigent-workspace" if profile_enabled else None
+    )
 
 
 @pytest.mark.asyncio
@@ -256,6 +269,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
         start=AsyncMock(),
         close=close_server,
         codex_cli_version=(0, 154, 0),
+        workspace_profile=None,
         config_overrides=[],
         env={},
         codex_home=tmp_path / "codex-home",
@@ -1052,3 +1066,52 @@ async def test_find_running_codex_terminal_generic_errors_still_raise(
 
     assert f"Failed to fetch Codex terminal ({status_code})" in excinfo.value.message
     assert "database unavailable" in excinfo.value.message
+
+
+@pytest.mark.parametrize("enabled,fail", [(False, False), (True, False), (True, True)])
+async def test_fresh_thread_applies_launch_permission_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    enabled: bool,
+    fail: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
+    from omnigent.harnesses.codex_native.launch_args import CodexWorkspaceProfile
+
+    update = AsyncMock(side_effect=RuntimeError("rejected") if fail else None)
+    monkeypatch.setattr(codex_native, "apply_codex_thread_permissions", update)
+    monkeypatch.setattr(
+        codex_native, "_wait_for_thread_started", AsyncMock(return_value="thread-new")
+    )
+    monkeypatch.setattr(codex_native, "_patch_external_session_id", AsyncMock())
+    profile = CodexWorkspaceProfile("omnigent-workspace", ()) if enabled else None
+    prepared = codex_native.PreparedCodexTerminal(
+        session_id="conv",
+        terminal_id="terminal",
+        tmux_socket=None,
+        tmux_target=None,
+        bridge_dir=tmp_path,
+        thread_id=None,
+        app_server_url="ws://127.0.0.1:1234",
+        app_server=SimpleNamespace(workspace_profile=profile),
+        event_client=SimpleNamespace(),
+        reattached=False,
+    )
+    assert (
+        await codex_native._initialize_fresh_terminal_thread(
+            base_url="http://example.test", headers={}, prepared=prepared
+        )
+        == "thread-new"
+    )
+    assert read_bridge_state(tmp_path).permission_profile == (
+        "omnigent-workspace" if enabled else None
+    )
+    if enabled:
+        update.assert_awaited_once_with("ws://127.0.0.1:1234", "thread-new", "omnigent-workspace")
+    else:
+        update.assert_not_called()
+    if fail:
+        assert "Failed to apply Codex thread permissions" in caplog.text
