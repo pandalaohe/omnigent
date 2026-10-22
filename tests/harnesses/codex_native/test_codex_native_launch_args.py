@@ -844,8 +844,9 @@ def test_reject_reserved_codex_transport_args_allows(allowed_args: list[str]) ->
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
     )
-    # Omnigent still appends exactly its own single attach.
-    assert result[-2:] == ["--remote", "ws://127.0.0.1:9876"]
+    # The runner-owned attach precedes any prompt separator.
+    option_args = result[: result.index("--")] if "--" in result else result
+    assert option_args[-2:] == ["--remote", "ws://127.0.0.1:9876"]
 
 
 @pytest.fixture

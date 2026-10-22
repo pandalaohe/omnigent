@@ -146,7 +146,7 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
     profile_id = profile.get("id") if isinstance(profile, Mapping) else None
     if (
         sandbox_type in _FULL_ACCESS_SANDBOX_TYPES
-        or profile_id == ":danger-full-access"
+        or profile_id in (":danger-full-access", ":danger-no-sandbox")
         or approval_policy == "never"
     ):
         return "full-access"

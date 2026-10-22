@@ -19,6 +19,29 @@ from tests.harnesses.codex_native.session._support import (
 )
 
 
+@pytest.mark.parametrize("flag", ["--approve-for-me", "--not-so-yolo"])
+@pytest.mark.parametrize(
+    "config_args",
+    [[], ["-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"']],
+)
+def test_rollout_policy_records_approve_for_me_workspace(
+    flag: str, config_args: list[str]
+) -> None:
+    """Cold-resume policy records retain the shorthand's sandbox selection."""
+    assert codex_native._codex_turn_context_policy_fields_from_launch_args(
+        [flag, *config_args]
+    ) == {
+        "approval_policy": "on-request",
+        "sandbox_policy": {"type": "workspace-write"},
+    }
+
+
+def test_rollout_policy_ignores_permission_flags_in_prompt_tail() -> None:
+    assert codex_native._codex_turn_context_policy_fields_from_launch_args(
+        ["--sandbox", "read-only", "--", "--approve-for-me", "--sandbox=danger-full-access"]
+    ) == {"approval_policy": "on-request", "sandbox_policy": {"type": "read-only"}}
+
+
 def test_clone_codex_rollout_rewrites_id_and_structural_cwd_into_clone_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

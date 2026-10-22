@@ -1539,8 +1539,7 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
         sandbox_mode = sandbox_policy.get("type")
         if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
             return None
-        if approval_policy != "on-request" or sandbox_mode != "workspace-write":
-            args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
+        args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
 
     if reviewer in {"user", "auto_review", "guardian_subagent"}:
         args.extend(["-c", f"approvals_reviewer={json.dumps(reviewer)}"])

@@ -139,6 +139,17 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
     assert codex_permission_preset_from_thread_settings({}) is None
 
 
+@pytest.mark.parametrize("profile_id", [":danger-no-sandbox", ":danger-full-access"])
+def test_full_access_profile_without_redundant_sandbox_or_policy(profile_id: str) -> None:
+    """Both Codex profile names identify Full Access on their own."""
+    assert (
+        codex_permission_preset_from_thread_settings(
+            {"activePermissionProfile": {"id": profile_id}, "approvalPolicy": "on-request"}
+        )
+        == "full-access"
+    )
+
+
 def test_parse_profile_popup_all_four_rows() -> None:
     """The profile-popup variant parses all four rows, stripping `` (current)``."""
     assert codex_permissions_menu(_PROFILE_POPUP) == {
