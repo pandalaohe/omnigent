@@ -797,8 +797,20 @@ async def test_list_projects_returns_names_sorted(
     assert resp.status_code == 200
     # Label-only projects (no first-class row) list with id=None, sorted by name.
     assert resp.json() == [
-        {"id": None, "name": "Customer X", "icon": None},
-        {"id": None, "name": "Sprint 42", "icon": None},
+        {
+            "id": None,
+            "name": "Customer X",
+            "icon": None,
+            "archived_at": None,
+            "archive_summary": {"sessions": 0, "tasks": 0},
+        },
+        {
+            "id": None,
+            "name": "Sprint 42",
+            "icon": None,
+            "archived_at": None,
+            "archive_summary": {"sessions": 0, "tasks": 0},
+        },
     ]
 
 

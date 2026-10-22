@@ -491,7 +491,12 @@ async def test_create_sdk_permission_uses_harness_override(client: httpx.AsyncCl
     ("harness", "field", "value", "detail"),
     [
         ("claude-native", "approval_mode", "full-access", "claude-native"),
-        ("claude-sdk", "permission_mode", "unsafe", "permission_mode must be one of"),
+        (
+            "claude-sdk",
+            "permission_mode",
+            "unsafe",
+            "permission_mode 'unsafe' is not supported for 'claude-sdk'",
+        ),
     ],
 )
 async def test_create_rejects_unsupported_sdk_permission(
@@ -522,7 +527,10 @@ async def test_create_rejects_sdk_permission_for_sub_agent(client: httpx.AsyncCl
         },
     )
     assert response.status_code == 400, response.text
-    assert "top-level sessions" in response.text
+    assert (
+        "permission_mode and approval_mode are not supported for named sub-agent sessions"
+        in response.text
+    )
 
 
 async def test_first_message_schedules_background_semantic_title(
