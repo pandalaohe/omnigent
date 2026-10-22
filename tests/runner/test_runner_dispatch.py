@@ -8779,6 +8779,63 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bundle", [False, True])
+@pytest.mark.parametrize("created", [False, True])
+async def test_sys_session_create_total_deadline_preserves_known_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bundle: bool,
+    created: bool,
+) -> None:
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_TOOL_TIMEOUT_S", 1.0)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            if request.url.path.endswith("deadline_child"):
+                await asyncio.sleep(5)
+            return httpx.Response(200, json={"id": "deadline_parent"})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={})
+        if not created:
+            await asyncio.sleep(5)
+        return httpx.Response(
+            201,
+            json={
+                "id": "deadline_child",
+                "session_id": "deadline_child",
+                "agent_id": "ag_x",
+            },
+        )
+
+    (tmp_path / "agent.tar.gz").write_bytes(b"bundle")
+    args = {"config_path": "agent.tar.gz"} if bundle else {"agent_id": "ag_x"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        try:
+            info = json.loads(
+                await tool_dispatch.execute_tool(
+                    tool_name="sys_session_create",
+                    arguments=json.dumps({**args, "message": "go"}),
+                    conversation_id="deadline_parent",
+                    server_client=client,
+                    runner_workspace=tmp_path,
+                )
+            )
+            assert "error" not in info
+            if created:
+                assert info["conversation_id"] == "deadline_child"
+                assert info["initial_message"]["status"] == "pending"
+            else:
+                assert info["status"] == "unknown"
+        finally:
+            subagent_work.unregister_subagent_work_for_session("deadline_child")
+            subagent_work.unregister_child_session("deadline_child")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bundle", [False, True])
 async def test_sys_session_create_waits_for_slow_creation_and_sends_message(
     tmp_path: Path, bundle: bool
 ) -> None:
@@ -8796,6 +8853,7 @@ async def test_sys_session_create_waits_for_slow_creation_and_sends_message(
             # Model a host operation completing after 65 seconds without a
             # wall-clock sleep: enforce the HTTP client's configured budget.
             read_timeout = request.extensions["timeout"]["read"]
+            assert read_timeout is not None and read_timeout < 300
             if read_timeout is not None and read_timeout < 65:
                 raise httpx.ReadTimeout("", request=request)
             return httpx.Response(
@@ -8885,7 +8943,8 @@ async def test_sys_session_create_empty_transport_error_names_exception(
             runner_workspace=tmp_path,
         )
     info = json.loads(output)
-    assert "ReadTimeout" in info["error"]
+    assert info["status"] == "unknown"
+    assert "ReadTimeout" in info["detail"]
     assert "unknown" in info["message"]
 
 
@@ -15745,8 +15804,10 @@ async def test_sys_session_create_first_turn_stamps_dispatch_id() -> None:
         if request.method == "GET" and path == "/v1/sessions/conv_new":
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "PATCH" and path == "/v1/sessions/conv_new":
-            ops.append("patch")
-            patches.append(json.loads(request.content))
+            patch = json.loads(request.content)
+            if subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY in patch.get("labels", {}):
+                ops.append("patch")
+                patches.append(patch)
             return httpx.Response(200, json={})
         if request.method == "POST" and path == "/v1/sessions/conv_new/events":
             ops.append("events")
@@ -15803,7 +15864,10 @@ async def test_sys_session_create_stamp_failure_fails_closed() -> None:
         if request.method == "GET" and path == "/v1/sessions/conv_new_fail":
             return httpx.Response(200, json={"id": "conv_new_fail"})
         if request.method == "PATCH" and path == "/v1/sessions/conv_new_fail":
-            ops.append("patch")
+            if subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY in json.loads(request.content).get(
+                "labels", {}
+            ):
+                ops.append("patch")
             return httpx.Response(500, json={"error": "boom"})
         if request.method == "POST" and path == "/v1/sessions/conv_new_fail/events":
             ops.append("events")
@@ -15863,7 +15927,10 @@ async def test_sys_session_create_waits_for_child_registration(registration_stat
         if request.method == "GET" and path == "/v1/sessions/conv_register_child":
             return httpx.Response(200, json={"id": "conv_register_child"})
         if request.method == "PATCH" and path == "/v1/sessions/conv_register_child":
-            ops.append("stamp")
+            if subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY in json.loads(request.content).get(
+                "labels", {}
+            ):
+                ops.append("stamp")
             return httpx.Response(200, json={})
         if request.method == "POST" and path.endswith("/startup/registered"):
             assert runner_app.get_subagent_work("conv_register_child") is not None

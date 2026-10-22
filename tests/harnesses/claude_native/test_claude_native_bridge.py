@@ -7483,6 +7483,326 @@ async def test_channel_server_relays_active_omnigent_tools(
             proc.wait(timeout=5.0)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_phase", ["create", "message"])
+@pytest.mark.parametrize("message_status", [202, 503])
+async def test_session_create_relay_waits_for_created_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slow_phase: str,
+    message_status: int,
+) -> None:
+    from omnigent.runner import subagent_work, tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_POST_TIMEOUT_S", 0.4)
+    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_FINALIZE_TIMEOUT_S", 0.01, raising=False)
+    creates = 0
+    posts = 0
+    parent_id = "relay_create_parent"
+    detail = "runner_unavailable: Timed out waiting for runner stream relay to subscribe"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, posts
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": parent_id})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={})
+        if request.url.path == "/v1/sessions":
+            creates += 1
+            if slow_phase == "create":
+                await asyncio.sleep(0.05)
+            return httpx.Response(201, json={"id": "slow_child", "agent_id": "ag_x"})
+        posts += 1
+        if slow_phase == "message":
+            await asyncio.sleep(0.05)
+        return httpx.Response(message_status, text=detail)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+
+        async def execute(name: str, arguments: dict[str, Any]) -> object:
+            return json.loads(
+                await execute_tool(
+                    tool_name=name,
+                    arguments=json.dumps(arguments),
+                    server_client=client,
+                    conversation_id=parent_id,
+                )
+            )
+
+        relay = start_tool_relay(
+            bridge_dir=tmp_path / "bridge",
+            tools=[],
+            tool_executor=execute,
+            loop=asyncio.get_running_loop(),
+        )
+        try:
+            result = await asyncio.to_thread(
+                claude_native_bridge._call_relay_tool,
+                tmp_path / "bridge",
+                "sys_session_create",
+                {"agent_id": "ag_x", "message": "start"},
+            )
+            info = json.loads(result["content"][0]["text"])
+            assert info["conversation_id"] == "slow_child"
+            assert not result.get("isError")
+            if slow_phase == "message":
+                assert info["initial_message"]["status"] == "pending"
+                assert "sys_session_get_info" in info["initial_message"]["detail"]
+                assert "re-create" in info["initial_message"]["detail"]
+            elif message_status == 202:
+                assert info["initial_message"] == {"status": "sent"}
+            else:
+                assert info["initial_message"] == {
+                    "status": "failed",
+                    "error": "child_not_ready",
+                    "detail": f"503 {detail}",
+                }
+            assert creates == posts == 1
+        finally:
+            # Drain a timed-out dispatch before closing its HTTP client.
+            await asyncio.sleep(0.1)
+            relay.close()
+            subagent_work.unregister_subagent_work_for_session("slow_child")
+            subagent_work.unregister_child_session("slow_child")
+            subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_tool_relay_names_empty_dispatch_exception() -> None:
+    async def execute(name: str, arguments: dict[str, Any]) -> object:
+        raise TimeoutError()
+
+    result = await asyncio.to_thread(
+        claude_native_bridge._run_relay_tool,
+        execute,
+        asyncio.get_running_loop(),
+        "sys_session_create",
+        {},
+    )
+    assert result["isError"] is True
+    assert "TimeoutError" in json.loads(result["content"][0]["text"])["error"]
+
+
+def test_heartbeat_cancel_before_thread_start() -> None:
+    heartbeat = claude_native_bridge._McpProgressHeartbeat("creating", threading.Lock())
+    worker = threading.Thread(target=heartbeat._run)
+    heartbeat._thread = worker
+    heartbeat.stop()
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_create", [False, True])
+async def test_serve_mcp_cancel_create_releases_slot_and_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    finish_create: bool,
+) -> None:
+    from omnigent.runner import subagent_work, tool_dispatch
+    from omnigent.runner.mcp_execution_registry import (
+        MCP_OPERATION_ID_PARAM,
+        McpExecutionRegistry,
+        McpExecutionResult,
+    )
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+
+    started = threading.Event()
+    detached = asyncio.Event()
+    finished = asyncio.Event()
+    allow_create = asyncio.Event()
+    operation_cancelled = asyncio.Event()
+    registry = McpExecutionRegistry()
+    creates = 0
+    labels: dict[str, str] = {}
+    operation_results: list[dict[str, Any]] = []
+    relay_results: queue.Queue[dict[str, Any]] = queue.Queue()
+    requests: queue.Queue[bytes] = queue.Queue()
+    responses: queue.Queue[dict[str, Any]] = queue.Queue()
+    heartbeat_stopped = threading.Event()
+    real_stop = claude_native_bridge._McpProgressHeartbeat.stop
+    real_relay_call = claude_native_bridge._call_relay_tool
+    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_TOOL_TIMEOUT_S", 5.0)
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        nonlocal creates
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            started.set()
+            await allow_create.wait()
+            creates += 1
+            return httpx.Response(201, json={"id": "interrupt_child", "title": "child"})
+        if request.method == "PATCH":
+            labels.update(json.loads(request.content).get("labels", {}))
+        if request.url.path.endswith("/child_sessions"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": "interrupt_child", "title": "child"}] if creates else [],
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={"id": "interrupt_parent", "labels": labels})
+
+    api_client = httpx.AsyncClient(transport=httpx.MockTransport(api), base_url="http://server")
+
+    async def gateway(request: httpx.Request) -> httpx.Response:
+        params = json.loads(request.content)["params"]
+
+        async def run() -> McpExecutionResult:
+            try:
+                result = await tool_dispatch.execute_tool(
+                    tool_name=params["name"],
+                    arguments=json.dumps(params["arguments"]),
+                    conversation_id="interrupt_parent",
+                    server_client=api_client,
+                )
+                operation_results.append(json.loads(result))
+                return McpExecutionResult(
+                    200,
+                    {
+                        "result": {
+                            "content": [{"type": "text", "text": result}],
+                        }
+                    },
+                )
+            except asyncio.CancelledError:
+                operation_cancelled.set()
+                raise
+            finally:
+                finished.set()
+
+        result = await registry.execute(
+            session_id="interrupt_parent",
+            operation_id=params[MCP_OPERATION_ID_PARAM],
+            step="initial",
+            params=params,
+            run=run,
+        )
+        return httpx.Response(result.status_code, json=result.content)
+
+    gateway_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(gateway), base_url="http://gateway"
+    )
+    manager = ProxyMcpManager(
+        session_id="interrupt_parent",
+        ap_client=gateway_client,
+        execution_registry=registry,
+    )
+
+    class QueuedStdin:
+        @property
+        def buffer(self) -> QueuedStdin:
+            return self
+
+        def readline(self) -> bytes:
+            return requests.get(timeout=10)
+
+    async def execute(name: str, args: dict[str, Any]) -> object:
+        try:
+            return json.loads(await manager.call_tool(None, name, args))
+        except asyncio.CancelledError:
+            detached.set()
+            raise
+
+    def relay_call(*args: Any) -> dict[str, Any]:
+        result = real_relay_call(*args)
+        relay_results.put(result)
+        return result
+
+    def stop(heartbeat: Any) -> None:
+        real_stop(heartbeat)
+        heartbeat_stopped.set()
+
+    monkeypatch.setattr(claude_native_bridge, "_MAX_CONCURRENT_MCP_REQUESTS", 1)
+    monkeypatch.setattr(claude_native_bridge.sys, "stdin", QueuedStdin())
+    monkeypatch.setattr(claude_native_bridge, "_call_relay_tool", relay_call)
+    monkeypatch.setattr(claude_native_bridge._McpProgressHeartbeat, "stop", stop)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_write_jsonrpc",
+        lambda payload, _lock, **kwargs: responses.put(payload),
+    )
+    relay = start_tool_relay(
+        bridge_dir=tmp_path / "bridge",
+        tools=[{"name": "sys_session_create", "parameters": {}}],
+        tool_executor=execute,
+        loop=asyncio.get_running_loop(),
+    )
+    server = threading.Thread(
+        target=claude_native_bridge._stdio_jsonrpc_loop,
+        args=({}, threading.Lock(), tmp_path / "bridge"),
+        daemon=True,
+    )
+    server.start()
+
+    def send(payload: dict[str, Any]) -> None:
+        requests.put((json.dumps(payload) + "\n").encode())
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "sys_session_create",
+                    "arguments": {"agent_id": "ag_x", "message": "go"},
+                    "_meta": {"progressToken": "creating"},
+                },
+            }
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}})
+        send({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        while True:
+            response = await asyncio.to_thread(responses.get, True, 5)
+            if "id" in response:
+                break
+        assert response == {"jsonrpc": "2.0", "id": 2, "result": {}}
+        await asyncio.wait_for(detached.wait(), 5)
+        assert await asyncio.to_thread(heartbeat_stopped.wait, 5)
+        assert not any(t.name == "mcp-progress-heartbeat" for t in threading.enumerate())
+        assert not finished.is_set()
+        if finish_create:
+            allow_create.set()
+        await asyncio.wait_for(finished.wait(), 10)
+        assert not operation_cancelled.is_set()
+        if finish_create:
+            assert creates == 1
+            assert operation_results[0]["conversation_id"] == "interrupt_child"
+            listing = json.loads(
+                await tool_dispatch.execute_tool(
+                    tool_name="sys_session_list",
+                    arguments="{}",
+                    conversation_id="interrupt_parent",
+                    server_client=api_client,
+                )
+            )
+            assert listing["sub_agents"][0]["conversation_id"] == "interrupt_child"
+        else:
+            assert creates == 0
+            assert operation_results[0]["status"] == "unknown"
+        interrupted = await asyncio.to_thread(relay_results.get, True, 5)
+        outcome = json.loads(interrupted["content"][0]["text"])
+        assert outcome["status"] == "detached"
+        assert "sys_session_list" in outcome["detail"]
+    finally:
+        requests.put(b"")
+        await asyncio.to_thread(server.join, 5)
+        relay.close()
+        await registry.cancel_session("interrupt_parent")
+        subagent_work.unregister_subagent_work_for_session("interrupt_child")
+        subagent_work.unregister_child_session("interrupt_child")
+        subagent_work._session_inboxes_ref.pop("interrupt_parent", None)
+        await gateway_client.aclose()
+        await api_client.aclose()
+
+
 def test_call_relay_tool_returns_mcp_error_on_read_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

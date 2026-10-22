@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import json
 import logging
@@ -324,9 +325,64 @@ _CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
 # window only for creates that present it, so web UI creates do not spend
 # the agent's budget.
 _AGENT_CREATE_HEADERS = {CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
-# Create can await host worktree operations before returning an id. Keep
-# transport deadlines, but let the enclosing tool budget bound response reads.
-_SESSION_CREATE_TIMEOUT = httpx.Timeout(30.0, read=None)
+# Leave headroom below the relay's 300 s cap for returning a created handle.
+_SESSION_CREATE_TIMEOUT = httpx.Timeout(30.0, read=90.0)
+_SESSION_CREATE_TOOL_TIMEOUT_S = 240.0
+_SESSION_CREATE_FINALIZE_TIMEOUT_S = 90.0
+_INITIAL_MESSAGE_LABEL = "omnigent.initial_message"
+_INITIAL_MESSAGE_LABEL_RETRY_DELAY_S = 0.5
+_SESSION_CREATE_DELIVERIES: set[asyncio.Task[str]] = set()
+
+
+@dataclass
+class _SessionCreateProgress:
+    data: _JsonObject | None = None
+
+
+def _pending_created_session(
+    data: _JsonObject,
+    args: _JsonObject,
+    reason: str | None = None,
+) -> str:
+    detail = (
+        "First-message delivery is still in flight, for example awaiting approval. "
+        "It must not be resent. Check sys_session_get_info later with this conversation_id; "
+        "never re-create the session."
+        if args.get("message")
+        else "Session setup is still in flight. Check sys_session_get_info with this "
+        "conversation_id; never re-create the session."
+    )
+    if reason is not None:
+        detail += f" Latest delivery response: {reason}"
+    return json.dumps(
+        {
+            **{
+                key: data.get(key)
+                for key in (
+                    "agent_name",
+                    "project_id",
+                    "host_id",
+                    "host_name",
+                    "workspace",
+                    "worktree",
+                    "git_branch",
+                    "harness",
+                )
+            },
+            "conversation_id": data["id"],
+            "kind": "sub_agent",
+            "agent_id": data.get("agent_id") or args.get("agent_id"),
+            "title": args.get("title") if isinstance(args.get("title"), str) else None,
+            "status": data.get("status") or "created",
+            "detail": detail,
+            **(
+                {"initial_message": {"status": "pending", "detail": detail}}
+                if args.get("message")
+                else {}
+            ),
+        }
+    )
+
 
 # Priority 5f.0b: Session-open write. ``sys_session_open`` opens a plain
 # top-level session on any host / project / agent of the caller's user.
@@ -5192,8 +5248,13 @@ async def _post_created_child_message(
     content: list[_JsonObject] = [{"type": "input_text", "text": message}]
     try:
         resp = await _post_child_message_event(
-            server_client, child_session_id, content=content, created_by=None
+            server_client,
+            child_session_id,
+            content=content,
+            created_by=None,
         )
+    except httpx.TimeoutException:
+        raise
     except httpx.HTTPError as exc:
         return f"{type(exc).__name__}: {exc}"
     if _message_post_accepted(resp):
@@ -5202,8 +5263,13 @@ async def _post_created_child_message(
         if await _wait_for_runner_online(server_client, child_session_id):
             try:
                 resp = await _post_child_message_event(
-                    server_client, child_session_id, content=content, created_by=None
+                    server_client,
+                    child_session_id,
+                    content=content,
+                    created_by=None,
                 )
+            except httpx.TimeoutException:
+                raise
             except httpx.HTTPError as exc:
                 return f"{type(exc).__name__}: {exc}"
             if _message_post_accepted(resp):
@@ -5324,7 +5390,91 @@ def _build_session_create_body(
     return body
 
 
+async def _record_initial_message_outcome(
+    server_client: httpx.AsyncClient,
+    child_id: str,
+    outcome: _JsonObject,
+) -> None:
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(_INITIAL_MESSAGE_LABEL_RETRY_DELAY_S)
+        try:
+            error = await _patch_subagent_label(
+                server_client,
+                child_id,
+                _INITIAL_MESSAGE_LABEL,
+                json.dumps(outcome),
+            )
+        except RuntimeError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        if error is None:
+            return
+    _logger.warning(
+        "Failed to record first-message outcome for child=%s status=%s after 3 attempts: %s",
+        child_id,
+        outcome.get("status"),
+        error,
+    )
+
+
 async def _finalize_created_session(
+    data: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    agent_id: str | None,
+    title: object,
+    publish_event: Callable[[str, _JsonObject], None] | None,
+    message: object = None,
+    placement: _CreatePlacement | None = None,
+    inherited_host_id: str | None = None,
+    metadata_required_for_registration: bool = False,
+) -> str:
+    async def deliver() -> str:
+        try:
+            if isinstance(message, str) and message:
+                await _patch_subagent_label(
+                    server_client,
+                    str(data["id"]),
+                    _INITIAL_MESSAGE_LABEL,
+                    json.dumps({"status": "pending"}),
+                )
+            result = await _complete_created_session(
+                data,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent_id=agent_id,
+                title=title,
+                publish_event=publish_event,
+                message=message,
+                placement=placement,
+                inherited_host_id=inherited_host_id,
+                metadata_required_for_registration=metadata_required_for_registration,
+            )
+        except Exception as exc:  # noqa: BLE001 - creation succeeded; retain its handle.
+            _logger.warning("Created child finalization unsettled: %s", type(exc).__name__)
+            result = pending(f"{type(exc).__name__}: {exc}")
+        outcome = _string_object_dict(json.loads(result).get("initial_message"))
+        if outcome is not None:
+            await _record_initial_message_outcome(server_client, str(data["id"]), outcome)
+        return result
+
+    def pending(reason: str | None = None) -> str:
+        return _pending_created_session(
+            data,
+            {"agent_id": agent_id, "title": title, "message": message},
+            reason,
+        )
+
+    task = asyncio.create_task(deliver(), name=f"create-message-{data['id']}")
+    _SESSION_CREATE_DELIVERIES.add(task)
+    task.add_done_callback(_SESSION_CREATE_DELIVERIES.discard)
+    # Caller interruption detaches; delivery retains the message request's lifetime.
+    done, _ = await asyncio.wait({task}, timeout=_SESSION_CREATE_FINALIZE_TIMEOUT_S)
+    return task.result() if done else pending()
+
+
+async def _complete_created_session(
     data: _JsonObject,
     *,
     server_client: httpx.AsyncClient,
@@ -5671,6 +5821,42 @@ async def _execute_session_create(
     agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
 ) -> str:
+    progress = _SessionCreateProgress()
+    try:
+        async with asyncio.timeout(_SESSION_CREATE_TOOL_TIMEOUT_S):
+            return await _execute_session_create_impl(
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                publish_event=publish_event,
+                agent_spec=agent_spec,
+                runner_workspace=runner_workspace,
+                progress=progress,
+            )
+    except TimeoutError:
+        if progress.data is not None:
+            return _pending_created_session(progress.data, args)
+        return json.dumps(
+            {
+                "status": "unknown",
+                "detail": (
+                    "Creation timed out before its id was received. "
+                    "Check sub_agents before retrying."
+                ),
+            }
+        )
+
+
+async def _execute_session_create_impl(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
+    agent_spec: AgentSpec | None = None,
+    runner_workspace: Path | None = None,
+    progress: _SessionCreateProgress,
+) -> str:
     """
     Create a child session (``sys_session_create``).
 
@@ -5775,6 +5961,7 @@ async def _execute_session_create(
             publish_event=publish_event,
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
+            progress=progress,
         )
     caller_snapshot = await _session_snapshot(server_client, conversation_id)
     refusal = await _child_session_create_refusal(
@@ -5811,7 +5998,8 @@ async def _execute_session_create(
     except Exception as exc:  # noqa: BLE001
         return json.dumps(
             {
-                "error": f"sys_session_create failed: {type(exc).__name__}: {exc}",
+                "status": "unknown",
+                "detail": f"sys_session_create: {type(exc).__name__}: {exc}",
                 "message": "Creation outcome unknown; check sub_agents before retrying.",
             }
         )
@@ -5830,6 +6018,7 @@ async def _execute_session_create(
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
+    progress.data = data
     return await _finalize_created_session(
         data,
         server_client=server_client,
@@ -5949,7 +6138,8 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001
         return json.dumps(
             {
-                "error": f"sys_session_create failed: {type(exc).__name__}: {exc}",
+                "status": "unknown",
+                "detail": f"sys_session_create: {type(exc).__name__}: {exc}",
                 "message": "Creation outcome unknown; check sub_agents before retrying.",
             }
         )
@@ -5978,6 +6168,7 @@ async def _session_create_from_config_path(
     publish_event: Callable[[str, _JsonObject], None] | None,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    progress: _SessionCreateProgress,
 ) -> str:
     """
     Bundle-mode ``sys_session_create``: upload a new agent and launch it.
@@ -6013,6 +6204,7 @@ async def _session_create_from_config_path(
     child_session_id = data.get("session_id")
     if not isinstance(child_session_id, str) or not child_session_id:
         return json.dumps({"error": "server did not return a child session id"})
+    progress.data = {**data, "id": child_session_id}
     created_agent_id = data.get("agent_id")
     if not isinstance(created_agent_id, str) or not created_agent_id:
         # CreatedSessionResponse.agent_id is a required field — a
@@ -7809,6 +8001,12 @@ async def _session_info_item(
             "session_id": target,
         }
     snap: _JsonObject = resp.json()
+    labels = _string_mapping(snap.get("labels")) or {}
+    initial_message: _JsonObject | None = None
+    raw_initial_message = labels.get(_INITIAL_MESSAGE_LABEL)
+    if raw_initial_message:
+        with contextlib.suppress(ValueError):
+            initial_message = _string_object_dict(json.loads(raw_initial_message))
     as_of = _session_info_as_of(resp)
     pending_value = snap.get("pending_elicitations")
     pending = pending_value if isinstance(pending_value, list) else []
@@ -7827,6 +8025,7 @@ async def _session_info_item(
     context_window = snap.get("context_window")
     auto_compact_token_limit = snap.get("auto_compact_token_limit")
     item: _JsonObject = {
+        **({"initial_message": initial_message} if initial_message is not None else {}),
         "session_id": snap.get("id"),
         "status": snap.get("status"),
         # Persisted conversation activity is distinct from lifecycle
