@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Known-pixel annotation capture</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font:
+          16px/1.5 system-ui,
+          sans-serif;
+        color: #172b2a;
+        background: #f4f7f4;
+      }
+      body {
+        margin: 0;
+      }
+      main {
+        max-width: 52rem;
+        margin: auto;
+        padding: 24px;
+      }
+      h1 {
+        font-size: 1.5rem;
+      }
+      h2 {
+        font-size: 1.1rem;
+        margin-top: 2rem;
+      }
+      #pixel-target {
+        box-sizing: border-box;
+        width: 320px;
+        height: 160px;
+        border: 4px solid #0b6b63;
+        background: #fff7e6;
+        display: grid;
+        place-items: center;
+        text-align: center;
+      }
+      #metrics {
+        border: 1px solid #9aa8a3;
+        padding: 12px;
+        font:
+          12px/1.5 ui-monospace,
+          monospace;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      iframe {
+        box-sizing: border-box;
+        width: 320px;
+        height: 160px;
+        border: 4px solid #914f20;
+        background: #fff7e6;
+      }
+      button {
+        font: inherit;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+      button:focus-visible,
+      #metrics:focus-visible {
+        outline: 3px solid #0b6b63;
+        outline-offset: 3px;
+      }
+      dialog {
+        max-width: calc(100vw - 64px);
+        border: 4px solid #914f20;
+        padding: 20px;
+        background: #f4f7f4;
+        color: #172b2a;
+      }
+      dialog::backdrop {
+        background: rgb(23 43 42 / 35%);
+      }
+      .scroll-track {
+        min-height: 900px;
+        border-left: 4px dashed #9aa8a3;
+        padding-left: 16px;
+        margin-top: 32px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Known-pixel capture</h1>
+      <p>
+        Public, local evidence for element, region, text and modal capture. Nothing is sent here.
+      </p>
+      <section aria-labelledby="sample">
+        <h2 id="sample">Fixed border target</h2>
+        <p>
+          The outer border box below is 320 × 160 CSS pixels, including its 4-pixel teal border.
+        </p>
+        <div id="pixel-target">320 × 160 CSS pixels · 4-pixel border · #0b6b63</div>
+        <h2>Selectable text and context</h2>
+        <p>Cart context. <span>Total: "€25" ```</span> Continue to the next public sample.</p>
+        <h2>Live CSS metrics</h2>
+        <p>
+          These numbers describe this page, not a captured bitmap. Use the captured evidence's
+          measured bitmap scale; devicePixelRatio is only a consistency signal.
+        </p>
+        <pre id="metrics" tabindex="0" aria-label="Live capture metrics"></pre>
+      </section>
+      <section aria-labelledby="frame-heading">
+        <h2 id="frame-heading">Opaque frame: use Region</h2>
+        <p>
+          The sandbox has no same-origin or script permission. Its inner DOM is not picker evidence.
+        </p>
+        <iframe
+          title="Opaque frame region sample"
+          sandbox=""
+          srcdoc="<h2>Opaque frame</h2><p>Capture this visible area with Region. Its inner element details are unavailable.</p>"
+        ></iframe>
+      </section>
+      <section aria-labelledby="dialog-heading">
+        <h2 id="dialog-heading">Modal top layer</h2>
+        <p>Open the dialog, then invoke the extension action or shortcut while it stays open.</p>
+        <button id="open-dialog" type="button">Open dialog</button>
+        <dialog id="sample-dialog" aria-labelledby="modal-title">
+          <h2 id="modal-title">Top-layer capture sample</h2>
+          <p>
+            Pick this visible dialog text or drag a region over it. The picker must remain usable.
+          </p>
+          <button id="close-dialog" type="button">Close dialog</button>
+        </dialog>
+      </section>
+      <section class="scroll-track" aria-labelledby="scroll-heading">
+        <h2 id="scroll-heading">Scroll and partial visibility</h2>
+        <p>
+          Scroll until the teal target is partly outside the viewport, then capture its visible
+          portion. The metrics update on scrolling and resizing. No full-page stitching is expected.
+        </p>
+      </section>
+      <p>End of scroll track. This page uses no external assets, storage or extension messages.</p>
+    </main>
+    <script>
+      const target = document.getElementById("pixel-target");
+      const metrics = document.getElementById("metrics");
+      const dialog = document.getElementById("sample-dialog");
+
+      function updateMetrics() {
+        const viewport = window.visualViewport;
+        metrics.textContent = JSON.stringify(
+          {
+            cssViewport: { width: window.innerWidth, height: window.innerHeight },
+            clientWidth: document.documentElement.clientWidth,
+            targetBorderBox: target.getBoundingClientRect().toJSON(),
+            scroll: { x: window.scrollX, y: window.scrollY },
+            devicePixelRatioSignal: window.devicePixelRatio,
+            visualViewport: viewport
+              ? {
+                  width: viewport.width,
+                  height: viewport.height,
+                  scale: viewport.scale,
+                  offsetLeft: viewport.offsetLeft,
+                  offsetTop: viewport.offsetTop,
+                }
+              : null,
+          },
+          null,
+          2,
+        );
+      }
+
+      document.getElementById("open-dialog").addEventListener("click", () => {
+        dialog.showModal();
+        updateMetrics();
+      });
+      document.getElementById("close-dialog").addEventListener("click", () => dialog.close());
+      dialog.addEventListener("close", updateMetrics);
+      window.addEventListener("resize", updateMetrics);
+      window.addEventListener("scroll", updateMetrics, { passive: true });
+      window.visualViewport?.addEventListener("resize", updateMetrics);
+      window.visualViewport?.addEventListener("scroll", updateMetrics);
+      updateMetrics();
+    </script>
+  </body>
+</html>

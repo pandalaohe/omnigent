@@ -94,6 +94,28 @@ def delegated_path_allowed(path: str) -> bool:
     return False
 
 
+def annotation_path_allowed(method: str | None, path: str) -> bool:
+    """Allow only the annotation protocol's named operations."""
+    import re
+
+    if (method, path) in {
+        ("GET", "/v1/browser-annotations/sessions"),
+        ("POST", "/v1/browser-annotations/sessions"),
+        ("POST", "/oauth/token"),
+        ("POST", "/oauth/revoke"),
+    }:
+        return True
+    if method in ("GET", "POST") and re.fullmatch(
+        r"/v1/browser-annotations/batches/[0-9a-f]{32}", path
+    ):
+        return True
+    if method == "POST" and re.fullmatch(
+        r"/v1/browser-annotations/sessions/[A-Za-z0-9_-]+/(screenshots|batches)", path
+    ):
+        return True
+    return False
+
+
 # Explicit single-user marker. Set by the managed local-server spawn
 # paths (`omnigent run` in chat.py, the daemon's
 # host/local_server.py) and by the canonical bare loopback
@@ -492,6 +514,8 @@ class UnifiedAuthProvider(AuthProvider):
         # closed). Consulted only for delegated tokens (those carrying a
         # ``grant_id`` claim); left None disables the check.
         self._grant_revoked: Callable[[str], bool] | None = None
+        self._annotation_grant_check: Callable[[str, str, str | None], bool] | None = None
+        self._annotation_origin: str | None = None
         # Accounts JWTs validate generation and revocation on every request.
         # OIDC and machine principals retain their independent lifecycle.
         self._account_check: Callable[[str, str], bool] | None = None
@@ -503,6 +527,14 @@ class UnifiedAuthProvider(AuthProvider):
             grant is revoked or unknown (fail closed).
         """
         self._grant_revoked = check
+
+    def set_annotation_grant_check(self, check: Callable[[str, str, str | None], bool]) -> None:
+        """Wire live, persisted scope and subject validation for annotation grants."""
+        self._annotation_grant_check = check
+
+    def set_annotation_origin(self, origin: str | None) -> None:
+        """Require the configured extension origin on narrow-scope API calls."""
+        self._annotation_origin = origin
 
     def set_account_check(self, check: Callable[[str, str], bool]) -> None:
         """Wire uncached generation/revocation validation in accounts mode."""
@@ -730,7 +762,26 @@ class UnifiedAuthProvider(AuthProvider):
                 # The feed records the highest cursor each grant presented, so
                 # the release CAS can corroborate a consumer's ACK.
                 request.state.usage_read_grant_id = grant_id
-            elif scope is not None and not delegated_path_allowed(request.url.path):
+            elif scope == "annotations:write":
+                raw_path = request.scope.get("raw_path", b"")
+                if (
+                    request.scope.get("type") != "http"
+                    or not isinstance(raw_path, bytes)
+                    or b"%" in raw_path
+                    or self._annotation_origin is None
+                    or request.headers.get("origin") != self._annotation_origin
+                    or not annotation_path_allowed(request.scope.get("method"), request.url.path)
+                    or not isinstance(grant_id, str)
+                    or self._annotation_grant_check is None
+                    or not self._annotation_grant_check(
+                        grant_id, user_id, payload.get("account_generation")
+                    )
+                ):
+                    return None
+            elif scope == "sessions":
+                if not delegated_path_allowed(request.url.path):
+                    return None
+            elif scope is not None:
                 return None
             return user_id
 

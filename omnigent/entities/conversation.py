@@ -921,6 +921,8 @@ class NewConversationItem(BaseModel):
     recovery_after: str | None = Field(default=None, exclude=True)
     status: Literal["completed", "in_progress", "incomplete", "failed"] = "completed"
     replaces_pending_id: str | None = Field(default=None, exclude=True)
+    # The caller saw a runner acceptance or a native transcript echo.
+    annotation_delivery_confirmed: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:

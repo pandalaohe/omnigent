@@ -7545,6 +7545,16 @@
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
+          "browser_annotations_available": {
+            "default": false,
+            "title": "Browser Annotations Available",
+            "type": "boolean"
+          },
+          "connected_apps_available": {
+            "default": false,
+            "title": "Connected Apps Available",
+            "type": "boolean"
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"

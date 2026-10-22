@@ -559,7 +559,7 @@ class SqlDeviceGrant(OmnigentBase):
         and recorded in the issued token's ``act`` claim for audit.
         Display/audit only — not a security-decision key.
     :param scope: Persisted authority; ``NULL`` only for first-party login
-        grants, ``sessions`` or ``usage:read`` for device grants.
+        grants, with device scopes including ``annotations:write``.
     :param user_id: The Omnigent identity that approved the grant, set at
         consent time. ``NULL`` while pending. The delegated token's ``sub``.
     :param refresh_token_hash: HMAC-SHA256 hex digest of the current
@@ -597,6 +597,7 @@ class SqlDeviceGrant(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     client_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     scope: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    label: Mapped[str | None] = mapped_column(String(80), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Digest of the just-superseded refresh token, kept only so a replay
@@ -607,6 +608,7 @@ class SqlDeviceGrant(OmnigentBase):
     expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_used_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
@@ -674,6 +676,90 @@ class SqlSessionPermission(OmnigentBase):
             "user_id",
         ),
     )
+
+
+class SqlAnnotationReceiver(OmnigentBase):
+    """One browser-annotation receiving session per user and workspace."""
+
+    __tablename__ = "annotation_receivers"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    session_archive_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    set_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (Index("ix_annotation_receivers_session", "workspace_id", "session_id"),)
+
+
+class SqlAnnotationReceipt(OmnigentBase):
+    """One durable Chrome batch identity, independent of grant-row retention."""
+
+    __tablename__ = "annotation_receipts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    grant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    item_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    accepted_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    dispatch_phase: Mapped[str] = mapped_column(String(16), nullable=False)
+    retry_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+
+    __table_args__ = (
+        Index("ix_annotation_receipts_item", "workspace_id", "session_id", "item_id"),
+    )
+
+
+class SqlAnnotationGrantOwner(OmnigentBase):
+    """Retain original owner after the credential grant row is purged."""
+
+    __tablename__ = "annotation_grant_owners"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    grant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_generation: Mapped[str] = mapped_column(String(32), nullable=False)
+    approved_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlAnnotationCapture(OmnigentBase):
+    """Owner-bound staging and committed capture identity."""
+
+    __tablename__ = "annotation_captures"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    grant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    capture_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    evidence_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    file_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ready", server_default="ready"
+    )
+    committed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+
+    __table_args__ = (Index("ix_annotation_captures_expiry", "workspace_id", "expires_at"),)
 
 
 class SqlConversationMetadata(OmnigentBase):

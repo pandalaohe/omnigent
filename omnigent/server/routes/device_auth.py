@@ -52,6 +52,7 @@ import hmac
 import html
 import logging
 import os
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -63,7 +64,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 
 from omnigent.entities.device_grant import DEVICE_GRANT_SCOPES, DeviceGrant
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import UnifiedAuthProvider, env_var_is_truthy
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 from omnigent.server.routes._oauth import (
     NO_STORE_HEADERS,
@@ -90,6 +91,10 @@ _CLIENT_SECRET_HEADER = "X-Omnigent-Client-Secret"
 # to the session-facing APIs a delegated client needs; the auth layer
 # refuses admin / user-management paths for a token carrying this scope.
 DELEGATED_SCOPE = "sessions"
+CHROME_CLIENT_ID = "omnigent-chrome"
+ANNOTATION_SCOPE = "annotations:write"
+_CHROME_ENABLED_ENV = "OMNIGENT_CHROME_ANNOTATIONS_ENABLED"
+_CHROME_ORIGIN_ENV = "OMNIGENT_CHROME_EXTENSION_ORIGIN"
 
 
 def _grant_scope(grant: DeviceGrant) -> str | None:
@@ -133,6 +138,7 @@ _ACCESS_TOKEN_TTL_SECONDS = 3600
 # re-consent through the flow. Bounds the blast radius of a leaked/phished
 # grant to this window even if revocation is never called.
 _GRANT_MAX_LIFETIME_SECONDS = 30 * 24 * 3600  # 30 days
+_ANNOTATION_GRANT_LIFETIME_SECONDS = 30 * 24 * 3600
 # Operator override for the grant lifetime, in whole days. Deployments
 # running unattended hosts can extend the re-consent window deliberately;
 # the 30-day default stays the safe posture.
@@ -537,9 +543,12 @@ def create_oauth_token_router(
         # Refuse to refresh a grant past its absolute lifetime — the user
         # must re-consent. Checked before rotating so an aged grant simply
         # stops working (it is NOT reuse, so it must not revoke/oscillate).
-        if grant.approved_at is not None and (
-            int(time.time()) - grant.approved_at >= _grant_max_lifetime
-        ):
+        max_lifetime = (
+            min(_grant_max_lifetime, _ANNOTATION_GRANT_LIFETIME_SECONDS)
+            if grant.scope == ANNOTATION_SCOPE
+            else _grant_max_lifetime
+        )
+        if grant.approved_at is not None and int(time.time()) - grant.approved_at >= max_lifetime:
             return _oauth_error("expired_token")
         if grant.user_id is None:
             return _oauth_error("invalid_grant")
@@ -571,7 +580,7 @@ def create_oauth_token_router(
             expected_hash=presented_hash,
             new_hash=hash_secret(new_refresh, cookie_secret),
             now_epoch_seconds=int(time.time()),
-            max_lifetime_seconds=_grant_max_lifetime,
+            max_lifetime_seconds=max_lifetime,
         )
         if rotated is None:
             # Lost a concurrent rotation race, or the grant aged out between
@@ -636,6 +645,70 @@ def create_oauth_token_router(
         grant_id = payload.get("grant_id")
         return grant_id if isinstance(grant_id, str) else None
 
+    cookie_config = (
+        auth_provider._accounts_config
+        if auth_provider._source == "accounts"
+        else auth_provider._oidc_config
+    )
+    assert cookie_config is not None
+    session_cookie_name = getattr(cookie_config, "session_cookie_name", None)
+
+    def _connected_apps_user(request: Request) -> str:
+        token = request.cookies.get(session_cookie_name) if session_cookie_name else None
+        if not token:
+            raise HTTPException(status_code=401)
+        try:
+            claims = jwt.decode(token, cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError as error:
+            raise HTTPException(status_code=401) from error
+        if "grant_id" in claims or "scope" in claims:
+            raise HTTPException(status_code=401)
+        user_id = auth_provider.get_user_id(request)
+        if user_id is None:
+            raise HTTPException(status_code=401)
+        return user_id
+
+    @router.get("/v1/me/connected-apps")
+    async def connected_apps(request: Request) -> Response:
+        user_id = _connected_apps_user(request)
+        grants = device_grant_store.list_connected_apps(
+            user_id, max_lifetime_seconds=_grant_max_lifetime
+        )
+        return JSONResponse(
+            content={
+                "apps": [
+                    {
+                        "grant_id": grant.id,
+                        "client_name": grant.client_id or "Unknown application",
+                        "label": grant.label or grant.client_id,
+                        "scope": grant.scope,
+                        "created_at": grant.created_at,
+                        "expires_at": (
+                            grant.approved_at
+                            + (
+                                min(_grant_max_lifetime, _ANNOTATION_GRANT_LIFETIME_SECONDS)
+                                if grant.scope == ANNOTATION_SCOPE
+                                else _grant_max_lifetime
+                            )
+                            if grant.approved_at is not None
+                            else None
+                        ),
+                        "last_used_at": grant.last_used_at,
+                    }
+                    for grant in grants
+                ]
+            },
+            headers=NO_STORE_HEADERS,
+        )
+
+    @router.delete("/v1/me/connected-apps/{grant_id}")
+    async def revoke_connected_app(grant_id: str, request: Request) -> Response:
+        _require_browser_origin(request)
+        user_id = _connected_apps_user(request)
+        if not device_grant_store.revoke_connected_app(user_id, grant_id):
+            raise HTTPException(status_code=404)
+        return JSONResponse(content={"revoked": True}, headers=NO_STORE_HEADERS)
+
     return router
 
 
@@ -644,6 +717,7 @@ def create_device_auth_router(
     device_grant_store: DeviceGrantStore,
     *,
     handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
+    annotation_storage_supported: bool = True,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
@@ -678,6 +752,13 @@ def create_device_auth_router(
     session_cookie_name: str = _mode_cfg.session_cookie_name
 
     _client_secret_ok = _make_client_secret_gate()
+    chrome_origin: str | None = None
+    if env_var_is_truthy(_CHROME_ENABLED_ENV, default=False):
+        if auth_provider._source != "accounts":
+            raise RuntimeError("Chrome annotation pairing requires accounts auth mode")
+        chrome_origin = os.environ.get(_CHROME_ORIGIN_ENV, "")
+        if re.fullmatch(r"chrome-extension://[a-p]{32}", chrome_origin) is None:
+            raise RuntimeError("Chrome annotation pairing requires an exact extension origin")
     # Resolve grant max lifetime once at mount (not on every purge).
     _grant_max_lifetime = _grant_max_lifetime_seconds()
 
@@ -726,20 +807,10 @@ def create_device_auth_router(
 
     # ── Device authorization (public) ─────────────────────────────
 
-    @router.post("/oauth/device/authorize", dependencies=[])
-    async def device_authorize(request: Request) -> Response:
-        """Start a device flow (public — anyone may initiate).
-
-        Nothing is granted here: the grant is ``pending`` until an
-        authenticated user approves it in a browser. The ``client_id`` is
-        recorded for the consent screen and the issued token's audit
-        ``act`` claim.
-
-        Rate-limited per client IP, and opportunistically purges expired
-        grants so the table stays bounded.
-        """
-        if not _client_secret_ok(request):
-            return _oauth_error("invalid_client", status_code=401)
+    def _authorize_pending(
+        request: Request, *, client_id: str | None, scope: str, label: str | None = None
+    ) -> Response:
+        """Issue a pending code after the route's own client gate."""
         now_wall = time.time()
         client_ip = request.client.host if request.client else "unknown"
         if not _rate_limiter.allow(client_ip, now_wall):
@@ -756,25 +827,13 @@ def create_device_auth_router(
             except Exception:  # housekeeping must never fail a request
                 _logger.exception("device grant purge failed")
 
-        try:
-            body = await request.json()
-        except (ValueError, UnicodeDecodeError):
-            body = {}
-        if not isinstance(body, dict):
-            body = {}
-        client_id = _client_id(body)
-        # LOGIN_GRANT_CLIENT_ID marks a first-party login grant, whose
-        # refreshed tokens carry full session authority. It is reserved:
-        # a device client must never be able to self-declare into that
-        # class by naming it here.
         if _is_login_grant(client_id):
             _logger.warning(
                 "device/authorize: refused reserved client_id %r", LOGIN_GRANT_CLIENT_ID
             )
             return _oauth_error("invalid_request")
 
-        requested_scope = body.get("scope", DELEGATED_SCOPE)
-        if not isinstance(requested_scope, str) or requested_scope not in DEVICE_GRANT_SCOPES:
+        if scope not in DEVICE_GRANT_SCOPES:
             return _oauth_error("invalid_scope")
 
         device_code = secrets.token_urlsafe(32)
@@ -786,7 +845,8 @@ def create_device_auth_router(
             device_code_hash=hash_secret(device_code, cookie_secret),
             user_code=user_code,
             client_id=client_id,
-            scope=requested_scope,
+            label=label,
+            scope=scope,
             created_at=now,
             expires_at=now + _DEVICE_CODE_TTL_SECONDS,
         )
@@ -815,6 +875,99 @@ def create_device_auth_router(
             # so this body is as sensitive as a token response.
             headers=NO_STORE_HEADERS,
         )
+
+    @router.post("/oauth/device/authorize", dependencies=[])
+    async def device_authorize(request: Request) -> Response:
+        """Start the existing shared-secret-gated device flow."""
+        if not _client_secret_ok(request):
+            return _oauth_error("invalid_client", status_code=401)
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        requested_scope = body.get("scope", DELEGATED_SCOPE)
+        if (
+            not isinstance(requested_scope, str)
+            or requested_scope == ANNOTATION_SCOPE
+            or _client_id(body) == CHROME_CLIENT_ID
+        ):
+            return _oauth_error("invalid_scope")
+        return _authorize_pending(request, client_id=_client_id(body), scope=requested_scope)
+
+    def _chrome_response(response: Response) -> Response:
+        assert chrome_origin is not None
+        response.headers["Access-Control-Allow-Origin"] = chrome_origin
+        response.headers["Vary"] = "Origin"
+        return response
+
+    def _chrome_origin_ok(request: Request) -> bool:
+        return chrome_origin is not None and request.headers.get("origin") == chrome_origin
+
+    if chrome_origin is not None:
+
+        @router.options("/oauth/annotations/{action}")
+        async def chrome_preflight(action: str, request: Request) -> Response:
+            if action not in ("authorize", "token") or not _chrome_origin_ok(request):
+                return Response(status_code=403)
+            return _chrome_response(
+                Response(
+                    status_code=204,
+                    headers={
+                        "Access-Control-Allow-Methods": "POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                    },
+                )
+            )
+
+        @router.post("/oauth/annotations/authorize")
+        async def chrome_authorize(request: Request) -> Response:
+            if not _chrome_origin_ok(request):
+                return Response(status_code=403)
+            if not annotation_storage_supported:
+                return _chrome_response(
+                    JSONResponse(
+                        status_code=503,
+                        content={"error": "annotation_storage_unsupported"},
+                        headers=NO_STORE_HEADERS,
+                    )
+                )
+            try:
+                body = await request.json()
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            if not isinstance(body, dict) or set(body) != {"label"}:
+                return _chrome_response(_oauth_error("invalid_request"))
+            label = body["label"]
+            if (
+                not isinstance(label, str)
+                or not 1 <= len(label.strip()) <= 80
+                or any(ord(char) < 32 or ord(char) == 127 for char in label)
+            ):
+                return _chrome_response(_oauth_error("invalid_request"))
+            return _chrome_response(
+                _authorize_pending(
+                    request,
+                    client_id=CHROME_CLIENT_ID,
+                    scope=ANNOTATION_SCOPE,
+                    label=label.strip(),
+                )
+            )
+
+        @router.post("/oauth/annotations/token")
+        async def chrome_token(request: Request) -> Response:
+            if not _chrome_origin_ok(request):
+                return Response(status_code=403)
+            form = await request.form()
+            if (
+                set(form) != {"grant_type", "device_code"}
+                or form.get("grant_type") != "urn:ietf:params:oauth:grant-type:device_code"
+            ):
+                return _chrome_response(_oauth_error("invalid_request"))
+            return _chrome_response(
+                _handle_device_code_grant(str(form.get("device_code") or ""), chrome_only=True)
+            )
 
     # ── Browser consent page ──────────────────────────────────────
 
@@ -852,6 +1005,19 @@ def create_device_auth_router(
         iat = payload.get("iat")
         return iat if isinstance(iat, int) else None
 
+    def _browser_user_id(request: Request) -> str | None:
+        """Consent requires a first-party browser cookie, never a bearer grant."""
+        token = request.cookies.get(session_cookie_name)
+        if not token:
+            return None
+        try:
+            claims = jwt.decode(token, cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        if "grant_id" in claims or "scope" in claims:
+            return None
+        return auth_provider.get_user_id(request)
+
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
         """Render the consent page for a ``user_code``.
@@ -871,7 +1037,7 @@ def create_device_auth_router(
         an attacker's grant with one click; they must re-enter their password
         against a screen naming the exact identity and client.
         """
-        user_id = auth_provider.get_user_id(request)
+        user_id = _browser_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
         base_path: str = getattr(request.app.state, "base_path", "")
         if user_id is None:
@@ -909,6 +1075,7 @@ def create_device_auth_router(
                 user_id=user_id,
                 client_id=grant.client_id,
                 scope=grant.scope,
+                label=grant.label,
                 base_path=base_path,
             ),
             status_code=200,
@@ -923,7 +1090,7 @@ def create_device_auth_router(
         identity to the grant.
         """
         _require_browser_origin(request)
-        user_id = auth_provider.get_user_id(request)
+        user_id = _browser_user_id(request)
         if user_id is None:
             return _oauth_error("unauthorized", status_code=401)
 
@@ -971,7 +1138,12 @@ def create_device_auth_router(
             grant.client_id,
         )
         return HTMLResponse(
-            _consent_html(approved_as=user_id, client_id=approved.client_id, scope=approved.scope),
+            _consent_html(
+                approved_as=user_id,
+                client_id=approved.client_id,
+                scope=approved.scope,
+                label=approved.label,
+            ),
             status_code=200,
         )
 
@@ -979,7 +1151,7 @@ def create_device_auth_router(
     async def device_deny(request: Request) -> Response:
         """Deny a pending grant."""
         _require_browser_origin(request)
-        user_id = auth_provider.get_user_id(request)
+        user_id = _browser_user_id(request)
         if user_id is None:
             return _oauth_error("unauthorized", status_code=401)
         form = await request.form()
@@ -994,7 +1166,7 @@ def create_device_auth_router(
     # only addition is the device_code grant handler, injected here so
     # /oauth/token stays a single registration either way.
 
-    def _handle_device_code_grant(device_code: str) -> Response:
+    def _handle_device_code_grant(device_code: str, *, chrome_only: bool = False) -> Response:
         if not device_code:
             return _oauth_error("invalid_request")
         now = int(time.time())
@@ -1003,6 +1175,12 @@ def create_device_auth_router(
             now_epoch_seconds=now,
             min_interval_seconds=_POLL_INTERVAL_SECONDS,
         )
+        if grant is not None:
+            is_chrome_grant = (
+                grant.client_id == CHROME_CLIENT_ID and grant.scope == ANNOTATION_SCOPE
+            )
+            if is_chrome_grant != chrome_only:
+                return _oauth_error("invalid_grant")
         if outcome == "not_found":
             return _oauth_error("invalid_grant")
         if outcome == "slow_down":
@@ -1027,17 +1205,29 @@ def create_device_auth_router(
         if redeemed is None or redeemed.user_id is None:
             # Lost the race (concurrent poll already redeemed) or expired.
             return _oauth_error("invalid_grant")
+        if chrome_only and (
+            redeemed.client_id != CHROME_CLIENT_ID or redeemed.scope != ANNOTATION_SCOPE
+        ):
+            return _oauth_error("invalid_grant")
         access_token = _issue_access_token(redeemed.id)
         _logger.info("oauth/token: issued delegated token for grant %s", redeemed.id)
+        content: dict[str, object] = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "grant_id": redeemed.id,
+            "token_type": "Bearer",
+            "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+        }
+        if chrome_only:
+            content.update(
+                grant_id=redeemed.id,
+                user_id=redeemed.user_id,
+                display_identity=redeemed.user_id,
+                protocol_version=1,
+            )
         return JSONResponse(
             status_code=200,
-            content={
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "grant_id": redeemed.id,
-                "token_type": "Bearer",
-                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
-            },
+            content=content,
             headers=NO_STORE_HEADERS,
         )
 
@@ -1060,6 +1250,7 @@ def _consent_html(
     user_id: str = "",
     client_id: str | None = None,
     scope: str | None = DELEGATED_SCOPE,
+    label: str | None = None,
     prompt_for_code: bool = False,
     error: str = "",
     approved_as: str = "",
@@ -1084,8 +1275,13 @@ def _consent_html(
     # Requesting client's identifier, defaulting to a neutral label when it
     # didn't identify itself.
     app_name = esc(client_id) if client_id else "An application"
+    if label:
+        app_name += f" ({esc(label)})"
     access_verb = "view usage events for" if scope == "usage:read" else "act as"
     access_limit = " (read-only)" if scope == "usage:read" else " on session APIs"
+    if scope == ANNOTATION_SCOPE:
+        access_verb = "list editable sessions, stage screenshots, and send annotation batches for"
+        access_limit = ""
     if error:
         body = f'<p class="err">{esc(error)}</p>'
     elif approved_as:

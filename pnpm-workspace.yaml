@@ -1,5 +1,6 @@
 packages:
   - 'web'
+  - 'browsers/chrome'
   - 'web/electron'
   - '.github/ci-deps'
   - 'editors/vscode'

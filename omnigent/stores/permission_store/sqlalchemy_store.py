@@ -18,7 +18,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import account_generation, require_active_account
-from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
+from omnigent.db.db_models import (
+    SqlAnnotationReceiver,
+    SqlSessionPermission,
+    SqlUser,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -124,6 +129,24 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
     )
 
 
+def _clear_annotation_receiver(session: Session, user_id: str, conversation_id: str) -> None:
+    """A lost explicit edit grant must not revive the old target on re-grant."""
+    session.execute(
+        update(SqlAnnotationReceiver)
+        .where(
+            SqlAnnotationReceiver.workspace_id == current_workspace_id(),
+            SqlAnnotationReceiver.user_id == user_id,
+            SqlAnnotationReceiver.session_id == conversation_id,
+        )
+        .values(
+            session_id=None,
+            session_archive_revision=None,
+            set_at=None,
+            revision=SqlAnnotationReceiver.revision + 1,
+        )
+    )
+
+
 class SqlAlchemyPermissionStore(PermissionStore):
     """SQLAlchemy-backed implementation of :class:`PermissionStore`.
 
@@ -215,6 +238,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
             session.flush()
+            if level < 2:
+                _clear_annotation_receiver(session, user_id, conversation_id)
 
         run_write_transaction(
             self._session_immediate,
@@ -243,6 +268,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     )
                 ),
             )
+            if result.rowcount > 0:
+                _clear_annotation_receiver(session, user_id, conversation_id)
             return result.rowcount > 0
 
         deleted = run_write_transaction(
@@ -336,6 +363,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     )
                     .values(user_id=to_user_id)
                 )
+            for conversation_id in conversation_ids:
+                _clear_annotation_receiver(session, from_user_id, conversation_id)
             return len(reassign_ids), True
 
         moved, changed = run_write_transaction(

@@ -26,6 +26,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
+from omnigent.server.annotation_batch import AnnotationFailure
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.startup_protocol import StartupAttemptRef
@@ -34,6 +35,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     ConversationStore,
 )
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.session_startup_store import StartupSnapshot
 
@@ -56,9 +58,17 @@ def input_content(item: ConversationItem) -> list[dict[str, Any]]:
     return data.get("content", [])
 
 
-async def restore_pending_inputs(store: ConversationStore, session_id: str) -> None:
+async def restore_pending_inputs(
+    store: ConversationStore, session_id: str, *, annotation_only: bool = False
+) -> None:
     """Restore native receipt matching after an AP restart, without submitting again."""
     for item in await asyncio.to_thread(store.list_pending_inputs, session_id):
+        if annotation_only and (
+            not isinstance(store, SqlAlchemyConversationStore)
+            or await asyncio.to_thread(store.annotation_receipt_for_item, session_id, item.id)
+            is None
+        ):
+            continue
         if (
             item.status == "incomplete"
             and pending_inputs.pending_id_for_stable_id(session_id, item.id) is None
@@ -91,6 +101,13 @@ async def reconcile_accepted_startup_input(
         and startup.attempt_id
     ):
         return
+    if isinstance(conversations, SqlAlchemyConversationStore):
+        annotation = await asyncio.to_thread(
+            conversations.annotation_receipt_for_item, startup.session_id, startup.input_id
+        )
+        if annotation is not None:
+            # Annotation confirmation requires its native transcript receipt.
+            return
     pending = await asyncio.to_thread(conversations.get_item, startup.session_id, startup.input_id)
     if pending is None or pending.response_id != PENDING_INPUT_RESPONSE_ID:
         return
@@ -123,6 +140,8 @@ class StartupInputContext:
     user_id: str | None
     input_id: str
     submitted: bool = False
+    forward_started: bool = False
+    forward_rejected: bool = False
     startup: StartupAttemptRef | None = None
 
     async def is_disconnected(self) -> bool:
@@ -206,6 +225,54 @@ class ManagedStartupInputs:
         ] = {}
         self._deliveries: dict[tuple[int, str], asyncio.Task[Any]] = {}
 
+    async def dispatch_annotation(
+        self,
+        app: Any,
+        session_id: str,
+        item_id: str,
+        user_id: str,
+        grant_id: str,
+        generation: str,
+        batch_id: str,
+        *,
+        target_live: Callable[[str], bool],
+        explicit_retry: bool = False,
+    ) -> None:
+        """Enter the existing saved-input dispatch after the durable pre-forward CAS."""
+        if not isinstance(self.conversations, SqlAlchemyConversationStore):
+            return
+        live = await asyncio.to_thread(target_live, session_id)
+        try:
+            started = await asyncio.to_thread(
+                self.conversations.begin_annotation_dispatch,
+                user_id,
+                grant_id,
+                generation,
+                batch_id,
+                target_live=live,
+                explicit_retry=explicit_retry,
+            )
+        except AnnotationFailure:
+            # Admission already committed. A later revoke/archive cannot erase it.
+            return
+        if started is None:
+            return
+        if explicit_retry:
+            # A native runner may have marked the prior queue entry rejected
+            # after accepting the POST. Re-record it with fresh delivery state.
+            pending_inputs.resolve(session_id, pending_inputs.make_pending_id(session_id, item_id))
+        item = await asyncio.to_thread(self.conversations.get_item, session_id, item_id)
+        if item is not None:
+            outcome = await self._deliver(app, session_id, item, annotation=True)
+            if outcome == "not_dispatched":
+                await asyncio.to_thread(
+                    self.conversations.defer_unsubmitted_annotation, session_id, item_id
+                )
+        else:
+            await asyncio.to_thread(
+                self.conversations.defer_unsubmitted_annotation, session_id, item_id
+            )
+
     async def enqueue(
         self,
         session_id: str,
@@ -285,7 +352,23 @@ class ManagedStartupInputs:
                 self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
             )
         undelivered = False
+        annotation_store = (
+            self.conversations
+            if isinstance(self.conversations, SqlAlchemyConversationStore)
+            else None
+        )
         for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            if (
+                annotation_store is not None
+                and await asyncio.to_thread(
+                    annotation_store.annotation_receipt_for_item, session_id, item.id
+                )
+                is not None
+            ):
+                await asyncio.to_thread(
+                    annotation_store.defer_annotation_input, session_id, item.id
+                )
+                continue
             if item.status == "in_progress":
                 undelivered |= await asyncio.to_thread(
                     self.conversations.transition_pending_input,
@@ -445,6 +528,48 @@ class ManagedStartupInputs:
         # ones behind it. One submitted to a native harness and awaiting its
         # transcript receipt still does: it may already have run.
         head = next((item for item in items if item.status != "failed"), None)
+        annotation_store = (
+            self.conversations
+            if isinstance(self.conversations, SqlAlchemyConversationStore)
+            else None
+        )
+        if head is not None and annotation_store is not None:
+            receipt = await asyncio.to_thread(
+                annotation_store.annotation_receipt_for_item, session_id, head.id
+            )
+            if receipt is not None:
+                key = (current_workspace_id(), session_id)
+                if receipt["dispatch_phase"] == "dispatching" and key not in self._deliveries:
+                    await asyncio.to_thread(
+                        annotation_store.mark_annotation_uncertain, session_id, head.id
+                    )
+                elif (
+                    receipt["dispatch_phase"] == "ready"
+                    and not receipt["retry_required"]
+                    and isinstance(receipt["generation"], str)
+                    and head.status == "in_progress"
+                ):
+                    task = asyncio.create_task(
+                        self.dispatch_annotation(
+                            app,
+                            session_id,
+                            head.id,
+                            str(receipt["user_id"]),
+                            str(receipt["grant_id"]),
+                            receipt["generation"],
+                            str(receipt["batch_id"]),
+                            target_live=app.state.annotation_target_live,
+                        ),
+                        name=f"annotation-input-{session_id}",
+                    )
+                    self._deliveries[key] = task
+
+                    def clear_annotation_delivery(done: asyncio.Task[None]) -> None:
+                        if self._deliveries.get(key) is done:
+                            self._deliveries.pop(key, None)
+
+                    task.add_done_callback(clear_annotation_delivery)
+                return False
         admission = getattr(app.state, "startup_admission", None)
         if admission is not None:
             current = await asyncio.to_thread(admission.startups.for_session, session_id)
@@ -509,6 +634,7 @@ class ManagedStartupInputs:
         item: ConversationItem,
         *,
         startup: StartupAttemptRef | None = None,
+        annotation: bool = False,
     ) -> Literal["submitted", "not_dispatched", "unconfirmed"]:
         if self.dispatch is None:
             return "not_dispatched"
@@ -516,7 +642,7 @@ class ManagedStartupInputs:
         task = asyncio.current_task()
         assert task is not None
         if key in self._deliveries and self._deliveries[key] is not task:
-            return "unconfirmed"
+            return "not_dispatched" if annotation else "unconfirmed"
         self._deliveries[key] = task
         context: StartupInputContext | None = None
         try:
@@ -556,6 +682,8 @@ class ManagedStartupInputs:
             )
             response = await self.dispatch(context, session_id, event)
             if response.get("denied"):
+                if annotation:
+                    return "not_dispatched"
                 raise ValueError(str(response.get("reason", "Input denied by policy")))
             if context.submitted:
                 if not response.get("pending_id") and not response.get("item_id"):
@@ -584,6 +712,14 @@ class ManagedStartupInputs:
             raise
         except Exception as exc:
             _logger.exception("Unable to deliver saved message for session %s", session_id)
+            if annotation:
+                if context is None or not context.forward_started or context.forward_rejected:
+                    return "not_dispatched"
+                if isinstance(self.conversations, SqlAlchemyConversationStore):
+                    await asyncio.to_thread(
+                        self.conversations.mark_annotation_uncertain, session_id, item.id
+                    )
+                return "unconfirmed"
             if context is None or not context.submitted:
                 await asyncio.to_thread(
                     self.conversations.transition_pending_input,
@@ -642,7 +778,24 @@ class ManagedStartupInputs:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        annotation_store = (
+            self.conversations
+            if isinstance(self.conversations, SqlAlchemyConversationStore)
+            else None
+        )
         for item in items:
+            if (
+                annotation_store is not None
+                and await asyncio.to_thread(
+                    annotation_store.annotation_receipt_for_item, session_id, item.id
+                )
+                is not None
+            ):
+                await asyncio.to_thread(
+                    annotation_store.defer_annotation_input, session_id, item.id
+                )
+                cancelled_before_dispatch = False
+                continue
             if item.status == "incomplete":
                 cancelled_before_dispatch = False
                 pending_inputs.mark_interrupted(

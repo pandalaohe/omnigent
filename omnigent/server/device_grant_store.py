@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import time
 from typing import cast
 
 from sqlalchemy import and_, delete, or_, select, update
@@ -33,7 +34,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.db_models import SqlDeviceGrant, current_workspace_id
+from omnigent.db.db_models import SqlAnnotationGrantOwner, SqlDeviceGrant, current_workspace_id
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -78,6 +79,8 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
         account_generation=row.account_generation,
+        label=row.label,
+        last_used_at=row.last_used_at,
     )
 
 
@@ -114,6 +117,7 @@ class DeviceGrantStore:
         device_code_hash: str,
         user_code: str,
         client_id: str | None,
+        label: str | None = None,
         scope: str = "sessions",
         created_at: int,
         expires_at: int,
@@ -146,6 +150,7 @@ class DeviceGrantStore:
                 user_code=user_code,
                 status=encode_device_grant_status("pending"),
                 client_id=client_id,
+                label=label,
                 scope=scope,
                 user_id=None,
                 refresh_token_hash=None,
@@ -304,6 +309,90 @@ class DeviceGrantStore:
                 for row in rows
             ]
 
+    def authorize_annotation_request(
+        self, grant_id: str, user_id: str, generation: str | None
+    ) -> bool:
+        """Check the persisted Chrome grant on every narrow-scope request."""
+        if not isinstance(generation, str):
+            return False
+        now = int(time.time())
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        SqlDeviceGrant.workspace_id == current_workspace_id(),
+                        SqlDeviceGrant.id == grant_id,
+                        SqlDeviceGrant.user_id == user_id,
+                        SqlDeviceGrant.account_generation == generation,
+                        SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                        SqlDeviceGrant.client_id == "omnigent-chrome",
+                        SqlDeviceGrant.scope == "annotations:write",
+                        SqlDeviceGrant.approved_at > now - 30 * 24 * 3600,
+                    )
+                    .values(last_used_at=now)
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(self._session_immediate, "authorize_annotation", write)
+
+    def list_connected_apps(
+        self, user_id: str, *, max_lifetime_seconds: int = 30 * 24 * 3600
+    ) -> list[DeviceGrant]:
+        """Return the caller's currently active delegated grants only."""
+        now = int(time.time())
+        with self._session("list_connected_apps") as session:
+            generation = require_active_account(session, user_id)
+            rows = session.scalars(
+                select(SqlDeviceGrant)
+                .where(
+                    SqlDeviceGrant.workspace_id == current_workspace_id(),
+                    SqlDeviceGrant.user_id == user_id,
+                    SqlDeviceGrant.account_generation == generation,
+                    SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                    SqlDeviceGrant.scope.in_(DEVICE_GRANT_SCOPES),
+                    SqlDeviceGrant.approved_at > now - max_lifetime_seconds,
+                )
+                .order_by(SqlDeviceGrant.created_at.desc(), SqlDeviceGrant.id.desc())
+            ).all()
+            return [
+                _to_device_grant(row)
+                for row in rows
+                if row.scope != "annotations:write"
+                or (row.approved_at is not None and row.approved_at > now - 30 * 24 * 3600)
+            ]
+
+    def revoke_connected_app(self, user_id: str, grant_id: str) -> bool:
+        """Atomically revoke one live delegated grant owned by the caller."""
+
+        def write(session: Session) -> bool:
+            generation = require_active_account(session, user_id)
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        SqlDeviceGrant.workspace_id == current_workspace_id(),
+                        SqlDeviceGrant.id == grant_id,
+                        SqlDeviceGrant.user_id == user_id,
+                        SqlDeviceGrant.account_generation == generation,
+                        SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                        SqlDeviceGrant.scope.in_(DEVICE_GRANT_SCOPES),
+                    )
+                    .values(
+                        status=encode_device_grant_status("revoked"),
+                        refresh_token_hash=None,
+                        prev_refresh_token_hash=None,
+                    )
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(self._session_immediate, "revoke_connected_app", write)
+
     def get_by_refresh_hash(self, refresh_token_hash: str) -> DeviceGrant | None:
         """Look up the grant currently holding this refresh-token digest.
 
@@ -372,6 +461,21 @@ class DeviceGrantStore:
             if result.rowcount == 0:
                 return None
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            if (
+                row is not None
+                and row.scope == "annotations:write"
+                and row.user_id is not None
+                and row.account_generation is not None
+                and row.approved_at is not None
+            ):
+                session.add(
+                    SqlAnnotationGrantOwner(
+                        grant_id=row.id,
+                        user_id=row.user_id,
+                        account_generation=row.account_generation,
+                        approved_at=row.approved_at,
+                    )
+                )
             return _to_device_grant(row) if row is not None else None
 
         return run_write_transaction(self._session_immediate, "approve_device_grant", write)
@@ -486,6 +590,7 @@ class DeviceGrantStore:
                     .values(
                         status=encode_device_grant_status("redeemed"),
                         refresh_token_hash=refresh_token_hash,
+                        last_used_at=now_epoch_seconds,
                     )
                 ),
             )
@@ -546,7 +651,11 @@ class DeviceGrantStore:
                             SqlDeviceGrant.approved_at > min_approved_at,
                         )
                     )
-                    .values(refresh_token_hash=new_hash, prev_refresh_token_hash=expected_hash)
+                    .values(
+                        refresh_token_hash=new_hash,
+                        prev_refresh_token_hash=expected_hash,
+                        last_used_at=now_epoch_seconds,
+                    )
                 ),
             )
             if result.rowcount == 0:

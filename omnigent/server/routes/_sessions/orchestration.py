@@ -480,6 +480,7 @@ from omnigent.stores.conversation_store import (
     pinned_label_key,
     runner_seen_is_fresh,
 )
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.peer_message_store import PeerMessageStore
@@ -4742,6 +4743,30 @@ def _log_detached_mirror_persist(
         )
 
 
+async def _preserve_unmatched_annotation(
+    conversation_store: ConversationStore,
+    session_id: str,
+    drained: pending_inputs.DrainedInput,
+) -> bool:
+    """Keep an annotation pending when a mirror has no matching text."""
+    if (
+        not isinstance(conversation_store, SqlAlchemyConversationStore)
+        or drained.stable_id is None
+    ):
+        return False
+    receipt = await asyncio.to_thread(
+        conversation_store.annotation_receipt_for_item, session_id, drained.stable_id
+    )
+    if receipt is None:
+        return False
+    pending_inputs.restore(session_id, drained)
+    pending_inputs.mark_uncertain(session_id)
+    await asyncio.to_thread(
+        conversation_store.mark_annotation_uncertain, session_id, drained.stable_id
+    )
+    return True
+
+
 async def _persist_external_conversation_item_serialized(
     session_id: str,
     conv: Conversation,
@@ -4833,8 +4858,12 @@ async def _persist_external_conversation_item_unlocked(
         )
         if existing is not None:
             return existing.id, True
-    if _drains_pending_inputs(item) and STARTUP_LABEL in conv.labels:
-        await restore_pending_inputs(conversation_store, session_id)
+    if _drains_pending_inputs(item):
+        await restore_pending_inputs(
+            conversation_store,
+            session_id,
+            annotation_only=STARTUP_LABEL not in conv.labels,
+        )
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry and fold the entry's file
     # blocks (image / file) into the item BEFORE persisting. The transcript
@@ -4855,6 +4884,7 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
+    original_held: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -4872,6 +4902,9 @@ async def _persist_external_conversation_item_unlocked(
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
         match_method = matched.match_method
+        original_held = [*matched.skipped, *matched.uncertain]
+        if drained is not None:
+            original_held.append(drained)
         if agent_message_candidate:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
@@ -4893,19 +4926,49 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
-            # The s10-guarded fallback: drain the FIFO head unless an
-            # attachment-bearing head clearly differs from the mirrored text.
-            drained = pending_inputs.resolve_oldest_for_mirrored_text(
-                session_id,
-                _message_text(item.data.content) or "",
-                hold=True,
-            )
-            if drained is not None:
-                match_method = "fifo_fallback"
-                # The mirror's true owner may be any entry still queued, so none
-                # of them can be declared undelivered later.
-                pending_inputs.mark_uncertain(session_id)
+        try:
+            if (
+                drained is None
+                and not agent_message_candidate
+                and not _is_kiro_native_session(conv)
+            ):
+                # The s10-guarded fallback: drain the FIFO head unless an
+                # attachment-bearing head clearly differs from the mirrored text.
+                drained = pending_inputs.resolve_oldest_for_mirrored_text(
+                    session_id,
+                    _message_text(item.data.content) or "",
+                    hold=True,
+                )
+                if drained is not None:
+                    original_held.append(drained)
+                    match_method = "fifo_fallback"
+                    if await _preserve_unmatched_annotation(
+                        conversation_store, session_id, drained
+                    ):
+                        drained = None
+                        match_method = None
+                    else:
+                        # The mirror's true owner may be any entry still queued.
+                        pending_inputs.mark_uncertain(session_id)
+            if skipped_pending:
+                skipped_pending = [
+                    entry
+                    for entry in skipped_pending
+                    if not await _preserve_unmatched_annotation(
+                        conversation_store, session_id, entry
+                    )
+                ]
+            if uncertain_pending:
+                uncertain_pending = [
+                    entry
+                    for entry in uncertain_pending
+                    if not await _preserve_unmatched_annotation(
+                        conversation_store, session_id, entry
+                    )
+                ]
+        except Exception:
+            _restore_drained_inputs(session_id, original_held, None)
+            raise
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -4946,15 +5009,24 @@ async def _persist_external_conversation_item_unlocked(
                 break
         drained = matched.matched
         match_method = matched.match_method
+        original_held = [*matched.skipped, *matched.uncertain]
         if drained is not None:
+            original_held.append(drained)
             cleared_pending_id = drained.pending_id
         held_older = [*matched.skipped, *matched.uncertain]
     elif (shell_command := _shell_command_input(item)) is not None:
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
         if drained is not None:
+            original_held.append(drained)
             cleared_pending_id = drained.pending_id
     if drained is not None:
-        item = item.model_copy(update={"replaces_pending_id": drained.stable_id})
+        item = item.model_copy(
+            update={
+                "replaces_pending_id": drained.stable_id,
+                "annotation_delivery_confirmed": match_method
+                in ("normalized_text", "attachment_normalized_text"),
+            }
+        )
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error) with stable
@@ -4978,9 +5050,7 @@ async def _persist_external_conversation_item_unlocked(
         # Nothing was committed: unhold every drained entry so the forwarder's
         # retry drains the same entries and surfaces the same undelivered
         # messages.
-        _restore_drained_inputs(
-            session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
-        )
+        _restore_drained_inputs(session_id, original_held, None)
         if isinstance(exc, NativeReplayConflictError):
             raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         raise
@@ -4989,9 +5059,7 @@ async def _persist_external_conversation_item_unlocked(
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
         # message.
-        _restore_drained_inputs(
-            session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
-        )
+        _restore_drained_inputs(session_id, original_held, None)
         await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id, True
     # Landed: the drained entries are settled (uncertain ones leave without a
@@ -5244,7 +5312,7 @@ async def _settle_undelivered_native_input(
     reason_code: str | None = None,
 ) -> None:
     """
-    Commit a failed native turn's own queued web message as a user item.
+    Settle a failed native turn's own queued web message.
 
     Only native-terminal sessions queue web messages: the transcript forwarder
     normally mirrors each one back and drains its entry. When the runner
@@ -5256,6 +5324,7 @@ async def _settle_undelivered_native_input(
     reload. Settlement is by identity, never by queue order: a turn that fails
     after its message was mirrored (entry already drained) settles nothing, so
     a later message still buffered in the runner keeps its own entry.
+    An annotation stays pending for its owner's explicit retry.
 
     :param conversation_store: Store to append to; ``None`` skips persistence.
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
@@ -5267,6 +5336,20 @@ async def _settle_undelivered_native_input(
     """
     if input_stable_id is None:
         return
+    if isinstance(conversation_store, SqlAlchemyConversationStore):
+        annotation = await asyncio.to_thread(
+            conversation_store.annotation_receipt_for_item, session_id, input_stable_id
+        )
+        if annotation is not None:
+            # The runner proved it never handed this input to the harness.
+            # Keep its pending row so the owner can explicitly retry it.
+            await asyncio.to_thread(
+                conversation_store.defer_unsubmitted_annotation,
+                session_id,
+                input_stable_id,
+                runner_reported=True,
+            )
+            return
     pending_inputs.mark_lifecycle(
         session_id,
         input_stable_id,
@@ -8072,6 +8155,7 @@ async def _forward_native_terminal_message(
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
     usage_admission: dict[str, Any] | None = None,
+    startup_context: StartupInputContext | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -8154,6 +8238,8 @@ async def _forward_native_terminal_message(
                 extra={"session_id": session_id},
             )
     try:
+        if startup_context is not None:
+            startup_context.forward_started = True
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events?stream=true"
             if harness == "claude-native" and body.data.get("confirm_delivery") is True
@@ -8185,6 +8271,8 @@ async def _forward_native_terminal_message(
             detail=f"{display_name} terminal message delivery failed",
         ) from exc
     if resp.status_code >= 400:
+        if startup_context is not None:
+            startup_context.forward_rejected = True
         _logger.warning(
             "%s terminal message forward rejected for session=%s status=%s body=%s",
             display_name,
@@ -8690,6 +8778,7 @@ async def _forward_event_to_runner(
     startup_attempt: StartupAttemptRef | None = None,
     startup_required: bool = False,
     usage_admission: dict[str, Any] | None = None,
+    startup_context: StartupInputContext | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8734,7 +8823,26 @@ async def _forward_event_to_runner(
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
     sdk_peer = body.data.get("peer_delivery") is not None
-    if startup_attempt is not None:
+    annotation_lookup = getattr(conversation_store, "annotation_receipt_for_item", None)
+    annotation_pending = bool(
+        startup_input_id is not None
+        and startup_attempt is None
+        and annotation_lookup is not None
+        and await asyncio.to_thread(annotation_lookup, session_id, startup_input_id) is not None
+    )
+    if annotation_pending:
+        assert startup_input_id is not None
+        canonical = await asyncio.to_thread(
+            conversation_store.get_item, session_id, startup_input_id
+        )
+        if (
+            canonical is None
+            or canonical.response_id != PENDING_INPUT_RESPONSE_ID
+            or canonical.status != "incomplete"
+        ):
+            raise HTTPException(409, "Annotation input owner changed")
+        persisted_items = [canonical]
+    elif startup_attempt is not None:
         canonical = (
             await asyncio.to_thread(
                 conversation_store.get_item, session_id, startup_attempt.input_id
@@ -9225,6 +9333,8 @@ async def _forward_event_to_runner(
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
     try:
+        if startup_context is not None:
+            startup_context.forward_started = True
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -9240,6 +9350,8 @@ async def _forward_event_to_runner(
         # status rather than via ``raise_for_status`` so the runner-client fakes
         # that only expose ``status_code`` behave as they do in production.
         if _forward_resp.status_code >= 400:
+            if startup_context is not None:
+                startup_context.forward_rejected = True
             if sdk_peer or startup_attempt is not None:
                 raise HTTPException(status_code=502, detail="SDK peer forward has no receipt")
             # The live runner took nothing, so ``idle`` would read as a finished
@@ -9284,6 +9396,12 @@ async def _forward_event_to_runner(
             )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
+        if annotation_pending:
+            persisted_items = await asyncio.to_thread(
+                conversation_store.append,
+                session_id,
+                [item.model_copy(update={"annotation_delivery_confirmed": True})],
+            )
         if not sdk_peer and startup_attempt is None:
             _publish_input_consumed(session_id, persisted_items[0])
         _logger.info(
@@ -10038,6 +10156,7 @@ async def _dispatch_session_event_to_runner_impl(
                 input_delivery=input_delivery,
                 agent_revision=agent_revision,
                 usage_admission=usage_admission,
+                startup_context=startup_input,
             )
             forwarded = True
             if pending_id is not None:
@@ -10115,6 +10234,7 @@ async def _dispatch_session_event_to_runner_impl(
         startup_attempt=startup_input.startup if startup_input is not None else None,
         startup_required=host_registry is not None and host_registry.startup_admitter is not None,
         usage_admission=usage_admission,
+        startup_context=startup_input,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -11233,7 +11353,8 @@ async def _relay_runner_stream_once(
                     if evt_type == "response.failed":
                         # The runner could not hand this turn to a native
                         # harness, so the web message it carried was never
-                        # mirrored back: commit it ahead of the error item.
+                        # mirrored back. Settle it before the error item;
+                        # annotations stay pending for an explicit retry.
                         raw_input_stable_id = event.get("input_stable_id")
                         await _settle_undelivered_native_input(
                             conversation_store,

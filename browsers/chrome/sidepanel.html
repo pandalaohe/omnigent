@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Omnigent web annotations</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font:
+          13px/1.5 system-ui,
+          sans-serif;
+        color: #152845;
+        background: #f7faff;
+        --line: #b8c8df;
+        --paper: #fff;
+        --blue: #245fd6;
+        --muted: #526780;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 18px;
+        overflow-wrap: anywhere;
+      }
+      header {
+        border-left: 4px solid var(--blue);
+        padding-left: 12px;
+      }
+      h1 {
+        font-size: 22px;
+        letter-spacing: -0.04em;
+        margin: 0;
+      }
+      h2 {
+        font-size: 15px;
+        margin: 20px 0 8px;
+      }
+      p {
+        margin: 6px 0;
+      }
+      .caption {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        color: var(--muted);
+      }
+      .muted,
+      small {
+        color: var(--muted);
+      }
+      input,
+      textarea,
+      select,
+      button {
+        font: inherit;
+        color: inherit;
+      }
+      input,
+      textarea {
+        width: 100%;
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 8px;
+      }
+      input[type="checkbox"] {
+        width: auto;
+      }
+      textarea {
+        min-height: 78px;
+        resize: vertical;
+      }
+      label {
+        display: block;
+        margin: 8px 0;
+      }
+      button {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 6px 9px;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      button:focus-visible,
+      a:focus-visible,
+      input:focus-visible,
+      textarea:focus-visible {
+        outline: 3px solid var(--blue);
+        outline-offset: 2px;
+      }
+      .primary {
+        background: var(--blue);
+        color: #fff;
+        border-color: var(--blue);
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .card {
+        margin: 10px 0;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--paper);
+      }
+      .target {
+        display: block;
+        width: 100%;
+        text-align: left;
+        margin: 5px 0;
+      }
+      .target[aria-pressed="true"] {
+        border-left: 4px solid var(--blue);
+      }
+      img {
+        display: block;
+        max-width: 100%;
+        max-height: 220px;
+        object-fit: contain;
+        border: 1px solid var(--line);
+        margin: 8px 0;
+      }
+      pre {
+        font:
+          11px/1.6 ui-monospace,
+          monospace;
+        white-space: pre-wrap;
+        background: #edf2fa;
+        padding: 10px;
+        border-radius: 5px;
+      }
+      #status {
+        padding: 10px 0;
+        border-block: 1px solid var(--line);
+        margin: 15px 0;
+      }
+      .error {
+        color: #a12f35;
+      }
+      .send {
+        position: sticky;
+        bottom: 0;
+        background: #f7faff;
+        padding: 12px 0;
+        border-top: 1px solid var(--line);
+      }
+      .send button {
+        width: 100%;
+        font-weight: 600;
+      }
+      a {
+        color: var(--blue);
+      }
+      summary {
+        cursor: pointer;
+      }
+      kbd {
+        font:
+          12px ui-monospace,
+          monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          color: #edf2fa;
+          background: #162337;
+          --paper: #22334c;
+          --line: #526780;
+          --muted: #b8c8df;
+          --blue: #87aeff;
+        }
+        .primary {
+          color: #162337;
+        }
+        .send {
+          background: #162337;
+        }
+        pre {
+          background: #162337;
+        }
+        .error {
+          color: #ffb8bb;
+        }
+      }
+    </style>
+    <script src="sidepanel.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <p class="caption">Omnigent · Web annotations</p>
+      <h1>Page evidence</h1>
+      <p>Pick with the Chrome action or <kbd id="shortcut">Ctrl+Shift+Y</kbd>.</p>
+    </header>
+    <p id="status" role="status" aria-live="polite">Opening local tray…</p>
+    <section aria-labelledby="connection-heading">
+      <h2 id="connection-heading">Connection</h2>
+      <form id="connect-form">
+        <label
+          >HTTPS Omnigent server<input
+            id="server"
+            type="url"
+            required
+            placeholder="https://example.test/omnigent"
+            autocomplete="off" /></label
+        ><label
+          >Browser label<input
+            id="label"
+            maxlength="80"
+            required
+            value="Chrome"
+            autocomplete="off" /></label
+        ><button class="primary" type="submit">Connect browser</button>
+      </form>
+      <div id="connection"></div>
+    </section>
+    <section id="target-section" hidden aria-labelledby="target-heading">
+      <h2 id="target-heading">Receiving session</h2>
+      <div id="selected-target"></div>
+      <form id="search-form">
+        <label>Find a session<input id="search" type="search" maxlength="200" /></label
+        ><button type="submit">Search</button>
+      </form>
+      <div id="targets"></div>
+      <button type="button" id="more" hidden>More sessions</button>
+    </section>
+    <section aria-labelledby="tray-heading">
+      <h2 id="tray-heading">Unsent notes <span id="size" class="muted"></span></h2>
+      <label
+        ><input id="full-url" type="checkbox" /> Include query and fragment in future captures (may
+        contain private data; preview before Send)</label
+      >
+      <div id="tray"></div>
+      <div class="row">
+        <button type="button" id="copy">Copy notes</button
+        ><button type="button" id="refresh">Refresh sessions</button>
+      </div>
+    </section>
+    <section id="preview" hidden aria-labelledby="preview-heading">
+      <h2 id="preview-heading">Latest capture</h2>
+      <p>Temporary preview. “Saved locally” appears only after the storage transaction succeeds.</p>
+      <img id="image" alt="Latest visible crop" hidden />
+      <p id="failure" class="error" role="alert" hidden></p>
+      <pre id="evidence"></pre>
+      <button type="button" id="save-preview">Save this capture to the current account</button>
+    </section>
+    <div class="send">
+      <button type="button" class="primary" id="send" disabled>
+        Choose a target and add notes
+      </button>
+    </div>
+    <section aria-labelledby="batches-heading">
+      <h2 id="batches-heading">Delivery receipts and frozen batches</h2>
+      <div id="batches"></div>
+    </section>
+    <section aria-labelledby="recovery-heading">
+      <h2 id="recovery-heading">Previous connections</h2>
+      <p class="muted">
+        Only the same verified server and account can recover old notes. Reconnecting never sends
+        them.
+      </p>
+      <div id="recovery"></div>
+    </section>
+  </body>
+</html>

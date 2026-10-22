@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Omnigent web annotations",
+  "version": "0.1.0",
+  "description": "Pick visible page evidence for Omnigent.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs3YVRqafWmmuk0SRLccaJRBla9yoG+AA2ZDkGX8FEB75+JVOv17w8HqP2ryQF60I6MR8lqTf+XSn1J2YuNXE7Mom9SyeZ91NPZgGZBJGCGrGnJPOlc215kIZLG1iJS9jscnS62KLn6FdVOp2BzCWEQFMz+QVq0FMxy3VClf2jjmNcfRv9jvvzYEkTWF75LpQDdXRW5cLVx0NRjbY5E1oAiGH6rEXMlaHpebI6gRi6Jp0g3Y09rW6WGZvNJYSuNDwEgHhZtZJLotU60EweMdMbNjyxy5/ooZQrj48hIcIcMfuZJWjdAIMZsP8Q6kBNgzEA2Yhj3aN0ffNtSCCcECNIwIDAQAB",
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
+  "optional_host_permissions": ["https://*/*"],
+  "action": {
+    "default_title": "Pick page evidence"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Pick page evidence"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  }
+}
