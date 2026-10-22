@@ -1656,8 +1656,7 @@ function startInboxPoller(
       }
       if (payload.type === "thinking_level_change") {
         // Point-in-time: one delivery attempt, then always consume the file.
-        // Pi's setThinkingLevel is async but fire-and-forget here — success is
-        // visible in Pi's TUI menu and the returned promise is discarded.
+        // The callback reads back Pi's effective level after its synchronous setter.
         if (
           typeof handleThinkingLevelChange === "function" &&
           typeof payload.thinkingLevel === "string"
@@ -1697,6 +1696,30 @@ module.exports = function (pi) {
   let latestContext = null;
   let rotationInFlight = false;
   let rotationPending = false;
+  let settingThinkingLevel = false;
+  let lastReportedThinkingLevel;
+  let thinkingLevelReport = Promise.resolve();
+  function reportThinkingLevel(force = false) {
+    // Serialize posts and read state when sending, so concurrent native events
+    // cannot deliver an older snapshot after a newer selection.
+    thinkingLevelReport = thinkingLevelReport.then(async () => {
+      try {
+        if (typeof pi.getThinkingLevel !== "function") return;
+        const level = pi.getThinkingLevel();
+        if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)) return;
+        if (!force && level === lastReportedThinkingLevel) return;
+        await postEventChecked(config, {
+          type: "external_reasoning_effort_change",
+          data: { reasoning_effort: level === "off" ? "none" : level },
+        });
+        lastReportedThinkingLevel = level;
+      } catch (_err) {
+        lastReportedThinkingLevel = undefined;
+        // Legacy APIs and a temporarily unavailable server must not break Pi.
+      }
+    });
+    return thinkingLevelReport;
+  }
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -2434,7 +2457,18 @@ module.exports = function (pi) {
         }
       },
       (model) => applyModelChange(pi, config, latestContext, model),
-      (level) => pi.setThinkingLevel(level),
+      (level) => {
+        settingThinkingLevel = true;
+        try {
+          pi.setThinkingLevel(level);
+        } catch (_err) {
+          // Report the unchanged effective value if Pi rejects the request.
+        } finally {
+          settingThinkingLevel = false;
+        }
+        // A clamped request can leave Pi unchanged and emit no native event.
+        return reportThinkingLevel(true);
+      },
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
         // state on SDK versions that don't expose isIdle() (same fallback
@@ -2489,6 +2523,7 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
+    await reportThinkingLevel();
     // Readiness is not turn completion: a queued prompt may already be running.
     // Only agent_end publishes idle so startup cannot complete a child task.
   });
@@ -2498,8 +2533,13 @@ module.exports = function (pi) {
     await publishTaskList();
   });
 
+  pi.on("thinking_level_select", async () => {
+    if (!settingThinkingLevel) await reportThinkingLevel();
+  });
+
   pi.on("model_select", async (event, ctx) => {
     rememberContext(ctx);
+    await reportThinkingLevel();
     // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
     // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
     // ``restore`` — that is Pi re-applying the session's saved model at

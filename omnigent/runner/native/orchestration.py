@@ -2745,6 +2745,10 @@ async def _auto_create_pi_terminal(
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     pi_binding = binding_for_harness(load_runtime_inference_config(), "pi-native")
+    explicit_thinking = any(
+        arg == "--thinking" or arg.startswith("--thinking=")
+        for arg in launch_config.terminal_launch_args or []
+    )
     if pi_binding is not None and _pi_args_have_provider(launch_config.terminal_launch_args or []):
         raise ValueError(
             "This session has a configured Pi provider. Select its model in the composer "
@@ -2773,7 +2777,7 @@ async def _auto_create_pi_terminal(
             launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",
                 provider,
-                launch_config.reasoning_effort,
+                None if explicit_thinking else launch_config.reasoning_effort,
                 selection=spec_model,
             )
             pi_env.update(launch.env)
@@ -2795,6 +2799,25 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 pi_args.extend(["--model", own_login_model])
+    # Own-login launches need the saved effort even when no model is pinned.
+    # Managed launches already supply it; deliberate CLI choices take priority.
+    if not any(arg == "--thinking" or arg.startswith("--thinking=") for arg in pi_args):
+        from omnigent.util.reasoning_effort import (
+            EFFORT_CLEAR_VALUES,
+            PI_EFFORTS,
+            to_pi_thinking_level,
+            validate_effort,
+        )
+
+        effort = launch_config.reasoning_effort
+        if effort and effort not in EFFORT_CLEAR_VALUES:
+            try:
+                effort = validate_effort(effort, "pi", PI_EFFORTS)
+            except ValueError as exc:
+                effort_notice = str(exc) if not credential_warning else None
+            else:
+                if effort is not None:
+                    pi_args.extend(["--thinking", to_pi_thinking_level(effort)])
     from omnigent.inner.pi_settings import ordered_pi_launch
     from omnigent.permission_tiers.host import (
         HOST_PERMISSION_STATE_FILE,
