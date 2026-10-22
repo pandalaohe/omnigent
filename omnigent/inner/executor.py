@@ -645,6 +645,28 @@ def classify_tool_result(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ExecutorResidentOwner:
+    """Registered execution owner evidence, not a normalized resident count."""
+
+    incarnation_id: str
+    session_keys: tuple[str, ...]
+    vendor_context_id: str | None
+    started: bool
+    closing: bool
+    cleanup_complete: bool
+
+
+@dataclass(frozen=True)
+class ExecutorResidentInventory:
+    """Only registered owners are enumerated; missing coverage remains unknown."""
+
+    owners: tuple[ExecutorResidentOwner, ...]
+    ambiguous_context_ids: tuple[str, ...] = ()
+    aliases_complete: bool = False
+    context_coverage_complete: bool = False
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -685,6 +707,10 @@ class Executor:
         return False
 
     def max_context_tokens(self) -> int | None:
+        return None
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Read owned context evidence without construction or probes; None is unknown."""
         return None
 
     async def close_session(self, session_key: str) -> None:  # noqa: ARG002 — default no-op; subclasses with per-session state override

@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorResidentInventory,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -225,6 +226,8 @@ class ExecutorAdapter(HarnessApp):
         # until completion; drained before recovery and on shutdown.
         self._bg_tasks: set[asyncio.Task[bool]] = set()
         self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
+        # Cleanup cannot prove complete coverage of owners left outside the current executor.
+        self._resident_inventory_detached = False
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -649,6 +652,8 @@ class ExecutorAdapter(HarnessApp):
             # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
                 abandoned_executor = self._executor
+                if abandoned_executor is not None:
+                    self._resident_inventory_detached = True
                 self._executor = None
                 interrupt_task = asyncio.create_task(
                     self._safe_interrupt(abandoned_executor, self._session_key)
@@ -667,6 +672,17 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is not None:
             await self._executor.interrupt_session(self._session_key)
         return response
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Read only the current owner; detached cleanup leaves coverage unknown."""
+        if (
+            self._executor is None
+            or self._resident_inventory_detached
+            or self._abandoned_executor_cleanup is not None
+            or self._bg_tasks
+        ):
+            return None
+        return self._executor.resident_inventory()
 
     async def _keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
         """Answer a keep-warm ping through the inner executor's channel."""
@@ -753,6 +769,8 @@ class ExecutorAdapter(HarnessApp):
                     self._session_key,
                 )
                 executor = self._executor
+                if executor is not None:
+                    self._resident_inventory_detached = True
                 self._executor = None
                 self._current_ctx = None
                 self._current_agent = None
@@ -1359,6 +1377,7 @@ class ExecutorAdapter(HarnessApp):
             await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
             self._bg_tasks.clear()
         if self._executor is not None:
+            self._resident_inventory_detached = True
             await self._executor.close_session(self._session_key)
             await self._executor.close()
             self._executor = None

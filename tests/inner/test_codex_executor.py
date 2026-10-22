@@ -8501,3 +8501,115 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
         assert session._certificate_failure is None
 
     _run(_t())
+
+
+def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monkeypatch):
+    from dataclasses import asdict
+
+    identities = iter(["1" * 32, "2" * 32, "3" * 32])
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.uuid4",
+        lambda: SimpleNamespace(hex=next(identities)),
+    )
+    executor = CodexExecutor(codex_path="/bin/echo")
+    sessions = [
+        _CodexAppServerSession(codex_path="/bin/echo", cwd=None, env={}, tool_executor=None)
+        for _ in range(3)
+    ]
+    for app, thread in zip(sessions, ["thread-main", "thread-side", "thread-main"], strict=True):
+        app.thread_id = thread
+        app._started = True
+        app._cleaned = False
+        app.start = AsyncMock(side_effect=AssertionError("inventory must not start"))
+        app.close = AsyncMock(side_effect=AssertionError("inventory must not close"))
+    executor._session_states = {
+        "main": _CodexSessionState(app_session=sessions[0]),
+        "ui-alias": _CodexSessionState(app_session=sessions[0]),
+        "side": _CodexSessionState(app_session=sessions[1], closing=True),
+        "ambiguous-alias": _CodexSessionState(app_session=sessions[2]),
+    }
+    snapshot = executor.resident_inventory()
+    assert asdict(snapshot) == {
+        "owners": (
+            {
+                "incarnation_id": "1" * 32,
+                "session_keys": ("main", "ui-alias"),
+                "vendor_context_id": "thread-main",
+                "started": True,
+                "closing": False,
+                "cleanup_complete": False,
+            },
+            {
+                "incarnation_id": "2" * 32,
+                "session_keys": ("side",),
+                "vendor_context_id": "thread-side",
+                "started": True,
+                "closing": True,
+                "cleanup_complete": False,
+            },
+            {
+                "incarnation_id": "3" * 32,
+                "session_keys": ("ambiguous-alias",),
+                "vendor_context_id": "thread-main",
+                "started": True,
+                "closing": False,
+                "cleanup_complete": False,
+            },
+        ),
+        "ambiguous_context_ids": ("thread-main",),
+        "aliases_complete": False,
+        "context_coverage_complete": False,
+    }
+    executor._session_states = dict(reversed(tuple(executor._session_states.items())))
+    assert executor.resident_inventory() == snapshot
+    executor._session_states.clear()
+    sessions[0].thread_id = "changed"
+    assert snapshot.owners[0].vendor_context_id == "thread-main"
+    assert snapshot.owners[0].session_keys == ("main", "ui-alias")
+    for app in sessions:
+        app.start.assert_not_called()
+        app.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_retains_closing_owner_until_cleanup_and_replacement(monkeypatch):
+    identities = iter(["a" * 32, "b" * 32])
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.uuid4", lambda: SimpleNamespace(hex=next(identities))
+    )
+    executor = CodexExecutor(codex_path="/bin/echo")
+    assert executor.resident_inventory().owners == ()
+    app = _CodexAppServerSession(codex_path="/bin/echo", cwd=None, env={}, tool_executor=None)
+    app.thread_id = "thread"
+    app._started, app._cleaned = True, False
+    executor._session_states["session"] = _CodexSessionState(app_session=app)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def close():
+        entered.set()
+        await release.wait()
+        app._cleaned = True
+
+    monkeypatch.setattr(app, "close", close)
+    closing = asyncio.create_task(executor.close_session("session"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (owner,) = executor.resident_inventory().owners
+        assert owner.incarnation_id == "a" * 32
+        assert owner.vendor_context_id == "thread"
+        assert owner.closing and not owner.cleanup_complete
+    finally:
+        release.set()
+        await asyncio.wait_for(closing, 2)
+    empty = executor.resident_inventory()
+    assert empty.owners == () and empty.context_coverage_complete is False
+    replacement = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd=None, env={}, tool_executor=None
+    )
+    executor._session_states["session"] = _CodexSessionState(app_session=replacement)
+    (owner,) = executor.resident_inventory().owners
+    assert owner.incarnation_id == "b" * 32
+    assert owner.vendor_context_id is None and not owner.started
+    assert app.resident_incarnation_id == "a" * 32
+    executor._session_states["unsupported"] = _CodexSessionState(app_session=SimpleNamespace())
+    assert executor.resident_inventory() is None

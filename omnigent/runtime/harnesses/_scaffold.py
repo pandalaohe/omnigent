@@ -44,7 +44,7 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, FastAPI, Request, Response, status
@@ -52,6 +52,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
+from omnigent.inner.executor import ExecutorResidentInventory
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -996,6 +997,10 @@ class HarnessApp:
         # shutdown started.
         self._shutting_down = asyncio.Event()
 
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Unsupported owners provide unknown coverage rather than an empty inventory."""
+        return None
+
     async def on_shutdown(self) -> None:
         """
         Subclass hook invoked during lifespan teardown.
@@ -1226,6 +1231,11 @@ class HarnessApp:
         """
         router = APIRouter()
         router.add_api_route(
+            "/sessions/{conversation_id}/resident-inventory",
+            self._get_resident_inventory,
+            methods=["GET"],
+        )
+        router.add_api_route(
             "/sessions/{conversation_id}/events",
             self._post_session_event,
             methods=["POST"],
@@ -1237,6 +1247,14 @@ class HarnessApp:
             response_model=None,
         )
         return router
+
+    async def _get_resident_inventory(self, conversation_id: str, request: Request) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        snapshot = self.resident_inventory()
+        return JSONResponse({"inventory": asdict(snapshot) if snapshot is not None else None})
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
         """

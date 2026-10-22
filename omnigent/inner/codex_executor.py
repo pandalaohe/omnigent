@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
+from uuid import uuid4
 
 import psutil
 from packaging.version import InvalidVersion, Version
@@ -116,6 +117,8 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorResidentInventory,
+    ExecutorResidentOwner,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -3099,6 +3102,7 @@ class _CodexAppServerSession:
         thread_model_provider: str | None = None,
     ) -> None:
         self._codex_path = codex_path
+        self._resident_incarnation_id = uuid4().hex
         self._cwd = cwd
         self._env = env
         self._usage_session_id: str | None = None
@@ -3197,6 +3201,11 @@ class _CodexAppServerSession:
         # retirement would otherwise retire the first ping's live fork queue.
         # Held across the whole ping, including the cleanup retirement.
         self._keep_warm_lock = asyncio.Lock()
+
+    @property
+    def resident_incarnation_id(self) -> str:
+        """Identity of this owner object, independent of session keys and vendor thread."""
+        return self._resident_incarnation_id
 
     async def start(self) -> None:
         """Start signer and worker transactionally."""
@@ -5680,6 +5689,52 @@ class CodexExecutor(Executor):
             logger.exception("codex: keep-warm ping failed")
             return keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
         return keep_warm_result_receipt(attempt_id, result)
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Copy registered app-session owners, including unconfirmed closing owners.
+
+        Maintenance forks, unregistered contexts and cross-owner aliases are not
+        covered. Equal vendor IDs on different owners remain ambiguous evidence.
+        """
+        owners: dict[str, tuple[_CodexAppServerSession, list[str], bool]] = {}
+        for session_key, state in tuple(self._session_states.items()):
+            app = state.app_session
+            if app is None:
+                continue
+            if not isinstance(app, _CodexAppServerSession):
+                return None
+            identity = app.resident_incarnation_id
+            previous = owners.get(identity)
+            if previous is None:
+                owners[identity] = (app, [session_key], state.closing)
+            else:
+                previous[1].append(session_key)
+                owners[identity] = (app, previous[1], previous[2] or state.closing)
+        snapshots = tuple(
+            ExecutorResidentOwner(
+                incarnation_id=identity,
+                session_keys=tuple(sorted(keys)),
+                vendor_context_id=app.thread_id,
+                started=app._started,
+                closing=closing or app._closing,
+                cleanup_complete=app.cleaned,
+            )
+            for identity, (app, keys, closing) in sorted(owners.items())
+        )
+        context_owners: dict[str, set[str]] = {}
+        for owner in snapshots:
+            if owner.vendor_context_id is not None:
+                context_owners.setdefault(owner.vendor_context_id, set()).add(owner.incarnation_id)
+        return ExecutorResidentInventory(
+            owners=snapshots,
+            ambiguous_context_ids=tuple(
+                sorted(
+                    context_id
+                    for context_id, identities in context_owners.items()
+                    if len(identities) > 1
+                )
+            ),
+        )
 
     def _live_app_session(self) -> _CodexAppServerSession | None:
         """

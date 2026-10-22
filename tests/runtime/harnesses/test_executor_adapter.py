@@ -2950,3 +2950,185 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_read_is_authenticated_bound_and_never_constructs():
+    from unittest.mock import Mock
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    factory = Mock(side_effect=AssertionError("inventory must not construct an executor"))
+    adapter = ExecutorAdapter(factory)
+    app = adapter.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = "test-auth"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://harness"
+    ) as client:
+        route = "/v1/sessions/conversation/resident-inventory"
+        assert (await client.get(route)).status_code == 401
+        client.headers["Authorization"] = "Bearer test-auth"
+        assert (await client.get("/v1/sessions/other/resident-inventory")).status_code == 404
+        response = await client.get(route)
+        assert response.status_code == 200
+        assert response.json() == {"inventory": None}
+        adapter._executor = Executor()
+        assert (await client.get(route)).json() == {"inventory": None}
+    factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_http_reads_codex_owner_and_preserves_detached_unknown(
+    monkeypatch,
+):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omnigent.inner.codex_executor import (
+        CodexExecutor,
+        _CodexAppServerSession,
+        _CodexSessionState,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.uuid4", lambda: SimpleNamespace(hex="a" * 32)
+    )
+    factory = Mock(side_effect=AssertionError("read must not construct"))
+    adapter = ExecutorAdapter(factory)
+    adapter._ensure_executor = Mock(side_effect=AssertionError("read must not prepare"))
+    executor = CodexExecutor(codex_path="/bin/echo")
+    app_session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd=None, env={}, tool_executor=None
+    )
+    executor._session_states["owner-key"] = _CodexSessionState(app_session=app_session)
+    adapter._executor = executor
+    app = adapter.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = "test-auth"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer test-auth"},
+    ) as client:
+        route = "/v1/sessions/conversation/resident-inventory"
+        assert (await client.get(route)).json() == {
+            "inventory": {
+                "owners": [
+                    {
+                        "incarnation_id": "a" * 32,
+                        "session_keys": ["owner-key"],
+                        "vendor_context_id": None,
+                        "started": False,
+                        "closing": False,
+                        "cleanup_complete": True,
+                    }
+                ],
+                "ambiguous_context_ids": [],
+                "aliases_complete": False,
+                "context_coverage_complete": False,
+            }
+        }
+        cleanup = asyncio.create_task(asyncio.sleep(0, result=True))
+        adapter._abandoned_executor_cleanup = cleanup
+        assert (await client.get(route)).json() == {"inventory": None}
+        await cleanup
+        assert (await client.get(route)).json() == {"inventory": None}
+    factory.assert_not_called()
+    adapter._ensure_executor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_owner_failure_is_not_silently_reported_empty():
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    class BrokenOwner(Executor):
+        def resident_inventory(self):
+            raise RuntimeError("owner read failed")
+
+    adapter = ExecutorAdapter(BrokenOwner)
+    adapter._executor = BrokenOwner()
+    app = adapter.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = "test-auth"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer test-auth"},
+    ) as client:
+        response = await client.get("/v1/sessions/conversation/resident-inventory")
+    assert response.status_code == 500
+    assert "inventory" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_fails", [False, True], ids=["closed", "close-failed"])
+async def test_resident_inventory_stays_unknown_after_orphan_resync_replacement(close_fails):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import ExecutorResidentInventory
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    class InventoryExecutor(Executor):
+        def resident_inventory(self):
+            return ExecutorResidentInventory(owners=())
+
+    close_started = asyncio.Event()
+    finish_close = asyncio.Event()
+
+    async def close_session(session_key):
+        assert session_key == "owner-key"
+        close_started.set()
+        await asyncio.wait_for(finish_close.wait(), timeout=2)
+        if close_fails:
+            raise RuntimeError("detached close_session failed")
+
+    old = InventoryExecutor()
+    old.close_session = AsyncMock(side_effect=close_session)
+    old.close = AsyncMock(
+        side_effect=RuntimeError("detached close failed") if close_fails else None
+    )
+    replacement = InventoryExecutor()
+    replacement.keep_warm = AsyncMock(return_value={"status": "warm"})
+    factory = Mock(return_value=replacement)
+    adapter = ExecutorAdapter(factory, session_key="owner-key")
+    adapter._executor = old
+    app = adapter.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = "test-auth"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer test-auth"},
+    ) as client:
+        route = "/v1/sessions/conversation/resident-inventory"
+        assert (await client.get(route)).json() == {
+            "inventory": {
+                "owners": [],
+                "ambiguous_context_ids": [],
+                "aliases_complete": False,
+                "context_coverage_complete": False,
+            }
+        }
+        resync = asyncio.create_task(adapter._maybe_resync_on_orphan(force=True))
+        try:
+            await asyncio.wait_for(close_started.wait(), timeout=2)
+            assert await adapter._keep_warm(attempt_id="warm-attempt", family="codex") == {
+                "status": "warm"
+            }
+            factory.assert_called_once_with()
+            assert adapter._executor is replacement
+            replacement.keep_warm.assert_awaited_once_with(
+                attempt_id="warm-attempt", family="codex"
+            )
+            assert (await client.get(route)).json() == {"inventory": None}
+        finally:
+            finish_close.set()
+            await asyncio.wait_for(resync, timeout=2)
+        assert adapter._resyncing is False
+        old.close_session.assert_awaited_once_with("owner-key")
+        old.close.assert_awaited_once_with()
+        assert (await client.get(route)).json() == {"inventory": None}
