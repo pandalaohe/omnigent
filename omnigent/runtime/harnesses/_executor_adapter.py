@@ -208,6 +208,8 @@ class ExecutorAdapter(HarnessApp):
         self._harness_label = harness_label
         # Lazily-constructed inner executor, reused across turns for the conversation lifetime.
         self._executor: Executor | None = None
+        # Stable callbacks and tool-call correlation state belong to one admitted turn.
+        self._turn_active = False
         # Per-turn turn context. The stable tool/elicitation/policy bridges read this at call
         # time so MCP handlers that closure-captured the bridge on turn 1 dispatch into the
         # current turn's ctx, not turn 1's dead ctx.
@@ -246,6 +248,15 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
+        if self._turn_active:
+            raise StartupPermissionUnavailable(f"{self._harness_label} query already active")
+        self._turn_active = True
+        try:
+            await self._run_admitted_turn(request, ctx)
+        finally:
+            self._turn_active = False
+
+    async def _run_admitted_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         startup_attempt = request.startup_attempt
         startup_required = request.startup_required or startup_attempt is not None
         if startup_required:

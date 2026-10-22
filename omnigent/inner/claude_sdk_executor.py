@@ -37,7 +37,7 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial
@@ -1935,7 +1935,8 @@ class ClaudeSDKExecutor(Executor):
         self._clients: dict[str, _ClaudeClientState] = {}
         # Per-session query slots serializing real turns and keep-warm pings.
         self._query_slots: dict[str, _QuerySlot] = {}
-        self._active_turns: set[str] = set()
+        self._active_turns: dict[str, int] = {}
+        self._startup_turns: set[str] = set()
         self._pending_framework_context: dict[str, str] = {}
         self._peer_pending: dict[str, list[_ClaudePeerPending]] = {}
         self._peer_late: dict[str, list[_ClaudePeerPending]] = {}
@@ -3223,16 +3224,30 @@ class ClaudeSDKExecutor(Executor):
         system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
-        """Keep one exclusive SDK response stream per session."""
+        """Reserve startup streams without changing warm-turn recovery."""
         session_key = self._session_key(messages)
-        if session_key in self._active_turns:
-            raise RuntimeError("Claude SDK query already active")
-        self._active_turns.add(session_key)
+        startup_turn = ClaudeTurnEvidence("").enabled
+        active_count = self._active_turns.get(session_key, 0)
+        if session_key in self._startup_turns or (startup_turn and active_count):
+            raise StartupPermissionUnavailable("Claude SDK query already active")
+        self._active_turns[session_key] = active_count + 1
+        if startup_turn:
+            self._startup_turns.add(session_key)
+        turn = self._run_turn_impl(messages, tools, system_prompt, config)
         try:
-            async for event in self._run_turn_impl(messages, tools, system_prompt, config):
+            async for event in turn:
                 yield event
         finally:
-            self._active_turns.remove(session_key)
+            try:
+                await turn.aclose()
+            finally:
+                if startup_turn:
+                    self._startup_turns.remove(session_key)
+                remaining = self._active_turns[session_key] - 1
+                if remaining:
+                    self._active_turns[session_key] = remaining
+                else:
+                    del self._active_turns[session_key]
 
     async def _run_turn_impl(
         self,
@@ -3240,7 +3255,7 @@ class ClaudeSDKExecutor(Executor):
         tools: list[ToolSpec],
         system_prompt: str,
         config: ExecutorConfig | None = None,
-    ) -> AsyncIterator[ExecutorEvent]:
+    ) -> AsyncGenerator[ExecutorEvent, None]:
         """Run one turn via the Claude Agent SDK.
 
         The SDK receives the latest user message as a prompt and runs its full
@@ -3306,7 +3321,7 @@ class ClaudeSDKExecutor(Executor):
             or not isinstance(prompt, str)
             or not callable(getattr(sdk, "HookMatcher", None))
         ):
-            raise RuntimeError("Claude SDK startup proof unavailable")
+            raise StartupPermissionUnavailable("Claude SDK startup proof unavailable")
         if not resume_session and not replacing_client:
             await claim_startup_boundary("executor_prepare")
 

@@ -123,7 +123,7 @@ async def test_refused_cold_boundary_preserves_executor_and_finishes_trace(monke
 
     executor = DeniedExecutor()
     adapter = ExecutorAdapter(lambda: executor)
-    ctx = _scaffold.TurnContext("response", asyncio.Queue(), asyncio.Event(), "session")
+    ctx = _scaffold.TurnContext("resp_" + "a" * 32, asyncio.Queue(), asyncio.Event(), "session")
     trace, span = Mock(), Mock()
     trace.start_agent_span.return_value = span
     monkeypatch.setattr(_executor_adapter, "is_tracing_enabled", lambda: True)
