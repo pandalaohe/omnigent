@@ -3700,6 +3700,176 @@ def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+@pytest.mark.parametrize(
+    ("getter", "expected"),
+    [
+        ('() => "max"', "max"),
+        ('() => "high"', "high"),
+        ('() => "off"', "none"),
+        ("undefined", None),
+        ('() => { throw new Error("unavailable"); }', None),
+        ('() => "unknown"', None),
+    ],
+)
+def test_session_start_reports_effective_thinking_level(
+    getter: str,
+    expected: str | None,
+) -> None:
+    """Read Pi's effective level, including clamping, without requiring a getter."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _usage_test_preamble()
+        + f"\npi.getThinkingLevel = {getter};\nconst expected = {json.dumps(expected)};\n"
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  const changes = postedEvents.filter((e) => e.type === "external_reasoning_effort_change");
+  assert.deepEqual(changes.map((e) => e.data),
+    expected === null ? [] : [{ reasoning_effort: expected }]);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_thinking_changes_report_effective_level_without_duplicate_native_events() -> None:
+    """Inbox acknowledgements read back clamping even when Pi emits no change event."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+let level = "high";
+const requested = [];
+pi.getThinkingLevel = () => level;
+pi.setThinkingLevel = (value) => {
+  requested.push(value);
+  const previous = level;
+  level = value === "medium" ? "high" : value;
+  if (previous !== level && handlers.thinking_level_select)
+    void handlers.thinking_level_select({ source: "set", level }, ctx);
+};
+function efforts() {
+  return posted.filter((e) => e.type === "external_reasoning_effort_change")
+    .map((e) => e.data.reasoning_effort);
+}
+async function deliverThinking(value, id) {
+  const file = path.join(inboxDir, `000-thinking-${id}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    id, type: "thinking_level_change", thinkingLevel: value,
+  }));
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("thinking change was not consumed");
+    await sleep(20);
+  }
+  await sleep(20);
+}
+(async () => {
+  await handlers.session_start({}, ctx);
+  assert.deepEqual(efforts(), ["high"]);
+  // Medium clamps back to high and emits no native event, but must correct the web choice.
+  await deliverThinking("medium", "clamped");
+  await deliverThinking("max", "maximum");
+  await deliverThinking("off", "disabled");
+  assert.deepEqual(requested, ["medium", "max", "off"]);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none"]);
+  assert.equal(typeof handlers.thinking_level_select, "function");
+  // A delayed native event from the setter also must not duplicate the acknowledgement.
+  await handlers.thinking_level_select({ source: "set", level: "off" }, ctx);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none"]);
+  level = "low";
+  await handlers.thinking_level_select({ source: "cycle", level: "max" }, ctx);
+  await handlers.thinking_level_select({ source: "cycle", level: "low" }, ctx);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low"]);
+  // Model changes may clamp the level without emitting thinking_level_select.
+  level = "off";
+  await handlers.model_select({ source: "set", model: ctx.model }, ctx);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low", "none"]);
+  pi.setThinkingLevel = () => { throw new Error("request rejected"); };
+  await deliverThinking("max", "rejected");
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low", "none", "none"]);
+  // A legacy API still consumes a request safely without inventing an effective value.
+  delete pi.getThinkingLevel;
+  await deliverThinking("max", "legacy");
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low", "none", "none"]);
+  finish();
+})().catch((error) => {
+  finish(); console.error(error); process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_thinking_reports_retry_failures_and_serialize_live_state() -> None:
+    """A failed POST stays retryable and queued reports never restore stale state."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+let level = "high";
+pi.getThinkingLevel = () => level;
+pi.setThinkingLevel = (value) => {
+  assert.equal(value, "medium");
+  level = "high";
+};
+(async () => {
+  await handlers.session_start({}, ctx);
+  assert.deepEqual(posted.filter((e) => e.type === "external_reasoning_effort_change")
+    .map((e) => e.data.reasoning_effort), ["high"]);
+  let failedAcknowledgements = 0;
+  global.fetch = async (_url, request) => {
+    const event = JSON.parse(request.body);
+    if (event.type !== "external_reasoning_effort_change") return { ok: true };
+    assert.equal(event.data.reasoning_effort, "high");
+    failedAcknowledgements += 1;
+    return { ok: false, status: 503 };
+  };
+  const file = path.join(inboxDir, "000-thinking-clamped.json");
+  fs.writeFileSync(file, JSON.stringify({
+    id: "clamped", type: "thinking_level_change", thinkingLevel: "medium",
+  }));
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("thinking change was not consumed");
+    await sleep(20);
+  }
+  await sleep(20);
+  assert.equal(failedAcknowledgements, 1);
+  const completed = [];
+  let release;
+  global.fetch = async (_url, request) => {
+    const event = JSON.parse(request.body);
+    if (event.type !== "external_reasoning_effort_change") return { ok: true };
+    if (event.data.reasoning_effort === "high")
+      await new Promise((resolve) => { release = resolve; });
+    completed.push(event.data.reasoning_effort);
+    return { ok: true };
+  };
+  const retry = handlers.thinking_level_select({}, ctx);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof release, "function");
+  level = "max";
+  const queued = handlers.thinking_level_select({}, ctx);
+  level = "off";
+  const latest = handlers.thinking_level_select({}, ctx);
+  assert.deepEqual(completed, []);
+  release();
+  await Promise.all([retry, queued, latest]);
+  assert.deepEqual(completed, ["high", "none"]);
+  finish();
+})().catch((error) => { finish(); console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None:
     """
     On ``session_start`` the extension posts Pi's auth-configured model catalog.
