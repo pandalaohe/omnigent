@@ -560,13 +560,13 @@ class NativeBackendThreadInventorySnapshot:
     context_coverage_complete: bool = False
 
 
-async def read_native_backend_thread_inventory(
+async def prepare_native_backend_thread_inventory(
     *, timeout_s: float = 5.0
-) -> NativeBackendThreadInventorySnapshot:
-    """Use retained clients only, reconciling every binding after all reads finish.
+) -> Callable[[], NativeBackendThreadInventorySnapshot]:
+    """Read retained clients and return a synchronous final reconciliation.
 
-    Loaded IDs are vendor evidence, not independent-context or alias proof. The
-    separate frozen result does not change the existing pure owner endpoint.
+    Sample the returned reader after other sources finish awaiting. Loaded IDs
+    are vendor evidence, not independent-context, fresh-revision or alias proof.
     """
     selected = native_backend_resident_inventory()
 
@@ -615,18 +615,29 @@ async def read_native_backend_thread_inventory(
                     workers.create_task(read_owners())
         except TimeoutError:
             pass
-    current = native_backend_resident_inventory()
-    thread_ids = tuple(
-        reads.get(owner.incarnation_id)
-        if (
-            (candidate := candidates.get(owner.incarnation_id)) is not None
-            and candidate[0] == owner
-            and binding_for(owner) is candidate[1]
+
+    def reconcile() -> NativeBackendThreadInventorySnapshot:
+        current = native_backend_resident_inventory()
+        thread_ids = tuple(
+            reads.get(owner.incarnation_id)
+            if (
+                (candidate := candidates.get(owner.incarnation_id)) is not None
+                and candidate[0] == owner
+                and binding_for(owner) is candidate[1]
+            )
+            else None
+            for owner in current.owners
         )
-        else None
-        for owner in current.owners
-    )
-    return NativeBackendThreadInventorySnapshot(current, thread_ids)
+        return NativeBackendThreadInventorySnapshot(current, thread_ids)
+
+    return reconcile
+
+
+async def read_native_backend_thread_inventory(
+    *, timeout_s: float = 5.0
+) -> NativeBackendThreadInventorySnapshot:
+    """Read native evidence when no other sources need to await before returning."""
+    return (await prepare_native_backend_thread_inventory(timeout_s=timeout_s))()
 
 
 async def _start_native_backend(

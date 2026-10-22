@@ -53,6 +53,7 @@ async def test_owner_reader_preserves_missing_registry_and_incomplete_aliases(
             "harnesses": None,
             "executor_contexts_complete": False,
             "external_owners_complete": False,
+            "native_thread_ids": [],
         }
 
 
@@ -888,3 +889,129 @@ async def test_runner_owner_inventory_deadline_includes_registry_waits(
         await asyncio.gather(read, return_exceptions=True)
         if locked.is_set():
             manager._registry_lock.release()
+
+
+@pytest.mark.parametrize("bound", [False, True])
+async def test_runner_inventory_transports_native_threads_after_auth(
+    harness_inventory_reader, native_thread_inventory, bound
+):
+    _, _, client, _ = harness_inventory_reader
+    backend, native = native_thread_inventory("main", bind=bound)
+    orchestration._AUTO_CODEX_APP_SERVERS["ui"] = backend
+    client.headers.clear()
+    assert (await client.get("/v1/startup/owner-inventory?read_id=native")).status_code == 401
+    native.read_loaded_thread_ids.assert_not_called()
+    client.headers["Authorization"] = "Bearer runner-auth"
+    response = await client.get("/v1/startup/owner-inventory?read_id=native")
+    assert response.status_code == 200
+    assert response.json().get("native_thread_ids") == ([["thread-one"]] if bound else [None])
+    assert response.json()["native_backends"]["owners"][0]["session_ids"] == ["main", "ui"]
+    assert response.json()["executor_contexts_complete"] is False
+    assert response.json()["external_owners_complete"] is False
+    assert native.read_loaded_thread_ids.await_count == int(bound)
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "rebind", "backend", "generation", "incarnation", "closing"]
+)
+async def test_runner_inventory_rechecks_native_after_harness_reconciliation_wait(
+    harness_inventory_reader, native_thread_inventory, monkeypatch, change
+):
+    manager, add, client, _ = harness_inventory_reader
+    await add("harness", ExecutorResidentInventory(owners=()))
+    backend, native = native_thread_inventory("native")
+    entered, resume = asyncio.Event(), asyncio.Event()
+    original = manager.resident_inventory
+
+    async def paused(**kwargs):
+        if "context_reads" in kwargs:
+            entered.set()
+            await resume.wait()
+        return await original(**kwargs)
+
+    monkeypatch.setattr(manager, "resident_inventory", paused)
+    read = asyncio.create_task(client.get("/v1/startup/owner-inventory?read_id=late-native"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert native.read_loaded_thread_ids.await_count == 1
+        if change in {"rebind", "backend"}:
+            if change == "backend":
+                backend = SimpleNamespace(**vars(backend))
+                orchestration._AUTO_CODEX_APP_SERVERS["native"] = backend
+            orchestration._bind_codex_inventory_client(
+                "native", backend, native, incarnation_id="backend-native"
+            )
+        elif change == "generation":
+            native.resident_connection_generation = 4
+        elif change == "incarnation":
+            backend.resident_incarnation_id = "restarted-native"
+        elif change == "closing":
+            orchestration._CLOSING_NATIVE_BACKENDS[object()] = orchestration._ClosingNativeBackend(
+                "backend-native", "native", "codex-native", backend
+            )
+        resume.set()
+        body = (await asyncio.wait_for(read, 2)).json()
+        assert body["native_thread_ids"] == ([["thread-one"]] if change == "none" else [None])
+        assert body["harnesses"]["contexts"][0]["inventory"]["owners"] == []
+    finally:
+        resume.set()
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize("change", ["none", "generation", "teardown"])
+async def test_runner_inventory_rechecks_harness_after_native_wait(
+    harness_inventory_reader, native_thread_inventory, change
+):
+    manager, add, client, _ = harness_inventory_reader
+    entry, _ = await add("harness", ExecutorResidentInventory(owners=()))
+    _, native = native_thread_inventory("native")
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def paused(**kwargs):
+        entered.set()
+        await resume.wait()
+        return ("thread-one",)
+
+    native.read_loaded_thread_ids.side_effect = paused
+    read = asyncio.create_task(client.get("/v1/startup/owner-inventory?read_id=late-harness"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if change == "generation":
+            manager._release_generations["harness"] = 1
+        elif change == "teardown":
+            entry.teardown_started = True
+        resume.set()
+        body = (await asyncio.wait_for(read, 2)).json()
+        assert body["native_thread_ids"] == [["thread-one"]]
+        context = body["harnesses"]["contexts"][0]
+        assert (context is None) is (change != "none")
+    finally:
+        resume.set()
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+async def test_runner_native_inventory_total_deadline_drains_all_sources(
+    harness_inventory_reader, native_thread_inventory, monkeypatch
+):
+    from omnigent.runner import resident_inventory
+
+    _, add, client, _ = harness_inventory_reader
+    await add("harness", ExecutorResidentInventory(owners=()))
+    _, native = native_thread_inventory("native")
+    drained = asyncio.Event()
+
+    async def paused(**kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drained.set()
+
+    native.read_loaded_thread_ids.side_effect = paused
+    monkeypatch.setattr(resident_inventory, "_OWNER_INVENTORY_TIMEOUT_S", 0.05)
+    body = (
+        await asyncio.wait_for(client.get("/v1/startup/owner-inventory?read_id=deadline"), 2)
+    ).json()
+    assert body["native_thread_ids"] is None and body["harnesses"] is None
+    assert drained.is_set()

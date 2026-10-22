@@ -1160,7 +1160,34 @@ async def _exchange_host_context_inventory(setup, **kwargs):
         await asyncio.gather(read, return_exceptions=True)
 
 
-async def test_host_context_inventory_preserves_contexts_and_aliases(host_context_reader):
+@pytest.mark.parametrize("native_threads", [False, True])
+async def test_host_context_inventory_preserves_contexts_and_aliases(
+    host_context_reader, native_threads
+):
+    if native_threads:
+        import json
+        from dataclasses import asdict
+
+        from omnigent.runner.native.orchestration import NativeBackendResidentSnapshot
+
+        async def include_native(response):
+            await response.aread()
+            payload = response.json()
+            owner = NativeBackendResidentSnapshot(
+                "native-one",
+                "codex-native",
+                ("native-main", "native-ui"),
+                True,
+                False,
+                False,
+                False,
+                transport_generation=3,
+            )
+            payload["native_backends"]["owners"] = [asdict(owner)]
+            payload["native_thread_ids"] = [["native-main", "native-side"]]
+            response._content = json.dumps(payload).encode()
+
+        host_context_reader[-2].event_hooks["response"].append(include_native)
     result = await _exchange_host_context_inventory(host_context_reader)
     assert result is not None
     assert len(result.runners) == 1
@@ -1172,6 +1199,10 @@ async def test_host_context_inventory_preserves_contexts_and_aliases(host_contex
         ("context-side", ("side",), "thread-side"),
     ]
     assert not result.aliases_complete and not result.context_coverage_complete
+    if native_threads:
+        assert read.inventory.native_thread_ids == (("native-main", "native-side"),)
+        assert read.inventory.native_backends.owners[0].session_ids == ("native-main", "native-ui")
+        assert not read.inventory.native_backends.aliases_complete
     assert host_context_reader[-1] == ["/v1/startup/owner-inventory"]
 
 
@@ -1374,6 +1405,16 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "ambiguous",
         "native-valid",
         "native-transport",
+        "native-thread-loaded",
+        "native-thread-empty",
+        "native-thread-unknown",
+        "native-thread-unaligned",
+        "native-thread-duplicate",
+        "native-thread-empty-id",
+        "native-thread-no-transport",
+        "native-thread-non-string",
+        "native-thread-unsupported",
+        "native-thread-exited",
         "native-negative-transport",
         "native-closing-transport",
         "native-empty-sessions",
@@ -1433,6 +1474,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "executor_contexts_complete": False,
         "external_owners_complete": False,
     }
+    payload["native_thread_ids"] = None
     if case.startswith("native-"):
         payload["native_backends"]["owners"] = [
             {
@@ -1455,6 +1497,27 @@ def test_runner_context_inventory_strict_wire_decode(case):
             native = payload["native_backends"]["owners"][0]
             native["transport_generation"] = -1 if case == "native-negative-transport" else 3
             native["closing"] = case == "native-closing-transport"
+        if case.startswith("native-thread-"):
+            payload["native_backends"]["owners"][0]["transport_generation"] = 3
+            payload["native_thread_ids"] = [["main", "side"]]
+            if case == "native-thread-empty":
+                payload["native_thread_ids"] = [[]]
+            elif case == "native-thread-unknown":
+                payload["native_thread_ids"] = [None]
+            elif case == "native-thread-unaligned":
+                payload["native_thread_ids"] = []
+            elif case == "native-thread-duplicate":
+                payload["native_thread_ids"] = [["main", "main"]]
+            elif case == "native-thread-empty-id":
+                payload["native_thread_ids"] = [[""]]
+            elif case == "native-thread-no-transport":
+                payload["native_backends"]["owners"][0]["transport_generation"] = None
+            elif case == "native-thread-non-string":
+                payload["native_thread_ids"] = [[7]]
+            elif case == "native-thread-unsupported":
+                payload["native_backends"]["owners"][0]["harness"] = "opencode-native"
+            elif case == "native-thread-exited":
+                payload["native_backends"]["owners"][0]["process_exit_confirmed"] = True
     if case == "empty":
         contexts["owners"] = []
     elif case == "unknown":
@@ -1489,7 +1552,17 @@ def test_runner_context_inventory_strict_wire_decode(case):
         owner["closing"] = True
         payload["harnesses"]["contexts"][0]["owner"]["closing"] = True
     result = _decode_runner_context_inventory(payload)
-    if case not in {"valid", "empty", "unknown", "ambiguous", "native-valid", "native-transport"}:
+    if case not in {
+        "valid",
+        "empty",
+        "unknown",
+        "ambiguous",
+        "native-valid",
+        "native-transport",
+        "native-thread-loaded",
+        "native-thread-empty",
+        "native-thread-unknown",
+    }:
         assert result is None
     else:
         assert result is not None
@@ -1508,3 +1581,12 @@ def test_runner_context_inventory_strict_wire_decode(case):
             assert result.native_backends.owners[0].session_ids == ("native-main", "native-ui")
         elif case == "native-transport":
             assert result.native_backends.owners[0].transport_generation == 3
+        elif case.startswith("native-thread-"):
+            assert (
+                result.native_thread_ids
+                == {
+                    "native-thread-loaded": (("main", "side"),),
+                    "native-thread-empty": ((),),
+                    "native-thread-unknown": (None,),
+                }[case]
+            )

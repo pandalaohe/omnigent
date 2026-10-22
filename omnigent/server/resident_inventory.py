@@ -108,6 +108,15 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
             )
         ):
             return None
+        native_threads = snapshot.native_thread_ids
+        if native_threads is not None:
+            if len(native_threads) != len(snapshot.native_backends.owners):
+                return None
+            for owner, ids in zip(snapshot.native_backends.owners, native_threads, strict=True):
+                if ids is not None and (
+                    owner.transport_generation is None or not all(ids) or len(set(ids)) != len(ids)
+                ):
+                    return None
         harnesses = snapshot.harnesses
         if harnesses is not None:
             ids = [o.incarnation_id for o in harnesses.owners]
