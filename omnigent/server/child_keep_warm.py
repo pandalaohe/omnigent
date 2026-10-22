@@ -1454,6 +1454,18 @@ class ChildKeepWarmSweeper:
             self._drop_tracking(session_id)
             return None
 
+        # G2 usage cutover gate: a held domain takes no keep-warm pings.
+        from omnigent.server.routes.usage import _resolve_session_harness
+        from omnigent.server.usage_cutover import active_hold
+
+        cutover_location = getattr(store, "storage_location", None)
+        if (
+            isinstance(cutover_location, str)
+            and conv.host_id
+            and active_hold(cutover_location, conv, _resolve_session_harness) is not None
+        ):
+            return None
+
         raw_label = conv.labels.get(KEEP_WARM_LABEL)
         state = _WarmState.parse(raw_label)
         running_since = _running_since(conv)

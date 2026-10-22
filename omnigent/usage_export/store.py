@@ -31,9 +31,17 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
-from omnigent.usage_export.models import HostProgress, UsageEvent, UsageObservation
+from omnigent.usage_export.models import (
+    HostProgress,
+    UsageEvent,
+    UsageObservation,
+    thread_key,
+)
 
 _MAX_EVENT_BYTES = 32 * 1024
+# Producer association evidence stays on the unit row; it is not part of
+# the committed event the consumer reads.
+_EVIDENCE_FIELDS = ("admission_id", "turn_key", "route_check", "terminal")
 _MAX_PAGE_BYTES = 1024 * 1024
 _IMMUTABLE_FIELDS = (
     "producer_unit_id",
@@ -154,6 +162,7 @@ class UsageEventStore:
     """Append complete unit revisions and page a committed feed prefix."""
 
     def __init__(self, storage_location: str) -> None:
+        self._storage_location = storage_location
         engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.usage_event_store", immediate=True
@@ -185,13 +194,22 @@ class UsageEventStore:
             session.flush()
         return feed
 
-    def _write(self, owner_id: str, operation: str, callback: Any) -> Any:
+    def _write(
+        self,
+        owner_id: str,
+        operation: str,
+        callback: Any,
+        prelock: Any = None,
+    ) -> Any:
         self._validate_owner(owner_id)
         workspace_id = current_workspace_id()
 
         def locked(session: Session) -> Any:
             generation = require_active_account(session, owner_id)
             owner_digest = self._owner(owner_id, generation)
+            # The hold row is always taken before the feed row (§2.3).
+            if prelock is not None:
+                prelock(session, workspace_id, owner_digest)
             feed = self._feed(session, workspace_id, owner_digest)
             return callback(session, feed, workspace_id, owner_digest)
 
@@ -335,10 +353,50 @@ class UsageEventStore:
         measurement_json = _json(measurement)
         call_digest = self._call_digest(observation)
 
+        from omnigent.usage_export.cutover import UsageCutoverStore
+
+        UsageCutoverStore(self._storage_location).ensure_domain(
+            owner_id, observation.host_id, observation.harness
+        )
+
+        hold_row: list[Any] = []
+
+        def prelock(session: Session, workspace_id: int, _owner_digest: bytes) -> None:
+            from omnigent.usage_export.cutover import UsageCutoverStore
+
+            hold_row[:] = [
+                UsageCutoverStore.lock_domain_hold(
+                    session, workspace_id, observation.host_id, observation.harness
+                )
+            ]
+
         def write(
             session: Session, feed: SqlUsageFeed, workspace_id: int, owner_digest: bytes
         ) -> dict[str, Any]:
+            from omnigent.usage_export.cutover import (
+                UsageCutoverStore,
+                append_receipt,
+            )
+
             unit = session.get(SqlUsageUnit, (workspace_id, owner_digest, unit_digest))
+            evidence = observation
+            if unit is not None:
+                first = json.loads(unit.observation)
+                evidence = observation.model_copy(
+                    update={
+                        "admission_id": unit.admission_id,
+                        "turn_key": first.get("turn_key"),
+                        "turn_id": first.get("turn_id"),
+                    }
+                )
+            association = UsageCutoverStore.associate_unit(
+                session,
+                workspace_id,
+                owner_digest,
+                evidence,
+                hold_row[0] if hold_row else None,
+                binding_session_id=observation.session_id,
+            )
             if unit is not None:
                 old = json.loads(unit.observation)
                 if any(old[field] != measurement[field] for field in _IMMUTABLE_FIELDS):
@@ -356,6 +414,39 @@ class UsageEventStore:
                         if candidate["event_id"] == unit.latest_event_id:
                             return candidate
                     raise UsageExportError(422, "corrupt_usage_feed")
+            recorded_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            previous_ended_at = None
+            if unit is not None:
+                previous = session.get(
+                    SqlUsageEvent, (workspace_id, owner_digest, unit.latest_sequence)
+                )
+                if previous is not None:
+                    previous_ended_at = _event_from_payload(previous.payload)["ended_at"]
+            started: dict[str, Any] = {}
+            if unit is not None:
+                previous_event = session.get(
+                    SqlUsageEvent, (workspace_id, owner_digest, unit.latest_sequence)
+                )
+                if previous_event is not None:
+                    prior = _event_from_payload(previous_event.payload)
+                    started = {
+                        "call_started_not_before": prior["call_started_not_before"],
+                        "call_start_basis": prior["call_start_basis"],
+                        "account_hint": prior["account_hint"],
+                    }
+            if not started:
+                started = {
+                    "call_started_not_before": association["call_started_not_before"],
+                    "call_start_basis": association["call_start_basis"],
+                    "account_hint": association["account_hint"],
+                }
+            ended_at = previous_ended_at or association["ended_at"]
+            if ended_at is None and observation.physical_session_id is not None:
+                own_thread = thread_key(
+                    observation.physical_session_id, observation.physical_subagent_id
+                )
+                if any(entry.key == own_thread for entry in observation.terminal):
+                    ended_at = recorded_at
             allocation = None
             if call_digest is not None:
                 allocation = session.get(
@@ -376,21 +467,28 @@ class UsageEventStore:
                 raise UsageExportError(409, "call_identity_conflict")
             event_id = uuid.uuid4().hex
             original_id = unit.original_event_id if unit is not None else event_id
+            sequence = feed.next_sequence
             event = {
-                **measurement,
+                **{
+                    key: value for key, value in measurement.items() if key not in _EVIDENCE_FIELDS
+                },
                 "event_id": event_id,
                 "original_event_id": original_id,
                 "kind": "correction" if unit is not None else "usage",
                 "correction_of": original_id if unit is not None else None,
                 "revision": unit.revision + 1 if unit is not None else 1,
-                "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "sequence": sequence,
+                "recorded_at": recorded_at,
                 "request_count": request_count,
+                "call_started_not_before": started["call_started_not_before"],
+                "call_start_basis": started["call_start_basis"],
+                "ended_at": ended_at,
+                "account_hint": started["account_hint"],
             }
             payload = _json(event)
             if len(payload.encode("utf-8")) > _MAX_EVENT_BYTES:
                 raise UsageExportError(422, "export_record_too_large")
             snapshot = _advance_progress(feed.progress, event)
-            sequence = feed.next_sequence
             feed.next_sequence += 1
             feed.progress = snapshot
             session.add(
@@ -400,6 +498,8 @@ class UsageEventStore:
                     sequence=sequence,
                     payload=payload,
                     snapshot=snapshot,
+                    host_id=observation.host_id,
+                    harness=observation.harness,
                 )
             )
             if unit is None:
@@ -414,6 +514,12 @@ class UsageEventStore:
                         latest_sequence=sequence,
                         revision=1,
                         request_count=request_count,
+                        admission_id=(
+                            association["admission"].admission_id
+                            if association["admission"] is not None
+                            else None
+                        ),
+                        association=association["association"],
                     )
                 )
             else:
@@ -422,9 +528,51 @@ class UsageEventStore:
                 unit.latest_sequence = sequence
                 unit.revision += 1
                 unit.request_count = request_count
+            hold = hold_row[0] if hold_row else None
+            if (
+                hold is not None
+                and association["after_hold"]
+                and association["admission"] is None
+                and hold.state in {"released", "abandoned"}
+            ):
+                append_receipt(
+                    session,
+                    workspace_id,
+                    owner_digest,
+                    hold,
+                    "late_violation",
+                    {
+                        "result": "violation",
+                        "failure_codes": ["unadmitted_call_after_hold"],
+                        "last_committed_sequence": sequence,
+                        "detection": None,
+                        "admissions": [],
+                        "calls": [
+                            {
+                                "call_key": {
+                                    "meter_epoch": observation.meter_epoch,
+                                    "producer_unit_id": observation.producer_unit_id,
+                                },
+                                "server": {
+                                    "original_event_id": original_id,
+                                    "latest_event_id": event_id,
+                                    "sequence": sequence,
+                                    "revision": event["revision"],
+                                },
+                                "admission_id": None,
+                                "admission": "unadmitted",
+                                "occurred_at": observation.occurred_at,
+                                "ended_at": ended_at,
+                                "state": "unadmitted_after_hold",
+                            }
+                        ],
+                        "counts": {"calls_unadmitted_after_hold": 1},
+                        "release": None,
+                    },
+                )
             return event
 
-        return self._write(owner_id, "append_usage_observation", write)
+        return self._write(owner_id, "append_usage_observation", write, prelock=prelock)
 
     @staticmethod
     def _cursor(
@@ -500,7 +648,13 @@ class UsageEventStore:
             )
         return position, fence
 
-    def page(self, owner_id: str, cursor: str | None = None, limit: int = 500) -> dict[str, Any]:
+    def page(
+        self,
+        owner_id: str,
+        cursor: str | None = None,
+        limit: int = 500,
+        grant_id: str | None = None,
+    ) -> dict[str, Any]:
         """Read a fixed committed fence, charging the durable owner read budget."""
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise UsageExportError(422, "invalid_usage_limit")
@@ -524,6 +678,10 @@ class UsageEventStore:
                 )
             timestamps.append(now)
             feed.read_timestamps = _json(timestamps)
+            if grant_id is not None:
+                positions = json.loads(feed.grant_positions or "{}")
+                positions[grant_id] = max(int(positions.get(grant_id, 0)), position)
+                feed.grant_positions = _json(positions)
             fence = cursor_fence if cursor_fence is not None else feed.next_sequence - 1
             rows = (
                 session.execute(
@@ -571,7 +729,7 @@ class UsageEventStore:
                 feed, workspace_id, owner_digest, last_sequence, fence if has_more else None
             )
             result = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "owner_scope_id": feed.owner_scope_id,
                 "feed_id": feed.feed_id,
                 "feed_epoch": feed.feed_epoch,

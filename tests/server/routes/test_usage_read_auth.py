@@ -63,9 +63,17 @@ def test_usage_scope_never_inherits_session_or_write_authority() -> None:
         ("/v1/sessions", "GET"),
         ("/v1/runners", "POST"),
         ("/auth/users", "GET"),
+        # Only the receipts page joins the one read path; every other cutover
+        # route stays owner-only.
+        ("/v1/usage-cutover/receipts", "POST"),
+        ("/v1/usage-cutover/holds", "GET"),
+        ("/v1/usage-cutover/holds/harness", "GET"),
     ]:
         assert provider.get_user_id(_request(token, path, method)) is None
     assert provider.get_user_id(_request(token)) == "owner"
+    receipts = _request(token, "/v1/usage-cutover/receipts")
+    assert provider.get_user_id(receipts) == "owner"
+    assert receipts.state.usage_read_grant_id == "a" * 32
 
 
 def test_usage_scope_requires_live_owner_grant() -> None:

@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 Harness = Literal["codex-native", "codex-sdk", "claude-native", "claude-sdk", "pi-native", "pi"]
 ResponseNamespace = Literal[
@@ -16,6 +24,7 @@ ResponseNamespace = Literal[
     "codex-responses/response-id/v1",
     "pi/response-id/v1",
 ]
+TerminalEvidence = Literal["terminal_record", "stop_hook", "executor_end", "writer_exit"]
 
 
 class AccountHint(BaseModel):
@@ -24,16 +33,17 @@ class AccountHint(BaseModel):
     provider: Literal["openai", "anthropic", "other"]
     billing_kind: Literal["subscription", "api", "gateway", "free"]
     billing_route: Literal["direct_provider", "gateway", "other"]
+    route_ref: str = Field(min_length=1)
     opaque_account_ref: str = Field(min_length=1)
     ref_generation: int = Field(gt=0)
     basis: Literal["runtime_identity", "owner_binding"]
     binding_version: int = Field(gt=0)
 
-    @field_validator("opaque_account_ref")
+    @field_validator("opaque_account_ref", "route_ref")
     @classmethod
     def bounded_ref(cls, value: str) -> str:
         if len(value.encode("utf-8")) > 256:
-            raise ValueError("opaque_account_ref exceeds 256 UTF-8 bytes")
+            raise ValueError("account reference exceeds 256 UTF-8 bytes")
         return value
 
 
@@ -52,6 +62,35 @@ class SourceRef(BaseModel):
         return value
 
 
+class ThreadTerminal(BaseModel):
+    """One physical thread's termination evidence, declared by the producer."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    physical_session_id: str = Field(min_length=1)
+    physical_subagent_id: str | None = None
+    evidence: TerminalEvidence
+    source_ref: str | None = Field(default=None, max_length=256)
+
+    @field_validator("physical_session_id", "physical_subagent_id", "source_ref")
+    @classmethod
+    def bounded_identifier(cls, value: str | None) -> str | None:
+        if value is not None and (not value or len(value.encode("utf-8")) > 256):
+            raise ValueError("identifier must be 1..256 UTF-8 bytes")
+        return value
+
+    @property
+    def key(self) -> str:
+        return thread_key(self.physical_session_id, self.physical_subagent_id)
+
+
+def thread_key(physical_session_id: str, physical_subagent_id: str | None) -> str:
+    """Stable key for one physical thread inside an owner's feed."""
+    return json.dumps(
+        [physical_session_id, physical_subagent_id], separators=(",", ":"), ensure_ascii=False
+    )
+
+
 class UsageObservation(BaseModel):
     """One producer unit's full current measurement; no server fields accepted."""
 
@@ -66,8 +105,7 @@ class UsageObservation(BaseModel):
     measurement_kind: Literal["request", "increment", "legacy_snapshot"]
     logical_call_id: str | None = None
     occurred_at: str | None = None
-    ended_at: str | None = None
-    time_quality: Literal["verified", "reported", "unknown"] = "reported"
+    time_quality: Literal["reported", "unknown"] = "reported"
     model_id: str | None = None
     parent_session_id: str | None = None
     upstream_thread_id: str | None = None
@@ -89,9 +127,14 @@ class UsageObservation(BaseModel):
     cost_estimated: bool | None = None
     cost_basis: Literal["metered", "estimated", "unknown"] = "unknown"
     usage_status: Literal["complete", "partial", "missing"] = "missing"
-    account_hint: AccountHint | None = None
     source_refs: list[SourceRef] = Field(default_factory=list, max_length=8)
     call_identity_coverage: Literal["complete", "partial", "none"] = "none"
+    # Association evidence: the admitted turn this unit belongs to, the
+    # runner's route comparison, and per-thread termination evidence.
+    admission_id: str | None = None
+    turn_key: str | None = None
+    route_check: Literal["match", "mismatch"] | None = None
+    terminal: list[ThreadTerminal] = Field(default_factory=list, max_length=32)
 
     @field_validator(
         "producer_unit_id",
@@ -108,6 +151,8 @@ class UsageObservation(BaseModel):
         "physical_session_id",
         "transcript_session_id",
         "physical_subagent_id",
+        "admission_id",
+        "turn_key",
     )
     @classmethod
     def bounded_identifier(cls, value: str | None) -> str | None:
@@ -122,7 +167,7 @@ class UsageObservation(BaseModel):
             raise ValueError("physical_transcript_path exceeds 1024 UTF-8 bytes")
         return value
 
-    @field_validator("occurred_at", "ended_at")
+    @field_validator("occurred_at")
     @classmethod
     def utc_time(cls, value: str | None) -> str | None:
         if value is None:
@@ -186,19 +231,37 @@ class UsageObservation(BaseModel):
             preferred is None or preferred.id != self.logical_call_id
         ):
             raise ValueError("logical_call_id must match preferred response ref")
+        if len({entry.key for entry in self.terminal}) != len(self.terminal):
+            raise ValueError("duplicate terminal thread evidence")
         return self
 
 
 class UsageEvent(UsageObservation):
-    """Complete committed event, validated again at the export boundary."""
+    """Complete committed event, validated again at the export boundary.
+
+    The admission-derived fields (``call_started_not_before``,
+    ``call_start_basis``, ``account_hint``) and the server fields
+    (``ended_at``, ``sequence``) are filled by the server only.
+    """
 
     event_id: str = Field(min_length=1)
     original_event_id: str = Field(min_length=1)
     kind: Literal["usage", "correction"]
     correction_of: str | None
     revision: int = Field(gt=0)
+    sequence: int = Field(ge=1)
     recorded_at: str
     request_count: int | None = Field(ge=0, le=1)
+    call_started_not_before: str | None = None
+    call_start_basis: Literal["turn_admission"] | None = None
+    ended_at: str | None = None
+    account_hint: AccountHint | None = None
+    # Association evidence stays on the server's unit row; it is never part of
+    # the committed event the consumer reads.
+    admission_id: str | None = Field(default=None, exclude=True)
+    turn_key: str | None = Field(default=None, exclude=True)
+    route_check: Literal["match", "mismatch"] | None = Field(default=None, exclude=True)
+    terminal: list[ThreadTerminal] = Field(default_factory=list, exclude=True)
 
     @field_validator("event_id", "original_event_id", "correction_of")
     @classmethod
@@ -207,11 +270,11 @@ class UsageEvent(UsageObservation):
             raise ValueError("invalid event identifier")
         return value
 
-    @field_validator("recorded_at")
+    @field_validator("recorded_at", "call_started_not_before", "ended_at")
     @classmethod
-    def recorded_time(cls, value: str) -> str:
+    def recorded_time(cls, value: str | None, info: ValidationInfo) -> str | None:
         normalized = UsageObservation.utc_time(value)
-        if normalized is None:
+        if normalized is None and info.field_name == "recorded_at":
             raise ValueError("recorded_at is required")
         return normalized
 
@@ -226,6 +289,19 @@ class UsageEvent(UsageObservation):
                 raise ValueError("invalid original usage event")
         elif self.kind != "correction" or self.correction_of != self.original_event_id:
             raise ValueError("invalid correction lineage")
+        # I1: the start basis is null exactly when the start bound is null.
+        if (self.call_start_basis is None) != (self.call_started_not_before is None):
+            raise ValueError("call start basis and bound must both be set or both null")
+        # I2: a hint requires a start basis.
+        if self.account_hint is not None and self.call_start_basis is None:
+            raise ValueError("account hint requires a call start basis")
+        if (
+            self.call_started_not_before is not None
+            and self.ended_at is not None
+            and datetime.fromisoformat(self.call_started_not_before.replace("Z", "+00:00"))
+            > datetime.fromisoformat(self.ended_at.replace("Z", "+00:00"))
+        ):
+            raise ValueError("call start bound after the end bound")
         return self
 
 

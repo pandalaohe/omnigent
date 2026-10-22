@@ -4317,6 +4317,17 @@ class _CodexAppServerSession:
                                 "sandbox_workspace_write.network_access must be a boolean"
                             )
                         sandbox_policy["networkAccess"] = network_access
+        if self._usage_session_id is not None:
+            from omnigent.usage_export.runtime import check_live_route
+
+            await asyncio.to_thread(
+                check_live_route,
+                self._usage_session_id,
+                "codex-sdk",
+                self._env,
+                codex_home=self._codex_home_dir,
+                provider=self._thread_model_provider,
+            )
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -4329,6 +4340,16 @@ class _CodexAppServerSession:
             return
         active_turn_id: str = raw_active_turn_id
         self.active_turn_id = active_turn_id
+        if self._usage_session_id is not None and self.thread_id is not None:
+            from omnigent.usage_export.runtime import link_codex_turn
+
+            await asyncio.to_thread(
+                link_codex_turn,
+                self._usage_session_id,
+                "codex-sdk",
+                self.thread_id,
+                active_turn_id,
+            )
         startup_evidence = CodexTurnEvidence(self.thread_id, active_turn_id, source="codex")
         # thread/start established the owned runtime. A configured dynamic-tool
         # bridge is ready only after the thread and turn RPCs have both returned.

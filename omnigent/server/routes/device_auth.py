@@ -558,6 +558,7 @@ def create_oauth_token_router(
                 content={
                     "access_token": access_token,
                     "refresh_token": refresh_token,
+                    "grant_id": grant.id,
                     "token_type": "Bearer",
                     "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
                 },
@@ -585,6 +586,7 @@ def create_oauth_token_router(
             content={
                 "access_token": access_token,
                 "refresh_token": new_refresh,
+                "grant_id": rotated.id,
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
@@ -712,6 +714,16 @@ def create_device_auth_router(
             scope=_grant_scope(grant),
         )
 
+    @router.get("/v1/auth/grants")
+    async def usage_grants(request: Request) -> Response:
+        owner = auth_provider.get_user_id(request)
+        if owner is None:
+            return _oauth_error("unauthorized", status_code=401)
+        return JSONResponse(
+            {"grants": device_grant_store.list_usage_grants(owner)},
+            headers=NO_STORE_HEADERS,
+        )
+
     # ── Device authorization (public) ─────────────────────────────
 
     @router.post("/oauth/device/authorize", dependencies=[])
@@ -792,6 +804,7 @@ def create_device_auth_router(
             status_code=200,
             content={
                 "device_code": device_code,
+                "grant_id": grant_id,
                 "user_code": user_code,
                 "verification_uri": verification_uri,
                 "verification_uri_complete": verification_uri_complete,
@@ -1021,6 +1034,7 @@ def create_device_auth_router(
             content={
                 "access_token": access_token,
                 "refresh_token": refresh_token,
+                "grant_id": redeemed.id,
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },

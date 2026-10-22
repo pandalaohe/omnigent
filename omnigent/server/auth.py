@@ -724,9 +724,12 @@ class UnifiedAuthProvider(AuthProvider):
                     or not grant_id
                     or self._grant_revoked is None
                     or request.scope.get("method") != "GET"
-                    or request.url.path != "/v1/usage-events"
+                    or request.url.path not in {"/v1/usage-events", "/v1/usage-cutover/receipts"}
                 ):
                     return None
+                # The feed records the highest cursor each grant presented, so
+                # the release CAS can corroborate a consumer's ACK.
+                request.state.usage_read_grant_id = grant_id
             elif scope is not None and not delegated_path_allowed(request.url.path):
                 return None
             return user_id

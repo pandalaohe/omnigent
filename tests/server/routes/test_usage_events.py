@@ -11,9 +11,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from omnigent.entities import Conversation
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.routes.usage_cutover import create_usage_cutover_router
 from omnigent.server.routes.usage_events import create_usage_events_router
+from omnigent.server.usage_cutover import admit_turn, refuse_if_held
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.usage_export.outbox import UsageOutbox
@@ -135,8 +138,11 @@ async def test_spool_survives_home_and_session_delete_and_lost_ack(tmp_path: Pat
         assert event["output_tokens"] == 20
         assert event["reasoning_tokens"] == 5
         assert event["request_count"] == 1
+        # ended_at is the server-clock bound of the revision that carried the
+        # physical thread's terminal evidence, never the host timestamp.
         assert events[0]["ended_at"] is None
-        assert event["ended_at"] == "2026-10-20T00:00:05Z"
+        assert "terminal" not in event
+        assert event["ended_at"] == event["recorded_at"]
         assert response.json()["host_progress"][0]["last_sealed_turn_at"] == event["ended_at"]
         assert event["account_hint"] is None
         assert (await server.get("/v1/usage-events?limit=0")).status_code == 422
@@ -148,6 +154,324 @@ async def test_spool_survives_home_and_session_delete_and_lost_ack(tmp_path: Pat
                 json={"producer_id": uuid.uuid4().hex, "observation": event},
             )
         ).status_code == 422
+
+
+def _cutover_app(
+    conversations: SqlAlchemyConversationStore,
+    *,
+    owner: str = "alice",
+    harness: str = "codex-native",
+) -> FastAPI:
+    """The cutover control plane plus a probe standing in for the §3 gates."""
+    app = FastAPI()
+    app.include_router(
+        create_usage_cutover_router(
+            conversations.storage_location,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+            host_owner=lambda host_id, _workspace=None: owner,
+        ),
+        prefix="/v1",
+    )
+    resolve = lambda _conv: harness  # noqa: E731 - test-local resolver
+
+    @app.post("/probe/{host_id}")
+    async def probe(host_id: str, source: str = "web") -> dict[str, object]:
+        conv = Conversation(
+            id="conv_test",
+            created_at=0,
+            updated_at=0,
+            root_conversation_id="conv_test",
+            title="probe",
+            host_id=host_id,
+        )
+        admission_id = admit_turn(
+            conversations.storage_location,
+            conv,
+            source=source,
+            resolve_harness=resolve,
+            owner_id="alice",
+        )
+        return {"admission_id": admission_id}
+
+    @app.post("/probe-control/{host_id}")
+    async def probe_control(host_id: str) -> dict[str, bool]:
+        conv = Conversation(
+            id="conv_test",
+            created_at=0,
+            updated_at=0,
+            root_conversation_id="conv_test",
+            title="probe",
+            host_id=host_id,
+        )
+        refuse_if_held(conversations.storage_location, conv, resolve_harness=resolve)
+        return {"ok": True}
+
+    @app.exception_handler(OmnigentError)
+    async def application_error(_request: object, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse({"error": {"code": exc.code}}, status_code=exc.http_status)
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_native_hook_and_plan_followup_cannot_bypass_a_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.forwarder import _plan_implementation_request_event
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import create_sessions_router
+    from omnigent.server.schemas import ElicitationResult
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'gates.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    host = "a" * 32
+    conv = conversations.create_conversation(host_id=host, workspace="/opt/work")
+    conversations.update_conversation(conv.id, harness_override="claude-native")
+    SqlAlchemyPermissionStore(uri).grant("alice", conv.id, LEVEL_OWNER)
+    app = _cutover_app(conversations)
+    app.include_router(
+        create_sessions_router(conversations, SqlAlchemyAgentStore(uri)), prefix="/v1"
+    )
+    store = UsageCutoverStore(uri)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://omni.test"
+    ) as client:
+        request = {"event": {"type": "PHASE_REQUEST", "data": {}, "context": {}}}
+        admitted = await client.post(f"/v1/sessions/{conv.id}/policies/evaluate", json=request)
+        assert admitted.status_code == 200, admitted.text
+        admission_id = admitted.json()["admission_id"]
+        pending = pending_inputs.record(conv.id, [], admission_id=admission_id)
+        store.create_hold("alice", host, "claude-native", 1)
+        interleaved = await client.post(f"/v1/sessions/{conv.id}/policies/evaluate", json=request)
+        assert interleaved.json()["admission_id"] == admission_id
+        pending_inputs.resolve(conv.id, pending)
+        denied = await client.post(f"/v1/sessions/{conv.id}/policies/evaluate", json=request)
+        assert denied.json()["result"] == "POLICY_ACTION_DENY"
+        assert denied.json()["reason"] == "usage_cutover_hold"
+
+        conversations.update_conversation(conv.id, harness_override="codex-native")
+        store.create_hold("alice", host, "codex-native", 1)
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions.routes_hooks._publish_and_wait_for_harness_elicitation",
+            AsyncMock(
+                return_value=ElicitationResult(
+                    action="accept", content={"plan_implementation": "Yes, implement this plan"}
+                )
+            ),
+        )
+        plan = await client.post(
+            f"/v1/sessions/{conv.id}/hooks/codex-elicitation-request",
+            json=_plan_implementation_request_event("thread", "turn"),
+        )
+        assert plan.status_code == 200, plan.text
+        assert plan.json() == {"answers": {}}
+
+
+def _drain_body(**changes: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "detection": {
+            "checkpoint_digest": "0" * 64,
+            "clock_offset_ms": 0,
+            "threshold_at": "2026-01-01T00:00:00Z",
+        },
+        "admissions": [],
+        "calls": [],
+        "counts": {},
+        "failure_codes": [],
+    }
+    body.update(changes)
+    return body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex-native", "pi-native", "pi"])
+async def test_cutover_gate_refuses_a_held_domain_and_records_nothing(
+    tmp_path: Path,
+    harness: str,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'server.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    app = _cutover_app(conversations, harness=harness)
+    held = "a" * 32
+    other = "b" * 32
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://omni.example.test",
+        headers={"X-Forwarded-Email": "alice"},
+    ) as server:
+        created = await server.post(
+            "/v1/usage-cutover/holds",
+            json={"host_id": held, "harness": harness, "generation": 1},
+        )
+        assert created.status_code == 200
+        refused = await server.post(f"/probe/{held}")
+        assert refused.status_code == 409
+        assert refused.json()["error"]["code"] == "usage_cutover_hold"
+        control = await server.post(f"/probe-control/{held}")
+        assert control.status_code == 409
+        assert control.json()["error"]["code"] == "usage_cutover_hold"
+        # A refused turn writes no admission.
+        status = await server.get(f"/v1/usage-cutover/holds/{held}/{harness}")
+        assert status.json()["open_admissions"] == 0
+        # Another domain is unaffected.
+        passed = await server.post(f"/probe/{other}")
+        assert passed.status_code == 200
+        assert bool(passed.json()["admission_id"]) is (harness == "codex-native")
+        # Abandoning the hold lifts it.
+        from omnigent.usage_export.store import UsageEventStore
+
+        pins = UsageEventStore(uri).page("alice")
+        abandoned = await server.post(
+            f"/v1/usage-cutover/holds/{held}/{harness}/1/release",
+            json={
+                "abandon": True,
+                "reason": "clock",
+                "consumer_receipt": {
+                    "kind": "abandon",
+                    **{key: pins[key] for key in ("owner_scope_id", "feed_id", "feed_epoch")},
+                    "domain": {"host_id": held, "harness": harness},
+                    "generation": 1,
+                    "producer_receipt_digest": "2" * 64,
+                    "acked_through_sequence": None,
+                    "usage_read_grant_id": None,
+                    "legacy_frozen": False,
+                    "cutover_at": None,
+                    "authority_revision": None,
+                    "authority_digest": None,
+                    "authority_published": False,
+                    "restored_authority_revision": None,
+                    "restored_authority_digest": None,
+                },
+            },
+        )
+        assert abandoned.status_code == 200
+        assert abandoned.json()["result"] == "abandoned"
+        after = await server.post(f"/probe/{held}")
+        assert after.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_receipts_route_serves_the_r4_page_shape_and_errors(
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'server.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    app = _cutover_app(conversations)
+    host = "c" * 32
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://omni.example.test",
+        headers={"X-Forwarded-Email": "alice"},
+    ) as server:
+        missing = await server.get("/v1/usage-cutover/receipts")
+        assert missing.status_code == 400
+        assert missing.json()["error"]["code"] == "usage_cutover_bad_request"
+        assert missing.headers["cache-control"] == "no-store"
+        unknown = await server.get(
+            "/v1/usage-cutover/receipts",
+            params={"host_id": host, "harness": "codex-native", "generation": 1},
+        )
+        assert unknown.status_code == 404
+        assert unknown.json()["error"]["code"] == "usage_cutover_domain_not_found"
+        assert (
+            await server.post(
+                "/v1/usage-cutover/holds",
+                json={"host_id": host, "harness": "codex-native", "generation": 2},
+            )
+        ).status_code == 200
+        empty = await server.get(
+            "/v1/usage-cutover/receipts",
+            params={"host_id": host, "harness": "codex-native", "generation": 2},
+        )
+        assert empty.status_code == 200
+        assert empty.json() == {
+            "receipt_page_schema_version": 1,
+            "domain": {"harness": "codex-native", "host_id": host},
+            "generation": 2,
+            "receipts": [],
+            "has_more": False,
+            "next_after_seq": 0,
+        }
+        wrong_generation = await server.get(
+            "/v1/usage-cutover/receipts",
+            params={"host_id": host, "harness": "codex-native", "generation": 1},
+        )
+        assert wrong_generation.status_code == 404
+        assert wrong_generation.json()["error"]["code"] == "usage_cutover_generation_not_found"
+        for params in (
+            {"host_id": host, "harness": "codex-native", "generation": 0},
+            {"host_id": host, "harness": "codex-native", "generation": 2, "limit": 0},
+            {"host_id": host, "harness": "codex-native", "generation": 2, "limit": 51},
+            {"host_id": host, "harness": "codex-native", "generation": 2, "after_seq": -1},
+            {"host_id": host, "harness": "opencode", "generation": 2},
+        ):
+            bad = await server.get("/v1/usage-cutover/receipts", params=params)
+            assert bad.status_code == 400, params
+            assert bad.json()["error"]["code"] == "usage_cutover_bad_request"
+        drained = await server.post(
+            f"/v1/usage-cutover/holds/{host}/codex-native/2/receipts",
+            json=_drain_body(),
+        )
+        assert drained.status_code == 200, drained.text
+        assert drained.json()["result"] == "drained"
+        page = await server.get(
+            "/v1/usage-cutover/receipts",
+            params={"host_id": host, "harness": "codex-native", "generation": 2},
+        )
+        assert page.status_code == 200
+        body = page.json()
+        assert body["receipts"][0]["digest"] == drained.json()["digest"]
+        assert body["receipts"][0]["receipt_seq"] == 1
+        assert body["next_after_seq"] == 1
+        assert body["has_more"] is False
+        assert page.headers["cache-control"] == "no-store"
+        # A second receipt (late violation) makes the first page report more.
+        from omnigent.usage_export.cutover import UsageCutoverStore
+
+        UsageCutoverStore(uri).abandon(
+            "alice",
+            host,
+            "codex-native",
+            2,
+            {
+                "kind": "abandon",
+                **{
+                    key: drained.json()[key] for key in ("owner_scope_id", "feed_id", "feed_epoch")
+                },
+                "domain": {"host_id": host, "harness": "codex-native"},
+                "generation": 2,
+                "authority_published": False,
+            },
+            "clock",
+        )
+        first = await server.get(
+            "/v1/usage-cutover/receipts",
+            params={
+                "host_id": host,
+                "harness": "codex-native",
+                "generation": 2,
+                "limit": 1,
+            },
+        )
+        assert first.status_code == 200
+        assert len(first.json()["receipts"]) == 1
+        assert first.json()["has_more"] is True
+        assert first.json()["next_after_seq"] == 1
+        tail = await server.get(
+            "/v1/usage-cutover/receipts",
+            params={
+                "host_id": host,
+                "harness": "codex-native",
+                "generation": 2,
+                "after_seq": 1,
+            },
+        )
+        assert tail.status_code == 200
+        assert [item["kind"] for item in tail.json()["receipts"]] == ["abandon"]
 
 
 @pytest.mark.asyncio
@@ -181,3 +505,94 @@ async def test_registration_requires_exact_owner_and_harness(
             )
         ).status_code == 409
         assert (await client.post("/v1/usage-producers", json=registration)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_read_only_policy_evaluation_cannot_mutate_admissions(tmp_path: Path) -> None:
+    from sqlalchemy import text
+
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+    from omnigent.server.routes.sessions import create_sessions_router
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    uri = f"sqlite:///{tmp_path / 'read-only.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    host = "a" * 32
+    conv = conversations.create_conversation(host_id=host, workspace="/opt/work")
+    conversations.update_conversation(conv.id, harness_override="claude-native")
+    permissions = SqlAlchemyPermissionStore(uri)
+    permissions.grant("owner", conv.id, LEVEL_OWNER)
+    permissions.grant("reader", conv.id, LEVEL_READ)
+    permissions.grant("editor", conv.id, LEVEL_EDIT)
+    app = _cutover_app(conversations)
+    app.include_router(
+        create_sessions_router(
+            conversations,
+            SqlAlchemyAgentStore(uri),
+            permission_store=permissions,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        ),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://omni.test"
+    ) as client:
+        request = {"event": {"type": "PHASE_REQUEST", "data": {}, "context": {}}}
+        response = await client.post(
+            f"/v1/sessions/{conv.id}/policies/evaluate",
+            json=request,
+            headers={"X-Forwarded-Email": "reader"},
+        )
+        assert response.status_code == 200, response.text
+        assert "admission_id" not in response.json()
+        with get_or_create_engine(uri).connect() as connection:
+            assert (
+                connection.execute(text("SELECT count(*) FROM usage_turn_admissions")).scalar_one()
+                == 0
+            )
+        response = await client.post(
+            f"/v1/sessions/{conv.id}/policies/evaluate",
+            json=request,
+            headers={"X-Forwarded-Email": "editor"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["admission_id"]
+
+
+@pytest.mark.parametrize("initial", [None, "active", "paused"])
+@pytest.mark.asyncio
+async def test_external_goal_completion_closes_goal_admissions(
+    tmp_path: Path, initial: str | None
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _persist_external_goal_state
+    from omnigent.server.schemas import SessionEventInput
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'goal.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    host = "a" * 32
+    conv = conversations.create_conversation(host_id=host, workspace="/opt/work")
+    SqlAlchemyPermissionStore(uri).grant("alice", conv.id, LEVEL_OWNER)
+    if initial is not None:
+        conversations.set_labels(conv.id, {"omnigent.goal_state": initial})
+    store = UsageCutoverStore(uri)
+    store.admit_turn(
+        "alice",
+        admission_id="goal",
+        session_id=conv.id,
+        host_id=host,
+        harness="codex-native",
+        source="goal",
+    )
+    from omnigent.usage_export.store import UsageExportError
+
+    with pytest.raises(UsageExportError, match="codex_goal_active"):
+        store.create_hold("alice", host, "codex-native", 1)
+    await _persist_external_goal_state(
+        conv.id,
+        conversations.get_conversation(conv.id),
+        SessionEventInput(type="external_goal_state", data={"state": None}),
+        conversations,
+    )
+    assert store.create_hold("alice", host, "codex-native", 1)["state"] == "held"

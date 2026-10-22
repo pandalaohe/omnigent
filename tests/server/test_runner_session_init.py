@@ -76,6 +76,28 @@ class _Client:
         return httpx.Response(self.status_code, json=self.response_json)
 
 
+def test_usage_hold_suppresses_both_recovery_entry_points(tmp_path) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    conv = _conversation()
+    conv.host_id = "a" * 32
+    conv.harness_override = "codex-native"
+    uri = f"sqlite:///{tmp_path / 'hold.db'}"
+    UsageCutoverStore(uri).create_hold("local", conv.host_id, "codex-native", 1)
+    payload = build_runner_session_init_payload(
+        conv, server_version="test", resume_interrupted_turn=True, usage_storage_location=uri
+    )
+    assert payload["session_init"]["suppress_recovery_turn"] is True
+    assert payload["session_init"]["resume_interrupted_turn"] is False
+    assert payload["session_init"]["recovery_id"] is None
+    conv.host_id = "b" * 32
+    other = build_runner_session_init_payload(
+        conv, server_version="test", resume_interrupted_turn=True, usage_storage_location=uri
+    )
+    assert other["session_init"]["suppress_recovery_turn"] is False
+    assert other["session_init"]["resume_interrupted_turn"] is True
+
+
 def _conversation() -> Conversation:
     return Conversation(
         id="conv_init",

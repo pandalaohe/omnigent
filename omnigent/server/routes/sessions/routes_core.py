@@ -1815,6 +1815,7 @@ def register_core_routes(
                 )
                 init_body = build_runner_session_init_payload(
                     conv,
+                    usage_storage_location=getattr(conversation_store, "storage_location", None),
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
                     peer_messaging_enabled=peer_messaging_enabled,

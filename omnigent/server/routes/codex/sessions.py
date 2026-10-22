@@ -24,7 +24,6 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import get_user_id as _get_user_id
 from omnigent.server.routes._auth_helpers import require_access as _require_access
-from omnigent.server.routes._sessions.common import _GOAL_STATE_LABEL_KEY
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _HOST_BOUND_RUNNER_CONNECT_GRACE_S,
@@ -70,22 +69,15 @@ async def _sync_codex_goal_marker(
         # Preserve the last known state if a newer Codex introduces a status
         # whose sidebar semantics have not been defined yet.
         return
-    if conv.labels.get(_GOAL_STATE_LABEL_KEY) == marker:
-        return
-    if marker is None:
-        await asyncio.to_thread(
-            conversation_store.delete_label,
-            session_id,
-            _GOAL_STATE_LABEL_KEY,
-        )
-        conv.labels.pop(_GOAL_STATE_LABEL_KEY, None)
-        return
-    await asyncio.to_thread(
-        conversation_store.set_labels,
+    from omnigent.server.routes._sessions.helpers import _persist_external_goal_state
+    from omnigent.server.schemas import SessionEventInput
+
+    await _persist_external_goal_state(
         session_id,
-        {_GOAL_STATE_LABEL_KEY: marker},
+        conv,
+        SessionEventInput(type="external_goal_state", data={"state": marker}),
+        conversation_store,
     )
-    conv.labels[_GOAL_STATE_LABEL_KEY] = marker
 
 
 def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
@@ -445,6 +437,25 @@ async def _forward_codex_goal_event(
     :returns: Runner forward result, or ``None`` if no runner could be
         reached.
     """
+    if event.get("type") in {"goal_set", "goal_status"} and isinstance(
+        getattr(conversation_store, "storage_location", None), str
+    ):
+        from omnigent.server.routes.usage import _resolve_session_harness
+        from omnigent.server.usage_cutover import admit_turn
+
+        authority = await asyncio.to_thread(
+            conversation_store.get_session_owner_authority,
+            conv.root_conversation_id or conv.id,
+            owner_only=True,
+        )
+        await asyncio.to_thread(
+            admit_turn,
+            conversation_store.storage_location,
+            conv,
+            source="goal",
+            resolve_harness=_resolve_session_harness,
+            owner_id=authority.user_id if authority else "local",
+        )
     runner_result = await _forward_session_change_to_runner(
         session_id,
         runner_router,

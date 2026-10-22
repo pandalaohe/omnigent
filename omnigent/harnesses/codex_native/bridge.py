@@ -10,12 +10,13 @@ import math
 import os
 import secrets
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -203,6 +204,8 @@ class CodexNativeBridgeState:
     codex_home: str
     active_turn_id: str | None = None
     cwd: str | None = None
+    usage_admission_id: str | None = None
+    usage_turn_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1206,6 +1209,14 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
                     "cwd": state.cwd,
+                    **(
+                        {
+                            "usage_admission_id": state.usage_admission_id,
+                            "usage_turn_id": state.usage_turn_id,
+                        }
+                        if state.usage_admission_id is not None
+                        else {}
+                    ),
                 },
                 handle,
                 sort_keys=True,
@@ -1712,6 +1723,12 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             codex_home=codex_home,
             active_turn_id=parsed_active_turn_id,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
+            usage_admission_id=raw.get("usage_admission_id")
+            if isinstance(raw.get("usage_admission_id"), str)
+            else None,
+            usage_turn_id=raw.get("usage_turn_id")
+            if isinstance(raw.get("usage_turn_id"), str)
+            else None,
         ),
         "ready",
     )
@@ -1751,14 +1768,60 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
             return
         _write_bridge_state_unlocked(
             bridge_dir,
-            CodexNativeBridgeState(
-                session_id=state.session_id,
-                socket_path=state.socket_path,
-                thread_id=state.thread_id,
-                codex_home=state.codex_home,
-                active_turn_id=active_turn_id,
-                cwd=state.cwd,
-            ),
+            replace(state, active_turn_id=active_turn_id),
+        )
+
+
+def record_usage_admission(
+    bridge_dir: Path, admission_id: str, turn_id: str | None = None
+) -> None:
+    """Persist pre-turn gate correlation even when usage capture is disabled."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is not None:
+            _write_bridge_state_unlocked(
+                bridge_dir, replace(state, usage_admission_id=admission_id, usage_turn_id=turn_id)
+            )
+
+
+def bind_usage_turn(bridge_dir: Path, turn_id: str) -> None:
+    """Bind the pending gate admission to the first observed physical turn."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is not None and state.usage_admission_id and state.usage_turn_id is None:
+            _write_bridge_state_unlocked(bridge_dir, replace(state, usage_turn_id=turn_id))
+
+
+@contextlib.contextmanager
+def _usage_completion_db(bridge_dir: Path) -> Iterator[sqlite3.Connection]:
+    """Completion retries share the native bridge's storage and retention."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(bridge_dir / "usage-completions.sqlite3")) as db, db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS completions (session_id TEXT, admission_id TEXT, "
+            "PRIMARY KEY (session_id,admission_id))"
+        )
+        yield db
+
+
+def queue_usage_completion(bridge_dir: Path, session_id: str, admission_id: str) -> None:
+    """Retain a terminal report until the server acknowledges it."""
+    with _usage_completion_db(bridge_dir) as db:
+        db.execute("INSERT OR IGNORE INTO completions VALUES (?,?)", (session_id, admission_id))
+
+
+def pending_usage_completions(bridge_dir: Path) -> list[tuple[str, str]]:
+    """Read reports across forwarder restarts and thread rotations."""
+    with _usage_completion_db(bridge_dir) as db:
+        return db.execute("SELECT session_id,admission_id FROM completions").fetchall()
+
+
+def ack_usage_completion(bridge_dir: Path, session_id: str, admission_id: str) -> None:
+    """Remove only the successfully delivered report."""
+    with _usage_completion_db(bridge_dir) as db:
+        db.execute(
+            "DELETE FROM completions WHERE session_id=? AND admission_id=?",
+            (session_id, admission_id),
         )
 
 
@@ -1781,14 +1844,7 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
             return
         _write_bridge_state_unlocked(
             bridge_dir,
-            CodexNativeBridgeState(
-                session_id=state.session_id,
-                socket_path=state.socket_path,
-                thread_id=thread_id,
-                codex_home=state.codex_home,
-                active_turn_id=active_turn_id,
-                cwd=state.cwd,
-            ),
+            replace(state, thread_id=thread_id, active_turn_id=active_turn_id),
         )
 
 
@@ -1854,14 +1910,7 @@ def clear_active_turn_id_if_matches(
             return False
         _write_bridge_state_unlocked(
             bridge_dir,
-            CodexNativeBridgeState(
-                session_id=state.session_id,
-                socket_path=state.socket_path,
-                thread_id=state.thread_id,
-                codex_home=state.codex_home,
-                active_turn_id=None,
-                cwd=state.cwd,
-            ),
+            replace(state, active_turn_id=None),
         )
         _run_on_cleared()
         return True

@@ -251,6 +251,7 @@ class DrainedInput:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    admission_id: str | None = None
 
 
 @dataclass
@@ -328,6 +329,7 @@ class _Entry:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    admission_id: str | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -377,6 +379,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    admission_id: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -423,6 +426,7 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            admission_id=admission_id,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -471,6 +475,20 @@ def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None
             if entry.stable_id == stable_id:
                 return entry.pending_id
     return None
+
+
+def oldest_admission_id(conversation_id: str) -> str | None:
+    """The admission carried by the oldest outstanding native web input."""
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        return next(
+            (
+                entry.admission_id
+                for entry in _pending.get(conversation_id, {}).values()
+                if not entry.interrupted and not entry.held
+            ),
+            None,
+        )
 
 
 def delivery_attributes(entry: DrainedInput | _Entry) -> dict[str, object]:
@@ -830,6 +848,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         reason_code=drained.reason_code,
         native_turn_id=drained.native_turn_id,
         lifecycle_response_id=drained.lifecycle_response_id,
+        admission_id=drained.admission_id,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1043,6 +1062,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         reason_code=entry.reason_code,
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
+        admission_id=entry.admission_id,
     )
 
 

@@ -249,6 +249,9 @@ class ErrorCode:
     INVALID_INPUT = "invalid_input"
     ALREADY_EXISTS = "already_exists"
     CONFLICT = "conflict"
+    # A usage cutover holds the session's (host, harness) domain: the server
+    # refuses new turns until the domain is released.
+    USAGE_CUTOVER_HOLD = "usage_cutover_hold"
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
@@ -290,6 +293,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.INVALID_INPUT: 400,
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
+    ErrorCode.USAGE_CUTOVER_HOLD: 409,
     ErrorCode.PROJECT_ARCHIVED: 409,
     ErrorCode.PROJECT_NAME_ARCHIVED: 409,
     ErrorCode.PROJECT_ARCHIVE_BUSY: 409,
@@ -349,6 +353,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.INVALID_INPUT: ErrorCategory.USER,
     ErrorCode.ALREADY_EXISTS: ErrorCategory.USER,
     ErrorCode.CONFLICT: ErrorCategory.USER,
+    ErrorCode.USAGE_CUTOVER_HOLD: ErrorCategory.USER,
     ErrorCode.PROJECT_ARCHIVED: ErrorCategory.USER,
     ErrorCode.PROJECT_NAME_ARCHIVED: ErrorCategory.USER,
     ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorCategory.USER,
@@ -424,6 +429,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.USAGE_CUTOVER_HOLD: ErrorImpact.BENIGN,
     ErrorCode.PROJECT_ARCHIVED: ErrorImpact.BENIGN,
     ErrorCode.PROJECT_NAME_ARCHIVED: ErrorImpact.BENIGN,
     ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorImpact.BENIGN,
@@ -456,6 +462,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.INVALID_INPUT: ErrorPhase.REQUEST,
     ErrorCode.ALREADY_EXISTS: ErrorPhase.REQUEST,
     ErrorCode.CONFLICT: ErrorPhase.REQUEST,
+    ErrorCode.USAGE_CUTOVER_HOLD: ErrorPhase.REQUEST,
     ErrorCode.PROJECT_ARCHIVED: ErrorPhase.REQUEST,
     ErrorCode.PROJECT_NAME_ARCHIVED: ErrorPhase.REQUEST,
     ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorPhase.REQUEST,
