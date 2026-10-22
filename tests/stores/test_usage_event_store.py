@@ -1204,7 +1204,7 @@ def test_cutover_migration_roundtrip(tmp_path: Path) -> None:
 
     uri = f"sqlite:///{tmp_path / 'cutover.db'}"
     config = _build_alembic_config(uri)
-    assert ScriptDirectory.from_config(config).get_heads() == ["a43c20261021"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["a42c20261022"]
     command.upgrade(config, "a44c20261021")
     command.upgrade(config, "a43c20261021")
     engine = create_engine(uri)
