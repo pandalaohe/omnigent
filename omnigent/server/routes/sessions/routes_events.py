@@ -1081,14 +1081,14 @@ async def _forward_subagent_terminal_to_parent_runner(
     forward_body: dict[str, Any],
 ) -> _RunnerForwardResult | None:
     """
-    POST a cross-host child's terminal status to the PARENT's runner.
+    POST a child's terminal status to the PARENT's runner.
 
     The event keeps the child id, so the parent runner's
     ``external_session_status`` handler rebuilds the work entry from the
     server and enqueues the result in the parent inbox — the same delivery a
     co-located child gets from its shared runner.
 
-    :param child_conv: The cross-host child whose terminal edge to deliver.
+    :param child_conv: The child whose terminal edge to deliver.
     :param parent_conv: The child's parent, whose runner owns the inbox.
     :param runner_router: Router used to resolve the parent's runner client.
     :param tunnel_registry: Runner-tunnel registry used to await the parent
@@ -3491,6 +3491,33 @@ def register_events_routes(
                     )
                     if recovered is not None:
                         runner_result = recovered
+                elif runner_result.status_code == 503:
+                    try:
+                        rejection = json.loads(runner_result.body)
+                    except ValueError:
+                        rejection = None
+                    if (
+                        isinstance(rejection, dict)
+                        and rejection.get("error") == "subagent_delivery_not_confirmed"
+                        and rejection.get("reason") == "missing_parent_inbox"
+                        and conv.parent_conversation_id is not None
+                    ):
+                        # Same-host children can own separate runners after a
+                        # restart. Deliver through the parent without rebinding
+                        # the child's still-live terminal to another runner.
+                        parent = await asyncio.to_thread(
+                            conversation_store.get_conversation, conv.parent_conversation_id
+                        )
+                        if parent is not None:
+                            recovered = await _forward_subagent_terminal_to_parent_runner(
+                                conv,
+                                parent,
+                                runner_router,
+                                getattr(request.app.state, "tunnel_registry", None),
+                                forward_body,
+                            )
+                            if recovered is not None:
+                                runner_result = recovered
                 _require_external_status_forward(
                     session_id,
                     status,

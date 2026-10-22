@@ -279,6 +279,103 @@ async def test_same_host_child_keeps_the_single_child_runner_forward(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restarted", ["parent", "child", "both"])
+@pytest.mark.parametrize("status", ["idle", "completed", "failed", "stopped", "killed"])
+async def test_same_host_completion_recovers_missing_inbox_after_runner_restart(
+    same_host_route: _CrossHostRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    restarted: str,
+    status: str,
+) -> None:
+    """A reachable child runner may no longer own its parent's inbox."""
+    route = same_host_route
+    parent_runner = "runner_parent_new" if restarted in {"parent", "both"} else "runner_lead"
+    child_runner = "runner_child_new" if restarted in {"child", "both"} else "runner_child"
+    route.store.replace_runner_id(route.parent_id, parent_runner)
+    route.store.replace_runner_id(route.child_id, child_runner)
+
+    async def reject_missing_inbox(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions._RunnerForwardResult(
+            status_code=503,
+            body=json.dumps(
+                {"error": "subagent_delivery_not_confirmed", "reason": "missing_parent_inbox"}
+            ),
+        )
+
+    monkeypatch.setattr(sessions, "_forward_session_change_to_runner", reject_missing_inbox)
+    response = await _post_status(route, status)
+
+    assert response.status_code == 202, response.text
+    assert route.waited_for == [route.parent_id]
+    assert len(route.forwarded) == 1
+    path, body = route.forwarded[0]
+    assert path == f"/v1/sessions/{route.child_id}/events"
+    assert body["type"] == "external_session_status"
+    expected_data: dict[str, Any] = {"status": status, "output": "result"}
+    if status == "failed":
+        expected_data["failure_context"] = {
+            "detail_source": "external_status_output",
+            "failure_source": "external_status",
+        }
+    assert body["data"] == expected_data
+    child = route.store.get_conversation(route.child_id)
+    assert child is not None and child.runner_id == child_runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        "not-json",
+        "[]",
+        '{"error":"unavailable"}',
+        '{"error":"subagent_delivery_not_confirmed","reason":"missing_work_entry"}',
+    ],
+)
+async def test_unrelated_runner_rejection_is_preserved(
+    same_host_route: _CrossHostRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    rejection: str,
+) -> None:
+    """Only an explicit missing-inbox rejection permits another delivery route."""
+    route = same_host_route
+
+    async def reject(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions._RunnerForwardResult(status_code=503, body=rejection)
+
+    monkeypatch.setattr(sessions, "_forward_session_change_to_runner", reject)
+    response = await _post_status(route, "idle")
+
+    assert response.status_code == 503
+    assert route.waited_for == []
+    assert route.forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_missing_inbox_is_not_acked_when_parent_runner_is_offline(
+    same_host_route: _CrossHostRoute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = same_host_route
+
+    async def reject(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions._RunnerForwardResult(
+            status_code=503,
+            body='{"error":"subagent_delivery_not_confirmed","reason":"missing_parent_inbox"}',
+        )
+
+    async def offline(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions, "_forward_session_change_to_runner", reject)
+    monkeypatch.setattr(sessions, "_wait_for_runner_client", offline)
+    response = await _post_status(route, "idle")
+
+    assert response.status_code == 503
+    assert "missing_parent_inbox" in response.json()["error"]["message"]
+    assert route.forwarded == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("child_host", "expects_forward"),
     [
