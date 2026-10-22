@@ -18,7 +18,8 @@ class SysChildCapTool(Tool):
     def description(cls) -> str:
         return (
             "Read the current session's child-session limit and open-child count. "
-            "Supply cap to set a positive limit, or 'none' to explicitly disable "
+            "Supply cap as a positive integer or decimal string to set a positive "
+            "limit, or 'none' to explicitly disable "
             "the limit for this session. Omit cap to read without changing it."
         )
 
@@ -34,6 +35,7 @@ class SysChildCapTool(Tool):
                         "cap": {
                             "oneOf": [
                                 {"type": "integer", "minimum": 1},
+                                {"type": "string", "pattern": r"^[1-9][0-9]*(?![\s\S])"},
                                 {"type": "string", "enum": ["none"]},
                             ],
                             "description": "New limit; omit to read the effective cap.",

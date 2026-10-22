@@ -8532,10 +8532,18 @@ async def _execute_child_cap(
     if client is None or conversation_id is None:
         return json.dumps({"error": "sys_child_cap requires server access and a session id"})
     cap = args.get("cap")
+    invalid_cap = json.dumps({"error": "cap must be a positive integer or 'none'"})
+    if isinstance(cap, str) and cap != "none":
+        if re.fullmatch(r"[1-9][0-9]*", cap) is None:
+            return invalid_cap
+        try:
+            cap = int(cap)
+        except ValueError:
+            return invalid_cap
     if "cap" in args and not (
         cap == "none" or (isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1)
     ):
-        return json.dumps({"error": "cap must be a positive integer or 'none'"})
+        return invalid_cap
     path = f"/v1/sessions/{conversation_id}/child-cap"
     try:
         response = (
