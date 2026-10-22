@@ -163,7 +163,7 @@ describe("ComposerAddMenu", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: /Work in a project/ }));
     expect(screen.getByText("Choose a project")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitem", { name: "docs" }));
+    fireEvent.click(screen.getByRole("option", { name: "docs" }));
     expect(onProjectSelect).toHaveBeenCalledWith("docs");
   });
 

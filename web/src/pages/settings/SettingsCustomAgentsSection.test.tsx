@@ -23,6 +23,14 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   }),
 }));
 vi.mock("@/lib/agentLabels", () => ({
+  fetchHarnessCatalog: vi.fn(async () => ({
+    rows: [],
+    capabilitiesByHarness: {},
+    labels: { "claude-sdk": "Claude SDK" },
+    setupSteps: {},
+    acpHarnesses: new Set(["jcode"]),
+    effortFamilies: {},
+  })),
   BRAIN_HARNESS_LABELS: { "claude-sdk": "Claude SDK" },
   useAcpHarnessIds: () => new Set(["jcode"]),
   useHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),

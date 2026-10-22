@@ -118,7 +118,10 @@ vi.mock("@/hooks/useHosts", () => ({
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
-vi.mock("@/hooks/useAvailableAgents", () => ({
+import type * as AvailableAgentsModule from "@/hooks/useAvailableAgents";
+
+vi.mock("@/hooks/useAvailableAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof AvailableAgentsModule>()),
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
 }));

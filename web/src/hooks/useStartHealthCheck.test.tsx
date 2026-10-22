@@ -124,15 +124,17 @@ describe("useStartHealthCheck", () => {
   it("requests brief, project session and first message, then navigates", async () => {
     fetchMock
       .mockResolvedValueOnce(mockResponse(BRIEF))
+      .mockResolvedValueOnce(mockResponse({ id: "project_1", archived_at: null }))
       .mockResolvedValueOnce(mockResponse(sessionWire("conv_1")))
       .mockResolvedValueOnce(mockResponse({ queued: true, forwarded: true }));
 
     const result = await start();
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/system/brief");
 
-    const [createUrl, createInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/projects/project_1");
+    const [createUrl, createInit] = fetchMock.mock.calls[2] as [string, RequestInit];
     expect(createUrl).toBe("/v1/sessions");
     expect(createInit.method).toBe("POST");
     const createBody = JSON.parse(String(createInit.body)) as Record<string, unknown>;
@@ -145,7 +147,7 @@ describe("useStartHealthCheck", () => {
     expect(createBody).not.toHaveProperty("agent_id");
     expect(createBody).not.toHaveProperty("workspace");
 
-    const [eventUrl, eventInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    const [eventUrl, eventInit] = fetchMock.mock.calls[3] as [string, RequestInit];
     expect(eventUrl).toBe("/v1/sessions/conv_1/events");
     expect(JSON.parse(String(eventInit.body))).toEqual({
       type: "message",
@@ -162,13 +164,14 @@ describe("useStartHealthCheck", () => {
   it("surfaces a create failure with the server message and posts no event", async () => {
     fetchMock
       .mockResolvedValueOnce(mockResponse(BRIEF))
+      .mockResolvedValueOnce(mockResponse({ id: "project_1", archived_at: null }))
       .mockResolvedValueOnce(
         mockResponse({ error: { message: "default agent cannot be launched" } }, 400),
       );
 
     const result = await start();
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(result.current.notice).toEqual({
       kind: "error",
       message: "default agent cannot be launched",
@@ -179,11 +182,12 @@ describe("useStartHealthCheck", () => {
   it.each([403, 404])("adds the ownership hint on create %i", async (status) => {
     fetchMock
       .mockResolvedValueOnce(mockResponse(BRIEF))
+      .mockResolvedValueOnce(mockResponse({ id: "project_1", archived_at: null }))
       .mockResolvedValueOnce(mockResponse({ error: { message: "no such project" } }, status));
 
     const result = await start();
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(result.current.notice?.message).toBe(
       "no such project The ops project and host must belong to you.",
     );
@@ -192,6 +196,7 @@ describe("useStartHealthCheck", () => {
   it("links the created session when the first message fails", async () => {
     fetchMock
       .mockResolvedValueOnce(mockResponse(BRIEF))
+      .mockResolvedValueOnce(mockResponse({ id: "project_1", archived_at: null }))
       .mockResolvedValueOnce(mockResponse(sessionWire("conv_1")))
       .mockResolvedValueOnce(mockResponse({ error: { message: "runner unavailable" } }, 503));
 
@@ -208,6 +213,7 @@ describe("useStartHealthCheck", () => {
   it("navigates when the event is persisted but not forwarded", async () => {
     fetchMock
       .mockResolvedValueOnce(mockResponse(BRIEF))
+      .mockResolvedValueOnce(mockResponse({ id: "project_1", archived_at: null }))
       .mockResolvedValueOnce(mockResponse(sessionWire("conv_1")))
       .mockResolvedValueOnce(mockResponse({ queued: true, forwarded: false }));
 

@@ -539,7 +539,7 @@ describe("fetchAllArchivedProjectNames", () => {
     expect(names).toEqual(["Alpha", "Beta"]);
     // The id→name resolution is one projects list call after the scan.
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toBe("/v1/projects");
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/projects?include_archived=true");
   });
 });
 

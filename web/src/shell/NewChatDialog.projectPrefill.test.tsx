@@ -116,7 +116,10 @@ vi.mock("@/hooks/useHosts", () => ({
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
-vi.mock("@/hooks/useAvailableAgents", () => ({
+import type * as AvailableAgentsModule from "@/hooks/useAvailableAgents";
+
+vi.mock("@/hooks/useAvailableAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof AvailableAgentsModule>()),
   useAvailableAgents: vi.fn(),
   // Opening the agent picker prefetches details per row; no-op here.
   prefetchAvailableAgentDetails: vi.fn(),
@@ -359,8 +362,19 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
   const submit = screen.getByTestId("new-chat-landing-submit");
   await waitFor(() => expect(submit).toBeEnabled());
   fireEvent.click(submit);
-  await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalled());
-  const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(authenticatedFetch)
+        .mock.calls.some(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
+    ).toBe(true),
+  );
+  const [, init] = vi
+    .mocked(authenticatedFetch)
+    .mock.calls.find(([url, init]) => url === "/v1/sessions" && init?.method === "POST") as [
+    string,
+    RequestInit,
+  ];
   return JSON.parse(init.body as string) as Record<string, unknown>;
 }
 
@@ -378,7 +392,11 @@ async function expectNoProjectRoot(): Promise<void> {
   expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
     "This project has no directory on",
   );
-  expect(vi.mocked(authenticatedFetch)).not.toHaveBeenCalled();
+  expect(
+    vi
+      .mocked(authenticatedFetch)
+      .mock.calls.filter(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
+  ).toHaveLength(0);
 }
 
 beforeEach(() => {
@@ -578,7 +596,11 @@ describe("NewChatLandingScreen project prefill", () => {
       target: { value: "hello" },
     });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-    expect(vi.mocked(authenticatedFetch)).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(authenticatedFetch)
+        .mock.calls.filter(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
+    ).toHaveLength(0);
 
     // Recovery: an explicit pick clears the state and submit goes through
     // with the agent the user actually chose.
@@ -819,7 +841,11 @@ describe("NewChatLandingScreen project prefill", () => {
       target: { value: "hello" },
     });
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-    expect(vi.mocked(authenticatedFetch)).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(authenticatedFetch)
+        .mock.calls.filter(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
+    ).toHaveLength(0);
   });
 
   // A repo with a main work tree plus one linked worktree. `git worktree list`

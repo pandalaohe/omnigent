@@ -129,7 +129,10 @@ vi.mock("@/hooks/useHosts", () => ({
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
-vi.mock("@/hooks/useAvailableAgents", () => ({
+import type * as AvailableAgentsModule from "@/hooks/useAvailableAgents";
+
+vi.mock("@/hooks/useAvailableAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof AvailableAgentsModule>()),
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
 }));
@@ -359,11 +362,22 @@ async function submitAndReadBody(
     target: { value: "hello" },
   });
   fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-  await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalled());
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(authenticatedFetch)
+        .mock.calls.some(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
+    ).toBe(true),
+  );
   // Let the post-create bookkeeping (move / invalidations / navigation) run
   // before reading the body, so move-call assertions can't race the submit.
   await waitFor(() => expect(navigateMock).toHaveBeenCalled());
-  const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+  const [, init] = vi
+    .mocked(authenticatedFetch)
+    .mock.calls.find(([url, init]) => url === "/v1/sessions" && init?.method === "POST") as [
+    string,
+    RequestInit,
+  ];
   return JSON.parse(init.body as string) as Record<string, unknown>;
 }
 
