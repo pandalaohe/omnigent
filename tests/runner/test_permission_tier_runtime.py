@@ -43,6 +43,265 @@ def _runtime(tmp_path: Path, tier: str) -> PermissionTierRuntime:
     return runtime
 
 
+def _extension_runtime(
+    tmp_path: Path, tier: str, scope: str = "user", name: str = "google_search"
+):
+    from omnigent.harnesses.pi_native.bridge import prepare_permission_installation
+
+    runtime = _runtime(tmp_path, tier)
+    runtime._harnesses["session-a"] = "pi-native"
+    bridge = runtime.path("session-a").parent
+    guard = bridge / "omnigent_pi_native_extension.js"
+    guard.write_text("// guard\n")
+    prepare_permission_installation(
+        bridge, session_id="session-a", harness="pi-native", extension=guard
+    )
+    expected = json.loads((bridge / "permission_expected.json").read_text())
+    package = tmp_path / "user-package"
+    package.mkdir()
+    (package / "package.json").write_text("{}")
+    source = package / "index.js"
+    source.write_text("// user extension\n")
+    config = tmp_path / "user-config"
+    config.mkdir()
+    registry = {
+        **{
+            key: expected[key]
+            for key in ("version", "installation_id", "session_id", "harness", "extension_sha256")
+        },
+        "tools": [
+            {
+                "name": name,
+                "sourceInfo": {
+                    "path": str(source),
+                    "source": "npm:sample-extension",
+                    "scope": scope,
+                    "origin": "package",
+                    "baseDir": str(config),
+                },
+                "real_path": str(source.resolve()),
+                "real_base_dir": str(config.resolve()),
+                "implementation_root": str(package.resolve()),
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    (bridge / "permission_tools.json").write_text(json.dumps(registry))
+    return runtime, source, registry
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected"),
+    [
+        ("ask", "ASK"),
+        ("plan", "DENY"),
+        ("accept-edits", "ASK"),
+        ("auto", "ALLOW"),
+        ("full", "ALLOW"),
+    ],
+)
+@pytest.mark.parametrize("name", ["google_search", "read", "bash"])
+def test_user_extension_tools_follow_tier_not_builtin_name(tmp_path, tier, expected, name):
+    runtime, _source, _registry = _extension_runtime(tmp_path, tier, name=name)
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="extension",
+        name=name,
+        arguments={"query": "release notes"},
+        expected_revision=3,
+    )
+    assert decision.action.value == expected, decision.reason
+
+
+@pytest.mark.parametrize("scope", ["project", "temporary", "unknown"])
+def test_extension_scope_cannot_claim_builtin_read_permissions(tmp_path, scope):
+    runtime, _source, _registry = _extension_runtime(tmp_path, "auto", scope, "read")
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="collision",
+        name="read",
+        arguments={"path": "notes.txt"},
+        expected_revision=3,
+    )
+    assert decision.action.value == "DENY"
+    assert "extension" in decision.reason.lower()
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing", "stale", "changed-source", "symlink-source", "symlink-registry"]
+)
+@pytest.mark.parametrize("tier", ["auto", "ask", "accept-edits"])
+def test_extension_registry_fails_closed_and_rechecks_authorization(tmp_path, fault, tier):
+    runtime, source, registry = _extension_runtime(tmp_path, tier)
+    binding, decision = runtime.inspect(
+        "session-a", call_id="extension", name="google_search", arguments={}, expected_revision=3
+    )
+    assert decision.action.value == ("ALLOW" if tier == "auto" else "ASK"), decision.reason
+    path = runtime.path("session-a").parent / "permission_tools.json"
+    if fault == "missing":
+        path.unlink()
+    elif fault == "stale":
+        registry["installation_id"] = "old-installation"
+        path.write_text(json.dumps(registry))
+    elif fault == "changed-source":
+        source.write_text("// modified since loading\n")
+    elif fault == "symlink-source":
+        other = tmp_path / "other.js"
+        other.write_text(source.read_text())
+        source.unlink()
+        source.symlink_to(other)
+    else:
+        other = tmp_path / "registry.json"
+        path.rename(other)
+        path.symlink_to(other)
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+    )
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="retry",
+        name="google_search",
+        arguments={"sourceInfo": registry["tools"][0]["sourceInfo"]},
+        expected_revision=3,
+    )
+    assert decision.action.value == "DENY"
+    assert "extension" in decision.reason.lower(), decision.reason
+
+
+@pytest.mark.parametrize(
+    "target", ["source", "dependency", "config", "project-pi", "project-agents"]
+)
+def test_extension_implementation_and_configuration_are_control_paths(tmp_path, target):
+    runtime, source, registry = _extension_runtime(tmp_path, "auto")
+    paths = {
+        "source": source,
+        "dependency": source.parent / "lib.js",
+        "config": Path(registry["tools"][0]["sourceInfo"]["baseDir"]) / "settings.json",
+        "project-pi": tmp_path / "workspace/.pi/extensions/injected.js",
+        "project-agents": tmp_path / "workspace/.agents/extensions/injected.js",
+    }
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="tamper",
+        name="write",
+        arguments={"path": str(paths[target]), "content": "injected"},
+        expected_revision=3,
+    )
+    assert decision.action.value == "DENY"
+    assert decision.rule_id == "control-path"
+
+
+@pytest.mark.parametrize("source", [None, {}, {"scope": "user", "source": "sdk"}])
+def test_tool_arguments_cannot_supply_missing_extension_provenance(tmp_path, source):
+    runtime, _entry, registry = _extension_runtime(tmp_path, "auto")
+    registry["tools"][0]["sourceInfo"] = source
+    bridge = runtime.path("session-a").parent
+    (bridge / "permission_tools.json").write_text(json.dumps(registry))
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="spoof",
+        name="google_search",
+        arguments={
+            "sourceInfo": {"scope": "user", "source": "npm:trusted"},
+            "tool_origin": "user-extension",
+            "readOnlyHint": True,
+        },
+        expected_revision=3,
+    )
+    assert decision.action.value == "DENY"
+    assert "extension source" in decision.reason
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected"),
+    [
+        ("ask", "ASK"),
+        ("accept-edits", "ASK"),
+        ("auto", "DENY"),
+        ("plan", "DENY"),
+        ("full", "ALLOW"),
+    ],
+)
+def test_incomplete_initial_local_extension_source_is_untrusted_not_changed(
+    tmp_path, tier, expected
+):
+    runtime, _entry, registry = _extension_runtime(tmp_path, tier)
+    tool = registry["tools"][0]
+    # Pi's explicit global settings.extensions local entries omit optional baseDir.
+    tool["sourceInfo"].pop("baseDir")
+    tool["sourceInfo"].update(source="local", origin="top-level")
+    for key in ("real_path", "real_base_dir", "implementation_root", "source_sha256"):
+        tool.pop(key)
+    (runtime.path("session-a").parent / "permission_tools.json").write_text(json.dumps(registry))
+    _binding, decision = runtime.inspect(
+        "session-a", call_id="local", name="google_search", arguments={}, expected_revision=3
+    )
+    assert decision.action.value == expected, decision.reason
+    if tier != "full":
+        assert "changed" not in decision.reason
+
+
+def test_verified_extension_registry_is_not_remote_tool_authority(tmp_path):
+    runtime, _entry, _registry = _extension_runtime(tmp_path, "auto")
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="remote",
+        name="google_search",
+        arguments={},
+        expected_revision=3,
+        local_execution=False,
+    )
+    assert decision.action.value == "DENY"
+
+
+def test_user_extension_symlink_protects_the_resolved_package(tmp_path):
+    runtime, entry, registry = _extension_runtime(tmp_path, "auto")
+    alias = tmp_path / "installed-link.js"
+    alias.symlink_to(entry)
+    registry["tools"][0]["sourceInfo"]["path"] = str(alias)
+    (runtime.path("session-a").parent / "permission_tools.json").write_text(json.dumps(registry))
+    _binding, decision = runtime.inspect(
+        "session-a", call_id="linked", name="google_search", arguments={}, expected_revision=3
+    )
+    assert decision.action.value == "ALLOW"
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="tamper-dependency",
+        name="write",
+        arguments={"path": str(entry.parent / "lib.js"), "content": "replace"},
+        expected_revision=3,
+    )
+    assert decision.rule_id == "control-path"
+
+
+def test_extension_configuration_symlink_change_invalidates_trust(tmp_path):
+    runtime, _entry, registry = _extension_runtime(tmp_path, "auto")
+    base = Path(registry["tools"][0]["sourceInfo"]["baseDir"])
+    alias = tmp_path / "config-link"
+    alias.symlink_to(base, target_is_directory=True)
+    registry["tools"][0]["sourceInfo"]["baseDir"] = str(alias)
+    (runtime.path("session-a").parent / "permission_tools.json").write_text(json.dumps(registry))
+    binding, decision = runtime.inspect(
+        "session-a", call_id="linked", name="google_search", arguments={}, expected_revision=3
+    )
+    assert decision.action.value == "ALLOW"
+    other = tmp_path / "other-config"
+    other.mkdir()
+    alias.unlink()
+    alias.symlink_to(other, target_is_directory=True)
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+    )
+
+
 @pytest.mark.parametrize("runner_id", ["runner-a", None])
 def test_cli_permission_fence_uses_authenticated_runner_binding(tmp_path, monkeypatch, runner_id):
     path = tmp_path / "permission_state.json"

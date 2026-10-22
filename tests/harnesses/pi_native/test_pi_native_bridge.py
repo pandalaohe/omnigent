@@ -3,12 +3,154 @@
 from __future__ import annotations
 
 import json
+import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+
+
+@pytest.mark.parametrize("harness", ["pi-native", "pi"])
+@pytest.mark.parametrize("scope", ["user", "project", "sdk", "unknown", "bridge", "local"])
+def test_runtime_owned_user_extension_registry_reaches_host_gate(
+    tmp_path: Path, harness: str, scope: str
+):
+    from omnigent.inner.pi_executor import _generate_extension_js
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+    from omnigent.runner.permission_tiers import PermissionTierRuntime
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for Pi bridge verification")
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    package = tmp_path / "user-package"
+    package.mkdir()
+    (package / "package.json").write_text("{}")
+    entry = package / "index.js"
+    entry.write_text("// user-installed extension\n")
+    state = HostPermissionState(
+        "extension-session", "test-host", str(tmp_path), "auto", 1, "ready"
+    )
+    write_host_permission_state(bridge / "permission_state.json", state)
+    tools = [{"name": "sys_os_write", "description": "Write", "parameters": {"type": "object"}}]
+    if harness == "pi-native":
+        extension, config = pi_native_bridge.write_extension_files(
+            bridge,
+            session_id=state.session_id,
+            server_url="http://mock",
+            conversation_url="http://mock/conversation",
+            tools=tools,
+        )
+    else:
+        extension = tmp_path / "omnigent_pi_active" / "omnigent_tools.js"
+        extension.parent.mkdir()
+        extension.write_text(
+            _generate_extension_js(
+                12345,
+                tools,
+                "test-token",
+                permission_bridge_dir=bridge,
+                session_id=state.session_id,
+            )
+        )
+        pi_native_bridge.prepare_permission_installation(
+            bridge, session_id=state.session_id, harness=harness, extension=extension
+        )
+        config = bridge / "config.json"
+    script = r"""
+const fs = require('fs');
+const assert = require('assert').strict;
+const { EventEmitter } = require('events');
+let policyCalls = 0;
+require('net').createConnection = (_options, connected) => {
+  const socket = new EventEmitter();
+  socket.destroy = () => {};
+  socket.write = (line) => {
+    const request = JSON.parse(line);
+    if (request.kind === 'policy_eval') policyCalls++;
+    queueMicrotask(() => socket.emit('data', JSON.stringify({ id: request.id,
+      verdict: { block: true, reason: 'untrusted registration' } }) + '\n'));
+  };
+  queueMicrotask(connected);
+  return socket;
+};
+process.env.OMNIGENT_PI_NATIVE_CONFIG = process.argv[2];
+process.env.OMNIGENT_PI_PERMISSION_INLINE = process.argv[1];
+global.setInterval = () => ({ unref() {} });
+global.fetch = async (url) => {
+  if (url.endsWith('/policies/evaluate')) policyCalls++;
+  return { ok: true, status: 200, json: async () => ({
+    result: 'POLICY_ACTION_DENY', reason: 'untrusted registration' }) };
+};
+const scope = process.argv[5];
+const name = scope === 'user' ? 'google_search' : 'sys_os_write';
+const tools = [{ name, sourceInfo: { scope, origin: 'package',
+  source: 'npm:sample-extension', path: process.argv[3], baseDir: process.argv[4] } }];
+if (scope === 'sdk') tools[0].sourceInfo = { scope: 'temporary', source: 'sdk',
+  origin: 'top-level', path: '<sdk:sys_os_write>' };
+if (scope === 'unknown') delete tools[0].sourceInfo;
+if (scope === 'local') tools[0].sourceInfo = { scope: 'user', source: 'local',
+  origin: 'top-level', path: process.argv[3] };
+if (scope === 'bridge') tools[0].sourceInfo = { scope: 'temporary', source: 'inline',
+  origin: 'top-level', path: '<inline:omnigent-permission>' };
+const handlers = {};
+let active = [name];
+const pi = { on: (name, fn) => { handlers[name] = fn; }, registerTool() {}, registerCommand() {},
+  getAllTools: () => tools, getActiveTools: () => active,
+  setActiveTools: (names) => { active = names; } };
+require(process.argv[1])(pi);
+Promise.resolve(handlers.session_start({}, { isIdle: () => true })).then(async () => {
+  if (scope === 'user') tools[0].sourceInfo.scope = 'project';
+  const verdict = await handlers.tool_call({ toolName: name,
+    toolCallId: 'changed-source', input: {} }, { isIdle: () => true });
+  if (scope === 'bridge') {
+    assert.equal(verdict, undefined);
+    assert.equal(policyCalls, 0);
+    return;
+  }
+  assert.equal(verdict.block, true);
+  const expected = scope === 'user' ? /registration changed/ : /untrusted registration/;
+  assert.match(verdict.reason, expected);
+  assert.equal(policyCalls, scope === 'user' ? 0 : 1);
+}).catch((err) => {
+  console.error(err); process.exitCode = 1;
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(extension), str(config), str(entry), str(package), scope],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert pi_native_bridge.verify_pi_permission_installation(bridge, "auto")
+    runtime = PermissionTierRuntime()
+    runtime._states[state.session_id] = state
+    runtime._paths[state.session_id] = bridge / "permission_state.json"
+    runtime._harnesses[state.session_id] = harness
+    binding, decision = runtime.inspect(
+        state.session_id,
+        call_id="search",
+        name="google_search" if scope == "user" else "sys_os_write",
+        arguments={"path": str(tmp_path / "note.txt"), "content": "x"},
+        expected_revision=1,
+    )
+    allowed = scope in ("user", "bridge")
+    assert decision.action.value == ("ALLOW" if allowed else "DENY"), decision.reason
+    assert (
+        runtime.authorize(
+            state.session_id,
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments_digest=binding.arguments_digest,
+            expected_revision=1,
+        )
+        == allowed
+    )
 
 
 def _inbox_files(bridge_dir: Path) -> list[str]:
@@ -215,6 +357,11 @@ def test_write_extension_files_embeds_tools(tmp_path: Path) -> None:
             "description": "Run a command",
             "parameters": {"type": "object", "properties": {}},
         },
+        {
+            "name": "sys_session_send",
+            "description": "Send a session message",
+            "parameters": {"type": "object", "properties": {}},
+        },
     ]
 
     _ext, cfg = pi_native_bridge.write_extension_files(
@@ -231,6 +378,7 @@ def test_write_extension_files_embeds_tools(tmp_path: Path) -> None:
     # serverUrl trailing slash is stripped so the extension can append paths.
     assert payload["serverUrl"] == "http://omnigent.test"
     assert payload["tools"] == tools
+    assert payload["planVisibleTools"] == ["read", "manage_todo_list", "sys_os_read"]
 
 
 def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
@@ -246,6 +394,7 @@ def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
 
     payload = json.loads(cfg.read_text(encoding="utf-8"))
     assert payload["tools"] == []
+    assert payload["planVisibleTools"] == ["read", "manage_todo_list"]
 
 
 def test_write_extension_files_replaces_startup_instructions_on_relaunch(tmp_path: Path) -> None:

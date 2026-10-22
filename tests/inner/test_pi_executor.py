@@ -1337,7 +1337,8 @@ class TestGenerateExtensionJs(unittest.TestCase):
         self.assertIn("block: true", js)
 
 
-def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tier", ["plan", "full"])
+def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path, tier) -> None:
     """The real generated JS must install itself and hide executable tools in plan."""
     node = shutil.which("node")
     if node is None:
@@ -1350,7 +1351,7 @@ def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path
             session_id="test-session",
             host_id="test-host",
             workspace=str(tmp_path),
-            tier="plan",
+            tier=tier,
             revision=1,
             status="blocked",
         ),
@@ -1377,29 +1378,38 @@ if (process.argv[2] === "safe") {
   process.argv.push("--no-extensions", "--extension", process.argv[1]);
 }
 const handlers = {};
+const tier = process.argv[3];
 let active = ["read", "sys_os_read", "sys_os_shell"];
 global.setInterval = () => 0;
 const pi = {
   on(name, handler) { handlers[name] = handler; },
   registerTool() {},
+  getAllTools() { throw new Error('metadata unavailable'); },
   getActiveTools() { return active; },
   setActiveTools(names) { active = names; },
 };
 require(process.argv[1])(pi);
 handlers.session_start({}, { isIdle: () => true });
-assert.deepEqual(active, process.argv[2] === "safe"
+assert.deepEqual(active, process.argv[2] === "safe" && tier === "plan"
   ? ["read", "sys_os_read"] : ["read", "sys_os_read", "sys_os_shell"]);
 """
-    result = subprocess.run([node, "-e", script, str(extension)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    assert not verify_pi_permission_installation(bridge_dir, "plan")
+    # Plan needs a usable registry API; full must retain its metadata-independent path.
+    if tier == "plan":
+        script = script.replace("throw new Error('metadata unavailable');", "return [];")
     result = subprocess.run(
-        [node, "-e", script, str(extension), "safe"], capture_output=True, text=True
+        [node, "-e", script, str(extension), "unsafe", tier], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
-    assert verify_pi_permission_installation(bridge_dir, "plan")
+    assert verify_pi_permission_installation(bridge_dir, tier) == (tier == "full")
+    result = subprocess.run(
+        [node, "-e", script, str(extension), "safe", tier], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert verify_pi_permission_installation(bridge_dir, tier)
     installed = json.loads((bridge_dir / "permission_installation.json").read_text())
-    assert installed["active_tools"] == ["read", "sys_os_read"]
+    assert installed["active_tools"] == (
+        ["read", "sys_os_read"] if tier == "plan" else ["read", "sys_os_read", "sys_os_shell"]
+    )
 
 
 @pytest.mark.asyncio

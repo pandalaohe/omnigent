@@ -2,6 +2,8 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const permissionToolSources = require("./permission_tool_registry.cjs");
+let permissionToolRegistry = null;
 
 // Tuning for the TOOL_CALL policy long-poll (see evalNativePolicyHttp).
 //
@@ -223,7 +225,7 @@ function activeToolsForTier(pi, config, baselineTools, tier) {
   }
 }
 
-function markPermissionInstallation(config, state, activeTools) {
+function markPermissionInstallation(pi, config, state, activeTools) {
   if (!config || !state || !activeTools ||
       (state.tier !== "full" && !permissionExtensionOrderProven()) ||
       typeof config.permissionInstallationId !== "string" ||
@@ -231,6 +233,13 @@ function markPermissionInstallation(config, state, activeTools) {
   try {
     const extensionSha256 = crypto.createHash("sha256")
       .update(fs.readFileSync(__filename)).digest("hex");
+    if (state.tier !== "full") {
+      permissionToolRegistry = permissionToolSources.capture(pi, {
+        version: 1, installation_id: config.permissionInstallationId,
+        session_id: state.session_id, harness: "pi-native", extension_sha256: extensionSha256,
+      });
+      writePermissionControlFile(config, "permission_tools.json", permissionToolRegistry);
+    }
     writePermissionControlFile(config, "permission_installation.json", {
       version: 1,
       installation_id: config.permissionInstallationId,
@@ -2404,7 +2413,7 @@ module.exports = function (pi) {
       if (Array.isArray(currentTools) && currentTools.every((name) => typeof name === "string")) {
         baselineActiveTools = currentTools;
         const active = activeToolsForTier(pi, config, baselineActiveTools, permissionState.tier);
-        markPermissionInstallation(config, permissionState, active);
+        markPermissionInstallation(pi, config, permissionState, active);
       }
     }
     restoreTaskList(ctx);
@@ -2705,6 +2714,10 @@ module.exports = function (pi) {
         !event.input || typeof event.input !== "object" || Array.isArray(event.input)) {
       return { block: true, reason: "invalid tool call" };
     }
+    if (permissionState.tier !== "full" && permissionToolRegistry &&
+        !permissionToolSources.matches(pi, permissionToolRegistry, event.toolName)) {
+      return { block: true, reason: "Pi extension registration changed; restart the session to verify its source" };
+    }
     // Bridged Omnigent tools (registered via pi.registerTool above) are
     // policy-evaluated server-side inside the /mcp proxy when execute() runs,
     // so skip the hook-level eval for them to avoid double-evaluation and, for
@@ -2712,7 +2725,9 @@ module.exports = function (pi) {
     // are NOT bridged and stay gated here.
     if (
       bridgedTools.has((event && event.toolName) || "") &&
-      !piNativeTools.has(event.toolName)
+      !piNativeTools.has(event.toolName) &&
+      (!permissionToolRegistry || permissionToolSources.isBridge(
+        permissionToolRegistry, event.toolName, __filename))
     ) {
       return;
     }
