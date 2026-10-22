@@ -184,6 +184,7 @@ def test_import_local_frames_round_trip() -> None:
     "frame",
     [
         HostSkillsFrame(request_id="req_skills", harness="claude-native", path="~/my project"),
+        HostSkillsFrame(request_id="picker", harness="codex", path="~", allow_pending=True),
         HostSkillsFrame(
             request_id="filtered", harness="claude-sdk", path="/repo", skills_filter=["review"]
         ),
@@ -228,6 +229,15 @@ def test_import_local_frames_round_trip() -> None:
 )
 def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame) -> None:
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_old_skills_frames_keep_waiting_and_pending_opt_in_is_boolean() -> None:
+    payload = {"kind": "host.skills", "request_id": "r", "harness": "codex", "path": "~"}
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostSkillsFrame)
+    assert frame.allow_pending is False
+    with pytest.raises(ValueError):
+        decode_host_frame(json.dumps({**payload, "allow_pending": "true"}))
 
 
 @pytest.mark.parametrize(

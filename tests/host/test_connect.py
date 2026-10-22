@@ -239,7 +239,7 @@ async def test_host_discovers_harness_skills_without_a_runner(
     )
 
     host = _make_host_process()
-    result = host._handle_skills(
+    result = await host._handle_skills(
         HostSkillsFrame(request_id="r", harness=harness, path="~/project with spaces")
     )
     assert result.status == "ok", result.error
@@ -266,7 +266,7 @@ async def test_host_skills_rejects_invalid_directory(
     (tmp_path / "file").write_text("not a directory")
     if path in {"missing", "file"}:
         path = str(tmp_path / path)
-    result = _make_host_process()._handle_skills(
+    result = await _make_host_process()._handle_skills(
         HostSkillsFrame(request_id="r", harness="claude-native", path=path)
     )
     assert result.status == "failed"
@@ -281,16 +281,109 @@ async def test_host_skills_distinguishes_empty_and_failure(
     host = _make_host_process()
     frame = HostSkillsFrame(request_id="r", harness="claude-native", path=str(tmp_path))
     monkeypatch.setattr(skill_sources, "resolve_harness_skills", lambda *_: [])
-    assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
+    assert await host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
 
     def fail(*_args: object) -> None:
         raise OSError("unreadable skill directory")
 
     monkeypatch.setattr(skill_sources, "resolve_harness_skills", fail)
     host = _make_host_process()
-    result = host._handle_skills(frame)
+    result = await host._handle_skills(frame)
     assert result.status == "failed"
     assert result.error_code == "discovery_failed"
+
+
+async def test_inventory_skill_scan_waits_for_the_catalog_past_the_picker_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    monkeypatch.setattr(skill_sources, "SKILLS_DISCOVERY_WAIT_SECONDS", 0.01)
+    release = threading.Event()
+    entered = threading.Event()
+    calls = 0
+
+    def scan(*_: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(5)
+        return [SimpleNamespace(name="review", description="Review", display_name=None)]
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", scan)
+    host = _make_host_process()
+    task = asyncio.create_task(
+        host._handle_skills(
+            HostSkillsFrame(request_id="r", harness="claude-native", path=str(tmp_path))
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        await asyncio.sleep(0.05)
+        assert not task.done(), "ordinary inventory requests must keep waiting for the scan"
+        picker = await host._handle_skills(
+            HostSkillsFrame(
+                request_id="picker",
+                harness="claude-native",
+                path=str(tmp_path),
+                allow_pending=True,
+            )
+        )
+        assert picker.error_code == "discovery_pending"
+        assert not task.done()
+        assert calls == 1
+        release.set()
+        result = await task
+        assert result.status == "ok"
+        assert result.skills == [{"name": "review", "description": "Review"}]
+    finally:
+        release.set()
+        await task
+        await host._skill_discovery.shutdown()
+        _cleanup_host(host)
+
+
+async def test_cold_skill_timeout_is_retryable_and_background_result_is_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    monkeypatch.setattr(skill_sources, "SKILLS_DISCOVERY_WAIT_SECONDS", 0.01)
+    release = threading.Event()
+    entered = threading.Event()
+    calls = 0
+
+    def slow_scan(*_: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(5)
+        return [SimpleNamespace(name="loaded", description="Loaded skill", display_name=None)]
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", slow_scan)
+    host = _make_host_process()
+    frame = HostSkillsFrame(
+        request_id="r", harness="codex", path=str(tmp_path), allow_pending=True
+    )
+    try:
+        result = await asyncio.wait_for(host._handle_skills(frame), 0.5)
+        assert result.status == "failed"
+        assert result.error_code == "discovery_pending"
+        assert result.error and "retry" in result.error
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert (await host._handle_skills(frame)).status == "failed"
+        assert calls == 1
+        tasks = list(host._skill_discovery._inflight.values())
+        release.set()
+        await asyncio.gather(*tasks)
+        retry = await host._handle_skills(frame)
+        assert retry.status == "ok"
+        assert retry.skills == [{"name": "loaded", "description": "Loaded skill"}]
+        assert calls == 1
+    finally:
+        release.set()
+        await host._skill_discovery.shutdown()
+        _cleanup_host(host)
 
 
 async def test_skill_bundle_fetch_survives_a_deleted_ssl_cert_file(
@@ -7847,6 +7940,66 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
     assert second.models == first.models
     assert probe_calls == [1]
     _cleanup_host(host)
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("refresh", [None, "auto", "force"])
+async def test_slow_codex_picker_keeps_probe_running_and_serves_matching_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness: str,
+    cached: bool,
+    refresh: str | None,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store as store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(app_server, "_PICKER_CATALOG_WAIT_SECONDS", 0.01, raising=False)
+    launch = app_server.NativeCodexLaunch(config_overrides=[], model=None, profile=None)
+    monkeypatch.setattr(app_server, "resolve_native_codex_launch", lambda **_: launch)
+    monkeypatch.setattr(app_server, "codex_catalog_fingerprint", lambda *_, **__: "target")
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda _: None
+    )
+    if cached:
+        store.write_catalog("codex-native", "target", [{"id": "last-good"}])
+        path = store.catalog_path("codex-native", "target")
+        old = path.stat().st_mtime - store.CATALOG_STALE_AFTER_S - 1
+        os.utime(path, (old, old))
+    store.write_catalog("codex-native", "other-config", [{"id": "wrong-provider"}])
+    release = asyncio.Event()
+    started = asyncio.Event()
+    calls = 0
+
+    async def probe(**_: object) -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return [{"id": "refreshed"}]
+
+    monkeypatch.setattr(app_server, "probe_codex_model_options", probe)
+    host = _make_host_process()
+    try:
+        frame = HostModelOptionsFrame(request_id="r", harness=harness, refresh=refresh)
+        result = await asyncio.wait_for(host._handle_model_options(frame), 0.5)
+        assert result.models == ([{"id": "last-good"}] if cached else [])
+        assert result.status == ("ok" if cached else "failed")
+        await asyncio.wait_for(started.wait(), 0.5)
+        assert calls == 1
+        again = await asyncio.wait_for(host._handle_model_options(frame), 0.5)
+        assert again.models == result.models
+        assert calls == 1
+        task = store._inflight[("codex-native", "target")]
+        release.set()
+        await task
+        assert store.read_catalog("codex-native", "target") == [{"id": "refreshed"}]
+    finally:
+        release.set()
+        await store.shutdown_catalog_probes()
+        _cleanup_host(host)
 
 
 async def test_handle_model_options_serves_claude_sdk_endpoint_listing(

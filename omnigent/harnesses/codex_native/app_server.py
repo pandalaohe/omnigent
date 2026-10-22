@@ -151,6 +151,7 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 _APP_SERVER_READY_TIMEOUT_SECONDS = 60.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
+_PICKER_CATALOG_WAIT_SECONDS = 2.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _CONTEXT_CATALOG_TIMEOUT_SECONDS = 2.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
@@ -1901,7 +1902,11 @@ def fresh_codex_launch_catalog(
 
 
 async def _codex_launch_catalog(
-    *, codex_path: str | None, launch: NativeCodexLaunch | None, reprobe: bool
+    *,
+    codex_path: str | None,
+    launch: NativeCodexLaunch | None,
+    reprobe: bool,
+    preview: bool = False,
 ) -> list[_JsonObject] | None:
     """Read or refresh one launch shape without resolving a different probe shape."""
     from omnigent.models import model_catalog_store
@@ -1941,7 +1946,14 @@ async def _codex_launch_catalog(
     # failed re-probe, leaving the stored rows serving.
     allow_empty = not model_catalog_store.read_catalog("codex-native", fingerprint)
     read = model_catalog_store.reprobe_catalog if reprobe else model_catalog_store.ensure_catalog
-    return await read("codex-native", fingerprint, lambda: _probe(allow_empty=allow_empty))
+    pending = read("codex-native", fingerprint, lambda: _probe(allow_empty=allow_empty))
+    if not preview:
+        return await pending
+    try:
+        return await asyncio.wait_for(pending, timeout=_PICKER_CATALOG_WAIT_SECONDS)
+    except TimeoutError:
+        # Store probes are shielded and keep refreshing the exact launch shape.
+        return model_catalog_store.read_catalog("codex-native", fingerprint)
 
 
 async def codex_launch_catalog(
@@ -1949,6 +1961,7 @@ async def codex_launch_catalog(
     codex_path: str | None = None,
     launch: NativeCodexLaunch | None = None,
     refresh: str | None = None,
+    preview: bool = False,
 ) -> list[_JsonObject] | None:
     """
     The shared codex catalog for a launch shape: store, then probe.
@@ -1961,6 +1974,8 @@ async def codex_launch_catalog(
     :param codex_path: Optional Codex executable override.
     :param launch: An already-resolved ``model=None`` launch shape. When
         omitted, resolve the host's default shape.
+    :param preview: Bound the picker wait and serve matching stored rows when
+        a probe is slow; the shared probe continues in the background.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
     if refresh not in {None, "auto", "force"}:
@@ -1975,7 +1990,7 @@ async def codex_launch_catalog(
         launch = shape
         refresh = "force" if age is None or age > 300 else None
     return await _codex_launch_catalog(
-        codex_path=codex_path, launch=launch, reprobe=refresh == "force"
+        codex_path=codex_path, launch=launch, reprobe=refresh == "force", preview=preview
     )
 
 

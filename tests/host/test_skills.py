@@ -234,3 +234,116 @@ def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> N
         HostSkillsFrame("request", "claude-native", str(tmp_path)), tmp_path
     ) == [{"name": "local", "description": "local description"}]
     fetch.assert_not_called()
+
+
+async def test_slow_skill_scan_serves_cache_and_refreshes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import threading
+
+    from omnigent.host import skills as module
+
+    monkeypatch.setattr(module, "SKILLS_DISCOVERY_WAIT_SECONDS", 0.01)
+    release = threading.Event()
+    entered = threading.Event()
+    calls = 0
+
+    def scan(*_: object) -> list[object]:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(5)
+        return []
+
+    monkeypatch.setattr(module, "resolve_harness_skills", scan)
+    discovery = HostSkillDiscovery(lambda _: pytest.fail("no bundle"))
+    frame = HostSkillsFrame("r", "codex", str(tmp_path), allow_pending=True)
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(discovery.discover_cached(frame, tmp_path), 0.5)
+        assert await asyncio.to_thread(entered.wait, 1)
+        with pytest.raises(TimeoutError):
+            await discovery.discover_cached(frame, tmp_path)
+        assert calls == 1
+        tasks = list(discovery._inflight.values())
+        release.set()
+        await asyncio.gather(*tasks)
+        assert await discovery.discover_cached(frame, tmp_path) == []
+        assert calls == 1
+    finally:
+        release.set()
+        await discovery.shutdown()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("allow_pending", [False, True])
+async def test_expired_skills_respect_pending_mode_during_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed: bool, allow_pending: bool
+) -> None:
+    import asyncio
+    import threading
+
+    from omnigent.host import skills as module
+
+    now = [0.0]
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(module, "SKILLS_DISCOVERY_WAIT_SECONDS", 0.01)
+    release = threading.Event()
+    entered = threading.Event()
+    calls = 0
+    old = _response(_bundle({"skills/old/SKILL.md": _skill("old")}, skills="none"))
+    new = _response(_bundle({"skills/new/SKILL.md": _skill("new")}, skills="none"))
+
+    def fetch(_: HostSkillsFrame) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return old
+        entered.set()
+        assert release.wait(5)
+        if failed:
+            raise httpx.ReadTimeout("slow bundle")
+        return new
+
+    discovery = HostSkillDiscovery(fetch)
+    frame = HostSkillsFrame(
+        "r", "session", str(tmp_path), "session", "agent", "1", allow_pending=allow_pending
+    )
+    try:
+        expected = [{"name": "old", "description": "old description"}]
+        assert discovery.discover(frame, tmp_path) == expected
+        now[0] = 61
+        if not allow_pending:
+            waiter = asyncio.create_task(discovery.discover_cached(frame, tmp_path))
+            assert await asyncio.to_thread(entered.wait, 1)
+            assert not waiter.done()
+            assert (
+                await discovery.discover_cached(replace(frame, allow_pending=True), tmp_path)
+                == expected
+            )
+            assert calls == 2
+            release.set()
+            if failed:
+                with pytest.raises(httpx.ReadTimeout, match="slow bundle"):
+                    await waiter
+            else:
+                assert await waiter == [{"name": "new", "description": "new description"}]
+            return
+        assert await asyncio.wait_for(discovery.discover_cached(frame, tmp_path), 0.5) == expected
+        assert await discovery.discover_cached(frame, tmp_path) == expected
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert calls == 2
+        # A changed agent version must never inherit the old bundle's skills.
+        with pytest.raises(TimeoutError):
+            await discovery.discover_cached(replace(frame, agent_version="2"), tmp_path)
+        tasks = list(discovery._inflight.values())
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        result = await discovery.discover_cached(frame, tmp_path)
+        assert result == (
+            expected if failed else [{"name": "new", "description": "new description"}]
+        )
+    finally:
+        release.set()
+        await discovery.shutdown()

@@ -177,6 +177,29 @@ async def test_unauthorized_session_does_not_send_discovery(
     assert not conn.pending_skills
 
 
+@pytest.mark.parametrize("allow_pending", [None, "true"])
+async def test_only_opted_in_picker_requests_bound_the_host_wait(presession_app, allow_pending):
+    app, _, conn, _, _, _ = presession_app
+    params = {"host_id": conn.host_id, "harness": "claude-native", "path": "~"}
+    if allow_pending is not None:
+        params["allow_pending"] = allow_pending
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        request = asyncio.create_task(
+            client.get("/v1/skills", params=params, headers={"x-test-user": "owner"})
+        )
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
+        assert isinstance(frame, HostSkillsFrame)
+        assert frame.allow_pending is (allow_pending == "true")
+        conn.pending_skills[frame.request_id].set_result(
+            HostSkillsResultFrame(frame.request_id, "ok")
+        )
+        assert (await request).status_code == 200
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

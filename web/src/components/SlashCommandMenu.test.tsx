@@ -110,6 +110,16 @@ describe("skill discovery state", () => {
     expect(onRetrySkills).toHaveBeenCalledOnce();
   });
 
+  it("offers retry after a cold discovery error without cached skills", () => {
+    const retry = vi.fn();
+    render(
+      <SlashCommandMenu {...props} commands={{}} skillsStatus="error" onRetrySkills={retry} />,
+    );
+    expect(screen.queryByText("Loading skills…")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
   it("shows disconnected state without a spinner", () => {
     render(<SlashCommandMenu {...props} skillsStatus="unavailable" />);
     expect(screen.getByRole("status")).toHaveTextContent("Skills unavailable while disconnected.");
