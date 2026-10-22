@@ -2129,6 +2129,7 @@ def create_app(
             conversation_store=conversation_store,
             file_store=file_store,
             artifact_store=artifact_store,
+            annotation_staging_cleanup=annotation_storage_supported,
         )
         app_inst.state.attachment_archive_cleanup = attachment_archive_cleanup
         await attachment_archive_cleanup.start()
@@ -2250,6 +2251,12 @@ def create_app(
         ManagedStartupInputs(conversation_store, host_registry)
         if startup_policy is not None
         or (sandbox_config is not None and sandbox_config.managed_launch_supported)
+        or (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "accounts"
+            and os.environ.get("OMNIGENT_CHROME_ANNOTATIONS_ENABLED", "").lower()
+            in ("1", "true", "yes", "on")
+        )
         else None
     )
     app.state.startup_inputs = startup_inputs
@@ -5272,14 +5279,38 @@ def create_app(
                 from omnigent.server.routes.browser_annotations import (
                     create_browser_annotations_router,
                 )
+                from omnigent.stores.conversation_store.sqlalchemy_store import (
+                    SqlAlchemyConversationStore,
+                )
+
+                chrome_origin = os.environ.get("OMNIGENT_CHROME_EXTENSION_ORIGIN", "")
+                app.state.chrome_annotation_origin = chrome_origin
+
+                def annotation_target_live(session_id: str) -> bool:
+                    conversation = conversation_store.get_conversation(session_id)
+                    if conversation is None:
+                        return False
+                    liveness = _session_liveness(session_id)
+                    return bool(
+                        (conversation.host_id is not None and liveness.host_online is True)
+                        or (conversation.runner_id is not None and liveness.runner_online)
+                    )
+
+                app.state.annotation_target_live = annotation_target_live
 
                 app.include_router(
                     create_browser_annotations_router(
                         auth_provider,
                         AnnotationReceiverStore(permission_store.storage_location),
                         device_grant_store,
-                        chrome_origin=os.environ.get("OMNIGENT_CHROME_EXTENSION_ORIGIN", ""),
+                        chrome_origin=chrome_origin,
                         storage_supported=annotation_storage_supported,
+                        conversations=conversation_store
+                        if isinstance(conversation_store, SqlAlchemyConversationStore)
+                        else None,
+                        artifacts=artifact_store,
+                        startup_inputs=startup_inputs,
+                        target_live=annotation_target_live,
                     ),
                     tags=["browser-annotations"],
                 )

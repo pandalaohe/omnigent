@@ -34,7 +34,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.db_models import SqlDeviceGrant, current_workspace_id
+from omnigent.db.db_models import SqlAnnotationGrantOwner, SqlDeviceGrant, current_workspace_id
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -430,6 +430,21 @@ class DeviceGrantStore:
             if result.rowcount == 0:
                 return None
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            if (
+                row is not None
+                and row.scope == "annotations:write"
+                and row.user_id is not None
+                and row.account_generation is not None
+                and row.approved_at is not None
+            ):
+                session.add(
+                    SqlAnnotationGrantOwner(
+                        grant_id=row.id,
+                        user_id=row.user_id,
+                        account_generation=row.account_generation,
+                        approved_at=row.approved_at,
+                    )
+                )
             return _to_device_grant(row) if row is not None else None
 
         return run_write_transaction(self._session_immediate, "approve_device_grant", write)

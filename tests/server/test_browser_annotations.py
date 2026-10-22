@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import io
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -23,12 +28,37 @@ from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import OmnigentError
 from omnigent.server.annotation_receiver_store import AnnotationReceiverStore, ReceiverConflict
 from omnigent.server.device_grant_store import DeviceGrantStore
+from omnigent.server.routes.browser_annotations import _await_claimed_write
 from omnigent.server.routes.device_auth import create_device_auth_router
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.test_device_auth import _build_accounts_app, _login_admin
 
 CHROME_ORIGIN = "chrome-extension://" + "a" * 32
 FIRST_PARTY_ORIGIN = "http://localhost:8000"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_waits_for_claimed_sql_write() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def write() -> None:
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+
+    operation = asyncio.create_task(_await_claimed_write(write))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert finished.is_set()
 
 
 def test_pairing_code_is_not_issued_for_split_storage(
@@ -255,6 +285,7 @@ def test_browser_picker_and_first_party_receiver_routes(
         )
         assert requested.status_code == 200
         code = requested.json()
+        _login_admin(client)
         assert (
             client.get("/oauth/device", params={"user_code": code["user_code"]}).status_code == 200
         )
@@ -264,6 +295,7 @@ def test_browser_picker_and_first_party_receiver_routes(
             headers={"Origin": FIRST_PARTY_ORIGIN},
         )
         assert approved.status_code == 200
+        assert "Connected" in approved.text
         issued = client.post(
             "/oauth/annotations/token",
             data={
@@ -301,5 +333,96 @@ def test_browser_picker_and_first_party_receiver_routes(
             == 401
         )
         assert client.get("/v1/me/annotation-receiver").json()["session_id"] == session_id
+
+        # Discovery may show an editable session whose runner is not currently live.
+        # A deliberate Send to that exact target must fail before admission.
+        offline_send = client.post(
+            f"/v1/browser-annotations/sessions/{session_id}/batches",
+            json={
+                "version": 1,
+                "batch_id": "e" * 32,
+                "items": [
+                    {
+                        "capture_id": "f" * 32,
+                        "captured_at": "2026-10-22T10:00:00Z",
+                        "kind": "region",
+                        "note": "Check the visible region",
+                        "page": {"url": "https://example.test/review", "title": "Review"},
+                        "target": {
+                            "tag": "",
+                            "selector": "",
+                            "quote": "",
+                            "prefix": "",
+                            "suffix": "",
+                            "aria_label": "",
+                            "role": "",
+                        },
+                        "geometry": {
+                            "rect": {"x": 1, "y": 2, "width": 20, "height": 10},
+                            "viewport": {"width": 800, "height": 600},
+                            "bitmap_scale": {"x": 1, "y": 1},
+                        },
+                    }
+                ],
+            },
+            headers=bearer,
+        )
+        assert offline_send.status_code == 503, offline_send.text
+
+        screenshot_fields = {"batch_id": "e" * 32, "capture_id": "f" * 32}
+        bad_image = client.post(
+            f"/v1/browser-annotations/sessions/{session_id}/screenshots",
+            data={**screenshot_fields, "sha256": hashlib.sha256(b"invalid").hexdigest()},
+            files={"file": ("capture.png", b"invalid", "image/png")},
+            headers=bearer,
+        )
+        assert bad_image.status_code == 422
+        assert bad_image.headers["access-control-allow-origin"] == CHROME_ORIGIN
+        oversized = b"x" * (2 * 1024 * 1024 + 64 * 1024 + 1)
+        too_large = client.post(
+            f"/v1/browser-annotations/sessions/{session_id}/screenshots",
+            data={**screenshot_fields, "sha256": hashlib.sha256(oversized).hexdigest()},
+            files={"file": ("capture.png", oversized, "image/png")},
+            headers=bearer,
+        )
+        assert too_large.status_code == 413
+        assert too_large.headers["access-control-allow-origin"] == CHROME_ORIGIN
+        huge_pixels = io.BytesIO()
+        Image.new("1", (4001, 4000)).save(huge_pixels, format="PNG")
+        pixel_bytes = huge_pixels.getvalue()
+        too_many_pixels = client.post(
+            f"/v1/browser-annotations/sessions/{session_id}/screenshots",
+            data={**screenshot_fields, "sha256": hashlib.sha256(pixel_bytes).hexdigest()},
+            files={"file": ("capture.png", pixel_bytes, "image/png")},
+            headers=bearer,
+        )
+        assert too_many_pixels.status_code == 422
+        assert too_many_pixels.headers["access-control-allow-origin"] == CHROME_ORIGIN
+        image = io.BytesIO()
+        Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+        image_bytes = image.getvalue()
+        upload = client.post(
+            f"/v1/browser-annotations/sessions/{session_id}/screenshots",
+            data={**screenshot_fields, "sha256": hashlib.sha256(image_bytes).hexdigest()},
+            files={"file": ("capture.png", image_bytes, "image/png")},
+            headers=bearer,
+        )
+        assert upload.status_code == 200, upload.text
+        assert upload.json()["sha256"] == hashlib.sha256(image_bytes).hexdigest()
+        assert (
+            client.delete(
+                f"/v1/me/connected-apps/{issued.json()['grant_id']}",
+                headers={"Origin": FIRST_PARTY_ORIGIN},
+            ).status_code
+            == 200
+        )
+        after_revoke = client.post(
+            f"/v1/browser-annotations/sessions/{session_id}/screenshots",
+            data={**screenshot_fields, "sha256": hashlib.sha256(image_bytes).hexdigest()},
+            files={"file": ("capture.png", image_bytes, "image/png")},
+            headers=bearer,
+        )
+        assert after_revoke.status_code == 401
+        assert after_revoke.headers["access-control-allow-origin"] == CHROME_ORIGIN
     finally:
         generator.close()
