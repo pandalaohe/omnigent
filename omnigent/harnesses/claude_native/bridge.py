@@ -54,7 +54,10 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -303,8 +306,7 @@ def _valid_pi_session_usage(payload: Mapping[str, object]) -> bool:
     return True
 
 
-# Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
-# tool dispatch to complete on the harness event loop.
+# Ceiling for a relay dispatch, including session creation's bounded outcome wait.
 _TOOL_CALL_TIMEOUT_S = 300.0
 # Timeout for the bridge's POST to the active-turn relay server
 # (``_call_relay_tool``). This is the OUTER hop: it waits for the relay
@@ -7752,6 +7754,11 @@ def _tool_relay_handler_factory(
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
+    pending: dict[str, Future[object]] = {}
+    pending_lock = threading.Lock()
+    # Remember a cancellation that races ahead of its /tool request.
+    cancelled_ids: deque[str] = deque(maxlen=_MAX_CONCURRENT_MCP_REQUESTS * 2)
+
     class _ToolRelayHandler(BaseHTTPRequestHandler):
         """HTTP handler for active Omnigent tool relay calls."""
 
@@ -7774,6 +7781,7 @@ def _tool_relay_handler_factory(
             """
             if self.path not in (
                 "/tool",
+                "/tool/cancel",
                 "/policies/evaluate",
                 "/pi/session-usage",
                 "/hook/claude/evaluate-policy",
@@ -7785,6 +7793,20 @@ def _tool_relay_handler_factory(
                 return
             if self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_error(HTTPStatus.UNAUTHORIZED)
+                return
+            if self.path == "/tool/cancel":
+                payload = self._read_json_body()
+                request_id = payload.get("request_id") if payload is not None else None
+                if not isinstance(request_id, str):
+                    self.send_error(HTTPStatus.BAD_REQUEST)
+                    return
+                with pending_lock:
+                    cancellation = pending.get(request_id)
+                    if cancellation is None:
+                        cancelled_ids.append(request_id)
+                    else:
+                        cancellation.cancel()
+                self._send_json({"cancelled": True})
                 return
             if self.path == "/pi/session-usage":
                 try:
@@ -7841,7 +7863,30 @@ def _tool_relay_handler_factory(
                 return
             if not isinstance(arguments, dict):
                 arguments = {}
-            self._send_json(_run_relay_tool(tool_executor, loop, name, arguments))
+            request_id = payload.get("request_id")
+
+            def register(future: Future[object]) -> None:
+                if not isinstance(request_id, str):
+                    return
+                with pending_lock:
+                    if request_id in cancelled_ids:
+                        future.cancel()
+                    pending[request_id] = future
+
+            try:
+                self._send_json(
+                    _run_relay_tool(
+                        tool_executor,
+                        loop,
+                        name,
+                        arguments,
+                        register=register,
+                    )
+                )
+            finally:
+                if isinstance(request_id, str):
+                    with pending_lock:
+                        pending.pop(request_id, None)
 
         def _respond_hook_output(self, output: dict[str, object] | None) -> None:
             """Answer a hook-evaluate request with final hook output JSON.
@@ -8179,11 +8224,26 @@ def _tool_relay_handler_factory(
     return _ToolRelayHandler
 
 
+def _detached_create_result() -> _JsonObject:
+    return _mcp_response_from_tool_result(
+        {
+            "status": "detached",
+            "detail": (
+                "The caller stopped waiting; creation may still be running and a child "
+                "may already exist. Check sys_session_list before creating again; "
+                "do not re-create while its outcome is unknown, or resend a pending first message."
+            ),
+        }
+    )
+
+
 def _run_relay_tool(
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
     name: str,
     arguments: _JsonObject,
+    *,
+    register: Callable[[Future[object]], None] | None = None,
 ) -> _JsonObject:
     """
     Execute one relay tool call on the harness event loop.
@@ -8199,9 +8259,16 @@ def _run_relay_tool(
         _await_tool_result(tool_executor(name, arguments)), loop
     )
     try:
+        if register is not None:
+            register(future)
         result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 - relay converts callback failures to MCP errors.
-        return _mcp_error(f"Omnigent tool dispatch failed: {exc}")
+        if name == "sys_session_create" and isinstance(exc, FutureCancelledError):
+            return _detached_create_result()
+        return _mcp_error(f"Omnigent tool dispatch failed: {type(exc).__name__}: {exc}")
+    finally:
+        if not future.done():
+            future.cancel()
     return _mcp_response_from_tool_result(result)
 
 
@@ -8235,6 +8302,43 @@ def _notification_writer(
         _write_jsonrpc(payload, stdout_lock)
 
 
+@dataclass
+class _McpRequestState:
+    release_slot: Callable[[], None]
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    on_cancel: Callable[[], None] | None = None
+    heartbeat: _McpProgressHeartbeat | None = None
+    released: bool = False
+
+    def finish(self) -> None:
+        with self.lock:
+            if self.released:
+                return
+            self.released = True
+        self.release_slot()
+
+    def set_cancel_callback(self, callback: Callable[[], None]) -> None:
+        with self.lock:
+            self.on_cancel = callback
+            cancelled = self.cancelled.is_set()
+        if cancelled:
+            callback()
+
+    def cancel(self) -> None:
+        with self.lock:
+            self.cancelled.set()
+            callback = self.on_cancel
+        self.finish()
+        if self.heartbeat is not None:
+            self.heartbeat.stop()
+        if callback is not None:
+            callback()
+
+
+_MCP_REQUEST_STATE: ContextVar[_McpRequestState | None] = ContextVar("mcp_request", default=None)
+
+
 def _stdio_jsonrpc_loop(
     tools: dict[str, Tool],
     stdout_lock: threading.Lock,
@@ -8251,9 +8355,22 @@ def _stdio_jsonrpc_loop(
     """
     use_content_length = False
     request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_MCP_REQUESTS)
+    pending: dict[str | int, _McpRequestState] = {}
+    pending_lock = threading.Lock()
+
+    def release(request_id: str | int, state: _McpRequestState) -> None:
+        with pending_lock:
+            if pending.get(request_id) is state:
+                pending.pop(request_id)
+        request_slots.release()
+
     while True:
         raw_line = sys.stdin.buffer.readline()
         if raw_line == b"":
+            with pending_lock:
+                states = list(pending.values())
+            for state in states:
+                state.cancel()
             return
         if raw_line.lower().startswith(b"content-length:"):
             use_content_length = True
@@ -8283,9 +8400,22 @@ def _stdio_jsonrpc_loop(
             continue
         request_id = message.get("id")
         method = message.get("method")
-        if request_id is None or not isinstance(method, str):
+        if method == "notifications/cancelled":
+            params = message.get("params")
+            cancelled_id = params.get("requestId") if isinstance(params, dict) else None
+            if isinstance(cancelled_id, (str, int)):
+                with pending_lock:
+                    state = pending.get(cancelled_id)
+                if state is not None:
+                    state.cancel()
+            continue
+        if not isinstance(request_id, (str, int)) or not isinstance(method, str):
             continue
         if request_slots.acquire(blocking=False):
+            state = _McpRequestState(release_slot=lambda: None)
+            state.release_slot = functools.partial(release, request_id, state)
+            with pending_lock:
+                pending[request_id] = state
             request_thread = threading.Thread(
                 target=_handle_and_write_mcp_request,
                 args=(
@@ -8297,6 +8427,7 @@ def _stdio_jsonrpc_loop(
                     stdout_lock,
                     use_content_length,
                     request_slots,
+                    state,
                 ),
                 name="claude-native-mcp-request",
                 daemon=True,
@@ -8304,7 +8435,7 @@ def _stdio_jsonrpc_loop(
             try:
                 request_thread.start()
             except RuntimeError:
-                request_slots.release()
+                state.finish()
             else:
                 continue
         _write_jsonrpc(
@@ -8391,7 +8522,7 @@ class _McpProgressHeartbeat:
     def stop(self) -> None:
         self._stop_event.set()
         thread = self._thread
-        if thread is not None:
+        if thread is not None and thread.ident is not None:
             thread.join(timeout=2.0)
             # Only forget a thread that actually exited; a writer blocked on a
             # full stdout pipe stays tracked (it exits on its next stop check).
@@ -8443,6 +8574,7 @@ def _handle_and_write_mcp_request(
     stdout_lock: threading.Lock,
     framed: bool,
     request_slots: threading.BoundedSemaphore,
+    state: _McpRequestState | None = None,
 ) -> None:
     """
     Handle one request without blocking the stdio reader.
@@ -8458,16 +8590,21 @@ def _handle_and_write_mcp_request(
     :returns: None after the response is written.
     """
     # A request failure must not tear down the long-lived MCP server.
-    # Heartbeat only relay-routed calls: the relay's own 300 s budget
-    # guarantees they terminate, so keep-alive is safe. A hung LOCAL tool
-    # must stay killable by the client's static timeout, so it gets no
-    # heartbeat that would reset that deadline forever.
+    # Relay calls have a finite 300 s ceiling; cancellation stops their heartbeat.
+    # Local tools get no heartbeat so the client's deadline can still stop them.
     progress_token = (
         _extract_progress_token(params)
         if method == "tools/call" and _is_relay_tool_call(params, bridge_dir)
         else None
     )
     heartbeat = _McpProgressHeartbeat(progress_token, stdout_lock, framed=framed)
+    if state is None:
+        state = _McpRequestState(release_slot=request_slots.release)
+    state.heartbeat = heartbeat
+    if state.cancelled.is_set():
+        state.finish()
+        return
+    context_token = _MCP_REQUEST_STATE.set(state)
     try:
         with heartbeat:
             result = _handle_mcp_request(method, params, tools, bridge_dir)
@@ -8483,9 +8620,11 @@ def _handle_and_write_mcp_request(
             "error": {"code": -32603, "message": f"internal error: {exc}"},
         }
     try:
-        _write_jsonrpc(response, stdout_lock, framed=framed)
+        if not state.cancelled.is_set():
+            _write_jsonrpc(response, stdout_lock, framed=framed)
     finally:
-        request_slots.release()
+        _MCP_REQUEST_STATE.reset(context_token)
+        state.finish()
 
 
 def _handle_mcp_request(
@@ -8678,7 +8817,35 @@ def _call_relay_tool(
     url = relay.get("url")
     if not isinstance(token, str) or not isinstance(url, str):
         return _mcp_error("active Omnigent tool relay is missing url/token")
-    payload = json.dumps({"name": name, "arguments": arguments}).encode("utf-8")
+    state = _MCP_REQUEST_STATE.get()
+    request_id = secrets.token_hex(16)
+
+    def cancel() -> None:
+        cancellation = request.Request(
+            f"{url}/tool/cancel",
+            method="POST",
+            data=json.dumps({"request_id": request_id}).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        try:
+            with request.urlopen(cancellation, timeout=0.5):
+                pass
+        except OSError:
+            _logger.warning("Could not forward MCP cancellation to relay", exc_info=True)
+
+    if state is not None:
+        state.set_cancel_callback(cancel)
+        if state.cancelled.is_set():
+            if name == "sys_session_create":
+                return _detached_create_result()
+            return _mcp_error("Omnigent tool call cancelled")
+    payload = json.dumps(
+        {
+            "name": name,
+            "arguments": arguments,
+            "request_id": request_id,
+        }
+    ).encode("utf-8")
     req = request.Request(
         f"{url}/tool",
         data=payload,
@@ -8701,7 +8868,7 @@ def _call_relay_tool(
     # through ``_call_mcp_tool`` → ``_stdio_jsonrpc_loop`` and kill the MCP
     # server.
     except OSError as exc:
-        return _mcp_error(f"failed to call Omnigent tool relay: {exc}")
+        return _mcp_error(f"failed to call Omnigent tool relay: {type(exc).__name__}: {exc}")
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError:

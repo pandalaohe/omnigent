@@ -32,7 +32,7 @@ from omnigent.runner.mcp_execution_registry import (
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
-from omnigent.spec.types import AgentSpec, MCPServerConfig
+from omnigent.spec.types import DEFAULT_ASK_TIMEOUT, AgentSpec, MCPServerConfig
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -127,6 +127,124 @@ def _make_manager(transport: _StubTransport) -> ProxyMcpManager:
 
 
 # ── schemas_for ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_status", [202, 503, "timeout"])
+@pytest.mark.parametrize("label_failures", [0, 2, 3])
+async def test_create_pending_handle_returns_before_proxy_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    message_status: int | str,
+    label_failures: int,
+) -> None:
+    from omnigent.runner import subagent_work, tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_FINALIZE_TIMEOUT_S", 0.01, raising=False)
+    monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_DELIVERY_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setattr(tool_dispatch, "_INITIAL_MESSAGE_LABEL_RETRY_DELAY_S", 0.0, raising=False)
+    creates = 0
+    label_attempts = 0
+    labels: dict[str, str] = {}
+    delivered = asyncio.Event()
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, label_attempts
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "proxy_parent", "labels": labels})
+        if request.method == "PATCH":
+            patch = json.loads(request.content).get("labels", {})
+            outcome = json.loads(patch.get("omnigent.initial_message", "{}"))
+            final = outcome.get("status") in {"sent", "failed"} or "detail" in outcome
+            if final:
+                label_attempts += 1
+                if label_attempts <= label_failures:
+                    if label_attempts == 3:
+                        delivered.set()
+                    return httpx.Response(503, text="label store unavailable")
+            labels.update(patch)
+            if final:
+                delivered.set()
+            return httpx.Response(200, json={})
+        if request.url.path == "/v1/sessions":
+            creates += 1
+            return httpx.Response(201, json={"id": "proxy_child"})
+        read_budget = request.extensions["timeout"]["read"]
+        assert read_budget is not None and read_budget >= DEFAULT_ASK_TIMEOUT
+        await asyncio.sleep(2.5)
+        if message_status == "timeout":
+            raise httpx.ReadTimeout("", request=request)
+        assert isinstance(message_status, int)
+        return httpx.Response(message_status, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(api), base_url="http://server"
+    ) as api_client:
+
+        async def gateway(request: httpx.Request) -> httpx.Response:
+            try:
+                result = await asyncio.wait_for(
+                    tool_dispatch.execute_tool(
+                        tool_name="sys_session_create",
+                        arguments=json.dumps({"agent_id": "ag_x", "message": "go"}),
+                        server_client=api_client,
+                        conversation_id="proxy_parent",
+                    ),
+                    timeout=2.0,
+                )
+            except TimeoutError:
+                return httpx.Response(
+                    200,
+                    json={
+                        "error": {
+                            "code": -32000,
+                            "message": "Runner MCP execute failed.",
+                        }
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "content": [{"type": "text", "text": result}],
+                    }
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(gateway), base_url="http://gateway"
+        ) as client:
+            manager = ProxyMcpManager(session_id="proxy_parent", ap_client=client)
+            try:
+                result = await manager.call_tool(_make_spec("omnigent"), "sys_session_create", {})
+                info = json.loads(result)
+                assert info["conversation_id"] == "proxy_child"
+                assert info["initial_message"]["status"] == "pending"
+                assert creates == 1
+                await asyncio.wait_for(delivered.wait(), 5)
+                status = json.loads(
+                    await tool_dispatch.execute_tool(
+                        tool_name="sys_session_get_info",
+                        arguments=json.dumps({"session_id": "proxy_child"}),
+                        conversation_id="proxy_parent",
+                        server_client=api_client,
+                    )
+                )
+                expected = (
+                    "pending"
+                    if message_status == "timeout" or label_failures == 3
+                    else ("sent" if message_status == 202 else "failed")
+                )
+                assert status["initial_message"]["status"] == expected
+                assert label_attempts == min(label_failures + 1, 3)
+                if label_failures == 3:
+                    assert "Failed to record first-message outcome" in caplog.text
+                elif message_status == "timeout":
+                    assert "ReadTimeout" in status["initial_message"]["detail"]
+            finally:
+                subagent_work.unregister_subagent_work_for_session("proxy_child")
+                subagent_work.unregister_child_session("proxy_child")
+                subagent_work._session_inboxes_ref.pop("proxy_parent", None)
 
 
 @pytest.mark.asyncio
@@ -660,12 +778,18 @@ async def test_call_tool_network_error_raises() -> None:
 
 def test_proxy_call_timeout_exceeds_forward_timeout() -> None:
     """The outer MCP proxy timeout must exceed the AP→runner timeout."""
+    from omnigent.harnesses.claude_native.bridge import _TOOL_CALL_TIMEOUT_S
     from omnigent.runner.tool_dispatch import (
         _OS_ENV_SHELL_DEFAULT_TIMEOUT_S,
         _RUNNER_EXECUTION_TIMEOUT_S,
+        _SESSION_CREATE_TIMEOUT,
+        _SESSION_CREATE_TOOL_TIMEOUT_S,
         MCP_PROXY_CALL_TIMEOUT_S,
         MCP_PROXY_FORWARD_TIMEOUT_S,
     )
+
+    assert 0 < _SESSION_CREATE_TIMEOUT.read < _SESSION_CREATE_TOOL_TIMEOUT_S
+    assert _SESSION_CREATE_TOOL_TIMEOUT_S < _TOOL_CALL_TIMEOUT_S < MCP_PROXY_FORWARD_TIMEOUT_S
 
     assert MCP_PROXY_FORWARD_TIMEOUT_S > _OS_ENV_SHELL_DEFAULT_TIMEOUT_S, (
         "AP→runner read timeout must exceed the default sys_os_shell timeout; "
