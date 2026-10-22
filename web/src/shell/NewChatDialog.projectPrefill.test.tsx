@@ -371,10 +371,9 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
   );
   const [, init] = vi
     .mocked(authenticatedFetch)
-    .mock.calls.find(([url, init]) => url === "/v1/sessions" && init?.method === "POST") as [
-    string,
-    RequestInit,
-  ];
+    .mock.calls.find(
+      ([url, requestInit]) => url === "/v1/sessions" && requestInit?.method === "POST",
+    ) as [string, RequestInit];
   return JSON.parse(init.body as string) as Record<string, unknown>;
 }
 
