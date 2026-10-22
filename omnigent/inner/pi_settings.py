@@ -2,20 +2,23 @@
 
 When the pi harness runs in gateway mode it relocates Pi's agent root to a
 per-session temp directory (for ``models.json``). That hides the user's global
-``~/.pi/agent/settings.json`` and installed package trees. This module copies
-the global settings metadata into the managed dir and symlinks install
-directories so Pi's native loader still sees extensions and ``pi install``
-packages — without mutating the user's home directory.
+agent settings, context and resources. This module seeds those inputs while
+leaving model/auth files and unrelated state owned by the managed directory.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
+import stat
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeAlias, cast
+from urllib.parse import unquote, urlsplit
 
 _logger = logging.getLogger(__name__)
 
@@ -141,9 +144,87 @@ def ordered_pi_launch(
     return str(launcher), remaining
 
 
-# Install / checkout trees Pi places under the agent dir. Symlinked into the
-# managed dir so ``packages`` entries in settings keep resolving.
-_PI_AGENT_RESOURCE_DIRS: tuple[str, ...] = ("npm", "git")
+_PI_RESOURCE_SETTINGS = ("extensions", "skills", "prompts", "themes")
+_PI_AGENT_RESOURCE_DIRS = ("npm", "git", *_PI_RESOURCE_SETTINGS)
+_PI_AGENT_RESOURCE_FILES = (
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+    "mcp.json",
+)
+_PI_SEED_MANIFEST = ".omnigent-resource-seeds.json"
+
+
+def _normalize_pi_path(value: str) -> str:
+    """Match Pi's source/local path forms before applying native path operations."""
+    windows = os.name == "nt"
+    if windows and value.startswith("/") and not value.startswith("//") and "\\" not in value:
+        match = re.fullmatch(r"/(?:mnt/|cygdrive/)?([a-z])(?:/(.*))?", value, re.IGNORECASE)
+        if match:
+            value = match[1].upper() + ":\\" + (match[2] or "").replace("/", "\\")
+    if value == "~":
+        return str(Path.home())
+    if value.startswith("~/") or (windows and value.startswith("~\\")):
+        return os.path.join(Path.home(), value[2:])
+    if value.startswith("file://"):
+        parsed = urlsplit(value)
+        value = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            if not windows:
+                raise ValueError("Pi agent file URLs must refer to the local host")
+            value = "//" + parsed.netloc + value
+        elif windows and re.match(r"^/[a-z]:", value, re.IGNORECASE):
+            value = value[1:]
+    return value.replace("/", "\\") if windows else value
+
+
+def _resource_path(value: str, agent_root: Path) -> str:
+    """Keep SDK-independent paths intact; anchor local paths at their original root."""
+    if value.startswith(("npm:", "git:", "github:", "http:", "https:", "ssh:", "builtin:")):
+        return value
+    return os.path.join(agent_root, _normalize_pi_path(value))
+
+
+def _relocate_resource_settings(settings: _Settings, agent_root: Path, managed_dir: Path) -> None:
+    for key in _PI_RESOURCE_SETTINGS:
+        entries = settings.get(key)
+        if not isinstance(entries, list):
+            continue
+        relocated: list[object] = []
+        for entry in entries:
+            if not isinstance(entry, str):
+                relocated.append(entry)
+            elif entry.startswith(("!", "+", "-")):
+                # Filters must cover both linked auto-discovery and original local paths.
+                relocated.append(entry)
+                pattern = entry[1:]
+                if entry[0] in "+-" and pattern.startswith(("./", ".\\")):
+                    pattern = pattern[2:]
+                path = _resource_path(pattern, agent_root)
+                if path != entry[1:]:
+                    relocated.append(entry[0] + path)
+                root_prefix = str(agent_root).rstrip("/\\") + os.sep
+                if os.path.normcase(path).startswith(os.path.normcase(root_prefix)):
+                    relocated.append(
+                        entry[0] + os.path.join(managed_dir, path[len(root_prefix) :])
+                    )
+            else:
+                relocated.append(_resource_path(entry.strip(), agent_root))
+        settings[key] = relocated
+    packages = settings.get("packages")
+    if isinstance(packages, list):
+        relocated_packages: list[object] = []
+        for entry in packages:
+            if isinstance(entry, str):
+                entry = _resource_path(entry.strip(), agent_root)
+            elif isinstance(entry, dict) and isinstance(entry.get("source"), str):
+                entry = {**entry, "source": _resource_path(entry["source"].strip(), agent_root)}
+            relocated_packages.append(entry)
+        settings["packages"] = relocated_packages
 
 
 def default_pi_thinking_level(cwd: str | None, model_selection: str | None = None) -> str:
@@ -189,17 +270,17 @@ def _deep_merge_settings(base: Mapping[str, object], overlay: Mapping[str, objec
     return merged
 
 
-def _symlink_agent_resource_dirs(
+def _seed_agent_resources(
     managed_dir: Path,
     global_agent_dir: Path,
 ) -> None:
-    """Symlink package install trees from *global_agent_dir* into *managed_dir*."""
+    """Expose only Pi's resource trees, preserving existing managed entries."""
     for name in _PI_AGENT_RESOURCE_DIRS:
         source = global_agent_dir / name
         if not source.is_dir():
             continue
         target = managed_dir / name
-        if target.exists():
+        if target.exists() or target.is_symlink():
             continue
         try:
             target.symlink_to(source, target_is_directory=True)
@@ -211,6 +292,56 @@ def _symlink_agent_resource_dirs(
                 exc,
             )
 
+    manifest_path = managed_dir / _PI_SEED_MANIFEST
+    manifest = _read_settings_file(manifest_path)
+    for name in _PI_AGENT_RESOURCE_FILES:
+        source = global_agent_dir / name
+        target = managed_dir / name
+        try:
+            previous = manifest.get(name)
+            owned_hashes = previous if isinstance(previous, list) else [previous]
+            current_hash = None
+            if target.exists() or target.is_symlink():
+                if target.is_symlink() or not target.is_file():
+                    manifest.pop(name, None)
+                    continue
+                current_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+                if current_hash not in owned_hashes:
+                    manifest.pop(name, None)
+                    continue
+            if not source.is_file():
+                if current_hash is not None:
+                    target.unlink()
+                manifest.pop(name, None)
+                continue
+            content = source.read_bytes()
+            source_hash = hashlib.sha256(content).hexdigest()
+            # Journal both hashes before replacement so an interrupted update is retryable.
+            manifest[name] = [current_hash, source_hash]
+            _atomic_write(manifest_path, json.dumps(manifest).encode())
+            _atomic_write(target, content, stat.S_IMODE(source.stat().st_mode))
+            manifest[name] = source_hash
+        except OSError as exc:
+            _logger.warning("Could not copy Pi agent resource %s -> %s: %s", source, target, exc)
+    try:
+        _atomic_write(manifest_path, json.dumps(manifest).encode())
+    except OSError as exc:
+        _logger.warning("Could not write Pi resource ownership at %s: %s", manifest_path, exc)
+
+
+def _atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
+    """Replace a managed file without exposing a partial copy on failure."""
+    fd, temporary = tempfile.mkstemp(prefix=".omnigent-pi-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
 
 def prepare_managed_pi_agent_dir(
     managed_dir: Path,
@@ -221,21 +352,27 @@ def prepare_managed_pi_agent_dir(
     """
     Seed a managed ``PI_CODING_AGENT_DIR`` with the user's global Pi settings.
 
-    Copies (merges) ``settings.json`` from the user's global agent dir into
-    *managed_dir*, applies *overlay* (e.g. Omnigent retry policy), and
-    symlinks install trees (``npm/``, ``git/``) so ``packages`` entries keep
-    working. The user's ``~/.pi/agent`` is never modified.
+    Copies settings, context, system prompts and MCP configuration, and links
+    resource/install trees. Relative settings paths retain their original root.
+    Unchanged seeded copies follow source edits/removals on relaunch. Managed
+    resource edits and model/auth files are preserved.
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.
 
     :param managed_dir: Per-session agent root (already contains ``models.json``).
     :param overlay: Settings merged on top of the copied global file.
-    :param global_agent_dir: Override for tests; defaults to
-        :data:`DEFAULT_PI_AGENT_DIR`.
+    :param global_agent_dir: Explicit source; otherwise ``PI_CODING_AGENT_DIR``
+        or :data:`DEFAULT_PI_AGENT_DIR`.
     """
-    agent_root = global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR
+    source = (
+        str(global_agent_dir)
+        if global_agent_dir is not None
+        else (os.environ.get("PI_CODING_AGENT_DIR") or str(DEFAULT_PI_AGENT_DIR))
+    )
+    agent_root = Path(os.path.abspath(_normalize_pi_path(source)))
     settings = _read_settings_file(agent_root / "settings.json")
+    _relocate_resource_settings(settings, agent_root, managed_dir.absolute())
     if overlay:
         settings = _deep_merge_settings(settings, overlay)
 
@@ -250,4 +387,4 @@ def prepare_managed_pi_agent_dir(
         _logger.warning("Could not write managed Pi settings at %s: %s", settings_path, exc)
         return
 
-    _symlink_agent_resource_dirs(managed_dir, agent_root)
+    _seed_agent_resources(managed_dir, agent_root)
