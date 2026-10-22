@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -608,6 +608,73 @@ async def test_succession_target_not_ready_stays_moved_then_resumes(
     assert second.json()["status"] == "done"
     receipt = store.get_succession(old, new)
     assert receipt is not None and receipt.phase == "done"
+
+
+@pytest.mark.parametrize("phase", ["moved", "rekeyed", "opened"])
+@pytest.mark.parametrize("availability", ["offline", "archived", "online"])
+async def test_advance_succession_parks_unavailable_successor_and_recovers(
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    phase: str,
+    availability: str,
+) -> None:
+    """Unavailable successors park quietly; a usable successor completes the receipt."""
+    old = _create(store, title="mother")
+    new = _create(store, title="successor")
+    _create(store, parent=old, title="child")
+    receipt_id = generate_task_id()
+    store.reassign_live_children(old, new, receipt_id)
+    receipt = store.get_succession_by_id(receipt_id)
+    assert receipt is not None
+    store.update_succession(
+        receipt.id,
+        expected_phase="moved",
+        phase=phase,
+        questions=[_question_event()] if phase == "opened" else None,
+    )
+    pending_elicitations.record_publish(old, _question_event())
+    if availability == "archived":
+        store.update_conversation(new, archived=True)
+    resolve = AsyncMock(return_value=None if availability == "offline" else runner)
+    retry = Mock()
+    monkeypatch.setattr(succession_module, "_get_runner_client", resolve)
+    monkeypatch.setattr(succession_module, "_schedule_retry", retry)
+    caplog.set_level("INFO", logger=succession_module.__name__)
+
+    for _ in range(2):
+        result = await succession_module.advance_succession(
+            receipt.id, conversation_store=store, runner_router=None, peer_message_store=None
+        )
+        assert result.phase == ("done" if availability == "online" else phase)
+    retry.assert_not_called()
+    assert not [record for record in caplog.records if record.exc_info or record.levelno >= 40]
+    if availability != "online":
+        assert runner.posts == []
+        wake.assert_not_awaited()
+        assert result.error is not None and availability in result.error
+        if phase != "moved":
+            assert result.questions == [_question_event()]
+        assert len([record for record in caplog.records if "parked" in record.message]) == 1
+        assert store.get_conversation(old).archived is False
+        assert pending_elicitations.count_for(old) == 1
+        if availability == "archived":
+            resolve.assert_not_awaited()
+        store.update_conversation(new, archived=False)
+        resolve.return_value = runner
+        if phase != "moved":
+            pending_elicitations.reset_for_tests()
+        result = await succession_module.advance_succession(
+            receipt.id, conversation_store=store, runner_router=None, peer_message_store=None
+        )
+    assert result.phase == "done" and result.error is None
+    assert store.get_conversation(old).archived is True
+    if phase != "opened":
+        wake.assert_awaited_once()
+        assert "Postgres or SQLite?" in wake.await_args.args[1]
+    assert pending_elicitations.count_for(old) == 0
 
 
 async def test_succession_retry_that_fails_again_keeps_retrying(

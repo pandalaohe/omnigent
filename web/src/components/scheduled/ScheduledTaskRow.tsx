@@ -24,6 +24,8 @@ import {
   ZapIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { PickerShell } from "@/components/PickerShell";
+import { SelectionList } from "@/components/SelectionList";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -35,6 +37,8 @@ import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
+const EMPTY_PROJECTS: { id: string; name: string }[] = [];
+
 export function ScheduledTaskRow({
   task,
   now,
@@ -43,6 +47,10 @@ export function ScheduledTaskRow({
   onRunNow,
   onDelete,
   busy,
+  archivedProject,
+  activeProjects = EMPTY_PROJECTS,
+  onRestoreProject,
+  onMoveAndResume,
 }: {
   task: ScheduledTask;
   // The current wall-clock time, supplied by the parent's shared `useNow` ticker
@@ -55,8 +63,13 @@ export function ScheduledTaskRow({
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
   busy: boolean;
+  archivedProject?: { id: string; name: string };
+  activeProjects?: { id: string; name: string }[];
+  onRestoreProject?: (id: string) => void;
+  onMoveAndResume?: (task: ScheduledTask, projectId: string) => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(false);
   const { trackClick } = useOmnigentAnalytics();
   const paused = task.state === "paused";
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
@@ -93,6 +106,12 @@ export function ScheduledTaskRow({
               className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
             >
               Paused
+            </span>
+          )}
+          {archivedProject && (
+            <span className="truncate text-xs text-muted-foreground">
+              {archivedProject.name} ·{" "}
+              {task.pausedByArchiveBatch ? "Paused with project" : "Paused earlier"}
             </span>
           )}
         </span>
@@ -133,58 +152,90 @@ export function ScheduledTaskRow({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.run_now", "button");
-              onRunNow(task);
-            }}
-            data-testid="task-run-now"
-          >
-            <ZapIcon className="size-4" />
-            Run now
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.edit", "button");
-              onEdit(task);
-            }}
-            data-testid="task-edit"
-          >
-            <PencilIcon className="size-4" />
-            Edit
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.pause_resume", "button");
-              onPauseToggle(task);
-            }}
-            data-testid="task-pause-toggle"
-          >
-            {paused ? (
-              <>
-                <PlayIcon className="size-4" />
-                Resume
-              </>
-            ) : (
-              <>
-                <PauseIcon className="size-4" />
-                Pause
-              </>
-            )}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            variant="destructive"
-            onSelect={() => {
-              trackClick("tasks.scheduled.delete", "button");
-              onDelete(task);
-            }}
-            data-testid="task-delete"
-          >
-            <Trash2Icon className="size-4" />
-            Delete
-          </DropdownMenuItem>
+          {archivedProject ? (
+            <>
+              <DropdownMenuItem onSelect={() => onRestoreProject?.(archivedProject.id)}>
+                Restore project
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setMoveOpen(true)}>
+                Move to another project and resume…
+              </DropdownMenuItem>
+            </>
+          ) : (
+            <>
+              <DropdownMenuItem
+                onSelect={() => {
+                  trackClick("tasks.scheduled.run_now", "button");
+                  onRunNow(task);
+                }}
+                data-testid="task-run-now"
+              >
+                <ZapIcon className="size-4" />
+                Run now
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => {
+                  trackClick("tasks.scheduled.edit", "button");
+                  onEdit(task);
+                }}
+                data-testid="task-edit"
+              >
+                <PencilIcon className="size-4" />
+                Edit
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => {
+                  trackClick("tasks.scheduled.pause_resume", "button");
+                  onPauseToggle(task);
+                }}
+                data-testid="task-pause-toggle"
+              >
+                {paused ? (
+                  <>
+                    <PlayIcon className="size-4" />
+                    Resume
+                  </>
+                ) : (
+                  <>
+                    <PauseIcon className="size-4" />
+                    Pause
+                  </>
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                variant="destructive"
+                onSelect={() => {
+                  trackClick("tasks.scheduled.delete", "button");
+                  onDelete(task);
+                }}
+                data-testid="task-delete"
+              >
+                <Trash2Icon className="size-4" />
+                Delete
+              </DropdownMenuItem>
+            </>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
+      {archivedProject && (
+        <PickerShell
+          title="Move automation to another project"
+          open={moveOpen}
+          onOpenChange={setMoveOpen}
+          trigger={<button type="button" className="hidden" aria-hidden="true" tabIndex={-1} />}
+        >
+          <SelectionList
+            mode="single"
+            items={activeProjects.map((project) => ({ id: project.id, label: project.name }))}
+            value={null}
+            onChange={(id) => {
+              if (id) onMoveAndResume?.(task, id);
+              setMoveOpen(false);
+            }}
+            searchLabel="Search projects"
+          />
+        </PickerShell>
+      )}
     </div>
   );
 }

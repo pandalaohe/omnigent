@@ -38,6 +38,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import (
     HANDOVER_ITEM_LABEL_KEY,
     ROTATE_REQUESTED_LABEL_KEY,
+    ROTATION_SUCCESSOR_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
     SUCCESSION_OPERATION_LABEL_KEYS,
@@ -486,6 +487,7 @@ def test_create_session_strips_succession_operation_labels(
                 SUCCEEDS_LABEL_KEY: "0" * 32,
                 HANDOVER_ITEM_LABEL_KEY: "item-1",
                 ROTATE_REQUESTED_LABEL_KEY: "1",
+                ROTATION_SUCCESSOR_LABEL_KEY: '{"id":"prepared","revision":0}',
                 "team": "ml",
             },
         },
@@ -511,3 +513,13 @@ def test_create_session_strips_succession_operation_labels(
     conv = conversation_store.get_conversation(session_id)
     assert conv is not None
     assert SUCCEEDED_BY_LABEL_KEY not in conv.labels
+
+    patch = TestClient(app).patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {ROTATION_SUCCESSOR_LABEL_KEY: "forged"}},
+        headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    assert patch.status_code == 400
+    assert (
+        ROTATION_SUCCESSOR_LABEL_KEY not in conversation_store.get_conversation(session_id).labels
+    )

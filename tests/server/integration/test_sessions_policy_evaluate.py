@@ -24,6 +24,7 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -1603,3 +1604,72 @@ async def test_authenticated_evaluate_route_sql_budget(
     assert len(statements) == _EVALUATE_ROUTE_SQL_BUDGET, [
         s.split("\n")[0][:80] for s in statements
     ]
+
+
+@pytest.mark.parametrize("mode", ["off", "subagents", "all"])
+@pytest.mark.parametrize("caller_is_child", [False, True])
+async def test_session_restrictions_precede_optional_policies(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str, mode: str, caller_is_child: bool
+) -> None:
+    """Both session-scoped authorization transports enforce restrictions without any policies."""
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    caller = store.create_conversation(parent_conversation_id=root.id) if caller_is_child else root
+    archived = store.create_conversation()
+    store.update_conversation(archived.id, archived=True)
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL, "session_collab", {"sessionRestrictions": mode}
+    )
+    for name in (
+        "sys_session_create",
+        "sys_session_open",
+        "sys_session_unarchive",
+        "sys_session_send",
+    ):
+        arguments = {"session_id": archived.id}
+        restricted = (caller_is_child and mode != "off" and name != "sys_session_send") or (
+            mode == "all" and name in {"sys_session_unarchive", "sys_session_send"}
+        )
+        for prefix in ("", "mcp__omnigent__"):
+            data = {"name": prefix + name, "arguments": arguments}
+            hook = await client.post(
+                f"/v1/sessions/{caller.id}/policies/evaluate",
+                json={"event": {"type": "PHASE_TOOL_CALL", "data": data}},
+            )
+            assert hook.status_code == 200, hook.text
+            assert (hook.json()["result"] == "POLICY_ACTION_DENY") is restricted, hook.text
+        relay = await client.post(
+            f"/v1/sessions/{caller.id}/events",
+            json={
+                "type": "function_call",
+                "data": {
+                    "name": name,
+                    "arguments": json.dumps(arguments),
+                    "call_id": "restriction-check",
+                    "agent": "test",
+                    "evaluate_policy": True,
+                },
+            },
+        )
+        assert relay.status_code == 202, relay.text
+        assert relay.json()["verdict"] == ("deny" if restricted else "allow"), relay.text
+        if restricted and caller_is_child and name != "sys_session_send":
+            assert "final output" in relay.json()["reason"]
+
+
+async def test_session_restrictions_preserve_malformed_json_response(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = SqlAlchemyConversationStore(db_uri).create_conversation()
+    response = await client.post(
+        f"/v1/sessions/{session.id}/policies/evaluate",
+        content=b"{",
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400, response.text
+    assert "Invalid JSON" in response.text

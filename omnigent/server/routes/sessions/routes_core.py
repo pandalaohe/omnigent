@@ -301,6 +301,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    ConversationUpdateResult,
     pinned_label_key,
     runner_seen_is_fresh,
     touched_label_key,
@@ -504,6 +505,245 @@ class ChildCapPatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"]
+
+
+async def apply_session_archive_transition(
+    request: Request,
+    conv: Conversation,
+    body: UpdateSessionRequest,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    runner_router: RunnerRouter | None,
+    *,
+    expect_archived: bool | None = None,
+    expect_revision: int | None = None,
+    set_labels: dict[str, str] | None = None,
+    remove_labels: list[str] | None = None,
+    project_archive_batch: str | None = None,
+    **update_fields: Any,
+) -> ConversationUpdateResult:
+    """Apply an archive write and its runner lifecycle for session and project callers."""
+    session_id = conv.id
+    condition_kwargs: dict[str, Any] = {}
+    if expect_archived is not None:
+        condition_kwargs.update(expect_archived=expect_archived, expect_revision=expect_revision)
+    if set_labels is not None:
+        condition_kwargs["set_labels"] = set_labels
+    if remove_labels is not None:
+        condition_kwargs["remove_labels"] = remove_labels
+    if project_archive_batch is not None:
+        condition_kwargs["project_archive_batch"] = project_archive_batch
+    close_on_archive = False
+    archive_stop_when_idle = False
+    if body.archived is True and not conv.archived:
+        # Resolve the Host policy before the row mutation so the archive
+        # transition and its close request commit atomically below.
+        close_on_archive = True
+        # A target with a parent or sub-sessions also defers the teardown:
+        # its tree may be mid-turn (D5 / D4). Any retained child row
+        # counts — the teardown walks the same genealogy.
+        archive_stop_when_idle = body.stop_when_idle or conv.parent_conversation_id is not None
+        if not archive_stop_when_idle:
+            try:
+                children = (
+                    await asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_by_parent,
+                        [session_id],
+                    )
+                ).get(session_id)
+            except Exception:  # A failed lookup must not cut a running tree.
+                archive_stop_when_idle = True
+                _logger.warning(
+                    "Could not list children of %s for the archive deferral; "
+                    "deferring the teardown conservatively",
+                    session_id,
+                    exc_info=True,
+                )
+            else:
+                archive_stop_when_idle = bool(children)
+        if conv.host_id is not None:
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is not None:
+                try:
+                    policy_host = await asyncio.to_thread(
+                        host_store.get_host,
+                        conv.host_id,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Could not load CLI retention policy for archived session %s; "
+                        "using legacy close behavior",
+                        session_id,
+                        exc_info=True,
+                    )
+                else:
+                    if policy_host is not None and policy_host.cli_retention_policy is not None:
+                        close_on_archive = policy_host.cli_retention_policy.close_on_archive
+    safe_archive_cleanup = False
+    effective_mode = "never"
+    archive_paths: list[str] | None = None
+    if (
+        body.archived is True
+        and (not conv.archived or body.delete_worktree or body.worktree_archive_mode)
+        and not body.keep_worktree
+    ):
+        from omnigent.server.user_preferences_store import (
+            read_worktree_archive_preference_for_cleanup,
+        )
+
+        archive_preference = await asyncio.to_thread(
+            read_worktree_archive_preference_for_cleanup,
+            getattr(request.app.state, "user_preferences_store", None),
+            _get_session_owner_id(session_id, permission_store) or RESERVED_USER_LOCAL,
+        )
+        if archive_preference is not None:
+            effective_mode = body.worktree_archive_mode or archive_preference["mode"]
+            archive_paths = archive_preference["rebuildable_paths"]
+            if effective_mode != "never":
+                close_on_archive = True
+                safe_archive_cleanup = True
+
+    # Only a real archive transition carries the idle deferral; passing it
+    # through the store keeps the label write in the same commit. Spread
+    # conditionally so fakes with explicit signatures see only the kwargs
+    # they define.
+    archive_stop_when_idle_kwargs: dict[str, Any] = (
+        {"archive_stop_when_idle": True} if archive_stop_when_idle else {}
+    )
+    delete_worktree_kwargs: dict[str, Any] = (
+        {"delete_worktree": True} if safe_archive_cleanup else {}
+    )
+    archive_mode_kwargs: dict[str, Any] = (
+        {
+            "worktree_archive_mode": effective_mode,
+            "override_keep_worktree": body.delete_worktree,
+        }
+        if safe_archive_cleanup
+        else {}
+    )
+    keep_worktree_kwargs: dict[str, Any] = (
+        {"keep_worktree": True}
+        if body.keep_worktree or body.worktree_archive_mode == "never"
+        else {}
+    )
+    update_result = await asyncio.to_thread(
+        conversation_store.update_conversation_with_changes,
+        session_id,
+        **update_fields,
+        archived=body.archived,
+        close_cli_on_archive=close_on_archive,
+        **archive_stop_when_idle_kwargs,
+        **delete_worktree_kwargs,
+        **archive_mode_kwargs,
+        **keep_worktree_kwargs,
+        **condition_kwargs,
+    )
+    if update_result is None:
+        raise _session_not_found()
+    if getattr(update_result, "archive_outcome", None) in {"already", "conflict"}:
+        return update_result
+    updated = update_result.conversation
+    if body.archived is not None:
+        from omnigent.stores.conversation_store import archive_cascade_members
+
+        for child_id in archive_cascade_members(updated if body.archived else conv):
+            _publish_child_status_to_parent(child_id, None)
+            if body.archived:
+                _prune_session_read_state(child_id)
+    # Archive / unarchive changes a child's rail membership, and an
+    # archived child emits no further status edges — publish its fresh
+    # summary to the parent's stream directly so the row moves without a
+    # reload. Only a real transition is worth an event.
+    if (
+        body.archived is not None
+        and bool(conv.archived) != bool(body.archived)
+        and updated.parent_conversation_id is not None
+    ):
+        _publish_child_status_to_parent(session_id, None)
+    # Archiving hides the session from the default view (and its unread
+    # dot), so drop its per-user read-state to bound in-memory growth.
+    # Only on archive→true; unarchiving leaves it pruned (reads as seen).
+    if body.archived is True:
+        _prune_session_read_state(session_id)
+        if archive_stop_when_idle:
+            # D5 / D4: a deferred teardown leaves the runner's start gate
+            # open, so fence new turns on the whole tree now — whether or
+            # not this host stops runners on archive.
+            _spawn_archive_fence(
+                session_id,
+                updated.archive_revision,
+                conversation_store,
+                runner_router,
+            )
+        # Defer the stop now that the flag is committed, so a request
+        # rejected after this point can't leave a live runner on a session
+        # that ends up archived. Detached, not awaited: the response must
+        # not wait out the stop's per-runner timeouts (seconds against a
+        # wedged or asleep runner). The teardown sleeps past the Undo
+        # window, then re-reads the archived flag and skips if undone, so
+        # undoing keeps the runner alive. Archive has no client-side stop,
+        # so this also carries the host-runner teardown.
+        if (
+            close_on_archive
+            and updated.archive_close_requested_revision == updated.archive_revision
+        ):
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+                getattr(request.app.state, "archive_close_coordinator", None),
+                delete_worktree=safe_archive_cleanup,
+                archive_mode=effective_mode if safe_archive_cleanup else None,
+                rebuildable_paths=archive_paths if safe_archive_cleanup else None,
+                project_host_binding_store=getattr(
+                    request.app.state, "project_host_binding_store", None
+                ),
+            )
+    elif body.archived is False:
+        # Unarchive (including Undo, which re-PATCHes archived=false within
+        # the pill's window): cancel a still-pending archive stop so the
+        # runner is kept alive instead of torn down for a session the user
+        # decided to keep. Same-replica fast path; the deferred stop's
+        # archived-flag re-check covers a cross-replica Undo.
+        _cancel_pending_archive_stop(session_id)
+        if conv.archived:
+            # The transition above deleted the idle-deferral marker in the
+            # same commit; the revision bump already voided it.
+            # Clear the runner-side archive fence for the newer revision.
+            _spawn_archive_unfence(
+                session_id,
+                updated.archive_revision,
+                conversation_store,
+                runner_router,
+            )
+            # Unarchiving a keep-warm host-offline archive opts out of that
+            # pass for the host's current offline spell: drop the provenance
+            # and pin the host's last-seen stamp (a reconnect bumps it,
+            # re-arming the pass).
+            if updated.labels.get(_ARCHIVE_REASON_LABEL_KEY) == _ARCHIVE_REASON_HOST_OFFLINE:
+                await asyncio.to_thread(
+                    conversation_store.delete_label, session_id, _ARCHIVE_REASON_LABEL_KEY
+                )
+                await asyncio.to_thread(
+                    conversation_store.delete_label, session_id, _ARCHIVED_BY_LABEL_KEY
+                )
+                exempt_host_id = await asyncio.to_thread(
+                    effective_host_id, conversation_store, updated
+                )
+                host_store = getattr(request.app.state, "host_store", None)
+                exempt_host = (
+                    await asyncio.to_thread(host_store.get_host, exempt_host_id)
+                    if exempt_host_id is not None and host_store is not None
+                    else None
+                )
+                if exempt_host is not None:
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {_ARCHIVE_EXEMPT_SINCE_LABEL_KEY: str(exempt_host.updated_at)},
+                    )
+    return update_result
 
 
 def register_core_routes(
@@ -1625,7 +1865,10 @@ def register_core_routes(
         # agent-initiated; without the header there is no budget to spend,
         # so the access check and the charge are both skipped.
         origin = request.headers.get(CREATE_ORIGIN_HEADER, "")
-        if origin.strip().lower() != CREATE_ORIGIN_AGENT:
+        if (
+            origin.strip().lower() != CREATE_ORIGIN_AGENT
+            and RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
+        ):
             yield
             return
         # Authorize the caller on the parent before charging its owner's
@@ -1645,6 +1888,23 @@ def register_core_routes(
             )
             if parent is None:
                 raise _session_not_found()
+            from omnigent.server.routes.sessions.routes_peer import _runner_authorized_for_sender
+            from omnigent.server.session_collab import require_session_action_allowed
+
+            if RUNNER_TUNNEL_TOKEN_HEADER in request.headers and not _runner_authorized_for_sender(
+                request, parent, runner_tunnel_tokens
+            ):
+                raise OmnigentError(
+                    "Runner tunnel token is not bound to the calling session's runner",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                parent,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+            )
             cap, _ = await asyncio.to_thread(
                 child_cap_for,
                 parent,
@@ -2051,6 +2311,7 @@ def register_core_routes(
         )
 
         request_fields_set = parsed_metadata.model_fields_set
+        explicit_project_label = "omni_project" in parsed_metadata.labels
         bundle_bytes = await bundle.read()
         # The lead Agent's saved speed is an explicit launch value. Seed it
         # before resolving project defaults so an inherited tier cannot be
@@ -2478,6 +2739,9 @@ def register_core_routes(
                         worktree=placed_worktree,
                         git_branch=bound_branch,
                         agent_store=agent_store,
+                        project_admission="reject"
+                        if "project_id" in request_fields_set or explicit_project_label
+                        else "inherit",
                     )
                 )
         session_created(
@@ -2608,6 +2872,8 @@ def register_core_routes(
     @router.get("/sessions/projects")
     async def list_session_projects(
         request: Request,
+        include_archived: bool = False,
+        archived: Literal["only"] | None = None,
     ) -> list[SessionProjectSummary]:
         """
         Return the caller's project summaries in their preferred display order.
@@ -2632,17 +2898,49 @@ def register_core_routes(
         def _list_union() -> list[SessionProjectSummary]:
             # First-class first so its id wins when a name exists in both.
             by_name: dict[str, SessionProjectSummary] = {}
+            archived_names: set[str] = set()
             if project_store is not None:
-                for proj in project_store.list(user_id=user_id):
+                all_projects = project_store.list(user_id=user_id, archived="include")
+                archived_names = {
+                    proj.name for proj in all_projects if proj.archived_at is not None
+                }
+                for proj in all_projects:
+                    if archived and proj.archived_at is None:
+                        continue
+                    if not archived and not include_archived and proj.archived_at is not None:
+                        continue
                     icon = proj.config.get("icon")
+                    batch = proj.archive_state.get("batch")
+                    summary = {"sessions": 0, "tasks": 0}
+                    if batch:
+                        summary["sessions"] = len(
+                            conversation_store.list_project_archive_sessions(
+                                proj.id,
+                                proj.name,
+                                user_id,
+                                batch=batch,
+                            )
+                        )
+                        task_store = getattr(request.app.state, "scheduled_task_store", None)
+                        if task_store is not None:
+                            summary["tasks"] = len(
+                                task_store.list_for_project_archive(
+                                    proj.id,
+                                    owner_user_id=user_id,
+                                    batch=batch,
+                                )
+                            )
                     by_name[proj.name] = SessionProjectSummary(
                         id=proj.id,
                         name=proj.name,
                         icon=icon if isinstance(icon, str) else None,
+                        archived_at=proj.archived_at,
+                        archive_summary=summary,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in sorted(conversation_store.list_projects(owned_by=user_id)):
-                by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
+                if not archived and (include_archived or name not in archived_names):
+                    by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
             from omnigent.stores.project_store import apply_project_order
 
             order = project_store.get_order(user_id=user_id) if project_store is not None else None
@@ -2992,13 +3290,13 @@ def register_core_routes(
         }
 
     async def _require_list_permission_protocol(
-        connection: Request | WebSocket, conversations: list[Conversation]
+        connection: WebSocket, conversations: list[Conversation]
     ) -> None:
         from omnigent.server.permission_tiers import require_permission_protocol
 
-        if connection.headers.get("X-Omnigent-Permission-Tiers") == "1" or (
-            isinstance(connection, WebSocket)
-            and connection.query_params.get("permission_tiers") == "1"
+        if (
+            connection.headers.get("X-Omnigent-Permission-Tiers") == "1"
+            or connection.query_params.get("permission_tiers") == "1"
         ):
             return
         for conv in conversations:
@@ -3013,10 +3311,8 @@ def register_core_routes(
             try:
                 require_permission_protocol(connection, harness=harness)
             except HTTPException:
-                if isinstance(connection, WebSocket):
-                    await connection.close(code=4406, reason="permission_tiers_refresh_required")
-                    raise WebSocketDisconnect(code=4406) from None
-                raise
+                await connection.close(code=4406, reason="permission_tiers_refresh_required")
+                raise WebSocketDisconnect(code=4406) from None
 
     async def _session_list_page(
         request: Request,
@@ -3042,7 +3338,6 @@ def register_core_routes(
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).
         page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
-        await _require_list_permission_protocol(request, page.data)
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -3209,8 +3504,20 @@ def register_core_routes(
         # single-session snapshot, the WS stream, and the /health poll, not
         # from list rows. Skipping it here removes the session-connectivity
         # and hosts-table queries from every GET /v1/sessions.
+        data = [item.model_dump(exclude_none=True) for item in items]
+        # Host self-update needs this inventory before it can upgrade its client.
+        # Keep every row available without exposing tier controls to old clients.
+        if request.headers.get("X-Omnigent-Permission-Tiers") != "1":
+            from omnigent.server.permission_tiers import is_permission_label_key
+
+            for row in data:
+                row["labels"] = {
+                    key: value
+                    for key, value in row["labels"].items()
+                    if not is_permission_label_key(key)
+                }
         return PaginatedList(
-            data=[item.model_dump(exclude_none=True) for item in items],
+            data=data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
@@ -3479,7 +3786,7 @@ def register_core_routes(
 
     def _keep_warm_families_for(
         convs: list[Conversation],
-    ) -> dict[tuple[str | None, str | None, str | None], Literal["claude", "codex"] | None]:
+    ) -> dict[tuple[str | None, str | None, str | None], Literal["claude", "codex", "pi"] | None]:
         """
         Resolve keep-warm families for rows with no family-stamped label.
 
@@ -4427,6 +4734,42 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        from omnigent.server.session_collab import (
+            AGENT_SESSION_HEADER,
+            require_session_action_allowed,
+        )
+
+        if body.archived is False and (
+            AGENT_SESSION_HEADER in request.headers
+            or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+        ):
+            caller_id = request.headers.get(AGENT_SESSION_HEADER)
+            if not caller_id:
+                raise OmnigentError(
+                    "Agent unarchive requires the calling session identity",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            await _require_access(
+                user_id, caller_id, LEVEL_READ, permission_store, conversation_store
+            )
+            caller = await asyncio.to_thread(conversation_store.get_conversation, caller_id)
+            if caller is None:
+                raise _session_not_found()
+            from omnigent.server.routes.sessions.routes_peer import _runner_authorized_for_sender
+
+            if not _runner_authorized_for_sender(request, caller, runner_tunnel_tokens):
+                raise OmnigentError(
+                    "Runner tunnel token is not bound to the calling session's runner",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                caller,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+                action="unarchive",
+            )
         from omnigent.server.permission_tiers import require_permission_protocol
 
         conv_for_protocol = await asyncio.to_thread(
@@ -5284,79 +5627,6 @@ def register_core_routes(
                 )
 
         assert conv is not None
-        close_on_archive = False
-        archive_stop_when_idle = False
-        if body.archived is True and not conv.archived:
-            # Resolve the Host policy before the row mutation so the archive
-            # transition and its close request commit atomically below.
-            close_on_archive = True
-            # A target with a parent or sub-sessions also defers the teardown:
-            # its tree may be mid-turn (D5 / D4). Any retained child row
-            # counts — the teardown walks the same genealogy.
-            archive_stop_when_idle = body.stop_when_idle or conv.parent_conversation_id is not None
-            if not archive_stop_when_idle:
-                try:
-                    children = (
-                        await asyncio.to_thread(
-                            conversation_store.list_child_conversation_ids_by_parent,
-                            [session_id],
-                        )
-                    ).get(session_id)
-                except Exception:  # A failed lookup must not cut a running tree.
-                    archive_stop_when_idle = True
-                    _logger.warning(
-                        "Could not list children of %s for the archive deferral; "
-                        "deferring the teardown conservatively",
-                        session_id,
-                        exc_info=True,
-                    )
-                else:
-                    archive_stop_when_idle = bool(children)
-            if conv.host_id is not None:
-                host_store = getattr(request.app.state, "host_store", None)
-                if host_store is not None:
-                    try:
-                        policy_host = await asyncio.to_thread(
-                            host_store.get_host,
-                            conv.host_id,
-                        )
-                    except Exception:
-                        _logger.warning(
-                            "Could not load CLI retention policy for archived session %s; "
-                            "using legacy close behavior",
-                            session_id,
-                            exc_info=True,
-                        )
-                    else:
-                        if (
-                            policy_host is not None
-                            and policy_host.cli_retention_policy is not None
-                        ):
-                            close_on_archive = policy_host.cli_retention_policy.close_on_archive
-        safe_archive_cleanup = False
-        effective_mode = "never"
-        archive_paths: list[str] | None = None
-        if (
-            body.archived is True
-            and (not conv.archived or body.delete_worktree or body.worktree_archive_mode)
-            and not body.keep_worktree
-        ):
-            from omnigent.server.user_preferences_store import (
-                read_worktree_archive_preference_for_cleanup,
-            )
-
-            archive_preference = await asyncio.to_thread(
-                read_worktree_archive_preference_for_cleanup,
-                getattr(request.app.state, "user_preferences_store", None),
-                _get_session_owner_id(session_id, permission_store) or RESERVED_USER_LOCAL,
-            )
-            if archive_preference is not None:
-                effective_mode = body.worktree_archive_mode or archive_preference["mode"]
-                archive_paths = archive_preference["rebuildable_paths"]
-                if effective_mode != "never":
-                    close_on_archive = True
-                    safe_archive_cleanup = True
-
         live_model_change = not body.silent and (model_override is not None or clear_model)
         wake_for_model_change = (
             live_model_change
@@ -5370,32 +5640,29 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        # Only a real archive transition carries the idle deferral; passing it
-        # through the store keeps the label write in the same commit. Spread
-        # conditionally so fakes with explicit signatures see only the kwargs
-        # they define.
-        archive_stop_when_idle_kwargs: dict[str, Any] = (
-            {"archive_stop_when_idle": True} if archive_stop_when_idle else {}
-        )
-        delete_worktree_kwargs: dict[str, Any] = (
-            {"delete_worktree": True} if safe_archive_cleanup else {}
-        )
-        archive_mode_kwargs: dict[str, Any] = (
-            {
-                "worktree_archive_mode": effective_mode,
-                "override_keep_worktree": body.delete_worktree,
-            }
-            if safe_archive_cleanup
-            else {}
-        )
-        keep_worktree_kwargs: dict[str, Any] = (
-            {"keep_worktree": True}
-            if body.keep_worktree or body.worktree_archive_mode == "never"
-            else {}
-        )
-        update_result = await asyncio.to_thread(
-            conversation_store.update_conversation_with_changes,
-            session_id,
+        if body.archived is False and set_project:
+            target_project_id = body.project_id or None
+            if target_project_id is not None:
+                owned = (
+                    await asyncio.to_thread(project_store.get, target_project_id, user_id=user_id)
+                    if project_store is not None
+                    else None
+                )
+                if owned is None:
+                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            if not await asyncio.to_thread(
+                conversation_store.set_conversation_project, session_id, target_project_id
+            ):
+                raise _session_not_found()
+            set_project = False
+
+        update_result = await apply_session_archive_transition(
+            request,
+            conv,
+            body,
+            conversation_store,
+            permission_store,
+            runner_router,
             title=body.title,
             reasoning_effort=None if clear_effort else effort,
             _unset_reasoning_effort=clear_effort,
@@ -5411,23 +5678,8 @@ def register_core_routes(
             # an omitted field leaves it unchanged; True/False set or clear it.
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
-            archived=body.archived,
-            close_cli_on_archive=close_on_archive,
-            **archive_stop_when_idle_kwargs,
-            **delete_worktree_kwargs,
-            **archive_mode_kwargs,
-            **keep_worktree_kwargs,
         )
-        if update_result is None:
-            raise _session_not_found()
         updated = update_result.conversation
-        if body.archived is not None:
-            from omnigent.stores.conversation_store import archive_cascade_members
-
-            for child_id in archive_cascade_members(updated if body.archived else conv):
-                _publish_child_status_to_parent(child_id, None)
-                if body.archived:
-                    _prune_session_read_state(child_id)
         effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
@@ -5440,99 +5692,6 @@ def register_core_routes(
                     if key in body.model_fields_set
                 },
             )
-        # Archive / unarchive changes a child's rail membership, and an
-        # archived child emits no further status edges — publish its fresh
-        # summary to the parent's stream directly so the row moves without a
-        # reload. Only a real transition is worth an event.
-        if (
-            body.archived is not None
-            and bool(conv.archived) != bool(body.archived)
-            and updated.parent_conversation_id is not None
-        ):
-            _publish_child_status_to_parent(session_id, None)
-        # Archiving hides the session from the default view (and its unread
-        # dot), so drop its per-user read-state to bound in-memory growth.
-        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
-        if body.archived is True:
-            _prune_session_read_state(session_id)
-            if archive_stop_when_idle:
-                # D5 / D4: a deferred teardown leaves the runner's start gate
-                # open, so fence new turns on the whole tree now — whether or
-                # not this host stops runners on archive.
-                _spawn_archive_fence(
-                    session_id,
-                    updated.archive_revision,
-                    conversation_store,
-                    runner_router,
-                )
-            # Defer the stop now that the flag is committed, so a request
-            # rejected after this point can't leave a live runner on a session
-            # that ends up archived. Detached, not awaited: the response must
-            # not wait out the stop's per-runner timeouts (seconds against a
-            # wedged or asleep runner). The teardown sleeps past the Undo
-            # window, then re-reads the archived flag and skips if undone, so
-            # undoing keeps the runner alive. Archive has no client-side stop,
-            # so this also carries the host-runner teardown.
-            if (
-                close_on_archive
-                and updated.archive_close_requested_revision == updated.archive_revision
-            ):
-                _spawn_archive_stop(
-                    session_id,
-                    conversation_store,
-                    runner_router,
-                    getattr(request.app.state, "host_registry", None),
-                    getattr(request.app.state, "archive_close_coordinator", None),
-                    delete_worktree=safe_archive_cleanup,
-                    archive_mode=effective_mode if safe_archive_cleanup else None,
-                    rebuildable_paths=archive_paths if safe_archive_cleanup else None,
-                    project_host_binding_store=getattr(
-                        request.app.state, "project_host_binding_store", None
-                    ),
-                )
-        elif body.archived is False:
-            # Unarchive (including Undo, which re-PATCHes archived=false within
-            # the pill's window): cancel a still-pending archive stop so the
-            # runner is kept alive instead of torn down for a session the user
-            # decided to keep. Same-replica fast path; the deferred stop's
-            # archived-flag re-check covers a cross-replica Undo.
-            _cancel_pending_archive_stop(session_id)
-            if conv.archived:
-                # The transition above deleted the idle-deferral marker in the
-                # same commit; the revision bump already voided it.
-                # Clear the runner-side archive fence for the newer revision.
-                _spawn_archive_unfence(
-                    session_id,
-                    updated.archive_revision,
-                    conversation_store,
-                    runner_router,
-                )
-                # Unarchiving a keep-warm host-offline archive opts out of that
-                # pass for the host's current offline spell: drop the provenance
-                # and pin the host's last-seen stamp (a reconnect bumps it,
-                # re-arming the pass).
-                if updated.labels.get(_ARCHIVE_REASON_LABEL_KEY) == _ARCHIVE_REASON_HOST_OFFLINE:
-                    await asyncio.to_thread(
-                        conversation_store.delete_label, session_id, _ARCHIVE_REASON_LABEL_KEY
-                    )
-                    await asyncio.to_thread(
-                        conversation_store.delete_label, session_id, _ARCHIVED_BY_LABEL_KEY
-                    )
-                    exempt_host_id = await asyncio.to_thread(
-                        effective_host_id, conversation_store, updated
-                    )
-                    host_store = getattr(request.app.state, "host_store", None)
-                    exempt_host = (
-                        await asyncio.to_thread(host_store.get_host, exempt_host_id)
-                        if exempt_host_id is not None and host_store is not None
-                        else None
-                    )
-                    if exempt_host is not None:
-                        await asyncio.to_thread(
-                            conversation_store.set_labels,
-                            session_id,
-                            {_ARCHIVE_EXEMPT_SINCE_LABEL_KEY: str(exempt_host.updated_at)},
-                        )
         # The runner applies native settings live and caches SDK settings for the
         # next turn. Silent startup metadata writes skip both recovery and
         # forwarding to avoid recursive launches.
@@ -6396,6 +6555,30 @@ def register_core_routes(
                 "permission_tier is only supported by Pi and Antigravity forks",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if body.permission_mode is not None:
+            from omnigent.session_default_modes import apply_mode, valid_mode
+
+            if not valid_mode(body.permission_mode, target_harness, "permission", "create"):
+                raise OmnigentError(
+                    "Unsupported fork permission mode", code=ErrorCode.INVALID_INPUT
+                )
+            application = apply_mode(target_harness, "permission", body.permission_mode)
+            if application.tier is not None:
+                raise OmnigentError(
+                    "Use permission_tier for tiered forks", code=ErrorCode.INVALID_INPUT
+                )
+            extra_labels.update(application.labels)
+            if application.args:
+                override_launch_args = _validate_terminal_launch_args(
+                    [*(override_launch_args or []), *application.args]
+                )
+                launch_args_set = True
+                dropped_label_keys_set.update(
+                    {
+                        _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+                        _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+                    }
+                )
         if source_harness in TIER_HARNESSES or target_harness in TIER_HARNESSES:
             dropped_label_keys_set.update(PERMISSION_LABEL_KEYS)
         tier = None
@@ -6543,7 +6726,10 @@ def register_core_routes(
                 project_store=project_store,
             )
         except OmnigentError as exc:
-            if source.project_id is None or exc.code != ErrorCode.NOT_FOUND:
+            if source.project_id is None or exc.code not in (
+                ErrorCode.NOT_FOUND,
+                ErrorCode.PROJECT_ARCHIVED,
+            ):
                 raise
         else:
             fork_project_id = fork_resolution.project_id
@@ -6624,6 +6810,7 @@ def register_core_routes(
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
                 source_id,
+                project_admission="inherit",
                 title=body.title,
                 agent_id=fork_agent_id,
                 cloned_agent_name=base_agent.name if clone_location else None,
@@ -6972,6 +7159,7 @@ def register_core_routes(
             conv = await asyncio.to_thread(
                 conversation_store.create_conversation,
                 agent_id=source_agent.id,
+                project_admission="inherit",
                 host_id=source.host_id,
                 workspace=workspace,
                 project_id=source.project_id,
@@ -6991,6 +7179,7 @@ def register_core_routes(
             created = await asyncio.to_thread(
                 conversation_store.create_session_with_agent,
                 agent_id=generate_agent_id(),
+                project_admission="inherit",
                 agent_name=source_agent.name,
                 agent_bundle_location=source_agent.bundle_location,
                 agent_description=source_agent.description,

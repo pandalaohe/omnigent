@@ -86,6 +86,9 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useHarnessCapabilities } from "@/lib/agentLabels";
+import { callingDefaultHasModels } from "@/lib/callingDefaults";
+import { sessionDefaultModeOptions, sessionModeHandler } from "@/lib/sessionDefaultModes";
 import { randomUUID } from "@/lib/randomUUID";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
@@ -250,6 +253,7 @@ export interface ForkRunConfigValue {
   reasoningEffort?: string;
   terminalLaunchArgs?: string[];
   permissionTier?: string;
+  permissionMode?: string;
   /**
    * DANGEROUS codex full-bypass opt-in. Only emitted (as `true`) when the
    * user explicitly picks "Bypass approvals & sandbox" for a codex target;
@@ -312,16 +316,31 @@ function ForkRunConfig({
   selectedHostId: string | null;
   onChange: (value: ForkRunConfigValue) => void;
 }) {
+  const capabilities = useHarnessCapabilities();
+  const permissionHandler = targetHarness
+    ? sessionModeHandler(targetHarness, "permission", capabilities)
+    : null;
+  const permissionOptions = useMemo(
+    () =>
+      targetHarness
+        ? sessionDefaultModeOptions(targetHarness, "permission", [], null, "create", capabilities)
+        : [],
+    [targetHarness, capabilities],
+  );
   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(targetAgent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(targetAgent, "cursorMode");
-  const hasAgyPermissionTier =
-    nativeAgentHasCapability(targetAgent, "agyPermissionTier") || targetHarness === "pi";
+  const hasAgyPermissionTier = permissionHandler === "agy-tier";
+  const hasGenericPermission =
+    permissionHandler !== null &&
+    !["agy-tier", "claude-permission-mode", "codex-approval-preset", "codex-sdk-approval"].includes(
+      permissionHandler,
+    );
   const hasModelPicker = nativeAgentHasCapability(targetAgent, "modelPicker");
   // Codex resolves its own catalog, so it gets a model row even though it lacks
   // the modelPicker capability (mirrors the new-session dialog).
   const isCodex = targetHarness === "codex-native";
-  const hasAgyMode = nativeAgentHasCapability(targetAgent, "agyMode");
+  const hasAgyMode = callingDefaultHasModels(targetHarness ?? "", capabilities);
   const showModel = hasModelPicker || isCodex || hasAgyMode;
 
   // Live model catalog for the target harness on the picked host. Only the
@@ -397,6 +416,7 @@ function ForkRunConfig({
           : AGY_NATIVE_DEFAULT_PERMISSION_TIER;
       return inherited === "full" ? AGY_NATIVE_DEFAULT_PERMISSION_TIER : inherited;
     }
+    if (hasGenericPermission) return permissionOptions[0]?.value ?? "";
     // Same as permission: launch args carry over only on a same-agent fork, so
     // seed the mode from the source only then; otherwise the harness's default.
     const source = sameAgentAsSource ? (sourceSession?.terminalLaunchArgs ?? []) : [];
@@ -423,7 +443,16 @@ function ForkRunConfig({
       .sort((a, b) => b.args.length - a.args.length)
       .find((m) => m.args.length > 0 && m.args.every((arg) => source.includes(arg)));
     return match?.value ?? dflt;
-  }, [isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgyPermissionTier]);
+  }, [
+    isCodex,
+    sameAgentAsSource,
+    sourceSession,
+    hasApproval,
+    hasCursor,
+    hasAgyPermissionTier,
+    hasGenericPermission,
+    permissionOptions,
+  ]);
 
   const [model, setModel] = useState(seededModel);
   const [effort, setEffort] = useState(seededEffort);
@@ -526,6 +555,7 @@ function ForkRunConfig({
     }
     if (hasAgyPermissionTier && (touched.mode || sourceSession !== null))
       value.permissionTier = mode;
+    if (hasGenericPermission && touched.mode) value.permissionMode = mode;
     if (hasAgyMode && touched.effort) {
       value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
     }
@@ -537,6 +567,7 @@ function ForkRunConfig({
     hasApproval,
     hasCursor,
     hasAgyPermissionTier,
+    hasGenericPermission,
     sourceSession,
     isCodex,
     model,
@@ -549,7 +580,12 @@ function ForkRunConfig({
 
   if (
     targetHarness === null ||
-    (!showModel && !hasPermission && !hasApproval && !hasCursor && !hasAgyPermissionTier)
+    (!showModel &&
+      !hasPermission &&
+      !hasApproval &&
+      !hasCursor &&
+      !hasAgyPermissionTier &&
+      !hasGenericPermission)
   ) {
     return null;
   }
@@ -687,6 +723,21 @@ function ForkRunConfig({
         </ForkConfigRow>
       )}
 
+      {hasGenericPermission && permissionOptions.length > 0 && (
+        <ForkConfigRow label="Permissions">
+          <DescribedSelect
+            value={mode}
+            onValueChange={changeMode}
+            options={permissionOptions.map((option) => ({ ...option, description: "" }))}
+            testId="fork-session-config-permission"
+            ariaLabel="Permissions"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
+            componentId="fork_session.config.permission"
+          />
+        </ForkConfigRow>
+      )}
+
       {hasAgyPermissionTier && (
         <>
           {targetHarness === "antigravity-native" && (
@@ -704,7 +755,11 @@ function ForkRunConfig({
             <DescribedSelect
               value={mode}
               onValueChange={changeMode}
-              options={AGY_NATIVE_PERMISSION_TIERS}
+              options={
+                permissionOptions.length > 0
+                  ? permissionOptions.map((option) => ({ ...option, description: "" }))
+                  : AGY_NATIVE_PERMISSION_TIERS
+              }
               testId="fork-session-config-agy-skip"
               ariaLabel="Permissions"
               triggerClassName="text-sm"

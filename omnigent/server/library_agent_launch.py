@@ -23,19 +23,11 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
 from omnigent.member_snapshot import LIBRARY_AGENT_TEMPLATE_LABEL_KEY
-from omnigent.sdk_permission_modes import (
-    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
-    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
-    CODEX_SDK_APPROVAL_MODES,
-)
 from omnigent.server.auth import RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.custom_agents_store import CustomAgentsStore
-from omnigent.server.routes._session_create_validation import (
-    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
-)
 from omnigent.server.schemas import CreatedSessionResponse, SessionCreateMetadata
-from omnigent.session_default_modes import CODEX_NATIVE_PERMISSION_DEFAULT_ARGS
+from omnigent.session_default_modes import apply_mode, valid_mode
 
 # Saved library Agent ids are minted as ``ca_<uuid>`` by the custom-agents
 # route; the web picker keys the same prefix. Nothing else starts with it.
@@ -200,32 +192,23 @@ async def launch_library_agent(
     harness = library_agent_lead_harness(spec)
     permission_mode = launch.permission_mode
     launch_args: list[str] | None = None
-    if (
-        harness == "claude-native"
-        and permission_mode is not None
-        and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
-    ):
-        launch_args = ["--permission-mode", permission_mode]
-    elif harness == "codex-native" and permission_mode in CODEX_NATIVE_PERMISSION_DEFAULT_ARGS:
-        launch_args = list(CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[permission_mode])
     labels = library_agent_presentation_labels(spec=spec, host_bound=launch.host_id is not None)
-    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
+    if permission_mode is not None and valid_mode(
+        permission_mode, harness, "permission", "create"
+    ):
+        applied = apply_mode(harness, "permission", permission_mode)
+        launch_args = list(applied.args) or None
+        labels.update(applied.labels)
 
     speed = launch.speed or spec.executor.config.get("service_tier")
-    if isinstance(speed, str) and valid_speed_tier(speed, harness):
-        labels[SPEED_TIER_LABEL_KEY] = speed
-    if (
-        harness == "claude-sdk"
-        and permission_mode is not None
-        and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
-    ):
-        labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = permission_mode
-    elif (
-        harness == "codex"
-        and permission_mode is not None
-        and permission_mode in CODEX_SDK_APPROVAL_MODES
-    ):
-        labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission_mode
+    if isinstance(speed, str) and valid_mode(speed, harness, "speed", "create"):
+        applied = apply_mode(harness, "speed", speed)
+        launch_args = [*(launch_args or []), *applied.args] or None
+        labels.update(applied.labels)
+    if launch_args:
+        from omnigent.server.routes._sessions.helpers import _validate_terminal_launch_args
+
+        launch_args = _validate_terminal_launch_args(launch_args)
     labels[AGENT_TEMPLATE_LABEL_KEY] = agent_id
     # A joint bundle (2+ members) freezes its member snapshot on the session
     # before the synchronous persistence thread, like the interactive

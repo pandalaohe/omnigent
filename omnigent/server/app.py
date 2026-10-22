@@ -126,6 +126,7 @@ from omnigent.server.routes.project_collaboration import (
 )
 from omnigent.server.routes.project_entries import create_project_entries_router
 from omnigent.server.routes.project_host_roots import create_project_host_roots_router
+from omnigent.server.routes.project_settings import create_project_settings_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -2271,6 +2272,7 @@ def create_app(
     app.state.project_host_binding_store = project_host_binding_store
     app.state.project_repository_store = project_repository_store
     app.state.project_store = project_store
+    app.state.scheduled_task_store = scheduled_task_store
     # The create-time calling-defaults resolver reads these four stores off
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
@@ -2784,7 +2786,17 @@ def create_app(
             )
         return JSONResponse(
             status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    **{
+                        key: getattr(exc, key)
+                        for key in ("project_id", "project_name", "op_kind")
+                        if hasattr(exc, key)
+                    },
+                }
+            },
         )
 
     @app.exception_handler(RequestValidationError)
@@ -4181,6 +4193,10 @@ def create_app(
             create_projects_router(
                 project_store=project_store,
                 auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                scheduled_task_store=scheduled_task_store,
+                runner_router=runner_router,
             ),
             prefix="/v1",
             tags=["projects"],
@@ -4244,6 +4260,22 @@ def create_app(
             prefix="/v1",
             tags=["projects"],
         )
+        if host_store is not None and host_model_catalog_cache_store is not None:
+            app.include_router(
+                create_project_settings_router(
+                    binding_store=project_host_binding_store,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                    host_store=host_store,
+                    host_registry=host_registry,
+                    catalog_store=host_model_catalog_cache_store,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                    user_preferences_store=user_preferences_store,
+                ),
+                prefix="/v1",
+                tags=["projects"],
+            )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 

@@ -31,6 +31,7 @@ import { useProjects } from "@/hooks/useConversations";
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
+  useProjectsWithArchived: () => useProjects(),
 }));
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
@@ -53,6 +54,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({}),
+  useHarnessCapabilities: () => ({}),
 }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),

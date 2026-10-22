@@ -268,6 +268,9 @@ class ErrorCode:
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
     ELICITATION_TIMED_OUT = "elicitation_timed_out"
+    PROJECT_ARCHIVED = "project_archived"
+    PROJECT_NAME_ARCHIVED = "project_name_archived"
+    PROJECT_ARCHIVE_BUSY = "project_archive_busy"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -291,6 +294,9 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
     ErrorCode.USAGE_CUTOVER_HOLD: 409,
+    ErrorCode.PROJECT_ARCHIVED: 409,
+    ErrorCode.PROJECT_NAME_ARCHIVED: 409,
+    ErrorCode.PROJECT_ARCHIVE_BUSY: 409,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the
     # harness implementation — surface as 500 (no client action
@@ -347,6 +353,10 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.INVALID_INPUT: ErrorCategory.USER,
     ErrorCode.ALREADY_EXISTS: ErrorCategory.USER,
     ErrorCode.CONFLICT: ErrorCategory.USER,
+    ErrorCode.USAGE_CUTOVER_HOLD: ErrorCategory.USER,
+    ErrorCode.PROJECT_ARCHIVED: ErrorCategory.USER,
+    ErrorCode.PROJECT_NAME_ARCHIVED: ErrorCategory.USER,
+    ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorCategory.USER,
     # Our fault, raised where the site knows it is ours.
     ErrorCode.INTERNAL_ERROR: ErrorCategory.SERVER,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorCategory.SERVER,
@@ -419,6 +429,10 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.USAGE_CUTOVER_HOLD: ErrorImpact.BENIGN,
+    ErrorCode.PROJECT_ARCHIVED: ErrorImpact.BENIGN,
+    ErrorCode.PROJECT_NAME_ARCHIVED: ErrorImpact.BENIGN,
+    ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
     ErrorCode.ELICITATION_TIMED_OUT: ErrorImpact.BENIGN,
@@ -448,6 +462,10 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.INVALID_INPUT: ErrorPhase.REQUEST,
     ErrorCode.ALREADY_EXISTS: ErrorPhase.REQUEST,
     ErrorCode.CONFLICT: ErrorPhase.REQUEST,
+    ErrorCode.USAGE_CUTOVER_HOLD: ErrorPhase.REQUEST,
+    ErrorCode.PROJECT_ARCHIVED: ErrorPhase.REQUEST,
+    ErrorCode.PROJECT_NAME_ARCHIVED: ErrorPhase.REQUEST,
+    ErrorCode.PROJECT_ARCHIVE_BUSY: ErrorPhase.REQUEST,
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HOST_OFFLINE: ErrorPhase.RUNNER_LAUNCH,
@@ -551,6 +569,37 @@ class OmnigentError(Exception):
         """Lifecycle phase: the constructor override if given, else the code's
         mapping."""
         return self._phase_override or phase_for_code(self.code)
+
+
+class ProjectArchivedError(OmnigentError):
+    """A write would place an active member in an archived project."""
+
+    def __init__(self, project_id: str, project_name: str) -> None:
+        super().__init__(
+            f"项目 {project_name} 已归档；先取消归档项目，或换一个项目",
+            code=ErrorCode.PROJECT_ARCHIVED,
+        )
+        self.project_id = project_id
+        self.project_name = project_name
+
+
+class ProjectNameArchivedError(OmnigentError):
+    """An archived project owns the requested name."""
+
+    def __init__(self, project_id: str, project_name: str) -> None:
+        super().__init__(
+            f"有一个已归档的同名项目 {project_name}；可先取消归档",
+            code=ErrorCode.PROJECT_NAME_ARCHIVED,
+        )
+        self.project_id = project_id
+
+
+class ProjectArchiveBusyError(OmnigentError):
+    """An opposite archive operation is still live."""
+
+    def __init__(self, op_kind: str) -> None:
+        super().__init__("项目归档操作仍在进行，请稍后重试", code=ErrorCode.PROJECT_ARCHIVE_BUSY)
+        self.op_kind = op_kind
 
 
 class StaleCursorError(OmnigentError):

@@ -10,6 +10,8 @@ import type {
   InstructionPreview,
 } from "@/hooks/useInstructionLayers";
 import type * as InstructionHooks from "@/hooks/useInstructionLayers";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as AgentRegistryModule from "@/hooks/useAgentRegistry";
 import type * as NativeBridge from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
@@ -20,6 +22,23 @@ const mocks = vi.hoisted(() => ({
   save: vi.fn(),
   copy: vi.fn(),
   previewQuery: vi.fn(),
+}));
+const capabilities = vi.hoisted(() => ({}));
+vi.mock("@/lib/agentLabels", async (original) => ({
+  ...(await original<typeof AgentLabelsModule>()),
+  useHarnessCapabilities: () => capabilities,
+  useHarnessCatalog: (_selector: unknown, fallback: unknown) => fallback,
+}));
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<typeof AgentRegistryModule>()),
+  useAgentRegistry: () => ({
+    items: [],
+    legacyLabels: {},
+    legacyProducts: {},
+    isLoading: false,
+    isError: false,
+    retry: vi.fn(),
+  }),
 }));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.admin }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -442,4 +461,21 @@ describe("InstructionsPage", () => {
     expect(screen.getByText("Independent text")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("This preview is incomplete");
   });
+});
+
+it("adds a blank ACP column for this visit and drops blank latest layers on reload", async () => {
+  mocks.layers!.agents.push({
+    key: "acp:plugin",
+    display_name: "Plugin",
+    harnesses: ["acp:plugin"],
+  });
+  mocks.layers!.data.push(layer("agent", "  ", "acp:plugin"));
+  const view = page();
+  expect(screen.queryByRole("button", { name: "Edit Plugin" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Add agent" }));
+  fireEvent.click(await screen.findByRole("button", { name: /Plugin.*ACP/ }));
+  expect(screen.getByRole("button", { name: "Edit Plugin" })).toBeInTheDocument();
+  view.unmount();
+  page();
+  expect(screen.queryByRole("button", { name: "Edit Plugin" })).not.toBeInTheDocument();
 });

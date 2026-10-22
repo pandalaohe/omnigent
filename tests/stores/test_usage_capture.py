@@ -54,11 +54,269 @@ def _rows(spool: UsageOutbox) -> list[dict]:
         ]
 
 
+def test_pi_native_resume_baseline_and_cache_warm_are_content_free(tmp_path: Path) -> None:
+    spool = UsageOutbox(tmp_path / "spool")
+    root = tmp_path / "pi-sessions"
+    root.mkdir()
+    source = root / "physical.jsonl"
+    header = {"type": "session", "id": "physical-1", "timestamp": "2026-10-20T00:00:00Z"}
+    old = {
+        "type": "message",
+        "id": "old",
+        "timestamp": "2026-10-20T00:00:01Z",
+        "message": {"role": "assistant", "usage": {"input": 100, "output": 1}},
+    }
+    source.write_text(json.dumps(header) + "\n" + json.dumps(old) + "\n")
+    spool.register_pi_root(root, "session")
+    response = {
+        "type": "message",
+        "id": "entry-1",
+        "timestamp": "2026-10-20T00:00:02Z",
+        "message": {
+            "role": "assistant",
+            "model": "model-1",
+            "responseId": "r-1",
+            "content": "must-not-be-stored",
+            "usage": {"input": 3, "output": 2, "cacheRead": 4, "cacheWrite": 5},
+        },
+    }
+    warm = {
+        "type": "usage",
+        "id": "warm-1",
+        "kind": "cache_warm",
+        "timestamp": "2026-10-20T00:00:03Z",
+        "model": "model-1",
+        "note": "must-not-be-stored",
+        "usage": {"input": 0, "output": 0, "cacheRead": 8, "cacheWrite": 2},
+    }
+    compact = {
+        "type": "compaction",
+        "id": "compact-1",
+        "timestamp": "2026-10-20T00:00:04Z",
+        "summary": "must-not-be-stored",
+        "usage": {"input": 1, "output": 3, "cacheRead": 0, "cacheWrite": 0},
+    }
+    with source.open("a") as file:
+        file.write(
+            json.dumps(response) + "\n" + json.dumps(warm) + "\n" + json.dumps(compact) + "\n"
+        )
+    spool.scan_registered_sources()
+    clone = root / "clone.jsonl"
+    clone.write_text(
+        json.dumps({**header, "id": "physical-2"})
+        + "\n"
+        + json.dumps(old)
+        + "\n"
+        + json.dumps(response)
+        + "\n"
+        + json.dumps(warm)
+        + "\n"
+        + json.dumps(compact)
+        + "\n"
+    )
+    UsageOutbox(tmp_path / "spool").scan_registered_sources()
+    rows = _rows(spool)
+    assert [row["producer_unit_id"] for row in rows] != ["old"]
+    assert [
+        (row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"])
+        for row in rows
+    ] == [(3, 4, 5), (0, 8, 2), (1, 0, 0)]
+    assert rows[0]["logical_call_id"] == "r-1"
+    assert rows[0]["physical_session_id"] == "physical-1"
+    assert rows[1]["logical_call_id"] is None
+    assert "must-not-be-stored" not in str(rows)
+
+
+def test_pi_native_reconnect_before_scan_retains_new_file_usage(tmp_path: Path) -> None:
+    root = tmp_path / "pi-sessions"
+    root.mkdir()
+    spool_dir = tmp_path / "spool"
+    UsageOutbox(spool_dir).register_pi_root(root, "session")
+    source = root / "physical.jsonl"
+    source.write_text(
+        json.dumps({"type": "session", "id": "physical-1"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "message",
+                "id": "entry-1",
+                "timestamp": "2026-10-20T00:00:02Z",
+                "message": {
+                    "role": "assistant",
+                    "responseId": "r-1",
+                    "usage": {"input": 3, "output": 2, "cacheRead": 1, "cacheWrite": 0},
+                },
+            }
+        )
+        + "\n"
+    )
+    reconnected = UsageOutbox(spool_dir)
+    reconnected.register_pi_root(root, "session")
+    reconnected.scan_registered_sources()
+    UsageOutbox(spool_dir).scan_registered_sources()
+    rows = _rows(reconnected)
+    assert len(rows) == 1
+    assert rows[0]["input_tokens"] == 3
+    assert rows[0]["logical_call_id"] == "r-1"
+
+
+def test_pi_rpc_message_preserves_unknown_counters_and_dedupes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.runtime import capture_pi_rpc_message
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    message = {
+        "role": "assistant",
+        "responseId": "r-1",
+        "model": "model-1",
+        "content": "must-not-be-stored",
+        "usage": {"input": 2, "output": 3},
+    }
+    capture_pi_rpc_message("session", message)
+    capture_pi_rpc_message("session", message)
+    rows = _rows(UsageOutbox(tmp_path / "runtime" / "usage-export"))
+    assert len(rows) == 1
+    assert rows[0]["cached_input_tokens"] is None
+    assert rows[0]["cache_write_input_tokens"] is None
+    assert rows[0]["usage_status"] == "partial"
+    assert "must-not-be-stored" not in str(rows)
+
+
 def _deferred(spool: UsageOutbox) -> list[dict]:
     with sqlite3.connect(spool.path) as db:
         return [
             json.loads(row[0]) for row in db.execute("SELECT payload FROM deferred_measurements")
         ]
+
+
+@pytest.mark.parametrize("harness", [None, "pi-native"])
+def test_pi_filtered_final_scan_discovers_sources_and_keeps_cutover_origins(
+    tmp_path: Path, harness: str | None
+) -> None:
+    from omnigent.usage_export.cli import _pending_calls
+
+    spool = UsageOutbox(tmp_path / "spool")
+    root = tmp_path / "pi-sessions"
+    root.mkdir()
+    spool.register_pi_root(root, "session")
+    source = root / "physical.jsonl"
+    header = {"type": "session", "id": "physical-1"}
+    entry = {
+        "type": "message",
+        "id": "before",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "message": {"role": "assistant", "usage": {"input": 3, "output": 2}},
+    }
+    source.write_text(json.dumps(header) + "\n" + json.dumps(entry) + "\n")
+    spool.scan_registered_sources(harness="codex-native", final=True)
+    assert not spool.has_source(source)
+    spool.scan_registered_sources(harness=harness)
+    with sqlite3.connect(spool.path) as db:
+        db.execute(
+            "UPDATE producers SET binding=?",
+            (
+                json.dumps(
+                    {
+                        "host_id": "host",
+                        "session_id": "session",
+                        "harness": "pi-native",
+                        "agent_id": "agent",
+                    }
+                ),
+            ),
+        )
+    checkpoint = spool.checkpoint("host", "pi-native", 1)
+    before = spool.domain_report("pi-native")
+    assert before["units"][0]["origin"] == {
+        "path": str(source),
+        "position": source.stat().st_size,
+    }
+    assert _pending_calls(before, checkpoint, 1767225660)[0]["state"] == "unsent"
+
+    clone = root / "clone.jsonl"
+    # The final scan must discover new files, pass the live 1000-line limit,
+    # accept a last complete JSON value without a newline, and dedupe copies.
+    clone.write_text(
+        json.dumps({**header, "id": "physical-2"})
+        + "\n"
+        + json.dumps(entry)
+        + "\n"
+        + "{}\n" * 1001
+        + json.dumps({**entry, "id": "after", "timestamp": "2026-01-01T00:02:00Z"})
+    )
+    UsageOutbox(tmp_path / "spool").scan_registered_sources(harness=harness, final=True)
+    spool.scan_registered_sources(harness=harness, final=True)
+    report = spool.domain_report("pi-native")
+    assert len(report["units"]) == 2
+    assert [call["state"] for call in _pending_calls(report, checkpoint, 1767225660)] == [
+        "unsent",
+        "unadmitted_after_hold",
+    ]
+    assert report["units"][1]["origin"] == {
+        "path": str(clone),
+        "position": clone.stat().st_size,
+    }
+
+
+@pytest.mark.parametrize("harness", ["pi-native", "pi"])
+def test_pi_unadmitted_usage_invalidates_hold_and_refuses_new_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+    from omnigent.usage_export.models import UsageObservation
+    from omnigent.usage_export.store import UsageEventStore, UsageExportError
+
+    uri = f"sqlite:///{tmp_path / 'usage.db'}"
+    feed = UsageEventStore(uri)
+    cutover = UsageCutoverStore(uri)
+    spool = UsageOutbox(tmp_path / "spool")
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    cutover.create_hold("alice", "host", harness, 1)
+    with pytest.raises(UsageExportError) as refused:
+        cutover.admit_turn(
+            "alice",
+            admission_id="refused",
+            session_id="session",
+            host_id="host",
+            harness=harness,
+            source="web",
+        )
+    assert refused.value.code == "usage_cutover_hold"
+    spool.append(
+        "session",
+        harness,
+        {
+            "harness_family": "pi",
+            "identity_namespace": "pi/session/v1" if harness == "pi-native" else "pi/rpc/v1",
+            "thread_kind": "main",
+            "physical_session_id": "physical-1",
+        },
+        {
+            "type": "message",
+            "id": "after",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {"role": "assistant", "usage": {"input": 3, "output": 2}},
+        },
+    )
+    event = feed.append(
+        "alice",
+        UsageObservation.model_validate(
+            {
+                **_rows(spool)[0],
+                "session_id": "session",
+                "agent_id": "agent",
+                "host_id": "host",
+                "harness": harness,
+            }
+        ),
+    )
+    assert event["sequence"] == 1
+    assert event["call_started_not_before"] is None
+    assert cutover.hold_status("alice", "host", harness)["state"] == "invalidated"
+    with pytest.raises(UsageExportError, match="not_drained"):
+        cutover.submit_drain("alice", "host", harness, 1, {})
 
 
 def test_clone_ignores_inherited_calls_and_commits_checkpoint_once(tmp_path: Path) -> None:

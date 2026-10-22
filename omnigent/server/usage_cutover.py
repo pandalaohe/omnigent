@@ -17,7 +17,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.usage_export.cutover import UsageCutoverStore
 from omnigent.usage_export.store import UsageExportError
 
-# Session harness names to the four feed names.
+# Session harness names to feed domains.
 _FEED_HARNESS = {
     "codex": "codex-sdk",
     "codex-sdk": "codex-sdk",
@@ -26,6 +26,8 @@ _FEED_HARNESS = {
     "claude-native": "claude-native",
     "claude-sdk": "claude-sdk",
     "claude-code-sdk": "claude-sdk",
+    "pi-native": "pi-native",
+    "pi": "pi",
 }
 
 
@@ -77,6 +79,11 @@ def admit_turn(
     store = _store(storage_location)
     harness = feed_harness(conv, resolve_harness)
     if harness == "unsupported":
+        return None
+    if harness in {"pi", "pi-native"}:
+        # Pi has no admission/terminal correlation transport yet. Enforce
+        # the hold without creating an admission that cannot be completed.
+        refuse_if_held(storage_location, conv, resolve_harness=resolve_harness)
         return None
     try:
         record = store.admit_turn(

@@ -241,6 +241,17 @@
             "title": "Id",
             "type": "string"
           },
+          "integration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Integration Mode"
+          },
           "mcp_registry_editable": {
             "default": false,
             "title": "Mcp Registry Editable",
@@ -288,6 +299,17 @@
             },
             "title": "Policies",
             "type": "array"
+          },
+          "product_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Of"
           },
           "skills": {
             "items": {
@@ -539,6 +561,18 @@
             "title": "Id",
             "type": "string"
           },
+          "integration_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the agent's harness runs, when declared.",
+            "title": "Integration Mode"
+          },
           "mcp_registry_editable": {
             "default": false,
             "description": "Whether this caller owns the session and can select managed MCP services independently of agent ownership.",
@@ -593,6 +627,18 @@
             },
             "title": "Policies",
             "type": "array"
+          },
+          "product_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Harness id represented by this seeded product row, if any.",
+            "title": "Product Of"
           },
           "skills": {
             "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session exists. `GET /skills` discovers host skills and, when given `session_id`, merges the session's bundled skills. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
@@ -8299,6 +8345,17 @@
             "description": "Per-session LLM model override to apply to the fork, e.g. `\"claude-opus-4-7\"`. **Omitting** the field inherits the source's model (same as today, within the same provider family); an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets the fork to the bound agent's default. Validated against a conservative model-id charset. Set by the web fork dialog's model picker.",
             "title": "Model Override"
           },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
+          },
           "permission_tier": {
             "anyOf": [
               {
@@ -9438,6 +9495,26 @@
       "SessionProjectSummary": {
         "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
         "properties": {
+          "archive_summary": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "title": "Archive Summary",
+            "type": "object"
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
           "icon": {
             "anyOf": [
               {
@@ -12855,6 +12932,181 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "_HarnessPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effort"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "permission": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission"
+          },
+          "speed": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed"
+          }
+        },
+        "title": "_HarnessPatch",
+        "type": "object"
+      },
+      "_HostPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "harnesses": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/_HarnessPatch"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harnesses"
+          },
+          "host_id": {
+            "title": "Host Id",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "title": "_HostPatch",
+        "type": "object"
+      },
+      "_ProjectPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          }
+        },
+        "title": "_ProjectPatch",
+        "type": "object"
+      },
+      "_SettingsPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "string"
+          },
+          "host": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/_HostPatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/_ProjectPatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "_SettingsPatch",
         "type": "object"
       }
     },
@@ -16792,6 +17044,35 @@
       "get": {
         "description": "List the caller's projects.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
         "operationId": "list_projects_v1_projects_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "only",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -16804,6 +17085,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Projects",
@@ -17055,6 +17346,94 @@
           }
         },
         "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/archive": {
+      "post": {
+        "operationId": "archive_project_v1_projects__project_id__archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Archive Project V1 Projects  Project Id  Archive Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/archive-preview": {
+      "get": {
+        "operationId": "archive_preview_v1_projects__project_id__archive_preview_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Archive Preview V1 Projects  Project Id  Archive Preview Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive Preview",
         "tags": [
           "projects"
         ]
@@ -17741,6 +18120,178 @@
           }
         },
         "summary": "Put Repository",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/settings": {
+      "get": {
+        "operationId": "read_settings_v1_projects__project_id__settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Settings V1 Projects  Project Id  Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Settings",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "operationId": "update_settings_v1_projects__project_id__settings_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_SettingsPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Settings V1 Projects  Project Id  Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Settings",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/unarchive": {
+      "post": {
+        "operationId": "unarchive_project_v1_projects__project_id__unarchive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unarchive Project V1 Projects  Project Id  Unarchive Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unarchive Project",
         "tags": [
           "projects"
         ]
@@ -18601,6 +19152,35 @@
       "get": {
         "description": "Return the caller's project summaries in their preferred display order.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** Project summaries in custom order, or alphabetical order by default.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "const": "only",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archived"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -18615,6 +19195,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Session Projects",
@@ -20027,7 +20617,7 @@
     },
     "/v1/sessions/{session_id}/handover": {
       "post": {
-        "description": "Record a handover note and optionally request a turn-end rotation.\n\nThe note is a persisted assistant message whose id is stored in\n`omnigent.handover_item`, so the succession engine can open the\nsuccessor with it. With `rotate`, `omnigent.rotate_requested`\ncarries the archive revision and the runner types `/clear` into\nthe session's terminal when the current turn ends.\n\nOnly a top-level claude-native / codex-native session may call\nthis: other harnesses have no rotation this fork can complete.",
+        "description": "Record a handover note and optionally request a turn-end rotation.\n\nThe note is a persisted assistant message whose id is stored in\n`omnigent.handover_item`, so the succession engine can open the\nsuccessor with it. With `rotate`, `omnigent.rotate_requested`\ncarries the archive revision and the runner types `/clear` into\nthe session's terminal when the current turn ends.\n\nOnly a top-level session with a supported rotation harness may call\nthis: other harnesses have no rotation this fork can complete.",
         "operationId": "record_session_handover_v1_sessions__session_id__handover_post",
         "parameters": [
           {
@@ -23140,6 +23730,47 @@
           }
         },
         "summary": "Start Session Succession",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/successor": {
+      "post": {
+        "description": "Create or recover one server-configured successor for a Pi session.",
+        "operationId": "create_session_successor_v1_sessions__session_id__successor_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Successor",
         "tags": [
           "sessions"
         ]

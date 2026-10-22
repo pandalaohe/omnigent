@@ -1939,7 +1939,7 @@ async def test_startup_requires_auth_before_host_lookup(startup_http_app, monkey
         ("owner", "claude-native", "offline", 409),
         ("owner", "claude-native", "old", 501),
         ("owner", "claude-native", "unknown", 404),
-        ("owner", "pi-native", "online", 404),
+        ("owner", "devin-native", "online", 404),
         ("owner", "antigravity-native", "online", 404),
         ("owner", "opencode-native", "online", 404),
     ],

@@ -19,6 +19,83 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
+
+ModeContext = Literal["default", "create"]
+
+
+@dataclass(frozen=True)
+class ModeOption:
+    value: str
+    label: str
+    concept: str
+    contexts: frozenset[ModeContext]
+
+    def __post_init__(self) -> None:
+        if not self.value or not self.label or not self.concept:
+            raise ValueError("mode option value, label and concept are required")
+        if not self.contexts or not self.contexts <= {"default", "create"}:
+            raise ValueError("mode option contexts must be default and/or create")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "value": self.value,
+            "label": self.label,
+            "concept": self.concept,
+            "contexts": sorted(self.contexts),
+        }
+
+
+@dataclass(frozen=True)
+class ModeSet:
+    handler: str
+    options: tuple[ModeOption, ...] | Literal["per-model"]
+
+    def __post_init__(self) -> None:
+        if not self.handler or (
+            self.options != "per-model"
+            and (
+                not isinstance(self.options, tuple)
+                or not self.options
+                or any(not isinstance(option, ModeOption) for option in self.options)
+            )
+        ):
+            raise ValueError("mode set needs a handler and options")
+        if self.options != "per-model" and len({option.value for option in self.options}) != len(
+            self.options
+        ):
+            raise ValueError("mode option values must be unique")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "handler": self.handler,
+            "options": (
+                self.options
+                if self.options == "per-model"
+                else [option.as_dict() for option in self.options]
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class SessionModes:
+    permission: ModeSet | None = None
+    speed: ModeSet | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "permission": self.permission.as_dict() if self.permission else None,
+            "speed": self.speed.as_dict() if self.speed else None,
+        }
+
+
+@dataclass(frozen=True)
+class CallingDefaultsSupport:
+    model_options: bool
+    inherits_from: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {"model_options": self.model_options, "inherits_from": self.inherits_from}
 
 
 class IntegrationMode(str, Enum):
@@ -161,8 +238,11 @@ class HarnessCapabilities:
     shell_tool_name: str | None = None
     shell_tool_prompt: str | None = None
     instruction_delivery: InstructionDelivery = InstructionDelivery.UNKNOWN
+    keep_warm_family: str | None = None
+    calling_defaults: CallingDefaultsSupport | None = None
+    session_modes: SessionModes | None = None
 
-    def as_dict(self) -> dict[str, str | bool | None]:
+    def as_dict(self) -> dict[str, object]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
         return {
             "integration_mode": self.integration_mode.value,
@@ -182,4 +262,7 @@ class HarnessCapabilities:
             "shell_tool_name": self.shell_tool_name,
             "shell_tool_prompt": self.shell_tool_prompt,
             "instruction_delivery": self.instruction_delivery.value,
+            "keep_warm_family": self.keep_warm_family,
+            "calling_defaults": self.calling_defaults.as_dict() if self.calling_defaults else None,
+            "session_modes": self.session_modes.as_dict() if self.session_modes else None,
         }

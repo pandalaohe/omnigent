@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
 from omnigent.db.db_models import SqlGlobalInstructionRevision, current_workspace_id
@@ -18,6 +20,7 @@ from omnigent.stores.global_instructions_store import (
     GlobalInstructionRevision,
     GlobalInstructionsStore,
     InstructionLayerKey,
+    InstructionRevisionConflict,
 )
 
 
@@ -104,32 +107,57 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
         scope: str = "shared",
         agent_key: str = "",
         host_id: str = "",
+        expected_revision_id: str | None = None,
+        check_revision: bool = False,
     ) -> GlobalInstructionRevision:
         """Append a revision and return it."""
         key = InstructionLayerKey(scope, agent_key, host_id)
-        # µs, not seconds: back-to-back saves must still order newest-first
-        # without the write having to read the current max back.
-        created_us = now_epoch_us()
-        revision_id = uuid.uuid4().hex
 
         def write(session: Session) -> GlobalInstructionRevision:
+            current = self._current(session, key)
+            current_id = current.id if current else None
+            if check_revision and current_id != expected_revision_id:
+                raise InstructionRevisionConflict(
+                    "Instruction layer changed; read it again before saving"
+                )
+            parent_id = (
+                current_id
+                or "empty:"
+                + uuid.uuid5(
+                    uuid.NAMESPACE_URL, json.dumps([key.scope, key.agent_key, key.host_id])
+                ).hex
+            )
             row = SqlGlobalInstructionRevision(
-                id=revision_id,
+                id=uuid.uuid4().hex,
                 text=text,
-                created_us=created_us,
+                created_us=max(now_epoch_us(), current.created_us + 1 if current else 0),
                 created_by=created_by,
                 scope=key.scope,
                 agent_key=key.agent_key,
                 host_id=key.host_id,
+                parent_revision_id=parent_id,
             )
             session.add(row)
             return _to_entity(row)
 
-        return run_write_transaction(
-            self._session_immediate,
-            "insert_global_instruction_revision",
-            write,
-        )
+        for attempt in range(4):
+            try:
+                return run_write_transaction(
+                    self._session_immediate, "append_global_instruction_revision", write
+                )
+            except IntegrityError as exc:
+                if "uq_instruction_parent" not in str(exc) and (
+                    "global_instruction_revisions.workspace_id, "
+                    "global_instruction_revisions.parent_revision_id"
+                ) not in str(exc):
+                    raise
+                if check_revision:
+                    raise InstructionRevisionConflict(
+                        "Instruction layer changed; read it again before saving"
+                    ) from exc
+                if attempt == 3:
+                    raise
+        raise AssertionError("instruction save retry loop exited unexpectedly")
 
     def list_revisions(
         self,

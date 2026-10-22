@@ -112,7 +112,8 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
-import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { listProjects } from "@/lib/projectsApi";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import {
   Link,
@@ -200,6 +201,7 @@ import type { ArchiveWorktreeMode } from "@/lib/archiveWorktreePreferences";
 import { WorktreeDetailsDialog } from "@/components/WorktreeDetailsDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { ArchiveProjectDialog, restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import {
@@ -218,7 +220,7 @@ import {
   type NewSessionTarget,
 } from "@/lib/newSessionTarget";
 import { isSessionStoppable } from "@/lib/sessionStop";
-import { retrySession } from "@/lib/sessionsApi";
+import { ApiError, retrySession } from "@/lib/sessionsApi";
 import { effectiveWorktree } from "@/lib/types";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
@@ -2345,6 +2347,12 @@ function ConversationList({
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
+  const { data: allProjects = [] } = useQuery({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => listProjects({ includeArchived: true }),
+    staleTime: 30_000,
+  });
+  const archivedProjectCount = allProjects.filter((project) => !!project.archived_at).length;
   const projectOrder = useProjectOrder();
   const saveOrder = useSaveProjectOrder();
   const [draggedProject, setDraggedProject] = useState<string | null>(null);
@@ -4869,6 +4877,16 @@ function ConversationList({
                     )}
                     {!rendersSectionHeader && <NewSectionFallback />}
                   </SortableContext>
+                )}
+                {archivedProjectCount > 0 && (
+                  <Link
+                    to="/settings/archived?tab=projects"
+                    className="mx-2 flex min-h-10 items-center gap-2 rounded-md px-3 text-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+                    data-testid="archived-projects-link"
+                  >
+                    <ArchiveIcon className="size-4" />
+                    Archived projects ({archivedProjectCount})
+                  </Link>
                 )}
                 {/* Browsers keep audio locked until a gesture; the hint clears
                     itself the moment the context unlocks. */}
@@ -8248,6 +8266,12 @@ function ProjectFolderMenuItems({
         <Settings2Icon className="size-3.5" />
         Project settings
       </C.Item>
+      {projectId && (
+        <C.Item data-testid="archive-project" onSelect={actions.openArchive}>
+          <ArchiveIcon className="size-3.5" />
+          Archive project
+        </C.Item>
+      )}
       {layoutContext !== null && (
         <C.Item data-testid="favorite-project" onSelect={toggleFavorite}>
           {isFavorite ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -8299,6 +8323,7 @@ interface ProjectFolderMenuActions {
   };
   openRename: () => void;
   openSettings: () => void;
+  openArchive: () => void;
   openDelete: () => void;
   onMenuOpen: () => void;
   onMenuClose: () => void;
@@ -8315,6 +8340,7 @@ function useProjectFolderMenu(
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -8326,6 +8352,17 @@ function useProjectFolderMenu(
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
   const updateConfig = useUpdateProjectConfig();
+  const queryClient = useQueryClient();
+  const { data: allProjects = [] } = useQuery({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => listProjects({ includeArchived: true }),
+    staleTime: 30_000,
+  });
+  const archivedNameConflict =
+    renameProject.error instanceof ApiError && renameProject.error.code === "project_name_archived";
+  const archivedNameMatch = archivedNameConflict
+    ? allProjects.find((project) => project.archived_at && project.name === renameValue.trim())
+    : undefined;
   // Fetch the full config only while the menu or rename modal is open, so we can
   // merge the icon onto the other stored defaults (host / workspace / agent)
   // without a per-folder request on every sidebar render — and without wiping
@@ -8356,6 +8393,10 @@ function useProjectFolderMenu(
       openSettings: () => {
         menuOpenedDialogRef.current = true;
         setSettingsOpen(true);
+      },
+      openArchive: () => {
+        menuOpenedDialogRef.current = true;
+        setArchiveOpen(true);
       },
       openDelete: () => {
         menuOpenedDialogRef.current = true;
@@ -8537,7 +8578,26 @@ function useProjectFolderMenu(
             )}
             {(renameProject.isError || updateConfig.isError) && (
               <p className="text-ui text-destructive" role="alert">
-                {((renameProject.error ?? updateConfig.error) as Error).message}
+                {archivedNameConflict
+                  ? "An archived project has this name."
+                  : ((renameProject.error ?? updateConfig.error) as Error).message}
+                {archivedNameMatch && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="ml-2"
+                    onClick={() =>
+                      void restoreProjectWithNotice(
+                        archivedNameMatch.id,
+                        archivedNameMatch.name,
+                        queryClient,
+                      ).then(() => setRenameOpen(false))
+                    }
+                  >
+                    Restore project
+                  </Button>
+                )}
               </p>
             )}
             <DialogFooter className="border-t-0 bg-transparent">
@@ -8573,6 +8633,18 @@ function useProjectFolderMenu(
           }}
           projectId={projectId}
           projectName={projectName}
+          onArchive={() => {
+            setSettingsOpen(false);
+            setArchiveOpen(true);
+          }}
+        />
+      )}
+      {projectId && (
+        <ArchiveProjectDialog
+          projectId={projectId}
+          projectName={projectName}
+          open={archiveOpen}
+          onOpenChange={setArchiveOpen}
         />
       )}
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>

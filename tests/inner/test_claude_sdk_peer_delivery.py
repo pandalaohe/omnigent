@@ -266,6 +266,7 @@ async def test_real_sdk_mirror_and_hook_adapter_bind_child_path_after_flush(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import claude_agent_sdk as sdk
+    import httpx
     from claude_agent_sdk._internal.query import Query
     from claude_agent_sdk._internal.transcript_mirror_batcher import TranscriptMirrorBatcher
 
@@ -297,7 +298,8 @@ async def test_real_sdk_mirror_and_hook_adapter_bind_child_path_after_flush(
     await batcher.flush()
     spool = UsageOutbox(tmp_path / "runtime" / "usage-export")
     with sqlite3.connect(spool.path) as db:
-        before = json.loads(db.execute("SELECT payload FROM observations").fetchone()[0])
+        assert db.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+        before = json.loads(db.execute("SELECT payload FROM deferred_measurements").fetchone()[0])
     assert before["physical_transcript_path"] is None
     assert before["physical_session_id"] == "parent"
     assert before["physical_subagent_id"] == "child"
@@ -337,9 +339,32 @@ async def test_real_sdk_mirror_and_hook_adapter_bind_child_path_after_flush(
     )
     assert json.loads(transport.write.await_args.args[0])["response"]["subtype"] == "success"
     with sqlite3.connect(spool.path) as db:
-        after = json.loads(db.execute("SELECT payload FROM observations").fetchone()[0])
+        after = json.loads(db.execute("SELECT payload FROM deferred_measurements").fetchone()[0])
     assert after["physical_transcript_path"] == str(child.resolve())
     assert after["transcript_session_id"] == "observed-child"
+    delivered = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/v1/usage-producers":
+            return httpx.Response(
+                200,
+                json={**body, "host_id": "host", "agent_id": "agent", "parent_session_id": None},
+            )
+        assert request.url.path == "/v1/usage-observations"
+        delivered.append(body["observation"])
+        return httpx.Response(200, json={"event_id": "e" * 32})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="https://omni.test"
+    ) as client:
+        await spool.drain(client)
+    assert len(delivered) == 1
+    assert delivered[0]["physical_transcript_path"] == str(child.resolve())
+    assert delivered[0]["transcript_session_id"] == "observed-child"
+    assert delivered[0].get("admission_id") is None
+    with sqlite3.connect(spool.path) as db:
+        assert db.execute("SELECT count(*) FROM deferred_measurements").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

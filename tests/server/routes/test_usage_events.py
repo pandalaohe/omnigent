@@ -156,7 +156,12 @@ async def test_spool_survives_home_and_session_delete_and_lost_ack(tmp_path: Pat
         ).status_code == 422
 
 
-def _cutover_app(conversations: SqlAlchemyConversationStore, *, owner: str = "alice") -> FastAPI:
+def _cutover_app(
+    conversations: SqlAlchemyConversationStore,
+    *,
+    owner: str = "alice",
+    harness: str = "codex-native",
+) -> FastAPI:
     """The cutover control plane plus a probe standing in for the §3 gates."""
     app = FastAPI()
     app.include_router(
@@ -167,7 +172,7 @@ def _cutover_app(conversations: SqlAlchemyConversationStore, *, owner: str = "al
         ),
         prefix="/v1",
     )
-    resolve = lambda _conv: "codex-native"  # noqa: E731 - test-local resolver
+    resolve = lambda _conv: harness  # noqa: E731 - test-local resolver
 
     @app.post("/probe/{host_id}")
     async def probe(host_id: str, source: str = "web") -> dict[str, object]:
@@ -283,12 +288,14 @@ def _drain_body(**changes: object) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex-native", "pi-native", "pi"])
 async def test_cutover_gate_refuses_a_held_domain_and_records_nothing(
     tmp_path: Path,
+    harness: str,
 ) -> None:
     uri = f"sqlite:///{tmp_path / 'server.db'}"
     conversations = SqlAlchemyConversationStore(uri)
-    app = _cutover_app(conversations)
+    app = _cutover_app(conversations, harness=harness)
     held = "a" * 32
     other = "b" * 32
     async with httpx.AsyncClient(
@@ -298,7 +305,7 @@ async def test_cutover_gate_refuses_a_held_domain_and_records_nothing(
     ) as server:
         created = await server.post(
             "/v1/usage-cutover/holds",
-            json={"host_id": held, "harness": "codex-native", "generation": 1},
+            json={"host_id": held, "harness": harness, "generation": 1},
         )
         assert created.status_code == 200
         refused = await server.post(f"/probe/{held}")
@@ -308,25 +315,25 @@ async def test_cutover_gate_refuses_a_held_domain_and_records_nothing(
         assert control.status_code == 409
         assert control.json()["error"]["code"] == "usage_cutover_hold"
         # A refused turn writes no admission.
-        status = await server.get(f"/v1/usage-cutover/holds/{held}/codex-native")
+        status = await server.get(f"/v1/usage-cutover/holds/{held}/{harness}")
         assert status.json()["open_admissions"] == 0
         # Another domain is unaffected.
         passed = await server.post(f"/probe/{other}")
         assert passed.status_code == 200
-        assert passed.json()["admission_id"]
+        assert bool(passed.json()["admission_id"]) is (harness == "codex-native")
         # Abandoning the hold lifts it.
         from omnigent.usage_export.store import UsageEventStore
 
         pins = UsageEventStore(uri).page("alice")
         abandoned = await server.post(
-            f"/v1/usage-cutover/holds/{held}/codex-native/1/release",
+            f"/v1/usage-cutover/holds/{held}/{harness}/1/release",
             json={
                 "abandon": True,
                 "reason": "clock",
                 "consumer_receipt": {
                     "kind": "abandon",
                     **{key: pins[key] for key in ("owner_scope_id", "feed_id", "feed_epoch")},
-                    "domain": {"host_id": held, "harness": "codex-native"},
+                    "domain": {"host_id": held, "harness": harness},
                     "generation": 1,
                     "producer_receipt_digest": "2" * 64,
                     "acked_through_sequence": None,
@@ -468,16 +475,22 @@ async def test_receipts_route_serves_the_r4_page_shape_and_errors(
 
 
 @pytest.mark.asyncio
-async def test_registration_requires_exact_owner_and_harness(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("actual_harness", "registered_harness"),
+    [("claude-code-native", "claude-native"), ("pi-native", "pi-native"), ("pi", "pi")],
+)
+async def test_registration_requires_exact_owner_and_harness(
+    tmp_path: Path, actual_harness: str, registered_harness: str
+) -> None:
     uri = f"sqlite:///{tmp_path / 'server.db'}"
     store = SqlAlchemyConversationStore(uri)
     conv = store.create_conversation(agent_id="a" * 32, host_id="b" * 32, workspace="/opt/work")
     SqlAlchemyPermissionStore(uri).grant("alice", conv.id, LEVEL_OWNER)
-    app = _app(store, "claude-code-native")
+    app = _app(store, actual_harness)
     registration = {
         "producer_id": uuid.uuid4().hex,
         "session_id": conv.id,
-        "harness": "claude-native",
+        "harness": registered_harness,
     }
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="https://omni.example.test"

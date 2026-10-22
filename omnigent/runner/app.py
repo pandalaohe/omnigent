@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
@@ -4296,6 +4296,16 @@ def create_runner_app(
 
         permission_tier_ack: str | None = None
         try:
+            if harness_name == "pi":
+                from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+
+                # The RPC Pi extension can report idle usage before any web
+                # turn, so bind its session relay before permission bootstrap.
+                await _ensure_comment_relay_started(
+                    session_id,
+                    explicit_bridge_dir=bridge_dir_for_session_id(session_id),
+                    session_labels=init_context.labels,
+                )
             if (
                 harness_name == "pi"
                 and init_context.envelope is not None
@@ -5526,7 +5536,28 @@ def create_runner_app(
                 extra={"session_id": conversation_id},
             )
 
-    async def _run_pending_rotation(conv_id: str) -> None:
+    async def _create_pi_rotation_successor(conv_id: str, snapshot: dict[str, Any]) -> str:
+        """Prepare the source's durable successor and initialize its runner inbox."""
+        runner_id = snapshot.get("runner_id")
+        if not isinstance(runner_id, str) or not runner_id:
+            raise ValueError("Pi rotation source has no runner")
+        created = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/successor", timeout=30.0
+        )
+        created.raise_for_status()
+        payload = created.json()
+        successor_id = payload.get("id") if isinstance(payload, dict) else None
+        if not isinstance(successor_id, str) or not successor_id:
+            raise ValueError("Pi rotation create response has no session id")
+        bound = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(successor_id, safe='')}",
+            json={"runner_id": runner_id},
+            timeout=30.0,
+        )
+        bound.raise_for_status()
+        return successor_id
+
+    async def _run_pending_rotation(conv_id: str, *, require_label: bool = True) -> bool:
         """Type ``/clear`` for a session whose handover asked for rotation.
 
         The server is the source of truth: a session archived (or rotated)
@@ -5549,7 +5580,7 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv_id},
             )
-            return
+            return False
         if resp.status_code != 200:
             _logger.warning(
                 "Pending rotation read of session %s returned %d",
@@ -5557,19 +5588,30 @@ def create_runner_app(
                 resp.status_code,
                 extra={"session_id": conv_id},
             )
-            return
+            return False
         try:
             snapshot = resp.json()
         except ValueError:
-            return
-        if not isinstance(snapshot, dict) or snapshot.get("archived") is True:
-            return
+            return False
+        if not isinstance(snapshot, dict):
+            return False
+        harness = snapshot.get("harness") or _session_harness_name(conv_id)
         labels = snapshot.get("labels")
-        if not isinstance(labels, dict) or not labels.get(ROTATE_REQUESTED_LABEL_KEY):
-            return
-        harness = snapshot.get("harness")
-        if not isinstance(harness, str) or not harness:
-            harness = _session_harness_name(conv_id)
+        completed_pi_source = (
+            harness == "pi"
+            and isinstance(labels, dict)
+            and isinstance(labels.get("omnigent.succeeded_by"), str)
+        )
+        if snapshot.get("parent_session_id"):
+            if not require_label:
+                raise HTTPException(409, "Only a top-level Pi session can rotate")
+            return False
+        if snapshot.get("archived") is True and not completed_pi_source:
+            return False
+        if require_label and (
+            not isinstance(labels, dict) or not labels.get(ROTATE_REQUESTED_LABEL_KEY)
+        ):
+            return False
         try:
             if harness == "claude-native":
                 response = await _handle_claude_native_slash_command(
@@ -5585,6 +5627,28 @@ def create_runner_app(
                     error_code="codex_native_clear_failed",
                     context="codex-native clear",
                 )
+            elif harness == "pi-native":
+                response = await _handle_codex_native_slash_command(
+                    conv_id,
+                    "/new",
+                    error_code="pi_native_new_failed",
+                    context="pi-native new",
+                    terminal_name="pi",
+                )
+            elif harness == "pi":
+                if process_manager is None:
+                    raise RuntimeError("Pi runner has no process manager")
+                successor_id = await _create_pi_rotation_successor(conv_id, snapshot)
+                succession = await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/succession",
+                    json={"target_session_id": successor_id, "allow_empty": True},
+                    timeout=30.0,
+                )
+                succession.raise_for_status()
+                if succession.json().get("status") != "done":
+                    return False
+                await process_manager.release(conv_id)
+                return True
             else:
                 _logger.warning(
                     "Pending rotation: unsupported harness %r for session %s",
@@ -5592,7 +5656,7 @@ def create_runner_app(
                     conv_id,
                     extra={"session_id": conv_id},
                 )
-                return
+                return False
         except Exception:  # noqa: BLE001 - no retry; the label remains for a manual clear.
             _logger.warning(
                 "Pending rotation /clear failed for session %s",
@@ -5600,7 +5664,7 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv_id},
             )
-            return
+            return False
         if response.status_code >= 400:
             _logger.warning(
                 "Pending rotation /clear was refused for session %s (status %d)",
@@ -5608,6 +5672,7 @@ def create_runner_app(
                 response.status_code,
                 extra={"session_id": conv_id},
             )
+        return response.status_code < 400
 
     def _schedule_pending_rotation(session_id: str) -> None:
         """Consume an armed rotation at the session's native idle edge."""
@@ -6157,6 +6222,8 @@ def create_runner_app(
         # was typed, so it must not treat the work as finished.
         if not was_interrupted and not _is_native_harness(conv_id):
             _handle_member_turn_end(conv_id)
+            if error is None and not has_buffered and _session_harness_name(conv_id) == "pi":
+                _schedule_pending_rotation(conv_id)
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
@@ -9464,6 +9531,30 @@ def create_runner_app(
                     extra={"session_id": conversation_id},
                 )
                 return Response(status_code=202)
+        if body_type in ("message", None) and isinstance(body, dict):
+            if "peer_delivery" not in body and _side_chat_text_from_content(
+                body.get("content")
+            ).strip() in {"/clear", "/new"}:
+                pi_harness = _session_harness_name(conversation_id)
+                if pi_harness == "pi-native":
+                    return await _handle_codex_native_slash_command(
+                        conversation_id,
+                        "/new",
+                        error_code="pi_native_new_failed",
+                        context="pi-native new",
+                        terminal_name="pi",
+                    )
+                if pi_harness == "pi":
+                    rotated = await _run_pending_rotation(conversation_id, require_label=False)
+                    if rotated:
+                        return Response(status_code=202)
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "pi_clear_failed",
+                            "detail": "Pi handover has not completed; retry /clear to resume it.",
+                        },
+                    )
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
                 return JSONResponse(

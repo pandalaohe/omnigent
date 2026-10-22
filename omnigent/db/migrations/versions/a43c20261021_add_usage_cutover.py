@@ -1,7 +1,7 @@
 """Add cutover holds, turn admissions, pinned bindings and receipts.
 
 Revision ID: a43c20261021
-Revises: a41c20261021
+Revises: a44c20261021
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from omnigent.db.db_models import Uuid16
 
 revision: str = "a43c20261021"
-down_revision: str | None = "a41c20261021"
+down_revision: str | None = "a44c20261021"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

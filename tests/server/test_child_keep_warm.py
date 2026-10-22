@@ -14,7 +14,7 @@ import asyncio
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -42,7 +42,12 @@ from omnigent.server.child_keep_warm import (
 from omnigent.server.routes._sessions import helpers as helpers_module
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
-from omnigent.server.user_preferences_store import read_keep_warm_settings
+from omnigent.server.session_overrides import AGENT_TEMPLATE_ID_LABEL
+from omnigent.server.user_preferences_store import (
+    AgentKeepWarm,
+    KeepWarmSettings,
+    read_keep_warm_settings,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import Host
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -2354,6 +2359,90 @@ async def test_warm_state_for_labels_falls_back_to_the_harness_family() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("family", "fresh_age", "stale_age"),
+    [("claude", 3599, 3600), ("codex", 1799, 1800)],
+)
+async def test_unlabelled_idle_warm_state_uses_last_real_turn(
+    family: str, fresh_age: int, stale_age: int
+) -> None:
+    now = 1_000_000
+
+    def state(age: int, *, cold_after_s: int | None = None) -> str | None:
+        return warm_state_for_labels(
+            {RUNNING_SINCE_LABEL_KEY: str(now - age)},
+            archived=False,
+            busy=False,
+            now=now,
+            family=family,
+            cold_after_s=cold_after_s,
+        )
+
+    assert state(fresh_age) == "warm"
+    assert state(stale_age) == "cold"
+    assert (
+        warm_state_for_labels(
+            {
+                RUNNING_SINCE_LABEL_KEY: str(now - 7200),
+                "omnigent.last_real_turn_settled": str(now - fresh_age),
+            },
+            archived=False,
+            busy=False,
+            now=now,
+            family=family,
+        )
+        == "warm"
+    )
+    assert state(stale_age, cold_after_s=0) == "warm"
+    assert state(599, cold_after_s=600) == "cold"
+    assert state(600, cold_after_s=600) == "cold"
+    assert (
+        warm_state_for_labels(
+            {RUNNING_SINCE_LABEL_KEY: str(now - 1)},
+            archived=False,
+            busy=False,
+            now=now,
+        )
+        is None
+    )
+    # A keep-warm label remains authoritative even when a later turn is fresh.
+    assert (
+        warm_state_for_labels(
+            {
+                RUNNING_SINCE_LABEL_KEY: str(now - 1),
+                KEEP_WARM_LABEL: _label(s="c", y=family, why="cap", t=now - 7200),
+            },
+            archived=False,
+            busy=False,
+            now=now,
+        )
+        == "cold"
+    )
+    if family == "codex":
+        assert (
+            warm_state_for_labels(
+                {
+                    "omnigent.last_real_turn_settled": str(now - 1),
+                    KEEP_WARM_LABEL: _label(s="w", y="codex", t=now - 100, o=[now - 100, 0]),
+                },
+                archived=False,
+                busy=False,
+                now=now,
+            )
+            == "cold"
+        )
+    assert (
+        warm_state_for_labels(
+            {"omnigent.last_real_turn_settled": str(now - 1)},
+            archived=True,
+            busy=False,
+            now=now,
+            family=family,
+        )
+        is None
+    )
+
+
 async def test_warm_state_from_label_cold_after_zero_never_reads_cold() -> None:
     """cold_after_s == 0: warm for an unlabelled or cold label on both families."""
     now = 1_000_000
@@ -2501,6 +2590,148 @@ async def test_cold_after_for_reads_the_agent_row(harness: _Harness) -> None:
             raise RuntimeError("preferences unavailable")
 
     assert harness.sweeper.cold_after_for(main, _RaisingPrefs()) is None
+
+
+async def test_cold_after_batch_applies_default_and_exception_identity(harness: _Harness) -> None:
+    harness.prefs.keep_warm = {
+        "default": {"coldAfterSeconds": 0},
+        "agents": {
+            "harness:claude-native": {"coldAfterSeconds": 600},
+            _CLAUDE_AGENT: {"coldAfterSeconds": 120},
+            "ca_42": {"coldAfterSeconds": 180},
+        },
+    }
+    default = _main(harness, agent_id=None, harness_override="codex-native")
+    by_harness = _main(harness, agent_id=_CODEX_AGENT)
+    direct = _main(harness)
+    template = _main(harness, labels={AGENT_TEMPLATE_ID_LABEL: "ca_42"})
+    cold_after = harness.sweeper.cold_after_for_many(
+        [default, by_harness, direct, template], harness.prefs
+    )
+    assert cold_after == {
+        default.id: 0,
+        by_harness.id: 600,
+        direct.id: 120,
+        template.id: 180,
+    }
+    assert (
+        warm_state_for_labels(
+            {},
+            archived=False,
+            busy=False,
+            now=harness.now,
+            family="codex",
+            cold_after_s=cold_after[default.id],
+        )
+        == "warm"
+    )
+
+
+async def test_cold_after_batch_keeps_direct_rows_when_harness_read_fails(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from botocore.exceptions import ClientError
+
+    import omnigent.runtime as runtime
+
+    harness.prefs.keep_warm = {
+        "default": {"coldAfterSeconds": 0},
+        "agents": {
+            "harness:claude-native": {"coldAfterSeconds": 600},
+            _CLAUDE_AGENT: {"coldAfterSeconds": 120},
+            "ca_42": {"coldAfterSeconds": 180},
+        },
+    }
+    template = _main(harness, labels={AGENT_TEMPLATE_ID_LABEL: "ca_42"})
+    direct = _main(harness)
+    fallback = _main(harness, agent_id=_CODEX_AGENT, harness_override="")
+    reads: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.runtime._globals._agent_store",
+        SimpleNamespace(
+            get=lambda agent_id: (
+                reads.append(agent_id)
+                or SimpleNamespace(id=agent_id, bundle_location="bundle", operator_authored=False)
+            )
+        ),
+    )
+
+    def failing_load(*_args: Any, **_kwargs: Any) -> None:
+        raise ClientError({"Error": {"Code": "500", "Message": "unavailable"}}, "GetObject")
+
+    monkeypatch.setattr(runtime, "get_agent_cache", lambda: SimpleNamespace(load=failing_load))
+    assert harness.sweeper.cold_after_for_many([template, direct, fallback], harness.prefs) == {
+        template.id: 180,
+        direct.id: 120,
+        fallback.id: 0,
+    }
+    assert reads == [_CODEX_AGENT]
+
+
+async def test_cold_after_batch_shares_bundle_with_distinct_session_harnesses(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.runtime as runtime
+    from omnigent.runtime import workflow
+
+    harness.prefs.keep_warm = {
+        "default": {"coldAfterSeconds": 0},
+        "agents": {
+            "harness:claude-native": {"coldAfterSeconds": 600},
+            "harness:codex-native": {"coldAfterSeconds": 900},
+        },
+    }
+    parent = _parent(harness)
+    base = _child(
+        harness, parent.id, agent_id=_CLAUDE_AGENT, harness_override="", title="researcher:base"
+    )
+    sub = _child(
+        harness,
+        parent.id,
+        agent_id=_CLAUDE_AGENT,
+        harness_override="",
+        sub_agent_name="codex-head",
+        title="researcher:sub",
+    )
+    override = _child(
+        harness,
+        parent.id,
+        agent_id=_CLAUDE_AGENT,
+        harness_override="codex-native",
+        title="researcher:override",
+    )
+    reads: list[str] = []
+    loads: list[str] = []
+    agent = SimpleNamespace(id=_CLAUDE_AGENT, bundle_location="bundle", operator_authored=False)
+    monkeypatch.setattr(
+        "omnigent.runtime._globals._agent_store",
+        SimpleNamespace(get=lambda agent_id: reads.append(agent_id) or agent),
+    )
+    root_executor = SimpleNamespace(config={"harness": "claude-native"}, type="native")
+    sub_executor = SimpleNamespace(config={"harness": "codex-native"}, type="native")
+    loaded = SimpleNamespace(spec=SimpleNamespace(executor=root_executor))
+    monkeypatch.setattr(
+        runtime,
+        "get_agent_cache",
+        lambda: SimpleNamespace(
+            load=lambda agent_id, *_args, **_kwargs: loads.append(agent_id) or loaded
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_find_spec_by_name",
+        lambda _spec, name: (
+            SimpleNamespace(executor=sub_executor) if name == "codex-head" else None
+        ),
+    )
+
+    assert harness.sweeper.cold_after_for_many([base, sub, override], harness.prefs) == {
+        base.id: 600,
+        sub.id: 900,
+        override.id: 900,
+    }
+    assert reads == [_CLAUDE_AGENT]
+    assert loads == [_CLAUDE_AGENT]
 
 
 class _CountingPrefs(_Prefs):
@@ -2881,13 +3112,19 @@ async def test_cold_after_edge_with_a_stop_reason_write_publishes_once(harness: 
 
 
 @pytest.mark.parametrize(
-    ("cold_after", "expected"),
-    [(0, "warm"), (None, "cold")],
-    ids=["never-cold", "platform-rule"],
+    ("source", "cold_after", "expected"),
+    [
+        ("agent", 0, "warm"),
+        ("default", 0, "warm"),
+        ("harness", 0, "warm"),
+        ("template", 0, "warm"),
+        ("agent", None, "cold"),
+    ],
 )
 async def test_expired_warm_label_publishes_the_cold_after_pill(
     harness: _Harness,
     monkeypatch: pytest.MonkeyPatch,
+    source: str,
     cold_after: int | None,
     expected: str,
 ) -> None:
@@ -2899,13 +3136,24 @@ async def test_expired_warm_label_publishes_the_cold_after_pill(
     agent_row: dict[str, Any] = {"main": True, "child": True}
     if cold_after is not None:
         agent_row["coldAfterSeconds"] = cold_after
-    harness.prefs.keep_warm = {"agents": {_CLAUDE_AGENT: agent_row}}
+    if source == "default":
+        harness.prefs.keep_warm = {"default": agent_row, "agents": {}}
+    else:
+        key = {
+            "agent": _CLAUDE_AGENT,
+            "harness": "harness:claude-native",
+            "template": "ca_42",
+        }[source]
+        harness.prefs.keep_warm = {"agents": {key: agent_row}}
     parent = _parent(harness)
     u = harness.now - 20 * 60
     child = _child(
         harness,
         parent.id,
-        labels={KEEP_WARM_LABEL: _warm_label(t=u, w=harness.now - 60)},
+        labels={
+            KEEP_WARM_LABEL: _warm_label(t=u, w=harness.now - 60),
+            **({AGENT_TEMPLATE_ID_LABEL: "ca_42"} if source == "template" else {}),
+        },
         running_since=u,
     )
     published_events: list[tuple[str, dict[str, Any]]] = []
@@ -2997,9 +3245,23 @@ async def test_zero_cold_after_agent_still_pings(harness: _Harness) -> None:
 
 async def test_keep_warm_family_helpers_read_harness_and_label() -> None:
     """The family helpers map supported harnesses and the label's ``y`` stamp."""
+    from omnigent.harness_plugins import capabilities_by_harness
+
+    registry = capabilities_by_harness()
+    for harness_id, family in (
+        ("claude-native", "claude"),
+        ("claude-sdk", "claude"),
+        ("codex-native", "codex"),
+        ("codex", "codex"),
+    ):
+        assert registry[harness_id]["keep_warm_family"] == family
+    assert registry["pi"]["keep_warm_family"] is None
     assert child_keep_warm.keep_warm_family_for_harness("claude-native") == "claude"
     assert child_keep_warm.keep_warm_family_for_harness("claude-sdk") == "claude"
+    assert child_keep_warm.keep_warm_family_for_harness("codex-native") == "codex"
     assert child_keep_warm.keep_warm_family_for_harness("codex") == "codex"
+    assert child_keep_warm.keep_warm_family_for_harness("pi") == "pi"
+    assert child_keep_warm.keep_warm_family_for_harness("pi-native") == "pi"
     assert child_keep_warm.keep_warm_family_for_harness("opencode-native") is None
     assert child_keep_warm.keep_warm_family_for_harness(None) is None
     assert (
@@ -3008,6 +3270,200 @@ async def test_keep_warm_family_helpers_read_harness_and_label() -> None:
     )
     assert child_keep_warm.keep_warm_family_from_labels({KEEP_WARM_LABEL: _label(s="w")}) is None
     assert child_keep_warm.keep_warm_family_from_labels({}) is None
+
+
+async def test_pi_warm_state_requires_cache_capability_and_measured_tokens() -> None:
+    """An unsupported model or a zero-cache call cannot masquerade as warm."""
+    now = 1_800_000_000
+
+    def state(labels: dict[str, str], *, archived: bool = False) -> str | None:
+        return warm_state_for_labels(
+            labels, archived=archived, busy=True, now=now, family="pi", cold_after_s=0
+        )
+
+    assert state({}) is None
+    assert (
+        warm_state_from_label(
+            _label(s="w", w=now + 60),
+            archived=False,
+            harness="pi",
+            busy=False,
+            now=now,
+        )
+        is None
+    )
+    invalid_ttl = '{"ttl":0,"at":1800000000,"read":1,"write":0}'
+    assert state({child_keep_warm.PI_CACHE_LABEL: invalid_ttl}) is None
+    no_cache = child_keep_warm.pi_cache_label(300, now - 1, 0, 0)
+    assert state({child_keep_warm.PI_CACHE_LABEL: no_cache}) == "cold"
+    cached = child_keep_warm.pi_cache_label(300, now - 299, 12, 0)
+    assert state({child_keep_warm.PI_CACHE_LABEL: cached}) == "warm"
+    expired = child_keep_warm.pi_cache_label(300, now - 300, 0, 12)
+    assert state({child_keep_warm.PI_CACHE_LABEL: expired}) == "cold"
+    future = child_keep_warm.pi_cache_label(300, now + 1, 12, 0)
+    assert state({child_keep_warm.PI_CACHE_LABEL: future}) == "cold"
+    assert state({child_keep_warm.PI_CACHE_LABEL: cached}, archived=True) is None
+    assert (
+        warm_state_for_labels(
+            {child_keep_warm.PI_CACHE_LABEL: cached},
+            archived=False,
+            busy=False,
+            now=now,
+            family="claude",
+        )
+        == "cold"
+    )
+
+
+async def test_pi_idle_warming_obeys_owner_switch_and_30_minute_cap(harness: _Harness) -> None:
+    now = harness.now
+    main = _main(harness, harness_override="pi", running_since=now - 1799)
+    child = _child(harness, main.id, harness_override="pi-native", running_since=now - 100)
+
+    def settings(*, main_on: bool, child_on: bool) -> KeepWarmSettings:
+        return KeepWarmSettings(
+            agents={
+                _CLAUDE_AGENT: AgentKeepWarm(
+                    main=main_on, child=child_on, interval_s=None, max_s=7200
+                )
+            },
+            host_offline_archive_s=14400,
+            migrated_from_legacy_at=None,
+            present=True,
+        )
+
+    assert child_keep_warm.pi_cache_warming_allowed(
+        main, settings(main_on=True, child_on=False), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        main, settings(main_on=False, child_on=True), now
+    )
+    assert child_keep_warm.pi_cache_warming_allowed(
+        child, settings(main_on=False, child_on=True), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        child, settings(main_on=True, child_on=False), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        main, KeepWarmSettings({}, 14400, None, True), now
+    )
+    enabled = AgentKeepWarm(True, True, None, 7200)
+    disabled = AgentKeepWarm(False, False, None, 7200)
+    for rows, default, expected in [
+        ({}, enabled, True),
+        ({"harness:pi": enabled}, disabled, True),
+        ({"harness:pi": enabled, _CLAUDE_AGENT: disabled}, enabled, False),
+        ({_CLAUDE_AGENT: enabled, "ca_42": disabled}, enabled, False),
+    ]:
+        selected = replace(main, labels={**main.labels, AGENT_TEMPLATE_ID_LABEL: "ca_42"})
+        assert (
+            child_keep_warm.pi_cache_warming_allowed(
+                selected, KeepWarmSettings(rows, 14400, None, True, default), now
+            )
+            is expected
+        )
+    _set_running_since(harness, main.id, now - 1800)
+    capped = harness.store.get_conversation(main.id)
+    assert capped is not None
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        capped, settings(main_on=True, child_on=True), now
+    )
+    _set_running_since(harness, main.id, now + 1)
+    future = harness.store.get_conversation(main.id)
+    assert future is not None
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        future, settings(main_on=True, child_on=True), now
+    )
+    harness.store.set_labels(child.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    closed = harness.store.get_conversation(child.id)
+    assert closed is not None
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        closed, settings(main_on=True, child_on=True), now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        replace(main, archived=True), settings(main_on=True, child_on=True), now
+    )
+
+
+@pytest.mark.parametrize(
+    ("harness_id", "family", "interval"),
+    [("claude-native", "claude", 3300), ("codex-native", "codex", 1500)],
+)
+async def test_default_only_row_pings_at_family_interval(
+    harness: _Harness, harness_id: str, family: str, interval: int
+) -> None:
+    harness.prefs.keep_warm = {"default": {"main": True, "child": True}, "agents": {}}
+    touched = harness.now - interval - 1
+    main = _main(
+        harness,
+        agent_id=None,
+        harness_override=harness_id,
+        labels={KEEP_WARM_LABEL: _warm_label(t=touched, interval=interval)},
+        running_since=touched,
+    )
+    await _tick(harness)
+    pending = _read_label(harness, main.id)
+    assert pending is not None and pending.a is not None
+    assert harness.forward.pings() == [
+        {
+            "session_id": main.id,
+            "body": {
+                "type": "keep_warm_ping",
+                "attempt_id": pending.a,
+                "family": family,
+                "harness": harness_id,
+            },
+        }
+    ]
+    assert (
+        await harness.sweeper.settle_receipt(main.id, {"attempt_id": pending.a, "outcome": "ok"})
+        is True
+    )
+    settled = _read_label(harness, main.id)
+    assert settled is not None and settled.w == harness.now + interval + _SLACK_S
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("default", True),
+        ("harness", True),
+        ("direct", True),
+        ("template", True),
+        ("disabled-template", False),
+    ],
+)
+async def test_keep_warm_exception_tiers_drive_ping(
+    harness: _Harness, source: str, expected: bool
+) -> None:
+    rows: dict[str, dict[str, bool]] = {}
+    if source in ("harness", "direct", "template", "disabled-template"):
+        rows["harness:claude-native"] = {"main": source == "harness"}
+    if source in ("direct", "template", "disabled-template"):
+        rows[_CLAUDE_AGENT] = {"main": source == "direct"}
+    if source in ("template", "disabled-template"):
+        rows["ca_42"] = {"main": source == "template"}
+    harness.prefs.keep_warm = {
+        "default": {"main": source == "default"},
+        "agents": rows,
+    }
+    touched = harness.now - _CLAUDE_INTERVAL_S - 1
+    main = _main(
+        harness,
+        labels={
+            KEEP_WARM_LABEL: _warm_label(t=touched),
+            **(
+                {AGENT_TEMPLATE_ID_LABEL: "ca_42"}
+                if source in ("template", "disabled-template")
+                else {}
+            ),
+        },
+        running_since=touched,
+    )
+    await _tick(harness)
+    assert (len(harness.forward.pings()) == 1) is expected
+    if expected:
+        assert harness.forward.pings()[0]["session_id"] == main.id
 
 
 async def test_sweeper_stamps_the_family_on_label_writes(harness: _Harness) -> None:

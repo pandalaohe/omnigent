@@ -262,6 +262,34 @@ def test_create_retries_metadata_phase_after_conversation_commit(tmp_path: Path)
         assert session.query(SqlConversationMetadata).filter_by(id=conversation_id).count() == 1
 
 
+def test_bundled_create_retries_metadata_without_reinserting_ap(tmp_path: Path) -> None:
+    """A split metadata retry leaves one bundled session and one agent."""
+    from omnigent.db.db_models import SqlAgent, SqlConversation, SqlConversationMetadata
+
+    metadata_uri = f"sqlite:///{tmp_path / 'metadata.db'}"
+    conversation_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+    store = SqlAlchemyConversationStore(metadata_uri, conversation_uri)
+    retrying_metadata_maker = _RetryOnceMaker(store._session_immediate)
+    store._session_immediate = retrying_metadata_maker
+
+    created = store.create_session_with_agent(
+        agent_id="c" * 32,
+        agent_name="bundled",
+        agent_bundle_location="bundle/one",
+        agent_description=None,
+    )
+
+    assert retrying_metadata_maker.attempts == 2
+    with store._conv_session("test_bundled_retry_ap") as session:
+        assert session.query(SqlConversation).filter_by(id=created.conversation.id).count() == 1
+    with store._session("test_bundled_retry_metadata") as session:
+        assert (
+            session.query(SqlConversationMetadata).filter_by(id=created.conversation.id).count()
+            == 1
+        )
+        assert session.query(SqlAgent).filter_by(id="c" * 32).count() == 1
+
+
 def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> None:
     assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 
@@ -7191,14 +7219,14 @@ def test_fork_seeds_next_position_from_copied_items(
 
 
 def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
-    db_uri: str,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fork retries replay inserts without repeating preparation hooks."""
 
     class RecordingStore(SqlAlchemyConversationStore):
-        def __init__(self, uri: str) -> None:
-            super().__init__(uri)
+        def __init__(self, metadata_uri: str, conversation_uri: str) -> None:
+            super().__init__(metadata_uri, conversation_uri)
             self.decode_calls = 0
             self.encode_calls = 0
 
@@ -7210,7 +7238,10 @@ def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
             self.encode_calls += 1
             return super()._encode_item_data(data_json)
 
-    store = RecordingStore(db_uri)
+    store = RecordingStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'conversations.db'}",
+    )
     source = store.create_conversation()
     store.append(
         source.id,
@@ -7230,12 +7261,12 @@ def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
         "omnigent.stores.conversation_store.sqlalchemy_store.generate_item_id",
         generate_id,
     )
-    retrying_ap_maker = _RetryOnceMaker(store._conv_session_immediate)
-    store._conv_session_immediate = retrying_ap_maker
+    retrying_metadata_maker = _RetryOnceMaker(store._session_immediate)
+    store._session_immediate = retrying_metadata_maker
 
     fork = store.fork_conversation(source.id)
 
-    assert retrying_ap_maker.attempts == 2
+    assert retrying_metadata_maker.attempts == 2
     # Copied payloads reuse the source's stored encoding verbatim (only
     # compaction payloads re-encode, and this source has none), so a retry
     # replays SQL alone: zero decode/encode hook calls on either attempt.

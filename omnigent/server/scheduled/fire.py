@@ -60,11 +60,6 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, Project, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
-from omnigent.sdk_permission_modes import (
-    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
-    CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
-    CODEX_SDK_APPROVAL_MODES,
-)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -75,7 +70,6 @@ from omnigent.server.library_agent_launch import (
     load_library_agent_bundle,
 )
 from omnigent.server.routes._session_create_validation import (
-    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
     resolve_create_calling_stores,
     validate_existing_host_workspace,
     validate_session_agent,
@@ -84,7 +78,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_uploaded_bundle_host_workspace,
 )
 from omnigent.server.schemas import SessionEventInput
-from omnigent.session_default_modes import CODEX_NATIVE_PERMISSION_DEFAULT_ARGS
+from omnigent.session_default_modes import apply_mode, valid_mode
 
 _logger = logging.getLogger(__name__)
 
@@ -1048,14 +1042,25 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     harness = await _permission_mode_harness(deps, task)
     permission_mode = task.permission_mode
     launch_args: list[str] | None = None
-    if (
-        harness == "claude-native"
-        and permission_mode is not None
-        and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
-    ):
-        launch_args = ["--permission-mode", permission_mode]
-    elif harness == "codex-native" and permission_mode in CODEX_NATIVE_PERMISSION_DEFAULT_ARGS:
-        launch_args = list(CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[permission_mode])
+    applied_permission = (
+        apply_mode(harness, "permission", permission_mode)
+        if permission_mode is not None
+        and valid_mode(permission_mode, harness, "permission", "create")
+        else None
+    )
+    if applied_permission is not None:
+        launch_args = list(applied_permission.args) or None
+    applied_speed = (
+        apply_mode(harness, "speed", task.speed)
+        if task.speed is not None and valid_mode(task.speed, harness, "speed", "create")
+        else None
+    )
+    if applied_speed is not None:
+        launch_args = [*(launch_args or []), *applied_speed.args] or None
+    if launch_args:
+        from omnigent.server.routes._sessions.helpers import _validate_terminal_launch_args
+
+        launch_args = _validate_terminal_launch_args(launch_args)
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
@@ -1082,22 +1087,10 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     # the override reload above) so the labels land on the conversation returned
     # to the launch/dispatch caller, not a stale pre-label reload of it.
     labels = await _presentation_labels(deps, task)
-    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
-
-    if task.speed is not None and valid_speed_tier(task.speed, harness):
-        labels[SPEED_TIER_LABEL_KEY] = task.speed
-    if (
-        harness == "claude-sdk"
-        and permission_mode is not None
-        and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
-    ):
-        labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = permission_mode
-    elif (
-        harness == "codex"
-        and permission_mode is not None
-        and permission_mode in CODEX_SDK_APPROVAL_MODES
-    ):
-        labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission_mode
+    if applied_speed is not None:
+        labels.update(applied_speed.labels)
+    if applied_permission is not None:
+        labels.update(applied_permission.labels)
     if labels:
         await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
         conv.labels.update(labels)

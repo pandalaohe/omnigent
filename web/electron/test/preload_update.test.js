@@ -46,6 +46,17 @@ function loadPreload() {
 }
 
 describe("browser action bridge", () => {
+  it("exposes only setting and clear operations for browser login", async () => {
+    const h = loadPreload();
+    await h.desktop.getBrowserLoginSetting();
+    await h.desktop.setBrowserLoginSetting(true);
+    await h.desktop.clearBrowserLogin();
+    assert.deepEqual(h.invokes.slice(-3), [
+      { channel: "omnigent:browser-login-setting:get", args: undefined },
+      { channel: "omnigent:browser-login-setting:set", args: true },
+      { channel: "omnigent:browser-login:clear", args: undefined },
+    ]);
+  });
   it("forwards typed actions to main", async () => {
     const h = loadPreload();
     const params = { ref: 2, text: "hello" };

@@ -14,7 +14,9 @@ e2e suite, gated on the binary being available.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -23,6 +25,99 @@ from fastapi.testclient import TestClient
 
 from omnigent.inner import pi_harness
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+
+
+@pytest.mark.asyncio
+async def test_pi_idle_event_callback_uses_bound_relay_without_active_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+    from omnigent.inner.pi_executor import PiExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = pi_bridge.prepare_bridge_dir("bound-session")
+    forwarded: list[httpx.Request] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
+        return httpx.Response(200, json={"pi_cache_warming_allowed": True})
+
+    async def unused_tool(_name: str, _arguments: dict[str, object]) -> dict[str, object]:
+        return {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server), base_url="http://server"
+    ) as client:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[],
+            tool_executor=unused_tool,
+            loop=asyncio.get_running_loop(),
+            policy_client=client,
+            session_id="bound-session",
+        )
+        try:
+            executor = PiExecutor(pi_path="/usr/bin/pi")
+            adapters: list[ExecutorAdapter] = []
+
+            def capture_adapter(**kwargs: Any) -> ExecutorAdapter:
+                adapter = ExecutorAdapter(**kwargs)
+                adapters.append(adapter)
+                return adapter
+
+            monkeypatch.setattr(pi_harness, "ExecutorAdapter", capture_adapter)
+            monkeypatch.setattr(pi_harness, "_build_pi_executor", lambda: executor)
+            app = pi_harness.create_app()
+            app.state.conversation_id = "bound-session"
+            assert adapters[0]._ensure_executor() is executor
+            assert not adapters[0]._in_flight
+            assert executor._pi_session_event is not None
+            assert await executor._pi_session_event(
+                "bound-session", {"pi_cache_warming_probe": True}
+            ) == {"pi_cache_warming_allowed": True}
+            assert [request.url.path for request in forwarded] == [
+                "/v1/sessions/bound-session/events"
+            ]
+            with pytest.raises(RuntimeError, match="another session"):
+                await executor._pi_session_event("other-session", {"pi_cache_warming_probe": True})
+        finally:
+            relay.close()
+    with pytest.raises(RuntimeError, match="relay unavailable"):
+        assert executor._pi_session_event is not None
+        await executor._pi_session_event("bound-session", {"pi_cache_warming_probe": True})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relay_url", "relay_session", "token"),
+    [
+        ("http://example.invalid:8000", "bound-session", "placeholder"),
+        ("http://127.0.0.1:8000/other", "bound-session", "placeholder"),
+        ("http://127.0.0.1:8000", "other-session", "placeholder"),
+        ("http://127.0.0.1:8000", "bound-session", ""),
+    ],
+)
+async def test_pi_session_usage_rejects_untrusted_relay_advertisement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relay_url: str,
+    relay_session: str,
+    token: str,
+) -> None:
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = pi_bridge.prepare_bridge_dir("bound-session")
+    (bridge_dir / "tool_relay.json").write_text(
+        json.dumps({"url": relay_url, "session_id": relay_session, "token": token}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="relay binding invalid"):
+        await pi_harness._post_pi_session_usage("bound-session", {"context_tokens": 1})
 
 
 @pytest.mark.asyncio

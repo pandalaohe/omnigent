@@ -139,6 +139,8 @@ async def prepare_capture(client: httpx.AsyncClient, session_id: str, harness: s
         "codex-native",
         "claude-sdk",
         "claude-native",
+        "pi",
+        "pi-native",
     }:
         feed_harness = "codex-sdk" if harness == "codex" else harness
         await outbox().prepare(client, session_id, feed_harness)
@@ -147,6 +149,38 @@ async def prepare_capture(client: httpx.AsyncClient, session_id: str, harness: s
         if route is not None:
             response = await client.post("/v1/usage-cutover/route", json=route)
             response.raise_for_status()
+
+
+def register_pi_native_sessions(directory: Path, session_id: str) -> None:
+    if capture_enabled():
+        outbox().register_pi_root(directory, session_id)
+
+
+def capture_pi_rpc_message(session_id: str, message: Mapping[str, Any]) -> None:
+    """Persist one RPC assistant response; RPC mode has no session transcript."""
+    if not capture_enabled() or not session_id or session_id == "__default__":
+        return
+    response_id = message.get("responseId")
+    timestamp = message.get("timestamp")
+    unit_id = (
+        response_id
+        if isinstance(response_id, str) and response_id
+        else f"ts:{timestamp}"
+        if type(timestamp) is int and timestamp >= 0
+        else uuid.uuid4().hex
+    )
+    metering = {
+        "role": message.get("role"),
+        "model": message.get("model"),
+        "responseId": response_id,
+        "usage": message.get("usage"),
+    }
+    outbox().append(
+        session_id,
+        "pi",
+        {"harness_family": "pi", "identity_namespace": "pi/rpc/v1", "thread_kind": "main"},
+        {"type": "message", "id": unit_id, "message": metering},
+    )
 
 
 def capture_codex_home(

@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/select";
 import { AgentMemberTrigger } from "@/components/AgentMemberTrigger";
 import { useNewChatHostId } from "@/hooks/useHosts";
+import { registryHarnessOptions, useAgentRegistry } from "@/hooks/useAgentRegistry";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
@@ -322,7 +323,12 @@ export function CreateAgentForm({
 
 function useAgentFormFields() {
   const brainHarnessLabels = useBrainHarnessLabels();
-  const harnessOptions = Object.entries(brainHarnessLabels).map(([id, label]) => ({ id, label }));
+  const registry = useAgentRegistry();
+  const harnessOptions = registryHarnessOptions(
+    registry.items,
+    brainHarnessLabels,
+    Object.keys(brainHarnessLabels),
+  );
   const hostId = useNewChatHostId();
   const { trackValueChange } = useOmnigentAnalytics();
   const [name, setName] = useState("");

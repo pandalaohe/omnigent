@@ -2,8 +2,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+import type * as AgentLabelsModule from "@/lib/agentLabels";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
-import { readCallingDefaults } from "@/lib/callingDefaults";
+import {
+  callingDefaultHarnesses,
+  callingHarnessLabel,
+  readCallingDefaults,
+} from "@/lib/callingDefaults";
 import { writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   createProject,
@@ -18,6 +23,12 @@ import {
   updateProjectConfig,
 } from "@/lib/projectsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
+
+const harnessCapabilitiesMock = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/agentLabels", async (original) => ({
+  ...(await original<typeof AgentLabelsModule>()),
+  useHarnessCapabilities: harnessCapabilitiesMock,
+}));
 
 vi.mock("@/lib/projectsApi", () => ({
   createProject: vi.fn(),
@@ -202,6 +213,7 @@ function renderDialog(projectId: string | null = "p_1", onOpenChangeSpy?: (open:
 }
 
 beforeEach(() => {
+  harnessCapabilitiesMock.mockReturnValue({});
   getProjectMock.mockReset();
   getCollaborationMock.mockReset();
   getCollaborationMock.mockResolvedValue({ repositories: [], bindings: [], problems: [] });
@@ -1804,6 +1816,99 @@ describe("ProjectSettingsDialog", () => {
     }
   });
 
+  const offeredHarnesses = [...callingDefaultHarnesses(), "pi", "acp", "grok", "jcode"];
+  it.each(offeredHarnesses)(
+    "adds %s with its calling defaults and saves without reselecting a model",
+    async (harness) => {
+      harnessCapabilitiesMock.mockReturnValue(
+        Object.fromEntries(
+          offeredHarnesses.map((id) => [
+            id,
+            { calling_defaults: { model_options: true, inherits_from: null } },
+          ]),
+        ),
+      );
+      listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      const defaults = {
+        model: "shared-model",
+        effort: "high",
+        ...(harness === "codex" || harness === "codex-native"
+          ? { speed: "standard", permission: "read-only" }
+          : {}),
+      };
+      localStorage.setItem(
+        "omnigent:calling-defaults",
+        JSON.stringify({ h1: { [harness]: defaults }, h2: { [harness]: { model: "other-host" } } }),
+      );
+      const rows = [
+        catalogRow("h1", harness, [{ id: "shared-model", displayName: "Shared model" }]),
+      ];
+      listCatalogsMock.mockResolvedValue(rows);
+      syncCatalogsMock.mockResolvedValue(rows);
+      renderDialog();
+      await screen.findByTestId("project-settings-host-detail-h1");
+      fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
+      await pickOption("project-settings-host-other-add-h1", callingHarnessLabel(harness));
+      expect(
+        screen.getByTestId(`project-settings-host-other-model-h1-${harness}`),
+      ).toHaveTextContent("Shared model");
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          calling_defaults: { h1: { harnesses: { [harness]: defaults } } },
+        }),
+      );
+    },
+  );
+
+  it("adds an SDK harness from unsaved native defaults without copying the primary agent model", async () => {
+    harnessCapabilitiesMock.mockReturnValue({
+      codex: { calling_defaults: { model_options: true, inherits_from: "codex-native" } },
+    });
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        agent_id: "ag_claude",
+        model: "opus",
+        calling_defaults: {
+          h1: { harnesses: { "codex-native": { model: "old-model", effort: "high" } } },
+        },
+      },
+    });
+    const rows = [
+      catalogRow("h1", "codex-native", [{ id: "new-model", displayName: "New model" }]),
+    ];
+    listCatalogsMock.mockResolvedValue(rows);
+    syncCatalogsMock.mockResolvedValue(rows);
+    renderDialog();
+    await screen.findByTestId("project-settings-host-detail-h1");
+    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
+    await pickOption("project-settings-host-other-model-h1-codex-native", "New model");
+    await pickOption("project-settings-host-other-add-h1", "Codex SDK");
+    expect(screen.getByTestId("project-settings-host-other-model-h1-codex")).toHaveTextContent(
+      "new-model",
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        model: "opus",
+        calling_defaults: {
+          h1: {
+            harnesses: {
+              "codex-native": { model: "new-model", effort: "high" },
+              codex: { model: "new-model", effort: "high" },
+            },
+          },
+        },
+      }),
+    );
+  });
+
   it("adds and deletes an other-harness model row", async () => {
     availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
     listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
@@ -1953,7 +2058,7 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("copies saved selected fields to all checked targets without sending folders or Agent", async () => {
+  it("copies saved selected fields to applicable targets without sending folders or Agent", async () => {
     const source = {
       id: "p_1",
       name: "Work",
@@ -1992,8 +2097,14 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(copy).not.toHaveAttribute("data-disabled"));
     fireEvent.click(copy);
     expect(await screen.findByTestId("project-settings-copy-panel")).toBeInTheDocument();
-    expect(screen.getByTestId("project-settings-copy-target-p_2")).toBeChecked();
-    expect(screen.getByTestId("project-settings-copy-target-p_3")).toBeChecked();
+    expect(screen.getByTestId("project-settings-copy-summary")).toHaveTextContent(
+      "All 1 applicable projects · 1 skipped",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+    expect(screen.getByRole("dialog", { name: "Apply to which projects" })).toHaveTextContent(
+      "Other",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
     expect(screen.getByTestId("project-settings-copy-field-agent")).not.toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
     await waitFor(() => expect(patchDefaultsMock).toHaveBeenCalledTimes(1));
@@ -2004,11 +2115,7 @@ describe("ProjectSettingsDialog", () => {
       fields: { model: "gpt-6-sol", effort: null, speed: null, permission: "read-only" },
       copy_agent: false,
     });
-    await waitFor(() =>
-      expect(screen.getByTestId("project-settings-copy-results")).toHaveTextContent(
-        "No folder: skipped — no entry folder",
-      ),
-    );
+    expect(patchDefaultsMock).toHaveBeenCalledTimes(1);
   });
 
   it("updates the master four fields while retaining project overrides", async () => {
@@ -2218,6 +2325,15 @@ describe("ProjectSettingsDialog", () => {
     },
   );
 
+  function openCopyPreview() {
+    fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+    return screen.getByRole("dialog", { name: "Apply to which projects" });
+  }
+
+  function closeCopyPreview() {
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+  }
+
   it("previews unavailable fields and reports a target revision conflict", async () => {
     const source = {
       id: "p_1",
@@ -2247,12 +2363,11 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(copy).not.toHaveAttribute("data-disabled"));
     fireEvent.click(copy);
     await screen.findByTestId("project-settings-copy-panel");
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "model unavailable",
-    );
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
+    expect(openCopyPreview()).toHaveTextContent("model unavailable");
+    expect(screen.getByRole("dialog", { name: "Apply to which projects" })).toHaveTextContent(
       "speed unavailable",
     );
+    closeCopyPreview();
     fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-copy-results")).toHaveTextContent(
@@ -2322,15 +2437,10 @@ describe("ProjectSettingsDialog", () => {
     const copy = await openHarnessAction("project-settings-host-copy-h1-codex");
     await waitFor(() => expect(copy).not.toHaveAttribute("data-disabled"));
     fireEvent.click(copy);
-    expect(await screen.findByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "matching harness is unavailable",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
-    await waitFor(() =>
-      expect(screen.getByTestId("project-settings-copy-results")).toHaveTextContent(
-        "Other: skipped — matching harness is unavailable",
-      ),
-    );
+    await screen.findByTestId("project-settings-copy-panel");
+    expect(openCopyPreview()).toHaveTextContent("matching harness is unavailable");
+    closeCopyPreview();
+    expect(screen.getByRole("button", { name: "Apply selected fields" })).toBeDisabled();
     expect(patchDefaultsMock).not.toHaveBeenCalled();
   });
 
@@ -2414,9 +2524,10 @@ describe("ProjectSettingsDialog", () => {
       sourceSet: { effort: "high", speed: "fast" },
       targetSet: { model: "m-fast" },
     });
-    const preview = screen.getByTestId("project-settings-copy-panel");
+    const preview = openCopyPreview();
     expect(preview).toHaveTextContent("Apply: model, effort, permission");
     expect(preview).toHaveTextContent("Skip: speed unavailable");
+    closeCopyPreview();
     fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
     await waitFor(() => expect(patchDefaultsMock).toHaveBeenCalledTimes(1));
     expect(patchDefaultsMock.mock.calls[0][1]).toMatchObject({
@@ -2430,9 +2541,8 @@ describe("ProjectSettingsDialog", () => {
       targetSet: { model: "m-fast" },
     });
     fireEvent.click(screen.getByTestId("project-settings-copy-field-model"));
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "Apply: effort, speed, permission",
-    );
+    expect(openCopyPreview()).toHaveTextContent("Apply: effort, speed, permission");
+    closeCopyPreview();
     fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
     await waitFor(() => expect(patchDefaultsMock).toHaveBeenCalledTimes(1));
     expect(patchDefaultsMock.mock.calls[0][1]).toMatchObject({
@@ -2447,19 +2557,17 @@ describe("ProjectSettingsDialog", () => {
       targetModel: null,
       targetNativeModel: "m-slow",
     });
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "Apply: model, effort, permission",
-    );
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
+    expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, permission");
+    expect(screen.getByRole("dialog", { name: "Apply to which projects" })).toHaveTextContent(
       "Skip: speed unavailable",
     );
+    closeCopyPreview();
   });
 
   it("uses an explicitly copied model for effort and speed", async () => {
     await openModelCopy({ sourceSet: { model: "m-fast", effort: "high", speed: "fast" } });
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "Apply: model, effort, speed, permission",
-    );
+    expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, speed, permission");
+    closeCopyPreview();
   });
 
   it("uses the optional copied Agent when resolving the target legacy model", async () => {
@@ -2471,16 +2579,14 @@ describe("ProjectSettingsDialog", () => {
       sourceSet: { effort: "high", speed: "fast" },
       targetAgent: "ag_other",
     });
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "Apply: model, effort, speed, permission",
-    );
+    expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, speed, permission");
+    closeCopyPreview();
     fireEvent.click(screen.getByTestId("project-settings-copy-field-agent"));
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "Apply: model, effort, permission, Agent",
-    );
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
+    expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, permission, Agent");
+    expect(screen.getByRole("dialog", { name: "Apply to which projects" })).toHaveTextContent(
       "Skip: speed unavailable",
     );
+    closeCopyPreview();
   });
 
   it("treats saved host and harness entries as equal regardless of their order", async () => {
@@ -2549,9 +2655,8 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(copy).not.toHaveAttribute("data-disabled"));
     fireEvent.click(copy);
     await screen.findByTestId("project-settings-copy-panel");
-    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
-      "Apply: model, effort, speed, permission",
-    );
+    expect(openCopyPreview()).toHaveTextContent("Apply: model, effort, speed, permission");
+    closeCopyPreview();
     fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
     await waitFor(() => expect(patchDefaultsMock).toHaveBeenCalledTimes(1));
   });

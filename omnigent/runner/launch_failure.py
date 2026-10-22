@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
@@ -125,6 +125,12 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: claude",
     "usage: codex",
 )
+# Preserve the CLI's rejected option name without echoing its value or surrounding output.
+_REJECTED_OPTION = re.compile(
+    r"\b(?P<reason>unknown option|unrecognized option|unexpected argument):?\s+[\"']?"
+    r"(?P<flag>--[a-z][a-z0-9-]{0,63})(?=$|[=\s\"'.,)])",
+    re.IGNORECASE,
+)
 
 
 # Ordered most-specific first: the root case also reads like a permission /
@@ -210,6 +216,14 @@ def classify_terminal_failure(
     )
     for matcher in _TERMINAL_EXIT_MATCHERS:
         if matcher.predicate(signal):
+            if matcher.name == "rejected_arguments":
+                rejected = _REJECTED_OPTION.search(output or "")
+                if rejected is not None:
+                    detail = f"{rejected['reason'].capitalize()}: {rejected['flag']}."
+                    return replace(
+                        matcher.diagnosis,
+                        cause=f"{matcher.diagnosis.cause} CLI error: {detail}",
+                    )
             return matcher.diagnosis
     return None
 

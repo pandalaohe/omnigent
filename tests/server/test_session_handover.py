@@ -3,7 +3,7 @@
 ``POST /v1/sessions/{id}/handover`` persists the calling session's handover
 as a visible assistant message, points ``omnigent.handover_item`` at it, and
 (with ``rotate``) arms ``omnigent.rotate_requested`` plus a visible notice.
-Only a top-level claude-native / codex-native session may call it.
+Only a top-level session with a supported rotation harness may call it.
 """
 
 from __future__ import annotations
@@ -233,6 +233,31 @@ async def test_handover_non_native_session_refused(
     assert response.status_code == 400, response.text
     assert "not_native" in response.text
     assert _handover_messages(store, session_id) == []
+
+
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize("rotate", [True, False])
+async def test_pi_handover_is_recorded_for_top_level_session(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    harness: str,
+    rotate: bool,
+) -> None:
+    session = store.create_conversation(harness_override=harness)
+
+    response = await client.post(
+        f"/v1/sessions/{session.id}/handover",
+        json={"handover": "Continue with the children.", "rotate": rotate},
+    )
+
+    assert response.status_code == 200, response.text
+    row = store.get_conversation(session.id)
+    assert row is not None
+    assert row.labels[HANDOVER_ITEM_LABEL_KEY] == response.json()["item_id"]
+    if rotate:
+        assert row.labels[ROTATE_REQUESTED_LABEL_KEY] == str(row.archive_revision)
+    else:
+        assert ROTATE_REQUESTED_LABEL_KEY not in row.labels
 
 
 async def test_handover_empty_text_refused(

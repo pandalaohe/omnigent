@@ -2715,6 +2715,43 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
 
 
 @pytest.mark.asyncio
+async def test_pi_bridged_shell_session_identity_is_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.types import AgentSpec
+
+    monkeypatch.delenv("PI_SESSION_ID", raising=False)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    async def session_id(harness: str, conversation_id: str | None) -> str:
+        result = await execute_tool(
+            tool_name="sys_os_shell",
+            arguments=json.dumps({"command": "printf '%s' \"${PI_SESSION_ID-unset}\""}),
+            agent_spec=spec,
+            conversation_id=conversation_id,
+            effective_harness=harness,
+        )
+        parsed = json.loads(result)
+        assert parsed["exit_code"] == 0
+        return parsed["stdout"]
+
+    assert await session_id("pi", "conv_one") == "conv_one"
+    assert await session_id("pi", "conv_two") == "conv_two"
+    assert await session_id("pi", "conv_one") == "conv_one"
+    assert await session_id("pi", None) == "unset"
+    assert await session_id("codex", "conv_one") == "unset"
+
+
+@pytest.mark.asyncio
 async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
@@ -3860,6 +3897,8 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         nonlocal create_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_existing/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent":
             return httpx.Response(
                 200,
@@ -4014,6 +4053,11 @@ async def test_sys_session_send_existing_child_retries_without_rejected_actor(
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_existing_retry/items"
+        ):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_existing":
             return httpx.Response(
                 200,
@@ -4085,6 +4129,8 @@ async def test_sys_session_send_existing_offline_child_relaunches_and_reposts(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         nonlocal liveness_reads
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_child":
             if request.url.params.get("include_liveness") == "true":
                 liveness_reads += 1
@@ -4159,6 +4205,8 @@ async def test_sys_session_send_existing_offline_child_reports_relaunch_refusal(
     retry_posts: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_stuck/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_stuck":
             return httpx.Response(
                 200,
@@ -5359,6 +5407,8 @@ async def test_sys_session_send_by_id_names_child_from_snapshot(
     )
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_by_id_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_by_id_child":
             return httpx.Response(
                 200,
@@ -5539,6 +5589,8 @@ async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         """Serve two sends to the same child and policy checks for drains."""
         nonlocal lookup_count
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if (
             request.method == "GET"
             and request.url.path == f"/v1/sessions/{parent_id}/child_sessions"
@@ -10624,6 +10676,8 @@ async def test_sys_session_send_failed_continuation_receipts_its_dispatch(
     label_patches: list[dict[str, str]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
             return httpx.Response(
                 200,
@@ -10687,6 +10741,8 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
     event_posts: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child/items":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
             # Target IS a direct child of the caller.
             return httpx.Response(

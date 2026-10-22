@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import json
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
@@ -31,6 +32,12 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.errors import ProjectArchiveBusyError
+from omnigent.stores.project_store.sqlalchemy_store import (
+    assert_project_admits,
+    project_archive_batch_is_active,
+    project_archive_op_is_current,
+)
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
@@ -102,6 +109,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
         rrule=row.rrule,
         project_id=row.project_id,
+        paused_by_archive_batch=row.paused_by_archive_batch,
         explicit_null_fields=_decode_explicit_null_fields(row.explicit_null_fields),
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
@@ -202,6 +210,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         def write(session: Session) -> ScheduledTask:
             generation = require_active_account(session, user_id)
+            assert_project_admits(session, project_id)
             agent_column, custom_agent_column = _binding_columns(agent_id)
             row = SqlScheduledTask(
                 account_generation=generation,
@@ -259,6 +268,121 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
+
+    def list_for_project_archive(
+        self, project_id: str, *, owner_user_id: str | None, batch: str | None = None
+    ) -> builtins.list[ScheduledTask]:
+        with self._session("list_project_archive_tasks") as session:
+            stmt = select(SqlScheduledTask).where(
+                SqlScheduledTask.workspace_id == current_workspace_id(),
+                SqlScheduledTask.user_id == owner_user_id,
+            )
+            if batch is None:
+                stmt = stmt.where(
+                    SqlScheduledTask.project_id == project_id,
+                    SqlScheduledTask.state == encode_scheduled_task_state("active"),
+                )
+            else:
+                stmt = stmt.where(SqlScheduledTask.paused_by_archive_batch == batch)
+            return [
+                _to_entity(row)
+                for row in session.scalars(
+                    stmt.order_by(SqlScheduledTask.created_at, SqlScheduledTask.id)
+                )
+            ]
+
+    def pause_for_project_archive(
+        self, task_id: str, project_id: str, batch: str, *, op_id: str | None = None
+    ) -> ScheduledTask | None:
+        def write(session: Session) -> ScheduledTask | None:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), task_id), with_for_update=True
+            )
+            if row is None or row.project_id != project_id:
+                return None
+            if not project_archive_batch_is_active(session, project_id, batch, op_id):
+                if op_id is not None:
+                    raise ProjectArchiveBusyError("superseded")
+                return None
+            if row.state == encode_scheduled_task_state("paused"):
+                return _to_entity(row) if row.paused_by_archive_batch == batch else None
+            if row.state != encode_scheduled_task_state("active"):
+                return None
+            row.state = encode_scheduled_task_state("paused")
+            row.paused_by_archive_batch = batch
+            row.updated_at = now_epoch()
+            session.flush()
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "pause_project_archive_task", write)
+
+    def restore_from_project_archive(
+        self, task_id: str, project_id: str, batch: str, *, op_id: str | None = None
+    ) -> ScheduledTask | None:
+        def write(session: Session) -> ScheduledTask | None:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), task_id), with_for_update=True
+            )
+            if row is None or row.project_id != project_id or row.paused_by_archive_batch != batch:
+                return None
+            if op_id is not None and not project_archive_op_is_current(
+                session, project_id, op_id, batch=batch
+            ):
+                raise ProjectArchiveBusyError("superseded")
+            assert_project_admits(session, project_id)
+            if row.state == encode_scheduled_task_state("paused"):
+                row.state = encode_scheduled_task_state("active")
+                row.updated_at = now_epoch()
+                session.flush()
+            return _to_entity(row) if row.state == encode_scheduled_task_state("active") else None
+
+        return run_write_transaction(
+            self._session_immediate, "restore_project_archive_task", write
+        )
+
+    def clear_project_archive_marker(
+        self,
+        task_id: str,
+        batch: str,
+        *,
+        project_id: str | None = None,
+        op_id: str | None = None,
+    ) -> bool:
+        def write(session: Session) -> bool:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), task_id), with_for_update=True
+            )
+            if row is None or row.paused_by_archive_batch != batch:
+                return False
+            if op_id is not None:
+                if project_id is None:
+                    raise ValueError("project_id is required with archive op_id")
+                if not project_archive_op_is_current(session, project_id, op_id, batch=batch):
+                    raise ProjectArchiveBusyError("superseded")
+            row.paused_by_archive_batch = None
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session_immediate, "clear_project_archive_task", write)
+
+    def reconcile_project_archive_task(
+        self,
+        task_id: str,
+        project_id: str,
+        op_id: str,
+        reconcile: Callable[[ScheduledTask | None], None],
+    ) -> bool:
+        """Apply the current task state to the scheduler under its operation lock."""
+        # This callback has an external side effect, so this transaction must
+        # not use run_write_transaction's automatic replay on serialization errors.
+        with self._session_immediate("reconcile_project_archive_task") as session:
+            if not project_archive_op_is_current(session, project_id, op_id):
+                return False
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), task_id), with_for_update=True
+            )
+            reconcile(_to_entity(row) if row is not None else None)
+            return True
 
     def list_active(self) -> builtins.list[ScheduledTask]:
         """List active scheduled tasks ordered by ``created_at ASC, id ASC``."""
@@ -362,6 +486,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.get(SqlScheduledTask, (current_workspace_id(), scheduled_task_id))
             if row is None:
                 return None
+            target_project_id = row.project_id if project_id is _UNSET else project_id
+            if (project_id is not _UNSET and target_project_id is not None) or state == "active":
+                assert_project_admits(session, target_project_id)
             if state is not None and state != "deleted":
                 require_active_account(session, row.user_id, generation=row.account_generation)
             changed = False
@@ -384,6 +511,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if project_id is not _UNSET and row.project_id != project_id:
                 row.project_id = project_id
+                row.paused_by_archive_batch = None
                 changed = True
             if explicit_null_fields is not _UNSET:
                 encoded_nulls = _encode_explicit_null_fields(explicit_null_fields)
@@ -420,6 +548,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 encoded_state = encode_scheduled_task_state(state)
                 if row.state != encoded_state:
                     row.state = encoded_state
+                    changed = True
+                if row.paused_by_archive_batch is not None:
+                    row.paused_by_archive_batch = None
                     changed = True
             if last_run_at is not None and row.last_run_at != last_run_at:
                 row.last_run_at = last_run_at

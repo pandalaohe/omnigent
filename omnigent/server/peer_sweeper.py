@@ -56,8 +56,8 @@ from omnigent.server.routes.sessions.routes_peer import (
     _PEER_INBOUND_REFUSE,
     _PEER_RELEASED_REASON,
     _first_text_block,
-    _is_codex_native_harness,
     _native_attempt_id,
+    _needs_native_peer_receipt,
     _peer_envelope_msg_id,
     _released_peer_reason,
     effective_owner_id,
@@ -408,7 +408,7 @@ class PeerSweeper:
             attempt_reason = sdk_attempt_reason(
                 secrets.token_hex(16), "wait", released=_released_peer_reason(record.reason)
             )
-        elif _is_codex_native_harness(receiver):
+        elif _needs_native_peer_receipt(receiver):
             prefix = f"{_PEER_RELEASED_REASON}:" if _released_peer_reason(record.reason) else ""
             attempt_reason = f"{prefix}{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
         state, _runner_online = await self._true_state(receiver, receiver=True)
@@ -777,7 +777,7 @@ class PeerSweeper:
                     not native_attempt
                     or (
                         isinstance(match.response_id, str)
-                        and match.response_id.startswith("codex_")
+                        and match.response_id.startswith(("codex_", "pi-consumed-user-"))
                     )
                 )
                 for match in matches
@@ -848,8 +848,8 @@ class PeerSweeper:
                 )
             return
         if native_attempt:
-            # A lost RPC response may mean Codex already accepted the steer.
-            # Only an explicit refusal or native transcript permits settling it.
+            # The terminal may still accept the queued prompt after the
+            # runner reply. Only a native transcript proves acceptance.
             return
         if age_from is not None and now - age_from < _RECONCILE_GRACE_S:
             return

@@ -66,6 +66,8 @@ class _FakeServer:
                 200, json={"peer_id": "peer_1", "ref": "", "receiver": {}, **self.peer_answer}
             )
         target = path.removeprefix("/v1/sessions/").split("/")[0]
+        if request.method == "GET" and path.endswith("/items") and target in self.sessions:
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.method == "POST" and path.endswith("/events"):
             self.child_messages.append(target)
             runs = flows._session_flows.get(_SESSION, {}).values()

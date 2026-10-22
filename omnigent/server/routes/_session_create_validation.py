@@ -21,12 +21,10 @@ from omnigent.calling_defaults import (
     load_master,
     resolve_calling,
 )
-from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.entities.project import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.sdk_permission_modes import CODEX_SDK_APPROVAL_MODES
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.project_placement import (
@@ -39,7 +37,7 @@ from omnigent.server.project_placement import (
     root_on_host,
 )
 from omnigent.server.routes._auth_helpers import require_access
-from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY
+from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, mode_values, valid_mode
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore, host_is_live
@@ -302,6 +300,13 @@ async def resolve_project_session_create(
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if project.archived_at is not None:
+            from omnigent.errors import ProjectArchivedError
+
+            raise ProjectArchivedError(project.id, project.name)
+
+    if parent_project is not None and parent_project.archived_at is not None:
+        parent_project = None
 
     updates: dict[str, Any] = {}
     bindings: Any = []
@@ -455,8 +460,8 @@ async def resolve_project_session_create(
 # ``bypassPermissions`` are launch-only (rejected on a running-session PATCH),
 # but a scheduled task launches a fresh session each fire, so all of them are
 # valid here. Mirrors the frontend's ``CLAUDE_NATIVE_PERMISSION_MODES``.
-CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
-    {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = mode_values(
+    "claude-native", "permission", "create"
 )
 
 
@@ -524,16 +529,7 @@ def validate_permission_mode_harness_support(
     """
     if permission_mode is None or harness is None:
         return
-    modes = (
-        CODEX_SDK_APPROVAL_MODES
-        if harness == "codex"
-        else CODEX_NATIVE_PERMISSION_VALUES
-        if harness == "codex-native"
-        else CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
-        if harness in ("claude-native", "claude-sdk")
-        else frozenset()
-    )
-    if permission_mode not in modes:
+    if not valid_mode(permission_mode, harness, "permission", "create"):
         raise OmnigentError(
             f"permission_mode {permission_mode!r} is not supported for {harness!r} agents",
             code=ErrorCode.INVALID_INPUT,
@@ -553,7 +549,11 @@ def validate_session_permission_mode(permission_mode: str | None) -> str | None:
     """
     if permission_mode is None:
         return None
-    allowed = CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES | CODEX_SDK_APPROVAL_MODES
+    from omnigent.harness_plugins import harness_capabilities
+
+    allowed = frozenset().union(
+        *(mode_values(harness, "permission", "create") for harness in harness_capabilities())
+    ) | {"default"}  # Legacy Codex SDK scheduled value.
     if permission_mode not in allowed:
         raise OmnigentError(
             f"invalid permission_mode: {permission_mode!r} (expected one of {sorted(allowed)})",

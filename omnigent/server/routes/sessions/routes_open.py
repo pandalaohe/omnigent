@@ -760,12 +760,18 @@ def register_open_routes(
     ) -> dict[str, Any]:
         """Open a plain top-level session on a project host."""
         sender = await runner_auth(request, sender_id)
-        if sender.parent_conversation_id is not None:
-            return _problem(
-                "refused",
-                "is_subagent",
-                "Only a top-level session can open another session.",
+        from omnigent.server.session_collab import require_session_action_allowed
+
+        try:
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                sender,
+                conversation_store,
+                permission_store,
+                getattr(app_state, "user_preferences_store", None),
             )
+        except OmnigentError as exc:
+            return _problem("refused", "is_subagent", exc.message)
         request_user_id = _get_user_id(request, auth_provider)
         owner = (
             await asyncio.to_thread(
@@ -788,7 +794,9 @@ def register_open_routes(
         )
         if project is None:
             projects = (
-                await asyncio.to_thread(project_store.list, user_id=owner) if project_store else []
+                await asyncio.to_thread(project_store.list, user_id=owner, archived="include")
+                if project_store
+                else []
             )
             matches = [
                 item for item in projects if item.name.casefold() == body.project.casefold()
@@ -803,6 +811,12 @@ def register_open_routes(
                     [{"id": item.id, "name": item.name} for item in (matches or projects)],
                 )
             project = matches[0]
+        if project.archived_at is not None:
+            return _problem(
+                "refused",
+                "project_archived",
+                f"Project {project.name!r} is archived; unarchive it or choose another project.",
+            )
         bindings = await load_bindings(binding_store, project.id)
         entries = await load_entries(binding_store, project.id)
         roots = host_roots(project, bindings, entries=entries)

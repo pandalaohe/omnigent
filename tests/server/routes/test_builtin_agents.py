@@ -33,6 +33,18 @@ async def test_list_builtin_agents_empty(client: httpx.AsyncClient) -> None:
     assert "has_more" in body
 
 
+async def test_harnesses_expose_all_declared_capabilities_without_changing_picker_rows(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.get("/v1/harnesses")
+    assert response.status_code == 200
+    body = response.json()
+    assert "claude-native" not in {row["id"] for row in body["data"]}
+    assert body["capabilities_by_harness"]["claude-native"]["integration_mode"] == "native-tui"
+    assert body["capabilities_by_harness"]["claude-native"]["native_agent_key"] == "claude"
+    assert body["capabilities_by_harness"]["codex"]["integration_mode"] == "cli-subprocess"
+
+
 async def test_list_builtin_agents_with_limit(client: httpx.AsyncClient) -> None:
     """Limit parameter constrains the result size."""
     resp = await client.get("/v1/agents?limit=1")

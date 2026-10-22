@@ -629,7 +629,7 @@ export async function createSession(
  * the one-click health check so the ops session is an ordinary project session.
  */
 export async function createProjectSession(opts: {
-  projectId: string;
+  projectId?: string | null;
   hostId: string;
   title: string;
 }): Promise<Session> {
@@ -642,7 +642,7 @@ export async function createProjectSession(opts: {
       ...backgroundSessionTitlesRequestHeaders(),
     },
     body: JSON.stringify({
-      project_id: opts.projectId,
+      ...(opts.projectId ? { project_id: opts.projectId } : {}),
       host_id: opts.hostId,
       title: opts.title,
       initial_items: [],
@@ -964,6 +964,7 @@ export async function forkSession(
       reasoningEffort?: string;
       terminalLaunchArgs?: string[];
       permissionTier?: string;
+      permissionMode?: string;
       codexBypassSandbox?: boolean;
     };
     sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
@@ -980,6 +981,7 @@ export async function forkSession(
     reasoning_effort?: string;
     terminal_launch_args?: string[];
     permission_tier?: string;
+    permission_mode?: string;
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
@@ -1007,6 +1009,9 @@ export async function forkSession(
   }
   if (config?.permissionTier !== undefined) {
     body.permission_tier = config.permissionTier;
+  }
+  if (config?.permissionMode !== undefined) {
+    body.permission_mode = config.permissionMode;
   }
   if (config?.terminalLaunchArgs !== undefined) {
     body.terminal_launch_args = config.terminalLaunchArgs;

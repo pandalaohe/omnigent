@@ -184,6 +184,7 @@ class _SubagentWorkEntry:
     host_id: str | None = None
     placement_label: str | None = None
     delivered_result_key: str | None = None
+    prior_result_key: str | None = None
     recovery_result: tuple[str, str | None, str | None] | None = None
     recovery_turn_started: bool = False
     registered_by: str | None = None
@@ -357,6 +358,7 @@ def register_subagent_work(
     registered_by: str | None = None,
     flow_neutral: bool = False,
     recovered: bool = False,
+    prior_result_key: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -391,6 +393,8 @@ def register_subagent_work(
         child already belonged to the flow.
     :param recovered: When ``True``, the entry is rebuilt for a turn the
         mother did not dispatch; see :attr:`_SubagentWorkEntry.recovered`.
+    :param prior_result_key: Last result present before this dispatch's message
+        was posted. Its delayed terminal edge cannot complete this dispatch.
     :returns: The registered work entry.
     """
     parent_session_id = _resolve_succeeded_parent(parent_session_id)
@@ -422,6 +426,7 @@ def register_subagent_work(
         host_id=host_id,
         placement_label=placement_label,
         delivered_result_key=previous_result_key,
+        prior_result_key=prior_result_key,
         registered_by=registered_by,
         recovered=recovered,
     )
@@ -1153,6 +1158,15 @@ def mark_subagent_work_terminal(
             delivered=False,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH,
+        )
+    if result_key is not None and result_key == entry.prior_result_key:
+        # A user-started turn may have ended without delivering to the parent.
+        # Acknowledge its late edge without settling the parent's newer work.
+        return _SubagentDeliveryAck(
+            entry=None,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
     # A retried or delayed terminal edge for an already-delivered result:
     # its key was stored at delivery, so a repeat never re-opens the turn

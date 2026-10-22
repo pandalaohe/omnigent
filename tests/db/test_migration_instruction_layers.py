@@ -95,6 +95,7 @@ def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(db_uri:
             "created_us",
             "id",
         ]
+        run("upgrade", "head")
         store = SqlAlchemyGlobalInstructionsStore(uri)
         revisions = store.list_revisions()
         assert [(r.id, r.text, r.created_us, r.created_by) for r in revisions] == [
@@ -155,6 +156,6 @@ def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(db_uri:
             "ix_global_instruction_revisions_latest"
         }
     finally:
-        run("upgrade", _MIGRATION)
+        run("upgrade", "head")
         engine.dispose()
         clear_engine_cache()

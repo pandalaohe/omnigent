@@ -35,6 +35,9 @@ export interface AvailableAgent {
   // same-named `omnigent run` upload, but lets a newer upload supersede a
   // user-registered template (builtin === false).
   builtin?: boolean;
+  /** Declared harness product identity; absent on older servers. */
+  product_of?: string | null;
+  integration_mode?: string | null;
   // Roster projected from the catalog bundle: lead first, then each sub-agent.
   // Only set on catalog rows from GET /v1/agents; omitted on session-derived
   // agents and on older servers without the field. null means the bundle could
@@ -119,6 +122,8 @@ interface BuiltinAgentWire {
   // True only for server-seeded built-ins (deterministic id). Absent on
   // older servers, where every catalog row degrades to a protected entry.
   builtin?: boolean;
+  product_of?: string | null;
+  integration_mode?: string | null;
   members?: CustomAgentMember[] | null;
   created_at?: number | null;
   updated_at?: number | null;
@@ -166,6 +171,8 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
     // sensitive to absent-vs-undefined. Logic that reads builtin treats
     // undefined as "protected" (same as true), so omission is safe.
     ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
+    ...(a.product_of !== undefined ? { product_of: a.product_of } : {}),
+    ...(a.integration_mode !== undefined ? { integration_mode: a.integration_mode } : {}),
     ...(a.members !== undefined ? { members: a.members } : {}),
     ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
   };
@@ -445,10 +452,10 @@ function mergeAvailableAgents(
 // Catalog-only list backing the placeholder rows. Shared by the hook's
 // catalog query and the merged queryFn (via fetchQuery), so a picker mount
 // issues a single GET /v1/agents for both.
-const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
+export const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
 // The caller's own agents (GET /v1/agents?scope=user); refetch after an install.
 export const USER_AGENTS_QUERY_KEY = ["available-agents-user"] as const;
-const AVAILABLE_AGENTS_STALE_MS = 30_000;
+export const AVAILABLE_AGENTS_STALE_MS = 30_000;
 
 interface UseAvailableAgentsOptions {
   enabled?: boolean;

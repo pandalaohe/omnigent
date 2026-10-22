@@ -83,6 +83,9 @@ _last_liveness_stamp: dict[str, int] = {}
 # current running period. Defined here so this module and the routes package
 # share one string without this module importing the routes package.
 RUNNING_SINCE_LABEL_KEY: str = "omnigent.running_since"
+# Last completed real turn. Unlike conversation.updated_at, metadata edits and
+# keep-warm pings cannot move this clock.
+LAST_REAL_TURN_SETTLED_LABEL_KEY: str = "omnigent.last_real_turn_settled"
 
 
 def configure(
@@ -156,7 +159,9 @@ def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type
     return _executor.submit(ctx.run, _run)
 
 
-def persist_live_status(session_id: str, status: str) -> None:
+def persist_live_status(
+    session_id: str, status: str, *, check_real_turn_settle: bool = False
+) -> None:
     """
     Persist a relay-observed turn status transition.
 
@@ -165,6 +170,8 @@ def persist_live_status(session_id: str, status: str) -> None:
 
     :param session_id: Session/conversation identifier.
     :param status: One of ``idle`` / ``running`` / ``waiting`` / ``failed``.
+    :param check_real_turn_settle: An observed turn-end edge may record a
+        settle stamp when the durable status was running or waiting.
     """
     if _store is None:
         return
@@ -196,7 +203,17 @@ def persist_live_status(session_id: str, status: str) -> None:
         if _last_status.get(session_id) == status:
             _last_status.pop(session_id, None)
 
-    submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+    store = _store
+    settled_at = int(time.time()) if status == "idle" and check_real_turn_settle else None
+
+    def _write() -> None:
+        if settled_at is not None:
+            previous = store.get_conversation(session_id)
+            if previous is not None and previous.live_status in ("running", "waiting"):
+                store.set_labels(session_id, {LAST_REAL_TURN_SETTLED_LABEL_KEY: str(settled_at)})
+        store.set_session_live_status(session_id, status)
+
+    submit("live_status", _write, on_failure=_evict)
 
 
 def persist_running_since(

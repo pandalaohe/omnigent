@@ -4,6 +4,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 
+class InstructionRevisionConflict(ValueError):
+    """The instruction layer changed since the caller read it."""
+
+
 @dataclass(frozen=True)
 class InstructionLayerKey:
     """Identify a shared, product, host, independent or session-role layer."""
@@ -85,6 +89,8 @@ class GlobalInstructionsStore(ABC):
         scope: str = "shared",
         agent_key: str = "",
         host_id: str = "",
+        expected_revision_id: str | None = None,
+        check_revision: bool = False,
     ) -> GlobalInstructionRevision:
         """
         Append a revision and return it.
@@ -92,6 +98,8 @@ class GlobalInstructionsStore(ABC):
         :param text: The full replacement text; empty is a valid save.
         :param created_by: User ID of the saving admin, or ``None`` in
             single-user mode.
+        :param expected_revision_id: Observed revision; ``None`` means unsaved.
+        :param check_revision: Refuse a stale observed revision atomically.
         :returns: The newly created revision.
         """
         ...

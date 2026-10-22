@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import type { RegistryItem } from "@/hooks/useAgentRegistry";
 import {
   AGENT_BADGE_STORAGE_KEY,
   readAgentBadgePreferences,
@@ -17,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   availableLoading: false,
   availablePlaceholder: false,
   availableError: null as Error | null,
+  registryItems: [] as RegistryItem[],
   catalog: [] as CustomAgent[],
   catalogLoading: false,
   catalogError: null as Error | null,
@@ -29,6 +31,18 @@ const mocks = vi.hoisted(() => ({
   updateCustomAgent: vi.fn(),
   buildAgentBundle: vi.fn(),
   queueUserPreferencePatch: vi.fn(),
+}));
+
+vi.mock("@/hooks/useAgentRegistry", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useAgentRegistry: () => ({
+    items: mocks.registryItems,
+    legacyLabels: {},
+    legacyProducts: {},
+    isLoading: false,
+    isError: false,
+    retry: vi.fn(),
+  }),
 }));
 
 vi.mock("@/hooks/useAvailableAgents", () => ({
@@ -227,6 +241,7 @@ beforeEach(() => {
   mocks.availableLoading = false;
   mocks.availablePlaceholder = false;
   mocks.availableError = null;
+  mocks.registryItems = [];
   mocks.catalogLoading = false;
   mocks.catalogError = null;
   mocks.available = [
@@ -398,6 +413,80 @@ describe("AgentsSettings", () => {
       expect(within(builtins!).queryByRole("button", { name: `Pin ${name}` })).toBeNull();
       expect(within(builtins!).queryByRole("button", { name: `Unpin ${name}` })).toBeNull();
     }
+  });
+
+  it("groups declared products by registry section and searches without changing saved pins", () => {
+    const plugin = {
+      ...builtin,
+      id: "ag_plugin_sdk",
+      name: "plugin-sdk-product",
+      display_name: "Plugin SDK",
+      harness: "plugin-sdk",
+      product_of: "plugin-sdk",
+      integration_mode: "sdk-in-process",
+    };
+    mocks.available = [builtinPolly, plugin, builtinClaudeNative];
+    mocks.registryItems = [
+      {
+        key: "harness:plugin-sdk",
+        name: plugin.name,
+        label: plugin.display_name,
+        section: "sdk",
+        harness: "plugin-sdk",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+      {
+        key: "harness:claude-native",
+        name: builtinClaudeNative.name,
+        label: builtinClaudeNative.display_name,
+        section: "native",
+        harness: "claude-native",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+    ];
+    renderSettings();
+    expect(screen.getByRole("heading", { name: "SDK" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Native CLI" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search agents" }), {
+      target: { value: "plugin" },
+    });
+    expect(screen.getByText("Plugin SDK")).toBeInTheDocument();
+    expect(screen.queryByText("Claude Code")).toBeNull();
+    expect(screen.queryByText("Polly")).toBeNull();
+  });
+
+  it("keeps a built-in SDK row in SDK when a library agent has the same name and harness", () => {
+    mocks.available = [{ ...builtin, product_of: "codex", integration_mode: "cli-subprocess" }];
+    mocks.registryItems = [
+      {
+        key: "ca_copy",
+        name: "codex-sdk",
+        label: "Codex SDK · library",
+        section: "yours",
+        harness: "codex",
+        description: null,
+        deployed: true,
+        source: "library",
+      },
+      {
+        key: "harness:codex",
+        name: "codex-sdk",
+        label: "Codex SDK",
+        section: "sdk",
+        harness: "codex",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+    ];
+    renderSettings();
+    expect(
+      within(screen.getByRole("heading", { name: "SDK" }).parentElement!).getByText("Codex SDK"),
+    ).toBeInTheDocument();
   });
 
   it("shows a built-in's roster, lead first, in a read-only dialog", async () => {

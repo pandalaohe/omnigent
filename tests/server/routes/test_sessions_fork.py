@@ -195,6 +195,7 @@ class _ConversationStore:
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        project_admission: str = "reject",
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,
     ) -> Conversation:
@@ -2901,3 +2902,40 @@ def test_cross_agent_fork_to_pi_requires_protocol_and_stamps_tier(
         assert store.fork_calls[0]["extra_labels"]["omnigent.pi.permission_tier"] == "full"
     else:
         assert not store.fork_calls
+
+
+@pytest.mark.parametrize("mode,status", [("review", 201), ("undeclared", 400)])
+def test_plugin_fork_mode_uses_registered_handler(
+    monkeypatch: pytest.MonkeyPatch, mode: str, status: int
+) -> None:
+    from tests._helpers.session_mode_plugin import install_test_mode_plugin
+
+    install_test_mode_plugin(monkeypatch)
+    monkeypatch.setattr(routes_core, "_resolve_harness", lambda *_args, **_kwargs: "test-mode")
+    conv = _make_conversation()
+    store = _ConversationStore(conversations={conv.id: conv})
+    response = TestClient(_build_app(store)).post(
+        f"/v1/sessions/{conv.id}/fork", json={"permission_mode": mode}
+    )
+    assert response.status_code == status, response.text
+    if status == 201:
+        assert store.fork_calls[0]["override_terminal_launch_args"] == ["--review", "review"]
+        assert store.fork_calls[0]["extra_labels"]["plugin.mode"] == "review"
+    else:
+        assert store.fork_calls == []
+
+
+def test_declared_fork_permission_drops_stale_native_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(routes_core, "_resolve_harness", lambda *_args, **_kwargs: "claude-native")
+    conv = _make_conversation()
+    conv.labels["omnigent.claude_native.permission_mode"] = "bypassPermissions"
+    store = _ConversationStore(conversations={conv.id: conv})
+    response = TestClient(_build_app(store)).post(
+        f"/v1/sessions/{conv.id}/fork", json={"permission_mode": "plan"}
+    )
+    assert response.status_code == 201, response.text
+    call = store.fork_calls[0]
+    assert call["override_terminal_launch_args"] == ["--permission-mode", "plan"]
+    assert "omnigent.claude_native.permission_mode" in call["dropped_label_keys"]

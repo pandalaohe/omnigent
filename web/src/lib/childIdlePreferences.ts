@@ -22,6 +22,7 @@ export interface ChildIdlePreferences {
   idleThresholdSeconds: number;
   mergeWindowSeconds: number;
   repeatSeconds: number;
+  freezeDefault: ChildFreezePreferences;
   agents: Record<string, ChildFreezePreferences>;
 }
 
@@ -30,6 +31,7 @@ export const CHILD_IDLE_DEFAULTS: ChildIdlePreferences = {
   idleThresholdSeconds: 3600,
   mergeWindowSeconds: 1800,
   repeatSeconds: 14400,
+  freezeDefault: CHILD_FREEZE_DEFAULTS,
   agents: {},
 };
 
@@ -59,6 +61,12 @@ function normalize(value: unknown): ChildIdlePreferences {
     idleThresholdSeconds: number(raw.idleThresholdSeconds, 3600, 60, 604800),
     mergeWindowSeconds: number(raw.mergeWindowSeconds, 1800, 0, 86400),
     repeatSeconds: repeat === 0 || repeat >= 60 ? repeat : 14400,
+    freezeDefault: {
+      enabled: raw.freezeDefault?.enabled === true,
+      checkIntervalSeconds: number(raw.freezeDefault?.checkIntervalSeconds, 3600, 60, 604800),
+      freezeThresholdSeconds: number(raw.freezeDefault?.freezeThresholdSeconds, 3600, 60, 604800),
+      resumeOnce: raw.freezeDefault?.resumeOnce === true,
+    },
     agents,
   };
 }

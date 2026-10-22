@@ -468,6 +468,10 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # Priority 5l: Policy management — sys_add_policy.
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
+_INSTRUCTION_LAYER_TOOLS = frozenset(
+    {"sys_instruction_layers_read", "sys_instruction_layer_update"}
+)
+_PROJECT_SETTINGS_TOOLS = frozenset({"sys_project_settings_read", "sys_project_settings_update"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
@@ -546,6 +550,8 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _INSTRUCTION_LAYER_TOOLS
+    | _PROJECT_SETTINGS_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
@@ -1031,6 +1037,8 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _INSTRUCTION_LAYER_TOOLS
+    | _PROJECT_SETTINGS_TOOLS
     | _SCHEDULED_TASK_TOOLS
     # The panel tool executes HERE, including on the ``dispatch=None`` path;
     # relaying it upstream would skip the artifacts/open POST.
@@ -1629,7 +1637,10 @@ async def _find_existing_child_session(
                     "message": (
                         "this (agent, title) sub-agent session is archived; "
                         "unarchive it with sys_session_unarchive to continue, "
-                        "or sys_session_close it to free the name."
+                        "or sys_session_close it to free the name. "
+                        "If the session restriction setting prevents recovery, "
+                        "open a new session with a handover; if you are a sub-agent, "
+                        "report this need to your parent in your final output."
                     ),
                 }
             )
@@ -1734,6 +1745,24 @@ async def _record_subagent_receipt(
         )
 
 
+async def _prepare_child_dispatch(
+    server_client: httpx.AsyncClient, child_session_id: str, work_id: str
+) -> tuple[str | None, str | None]:
+    """Read the preceding result before stamping a continued child's new dispatch."""
+    from omnigent.runner import subagent_work
+
+    try:
+        prior_result = await subagent_work._fetch_latest_assistant_item(
+            server_client, child_session_id
+        )
+    except subagent_work._SubagentRecoveryReadError as exc:
+        return None, f"failed to read preceding child result: {exc}"
+    error = await _patch_subagent_label(
+        server_client, child_session_id, subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+    )
+    return prior_result[0] if prior_result is not None else None, error
+
+
 async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
@@ -1742,6 +1771,7 @@ async def _post_child_message_event(
     created_by: str | None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
+    from omnigent.server.session_collab import AGENT_SESSION_HEADER
 
     def _payload(actor: str | None) -> _JsonObject:
         return {
@@ -1756,6 +1786,7 @@ async def _post_child_message_event(
     resp = await server_client.post(
         f"{_session_url(session_id)}/events",
         json=_payload(created_by),
+        headers={AGENT_SESSION_HEADER: "agent"},
         # This message is gated at the recipient's REQUEST phase, which can
         # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
         # ``ask_timeout``. A 30s read budget severed that park → fail-closed
@@ -1773,6 +1804,7 @@ async def _post_child_message_event(
     return await server_client.post(
         f"{_session_url(session_id)}/events",
         json=_payload(None),
+        headers={AGENT_SESSION_HEADER: "agent"},
         timeout=_ASK_GATE_DELIVERY_TIMEOUT,
     )
 
@@ -4089,12 +4121,13 @@ async def _execute_subagent_tool(
     # title/tool/session_name are known here (we set the title above), so
     # even a cold status update carries a display name. Cleaned up when
     # the child session ends.
+    prior_result_key = None
     if not created_child:
         # A new child carries this turn's id in its create body; a continued
         # child keeps its session, so the id is written first. A missing
         # stamp would let the previous turn's receipt mask this turn's result.
-        stamp_error = await _patch_subagent_label(
-            server_client, child_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        prior_result_key, stamp_error = await _prepare_child_dispatch(
+            server_client, child_session_id, work_id
         )
         if stamp_error is not None:
             return f"Error: failed to record sub-agent dispatch: {stamp_error}"
@@ -4117,6 +4150,7 @@ async def _execute_subagent_tool(
         host_id=remote_host,
         placement_label=_placement_label(member_host_name, remote_workspace),
         registered_by="sys_session_send",
+        prior_result_key=prior_result_key,
     )
     if remote_child_bound:
         # A new remote child's ``running`` edge is emitted on its own host's
@@ -4805,8 +4839,8 @@ async def _send_to_existing_session(
             placement_label=child_placement,
         )
     work_id = _subagent_work.new_subagent_work_id()
-    stamp_error = await _patch_subagent_label(
-        server_client, target_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+    prior_result_key, stamp_error = await _prepare_child_dispatch(
+        server_client, target_session_id, work_id
     )
     if stamp_error is not None:
         return f"Error: failed to record sub-agent dispatch: {stamp_error}"
@@ -4829,6 +4863,7 @@ async def _send_to_existing_session(
         host_id=child_host if remote_child else None,
         placement_label=child_placement,
         registered_by="sys_session_send",
+        prior_result_key=prior_result_key,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -6933,6 +6968,99 @@ def _browser_screenshot_output(output: str) -> str:
     )
 
 
+async def _execute_instruction_layer_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Proxy the authenticated settings API without accepting identity arguments."""
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args = json.loads(arguments)
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be an object")
+        if tool_name == "sys_instruction_layer_update":
+            if not {"scope", "text", "expected_revision_id"} <= args.keys():
+                raise ValueError(
+                    "scope, text and expected_revision_id are required; read the layer first"
+                )
+            fields = {"scope", "agent_key", "host_id", "text", "expected_revision_id"}
+            if args.keys() - fields:
+                raise ValueError("unexpected update arguments")
+            response = await server_client.put("/v1/instruction-layers", json=args, timeout=30.0)
+        else:
+            mode = args.pop("mode", None)
+            routes = {
+                "layers": ("", set()),
+                "revisions": ("/revisions", {"scope", "agent_key", "host_id", "limit"}),
+                "preview": (
+                    "/preview",
+                    {"host_id", "agent_key", "session_id", "child", "spawn", "peer"},
+                ),
+            }
+            if mode not in routes:
+                raise ValueError("mode must be layers, revisions or preview")
+            suffix, fields = routes[mode]
+            if args.keys() - fields:
+                raise ValueError("unexpected arguments for read mode")
+            response = await server_client.get(
+                "/v1/instruction-layers" + suffix, params=args, timeout=30.0
+            )
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"server returned {response.status_code}", "details": response.text}
+            )
+        return json.dumps(response.json())
+    except (ValueError, httpx.HTTPError) as exc:
+        return json.dumps({"error": f"{tool_name}: {exc}"})
+
+
+async def _execute_project_settings_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Forward one authenticated project settings request without caller identity fields."""
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args = json.loads(arguments)
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be an object")
+        required = {"project_id"}
+        fields = (
+            {"project_id", "expected_revision", "project", "host"}
+            if tool_name == "sys_project_settings_update"
+            else {"project_id", "host_id", "harness"}
+        )
+        if tool_name == "sys_project_settings_update":
+            required.add("expected_revision")
+            if not isinstance(args.get("expected_revision"), str):
+                raise ValueError("expected_revision must be the revision returned by read")
+        if not required <= args.keys() or args.keys() - fields:
+            raise ValueError("missing required or unexpected project settings arguments")
+        project_id = args.pop("project_id")
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project_id must be a non-empty string")
+        from urllib.parse import quote
+
+        url = f"/v1/projects/{quote(project_id, safe='')}/settings"
+        if tool_name == "sys_project_settings_update":
+            response = await server_client.put(url, json=args, timeout=30.0)
+        else:
+            response = await server_client.get(url, params=args, timeout=30.0)
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"server returned {response.status_code}", "details": response.text}
+            )
+        return json.dumps(response.json())
+    except (ValueError, httpx.HTTPError) as exc:
+        return json.dumps({"error": f"{tool_name}: {exc}"})
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -8925,7 +9053,8 @@ def _archive_error(tool_name: str, resp: httpx.Response, session_id: str) -> str
             {
                 "error": "access_denied",
                 "session_id": session_id,
-                "message": "only the session owner can archive or unarchive it.",
+                "message": _omnigent_error_message(resp)
+                or "only the session owner can archive or unarchive it.",
             }
         )
     detail = _omnigent_error_message(resp)
@@ -9015,6 +9144,8 @@ async def _session_archive_via_rest(
     if not isinstance(raw_target, str) or not raw_target:
         return json.dumps({"error": f"{tool_name} requires a non-empty 'session_id' string"})
     target_id = raw_target
+    from omnigent.server.session_collab import AGENT_SESSION_HEADER
+
     # The PATCH is the owner gate and maps 404/401/403, so no snapshot read is
     # needed. The deferral intent is always recomputed from the caller lineage
     # and always sent: a GET's archived flag could have gone stale before the
@@ -9027,7 +9158,10 @@ async def _session_archive_via_rest(
         patch_body["stop_when_idle"] = True
     try:
         resp = await server_client.patch(
-            f"/v1/sessions/{target_id}", json=patch_body, timeout=30.0
+            f"/v1/sessions/{target_id}",
+            json=patch_body,
+            headers={AGENT_SESSION_HEADER: conversation_id},
+            timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{tool_name} failed: {exc}"})
@@ -9711,6 +9845,7 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
                 filesystem_registry=filesystem_registry,
+                effective_harness=effective_harness,
             )
         elif tool_name in _REST_TOOLS:
             output = await _execute_rest_tool(
@@ -9945,6 +10080,14 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
+            )
+        elif tool_name in _INSTRUCTION_LAYER_TOOLS:
+            output = await _execute_instruction_layer_tool(
+                tool_name, arguments, server_client=server_client
+            )
+        elif tool_name in _PROJECT_SETTINGS_TOOLS:
+            output = await _execute_project_settings_tool(
+                tool_name, arguments, server_client=server_client
             )
         elif tool_name in _POLICY_TOOLS:
             output = await _execute_policy_tool(
@@ -10350,6 +10493,7 @@ async def _execute_os_env_tool(
     runner_workspace: Path | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     resource_registry: SessionResourceRegistry | None = None,
+    effective_harness: str | None = None,
 ) -> str:
     """
     Execute sys_os_* through a runner-local OSEnvironment.
@@ -10446,6 +10590,9 @@ async def _execute_os_env_tool(
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),
                 timeout=cast("int | None", args.get("timeout")),
+                env_overrides=(
+                    {"PI_SESSION_ID": conversation_id} if effective_harness == "pi" else None
+                ),
             )
         else:
             return f"Error: {tool_name} not implemented"

@@ -26,6 +26,7 @@ from omnigent.entities.conversation import Conversation, ConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
 from omnigent.server.routes.sessions import create_sessions_router
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 _SESSION_ID = "conv_test"
 
@@ -201,7 +202,7 @@ def _make_client(store: _RecordingStore, **router_options: Any) -> TestClient:
         )
 
     app.include_router(router)
-    return TestClient(app, raise_server_exceptions=False)
+    return TestClient(app, headers=PERMISSION_TIERS_HEADERS, raise_server_exceptions=False)
 
 
 def _post(body: Any, *, store: _RecordingStore | None = None) -> tuple[Any, _RecordingStore]:

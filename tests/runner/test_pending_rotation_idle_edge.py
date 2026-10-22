@@ -31,8 +31,26 @@ CONV_ID = "conv_rotation_target"
 class _RotationServerClient:
     """Answers session snapshots and label reads for the rotation coroutine."""
 
-    def __init__(self, *, archived: bool = False, rotate_label: str | None = "0") -> None:
+    def __init__(
+        self,
+        *,
+        archived: bool = False,
+        rotate_label: str | None = "0",
+        harness: str = "claude-native",
+        succession_status: str = "done",
+        succession_http_status: int = 200,
+        fail_binding: bool = False,
+        parent_session_id: str | None = None,
+    ) -> None:
         self.archived = archived
+        self.harness = harness
+        self.succession_status = succession_status
+        self.succession_http_status = succession_http_status
+        self.fail_binding = fail_binding
+        self.parent_session_id = parent_session_id
+        self.created: list[dict[str, Any]] = []
+        self.succession: list[dict[str, Any]] = []
+        self.bound: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {}
         if rotate_label is not None:
             self.labels["omnigent.rotate_requested"] = rotate_label
@@ -47,25 +65,47 @@ class _RotationServerClient:
             json={
                 "archived": self.archived,
                 "labels": self.labels,
-                "harness": "claude-native",
+                "harness": self.harness,
+                "agent_id": "ag_rotation",
+                "runner_id": "runner_rotation",
+                "workspace": "/opt/work/sample",
+                "parent_session_id": self.parent_session_id,
             },
         )
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
-        del url, kwargs
+        if url.endswith("/successor"):
+            if not self.created:
+                self.created.append({"id": "conv_pi_next"})
+            return httpx.Response(
+                201,
+                json={"id": "conv_pi_next"},
+                request=httpx.Request("POST", f"http://test{url}"),
+            )
+        if url.endswith("/succession"):
+            self.succession.append(kwargs["json"])
+            return httpx.Response(
+                self.succession_http_status,
+                json={"status": self.succession_status},
+                request=httpx.Request("POST", f"http://test{url}"),
+            )
         return httpx.Response(200, json={})
 
     async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
-        del url, kwargs
-        return httpx.Response(200, json={})
+        self.bound.append(kwargs["json"])
+        return httpx.Response(
+            503 if self.fail_binding else 200,
+            json={},
+            request=httpx.Request("PATCH", f"http://test{url}"),
+        )
 
 
-def _build_app(server_client: _RotationServerClient) -> Any:
+def _build_app(server_client: _RotationServerClient, process_manager: Any = None) -> Any:
     """Build a runner app wired to a claude-native spec and the test server."""
     spec = AgentSpec(
         spec_version=1,
         name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        executor=ExecutorSpec(type="omnigent", config={"harness": server_client.harness}),
     )
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -73,7 +113,7 @@ def _build_app(server_client: _RotationServerClient) -> Any:
         return spec
 
     return create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        process_manager=process_manager or _FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
     )
@@ -218,3 +258,89 @@ async def test_idle_edge_without_pending_rotation_injects_nothing(
         await asyncio.sleep(0.2)
 
     assert injected == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("succession_status", ["done", "pending", "noop"])
+async def test_pi_rpc_turn_end_releases_only_after_succession(succession_status: str) -> None:
+    server = _RotationServerClient(harness="pi", succession_status=succession_status)
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = _build_app(server, manager)
+    async with _runner_client(app, permission_harness="pi") as client:
+        await _seed_session(client)
+        runner_app.record_pending_rotation(CONV_ID)
+        app.state.on_proxy_stream_end(CONV_ID)
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while not server.succession and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+
+    assert len(server.created) == 1
+    assert len(server.bound) == 1
+    assert server.succession == [{"target_session_id": "conv_pi_next", "allow_empty": True}]
+    assert manager.released == ([CONV_ID] if succession_status == "done" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_type", [True, False])
+async def test_pi_rpc_user_clear_rotates_without_handover(explicit_type: bool) -> None:
+    server = _RotationServerClient(harness="pi", rotate_label=None)
+    harness_client = _ScriptedHarnessClient([])
+    manager = _FakeProcessManager(harness_client)
+    app = _build_app(server, manager)
+    async with _runner_client(app, permission_harness="pi") as client:
+        await _seed_session(client)
+        body: dict[str, Any] = {"content": [{"type": "input_text", "text": "/clear"}]}
+        if explicit_type:
+            body["type"] = "message"
+        response = await client.post(f"/v1/sessions/{CONV_ID}/events", json=body)
+
+    assert response.status_code == 202
+    assert not harness_client.posted_bodies
+    assert len(server.created) == 1
+    assert server.succession == [{"target_session_id": "conv_pi_next", "allow_empty": True}]
+    assert manager.released == [CONV_ID]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["binding", "succession", "pending"])
+async def test_pi_rpc_retry_keeps_old_process_and_reuses_successor(failure: str) -> None:
+    server = _RotationServerClient(
+        harness="pi",
+        rotate_label=None,
+        fail_binding=failure == "binding",
+        succession_http_status=409 if failure == "succession" else 200,
+        succession_status="pending" if failure == "pending" else "done",
+    )
+    harness_client = _ScriptedHarnessClient([])
+    manager = _FakeProcessManager(harness_client)
+    app = _build_app(server, manager)
+    message = {"type": "message", "content": [{"type": "input_text", "text": "/clear"}]}
+    async with _runner_client(app, permission_harness="pi") as client:
+        await _seed_session(client)
+        first = await client.post(f"/v1/sessions/{CONV_ID}/events", json=message)
+        assert first.status_code == 503
+        assert manager.released == []
+        assert not harness_client.posted_bodies
+        server.fail_binding = False
+        server.succession_http_status = 200
+        server.succession_status = "done"
+        second = await client.post(f"/v1/sessions/{CONV_ID}/events", json=message)
+    assert second.status_code == 202
+    assert len(server.created) == 1
+    assert manager.released == [CONV_ID]
+    assert all(body["target_session_id"] == "conv_pi_next" for body in server.succession)
+
+
+@pytest.mark.asyncio
+async def test_pi_child_clear_never_creates_a_top_level_successor() -> None:
+    server = _RotationServerClient(harness="pi", rotate_label=None, parent_session_id="mother")
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = _build_app(server, manager)
+    async with _runner_client(app, permission_harness="pi") as client:
+        await _seed_session(client)
+        response = await client.post(
+            f"/v1/sessions/{CONV_ID}/events",
+            json={"type": "message", "content": [{"type": "input_text", "text": "/clear"}]},
+        )
+    assert response.status_code == 409
+    assert not server.created and not server.succession and not manager.released

@@ -15,6 +15,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { registryHarnessOptions, useAgentRegistry } from "@/hooks/useAgentRegistry";
 import { useHosts, useNewChatHostId, type Host } from "@/hooks/useHosts";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import {
@@ -25,22 +26,7 @@ import {
   type CustomAgentDetail,
   type CustomAgentMember,
 } from "@/lib/customAgentsApi";
-import { NATIVE_CODING_AGENTS, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
-
-/**
- * Worker harnesses a non-lead member may name. The server writes the member's
- * `executor.config.harness` verbatim (`omnigent/server/custom_agent_bundles.py`),
- * so this is the worker set the UI offers, not a server restriction: the
- * native CLI rows of the web's native-agent registry (the mirror of the
- * server's `native_agents()`) plus the headless `pi` harness the built-in
- * Polly `pi` sub-agent names (`examples/polly/agents/pi/config.yaml`).
- */
-const SUBAGENT_HARNESS_IDS: readonly string[] = [
-  ...NATIVE_CODING_AGENTS.filter((agent) => agent.harness !== "pi-native").map(
-    (agent) => agent.harness,
-  ),
-  "pi",
-];
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
 /** The spec's agent-name rule (`omnigent/spec/validator.py` `_AGENT_NAME_PATTERN`),
  *  re-stated for role names by `AgentMember.valid_role_name`
@@ -170,13 +156,6 @@ function isVersionConflict(error: unknown): boolean {
   );
 }
 
-function subagentHarnessOptions(labels: Record<string, string>): { id: string; label: string }[] {
-  return SUBAGENT_HARNESS_IDS.map((id) => ({
-    id,
-    label: labels[id] ?? nativeCodingAgentForHarness(id)?.displayName ?? id,
-  }));
-}
-
 /**
  * Editor for a saved Agent's name, description, instructions and member
  * roster. The lead member is the Agent itself, so its row shows the Agent's
@@ -204,11 +183,13 @@ export function AgentEditor({
   const { data: hostList } = useHosts();
   const hosts = useMemo(() => hostList ?? [], [hostList]);
   const brainHarnessLabels = useBrainHarnessLabels();
-  const leadHarnessOptions = Object.entries(brainHarnessLabels).map(([id, label]) => ({
-    id,
-    label,
-  }));
-  const memberHarnessOptions = subagentHarnessOptions(brainHarnessLabels);
+  const registry = useAgentRegistry();
+  const leadHarnessOptions = registryHarnessOptions(
+    registry.items,
+    brainHarnessLabels,
+    Object.keys(brainHarnessLabels),
+  );
+  const memberHarnessOptions = registryHarnessOptions(registry.items, brainHarnessLabels);
   const [name, setName] = useState(agent.name);
   const [description, setDescription] = useState(agent.description ?? "");
   const [instructions, setInstructions] = useState("");

@@ -93,6 +93,26 @@ def test_classifies_auth_failure(output: str) -> None:
     assert diagnosis.remediation is not None
 
 
+@pytest.mark.parametrize(
+    "reported",
+    [
+        "Error: Unknown option: --permission-mode",
+        "error: unrecognized option '--permission-mode=private-value'",
+        "error: unexpected argument '--permission-mode' found",
+    ],
+)
+def test_rejected_option_detail_keeps_flag_without_launch_values(reported: str) -> None:
+    diagnosis = classify_terminal_failure(
+        command="pi",
+        exit_status=1,
+        output="Authorization: Bearer private-token\n" + reported + "\nprivate-value",
+    )
+    assert diagnosis is not None
+    assert "--permission-mode" in diagnosis.cause
+    assert "private-value" not in diagnosis.cause
+    assert "private-token" not in diagnosis.cause
+
+
 def test_classifies_missing_binary_by_exit_code() -> None:
     diagnosis = classify_terminal_failure(command="qwen", exit_status=127, output="")
     assert diagnosis is not None

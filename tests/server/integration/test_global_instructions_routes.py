@@ -7,6 +7,7 @@ response pipeline is exercised.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.harness_plugins import native_agents
+from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -375,6 +377,83 @@ async def test_layer_routes_keep_independent_clear_and_history(
     assert removed_history.json()["data"][0]["text"] == "Host"
 
 
+@pytest.mark.parametrize("scope", ["shared", "agent", "host", "independent", "mother", "child"])
+async def test_instruction_tools_reuse_layer_api_and_revision_guard(
+    auth_client: httpx.AsyncClient, db_uri: str, scope: str
+) -> None:
+    _make_user(db_uri, "admin@example.test", is_admin=True)
+    auth_client.headers.update(_headers("admin@example.test"))
+    HostStore(db_uri).upsert_on_connect(_OWN_HOST, "laptop", "admin@example.test")
+    key = {"scope": scope}
+    if scope in {"agent", "independent"}:
+        key["agent_key"] = "codex"
+    if scope in {"host", "independent"}:
+        key["host_id"] = _OWN_HOST
+
+    async def call(name, args):
+        return json.loads(
+            await execute_tool(
+                tool_name=name, arguments=json.dumps(args), server_client=auth_client
+            )
+        )
+
+    first = await call(
+        "sys_instruction_layer_update",
+        {
+            **key,
+            "text": "First",
+            "expected_revision_id": None,
+        },
+    )
+    assert first["text"] == "First", first
+    assert "over_budget_routes" in first
+    listing = await call("sys_instruction_layers_read", {"mode": "layers"})
+    assert listing["data"][0]["revision_id"] == first["revision_id"]
+    second = await call(
+        "sys_instruction_layer_update",
+        {
+            **key,
+            "text": "Second",
+            "expected_revision_id": first["revision_id"],
+        },
+    )
+    assert second["revision_id"] != first["revision_id"], second
+    for stale in (None, first["revision_id"]):
+        refused = await call(
+            "sys_instruction_layer_update",
+            {
+                **key,
+                "text": "Lost update",
+                "expected_revision_id": stale,
+            },
+        )
+        assert refused["error"] == "server returned 409", refused
+    history = await call("sys_instruction_layers_read", {"mode": "revisions", **key})
+    assert [r["text"] for r in history["data"]] == ["Second", "First"]
+    preview = await call(
+        "sys_instruction_layers_read",
+        {
+            "mode": "preview",
+            "host_id": _OWN_HOST,
+            "agent_key": "codex",
+            "child": scope == "child",
+            "spawn": True,
+        },
+    )
+    assert "Second" in preview["text"], preview
+    _make_user(db_uri, "viewer@example.test", is_admin=False)
+    auth_client.headers.update(_headers("viewer@example.test"))
+    for name, args in (
+        (
+            "sys_instruction_layer_update",
+            {**key, "text": "Forbidden", "expected_revision_id": second["revision_id"]},
+        ),
+        ("sys_instruction_layers_read", {"mode": "revisions", **key}),
+    ):
+        refused = await call(name, args)
+        assert refused["error"] == "server returned 403", refused
+
+
 async def test_layer_scope_and_host_authorization(
     auth_client: httpx.AsyncClient,
     db_uri: str,
@@ -568,3 +647,69 @@ async def test_preview_loads_real_builtin_bundle_and_session_route(
     )
     assert legacy.status_code == 200, legacy.text
     assert legacy.json()["text"] == "Shared marker\n\nHost marker\n\nMother marker"
+
+
+async def test_acp_descriptor_drives_save_preview_size_and_runtime(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.runtime.instruction_layers import agent_key_for_harness
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda: [SimpleNamespace(slug="kilocode", name="Kilo Code")],
+    )
+    _make_user(db_uri, "admin@example.com", is_admin=True)
+    headers = _headers("admin@example.com")
+    auth_client.headers.update(headers)
+    HostStore(db_uri).upsert_on_connect(_OWN_HOST, "laptop", "admin@example.com")
+    text = "x" * 10001
+    saved = await auth_client.put(
+        "/v1/instruction-layers",
+        headers=headers,
+        json={"scope": "agent", "agent_key": "acp:kilocode", "text": text},
+    )
+    assert saved.status_code == 200, saved.text
+    assert any(row["agent_key"] == "acp:kilocode" for row in saved.json()["over_budget_routes"])
+    revision = saved.json()["revision_id"]
+    for expected_revision, succeeds in [(revision, True), (revision, False)]:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_instruction_layer_update",
+                arguments=json.dumps(
+                    {
+                        "scope": "agent",
+                        "agent_key": "acp:kilocode",
+                        "text": text,
+                        "expected_revision_id": expected_revision,
+                    }
+                ),
+                server_client=auth_client,
+            )
+        )
+        if succeeds:
+            assert "revision_id" in result, result
+            assert result["revision_id"] != revision, result
+        else:
+            assert result["error"] == "server returned 409", result
+    listing = (await auth_client.get("/v1/instruction-layers", headers=headers)).json()
+    descriptor = next(a for a in listing["agents"] if a["key"] == "acp:kilocode")
+    assert descriptor["harnesses"] == ["acp:kilocode"]
+    assert descriptor["display_name"] == "Kilo Code"
+    preview = await auth_client.get(
+        "/v1/instruction-layers/preview",
+        headers=headers,
+        params={"host_id": _OWN_HOST, "agent_key": "acp:kilocode"},
+    )
+    assert preview.status_code == 200, preview.text
+    assert text in preview.json()["text"]
+    assert preview.json()["subject"]["harness"] == "acp:kilocode"
+    assert agent_key_for_harness("acp:kilocode") == "acp:kilocode"
+    for key in ["none", "missing", "acp:" + "x" * 65]:
+        rejected = await auth_client.put(
+            "/v1/instruction-layers",
+            headers=headers,
+            json={"scope": "agent", "agent_key": key, "text": "refused"},
+        )
+        assert rejected.status_code == 400, rejected.text

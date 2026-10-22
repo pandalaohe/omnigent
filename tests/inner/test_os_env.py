@@ -162,6 +162,28 @@ def test_build_helper_env_desktop_session_policy(active: bool, explicit: bool) -
 # ---------------------------------------------------------------------------
 
 
+def test_shell_impl_environment_overrides_are_per_command(tmp_path: Path, monkeypatch) -> None:
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    assert shell_path is not None
+    monkeypatch.setenv("PI_SESSION_ID", "unrelated")
+
+    def session_id(value: str | None) -> str:
+        result = _shell_impl(
+            command="printf '%s' \"${PI_SESSION_ID-unset}\"",
+            timeout=10,
+            shell_path=shell_path,
+            cwd=tmp_path,
+            env_overrides={"PI_SESSION_ID": value},
+        )
+        assert result["exit_code"] == 0
+        return result["stdout"]
+
+    assert session_id("conv_one") == "conv_one"
+    assert session_id("conv_two") == "conv_two"
+    assert session_id(None) == "unset"
+    assert os.environ["PI_SESSION_ID"] == "unrelated"
+
+
 def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
     """Timed-out shell commands still return the documented result fields."""
     shell_path = shutil.which("bash") or shutil.which("sh")

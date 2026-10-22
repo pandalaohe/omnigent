@@ -42,7 +42,7 @@ const { createBrowserViewBoundsController } = require("../src/browserViewBounds"
  * also use `openOrNavigate` which embeds the conversationId so we can confirm
  * isolation per-conversation directly.
  */
-function makePartitionCapturingRegistry() {
+function makePartitionCapturingRegistry(options = {}) {
   // capturedPrefs: conversationId -> webPreferences passed at construction time.
   // Because the registry has no "which conversationId am I creating for?" arg
   // to the ctor, we correlate via call order: the Nth call to ctor corresponds
@@ -70,6 +70,7 @@ function makePartitionCapturingRegistry() {
     detachFromHost() {},
     sendToRenderer() {},
     getHostZoomFactor: () => 1,
+    ...options,
   });
 
   return { registry, createdPrefs };
@@ -200,6 +201,93 @@ describe("browserViewRegistry — partition storage placement", () => {
       two.createdPrefs[0].partition,
       "two registries gave the same conversationId one shared partition",
     );
+  });
+});
+
+describe("browserViewRegistry — optional persistent login", () => {
+  it("shares a stable on-disk partition by server origin and isolates different servers", () => {
+    const { persistentAgentPartition } = require("../src/browserViewRegistry");
+    assert.match(persistentAgentPartition("https://one.example"), /^persist:/);
+    assert.equal(
+      persistentAgentPartition("https://one.example"),
+      persistentAgentPartition("https://one.example"),
+    );
+    assert.notEqual(
+      persistentAgentPartition("https://one.example"),
+      persistentAgentPartition("https://two.example"),
+    );
+    const shared = persistentAgentPartition("https://one.example");
+    const one = makePartitionCapturingRegistry({ partitionForView: () => shared });
+    const two = makePartitionCapturingRegistry({ partitionForView: () => shared });
+    one.registry.openOrNavigate("one", "https://example.com/");
+    two.registry.openOrNavigate("two", "https://example.com/");
+    assert.equal(one.createdPrefs[0].partition, two.createdPrefs[0].partition);
+  });
+
+  it("keeps existing entries on their original partition after a toggle", () => {
+    const { persistentAgentPartition } = require("../src/browserViewRegistry");
+    let enabled = false;
+    const shared = persistentAgentPartition("https://one.example");
+    const { registry, createdPrefs } = makePartitionCapturingRegistry({
+      partitionForView: (id, fallback) => (enabled ? shared : fallback()),
+    });
+    registry.openOrNavigate("old", "https://example.com/");
+    enabled = true;
+    registry.openOrNavigate("old", "https://example.com/other");
+    registry.openOrNavigate("new", "https://example.com/");
+    assert.equal(createdPrefs[0].partition.startsWith("persist:"), false);
+    assert.equal(createdPrefs[1].partition, shared);
+    assert.equal(registry.get("old").partition, createdPrefs[0].partition);
+    assert.equal(registry.get("new").partition, shared);
+    const closed = registry.closePartition(shared, "login-cleared");
+    assert.equal(closed.length, 1);
+    assert.equal(registry.get("new"), null);
+    assert.ok(registry.get("old"));
+  });
+
+  it("checks DNS with an existing view's partition after the setting changes", async () => {
+    let enabled = false;
+    const seen = [];
+    const { registry, createdPrefs } = makePartitionCapturingRegistry({
+      partitionForView: (id, fallback) => (enabled ? "persist:shared" : fallback()),
+      resolveHost: async (_hostname, partition) => {
+        seen.push(partition);
+        return ["93.184.216.34"];
+      },
+    });
+    registry.getOrCreate("old");
+    enabled = true;
+    await registry.checkAgentNavigation("old", "https://public.example/");
+    await registry.checkAgentNavigation("new", "https://public.example/");
+    assert.deepEqual(seen, [createdPrefs[0].partition, "persist:shared"]);
+  });
+
+  it("blocks shared view creation while that partition is being cleared", () => {
+    const shared = "persist:shared";
+    let clearing = true;
+    const { registry, createdPrefs } = makePartitionCapturingRegistry({
+      partitionForView: () => shared,
+      isPartitionUnavailable: (partition) => clearing && partition === shared,
+    });
+    assert.equal(registry.getOrCreate("new").ok, false);
+    assert.equal(createdPrefs.length, 0);
+    clearing = false;
+    assert.equal(registry.getOrCreate("new").ok, true);
+  });
+
+  it("invalidates only pending navigation for the cleared partition, including unopened views", () => {
+    let enabled = true;
+    const { registry } = makePartitionCapturingRegistry({
+      partitionForView: (id, fallback) =>
+        enabled && id === "server-a" ? "persist:server-a" : fallback(),
+    });
+    const pendingA = registry.beginAgentNavigation("server-a");
+    const pendingB = registry.beginAgentNavigation("server-b");
+    enabled = false;
+    registry.closePartition("persist:server-a", "login-cleared");
+    assert.equal(pendingA(), false, "an unopened view for the cleared partition must be cancelled");
+    assert.equal(pendingB(), true, "another partition's pending navigation must continue");
+    assert.equal(registry.get("server-a"), null);
   });
 });
 
