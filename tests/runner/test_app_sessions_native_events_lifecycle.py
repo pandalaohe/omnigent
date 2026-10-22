@@ -5948,6 +5948,79 @@ async def test_antigravity_tier_transaction_keeps_confirmed_state_or_blocks(
     )
 
 
+@pytest.mark.parametrize("previous,target", [("auto", "ask"), ("ask", "full"), ("full", "ask")])
+async def test_pi_tier_transaction_settles_ready_after_live_switch(
+    monkeypatch, tmp_path, previous, target
+):
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+    from omnigent.runner.native import orchestration
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        ConfirmedPermissionState,
+    )
+
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path)
+    server_labels = {
+        **ConfirmedPermissionState(previous, 1, "ready").labels("pi-native"),
+        PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+    }
+
+    async def no_terminal(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(orchestration, "_auto_create_pi_terminal", no_terminal)
+
+    async def snapshot(*args, **kwargs):
+        return {"labels": server_labels}
+
+    monkeypatch.setattr("omnigent.runner.app._session_payload_for_host_spawn_check", snapshot)
+    applied = []
+
+    async def apply(session_id, harness, tier):
+        applied.append((session_id, harness, tier))
+        return True
+
+    monkeypatch.setattr(pi_bridge, "apply_pi_permission_tier", apply)
+    app, _ = await _build_app_for_spec(_harness_spec("pi-native"))
+    session_id = "conv_pi_tier_switch"
+    async with _runner_client(
+        app,
+        permission_harness="pi-native",
+        permission_snapshot={"labels": {"omnigent.pi.permission_tier": previous}},
+    ) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "agent_pi"}
+        )
+        assert created.status_code == 201, created.text
+        transaction = {
+            "permission_tier": target,
+            "expected_revision": 1,
+            "transaction_id": "switch-pi-tier",
+        }
+        prepared = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "permission_tier_prepare", **transaction},
+        )
+        assert prepared.status_code == 200, prepared.text
+        assert app.state.permission_tiers.state(session_id).status == "switching"
+        server_labels.clear()
+        server_labels.update(
+            {
+                **ConfirmedPermissionState(target, 2, "ready").labels("pi-native"),
+                PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+            }
+        )
+        committed = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "permission_tier_commit", "revision": 2, **transaction},
+        )
+        assert committed.status_code == 200, committed.text
+        state = app.state.permission_tiers.state(session_id)
+        assert (state.tier, state.revision, state.status) == (target, 2, "ready")
+    assert applied == [(session_id, "pi-native", target)]
+
+
 @pytest.mark.parametrize("requested", ["ask", "auto-relaxed", "auto-strict", "full"])
 async def test_antigravity_legacy_tier_event_requires_transaction_protocol(
     monkeypatch, isolate_antigravity_controls_launch, requested

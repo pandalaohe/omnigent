@@ -71,31 +71,33 @@ describe("permissionModeConcept", () => {
 });
 
 describe("shared Pi and Antigravity tiers", () => {
-  it("offers five Chinese tiers with no client launch flags and excludes full from project defaults", () => {
+  it("offers five English tiers for creation and defaults without client launch flags", () => {
     expect(AGY_NATIVE_DEFAULT_PERMISSION_TIER).toBe("auto");
     expect(
       AGY_NATIVE_PERMISSION_TIERS.map(({ value, label, args }) => [value, label, args]),
     ).toEqual([
-      ["ask", "每次都问", []],
-      ["plan", "只规划", []],
-      ["accept-edits", "自动改文件", []],
-      ["auto", "自动（只拦可怕的事）", []],
-      ["full", "全放开", []],
+      ["ask", "Ask every time", []],
+      ["plan", "Plan", []],
+      ["accept-edits", "Accept edits", []],
+      ["auto", "Auto", []],
+      ["full", "Full access", []],
     ]);
     expect(
       sessionDefaultModeOptions("antigravity-native", "permission").map((row) => row.value),
-    ).toEqual(["ask", "plan", "accept-edits", "auto"]);
+    ).toEqual(["ask", "plan", "accept-edits", "auto", "full"]);
     expect(sessionDefaultModeOptions("pi", "permission").map((row) => row.value)).toEqual([
       "ask",
       "plan",
       "accept-edits",
       "auto",
+      "full",
     ]);
     expect(sessionDefaultModeOptions("pi-native", "permission").map((row) => row.value)).toEqual([
       "ask",
       "plan",
       "accept-edits",
       "auto",
+      "full",
     ]);
     expect(sessionDefaultModeOptions("antigravity-native", "speed")).toEqual([]);
   });

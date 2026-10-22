@@ -15,6 +15,7 @@ def test_builtin_permission_contexts_and_application() -> None:
             "plan",
             "accept-edits",
             "auto",
+            "full",
         }
         assert mode_values(harness, "permission", "create") == {
             "ask",
@@ -23,7 +24,8 @@ def test_builtin_permission_contexts_and_application() -> None:
             "auto",
             "full",
         }
-        assert not valid_mode("full", harness, "permission", "default")
+        assert valid_mode("full", harness, "permission", "default")
+        assert apply_mode(harness, "permission", "full", context="default").tier == "full"
     for harness in ("claude-native", "claude-sdk"):
         assert "default" not in mode_values(harness, "permission", "default")
         assert "default" in mode_values(harness, "permission", "create")
@@ -53,7 +55,7 @@ def test_invalid_context_and_create_only_default_are_rejected() -> None:
     with pytest.raises(ValueError, match="context"):
         mode_values("pi", "permission", "later")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unsupported"):
-        apply_mode("pi", "permission", "full", context="default")
+        apply_mode("pi", "permission", "unknown", context="default")
 
 
 def test_legacy_codex_sdk_default_still_requires_approval() -> None:

@@ -10466,7 +10466,7 @@ def create_runner_app(
             "permission_tier_commit",
             "permission_tier_rollback",
         }:
-            from omnigent.permission_tiers import NON_FULL_TIERS
+            from omnigent.permission_tiers import NON_FULL_TIERS, PERMISSION_TIERS
             from omnigent.server.permission_tiers import read_permission_state
 
             harness = _session_harness_name(conversation_id)
@@ -10477,8 +10477,9 @@ def create_runner_app(
             target = body.get("permission_tier")
             transaction_id = body.get("transaction_id")
             expected_revision = body.get("expected_revision")
+            allowed_tiers = NON_FULL_TIERS if harness == "antigravity-native" else PERMISSION_TIERS
             if (
-                target not in NON_FULL_TIERS
+                target not in allowed_tiers
                 or not isinstance(transaction_id, str)
                 or not transaction_id
                 or type(expected_revision) is not int
@@ -10546,7 +10547,9 @@ def create_runner_app(
                         status_code=409, content={"error": "permission_tier_stale"}
                     )
                 if body_type == "permission_tier_prepare":
-                    if state.status != "ready" or state.tier == "full":
+                    if state.status != "ready" or (
+                        harness == "antigravity-native" and state.tier == "full"
+                    ):
                         return JSONResponse(
                             status_code=409, content={"error": "permission_tier_stale"}
                         )

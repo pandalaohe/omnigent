@@ -4790,7 +4790,7 @@ def register_core_routes(
                 "pi-native",
                 "antigravity-native",
             }:
-                from omnigent.permission_tiers import NON_FULL_TIERS
+                from omnigent.permission_tiers import NON_FULL_TIERS, PERMISSION_TIERS
                 from omnigent.server.permission_tiers import (
                     PERMISSION_CAPABILITY_VALUE,
                     PERMISSION_STATE_LABEL_KEY,
@@ -4808,9 +4808,14 @@ def register_core_routes(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 target = body.permission_mode
-                if (
-                    target not in NON_FULL_TIERS
-                    or conv_for_protocol.labels.get(tier_label_key(effective_harness)) == "full"
+                allowed_tiers = (
+                    NON_FULL_TIERS
+                    if effective_harness == "antigravity-native"
+                    else PERMISSION_TIERS
+                )
+                if target not in allowed_tiers or (
+                    effective_harness == "antigravity-native"
+                    and conv_for_protocol.labels.get(tier_label_key(effective_harness)) == "full"
                 ):
                     raise OmnigentError(
                         "Full permission is create-only",
@@ -4828,7 +4833,7 @@ def register_core_routes(
                     ) from exc
                 if (
                     state.status != "ready"
-                    or state.tier == "full"
+                    or (effective_harness == "antigravity-native" and state.tier == "full")
                     or body.expected_permission_tier_revision != state.revision
                     or raw_state is None
                 ):

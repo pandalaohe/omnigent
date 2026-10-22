@@ -569,7 +569,7 @@ class ProjectArchivedError(OmnigentError):
 
     def __init__(self, project_id: str, project_name: str) -> None:
         super().__init__(
-            f"项目 {project_name} 已归档；先取消归档项目，或换一个项目",
+            f"Project {project_name} is archived. Restore it or choose another project.",
             code=ErrorCode.PROJECT_ARCHIVED,
         )
         self.project_id = project_id
@@ -581,7 +581,7 @@ class ProjectNameArchivedError(OmnigentError):
 
     def __init__(self, project_id: str, project_name: str) -> None:
         super().__init__(
-            f"有一个已归档的同名项目 {project_name}；可先取消归档",
+            f"An archived project named {project_name} exists. Restore it to reuse the name.",
             code=ErrorCode.PROJECT_NAME_ARCHIVED,
         )
         self.project_id = project_id
@@ -591,7 +591,10 @@ class ProjectArchiveBusyError(OmnigentError):
     """An opposite archive operation is still live."""
 
     def __init__(self, op_kind: str) -> None:
-        super().__init__("项目归档操作仍在进行，请稍后重试", code=ErrorCode.PROJECT_ARCHIVE_BUSY)
+        super().__init__(
+            "A project archive operation is still in progress. Try again shortly.",
+            code=ErrorCode.PROJECT_ARCHIVE_BUSY,
+        )
         self.op_kind = op_kind
 
 

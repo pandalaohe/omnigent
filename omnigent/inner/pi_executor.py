@@ -863,8 +863,8 @@ function pollPermissionInbox(pi, ctx) {
       const idle = ctx && typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
       const valid = state && state.status === "switching" &&
         state.revision === payload.expected_revision && idle &&
-        ["ask", "plan", "accept-edits", "auto"].includes(payload.target_tier) &&
-        state.tier !== "full";
+        ["ask", "plan", "accept-edits", "auto", "full"].includes(payload.target_tier) &&
+        (payload.target_tier === "full" || permissionExtensionOrderProven());
       const active = valid ? applyPermissionTools(pi, payload.target_tier) : null;
       try { writePermissionJson("permission_ack.json", {
         id: payload.id, session_id: PERMISSION_SESSION_ID,
@@ -3407,25 +3407,22 @@ class PiExecutor(Executor):
                 )
             extra_args.extend(["--extension", ext_path])
             if permission_bridge_dir is not None:
-                permission_state = read_host_permission_state(
-                    permission_bridge_dir / HOST_PERMISSION_STATE_FILE
-                )
-                if permission_state.tier != "full":
-                    from omnigent.inner.pi_settings import ordered_pi_launch
+                read_host_permission_state(permission_bridge_dir / HOST_PERMISSION_STATE_FILE)
+                from omnigent.inner.pi_settings import ordered_pi_launch
 
-                    launcher, extra_args = ordered_pi_launch(
-                        self._pi_path,
-                        extra_args,
-                        extension=pathlib.Path(ext_path),
-                    )
-                    sandbox_launch = _try_sandbox_pi(
-                        launcher,
-                        self._os_env_spec,
-                        self._cwd,
-                        spawn_env_names=list(env),
-                        resource_executable=self._pi_path,
-                    )
-                    executable = sandbox_launch.launch_path
+                launcher, extra_args = ordered_pi_launch(
+                    self._pi_path,
+                    extra_args,
+                    extension=pathlib.Path(ext_path),
+                )
+                sandbox_launch = _try_sandbox_pi(
+                    launcher,
+                    self._os_env_spec,
+                    self._cwd,
+                    spawn_env_names=list(env),
+                    resource_executable=self._pi_path,
+                )
+                executable = sandbox_launch.launch_path
             # Allowlist the bridged tool names. ``--no-tools`` (set in
             # __init__) disables every tool by default in pi 0.68+;
             # ``--tools`` adds specific names back. Without this pass

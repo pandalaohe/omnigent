@@ -2856,6 +2856,92 @@ def test_full_tier_keeps_policy_gate_without_finish_lease(tmp_path: Path) -> Non
     _run_policy_node_script(_extension_path(), tmp_path, body)
 
 
+def test_live_pi_tier_changes_resume_tools_after_commit(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension policy test")
+    from omnigent.permission_tiers.host import (
+        HostPermissionState,
+        write_host_permission_state,
+    )
+
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState("session-1", "test-host", str(tmp_path), "auto", 1, "ready"),
+    )
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+const extensionPath = process.argv[1];
+const bridgeDir = process.argv[2];
+const inboxDir = path.join(bridgeDir, "inbox");
+const statePath = path.join(bridgeDir, "permission_state.json");
+fs.mkdirSync(inboxDir);
+fs.writeFileSync(path.join(bridgeDir, "config.json"), JSON.stringify({
+  serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir,
+  planVisibleTools: [],
+}));
+process.env.OMNIGENT_PI_NATIVE_CONFIG = path.join(bridgeDir, "config.json");
+process.env.OMNIGENT_PI_PERMISSION_INLINE = extensionPath;
+const handlers = {};
+let pollInbox;
+let activeTools = ["read", "bash"];
+global.setInterval = (fn) => { pollInbox = fn; return { unref() {} }; };
+global.fetch = async () => ({ ok: true, status: 200,
+  json: async () => ({ result: "POLICY_ACTION_ALLOW" }) });
+const pi = {
+  registerCommand() {}, registerTool() {},
+  on(name, fn) { handlers[name] = fn; },
+  getActiveTools() { return activeTools; },
+  setActiveTools(names) { activeTools = names; },
+};
+require(extensionPath)(pi);
+const ctx = {
+  isIdle() { return true; },
+  sessionManager: { getSessionId: () => "pi-session" },
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
+};
+async function switchTier(target, revision) {
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.status = "switching";
+  state.transaction_id = `switch-${revision}`;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  fs.writeFileSync(path.join(inboxDir, `00${revision}-tier.json`), JSON.stringify({
+    id: `switch-${revision}`, type: "permission_tier_change",
+    target_tier: target, expected_revision: revision,
+  }));
+  pollInbox();
+  await new Promise((resolve) => setImmediate(resolve));
+  const ack = JSON.parse(fs.readFileSync(path.join(bridgeDir, "permission_ack.json"), "utf8"));
+  assert.equal(ack.id, `switch-${revision}`);
+  assert.equal(ack.ok, true, JSON.stringify(ack));
+  state.tier = target;
+  state.revision = revision + 1;
+  state.status = "ready";
+  state.transaction_id = null;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  const verdict = await handlers.tool_call(
+    { toolCallId: `call-${revision}`, toolName: "bash", input: { command: "pwd" } }, ctx);
+  assert.ok(!verdict || verdict.block !== true, JSON.stringify(verdict));
+}
+(async () => {
+  await handlers.session_start({}, ctx);
+  await switchTier("ask", 1);
+  await switchTier("full", 2);
+  await switchTier("ask", 3);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(_extension_path()), str(tmp_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_policy_deny_blocks(tmp_path: Path) -> None:
     """A DENY verdict blocks the Pi tool call and surfaces the policy reason."""
     body = r"""

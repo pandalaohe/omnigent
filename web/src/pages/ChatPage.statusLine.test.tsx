@@ -235,12 +235,12 @@ describe("Composer status line (branch + context ring)", () => {
   });
 
   it.each([
-    ["ask", "每次都问", false],
-    ["plan", "只规划", false],
-    ["accept-edits", "自动改文件", false],
-    ["auto", "自动（只拦可怕的事）", false],
-    ["full", "全放开", true],
-  ])("shows Antigravity tier %s with the correct lock", (tier, label, locked) => {
+    ["ask", "Ask every time"],
+    ["plan", "Plan"],
+    ["accept-edits", "Accept edits"],
+    ["auto", "Auto"],
+    ["full", "Full access"],
+  ])("allows switching from Antigravity tier %s", (tier, label) => {
     useSessionMock.mockReturnValue({
       session: {
         id: "conv_test",
@@ -260,12 +260,10 @@ describe("Composer status line (branch + context ring)", () => {
     useChatStore.setState({ sessionHarness: "antigravity-native" });
     renderComposer({ modelPickerKind: "antigravity", showClaudePermissionMode: true });
     const picker = screen.getByRole("button", { name: `Permission mode: ${label}` });
-    if (locked) expect(picker).toBeDisabled();
-    else {
-      expect(picker).toBeEnabled();
-      fireEvent.pointerDown(picker, { button: 0 });
-      expect(screen.queryByRole("menuitemradio", { name: "全放开" })).toBeNull();
-    }
+    expect(picker).toBeEnabled();
+    fireEvent.pointerDown(picker, { button: 0 });
+    expect(screen.getByTestId("composer-permission-option-full")).toBeVisible();
+    expect(screen.getByTestId("composer-permission-option-ask")).toBeVisible();
   });
 
   it("shows a refused Antigravity permission change and keeps the confirmed tier", async () => {
@@ -300,7 +298,7 @@ describe("Composer status line (branch + context ring)", () => {
     );
     expect(await screen.findByText("Runner is busy")).toBeVisible();
     expect(screen.getByTestId("composer-permission-chip")).toHaveAccessibleName(
-      "Permission mode: 每次都问",
+      "Permission mode: Ask every time",
     );
   });
 

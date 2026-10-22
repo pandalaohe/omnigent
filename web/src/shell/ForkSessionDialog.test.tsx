@@ -2027,7 +2027,7 @@ describe("Antigravity fork controls", () => {
   it("sends a chosen tier and filters effort when the model changes", async () => {
     seedAgy("auto-relaxed");
     fireEvent.click(screen.getByTestId("fork-session-config-agy-skip"));
-    fireEvent.click(screen.getByRole("option", { name: "只规划" }));
+    fireEvent.click(screen.getByRole("option", { name: "Plan" }));
     fireEvent.click(screen.getByTestId("fork-session-config-model"));
     fireEvent.click(screen.getByRole("option", { name: "GPT OSS" }));
     fireEvent.click(screen.getByTestId("fork-session-config-effort"));

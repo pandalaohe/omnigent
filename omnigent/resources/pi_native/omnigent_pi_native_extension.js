@@ -890,7 +890,7 @@ async function callOmnigentTool(config, toolName, args, callId) {
 
   const permissionState = readPermissionState(config);
   if (!permissionState || permissionState.status !== "ready") {
-    return { content: [{ type: "text", text: "权限状态待恢复，工具已暂停" }], isError: true };
+    return { content: [{ type: "text", text: "Permission state needs recovery; tools are paused" }], isError: true };
   }
 
   const first = await postMcpToolsCall(config, toolName, args, 1, callId);
@@ -926,7 +926,7 @@ async function callOmnigentTool(config, toolName, args, callId) {
   const current = readPermissionState(config);
   if (!current || current.status !== "ready" ||
       current.revision !== permissionState.revision || current.tier !== permissionState.tier) {
-    return { content: [{ type: "text", text: "权限状态已变化，工具未执行" }], isError: true };
+    return { content: [{ type: "text", text: "Permission state changed; the tool was not executed" }], isError: true };
   }
   const retry = await postMcpToolsCall(config, toolName, args, 2, callId, {
     requestState: initial.requestState,
@@ -2450,8 +2450,8 @@ module.exports = function (pi) {
         const turnActive = idle === null ? agentRunning : !idle;
         const valid = state && state.status === "switching" &&
           state.revision === payload.expected_revision &&
-          PERMISSION_TIERS.has(target) && target !== "full" &&
-          state.tier !== "full" && baselineActiveTools &&
+          PERMISSION_TIERS.has(target) && baselineActiveTools &&
+          (target === "full" || permissionExtensionOrderProven()) &&
           !turnActive;
         const active = valid
           ? activeToolsForTier(pi, config, baselineActiveTools, target)
@@ -2699,7 +2699,7 @@ module.exports = function (pi) {
     }
     const permissionState = readPermissionState(config);
     if (!permissionState || permissionState.status !== "ready") {
-      return { block: true, reason: "权限状态待恢复，工具已暂停" };
+      return { block: true, reason: "Permission state needs recovery; tools are paused" };
     }
     if (!event || typeof event.toolCallId !== "string" || !event.toolCallId ||
         !event.input || typeof event.input !== "object" || Array.isArray(event.input)) {

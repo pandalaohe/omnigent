@@ -236,7 +236,7 @@ export function ComposerPermissionPicker({
               disabled={disabledOptions.includes(option.value)}
               title={
                 disabledOptions.includes(option.value)
-                  ? "Start a new Read Only session to use this mode"
+                  ? `Start a new ${option.label} session to use this mode`
                   : undefined
               }
               className="whitespace-normal break-words"
