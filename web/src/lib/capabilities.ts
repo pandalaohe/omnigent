@@ -76,6 +76,10 @@ export type FeatureValues = Record<string, boolean>;
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
+  /** Accounts-mode Chrome annotation routes are configured on a shared database. */
+  browser_annotations_available?: boolean;
+  /** Signed-in delegated grants can be listed and individually revoked. */
+  connected_apps_available?: boolean;
   /**
    * True only on an explicit single-user local runtime
    * (``OMNIGENT_LOCAL_SINGLE_USER=1``). This is the sole signal that
@@ -319,6 +323,8 @@ function parseBranding(raw: unknown): Branding | null {
 /** Sentinel used when the probe fails — accounts and release features are off. */
 export const FALLBACK_SERVER_INFO: ServerInfo = {
   accounts_enabled: false,
+  browser_annotations_available: false,
+  connected_apps_available: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
   login_url: null,
@@ -416,6 +422,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           accounts_enabled: data.accounts_enabled === true,
+          browser_annotations_available: data.browser_annotations_available === true,
+          connected_apps_available: data.connected_apps_available === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
           needs_setup: data.needs_setup === true,

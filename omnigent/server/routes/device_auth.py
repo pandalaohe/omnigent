@@ -715,6 +715,7 @@ def create_device_auth_router(
     device_grant_store: DeviceGrantStore,
     *,
     handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
+    annotation_storage_supported: bool = True,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
@@ -911,6 +912,14 @@ def create_device_auth_router(
         async def chrome_authorize(request: Request) -> Response:
             if not _chrome_origin_ok(request):
                 return Response(status_code=403)
+            if not annotation_storage_supported:
+                return _chrome_response(
+                    JSONResponse(
+                        status_code=503,
+                        content={"error": "annotation_storage_unsupported"},
+                        headers=NO_STORE_HEADERS,
+                    )
+                )
             try:
                 body = await request.json()
             except (ValueError, UnicodeDecodeError):

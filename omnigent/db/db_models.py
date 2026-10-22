@@ -677,6 +677,28 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+class SqlAnnotationReceiver(OmnigentBase):
+    """One browser-annotation receiving session per user and workspace."""
+
+    __tablename__ = "annotation_receivers"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    session_archive_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    set_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (Index("ix_annotation_receivers_session", "workspace_id", "session_id"),)
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.

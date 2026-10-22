@@ -286,6 +286,7 @@ def _build_accounts_app(
     *,
     device_grant_enabled: bool = True,
     base_path: str | None = None,
+    conversation_db_url: str | None = None,
 ) -> Iterator[TestClient]:
     monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -322,7 +323,7 @@ def _build_accounts_app(
     telemetry.init()
     permission_store = SqlAlchemyPermissionStore(db_url)
     agent_store = SqlAlchemyAgentStore(db_url)
-    conversation_store = SqlAlchemyConversationStore(db_url)
+    conversation_store = SqlAlchemyConversationStore(conversation_db_url or db_url)
     file_store = SqlAlchemyFileStore(db_url)
     comment_store = SqlAlchemyCommentStore(db_url)
     host_store = HostStore(db_url)
@@ -1265,6 +1266,8 @@ def test_chrome_public_pairing_preserves_shared_secret_and_consent(
             *,
             raw_path: bytes | None = None,
         ) -> str | None:
+            from omnigent.db.account_authority import account_authority_scope
+
             headers = [(b"authorization", f"Bearer {body['access_token']}".encode())]
             if request_origin is not None:
                 headers.append((b"origin", request_origin.encode()))
@@ -1280,7 +1283,8 @@ def test_chrome_public_pairing_preserves_shared_secret_and_consent(
                     "headers": headers,
                 }
             )
-            return provider.get_user_id(request)
+            with account_authority_scope(None, None):
+                return provider.get_user_id(request)
 
         assert identity("GET", "/v1/browser-annotations/sessions", _CHROME_ORIGIN) == "admin"
         assert identity("GET", "/v1/browser-annotations/sessions", None) is None
