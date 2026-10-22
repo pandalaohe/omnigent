@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -1060,3 +1061,405 @@ async def test_host_membership_union_bounds_database_wait(
             read.cancel()
         await asyncio.gather(read, return_exceptions=True)
         assert await asyncio.to_thread(finished.wait, 2)
+
+
+@pytest.fixture
+async def host_context_reader(host_owner_control, db_uri, monkeypatch):
+    from omnigent.inner.executor import ExecutorResidentInventory, ExecutorResidentOwner
+    from omnigent.runner.native.orchestration import NativeBackendInventorySnapshot
+    from omnigent.runner.resident_inventory import OwnerRegistrationSnapshot
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessContextInventorySnapshot,
+        HarnessInventorySnapshot,
+        HarnessResidentSnapshot,
+    )
+
+    hosts, conn, _host, _socket, _sent, _fault, _process = host_owner_control
+    conversations = SqlAlchemyConversationStore(db_uri)
+    main = conversations.create_conversation()
+    side = conversations.create_conversation(parent_conversation_id=main.id)
+    for conv in (main, side):
+        conversations.set_host_id(conv.id, conn.host_id, "/opt/work/project")
+        conversations.set_runner_id(conv.id, "runner-one")
+    owner = HarnessResidentSnapshot("harness-one", main.id, "codex", False, False, False)
+    inventory = OwnerRegistrationSnapshot(
+        NativeBackendInventorySnapshot((), True),
+        None,
+        HarnessInventorySnapshot(
+            (owner,),
+            True,
+            (
+                HarnessContextInventorySnapshot(
+                    owner,
+                    0,
+                    ExecutorResidentInventory(
+                        (
+                            ExecutorResidentOwner(
+                                "context-one", ("main", "ui"), "thread-one", True, False, False
+                            ),
+                            ExecutorResidentOwner(
+                                "context-side", ("side",), "thread-side", True, False, False
+                            ),
+                        )
+                    ),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.resident_inventory.owner_registration_snapshot",
+        AsyncMock(return_value=inventory),
+    )
+    runner_app = create_runner_app(server_client=NullServerClient(), auth_token="runner-auth")
+    tunnels = TunnelRegistry()
+    hello = HelloFrame("test", 1, capabilities=["resident_inventory_v1"])
+    tunnels.register("runner-one", FakeWebSocket(), hello)
+    router = RunnerRouter(registry=tunnels, conversation_store=conversations, host_registry=hosts)
+    initializer = RunnerSessionInitializer(tunnels, server_version="test")
+    requests = []
+
+    async def record(request):
+        requests.append(request.url.path)
+
+    async with AsyncExitStack() as stack:
+        client = await stack.enter_async_context(
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=runner_app),
+                base_url="http://runner",
+                headers={"Authorization": "Bearer runner-auth"},
+                event_hooks={"request": [record]},
+            )
+        )
+        router._clients["runner-one"] = client
+        yield host_owner_control, conversations, router, initializer, tunnels, client, requests
+
+
+async def _exchange_host_context_inventory(setup, **kwargs):
+    from omnigent.server.resident_inventory import read_host_context_inventory
+
+    control, conversations, router, initializer, _tunnels, _client, _requests = setup
+    hosts, conn, host, socket, _sent, _fault, _process = control
+    read = asyncio.create_task(
+        read_host_context_inventory(hosts, conn, conversations, router, initializer, **kwargs)
+    )
+    try:
+        for _ in range(4):
+            outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+            await host._handle_raw_message(socket, outbound.data)
+        return await asyncio.wait_for(read, 2)
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+async def test_host_context_inventory_preserves_contexts_and_aliases(host_context_reader):
+    result = await _exchange_host_context_inventory(host_context_reader)
+    assert result is not None
+    assert len(result.runners) == 1
+    read = result.runners[0]
+    assert read.membership.runner_id == "runner-one"
+    contexts = read.inventory.harnesses.contexts[0].inventory
+    assert [(o.incarnation_id, o.session_keys, o.vendor_context_id) for o in contexts.owners] == [
+        ("context-one", ("main", "ui"), "thread-one"),
+        ("context-side", ("side",), "thread-side"),
+    ]
+    assert not result.aliases_complete and not result.context_coverage_complete
+    assert host_context_reader[-1] == ["/v1/startup/owner-inventory"]
+
+
+def _add_host_context_runner(setup, runner_id):
+    from omnigent.host.connect import _RunnerHandle
+
+    control, conversations, router, _initializer, tunnels, client, _requests = setup
+    _hosts, conn, host, _socket, _sent, _fault, process = control
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, conn.host_id, "/opt/work/project")
+    conversations.set_runner_id(conv.id, runner_id)
+    host._runners[runner_id] = _RunnerHandle(
+        process, Path("/opt/work/runner.log"), session_id=conv.id
+    )
+    tunnels.register(
+        runner_id, FakeWebSocket(), HelloFrame("test", 1, capabilities=["resident_inventory_v1"])
+    )
+    router._clients[runner_id] = client
+    return conv
+
+
+@pytest.mark.parametrize("change", ["none", "reconnect", "disconnect"])
+async def test_host_context_inventory_rechecks_early_runner(
+    host_context_reader, monkeypatch, change
+):
+    _add_host_context_runner(host_context_reader, "runner-two")
+    _control, _conversations, _router, initializer, tunnels, client, _requests = (
+        host_context_reader
+    )
+    checked = asyncio.Event()
+    require = initializer.require_generation
+
+    def observe(runner_id, runner_client, generation):
+        require(runner_id, runner_client, generation)
+        if runner_id == "runner-one":
+            checked.set()
+
+    monkeypatch.setattr(initializer, "require_generation", observe)
+    calls = 0
+
+    async def pause_second(response):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await asyncio.wait_for(checked.wait(), 2)
+            if change == "reconnect":
+                tunnels.register(
+                    "runner-one",
+                    FakeWebSocket(),
+                    HelloFrame("test", 1, capabilities=["resident_inventory_v1"]),
+                )
+            elif change == "disconnect":
+                tunnels.deregister("runner-one")
+
+    client.event_hooks["response"].append(pause_second)
+    result = await _exchange_host_context_inventory(host_context_reader)
+    assert result is not None
+    assert (
+        result.runners[1].inventory.harnesses.contexts[0].inventory.owners[0].vendor_context_id
+        == "thread-one"
+    )
+    if change == "none":
+        assert result.runners[0].inventory is not None
+        assert result.runners[0].inventory == result.runners[1].inventory
+        assert result.runners[0].membership.runner_id != result.runners[1].membership.runner_id
+    else:
+        assert result.runners[0].inventory is None
+        assert result.runners[0].runner_generation is None
+    assert not result.aliases_complete and not result.context_coverage_complete
+
+
+@pytest.mark.parametrize(
+    "reason", ["unsupported", "closing", "pending", "host-only", "server-only", "bad-read-id"]
+)
+async def test_host_context_inventory_preserves_unknown_members(host_context_reader, reason):
+    control, conversations, _router, _initializer, tunnels, client, requests = host_context_reader
+    _hosts, _conn, host, _socket, _sent, _fault, _process = control
+    if reason == "unsupported":
+        tunnels.get("runner-one").hello.capabilities.clear()
+    elif reason == "closing":
+        host._runners["runner-one"].stop_requested = True
+    elif reason == "pending":
+        host._pending_runner_launches["runner-one"] = set()
+    elif reason == "host-only":
+        for conv in conversations.list_conversations_by_runner_id("runner-one"):
+            conversations.clear_runner_id(conv.id)
+    elif reason == "server-only":
+        host._runners.clear()
+    else:
+
+        async def corrupt(response):
+            import json
+
+            await response.aread()
+            payload = response.json()
+            payload["read_id"] = "old-read"
+            response._content = json.dumps(payload).encode()
+
+        client.event_hooks["response"].append(corrupt)
+    result = await _exchange_host_context_inventory(host_context_reader)
+    assert result is not None
+    assert len(result.runners) == 1 and result.runners[0].inventory is None
+    assert requests == (["/v1/startup/owner-inventory"] if reason == "bad-read-id" else [])
+
+
+@pytest.mark.parametrize("change", ["host-owner", "binding", "account"])
+async def test_host_context_inventory_rejects_final_membership_changes(
+    host_context_reader, change
+):
+    control, conversations, _router, _initializer, _tunnels, client, _requests = (
+        host_context_reader
+    )
+    _hosts, conn, host, _socket, _sent, _fault, process = control
+
+    async def mutate(_response):
+        from omnigent.host.connect import _RunnerHandle
+
+        if change == "host-owner":
+            host._runners["runner-one"] = _RunnerHandle(process, Path("/opt/work/runner.log"))
+        elif change == "binding":
+            conv = conversations.list_conversations_by_runner_id("runner-one")[0]
+            conversations.replace_runner_id(conv.id, "replacement")
+        else:
+            conn.account_generation = "replacement"
+
+    client.event_hooks["response"].append(mutate)
+    assert await _exchange_host_context_inventory(host_context_reader) is None
+
+
+@pytest.mark.parametrize("end", ["complete", "timeout", "cancel"])
+async def test_host_context_inventory_bounds_and_drains_reads(host_context_reader, end):
+    from omnigent.server.resident_inventory import read_host_context_inventory
+
+    for index in range(5):
+        _add_host_context_runner(host_context_reader, f"runner-extra-{index}")
+    control, conversations, router, initializer, _tunnels, client, requests = host_context_reader
+    hosts, conn, host, socket, _sent, _fault, _process = control
+    active = set()
+    four_started, resume = asyncio.Event(), asyncio.Event()
+    maximum = 0
+
+    async def pause(response):
+        nonlocal maximum
+        key = response.request.url.params["read_id"]
+        active.add(key)
+        maximum = max(maximum, len(active))
+        if len(active) == 4:
+            four_started.set()
+        try:
+            await asyncio.wait_for(resume.wait(), 2)
+        finally:
+            active.remove(key)
+
+    client.event_hooks["response"].append(pause)
+    read = asyncio.create_task(
+        read_host_context_inventory(
+            hosts,
+            conn,
+            conversations,
+            router,
+            initializer,
+            timeout_s=0.5 if end == "timeout" else 5,
+        )
+    )
+    try:
+        for _ in range(2):
+            outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+            await host._handle_raw_message(socket, outbound.data)
+        await asyncio.wait_for(four_started.wait(), 2)
+        assert maximum == 4
+        if end == "cancel":
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        elif end == "timeout":
+            assert await asyncio.wait_for(read, 2) is None
+        else:
+            resume.set()
+            for _ in range(2):
+                outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+                await host._handle_raw_message(socket, outbound.data)
+            result = await asyncio.wait_for(read, 2)
+            assert len(result.runners) == len(requests) == 6
+            assert all(r.inventory is not None for r in result.runners)
+        assert not active and maximum == 4 and not conn.pending_owner_inventory
+        assert not client.is_closed
+    finally:
+        resume.set()
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "valid",
+        "empty",
+        "unknown",
+        "ambiguous",
+        "bool-string",
+        "extra",
+        "missing",
+        "complete",
+        "context-complete",
+        "owner-mismatch",
+        "duplicate-harness",
+        "duplicate-context",
+        "unaligned",
+        "closing-harness",
+    ],
+)
+def test_runner_context_inventory_strict_wire_decode(case):
+    from omnigent.server.resident_inventory import _decode_runner_context_inventory
+
+    owner = {
+        "incarnation_id": "harness-one",
+        "session_id": "session-one",
+        "harness": "codex",
+        "closing": False,
+        "wrapper_exited": False,
+        "exit_confirmed": False,
+    }
+    contexts = {
+        "owners": [
+            {
+                "incarnation_id": "context-one",
+                "session_keys": ["main", "ui"],
+                "vendor_context_id": "thread-one",
+                "started": True,
+                "closing": False,
+                "cleanup_complete": False,
+            }
+        ],
+        "ambiguous_context_ids": [],
+        "aliases_complete": False,
+        "context_coverage_complete": False,
+    }
+    payload = {
+        "native_backends": {
+            "owners": [],
+            "exit_coverage_complete": True,
+            "aliases_complete": False,
+        },
+        "terminals": None,
+        "harnesses": {
+            "owners": [owner],
+            "exit_coverage_complete": True,
+            "contexts": [{"owner": dict(owner), "release_generation": 0, "inventory": contexts}],
+        },
+        "executor_contexts_complete": False,
+        "external_owners_complete": False,
+    }
+    if case == "empty":
+        contexts["owners"] = []
+    elif case == "unknown":
+        payload["harnesses"]["contexts"] = [None]
+    elif case == "ambiguous":
+        contexts["ambiguous_context_ids"] = ["thread-one"]
+    elif case == "bool-string":
+        contexts["owners"][0]["started"] = "false"
+    elif case == "extra":
+        contexts["owners"][0]["unexpected"] = "value"
+    elif case == "missing":
+        payload.pop("external_owners_complete")
+    elif case == "complete":
+        payload["executor_contexts_complete"] = True
+    elif case == "context-complete":
+        contexts["context_coverage_complete"] = True
+    elif case == "owner-mismatch":
+        payload["harnesses"]["contexts"][0]["owner"]["session_id"] = "other"
+    elif case == "duplicate-harness":
+        payload["harnesses"]["owners"] *= 2
+        payload["harnesses"]["contexts"] *= 2
+    elif case == "duplicate-context":
+        contexts["owners"] *= 2
+    elif case == "unaligned":
+        payload["harnesses"]["contexts"].append(None)
+    elif case == "closing-harness":
+        owner["closing"] = True
+        payload["harnesses"]["contexts"][0]["owner"]["closing"] = True
+    result = _decode_runner_context_inventory(payload)
+    if case not in {"valid", "empty", "unknown", "ambiguous"}:
+        assert result is None
+    else:
+        assert result is not None
+        assert result.external_owners_complete is False
+        read = result.harnesses.contexts[0]
+        if case == "unknown":
+            assert read is None
+        elif case == "empty":
+            assert read.inventory.owners == ()
+        elif case == "ambiguous":
+            assert read.inventory.ambiguous_context_ids == ("thread-one",)
+            assert read.inventory.aliases_complete is False
+        else:
+            assert read.inventory.owners[0].session_keys == ("main", "ui")

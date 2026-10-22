@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any
+import json
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import httpx
+from pydantic import TypeAdapter
 
 from omnigent.db.account_authority import AccountAuthority
 from omnigent.db.db_models import current_workspace_id
@@ -23,8 +25,14 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore
 
+if TYPE_CHECKING:
+    from omnigent.runner.resident_inventory import OwnerRegistrationSnapshot
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.server.runner_session_init import RunnerSessionInitializer
+
 _HOST_BINDING_PAGE_SIZE = 100
 _MAX_HOST_BINDING_PAGES = 10
+_MAX_CONCURRENT_RUNNER_READS = 4
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,179 @@ class HostMembershipInventory:
     unbound_session_ids: tuple[str, ...]
     aliases_complete: bool = False
     context_coverage_complete: bool = False
+
+
+@dataclass(frozen=True)
+class HostRunnerContextInventory:
+    membership: HostRunnerMembership
+    runner_generation: int | None
+    inventory: OwnerRegistrationSnapshot | None
+
+
+@dataclass(frozen=True)
+class HostContextInventory:
+    membership: HostMembershipInventory
+    runners: tuple[HostRunnerContextInventory, ...]
+    aliases_complete: bool = False
+    context_coverage_complete: bool = False
+
+
+def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapshot | None:
+    from omnigent.runner.resident_inventory import OwnerRegistrationSnapshot
+
+    try:
+        snapshot = TypeAdapter(OwnerRegistrationSnapshot).validate_json(
+            json.dumps(payload), strict=True
+        )
+        # Round-trip equality rejects ignored extras and omitted default fields at every depth.
+        if (
+            json.loads(json.dumps(asdict(snapshot))) != payload
+            or snapshot.executor_contexts_complete
+            or snapshot.external_owners_complete
+            or snapshot.native_backends.aliases_complete
+            or any(o.aliases_complete for o in snapshot.native_backends.owners)
+        ):
+            return None
+        native_ids = [o.incarnation_id for o in snapshot.native_backends.owners]
+        if not all(native_ids) or len(set(native_ids)) != len(native_ids):
+            return None
+        harnesses = snapshot.harnesses
+        if harnesses is not None:
+            ids = [o.incarnation_id for o in harnesses.owners]
+            if not all(ids) or len(set(ids)) != len(ids):
+                return None
+            if harnesses.contexts is not None:
+                if len(harnesses.contexts) != len(harnesses.owners):
+                    return None
+                for owner, read in zip(harnesses.owners, harnesses.contexts, strict=True):
+                    if read is None:
+                        continue
+                    inventory = read.inventory
+                    ids = [o.incarnation_id for o in inventory.owners]
+                    if (
+                        read.owner != owner
+                        or owner.closing
+                        or owner.wrapper_exited
+                        or owner.exit_confirmed
+                        or read.release_generation < 0
+                        or inventory.aliases_complete
+                        or inventory.context_coverage_complete
+                        or not all(ids)
+                        or len(set(ids)) != len(ids)
+                        or any(
+                            not o.session_keys or not all(o.session_keys) for o in inventory.owners
+                        )
+                    ):
+                        return None
+        return snapshot
+    except (ValueError, TypeError):
+        return None
+
+
+async def read_host_context_inventory(
+    hosts: HostRegistry,
+    conn: HostConnection,
+    conversations: ConversationStore,
+    router: RunnerRouter | None,
+    initializer: RunnerSessionInitializer | None,
+    *,
+    timeout_s: float = 5.0,
+) -> HostContextInventory | None:
+    """Aggregate sampled runner contexts; unresolved owners remain explicit unknowns."""
+    if router is None or initializer is None or not 0 < timeout_s <= 5.0:
+        return None
+    authority = (conn.ws, conn.workspace_id, conn.owner, conn.account_generation)
+    reads: dict[str, tuple[httpx.AsyncClient, int, OwnerRegistrationSnapshot]] = {}
+    try:
+        async with asyncio.timeout(timeout_s):
+            selected = await read_host_membership_inventory(
+                hosts, conn, conversations, timeout_s=timeout_s
+            )
+            if selected is None:
+                return None
+            members = iter(selected.runners)
+
+            async def read_runners() -> None:
+                for member in members:
+                    if (
+                        member.host_owner is None
+                        or member.host_owner.stop_requested
+                        or not member.session_ids
+                        or member.runner_id in selected.host.pending_runner_ids
+                        or not router.runner_has_capability(
+                            member.runner_id, "resident_inventory_v1"
+                        )
+                    ):
+                        continue
+                    try:
+                        routed = await asyncio.to_thread(
+                            router.client_for_existing_conversation, member.session_ids[0]
+                        )
+                        if routed is None or routed.runner_id != member.runner_id:
+                            continue
+                        generation = initializer.generation_for(routed.runner_id, routed.client)
+                        read_id = uuid4().hex
+                        response = await routed.client.get(
+                            "/v1/startup/owner-inventory",
+                            params={"read_id": read_id},
+                            timeout=timeout_s,
+                            follow_redirects=False,
+                        )
+                        initializer.require_generation(routed.runner_id, routed.client, generation)
+                        payload = response.json() if response.status_code == 200 else None
+                        if (
+                            not isinstance(payload, dict)
+                            or payload.pop("read_id", None) != read_id
+                        ):
+                            continue
+                        inventory = _decode_runner_context_inventory(payload)
+                        if inventory is not None:
+                            reads[member.runner_id] = (routed.client, generation, inventory)
+                    except (httpx.HTTPError, ConnectionError, ValueError):
+                        continue
+                    except OmnigentError as exc:
+                        if exc.code not in {
+                            ErrorCode.UNAUTHORIZED,
+                            ErrorCode.WRONG_REPLICA,
+                            ErrorCode.RUNNER_UNAVAILABLE,
+                        }:
+                            raise
+
+            async with asyncio.TaskGroup() as workers:
+                for _ in range(min(_MAX_CONCURRENT_RUNNER_READS, len(selected.runners))):
+                    workers.create_task(read_runners())
+            final = await read_host_membership_inventory(
+                hosts, conn, conversations, timeout_s=timeout_s
+            )
+            if (
+                final is None
+                or final != selected
+                or (conn.ws, conn.workspace_id, conn.owner, conn.account_generation) != authority
+            ):
+                return None
+            result = []
+            for member in final.runners:
+                read = reads.get(member.runner_id)
+                if read is not None:
+                    client, generation, _inventory = read
+                    try:
+                        initializer.require_generation(member.runner_id, client, generation)
+                        if client.is_closed or not router.runner_has_capability(
+                            member.runner_id, "resident_inventory_v1"
+                        ):
+                            read = None
+                    except ConnectionError:
+                        read = None
+                result.append(
+                    HostRunnerContextInventory(
+                        member,
+                        read[1] if read is not None else None,
+                        read[2] if read is not None else None,
+                    )
+                )
+            return HostContextInventory(final, tuple(result))
+    except (TimeoutError, ConnectionError):
+        return None
 
 
 async def read_host_membership_inventory(
