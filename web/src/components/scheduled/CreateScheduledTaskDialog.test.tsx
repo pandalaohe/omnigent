@@ -31,6 +31,7 @@ import { useProjects } from "@/hooks/useConversations";
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   useProjects: vi.fn(),
+  useProjectsWithArchived: () => useProjects(),
 }));
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));

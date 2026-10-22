@@ -13,6 +13,10 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ApiError } from "@/lib/sessionsApi";
+import { listProjects } from "@/lib/projectsApi";
+import { restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
 import { cn } from "@/lib/utils";
 
 /**
@@ -27,6 +31,17 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const createProject = useCreateProject();
+  const queryClient = useQueryClient();
+  const archivedName =
+    createProject.error instanceof ApiError && createProject.error.code === "project_name_archived";
+  const archivedProjects = useQuery({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => listProjects({ includeArchived: true }),
+    enabled: archivedName,
+  });
+  const match = archivedProjects.data?.find(
+    (project) => project.archived_at && project.name === name.trim(),
+  );
 
   const submit = () => {
     const trimmed = name.trim();
@@ -158,7 +173,24 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
           </div>
           {createProject.isError && (
             <p className="text-ui text-destructive" role="alert">
-              {(createProject.error as Error).message}
+              {archivedName
+                ? "An archived project has this name."
+                : (createProject.error as Error).message}
+              {archivedName && match && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="ml-2"
+                  onClick={() =>
+                    void restoreProjectWithNotice(match.id, match.name, queryClient).then(() =>
+                      setOpen(false),
+                    )
+                  }
+                >
+                  Restore project
+                </Button>
+              )}
             </p>
           )}
           <DialogFooter className="border-t-0 bg-transparent">

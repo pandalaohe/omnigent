@@ -47,7 +47,12 @@ import {
   useRef,
   useState,
 } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ProjectSinglePicker } from "@/components/ProjectSinglePicker";
+import { PickerShell } from "@/components/PickerShell";
+import { SelectionList } from "@/components/SelectionList";
+import { restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
+import { listProjects, type Project } from "@/lib/projectsApi";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useAgents } from "@/hooks/useAgents";
 import { useComments } from "@/hooks/useComments";
@@ -168,7 +173,7 @@ import {
   fetchDatabricksStatus,
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { authenticatedFetch, getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -177,6 +182,7 @@ import {
   type Conversation,
   ARCHIVE_LOCK_LABEL_KEY,
   type ArchivedDateField,
+  invalidateProjectArchiveQueries,
   useArchiveConversation,
   useArchiveLockConversation,
   useArchivedConversations,
@@ -185,6 +191,7 @@ import {
   useBulkArchiveLockConversations,
   useBulkDeleteConversations,
   useProjects,
+  useDeleteProject,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
@@ -673,7 +680,6 @@ export function SystemStatusSettingsSection() {
 }
 
 // Radix Select values must be non-empty strings, so unset maps to sentinels.
-const HEALTH_CHECK_PROJECT_UNSET = "__health_check_project_unset__";
 const HEALTH_CHECK_HOST_UNSET = "__health_check_host_unset__";
 
 interface HealthCheckDraft {
@@ -699,6 +705,10 @@ function healthCheckPromptPayload(text: string, defaultPrompt: string): string |
 
 function HealthCheckSettingsForm({ settings }: { settings: SystemStatusSettings }) {
   const projects = useProjects();
+  const allProjects = useQuery({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => listProjects({ includeArchived: true }),
+  });
   const hosts = useHosts();
   // Session-discovered agents only: the resolved id falls back to itself when
   // the default isn't among them.
@@ -723,9 +733,11 @@ function HealthCheckSettingsForm({ settings }: { settings: SystemStatusSettings 
     staleTime: 30_000,
   });
 
-  const projectOptions = (projects.data ?? []).flatMap((project) =>
-    project.id === null ? [] : [{ id: project.id, name: project.name }],
-  );
+  const projectOptions =
+    allProjects.data ??
+    (projects.data ?? []).flatMap((project) =>
+      project.id === null ? [] : [{ id: project.id, name: project.name }],
+    );
   const hostOptions = hosts.data ?? [];
   const resolvedAgentId = resolve.data?.agent_id ?? null;
   const resolvedAgentName =
@@ -755,31 +767,13 @@ function HealthCheckSettingsForm({ settings }: { settings: SystemStatusSettings 
         <label htmlFor="health-check-project" className="text-sm font-medium">
           Ops project
         </label>
-        <Select
-          value={projectId === "" ? HEALTH_CHECK_PROJECT_UNSET : projectId}
-          onValueChange={(value) =>
-            setDraft((current) => ({
-              ...current,
-              projectId: value === HEALTH_CHECK_PROJECT_UNSET ? "" : value,
-            }))
-          }
-        >
-          <SelectTrigger
-            id="health-check-project"
-            data-testid="health-check-project-trigger"
-            className="w-full"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent position="popper" align="start">
-            <SelectItem value={HEALTH_CHECK_PROJECT_UNSET}>No project</SelectItem>
-            {projectOptions.map((project) => (
-              <SelectItem key={project.id} value={project.id}>
-                {project.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <ProjectSinglePicker
+          projects={projectOptions}
+          value={projectId || null}
+          onChange={(id) => setDraft((current) => ({ ...current, projectId: id ?? "" }))}
+          label="Ops project"
+          testId="health-check-project-trigger"
+        />
         <p className="text-sm text-muted-foreground">
           Sessions opened by the check are filed in this project.
         </p>
@@ -3914,7 +3908,177 @@ function ImportSection() {
   );
 }
 
+function ArchiveTabs({ active }: { active: "sessions" | "projects" }) {
+  return (
+    <nav aria-label="Archived items" className="flex gap-1 border-b px-3 py-2">
+      <Link
+        to="/settings/archived"
+        aria-current={active === "sessions" ? "page" : undefined}
+        className={cn(
+          "rounded-md px-3 py-2 text-sm",
+          active === "sessions"
+            ? "bg-muted font-medium"
+            : "text-muted-foreground hover:bg-muted/50",
+        )}
+      >
+        Sessions
+      </Link>
+      <Link
+        to="/settings/archived?tab=projects"
+        aria-current={active === "projects" ? "page" : undefined}
+        className={cn(
+          "rounded-md px-3 py-2 text-sm",
+          active === "projects"
+            ? "bg-muted font-medium"
+            : "text-muted-foreground hover:bg-muted/50",
+        )}
+      >
+        Projects
+      </Link>
+    </nav>
+  );
+}
+
+function ArchivedProjectsPane() {
+  const queryClient = useQueryClient();
+  const {
+    data: allProjects,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => listProjects({ includeArchived: true }),
+  });
+  const archivedProjects = (allProjects ?? []).filter((project) => !!project.archived_at);
+  const del = useDeleteProject();
+  const [deleting, setDeleting] = useState<Project | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const restore = async (project: Project) => {
+    setBusyId(project.id);
+    setError(null);
+    try {
+      await restoreProjectWithNotice(project.id, project.name, queryClient);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusyId(null);
+    }
+  };
+  return (
+    <div
+      className="h-full overflow-y-auto pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))]"
+      data-testid="archived-projects-pane"
+    >
+      <ArchiveTabs active="projects" />
+      <div className="mx-auto max-w-4xl px-4 py-5 md:px-8">
+        <h1 className="mb-4 text-lg font-semibold">Archived projects</h1>
+        {isLoading && <p className="text-sm text-muted-foreground">Loading projects…</p>}
+        {isError && (
+          <p role="alert" className="text-sm text-destructive">
+            Couldn’t load projects.{" "}
+            <Button type="button" size="sm" variant="outline" onClick={() => void refetch()}>
+              Retry
+            </Button>
+          </p>
+        )}
+        {error && (
+          <p role="alert" className="mb-3 text-sm text-destructive">
+            {error}
+          </p>
+        )}
+        {!isLoading && !isError && archivedProjects.length === 0 && (
+          <p className="text-sm text-muted-foreground">No archived projects.</p>
+        )}
+        <ul className="divide-y rounded-lg border">
+          {archivedProjects.map((project) => (
+            <li
+              key={project.id}
+              className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-medium">{project.name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {project.archived_at
+                    ? new Date(project.archived_at * 1000).toLocaleDateString()
+                    : ""}{" "}
+                  · {project.archive_summary?.sessions ?? 0} sessions ·{" "}
+                  {project.archive_summary?.tasks ?? 0} automations
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={busyId === project.id}
+                  onClick={() => void restore(project)}
+                >
+                  Restore project
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="destructive"
+                  disabled={busyId === project.id}
+                  onClick={() => setDeleting(project)}
+                >
+                  Delete
+                </Button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <Dialog
+        open={deleting !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleting(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete archived project?</DialogTitle>
+            <DialogDescription>
+              This deletes {deleting?.name}. Its sessions will remain archived.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setDeleting(null)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              loading={del.isPending}
+              onClick={() => {
+                if (!deleting) return;
+                del.mutate(
+                  { id: deleting.id, name: deleting.name },
+                  {
+                    onSuccess: () => {
+                      setDeleting(null);
+                      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+                    },
+                    onError: (cause) => setError(cause.message),
+                  },
+                );
+              }}
+            >
+              Delete project
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 function ArchivedSection() {
+  const location = useLocation();
+  const tab =
+    new URLSearchParams(location.search).get("tab") === "projects" ? "projects" : "sessions";
   const isMobileViewport = useIsMobileViewport();
   const [selectedConversation, setSelectedConversation] = useState<Conversation | null>(null);
   const { width, containerRef, handleProps } = useResizableColumn(420, 300, 720);
@@ -3942,6 +4106,8 @@ function ArchivedSection() {
     if (singlePane) setSelectedConversation(null);
   }, [singlePane]);
 
+  if (tab === "projects") return <ArchivedProjectsPane />;
+
   return (
     <div
       ref={(node) => {
@@ -3959,6 +4125,7 @@ function ArchivedSection() {
         )}
         style={singlePane ? undefined : { width: listWidth }}
       >
+        <ArchiveTabs active="sessions" />
         <ArchivedListPane
           selectedConversationId={selectedConversation?.id ?? null}
           autoSelectFirst={!singlePane}
@@ -4004,6 +4171,10 @@ function ArchivedListPane({
   const viewerId = useViewerId();
   const paginationAnchorRef = useRef<HTMLElement>(null);
   const projectsQuery = useProjects();
+  const allProjectsQuery = useQuery({
+    queryKey: ["projects", "with-archived"],
+    queryFn: () => listProjects({ includeArchived: true }),
+  });
   const hostsQuery = useHosts({ includeSandbox: true });
   const pageNumber = pageCursors.length;
   useEffect(() => {
@@ -4090,8 +4261,14 @@ function ArchivedListPane({
     [facetsQuery.data],
   );
   const projectNames = useMemo(
-    () => new Map((projectsQuery.data ?? []).map((project) => [project.id, project.name])),
-    [projectsQuery.data],
+    () =>
+      new Map(
+        [...(projectsQuery.data ?? []), ...(allProjectsQuery.data ?? [])].map((project) => [
+          project.id,
+          project.name,
+        ]),
+      ),
+    [projectsQuery.data, allProjectsQuery.data],
   );
 
   useEffect(() => {
@@ -4325,6 +4502,15 @@ function ArchivedListPane({
                   (conv.project_id ? projectNames.get(conv.project_id) : undefined) ??
                   conv.labels?.omni_project
                 }
+                archivedProject={(allProjectsQuery.data ?? []).find(
+                  (project) =>
+                    !!project.archived_at &&
+                    (project.id === conv.project_id ||
+                      (!conv.project_id && project.name === conv.labels?.omni_project)),
+                )}
+                activeProjects={(allProjectsQuery.data ?? []).filter(
+                  (project) => !project.archived_at,
+                )}
                 hostName={hostNames.get(conv.host_id ?? "")}
                 cutoff={retentionCutoff}
                 selectionMode={selectionMode}
@@ -4561,6 +4747,8 @@ function ArchivedBulkActionBar({
 function ArchivedRow({
   conversation,
   projectName,
+  archivedProject,
+  activeProjects,
   hostName,
   cutoff,
   selectionMode,
@@ -4571,6 +4759,8 @@ function ArchivedRow({
 }: {
   conversation: Conversation;
   projectName?: string;
+  archivedProject?: Project;
+  activeProjects: Project[];
   hostName?: string;
   cutoff: number | null;
   selectionMode: boolean;
@@ -4580,6 +4770,10 @@ function ArchivedRow({
   onOpen: (conversation: Conversation) => void;
 }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [moving, setMoving] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [restoreBusy, setRestoreBusy] = useState(false);
   const archive = useArchiveConversation();
   const archiveLock = useArchiveLockConversation();
   const del = useStopAndDeleteConversation();
@@ -4596,6 +4790,30 @@ function ArchivedRow({
   const resolvedHostName = hostName ?? conversation.host_id ?? "Host not recorded";
   const resolvedAgentName = conversation.agent_name ?? "Agent not recorded";
   const matchCount = conversation.search_match_count ?? (conversation.search_match ? 1 : 0);
+
+  const moveAndRestore = async (projectId: string) => {
+    setRestoreBusy(true);
+    setRestoreError(null);
+    try {
+      const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(conversation.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId,
+          archived: false,
+          labels: { omni_project: "" },
+        }),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      await invalidateProjectArchiveQueries(queryClient);
+      setMoving(false);
+      navigate(`/c/${conversation.id}`);
+    } catch (cause) {
+      setRestoreError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
 
   return (
     <li
@@ -4736,29 +4954,76 @@ function ArchivedRow({
               {locked ? "Unlock before deleting" : "Delete permanently"}
             </TooltipContent>
           </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
+          {archivedProject ? (
+            <div className="flex flex-wrap items-center gap-1">
               <Button
                 type="button"
-                variant="ghost"
-                size="icon-sm"
-                className="dark:bg-secondary dark:hover:bg-secondary/80 max-md:size-11"
-                aria-label="Unarchive session"
-                data-testid="unarchive-conversation"
-                disabled={busy}
+                size="sm"
+                variant="outline"
+                disabled={restoreBusy}
                 onClick={() =>
-                  archive.mutate(
-                    { id: conversation.id, archived: false },
-                    { onSuccess: () => navigate(`/c/${conversation.id}`) },
+                  void restoreProjectWithNotice(
+                    archivedProject.id,
+                    archivedProject.name,
+                    queryClient,
+                  ).catch((cause) =>
+                    setRestoreError(cause instanceof Error ? cause.message : String(cause)),
                   )
                 }
               >
-                <ArchiveRestoreIcon className="size-4" />
+                Restore project
               </Button>
-            </TooltipTrigger>
-            <TooltipContent>Unarchive</TooltipContent>
-          </Tooltip>
+              <PickerShell
+                title="Move and restore session"
+                open={moving}
+                onOpenChange={setMoving}
+                trigger={
+                  <Button type="button" size="sm" variant="outline" disabled={restoreBusy}>
+                    Move and restore…
+                  </Button>
+                }
+              >
+                <SelectionList
+                  mode="single"
+                  items={activeProjects.map((project) => ({ id: project.id, label: project.name }))}
+                  value={null}
+                  onChange={(id) => {
+                    if (id) void moveAndRestore(id);
+                  }}
+                  searchLabel="Search projects"
+                />
+              </PickerShell>
+            </div>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  className="dark:bg-secondary dark:hover:bg-secondary/80 max-md:size-11"
+                  aria-label="Unarchive session"
+                  data-testid="unarchive-conversation"
+                  disabled={busy}
+                  onClick={() =>
+                    archive.mutate(
+                      { id: conversation.id, archived: false },
+                      { onSuccess: () => navigate(`/c/${conversation.id}`) },
+                    )
+                  }
+                >
+                  <ArchiveRestoreIcon className="size-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Unarchive</TooltipContent>
+            </Tooltip>
+          )}
         </div>
+      )}
+      {restoreError && (
+        <p role="alert" className="w-full px-2 text-xs text-destructive">
+          {restoreError}
+        </p>
       )}
 
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>

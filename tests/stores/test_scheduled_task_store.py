@@ -14,6 +14,8 @@ import sqlalchemy as sa
 
 from omnigent.db.db_models import uuid_to_bytes, workspace_scope
 from omnigent.db.utils import get_or_create_engine
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
@@ -1407,3 +1409,74 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
     with workspace_scope(11):
         found = store.get_running_run_by_conversation(_uid("conv_ws"))
         assert found is not None and found.id == _uid("run_ws")
+
+
+def test_project_archive_task_marker_survives_retry_and_manual_change(
+    store: SqlAlchemyScheduledTaskStore, db_uri: str
+) -> None:
+    """Only active members pause, and a manual state change drops archive provenance."""
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(_uid("archive-task-project"), "Work", None)
+    active = store.create(
+        _uid("archive-task-active"),
+        "Active",
+        "p",
+        "FREQ=DAILY",
+        None,
+        _uid("archive-task-agent"),
+        "UTC",
+        project_id=project.id,
+    )
+    paused = store.create(
+        _uid("archive-task-paused"),
+        "Paused",
+        "p",
+        "FREQ=DAILY",
+        None,
+        _uid("archive-task-agent"),
+        "UTC",
+        project_id=project.id,
+        state="paused",
+    )
+    op = projects.begin_archive_op(project.id, user_id=None, kind="archive")
+    assert [
+        task.id for task in store.list_for_project_archive(project.id, owner_user_id=None)
+    ] == [active.id]
+    assert store.pause_for_project_archive(active.id, project.id, op.batch).state == "paused"
+    assert store.pause_for_project_archive(active.id, project.id, op.batch).id == active.id
+    assert [
+        task.id
+        for task in store.list_for_project_archive(project.id, owner_user_id=None, batch=op.batch)
+    ] == [active.id]
+    assert store.pause_for_project_archive(paused.id, project.id, op.batch) is None
+    projects.finish_archive_op(project.id, op.id, user_id=None)
+    projects.begin_archive_op(project.id, user_id=None, kind="unarchive")
+    assert store.restore_from_project_archive(active.id, project.id, op.batch).state == "active"
+    assert store.get(active.id).paused_by_archive_batch == op.batch
+    assert store.clear_project_archive_marker(active.id, op.batch)
+    assert store.get(active.id).paused_by_archive_batch is None
+    assert store.get(paused.id).state == "paused"
+
+    # A later manual pause may not be undone by a stale archive retry.
+    store.update(active.id, state="paused")
+    assert store.restore_from_project_archive(active.id, project.id, op.batch) is None
+
+
+def test_task_creation_rejects_archived_project(
+    store: SqlAlchemyScheduledTaskStore, db_uri: str
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(_uid("archived-task-project"), "Work", None)
+    projects.begin_archive_op(project.id, user_id=None, kind="archive")
+    with pytest.raises(OmnigentError) as exc:
+        store.create(
+            _uid("task-in-archive"),
+            "Blocked",
+            "p",
+            "FREQ=DAILY",
+            None,
+            _uid("task-agent"),
+            "UTC",
+            project_id=project.id,
+        )
+    assert exc.value.code == ErrorCode.PROJECT_ARCHIVED

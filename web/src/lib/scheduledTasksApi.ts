@@ -62,6 +62,8 @@ export interface ScheduledTask {
    * Optional on the wire: older recorded fixtures omit it.
    */
   projectId?: string | null;
+  /** Set when this task was paused by its project's archive operation. */
+  pausedByArchiveBatch?: string | null;
   /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
   executionTarget: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
@@ -174,6 +176,7 @@ interface ScheduledTaskWire {
   workspace: string | null;
   host_id: string | null;
   project_id?: string | null;
+  paused_by_archive_batch?: string | null;
   execution_target: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
   last_run_at: number | null;
@@ -252,6 +255,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     workspace: wire.workspace,
     hostId: wire.host_id,
     projectId: wire.project_id ?? null,
+    pausedByArchiveBatch: wire.paused_by_archive_batch ?? null,
     executionTarget: wire.execution_target,
     state: wire.state,
     lastRunAt: wire.last_run_at,

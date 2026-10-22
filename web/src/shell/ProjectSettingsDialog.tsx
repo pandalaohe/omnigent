@@ -7,6 +7,9 @@ import { ChevronDownIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
+import { PickerShell } from "@/components/PickerShell";
+import { SelectionList, type PickerItem } from "@/components/SelectionList";
+import { resolveMulti, summarizeMulti, type MultiValue } from "@/lib/multiSelection";
 import { HelpTip } from "@/components/HelpTip";
 import {
   sessionDefaultModeOptions,
@@ -186,7 +189,7 @@ interface CopySelection {
   harness: string;
   source: Project;
   targets: Project[];
-  checked: Record<string, boolean>;
+  selection: MultiValue;
   fields: Record<CallingDefaultField, boolean>;
   agent: boolean;
   targetEntries: Record<string, ProjectHostEntry[] | null>;
@@ -621,6 +624,7 @@ export function ProjectSettingsDialog({
   onOpenChange,
   projectId,
   projectName,
+  onArchive,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -628,6 +632,7 @@ export function ProjectSettingsDialog({
    *  save — a row is created under `projectName` so its config can be stored). */
   projectId: string | null;
   projectName: string;
+  onArchive?: () => void;
 }) {
   const queryClient = useQueryClient();
   const capabilities = useHarnessCapabilities();
@@ -728,6 +733,8 @@ export function ProjectSettingsDialog({
   const [activeTab, setActiveTab] = useState("defaults");
   const masterDefaults = useCallingDefaults();
   const [copySelection, setCopySelection] = useState<CopySelection | null>(null);
+  const [copyPickerOpen, setCopyPickerOpen] = useState(false);
+  const [copyPickerBefore, setCopyPickerBefore] = useState<MultiValue | null>(null);
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
   const [copyResults, setCopyResults] = useState<string[]>([]);
@@ -1383,6 +1390,18 @@ export function ProjectSettingsDialog({
     return { fields, skipped, copyAgent, blocked: null };
   };
 
+  const copyPickerItems = (selection: CopySelection): PickerItem[] =>
+    selection.targets.map((target) => {
+      const plan = planCopyTarget(selection, target, selection.targetEntries[target.id]);
+      const fields = [...Object.keys(plan.fields), ...(plan.copyAgent ? ["Agent"] : [])];
+      return {
+        id: target.id,
+        label: target.name,
+        unavailableReason: plan.blocked ? (selection.entryErrors[target.id] ?? plan.blocked) : null,
+        description: `Apply: ${fields.join(", ") || "none"}${plan.skipped.length ? ` · Skip: ${plan.skipped.join(", ")}` : ""}`,
+      };
+    });
+
   const resetHarnessRow = (rowHostId: string, harness: string) => {
     setHostRows((rows) =>
       rows.map((row) => {
@@ -1431,7 +1450,7 @@ export function ProjectSettingsDialog({
         harness,
         source,
         targets,
-        checked: Object.fromEntries(targets.map((target) => [target.id, true])),
+        selection: { mode: "except", ids: [] },
         fields: { model: true, effort: true, speed: true, permission: true },
         agent: false,
         targetEntries,
@@ -1467,7 +1486,10 @@ export function ProjectSettingsDialog({
       return;
     }
     const sourceAgent = source.config?.calling_defaults?.[sourceHost]?.agent_id ?? null;
-    for (const target of copySelection.targets.filter((item) => copySelection.checked[item.id])) {
+    const selectedIds = new Set(
+      resolveMulti(copySelection.selection, copyPickerItems(copySelection)),
+    );
+    for (const target of copySelection.targets.filter((item) => selectedIds.has(item.id))) {
       try {
         // Read each target immediately before writing; the server checks this
         // revision again inside the transaction.
@@ -1897,45 +1919,82 @@ export function ProjectSettingsDialog({
               Project default agent
             </label>
           </div>
-          {copySelection.targets.map((target) => (
-            <div key={target.id} className="min-w-0 rounded-md border px-2 py-1.5">
-              <label className="flex items-center gap-2 text-ui">
-                <input
-                  type="checkbox"
-                  checked={copySelection.checked[target.id]}
-                  onChange={(event) =>
-                    setCopySelection((current) =>
-                      current
-                        ? {
-                            ...current,
-                            checked: { ...current.checked, [target.id]: event.target.checked },
-                          }
-                        : null,
-                    )
-                  }
-                  data-testid={`project-settings-copy-target-${target.id}`}
-                />
-                {target.name}
-              </label>
-              {(() => {
-                const plan = planCopyTarget(
-                  copySelection,
-                  target,
-                  copySelection.targetEntries[target.id],
-                );
-                const summary = !copySelection.checked[target.id]
-                  ? "Excluded"
-                  : plan.blocked
-                    ? `Skip: ${copySelection.entryErrors[target.id] ?? plan.blocked}`
-                    : `Apply: ${
-                        [...Object.keys(plan.fields), ...(plan.copyAgent ? ["Agent"] : [])].join(
-                          ", ",
-                        ) || "none"
-                      }${plan.skipped.length ? ` · Skip: ${plan.skipped.join(", ")}` : ""}`;
-                return <p className="ml-5 text-xs text-muted-foreground">{summary}</p>;
-              })()}
-            </div>
-          ))}
+          <div
+            className="flex min-w-0 flex-wrap items-center gap-2 text-sm"
+            data-testid="project-settings-copy-summary"
+          >
+            <span>
+              Apply to:{" "}
+              {summarizeMulti(copySelection.selection, copyPickerItems(copySelection)).text}
+            </span>
+            <PickerShell
+              title="Apply to which projects"
+              open={copyPickerOpen}
+              onOpenChange={(next) => {
+                if (next) setCopyPickerBefore(copySelection.selection);
+                else if (copyPickerBefore)
+                  setCopySelection((current) =>
+                    current ? { ...current, selection: copyPickerBefore } : null,
+                  );
+                setCopyPickerOpen(next);
+              }}
+              trigger={
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setCopyPickerBefore(copySelection.selection);
+                    setCopyPickerOpen(true);
+                  }}
+                >
+                  Change…
+                </Button>
+              }
+              footer={
+                <>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    onClick={() => {
+                      setCopySelection((current) =>
+                        current && copyPickerBefore
+                          ? { ...current, selection: copyPickerBefore }
+                          : current,
+                      );
+                      setCopyPickerBefore(null);
+                      setCopyPickerOpen(false);
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={() => {
+                      setCopyPickerBefore(null);
+                      setCopyPickerOpen(false);
+                    }}
+                  >
+                    Done
+                  </Button>
+                </>
+              }
+            >
+              <SelectionList
+                mode="multi"
+                items={copyPickerItems(copySelection)}
+                value={copySelection.selection}
+                onChange={(selection) =>
+                  setCopySelection((current) => (current ? { ...current, selection } : null))
+                }
+                searchLabel="Search projects"
+                onConfirm={() => {
+                  setCopyPickerBefore(null);
+                  setCopyPickerOpen(false);
+                }}
+              />
+            </PickerShell>
+          </div>
           {copySelection.targets.length === 0 && <p className="text-ui">No other projects.</p>}
           <div className="flex flex-wrap justify-end gap-2">
             <Button type="button" variant="ghost" onClick={() => setCopySelection(null)}>
@@ -1944,7 +2003,12 @@ export function ProjectSettingsDialog({
             <Button
               type="button"
               onClick={() => void applyCopy()}
-              disabled={copyBusy || !sourceSaved}
+              disabled={
+                copyBusy ||
+                !sourceSaved ||
+                summarizeMulti(copySelection.selection, copyPickerItems(copySelection)).applies ===
+                  0
+              }
             >
               Apply selected fields
             </Button>
@@ -2679,6 +2743,11 @@ export function ProjectSettingsDialog({
         )}
         <DialogFooter className="m-0 shrink-0 rounded-none border-t bg-popover px-5 py-4 sm:px-6 sm:py-4">
           <>
+            {projectId && onArchive && (
+              <Button type="button" variant="outline" className="mr-auto" onClick={onArchive}>
+                Archive project
+              </Button>
+            )}
             <Button
               type="button"
               variant="ghost"

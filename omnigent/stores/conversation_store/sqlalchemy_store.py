@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from functools import wraps
 from pathlib import PureWindowsPath
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 
 from sqlalchemy import (
     JSON,
@@ -97,7 +97,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
-from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
+from omnigent.errors import ErrorCode, OmnigentError, ProjectArchivedError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -122,6 +122,7 @@ from omnigent.stores.conversation_store import (
     MAX_PENDING_INPUTS,
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
+    PROJECT_ARCHIVE_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ROTATION_SUCCESSOR_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
@@ -147,6 +148,7 @@ from omnigent.stores.conversation_store import (
     SessionSuccession,
     SuccessionRefusedError,
     pinned_label_key,
+    project_archive_batch_label_key,
     worktree_admission_ancestor_fingerprints,
     worktree_admission_fingerprint,
 )
@@ -157,6 +159,12 @@ from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import (
+    admitted_project_id,
+    assert_project_admits,
+    assert_project_name_admits,
+    project_archive_op_is_current,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -789,6 +797,34 @@ def _fetch_labels(
             .all()
         )
     return dict(rows)
+
+
+def _assert_conversation_restore_admits(
+    ap_sess: Session, meta_sess: Session, conversation_id: str
+) -> None:
+    """Lock the project's visibility row through the conversation transition."""
+    from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+
+    metadata = meta_sess.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+    if metadata is not None and metadata.project_id is not None:
+        assert_project_admits(meta_sess, metadata.project_id)
+        return
+    name = _fetch_labels(ap_sess, conversation_id).get(PROJECT_LABEL_KEY)
+    if not name:
+        return
+    owner = meta_sess.scalar(
+        select(SqlSessionPermission.user_id)
+        .where(
+            SqlSessionPermission.workspace_id == current_workspace_id(),
+            SqlSessionPermission.conversation_id == conversation_id,
+            SqlSessionPermission.level >= LEVEL_OWNER,
+        )
+        .order_by(SqlSessionPermission.level.desc())
+        .limit(1)
+    )
+    assert_project_name_admits(
+        meta_sess, name, user_id=None if owner == RESERVED_USER_LOCAL else owner
+    )
 
 
 def _fetch_labels_bulk(
@@ -1534,6 +1570,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
+        project_owner_user_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
@@ -1633,7 +1671,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "harness_override": harness_override,
             }
         )
-        prepared_labels = _prepare_label_updates(labels) if labels else {}
+        prepared_labels: dict[str, str] = _prepare_label_updates(labels) if labels else {}
         try:
             _validate_inference_snapshot(encoded_inference_snapshot)
             if parent_conversation_id is not None and not title:
@@ -1743,13 +1781,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                     _upsert_prepared_labels(ap_sess, new_id, prepared_labels, now)
                 return row
 
-            row = run_write_transaction(
-                self._conv_session_immediate,
-                "insert_conversation",
-                insert_conversation,
-            )
-
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
+                resolved_project_id = admitted_project_id(
+                    meta_sess, project_id, admission=project_admission
+                )
+                if PROJECT_LABEL_KEY in prepared_labels:
+                    try:
+                        assert_project_name_admits(
+                            meta_sess,
+                            prepared_labels[PROJECT_LABEL_KEY],
+                            user_id=project_owner_user_id,
+                        )
+                    except ProjectArchivedError:
+                        if project_admission != "inherit":
+                            raise
+                        del prepared_labels[PROJECT_LABEL_KEY]
                 meta = SqlConversationMetadata(
                     id=new_id,
                     kind=encoded_kind,
@@ -1761,15 +1807,33 @@ class SqlAlchemyConversationStore(ConversationStore):
                     worktree=worktree,
                     terminal_launch_args=encoded_terminal_launch_args,
                     inference_snapshot=encoded_inference_snapshot,
-                    project_id=project_id,
+                    project_id=resolved_project_id,
                 )
                 meta_sess.add(meta)
                 return meta
 
-            meta = run_write_transaction(
+            ap_committed: SqlConversation | None = None
+
+            def insert_with_project_admission(meta_sess: Session):
+                nonlocal ap_committed
+                meta = insert_metadata(meta_sess)
+                meta_sess.flush()
+                if self._conv_engine is self._engine:
+                    row = insert_conversation(meta_sess)
+                else:
+                    if ap_committed is None:
+                        ap_committed = run_write_transaction(
+                            self._conv_session_immediate,
+                            "insert_conversation",
+                            insert_conversation,
+                        )
+                    row = ap_committed
+                return row, meta
+
+            row, meta = run_write_transaction(
                 self._session_immediate,
-                "insert_conversation_metadata",
-                insert_metadata,
+                "insert_conversation_project_admission",
+                insert_with_project_admission,
             )
             return _to_conversation(row, meta, prepared_labels)
         except IntegrityError as exc:
@@ -1793,6 +1857,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     and ("for key 'primary'" in msg or "for key 'conversations.primary'" in msg)
                 )
                 or ("unique" in msg and "conversations.id" in msg)
+                or ("unique" in msg and "omnigent_conversation_metadata.id" in msg)
             )
             if is_id_unique_violation:
                 raise ConversationAlreadyExistsError(
@@ -2136,11 +2201,31 @@ class SqlAlchemyConversationStore(ConversationStore):
             return
         stamp = updated_at if updated_at is not None else now_epoch()
         stable_updates = dict(updates)
+        project_name = stable_updates.get(PROJECT_LABEL_KEY)
+        owner: str | None = None
+        if project_name:
+            from omnigent.server.auth import RESERVED_USER_LOCAL
+
+            owner = self.get_session_owner(conversation_id, owner_only=True)
+            if owner == RESERVED_USER_LOCAL:
+                owner = None
 
         def write(session: Session) -> None:
+            if project_name and self._conv_engine is self._engine:
+                assert_project_name_admits(session, project_name, user_id=owner)
             _upsert_labels(session, conversation_id, stable_updates, stamp)
 
-        run_write_transaction(self._conv_session_immediate, "set_labels", write)
+        if project_name and self._conv_engine is not self._engine:
+
+            def write_with_project_lock(meta_sess: Session) -> None:
+                assert_project_name_admits(meta_sess, project_name, user_id=owner)
+                run_write_transaction(self._conv_session_immediate, "set_labels", write)
+
+            run_write_transaction(
+                self._session_immediate, "set_project_label_admission", write_with_project_lock
+            )
+        else:
+            run_write_transaction(self._conv_session_immediate, "set_labels", write)
 
     def compare_and_set_label(
         self, conversation_id: str, key: str, expected: str, value: str | None
@@ -2830,6 +2915,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> bool:
+            assert_project_admits(session, project_id)
             result = cast(
                 _RowCountResult,
                 session.execute(
@@ -4090,6 +4176,166 @@ class SqlAlchemyConversationStore(ConversationStore):
             write,
         )
 
+    def list_project_archive_sessions(
+        self,
+        project_id: str,
+        project_name: str,
+        user_id: str | None,
+        batch: str | None = None,
+    ) -> list[Conversation]:
+        """Find owner-scoped members without confusing a same-name foreign project."""
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+
+        with self._session("list_project_archive_owner_ids") as meta_sess:
+            owner_query = select(SqlSessionPermission.conversation_id).where(
+                SqlSessionPermission.workspace_id == current_workspace_id(),
+                SqlSessionPermission.level >= LEVEL_OWNER,
+            )
+            if user_id is None:
+                # No-auth sessions have no grant row. Include them and local
+                # grants, but never an explicitly foreign-owned session.
+                foreign_ids = set(
+                    meta_sess.scalars(
+                        owner_query.where(SqlSessionPermission.user_id != RESERVED_USER_LOCAL)
+                    )
+                )
+                owned_ids = None
+            else:
+                foreign_ids = set()
+                owned_ids = set(
+                    meta_sess.scalars(owner_query.where(SqlSessionPermission.user_id == user_id))
+                )
+            if owned_ids is not None and not owned_ids:
+                return []
+
+            def owner_scope(ids: set[str]) -> set[str]:
+                return ids - foreign_ids if owned_ids is None else ids & owned_ids
+
+            direct_ids: set[str] = set()
+            metadata_ids: set[str] = set()
+            if batch is None:
+                direct_ids = owner_scope(
+                    set(
+                        meta_sess.scalars(
+                            select(SqlConversationMetadata.id).where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlConversationMetadata.project_id == project_id,
+                            )
+                        )
+                    )
+                )
+                metadata_ids = set(
+                    meta_sess.scalars(
+                        select(SqlConversationMetadata.id).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.project_id.is_not(None),
+                        )
+                    )
+                )
+
+        with self._conv_session("list_project_archive_labels") as ap_sess:
+            if batch is None:
+                legacy_ids = (
+                    owner_scope(
+                        set(
+                            ap_sess.scalars(
+                                select(SqlConversationLabel.conversation_id).where(
+                                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                                    SqlConversationLabel.value == project_name,
+                                )
+                            )
+                        )
+                    )
+                    - metadata_ids
+                )
+                selected = direct_ids | legacy_ids
+                frontier = set(selected)
+                while frontier:
+                    children: set[str] = set()
+                    for start in range(0, len(frontier), 500):
+                        batch_ids = list(frontier)[start : start + 500]
+                        children.update(
+                            ap_sess.scalars(
+                                select(SqlConversation.id).where(
+                                    SqlConversation.workspace_id == current_workspace_id(),
+                                    SqlConversation.parent_conversation_id.in_(batch_ids),
+                                )
+                            )
+                        )
+                    frontier = owner_scope(children) - selected
+                    selected.update(frontier)
+                rows = []
+                for start in range(0, len(selected), 500):
+                    rows.extend(
+                        ap_sess.scalars(
+                            select(SqlConversation.id).where(
+                                SqlConversation.workspace_id == current_workspace_id(),
+                                SqlConversation.id.in_(list(selected)[start : start + 500]),
+                                SqlConversation.archived.is_(False),
+                            )
+                        )
+                    )
+                selected = set(rows)
+            else:
+                selected = owner_scope(
+                    set(
+                        ap_sess.scalars(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                or_(
+                                    SqlConversationLabel.key
+                                    == project_archive_batch_label_key(batch),
+                                    and_(
+                                        SqlConversationLabel.key == PROJECT_ARCHIVE_LABEL_KEY,
+                                        SqlConversationLabel.value.like(f"{batch}:%"),
+                                    ),
+                                ),
+                            )
+                        )
+                    )
+                )
+        result: list[Conversation] = []
+        ids = sorted(selected)
+        for start in range(0, len(ids), 500):
+            result.extend(self.get_conversations(ids[start : start + 500]).values())
+        return result
+
+    def clear_project_archive_labels(
+        self, conversation_id: str, project_id: str, op_id: str, batch: str
+    ) -> bool:
+        """Clear one batch's provenance under its current project operation."""
+
+        def clear(ap_sess: Session) -> bool:
+            labels = _fetch_labels(ap_sess, conversation_id)
+            keys = [project_archive_batch_label_key(batch)]
+            if labels.get(PROJECT_ARCHIVE_LABEL_KEY, "").startswith(f"{batch}:"):
+                keys.append(PROJECT_ARCHIVE_LABEL_KEY)
+            result = cast(
+                _RowCountResult,
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(keys),
+                    )
+                ),
+            )
+            return bool(result.rowcount)
+
+        def guarded(meta_sess: Session) -> bool:
+            if not project_archive_op_is_current(meta_sess, project_id, op_id, batch=batch):
+                return False
+            if self._conv_engine is self._engine:
+                return clear(meta_sess)
+            return run_write_transaction(
+                self._conv_session_immediate, "clear_project_archive_labels", clear
+            )
+
+        return run_write_transaction(
+            self._session_immediate, "guard_project_archive_label_clear", guarded
+        )
+
     def list_projects(
         self,
         accessible_by: str | None = None,
@@ -5320,6 +5566,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         worktree_archive_mode: str | None = None,
         override_keep_worktree: bool = False,
         reported_model: str | None = None,
+        expect_archived: bool | None = None,
+        expect_revision: int | None = None,
+        set_labels: dict[str, str] | None = None,
+        remove_labels: list[str] | None = None,
+        project_archive_batch: str | None = None,
+        archive_project_id: str | None = None,
+        archive_op_id: str | None = None,
     ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
@@ -5391,9 +5644,20 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         # Two transactions: AP (the conversation row, which carries the agent
         # binding + per-session override blob) and Omnigent (metadata).
+        archive_admission_session: Session | None = None
+
         def update_ap(
             ap_sess: Session,
-        ) -> tuple[SqlConversation, dict[str, str], bool, bool] | None:
+        ) -> (
+            tuple[
+                SqlConversation,
+                dict[str, str],
+                bool,
+                bool,
+                Literal["applied", "already", "conflict"] | None,
+            ]
+            | None
+        ):
             if archived is not None and self._supports_for_update:
                 ancestors: list[str] = []
                 ancestor_parents: dict[str, str | None] = {}
@@ -5433,6 +5697,31 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = ap_sess.scalar(row_query.execution_options(populate_existing=True))
             if not row:
                 return None
+            if archive_project_id is not None or archive_op_id is not None:
+                if archive_project_id is None or archive_op_id is None:
+                    raise ValueError("project archive guard needs project and operation ids")
+                guard_session = archive_admission_session or ap_sess
+                if not project_archive_op_is_current(
+                    guard_session,
+                    archive_project_id,
+                    archive_op_id,
+                    batch=project_archive_batch,
+                ):
+                    return row, _fetch_labels(ap_sess, conversation_id), False, False, "conflict"
+            conditional_archive = (
+                expect_archived is not None
+                or expect_revision is not None
+                or project_archive_batch is not None
+                or archive_project_id is not None
+            )
+            if conditional_archive:
+                if archived is None:
+                    raise ValueError("conditional archive requires archived state")
+                if expect_archived is not None and row.archived != expect_archived:
+                    outcome = "already" if row.archived == archived else "conflict"
+                    return row, _fetch_labels(ap_sess, conversation_id), False, False, outcome
+                if expect_revision is not None and row.archive_revision != expect_revision:
+                    return row, _fetch_labels(ap_sess, conversation_id), False, False, "conflict"
             ap_changed = False
             if title is not None:
                 row.title = title or ""
@@ -5498,7 +5787,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 cascade_members = archive_cascade_members(
                     _to_conversation(row, None, _fetch_labels(ap_sess, row.id))
                 )
-                if archived and not row.archived:
+                if archived and not row.archived and not conditional_archive:
                     frontier = [row.id]
                     seen = {row.id}
                     while frontier:
@@ -5519,7 +5808,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 archive_targets.append(child)
                                 cascade_members[child.id] = child.archive_revision + 1
                     defer_tree_close = defer_tree_close or len(seen) > 1
-                else:
+                elif not conditional_archive:
                     for child_id, child_revision in cascade_members.items():
                         self._lock_conversation(ap_sess, child_id)
                         child = ap_sess.get(SqlConversation, (current_workspace_id(), child_id))
@@ -5532,6 +5821,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             for row in archive_targets:
                 if archived is None:
                     continue
+                if archived is False and row.archived:
+                    try:
+                        _assert_conversation_restore_admits(
+                            ap_sess, archive_admission_session or ap_sess, row.id
+                        )
+                    except ProjectArchivedError:
+                        if row.id == conversation_id:
+                            raise
+                        continue
                 # archived lives on the AP conversations row; a visible state change.
                 if row.archived != archived:
                     if archived:
@@ -5724,17 +6022,72 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if ap_changed:
                 row.updated_at = now
+            if archived is not None and (not conditional_archive or ap_changed):
+                if set_labels:
+                    _upsert_labels(ap_sess, row.id, set_labels, now)
+                if remove_labels:
+                    ap_sess.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == row.id,
+                            SqlConversationLabel.key.in_(remove_labels),
+                        )
+                    )
+                if project_archive_batch is not None and archived and row.archived:
+                    _upsert_labels(
+                        ap_sess,
+                        row.id,
+                        {
+                            PROJECT_ARCHIVE_LABEL_KEY: (
+                                f"{project_archive_batch}:{row.archive_revision}"
+                            ),
+                            project_archive_batch_label_key(project_archive_batch): str(
+                                row.archive_revision
+                            ),
+                        },
+                        now,
+                    )
             labels = _fetch_labels(ap_sess, conversation_id)
-            return row, labels, reasoning_effort_changed, model_override_changed
+            return (
+                row,
+                labels,
+                reasoning_effort_changed,
+                model_override_changed,
+                "applied" if conditional_archive else None,
+            )
 
-        ap_result = run_write_transaction(
-            self._conv_session_immediate,
-            "update_conversation",
-            update_ap,
-        )
+        if (
+            archived is False or archive_project_id is not None
+        ) and self._conv_engine is not self._engine:
+
+            def update_with_project_lock(meta_sess: Session):
+                nonlocal archive_admission_session
+                archive_admission_session = meta_sess
+                return run_write_transaction(
+                    self._conv_session_immediate, "update_conversation", update_ap
+                )
+
+            ap_result = run_write_transaction(
+                self._session_immediate,
+                "restore_conversation_project_admission",
+                update_with_project_lock,
+            )
+        else:
+            ap_result = run_write_transaction(
+                self._conv_session_immediate,
+                "update_conversation",
+                update_ap,
+            )
         if ap_result is None:
             return None
-        row, labels, reasoning_effort_changed, model_override_changed = ap_result
+        row, labels, reasoning_effort_changed, model_override_changed, archive_outcome = ap_result
+        if archive_outcome in ("conflict", "already"):
+            return ConversationUpdateResult(
+                conversation=_to_conversation(row, self._get_meta(conversation_id), labels),
+                reasoning_effort_changed=False,
+                model_override_changed=False,
+                archive_outcome=archive_outcome,
+            )
         if terminal_launch_args is not None:
             recreated_metadata_kind = encode_conversation_kind(
                 "sub_agent" if row.parent_conversation_id else "default"
@@ -5773,6 +6126,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation=_to_conversation(row, meta, labels),
             reasoning_effort_changed=reasoning_effort_changed,
             model_override_changed=model_override_changed,
+            archive_outcome=archive_outcome,
         )
 
     def update_conversation(
@@ -7144,6 +7498,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
@@ -7224,6 +7579,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
             project_id=project_id,
+            project_admission=project_admission,
             host_id=host_id,
             inference_snapshot=inference_snapshot,
             created_by=created_by,
@@ -7248,6 +7604,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
@@ -7267,7 +7624,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         encoded_inference_snapshot = (
             json.dumps(inference_snapshot) if inference_snapshot is not None else None
         )
-        prepared_labels = _prepare_label_updates(labels) if labels else {}
+        prepared_labels: dict[str, str] = _prepare_label_updates(labels) if labels else {}
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.
         # Get parent root_id from AP first.
@@ -7305,15 +7662,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 _upsert_prepared_labels(ap_sess, conversation_id, prepared_labels, now)
             return conversation_row
 
-        conversation_row = run_write_transaction(
-            self._conv_session_immediate,
-            "create_session_with_agent_conversation",
-            insert_ap,
-        )
-
         def insert_metadata(
             session: Session,
         ) -> tuple[SqlConversationMetadata, SqlAgent]:
+            resolved_project_id = admitted_project_id(
+                session, project_id, admission=project_admission
+            )
+            if PROJECT_LABEL_KEY in prepared_labels:
+                try:
+                    assert_project_name_admits(
+                        session, prepared_labels[PROJECT_LABEL_KEY], user_id=created_by
+                    )
+                except ProjectArchivedError:
+                    if project_admission != "inherit":
+                        raise
+                    del prepared_labels[PROJECT_LABEL_KEY]
             agent_row = _new_session_agent_row(
                 created_by=created_by,
                 agent_id=agent_id,
@@ -7326,7 +7689,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conversation_id,
                 parent_conversation_id=parent_conversation_id,
                 runner_id=runner_id,
-                project_id=project_id,
+                project_id=resolved_project_id,
                 workspace=workspace,
                 worktree=worktree,
                 git_branch=git_branch,
@@ -7338,10 +7701,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.add(meta_row)
             return meta_row, agent_row
 
-        meta_row, agent_row = run_write_transaction(
+        ap_committed: SqlConversation | None = None
+
+        def insert_with_project_admission(session: Session):
+            nonlocal ap_committed
+            meta_row, agent_row = insert_metadata(session)
+            session.flush()
+            if self._conv_engine is self._engine:
+                conversation_row = insert_ap(session)
+            else:
+                if ap_committed is None:
+                    ap_committed = run_write_transaction(
+                        self._conv_session_immediate,
+                        "create_session_with_agent_conversation",
+                        insert_ap,
+                    )
+                conversation_row = ap_committed
+            return conversation_row, meta_row, agent_row
+
+        conversation_row, meta_row, agent_row = run_write_transaction(
             self._session_immediate,
-            "create_session_with_agent_metadata",
-            insert_metadata,
+            "create_session_with_agent_project_admission",
+            insert_with_project_admission,
         )
 
         return _created_session_from_rows(
@@ -7375,6 +7756,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
     ) -> Conversation:
@@ -7534,6 +7916,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             presentation_labels=presentation_labels,
             up_to_response_id=up_to_response_id,
             project_id=project_id,
+            project_admission=project_admission,
             file_id_map=file_id_map,
             created_by=created_by,
         )
@@ -7563,6 +7946,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        project_admission: Literal["reject", "inherit"] = "reject",
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
     ) -> Conversation:
@@ -7890,6 +8274,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{TOUCHED_LABEL_KEY}.")
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
+                and key != PROJECT_ARCHIVE_LABEL_KEY
+                and not key.startswith(f"{PROJECT_ARCHIVE_LABEL_KEY}.")
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
@@ -7983,16 +8369,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                 _upsert_labels(session, new_conv_id, fork_labels, now)
             return new_conv
 
-        new_conv = run_write_transaction(
-            self._conv_session_immediate,
-            "insert_fork_conversation",
-            insert_ap,
-        )
-
         # Write fork metadata (and cloned agent if any) to the Omnigent DB.
         def insert_metadata(
             meta_sess: Session,
         ) -> SqlConversationMetadata:
+            resolved_project_id = admitted_project_id(
+                meta_sess, project_id, admission=project_admission
+            )
+            if PROJECT_LABEL_KEY in fork_labels:
+                try:
+                    assert_project_name_admits(
+                        meta_sess, fork_labels[PROJECT_LABEL_KEY], user_id=created_by
+                    )
+                except ProjectArchivedError:
+                    if project_admission != "inherit":
+                        raise
+                    fork_labels.pop(PROJECT_LABEL_KEY, None)
             fork_meta = SqlConversationMetadata(
                 id=new_conv_id,
                 kind=encoded_default_kind,
@@ -8000,7 +8392,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 inference_snapshot=(
                     source_meta_ref.inference_snapshot if source_meta_ref else None
                 ),
-                project_id=project_id,
+                project_id=resolved_project_id,
             )
             meta_sess.add(fork_meta)
             if creating_clone and agent_id is not None:
@@ -8019,10 +8411,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             return fork_meta
 
-        fork_meta = run_write_transaction(
+        ap_committed: SqlConversation | None = None
+
+        def insert_with_project_admission(meta_sess: Session):
+            nonlocal ap_committed
+            fork_meta = insert_metadata(meta_sess)
+            meta_sess.flush()
+            if self._conv_engine is self._engine:
+                new_conv = insert_ap(meta_sess)
+            else:
+                if ap_committed is None:
+                    ap_committed = run_write_transaction(
+                        self._conv_session_immediate, "insert_fork_conversation", insert_ap
+                    )
+                new_conv = ap_committed
+            return new_conv, fork_meta
+
+        new_conv, fork_meta = run_write_transaction(
             self._session_immediate,
-            "insert_fork_metadata",
-            insert_metadata,
+            "insert_fork_project_admission",
+            insert_with_project_admission,
         )
 
         return _to_conversation(new_conv, fork_meta, fork_labels)

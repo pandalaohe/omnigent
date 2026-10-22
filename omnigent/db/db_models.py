@@ -802,6 +802,8 @@ class SqlProject(OmnigentBase):
     # can always override. Opaque and never SQL-filtered — stored compressed
     # (CompressedText).
     config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    archived_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    archive_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Cross-host collaboration switch. Gates creation, refresh, claim and
     # start only — never observation, completion, publication, cancellation
     # or reconciliation, so an attempt already running can finish after the
@@ -1887,6 +1889,7 @@ class SqlScheduledTask(OmnigentBase):
     custom_agent_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
     # Relates to projects.id. No DB foreign key (Rule R032); NULL = master only.
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    paused_by_archive_batch: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # JSON list of request fields sent as explicit nulls; opaque, never queried.
     explicit_null_fields: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Per-task overrides — None means fall back to the agent default. Widths

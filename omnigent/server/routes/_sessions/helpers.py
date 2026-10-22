@@ -11748,6 +11748,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             "archive cascade labels are server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    if any(
+        key == "omnigent.project_archive" or key.startswith("omnigent.project_archive.")
+        for key in labels
+    ):
+        raise OmnigentError(
+            "Project archive labels are server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if any(key.startswith(ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX) for key in labels):
         raise OmnigentError(
             "worktree admission fence labels are server-internal and cannot be set by clients",
@@ -12266,6 +12274,7 @@ def _persist_stored_session_bundle(
     created_by: str | None = None,
     worktree: str | None = None,
     git_branch: str | None = None,
+    project_admission: Literal["reject", "inherit"] = "reject",
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -12317,6 +12326,7 @@ def _persist_stored_session_bundle(
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
             project_id=metadata.project_id,
+            project_admission=project_admission,
             host_id=metadata.host_id,
             created_by=created_by,
             **inference_kwargs,
@@ -12375,6 +12385,7 @@ def _persist_session_for_uploaded_agent(
     inference_model: str | None = None,
     worktree: str | None = None,
     git_branch: str | None = None,
+    project_owner_user_id: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -12390,6 +12401,11 @@ def _persist_session_for_uploaded_agent(
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
+    project_owner_kwargs: dict[str, Any] = (
+        {"project_owner_user_id": project_owner_user_id}
+        if "omni_project" in metadata.labels
+        else {}
+    )
     try:
         conversation = conversation_store.create_conversation(
             agent_id=agent.id,
@@ -12402,6 +12418,7 @@ def _persist_session_for_uploaded_agent(
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
+            **project_owner_kwargs,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             model_override=inference_model

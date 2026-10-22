@@ -195,6 +195,7 @@ class _ConversationStore:
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        project_admission: str = "reject",
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,
     ) -> Conversation:

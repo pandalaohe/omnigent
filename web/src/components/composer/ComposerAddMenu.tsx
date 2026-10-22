@@ -8,6 +8,8 @@ import {
   TargetIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { PickerShell } from "@/components/PickerShell";
+import { SelectionList } from "@/components/SelectionList";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -57,7 +59,7 @@ export function ComposerAddMenu({
   onProjectSelect?: (name: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [showProjects, setShowProjects] = useState(false);
+  const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const pendingGoalRef = useRef(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
@@ -87,67 +89,51 @@ export function ComposerAddMenu({
   }, [open, measure]);
 
   return (
-    <DropdownMenu
-      open={open}
-      onOpenChange={(nextOpen) => {
-        if (nextOpen) measure();
-        else setShowProjects(false);
-        setOpen(nextOpen);
-      }}
-    >
-      <DropdownMenuTrigger asChild>
-        <Button
-          ref={triggerRef}
-          type="button"
-          size="icon"
-          variant="ghost"
-          className="size-8 rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
-          disabled={disabled}
-          aria-label="Add"
-          title="Add"
-          data-testid={`${testIdPrefix}-attach`}
-          componentId={`${testIdPrefix}.add_menu`}
-        >
-          <PlusIcon
-            className="size-4"
-            data-icon-size="16"
-            data-testid={`${testIdPrefix}-attach-icon`}
-          />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        onCloseAutoFocus={() => {
-          if (pendingGoalRef.current) {
-            pendingGoalRef.current = false;
-            requestAnimationFrame(() => onGoal?.());
-          }
+    <>
+      <DropdownMenu
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen) measure();
+          setOpen(nextOpen);
         }}
-        side="top"
-        align="start"
-        alignOffset={geometry.alignOffset}
-        sideOffset={geometry.sideOffset}
-        collisionPadding={12}
-        aria-label="Add"
-        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px]"
-        style={{ width: geometry.width }}
-        data-testid={`${testIdPrefix}-add-menu`}
       >
-        {showProjects ? (
-          <div className="flex flex-col gap-0.5">
-            <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">
-              Choose a project
-            </div>
-            {projects.length === 0 && <DropdownMenuItem disabled>No projects yet</DropdownMenuItem>}
-            {projects.map((project) => (
-              <DropdownMenuItem key={project.name} onSelect={() => onProjectSelect?.(project.name)}>
-                <span className="flex size-4 shrink-0 items-center justify-center">
-                  <FolderIcon className="size-3.5" />
-                </span>
-                <span className="min-w-0 truncate">{project.name}</span>
-              </DropdownMenuItem>
-            ))}
-          </div>
-        ) : (
+        <DropdownMenuTrigger asChild>
+          <Button
+            ref={triggerRef}
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="size-8 rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
+            disabled={disabled}
+            aria-label="Add"
+            title="Add"
+            data-testid={`${testIdPrefix}-attach`}
+            componentId={`${testIdPrefix}.add_menu`}
+          >
+            <PlusIcon
+              className="size-4"
+              data-icon-size="16"
+              data-testid={`${testIdPrefix}-attach-icon`}
+            />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          onCloseAutoFocus={() => {
+            if (pendingGoalRef.current) {
+              pendingGoalRef.current = false;
+              requestAnimationFrame(() => onGoal?.());
+            }
+          }}
+          side="top"
+          align="start"
+          alignOffset={geometry.alignOffset}
+          sideOffset={geometry.sideOffset}
+          collisionPadding={12}
+          aria-label="Add"
+          className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px]"
+          style={{ width: geometry.width }}
+          data-testid={`${testIdPrefix}-add-menu`}
+        >
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Add</div>
@@ -211,12 +197,7 @@ export function ComposerAddMenu({
                     </DropdownMenuItem>
                   )}
                   {onProjectSelect && (
-                    <DropdownMenuItem
-                      onSelect={(event) => {
-                        event.preventDefault();
-                        setShowProjects(true);
-                      }}
-                    >
+                    <DropdownMenuItem onSelect={() => setProjectPickerOpen(true)}>
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <FolderIcon className="size-3.5" />
                       </span>
@@ -230,8 +211,27 @@ export function ComposerAddMenu({
               </div>
             )}
           </div>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <PickerShell
+        open={projectPickerOpen}
+        onOpenChange={setProjectPickerOpen}
+        title="Choose a project"
+        trigger={<button type="button" className="hidden" aria-hidden="true" tabIndex={-1} />}
+      >
+        <SelectionList
+          mode="single"
+          items={projects.map((project) => ({ id: project.name, label: project.name }))}
+          value={null}
+          onChange={(name) => {
+            onProjectSelect?.(name ?? "");
+            setProjectPickerOpen(false);
+          }}
+          noneLabel="No project"
+          searchLabel="Search projects"
+          emptyLabel="No projects yet"
+        />
+      </PickerShell>
+    </>
   );
 }

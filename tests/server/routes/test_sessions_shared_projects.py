@@ -95,7 +95,15 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
     # so it lists with id=None.
     bob = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": BOB})
     assert bob.status_code == 200
-    assert bob.json() == [{"id": None, "name": "Bob Project", "icon": None}]
+    assert bob.json() == [
+        {
+            "id": None,
+            "name": "Bob Project",
+            "icon": None,
+            "archived_at": None,
+            "archive_summary": {"sessions": 0, "tasks": 0},
+        }
+    ]
 
     # Alice can access the session, but doesn't own it — no folder for her.
     alice = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": ALICE})
