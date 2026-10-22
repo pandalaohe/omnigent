@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -31,11 +32,13 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
+from pydantic import TypeAdapter
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_retention import cli_family_for_resident_harness
@@ -44,6 +47,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
+from omnigent.inner.executor import ExecutorResidentInventory, ExecutorResidentOwner
 from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runner.owner_file import write_owner_entry
@@ -58,6 +62,7 @@ from omnigent.runtime.harnesses.paths import (
 )
 
 _logger = logging.getLogger(__name__)
+_RESIDENT_INVENTORY_DECODER = TypeAdapter(ExecutorResidentInventory)
 
 # Per-AP-instance directory holding all per-conversation Unix
 # sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
@@ -486,6 +491,8 @@ class _SubprocessEntry:
         self.acp_config = acp_config or {}
         self.last_used_at: float = 0.0
         self.exit_confirmed = False
+        # Release generations may roll back after failed teardown; this evidence never does.
+        self.teardown_started = False
 
 
 @dataclass(frozen=True)
@@ -510,6 +517,15 @@ class HarnessInventorySnapshot:
 
     owners: tuple[HarnessResidentSnapshot, ...]
     exit_coverage_complete: bool
+
+
+@dataclass(frozen=True)
+class HarnessContextInventorySnapshot:
+    """Context evidence bound to one selected harness lifetime, never permission."""
+
+    owner: HarnessResidentSnapshot
+    release_generation: int
+    inventory: ExecutorResidentInventory
 
 
 def _model_env_key(harness: str) -> str:
@@ -732,6 +748,80 @@ class HarnessProcessManager:
                 for session_id, entry, closing in entries
             )
             return HarnessInventorySnapshot(snapshots, self._exit_coverage_complete)
+
+    async def read_resident_inventory(
+        self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
+    ) -> HarnessContextInventorySnapshot | None:
+        """Read an existing selected owner's channel; any stale or invalid evidence is unknown."""
+        if not 0 < timeout_s <= 5.0:
+            return None
+        async with self._registry_lock:
+            entry = self._entries.get(owner.session_id)
+            if entry is None or owner.closing or owner.wrapper_exited or owner.exit_confirmed:
+                return None
+            client, process = entry.client, entry.process
+            generation = self._release_generations.get(owner.session_id, 0)
+
+            def still_current() -> bool:
+                return (
+                    self._started
+                    and not self._shutting_down
+                    and self._entries.get(owner.session_id) is entry
+                    and entry.incarnation_id == owner.incarnation_id
+                    and entry.harness == owner.harness
+                    and entry.client is client
+                    and entry.process is process
+                    and not entry.teardown_started
+                    and not entry.exit_confirmed
+                    and entry.incarnation_id not in self._closing_entries
+                    and process.returncode is None
+                    and not client.is_closed
+                    and self._release_generations.get(owner.session_id, 0) == generation
+                )
+
+            if not still_current():
+                return None
+        try:
+            response = await asyncio.wait_for(
+                client.get(
+                    f"/v1/sessions/{quote(owner.session_id, safe='')}/resident-inventory",
+                    timeout=timeout_s,
+                    follow_redirects=False,
+                ),
+                timeout=timeout_s,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            if not isinstance(payload, dict) or set(payload) != {"inventory"}:
+                return None
+            raw = payload["inventory"]
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != {field.name for field in fields(ExecutorResidentInventory)}
+                or not isinstance(raw["owners"], list)
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != {field.name for field in fields(ExecutorResidentOwner)}
+                    for item in raw["owners"]
+                )
+            ):
+                return None
+            inventory = _RESIDENT_INVENTORY_DECODER.validate_json(json.dumps(raw), strict=True)
+            if inventory.aliases_complete or inventory.context_coverage_complete:
+                return None
+            identities = {item.incarnation_id for item in inventory.owners}
+            if len(identities) != len(inventory.owners) or any(
+                not item.incarnation_id or not item.session_keys or not all(item.session_keys)
+                for item in inventory.owners
+            ):
+                return None
+        except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+            return None
+        async with self._registry_lock:
+            if not still_current():
+                return None
+            return HarnessContextInventorySnapshot(owner, generation, inventory)
 
     async def retention_snapshot(
         self,
@@ -1751,6 +1841,7 @@ class HarnessProcessManager:
 
         :param entry: The bookkeeping record to tear down.
         """
+        entry.teardown_started = True
         cancellation: asyncio.CancelledError | None = None
         try:
             await asyncio.wait_for(entry.client.aclose(), timeout=_RELEASE_GRACE_S)
