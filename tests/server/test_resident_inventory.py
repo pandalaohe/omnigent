@@ -570,7 +570,7 @@ async def host_owner_control(monkeypatch):
         connection_id="connection-one",
     )
     conn = hosts.register(
-        "owned-host", server_socket, hello, owner=None, startup_generation="server-generation"
+        uuid4().hex, server_socket, hello, owner=None, startup_generation="server-generation"
     )
     sent = []
     fault = SimpleNamespace(mutate=None)
@@ -883,3 +883,180 @@ async def test_host_owner_inventory_wait_is_bounded_and_late_reply_is_ignored(
         if not read.done():
             read.cancel()
         await asyncio.gather(read, return_exceptions=True)
+
+
+async def test_host_membership_union_preserves_both_sources(
+    host_owner_control, db_uri, monkeypatch
+):
+    from omnigent.server import resident_inventory
+
+    monkeypatch.setattr(resident_inventory, "_HOST_BINDING_PAGE_SIZE", 2)
+
+    hosts, conn, host, socket, _sent, _fault, process = host_owner_control
+    conversations = SqlAlchemyConversationStore(db_uri)
+    main = conversations.create_conversation()
+    side = conversations.create_conversation(parent_conversation_id=main.id)
+    other = conversations.create_conversation()
+    unbound = conversations.create_conversation()
+    for conv in (main, side, other, unbound):
+        conversations.set_host_id(conv.id, conn.host_id, "/opt/work/project")
+    for conv in (main, side):
+        conversations.set_runner_id(conv.id, "runner-one")
+    conversations.set_runner_id(other.id, "server-only")
+    conversations.update_conversation(side.id, archived=True)
+    host._pending_runner_launches["pending-only"] = set()
+    read = asyncio.create_task(
+        resident_inventory.read_host_membership_inventory(hosts, conn, conversations)
+    )
+    try:
+        for _ in range(2):
+            outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+            await host._handle_raw_message(socket, outbound.data)
+        result = await asyncio.wait_for(read, 2)
+        assert result is not None
+        assert result.connection_id == "connection-one"
+        assert result.host_generation == "server-generation"
+        assert result.unbound_session_ids == (unbound.id,)
+        assert [(r.runner_id, r.session_ids) for r in result.runners] == [
+            ("pending-only", ()),
+            ("runner-one", tuple(sorted((main.id, side.id)))),
+            ("server-only", (other.id,)),
+        ]
+        assert result.runners[0].host_owner is None
+        assert result.runners[1].host_owner.incarnation_id == "handle-one"
+        assert result.runners[2].host_owner is None
+        assert not result.aliases_complete and not result.context_coverage_complete
+        assert not conn.pending_owner_inventory
+        process.poll.assert_not_called()
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize("race", ["binding", "host", "account", "connection"])
+async def test_host_membership_union_rejects_changes(host_owner_control, db_uri, race):
+    from omnigent.host.connect import _RunnerHandle
+    from omnigent.server.resident_inventory import read_host_membership_inventory
+
+    hosts, conn, host, socket, _sent, _fault, process = host_owner_control
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, conn.host_id, "/opt/work/project")
+    conversations.set_runner_id(conv.id, "runner-one")
+    read = asyncio.create_task(read_host_membership_inventory(hosts, conn, conversations))
+    try:
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+        await host._handle_raw_message(socket, outbound.data)
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+        if race == "binding":
+            conversations.replace_runner_id(conv.id, "replacement")
+        elif race == "host":
+            host._runners["runner-one"] = _RunnerHandle(process, Path("/opt/work/runner.log"))
+        elif race == "account":
+            conn.account_generation = "replacement"
+        else:
+            hosts.register(conn.host_id, FakeWebSocket(), conn.hello, owner=None)
+        await host._handle_raw_message(socket, outbound.data)
+        assert await asyncio.wait_for(read, 2) is None
+        assert not conn.pending_owner_inventory
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize("fault", ["page-cap", "missing", "reordered", "timeout", "cancel"])
+async def test_host_membership_union_incomplete_is_unknown(
+    host_owner_control, db_uri, monkeypatch, fault
+):
+    from omnigent.server import resident_inventory
+
+    hosts, conn, host, socket, _sent, _fault, _process = host_owner_control
+    conversations = SqlAlchemyConversationStore(db_uri)
+    ids = sorted(conversations.create_conversation().id for _ in range(2))
+    for session_id in ids:
+        conversations.set_host_id(session_id, conn.host_id, "/opt/work/project")
+    if fault == "page-cap":
+        monkeypatch.setattr(resident_inventory, "_HOST_BINDING_PAGE_SIZE", 1)
+        monkeypatch.setattr(resident_inventory, "_MAX_HOST_BINDING_PAGES", 1)
+    elif fault == "missing":
+        monkeypatch.setattr(conversations, "get_runner_ids", lambda _ids: {})
+    elif fault == "reordered":
+        monkeypatch.setattr(conversations, "list_host_conversation_ids", lambda *a, **k: ids[::-1])
+    read = asyncio.create_task(
+        resident_inventory.read_host_membership_inventory(
+            hosts, conn, conversations, timeout_s=0.1
+        )
+    )
+    try:
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+        if fault in {"timeout", "cancel"}:
+            if fault == "cancel":
+                read.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await read
+            else:
+                assert await asyncio.wait_for(read, 2) is None
+            await host._handle_raw_message(socket, outbound.data)
+            await asyncio.sleep(0)
+        else:
+            await host._handle_raw_message(socket, outbound.data)
+            assert await asyncio.wait_for(read, 2) is None
+        assert not conn.pending_owner_inventory
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+async def test_host_membership_union_workspace_mismatch_never_enqueues(host_owner_control, db_uri):
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.server.resident_inventory import read_host_membership_inventory
+
+    hosts, conn, _host, _socket, sent, _fault, _process = host_owner_control
+    conversations = SqlAlchemyConversationStore(db_uri)
+    with workspace_scope(17):
+        assert await read_host_membership_inventory(hosts, conn, conversations) is None
+    assert conn.outbound_queue.empty() and not sent
+
+
+@pytest.mark.parametrize("end", ["timeout", "cancel"])
+async def test_host_membership_union_bounds_database_wait(
+    host_owner_control, db_uri, monkeypatch, end
+):
+    from omnigent.server.resident_inventory import read_host_membership_inventory
+
+    hosts, conn, host, socket, _sent, _fault, _process = host_owner_control
+    conversations = SqlAlchemyConversationStore(db_uri)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def paused_page(*_args, **_kwargs):
+        entered.set()
+        try:
+            assert release.wait(3), "test did not release read-only query"
+            return []
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(conversations, "list_host_conversation_ids", paused_page)
+    read = asyncio.create_task(
+        read_host_membership_inventory(hosts, conn, conversations, timeout_s=0.5)
+    )
+    try:
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
+        await host._handle_raw_message(socket, outbound.data)
+        assert await asyncio.to_thread(entered.wait, 2)
+        if end == "cancel":
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        else:
+            assert await asyncio.wait_for(read, 2) is None
+        assert not conn.pending_owner_inventory and conn.outbound_queue.empty()
+    finally:
+        release.set()
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+        assert await asyncio.to_thread(finished.wait, 2)
