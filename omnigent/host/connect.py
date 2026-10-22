@@ -13,6 +13,7 @@ import concurrent.futures
 import contextlib
 import errno
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, SupportsIndex, SupportsInt, TypeVar, cast
@@ -112,6 +113,10 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostOwnedRunner,
+    HostOwnerInventoryFrame,
+    HostOwnerInventoryResultFrame,
+    HostOwnerInventorySnapshot,
     HostPluginsFrame,
     HostPluginsResultFrame,
     HostPostBindHookFrame,
@@ -1162,6 +1167,7 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+    incarnation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclass(frozen=True)
@@ -1587,6 +1593,23 @@ class HostProcess:
         if dead:
             self._trigger_maintenance("runner_exited_during_reconnect")
         return list(self._runners.keys())
+
+    def _owner_inventory_snapshot(self) -> HostOwnerInventorySnapshot:
+        """Copy the event-loop-owned registrations without probing or reaping."""
+        snapshot = HostOwnerInventorySnapshot(
+            runners=tuple(
+                HostOwnedRunner(
+                    runner_id, handle.incarnation_id, handle.session_id, handle.stop_requested
+                )
+                for runner_id, handle in sorted(self._runners.items())
+            ),
+            pending_runner_ids=tuple(sorted(self._pending_runner_launches)),
+            lifecycle_busy=self._runner_lifecycle_lock.locked(),
+            cleanup_pending=any(not task.done() for task in self._runner_stop_tasks),
+            registration_token="",
+        )
+        token = hashlib.sha256(json.dumps(asdict(snapshot), sort_keys=True).encode()).hexdigest()
+        return replace(snapshot, registration_token=token)
 
     def _tunnel_url(self) -> str:
         """Build the WebSocket tunnel URL.
@@ -5677,6 +5700,20 @@ class HostProcess:
             await self._send_text(ws, encode_host_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
+        elif isinstance(frame, HostOwnerInventoryFrame):
+            inventory = None
+            if self._ws is ws and self._startup_generation == frame.connection_id:
+                current = self._owner_inventory_snapshot()
+                if frame.expected_registration_token in (None, current.registration_token):
+                    inventory = current
+            await self._send_text(
+                ws,
+                encode_host_frame(
+                    HostOwnerInventoryResultFrame(
+                        frame.request_id, frame.connection_id, frame.host_generation, inventory
+                    )
+                ),
+            )
         elif isinstance(frame, HostStatFrame):
             await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):

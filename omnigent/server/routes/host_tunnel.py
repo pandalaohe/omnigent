@@ -57,6 +57,7 @@ from omnigent.host.frames import (
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
+    HostOwnerInventoryResultFrame,
     HostPluginsResultFrame,
     HostPostBindHookResultFrame,
     HostRefreshHarnessesResultFrame,
@@ -1269,6 +1270,11 @@ async def _receive_loop(
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostOwnerInventoryResultFrame):
+            owner_future = conn.pending_owner_inventory.pop(frame.request_id, None)
+            if owner_future is not None and not owner_future.done():
+                owner_future.set_result(frame)
             continue
         if isinstance(frame, HostPluginsResultFrame):
             plugins_future = conn.pending_plugins.pop(frame.request_id, None)

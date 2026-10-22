@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -544,3 +545,341 @@ async def test_inventory_commit_keeps_unrelated_traffic_and_eventloop_moving(
             await tunnels.register_async("target", FakeWebSocket(), HelloFrame("test", 1))
         ).generation != target.generation
     assert not tunnels._lifecycle_locks
+
+
+@pytest.fixture
+async def host_owner_control(monkeypatch):
+    from omnigent.host.connect import HostProcess, _RunnerHandle
+    from omnigent.server.routes.host_tunnel import _receive_loop
+
+    class ServerSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.inbox = asyncio.Queue()
+
+        async def receive(self):
+            return await self.inbox.get()
+
+    server_socket = ServerSocket()
+    hosts = HostRegistry()
+    hello = HostHelloFrame(
+        "test",
+        1,
+        "sample-host",
+        capabilities=["resident_inventory_v1"],
+        connection_id="connection-one",
+    )
+    conn = hosts.register(
+        "owned-host", server_socket, hello, owner=None, startup_generation="server-generation"
+    )
+    sent = []
+    fault = SimpleNamespace(mutate=None)
+
+    class HostSocket:
+        async def send(self, raw):
+            sent.append(raw)
+            if fault.mutate is not None:
+                raw = fault.mutate(raw)
+            await server_socket.inbox.put({"type": "websocket.receive", "text": raw})
+
+    socket = HostSocket()
+    host = object.__new__(HostProcess)
+    host._ws = socket
+    host._startup_generation = "connection-one"
+    host._runner_lifecycle_lock = asyncio.Lock()
+    host._runner_stop_tasks = set()
+    host._pending_runner_launches = {}
+    process = Mock()
+    process.poll.side_effect = AssertionError("must not probe")
+    process.kill.side_effect = AssertionError("must not stop")
+    handle = _RunnerHandle(process, Path("/opt/work/runner.log"), session_id="session-one")
+    handle.incarnation_id = "handle-one"
+    host._runners = {"runner-one": handle}
+
+    async def send(ws, raw):
+        await ws.send(raw)
+
+    host._send_text = send
+    for name in (
+        "_alive_runner_ids",
+        "_trigger_maintenance",
+        "_cleanup_runners",
+        "_handle_launch",
+    ):
+        monkeypatch.setattr(host, name, Mock(side_effect=AssertionError("read must be pure")))
+    receiver = asyncio.create_task(
+        _receive_loop(
+            server_socket,
+            conn,
+            conn.host_id,
+            Mock(),
+            hosts,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    )
+    try:
+        yield hosts, conn, host, socket, sent, fault, process
+    finally:
+        receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
+        hosts.deregister(conn.host_id, conn=conn)
+
+
+async def test_host_owner_inventory_control_round_trip_is_pure(host_owner_control):
+    from dataclasses import asdict
+
+    from omnigent.server.resident_inventory import read_host_owner_inventory
+
+    hosts, conn, host, socket, sent, _fault, process = host_owner_control
+    read = asyncio.create_task(read_host_owner_inventory(hosts, conn))
+    try:
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), timeout=2)
+        await host._handle_raw_message(socket, outbound.data)
+        result = await asyncio.wait_for(read, timeout=2)
+        assert result.connection_id == "connection-one"
+        assert result.host_generation == "server-generation"
+        inventory = asdict(result.inventory)
+        token = inventory.pop("registration_token")
+        assert len(token) == 64
+        assert inventory == {
+            "runners": (
+                {
+                    "runner_id": "runner-one",
+                    "incarnation_id": "handle-one",
+                    "session_id": "session-one",
+                    "stop_requested": False,
+                },
+            ),
+            "pending_runner_ids": (),
+            "lifecycle_busy": False,
+            "cleanup_pending": False,
+            "aliases_complete": False,
+            "context_coverage_complete": False,
+        }
+        assert len(sent) == 1
+        assert not conn.pending_owner_inventory
+        assert host._runners["runner-one"].incarnation_id == "handle-one"
+        process.poll.assert_not_called()
+        process.kill.assert_not_called()
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+async def _exchange_host_owner_control(control, **kwargs):
+    from omnigent.server.resident_inventory import read_host_owner_inventory
+
+    hosts, conn, host, socket, _sent, _fault, _process = control
+    read = asyncio.create_task(read_host_owner_inventory(hosts, conn, **kwargs))
+    try:
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), timeout=2)
+        await host._handle_raw_message(socket, outbound.data)
+        return await asyncio.wait_for(read, timeout=2)
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+async def test_host_owner_inventory_revalidates_registration_token_and_handle_lifetime(
+    host_owner_control,
+):
+    from dataclasses import FrozenInstanceError
+
+    from omnigent.host.connect import _RunnerHandle
+
+    _hosts, _conn, host, _socket, _sent, _fault, process = host_owner_control
+    first = await _exchange_host_owner_control(host_owner_control)
+    token = first.inventory.registration_token
+    same = await _exchange_host_owner_control(
+        host_owner_control, expected_registration_token=token
+    )
+    assert same.inventory == first.inventory
+    with pytest.raises(FrozenInstanceError):
+        first.inventory.cleanup_pending = True
+    replacement = _RunnerHandle(process, Path("/opt/work/runner.log"), session_id="session-one")
+    another = _RunnerHandle(process, Path("/opt/work/runner.log"), session_id="session-one")
+    assert replacement.incarnation_id != another.incarnation_id
+    assert replacement.incarnation_id != "handle-one"
+    host._runners["runner-one"] = replacement
+    assert (
+        await _exchange_host_owner_control(host_owner_control, expected_registration_token=token)
+        is None
+    )
+    current = await _exchange_host_owner_control(host_owner_control)
+    assert current.inventory.registration_token != token
+    assert current.inventory.runners[0].incarnation_id == replacement.incarnation_id
+    assert first.inventory.runners[0].incarnation_id == "handle-one"
+    host._runners.clear()
+    empty = await _exchange_host_owner_control(host_owner_control)
+    assert empty.inventory.runners == ()
+    assert not empty.inventory.aliases_complete and not empty.inventory.context_coverage_complete
+
+
+async def test_host_owner_inventory_keeps_pending_cleanup_unknown_without_waiting(
+    host_owner_control,
+):
+    _hosts, _conn, host, _socket, _sent, _fault, process = host_owner_control
+    pending = asyncio.get_running_loop().create_future()
+    host._pending_runner_launches["runner-pending"] = {pending}
+    cleanup = asyncio.create_task(asyncio.Event().wait())
+    host._runner_stop_tasks.add(cleanup)
+    await host._runner_lifecycle_lock.acquire()
+    try:
+        result = await _exchange_host_owner_control(host_owner_control)
+        assert result.inventory.pending_runner_ids == ("runner-pending",)
+        assert result.inventory.cleanup_pending and result.inventory.lifecycle_busy
+        assert not result.inventory.context_coverage_complete
+        assert not cleanup.done() and not pending.done()
+        assert host._runner_lifecycle_lock.locked()
+        process.poll.assert_not_called()
+    finally:
+        host._runner_lifecycle_lock.release()
+        pending.cancel()
+        cleanup.cancel()
+        await asyncio.gather(cleanup, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "race",
+    [
+        "disconnect",
+        "replacement",
+        "account",
+        "generation",
+        "connection",
+        "socket",
+        "host-socket",
+        "host-generation",
+    ],
+)
+async def test_host_owner_inventory_rejects_stale_control_replies(host_owner_control, race):
+    from omnigent.server.resident_inventory import read_host_owner_inventory
+
+    hosts, conn, host, socket, _sent, _fault, _process = host_owner_control
+    read = asyncio.create_task(read_host_owner_inventory(hosts, conn))
+    try:
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), timeout=2)
+        if race == "disconnect":
+            hosts.deregister(conn.host_id, conn=conn)
+        elif race == "replacement":
+            hosts.register(conn.host_id, FakeWebSocket(), conn.hello, owner=None)
+        elif race == "account":
+            conn.account_generation = "new-account"
+        elif race == "generation":
+            conn.startup_generation = "new-host-generation"
+        elif race == "connection":
+            conn.hello.connection_id = "new-connection"
+        elif race == "socket":
+            conn.ws = FakeWebSocket()
+        elif race == "host-socket":
+            host._ws = object()
+        else:
+            host._startup_generation = "new-connection"
+        await host._handle_raw_message(socket, outbound.data)
+        assert await asyncio.wait_for(read, timeout=2) is None
+        assert not conn.pending_owner_inventory
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "reason", ["unsupported", "missing-connection", "missing-host", "invalid-timeout"]
+)
+async def test_host_owner_inventory_compatibility_unknown_never_enqueues(
+    host_owner_control, reason
+):
+    from omnigent.server.resident_inventory import read_host_owner_inventory
+
+    hosts, conn, _host, _socket, sent, _fault, _process = host_owner_control
+    if reason == "unsupported":
+        conn.hello.capabilities.clear()
+    elif reason == "missing-connection":
+        conn.hello.connection_id = None
+    elif reason == "missing-host":
+        hosts.deregister(conn.host_id, conn=conn)
+        assert conn.outbound_queue.get_nowait() is None
+    result = await read_host_owner_inventory(
+        hosts, conn, timeout_s=0 if reason == "invalid-timeout" else 0.05
+    )
+    assert result is None and sent == []
+    assert conn.outbound_queue.empty()
+    assert not conn.pending_owner_inventory
+
+
+@pytest.mark.parametrize(
+    "fault_kind",
+    [
+        "bool-string",
+        "missing-field",
+        "extra-field",
+        "duplicate-owner",
+        "complete-coverage",
+        "wrong-generation",
+        "wrong-connection",
+        "wrong-read-id",
+    ],
+)
+async def test_host_owner_inventory_invalid_reply_is_unknown(host_owner_control, fault_kind):
+    import json
+
+    _hosts, conn, _host, _socket, _sent, fault, _process = host_owner_control
+
+    def mutate(raw):
+        body = json.loads(raw)
+        if fault_kind == "bool-string":
+            body["inventory"]["runners"][0]["stop_requested"] = "false"
+        elif fault_kind == "missing-field":
+            body["inventory"].pop("cleanup_pending")
+        elif fault_kind == "extra-field":
+            body["inventory"]["runners"][0]["unexpected"] = "field"
+        elif fault_kind == "duplicate-owner":
+            body["inventory"]["runners"] *= 2
+        elif fault_kind == "complete-coverage":
+            body["inventory"]["context_coverage_complete"] = True
+        elif fault_kind == "wrong-generation":
+            body["host_generation"] = "different-generation"
+        elif fault_kind == "wrong-connection":
+            body["connection_id"] = "different-connection"
+        else:
+            body["request_id"] = "different-read"
+        return json.dumps(body)
+
+    fault.mutate = mutate
+    assert await _exchange_host_owner_control(host_owner_control, timeout_s=0.05) is None
+    assert not conn.pending_owner_inventory
+
+
+@pytest.mark.parametrize("end", ["timeout", "cancel"])
+async def test_host_owner_inventory_wait_is_bounded_and_late_reply_is_ignored(
+    host_owner_control, end
+):
+    from omnigent.server.resident_inventory import read_host_owner_inventory
+
+    hosts, conn, host, socket, _sent, _fault, _process = host_owner_control
+    read = asyncio.create_task(read_host_owner_inventory(hosts, conn, timeout_s=0.05))
+    try:
+        outbound = await asyncio.wait_for(conn.outbound_queue.get(), timeout=2)
+        if end == "cancel":
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(read, timeout=2)
+        else:
+            assert await asyncio.wait_for(read, timeout=2) is None
+        assert not conn.pending_owner_inventory
+        await host._handle_raw_message(socket, outbound.data)
+        await asyncio.sleep(0)
+        assert not conn.pending_owner_inventory
+        assert list(host._runners) == ["runner-one"]
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)

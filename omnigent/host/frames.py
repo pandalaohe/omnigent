@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from os import PathLike
 from typing import Any, Literal, NoReturn
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from omnigent.codex_rate_limits import validate_codex_rate_limits_snapshot
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
@@ -204,6 +204,8 @@ class HostFrameKind(str, Enum):
     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
     MCP_SERVERS = "host.mcp_servers"
     MCP_SERVERS_RESULT = "host.mcp_servers_result"
+    OWNER_INVENTORY = "host.owner_inventory"
+    OWNER_INVENTORY_RESULT = "host.owner_inventory_result"
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
@@ -1391,6 +1393,46 @@ class HostMcpServersFrame:
     request_id: str
 
 
+@dataclass(frozen=True)
+class HostOwnedRunner:
+    runner_id: str
+    incarnation_id: str
+    session_id: str | None
+    stop_requested: bool
+
+
+@dataclass(frozen=True)
+class HostOwnerInventorySnapshot:
+    """Copied registrations, never complete runtime membership or absence proof."""
+
+    runners: tuple[HostOwnedRunner, ...]
+    pending_runner_ids: tuple[str, ...]
+    lifecycle_busy: bool
+    cleanup_pending: bool
+    registration_token: str
+    aliases_complete: bool = False
+    context_coverage_complete: bool = False
+
+
+_HOST_OWNER_INVENTORY_DECODER = TypeAdapter(HostOwnerInventorySnapshot)
+
+
+@dataclass
+class HostOwnerInventoryFrame:
+    request_id: str
+    connection_id: str
+    host_generation: str
+    expected_registration_token: str | None = None
+
+
+@dataclass
+class HostOwnerInventoryResultFrame:
+    request_id: str
+    connection_id: str
+    host_generation: str
+    inventory: HostOwnerInventorySnapshot | None = None
+
+
 @dataclass
 class HostMcpServersResultFrame:
     """Host → server: MCP server names and metadata, never env, args, or URLs."""
@@ -1698,6 +1740,8 @@ HostFrame = (
     | HostHarnessStartupResultFrame
     | HostMcpServersFrame
     | HostMcpServersResultFrame
+    | HostOwnerInventoryFrame
+    | HostOwnerInventoryResultFrame
     | HostImportLocalFrame
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
@@ -2292,6 +2336,12 @@ def encode_host_frame(frame: HostFrame) -> str:
         return _encode_payload(
             {"kind": HostFrameKind.MCP_SERVERS.value, "request_id": frame.request_id}
         )
+    if isinstance(frame, HostOwnerInventoryFrame):
+        return _encode_payload({"kind": HostFrameKind.OWNER_INVENTORY.value, **asdict(frame)})
+    if isinstance(frame, HostOwnerInventoryResultFrame):
+        return _encode_payload(
+            {"kind": HostFrameKind.OWNER_INVENTORY_RESULT.value, **asdict(frame)}
+        )
     if isinstance(frame, HostMcpServersResultFrame):
         return _encode_payload(
             {
@@ -2787,6 +2837,17 @@ def _decode_known_host_frame(
             return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.MCP_SERVERS_RESULT:
             return _decode_mcp_servers_result(msg)
+        case HostFrameKind.OWNER_INVENTORY:
+            return HostOwnerInventoryFrame(
+                request_id=_required_str(msg, "request_id"),
+                connection_id=_required_str(msg, "connection_id"),
+                host_generation=_required_str(msg, "host_generation"),
+                expected_registration_token=_optional_nullable_str(
+                    msg, "expected_registration_token"
+                ),
+            )
+        case HostFrameKind.OWNER_INVENTORY_RESULT:
+            return _decode_owner_inventory_result(msg)
         case HostFrameKind.PLUGINS:
             return HostPluginsFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.PLUGINS_RESULT:
@@ -3536,6 +3597,41 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
 _MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id")
+
+
+def _decode_owner_inventory_result(msg: _JsonObject) -> HostOwnerInventoryResultFrame:
+    inventory = None
+    raw = msg.get("inventory")
+    try:
+        if (
+            isinstance(raw, dict)
+            and set(raw) == {item.name for item in fields(HostOwnerInventorySnapshot)}
+            and isinstance(raw["runners"], list)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {part.name for part in fields(HostOwnedRunner)}
+                for item in raw["runners"]
+            )
+        ):
+            candidate = _HOST_OWNER_INVENTORY_DECODER.validate_json(json.dumps(raw), strict=True)
+            if (
+                not candidate.aliases_complete
+                and not candidate.context_coverage_complete
+                and candidate.registration_token
+                and len({item.runner_id for item in candidate.runners}) == len(candidate.runners)
+                and len({item.incarnation_id for item in candidate.runners})
+                == len(candidate.runners)
+                and all(item.runner_id and item.incarnation_id for item in candidate.runners)
+            ):
+                inventory = candidate
+    except ValueError:
+        pass
+    return HostOwnerInventoryResultFrame(
+        _required_str(msg, "request_id"),
+        _required_str(msg, "connection_id"),
+        _required_str(msg, "host_generation"),
+        inventory,
+    )
 
 
 def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:

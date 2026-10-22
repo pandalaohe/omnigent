@@ -10,9 +10,75 @@ import httpx
 
 from omnigent.db.account_authority import AccountAuthority
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import (
+    HostOwnerInventoryFrame,
+    HostOwnerInventoryResultFrame,
+    encode_host_frame,
+)
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore
+
+
+async def read_host_owner_inventory(
+    hosts: HostRegistry,
+    conn: HostConnection,
+    *,
+    expected_registration_token: str | None = None,
+    timeout_s: float = 5.0,
+) -> HostOwnerInventoryResultFrame | None:
+    """Read or revalidate copied registrations on this exact authenticated host tunnel."""
+    connection_id = conn.hello.connection_id
+    ws = conn.ws
+    owner = (conn.workspace_id, conn.owner, conn.account_generation, conn.startup_generation)
+    if (
+        not 0 < timeout_s <= 5.0
+        or not connection_id
+        or hosts.get(conn.host_id, workspace_id=conn.workspace_id) is not conn
+        or "resident_inventory_v1" not in conn.hello.capabilities
+    ):
+        return None
+    request_id = uuid4().hex
+    future: asyncio.Future[HostOwnerInventoryResultFrame] = (
+        asyncio.get_running_loop().create_future()
+    )
+    conn.pending_owner_inventory[request_id] = future
+    try:
+        async with asyncio.timeout(timeout_s):
+            hosts.send_text(
+                conn,
+                encode_host_frame(
+                    HostOwnerInventoryFrame(
+                        request_id, connection_id, owner[3], expected_registration_token
+                    )
+                ),
+            )
+            result = await future
+        if (
+            hosts.get(conn.host_id, workspace_id=owner[0]) is not conn
+            or conn.ws is not ws
+            or (conn.workspace_id, conn.owner, conn.account_generation, conn.startup_generation)
+            != owner
+            or conn.hello.connection_id != connection_id
+            or result.request_id != request_id
+            or result.connection_id != connection_id
+            or result.host_generation != owner[3]
+            or result.inventory is None
+            or (
+                expected_registration_token is not None
+                and result.inventory.registration_token != expected_registration_token
+            )
+        ):
+            return None
+        return result
+    except (ConnectionError, TimeoutError):
+        return None
+    finally:
+        conn.pending_owner_inventory.pop(request_id, None)
+        if not future.done():
+            future.cancel()
+        elif not future.cancelled():
+            future.exception()
 
 
 async def retain_unknown_owner_inventory(
