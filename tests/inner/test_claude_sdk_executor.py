@@ -263,6 +263,194 @@ def test_resident_inventory_rejects_unsupported_owner_aliases(monkeypatch, inval
     assert executor.resident_inventory() is None
 
 
+@pytest.fixture
+def resident_vendor_client(monkeypatch):
+    from claude_agent_sdk import SystemMessage
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    sdk = _make_recovery_fake_sdk()
+    sdk.SystemMessage = SystemMessage
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._ensure_sdk", lambda: sdk)
+    executor = ClaudeSDKExecutor()
+    client = sdk.ClaudeSDKClient(None)
+    state = _ClaudeClientState(client=client, model=None, permission_mode="auto")
+    executor._clients["main"] = state
+    return executor, sdk, client, state
+
+
+def _resident_vendor_result(session_id):
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(
+        subtype="success",
+        duration_ms=0,
+        duration_api_ms=0,
+        is_error=False,
+        num_turns=1,
+        session_id=session_id,
+        result="done",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["init", "result"])
+@pytest.mark.parametrize("channel", ["turn", "maintenance"])
+async def test_resident_inventory_observes_vendor_identity_from_current_stream(
+    resident_vendor_client, source, channel
+):
+    executor, sdk, client, state = resident_vendor_client
+    wire = (
+        sdk.SystemMessage("init", {"session_id": "vendor-main"})
+        if source == "init"
+        else _resident_vendor_result("vendor-main")
+    )
+    snapshots = []
+
+    async def response():
+        yield wire
+        snapshots.append(executor.resident_inventory())
+        if source == "init":
+            yield _resident_vendor_result("vendor-main")
+
+    client.receive_response = response
+    if channel == "turn":
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "current prompt", "session_id": "main"}], [], ""
+            )
+        ]
+        assert any(isinstance(event, TurnComplete) for event in events)
+        assert not any(isinstance(event, ExecutorError) for event in events)
+    else:
+        receipt = await executor.keep_warm(attempt_id="maintenance", family="claude")
+        assert receipt["outcome"] == "ok"
+    snapshot = snapshots[0] if snapshots else executor.resident_inventory()
+    (owner,) = snapshot.owners
+    assert owner.vendor_context_id == "vendor-main"
+    assert owner.incarnation_id == state.resident_incarnation_id
+    assert owner.session_keys == ("main",)
+    assert not snapshot.aliases_complete and not snapshot.context_coverage_complete
+    assert executor._clients["main"] is state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_id", [None, "", "   ", 7, {"id": "untrusted"}])
+async def test_resident_inventory_ignores_invalid_ids_and_child_system_events(
+    resident_vendor_client, invalid_id
+):
+    executor, sdk, client, _ = resident_vendor_client
+    client.receive_response = lambda: _stream_messages(
+        sdk.SystemMessage("init", {"session_id": invalid_id}),
+        sdk.SystemMessage("init", {"session_id": "child", "agent_id": "agent"}),
+        sdk.SystemMessage("init", {"session_id": "child", "parent_tool_use_id": "tool"}),
+        sdk.SystemMessage("task_started", {"session_id": "background"}),
+        _resident_vendor_result(invalid_id),
+    )
+    await executor.keep_warm(attempt_id="no-identity", family="claude")
+    (owner,) = executor.resident_inventory().owners
+    assert owner.vendor_context_id is None
+    assert not executor.resident_inventory().context_coverage_complete
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["turn", "maintenance"])
+async def test_resident_inventory_context_conflict_is_monotonic(resident_vendor_client, channel):
+    executor, sdk, client, state = resident_vendor_client
+    client.receive_response = lambda: _stream_messages(
+        sdk.SystemMessage("init", {"session_id": "first-vendor"}),
+        _resident_vendor_result("different-vendor"),
+    )
+    if channel == "turn":
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "current prompt", "session_id": "main"}], [], ""
+            )
+        ]
+        assert any(isinstance(event, TurnComplete) for event in events)
+    else:
+        assert (await executor.keep_warm(attempt_id="conflict", family="claude"))[
+            "outcome"
+        ] == "ok"
+    assert state.vendor_context_id == "first-vendor"
+    assert executor.resident_inventory() is None
+    client.receive_response = lambda: _stream_messages(_resident_vendor_result("first-vendor"))
+    await executor.keep_warm(attempt_id="later-consistent", family="claude")
+    assert executor.resident_inventory() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["turn", "maintenance"])
+@pytest.mark.parametrize("race", ["new-client", "same-client", "mutated-client", "removed"])
+async def test_resident_inventory_does_not_bind_late_ids_to_replacement(
+    resident_vendor_client, channel, race
+):
+    from omnigent.inner.claude_sdk_executor import _ClaudeClientState
+
+    executor, sdk, client, state = resident_vendor_client
+    replacement = _ClaudeClientState(
+        client=client if race == "same-client" else sdk.ClaudeSDKClient(None), model=None
+    )
+
+    async def query(*args, **kwargs):
+        if race == "removed":
+            executor._clients.pop("main")
+        elif race == "mutated-client":
+            state.client = replacement.client
+        else:
+            executor._clients["main"] = replacement
+
+    client.query = query
+    client.receive_response = lambda: _stream_messages(_resident_vendor_result("late-vendor"))
+    if channel == "turn":
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "current prompt", "session_id": "main"}], [], ""
+            )
+        ]
+        assert any(isinstance(event, TurnComplete) for event in events)
+    else:
+        assert (await executor.keep_warm(attempt_id="race", family="claude"))["outcome"] == "ok"
+    assert state.vendor_context_id is None and replacement.vendor_context_id is None
+    snapshot = executor.resident_inventory()
+    assert snapshot is not None and not snapshot.context_coverage_complete
+    if race == "removed":
+        assert snapshot.owners == ()
+    else:
+        assert snapshot.owners[0].vendor_context_id is None
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_preserves_same_vendor_id_on_independent_owners(
+    resident_vendor_client,
+):
+    from omnigent.inner.claude_sdk_executor import _ClaudeClientState
+
+    executor, sdk, main_client, _ = resident_vendor_client
+    side_client = sdk.ClaudeSDKClient(None)
+    executor._clients["side"] = _ClaudeClientState(
+        client=side_client, model=None, permission_mode="auto"
+    )
+    for key, client in [("main", main_client), ("side", side_client)]:
+        client.receive_response = lambda: _stream_messages(_resident_vendor_result("same-vendor"))
+        [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "current prompt", "session_id": key}], [], ""
+            )
+        ]
+    snapshot = executor.resident_inventory()
+    assert len(snapshot.owners) == 2
+    assert {owner.session_keys for owner in snapshot.owners} == {("main",), ("side",)}
+    assert {owner.vendor_context_id for owner in snapshot.owners} == {"same-vendor"}
+    assert snapshot.ambiguous_context_ids == ("same-vendor",)
+    assert not snapshot.aliases_complete and not snapshot.context_coverage_complete
+
+
 # ---------------------------------------------------------------------------
 # Tests: Prompt extraction
 # ---------------------------------------------------------------------------
@@ -6219,7 +6407,7 @@ class _PingAssistantMessage:
 def _ping_sdk():
     """Fake SDK module exposing only what the ping drain narrows on."""
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _PingAssistantMessage
         ResultMessage = _PingResultMessage
 

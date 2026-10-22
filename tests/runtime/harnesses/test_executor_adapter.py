@@ -3043,6 +3043,15 @@ async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknow
                 "context_coverage_complete": False,
             }
         }
+        if family == "claude-sdk":
+            state = executor._clients["owner-key"]
+            state.vendor_context_id = "vendor-context"
+            observed = (await client.get(route)).json()["inventory"]
+            assert observed["owners"][0]["vendor_context_id"] == "vendor-context"
+            assert observed["aliases_complete"] is False
+            assert observed["context_coverage_complete"] is False
+            state.resident_context_conflict = True
+            assert (await client.get(route)).json() == {"inventory": None}
         cleanup = asyncio.create_task(asyncio.sleep(0, result=True))
         adapter._abandoned_executor_cleanup = cleanup
         assert (await client.get(route)).json() == {"inventory": None}

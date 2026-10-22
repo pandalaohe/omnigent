@@ -869,6 +869,8 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     resident_incarnation_id: str = field(default_factory=lambda: uuid4().hex)
+    vendor_context_id: str | None = None
+    resident_context_conflict: bool = False
 
 
 @dataclass
@@ -2495,6 +2497,7 @@ class ClaudeSDKExecutor(Executor):
         :returns: The drained outcome, receipt-ready.
         """
         sdk = cast(_ClaudeSDK, _ensure_sdk())
+        resident_owner = self._clients.get(session_key)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _KEEP_WARM_PING_BUDGET_S
         try:
@@ -2545,6 +2548,7 @@ class ClaudeSDKExecutor(Executor):
                     message = next_task.result()
                 except StopAsyncIteration:
                     break
+                self._observe_resident_context(session_key, client, resident_owner, message, sdk)
                 if isinstance(message, sdk.AssistantMessage):
                     ping_model = (
                         concrete_reported_model(getattr(message, "model", None)) or ping_model
@@ -2776,10 +2780,48 @@ class ClaudeSDKExecutor(Executor):
         client._query = None
         client._transport = None
 
+    def _observe_resident_context(
+        self,
+        session_key: str,
+        client: _ClaudeClient,
+        owner: _ClaudeClientState | None,
+        message: object,
+        sdk: _ClaudeSDK,
+    ) -> None:
+        if (
+            owner is None
+            or self._clients.get(session_key) is not owner
+            or owner.client is not client
+        ):
+            return
+        if getattr(message, "parent_tool_use_id", None) is not None:
+            return
+        if isinstance(message, sdk.ResultMessage):
+            context_id = getattr(message, "session_id", None)
+        elif isinstance(message, sdk.SystemMessage):
+            system = cast(_SystemMessageObj, message)
+            data = system.data
+            if (
+                system.subtype != "init"
+                or not isinstance(data, dict)
+                or data.get("agent_id") is not None
+                or data.get("parent_tool_use_id") is not None
+            ):
+                return
+            context_id = data.get("session_id")
+        else:
+            return
+        if not isinstance(context_id, str) or not context_id.strip():
+            return
+        if owner.vendor_context_id is None:
+            owner.vendor_context_id = context_id
+        elif owner.vendor_context_id != context_id:
+            owner.resident_context_conflict = True
+
     def resident_inventory(self) -> ExecutorResidentInventory | None:
         """Copy registered client owners without loading or probing the SDK.
 
-        Connecting clients, vendor IDs and independent SDK subcontexts are not
+        Connecting clients and independent SDK subcontexts are not
         covered. A retired client keeps absence unknown even after cleanup returns.
         """
         if self._resident_inventory_detached:
@@ -2787,7 +2829,11 @@ class ClaudeSDKExecutor(Executor):
         owners: dict[str, ExecutorResidentOwner] = {}
         clients: set[int] = set()
         for session_key, state in tuple(self._clients.items()):
-            if not isinstance(state, _ClaudeClientState) or not session_key:
+            if (
+                not isinstance(state, _ClaudeClientState)
+                or not session_key
+                or state.resident_context_conflict
+            ):
                 return None
             identity = state.resident_incarnation_id
             # A shared SDK client does not prove keys are read-only context aliases.
@@ -2797,13 +2843,22 @@ class ClaudeSDKExecutor(Executor):
             owners[identity] = ExecutorResidentOwner(
                 incarnation_id=identity,
                 session_keys=(session_key,),
-                vendor_context_id=None,
+                vendor_context_id=state.vendor_context_id,
                 started=True,
                 closing=False,
                 cleanup_complete=False,
             )
+        context_counts: dict[str, int] = {}
+        for owner in owners.values():
+            if owner.vendor_context_id is not None:
+                context_counts[owner.vendor_context_id] = (
+                    context_counts.get(owner.vendor_context_id, 0) + 1
+                )
         return ExecutorResidentInventory(
-            owners=tuple(owners[identity] for identity in sorted(owners))
+            owners=tuple(owners[identity] for identity in sorted(owners)),
+            ambiguous_context_ids=tuple(
+                sorted(key for key, count in context_counts.items() if count > 1)
+            ),
         )
 
     def supports_streaming(self) -> bool:
@@ -3837,6 +3892,7 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") == "user"
                 for notice in framework_notices(message.get("content"))
             )
+            resident_owner = self._clients.get(session_key)
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
                 if isinstance(prompt, list):
@@ -3881,6 +3937,9 @@ class ClaudeSDKExecutor(Executor):
                         message = next_task.result()
                     except StopAsyncIteration:
                         break
+                    self._observe_resident_context(
+                        session_key, client, resident_owner, message, sdk
+                    )
                     if isinstance(
                         message, (_StreamEvent, sdk.AssistantMessage, sdk.ResultMessage)
                     ):
