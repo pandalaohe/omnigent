@@ -82,6 +82,7 @@ from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
 from omnigent.session_default_modes import codex_service_tier, valid_speed_tier
 from omnigent.spec.types import RetryPolicy
 from omnigent.startup_evidence import CodexTurnEvidence, claim_startup_boundary
+from omnigent.util.codex_inventory import read_loaded_codex_thread_ids
 from omnigent.util.reasoning_effort import (
     CODEX_EFFORTS,
     CODEX_NATIVE_EFFORTS,
@@ -209,6 +210,8 @@ _WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 7.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
+# Match the native websocket budget without limiting unobserved SDK streams.
+_SDK_INVENTORY_FRAME_LIMIT_BYTES = 128 << 20
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent. ``.credentials.json``
@@ -3134,6 +3137,8 @@ class _CodexAppServerSession:
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
         self._events: asyncio.Queue[CodexMessage | HarnessTransportClosedError] = asyncio.Queue()
         self._transport_error: HarnessTransportClosedError | None = None
+        self._resident_inventory_frame_limit: int | None = None
+        self._stdout_frame_buffer = bytearray()
         self._closing = False
         self._native_progress_observed = False
         self._reader_started_turn: str | None = None
@@ -4899,7 +4904,58 @@ class _CodexAppServerSession:
         except Exception as exc:  # noqa: BLE001 — tool errors are surfaced to Codex via the JSON response envelope
             return {"error": str(exc)}
 
-    async def _request(self, method: str, params: CodexParams) -> CodexMessage:
+    async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
+        """Read only an existing initialized stdio owner; never start or repair it."""
+        proc, reader, incarnation = self._proc, self._reader_task, self.resident_incarnation_id
+        if proc is None or reader is None or proc.stdin is None:
+            return None
+        stdin = proc.stdin
+        loop = asyncio.get_running_loop()
+
+        def current() -> bool:
+            return (
+                self._proc is proc
+                and self._reader_task is reader
+                and proc.stdin is stdin
+                and self.resident_incarnation_id == incarnation
+                and self._loop is loop
+                and self._started
+                and not self._closing
+                and not self._cleaned
+                and self._transport_error is None
+                and proc.returncode is None
+                and not reader.done()
+                and not reader.cancelling()
+            )
+
+        async def request(method: str, params: CodexParams) -> CodexMessage:
+            return await self._request(method, params, transport_guard=current)
+
+        if not 0 < timeout_s <= 5.0 or not current():
+            return None
+        # Keep the bound after timeout: the shared stdout reader may still hold
+        # an unfinished reply. This owner now shares native's frame budget.
+        self._resident_inventory_frame_limit = _SDK_INVENTORY_FRAME_LIMIT_BYTES
+        if len(self._stdout_frame_buffer) > self._resident_inventory_frame_limit:
+            self._note_transport_closed(
+                f"Codex stdout frame exceeds {self._resident_inventory_frame_limit} byte limit",
+                clean_eof=False,
+            )
+            self._stdout_frame_buffer.clear()
+            reader.cancel()
+            return None
+        try:
+            return await read_loaded_codex_thread_ids(request, current, timeout_s=timeout_s)
+        except OSError:
+            return None
+
+    async def _request(
+        self,
+        method: str,
+        params: CodexParams,
+        *,
+        transport_guard: Callable[[], bool] | None = None,
+    ) -> CodexMessage:
         if self._transport_error is not None:
             raise self._transport_error
         request_id = self._next_id
@@ -4909,13 +4965,11 @@ class _CodexAppServerSession:
         self._pending_requests[request_id] = future
         try:
             try:
-                await self._send_message(
-                    {
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    }
-                )
+                message: CodexMessage = {"id": request_id, "method": method, "params": params}
+                if transport_guard is None:
+                    await self._send_message(message)
+                else:
+                    await self._send_message(message, transport_guard=transport_guard)
             except Exception as exc:
                 if self._transport_error is not None:
                     raise self._transport_error from exc
@@ -4943,9 +4997,13 @@ class _CodexAppServerSession:
     async def _send_error(self, request_id: int | str, code: int, message: str) -> None:
         await self._send_message({"id": request_id, "error": {"code": code, "message": message}})
 
-    async def _send_message(self, payload: CodexMessage) -> None:
+    async def _send_message(
+        self, payload: CodexMessage, *, transport_guard: Callable[[], bool] | None = None
+    ) -> None:
         assert self._proc is not None and self._proc.stdin is not None
         async with self._stdin_lock:
+            if transport_guard is not None and not transport_guard():
+                raise RuntimeError("Codex inventory transport changed before write")
             self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
             await self._proc.stdin.drain()
 
@@ -4958,18 +5016,32 @@ class _CodexAppServerSession:
             yield chunk
 
     @staticmethod
-    async def _iter_stream_lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
-        buffer = bytearray()
+    async def _iter_stream_lines(
+        stream: asyncio.StreamReader,
+        *,
+        frame_limit: Callable[[], int | None] | None = None,
+        buffer: bytearray | None = None,
+    ) -> AsyncIterator[bytes]:
+        if buffer is None:
+            buffer = bytearray()
         async for chunk in _CodexAppServerSession._iter_stream_chunks(stream):
-            buffer.extend(chunk)
-            while True:
-                newline_index = buffer.find(b"\n")
-                if newline_index < 0:
-                    break
-                line = bytes(buffer[: newline_index + 1])
-                del buffer[: newline_index + 1]
-                yield line
+            offset = 0
+            while offset < len(chunk):
+                newline_index = chunk.find(b"\n", offset)
+                end = newline_index + 1 if newline_index >= 0 else len(chunk)
+                limit = frame_limit() if frame_limit is not None else None
+                if limit is not None and len(buffer) + end - offset > limit:
+                    raise RuntimeError(f"Codex stdout frame exceeds {limit} byte limit")
+                buffer.extend(chunk[offset:end])
+                offset = end
+                if newline_index >= 0:
+                    line = bytes(buffer)
+                    buffer.clear()
+                    yield line
         if buffer:
+            limit = frame_limit() if frame_limit is not None else None
+            if limit is not None and len(buffer) > limit:
+                raise RuntimeError(f"Codex stdout frame exceeds {limit} byte limit")
             yield bytes(buffer)
 
     def _note_native_activity(self, message: CodexMessage) -> None:
@@ -5146,7 +5218,11 @@ class _CodexAppServerSession:
     async def _reader_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         try:
-            async for line in self._iter_stream_lines(self._proc.stdout):
+            async for line in self._iter_stream_lines(
+                self._proc.stdout,
+                frame_limit=lambda: self._resident_inventory_frame_limit,
+                buffer=self._stdout_frame_buffer,
+            ):
                 raw = line.decode("utf-8", errors="replace").strip()
                 if not raw:
                     continue
@@ -5198,6 +5274,7 @@ class _CodexAppServerSession:
             logger.debug("Codex App Server reader loop ended: %s", exc)
             self._note_transport_closed(f"Codex app-server reader failed: {exc}", clean_eof=False)
         finally:
+            self._stdout_frame_buffer.clear()
             if not self._closing:
                 await self._close_signer()
 

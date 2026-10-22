@@ -204,6 +204,348 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "single",
+        "empty",
+        "pages",
+        "literal",
+        "duplicate",
+        "overlap",
+        "missing-cursor",
+        "oversized",
+        "repeated-cursor",
+        "page-cap",
+        "rpc-error",
+        "timeout",
+        "cancel",
+        "cancelled-future",
+        "not-started",
+        "closing",
+        "cleaned",
+        "no-process",
+        "no-reader",
+        "dead-reader",
+        "process-exit",
+        "transport-error",
+        "wrong-loop",
+        "replace-process",
+        "replace-stdin",
+        "replace-reader",
+        "incarnation",
+        "close-during-read",
+        "invalid-timeout",
+    ],
+)
+async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+    )
+    proc = _FakeProcess()
+    stdout = _QueuedStdoutPipe()
+    proc.stdout = stdout
+    session._proc = proc
+    session._loop = asyncio.get_running_loop()
+    session._started = True
+    session._cleaned = False
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    await asyncio.sleep(0)
+    session.start = AsyncMock(side_effect=AssertionError("must not start"))
+    session.close = AsyncMock(side_effect=AssertionError("must not close"))
+    entered = asyncio.Event()
+    requests, extra_readers = [], []
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        requests.append(message)
+        entered.set()
+        index = len(requests)
+        data, cursor = ["main"], None
+        if case == "empty":
+            data = []
+        elif case == "literal":
+            data = [" main ", "main"]
+        elif case in {"pages", "overlap"}:
+            data = ["main"] if index == 1 or case == "overlap" else ["side"]
+            cursor = "second" if index == 1 else None
+        elif case == "duplicate":
+            data = ["main", "main"]
+        elif case == "oversized":
+            data = [str(i) for i in range(101)]
+        elif case in {"repeated-cursor", "page-cap"}:
+            data, cursor = [str(index)], "same" if case == "repeated-cursor" else str(index)
+        elif case in {"timeout", "cancel"}:
+            return
+        elif case == "cancelled-future":
+            session._pending_requests[message["id"]].cancel()
+            return
+        elif case == "replace-process":
+            session._proc = _FakeProcess()
+        elif case == "replace-stdin":
+            proc.stdin = _FakePipe()
+        elif case == "replace-reader":
+            extra = asyncio.create_task(asyncio.Event().wait())
+            extra_readers.append(extra)
+            session._reader_task = extra
+        elif case == "incarnation":
+            session._resident_incarnation_id = "restarted-owner"
+        elif case == "close-during-read":
+            session._closing = True
+        reply = {"id": message["id"], "result": {"data": data, "nextCursor": cursor}}
+        if case == "missing-cursor":
+            reply["result"].pop("nextCursor")
+        elif case == "rpc-error":
+            reply = {"id": message["id"], "error": {"code": -32601, "message": "unsupported"}}
+        stdout.feed(reply)
+
+    proc.stdin.drain = respond
+    no_rpc = {
+        "not-started",
+        "closing",
+        "cleaned",
+        "no-process",
+        "no-reader",
+        "dead-reader",
+        "process-exit",
+        "transport-error",
+        "wrong-loop",
+        "invalid-timeout",
+    }
+    if case == "not-started":
+        session._started = False
+    elif case == "closing":
+        session._closing = True
+    elif case == "cleaned":
+        session._cleaned = True
+    elif case == "no-process":
+        session._proc = None
+    elif case == "no-reader":
+        session._reader_task = None
+    elif case == "dead-reader":
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+    elif case == "process-exit":
+        proc.returncode = 0
+    elif case == "transport-error":
+        session._transport_error = HarnessTransportClosedError("transport lost")
+    elif case == "wrong-loop":
+        session._loop = None
+    read = None
+    try:
+        read = asyncio.create_task(
+            session.read_loaded_thread_ids(timeout_s=0 if case == "invalid-timeout" else 0.1)
+        )
+        if case == "cancel":
+            await asyncio.wait_for(entered.wait(), 2)
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        else:
+            result = await asyncio.wait_for(read, 2)
+            assert result == {
+                "single": ("main",),
+                "empty": (),
+                "pages": ("main", "side"),
+                "literal": (" main ", "main"),
+            }.get(case)
+        assert session._pending_requests == {}
+        assert session._events.empty()
+        assert not requests if case in no_rpc else requests
+        if requests:
+            assert all(m["method"] == "thread/list/loaded" for m in requests)
+            assert requests[0]["params"] == {"limit": 100}
+        if case == "pages":
+            assert requests[1]["params"] == {"limit": 100, "cursor": "second"}
+        if case == "page-cap":
+            assert len(requests) == 10
+        session.start.assert_not_called()
+        session.close.assert_not_called()
+    finally:
+        session._closing = True
+        for task in [reader, *extra_readers, *([read] if read is not None else [])]:
+            task.cancel()
+        await asyncio.gather(
+            reader, *extra_readers, *([read] if read is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.parametrize("change", ["process", "stdin", "closing", "timeout"])
+async def test_sdk_loaded_thread_inventory_rechecks_after_stdin_lock_wait(change):
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+    )
+    proc = _FakeProcess()
+    session._proc = proc
+    session._loop = asyncio.get_running_loop()
+    session._started, session._cleaned = True, False
+    reader = asyncio.create_task(asyncio.Event().wait())
+    session._reader_task = reader
+    await session._stdin_lock.acquire()
+    read = asyncio.create_task(session.read_loaded_thread_ids(timeout_s=0.1))
+    try:
+        await asyncio.sleep(0)
+        assert len(session._pending_requests) == 1
+        target = proc.stdin
+        if change == "process":
+            session._proc = _FakeProcess()
+            target = session._proc.stdin
+        elif change == "stdin":
+            proc.stdin = _FakePipe()
+            target = proc.stdin
+        elif change == "closing":
+            session._closing = True
+        if change != "timeout":
+            session._stdin_lock.release()
+        assert await asyncio.wait_for(read, 2) is None
+        assert target.writes == []
+        assert session._pending_requests == {}
+    finally:
+        if session._stdin_lock.locked():
+            session._stdin_lock.release()
+        reader.cancel()
+        read.cancel()
+        await asyncio.gather(reader, read, return_exceptions=True)
+
+
+@pytest.fixture
+async def sdk_inventory_stream(monkeypatch):
+    import omnigent.inner.codex_executor as codex_module
+
+    monkeypatch.setattr(codex_module, "_SDK_INVENTORY_FRAME_LIMIT_BYTES", 1024, raising=False)
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+    )
+    proc = _FakeProcess()
+    proc.stdout = _QueuedStdoutPipe()
+    session._proc = proc
+    session._loop = asyncio.get_running_loop()
+    session._started, session._cleaned = True, False
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    await asyncio.sleep(0)
+    try:
+        yield session, proc, reader
+    finally:
+        session._closing = True
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.parametrize("when", ["during-read", "after-timeout", "terminated-frame"])
+async def test_sdk_inventory_frame_overflow_stops_reader(sdk_inventory_stream, when):
+    session, proc, reader = sdk_inventory_stream
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        if when == "after-timeout":
+            proc.stdout._frames.put_nowait(b'{"id":1,"result":{"data":["')
+        elif when == "terminated-frame":
+            proc.stdout.feed(
+                {"id": message["id"], "result": {"data": ["x" * 2048], "nextCursor": None}}
+            )
+        else:
+            proc.stdout._frames.put_nowait(b"x" * 2048)
+
+    proc.stdin.drain = respond
+    assert await session.read_loaded_thread_ids(timeout_s=0.03) is None
+    if when == "after-timeout":
+        proc.stdout._frames.put_nowait(b"x" * 2048)
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert reader.done(), "overflow must stop accumulating stdout after inventory ends"
+    assert isinstance(session._transport_error, HarnessTransportClosedError)
+    assert "frame" in str(session._transport_error).lower()
+    assert "1024" in str(session._transport_error)
+    assert session._pending_requests == {}
+    assert reader.get_coro().cr_frame is None
+    proc.stdout._frames.put_nowait(b"x" * 2048)
+    await asyncio.sleep(0)
+    assert proc.stdout._frames.qsize() == 1
+
+
+@pytest.mark.parametrize("inventory", [False, True])
+async def test_sdk_inventory_frame_budget_preserves_other_frames(sdk_inventory_stream, inventory):
+    session, proc, reader = sdk_inventory_stream
+    # An unobserved SDK stream retains its pre-existing large event behavior.
+    payload = "x" * (100 if inventory else 2048)
+    frames = [{"method": "sample/event", "params": {"text": payload}} for _ in range(20)]
+    encoded = b"".join((json.dumps(frame) + "\n").encode() for frame in frames)
+    assert len(encoded) > 1024
+    if inventory:
+
+        async def respond():
+            message = json.loads(proc.stdin.writes[-1])
+            proc.stdout._frames.put_nowait(encoded)
+            proc.stdout.feed(
+                {"id": message["id"], "result": {"data": ["main"], "nextCursor": None}}
+            )
+
+        proc.stdin.drain = respond
+        assert await session.read_loaded_thread_ids() == ("main",)
+    else:
+        proc.stdout._frames.put_nowait(encoded)
+    observed = [await asyncio.wait_for(session._events.get(), 2) for _ in frames]
+    assert observed == frames
+    assert not reader.done() and session._transport_error is None
+
+
+async def test_sdk_inventory_frame_cap_checks_stalled_partial_frame(sdk_inventory_stream):
+    session, proc, previous_reader = sdk_inventory_stream
+    previous_reader.cancel()
+    await asyncio.gather(previous_reader, return_exceptions=True)
+    stream = asyncio.StreamReader()
+    proc.stdout = stream
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    try:
+        stream.feed_data(b"x" * 8237)
+        await asyncio.sleep(0)
+        assert not stream._buffer and stream._waiter is not None
+        assert not reader.done() and session._transport_error is None
+        assert session._resident_inventory_frame_limit is None
+
+        assert await session.read_loaded_thread_ids(timeout_s=0.03) is None
+        await asyncio.sleep(0)
+        assert reader.done(), "arming must stop an oversized stalled frame without another byte"
+        assert isinstance(session._transport_error, HarnessTransportClosedError)
+        assert "1024" in str(session._transport_error)
+        assert session._pending_requests == {}
+        assert reader.get_coro().cr_frame is None
+        assert proc.stdin.writes == []
+    finally:
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+async def test_sdk_inventory_normalizes_real_subprocess_stdin_eio(sdk_inventory_stream):
+    session, proc, _reader = sdk_inventory_stream
+    loop = asyncio.get_running_loop()
+    protocol = asyncio.subprocess.SubprocessStreamProtocol(limit=65536, loop=loop)
+    original_stdin = proc.stdin
+    closed = []
+    transport = SimpleNamespace(
+        write=original_stdin.write,
+        is_closing=lambda: bool(closed),
+        close=lambda: closed.append(True),
+    )
+    stdin = asyncio.StreamWriter(transport, protocol, None, loop)
+    proc.stdin = stdin
+    protocol.pause_writing()
+    read = asyncio.create_task(session.read_loaded_thread_ids())
+    try:
+        await asyncio.sleep(0)
+        assert len(original_stdin.writes) == 1 and not read.done()
+        protocol.connection_lost(OSError(errno.EIO, "stdio I/O failure"))
+        assert await asyncio.wait_for(read, 2) is None
+        assert session._pending_requests == {} and not session._stdin_lock.locked()
+    finally:
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+        stdin.close()
+
+
 class TestCodexExecutor(unittest.TestCase):
     def test_databricks_codex_config_overrides(self):
         overrides = _databricks_codex_config_overrides(

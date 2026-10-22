@@ -30,6 +30,7 @@ from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.util.codex_inventory import read_loaded_codex_thread_ids
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -1236,53 +1237,14 @@ class CodexAppServerClient:
         connection = self._current_established_connection()
         if not 0 < timeout_s <= 5.0 or connection is None:
             return None
-        ids: list[str] = []
-        cursors: set[str] = set()
-        cursor: str | None = None
         try:
-            async with asyncio.timeout(timeout_s):
-                for _ in range(10):
-                    if self._current_established_connection() is not connection:
-                        return None
-                    params: CodexParams = {"limit": 100}
-                    if cursor is not None:
-                        params["cursor"] = cursor
-                    response = await self.request("thread/list/loaded", params)
-                    if self._current_established_connection() is not connection:
-                        return None
-                    result = response.get("result")
-                    if not isinstance(result, dict) or "nextCursor" not in result:
-                        return None
-                    page = result.get("data")
-                    if (
-                        not isinstance(page, list)
-                        or len(page) > 100
-                        or any(not isinstance(item, str) or not item for item in page)
-                    ):
-                        return None
-                    ids.extend(page)
-                    if len(set(ids)) != len(ids):
-                        return None
-                    cursor = result["nextCursor"]
-                    if cursor is None:
-                        return tuple(ids)
-                    if not isinstance(cursor, str) or not cursor or cursor in cursors:
-                        return None
-                    cursors.add(cursor)
-        except asyncio.CancelledError:
-            # Closing a client cancels pending RPC futures, independently of the caller.
-            task = asyncio.current_task()
-            if task is None or task.cancelling():
-                raise
-        except (
-            TimeoutError,
-            ConnectionError,
-            ConnectionClosed,
-            CodexAppServerResponseError,
-            RuntimeError,
-        ):
-            pass
-        return None
+            return await read_loaded_codex_thread_ids(
+                self.request,
+                lambda: self._current_established_connection() is connection,
+                timeout_s=timeout_s,
+            )
+        except ConnectionClosed:
+            return None
 
     async def request(self, method: str, params: CodexParams) -> CodexMessage:
         """

@@ -20,6 +20,24 @@ from omnigent.harnesses.codex_native.app_server import (
 )
 
 
+async def test_loaded_thread_inventory_keeps_native_oserror_behavior():
+    import errno
+
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:1")
+    websocket = AsyncMock(spec=ClientConnection)
+    reader = asyncio.create_task(asyncio.Event().wait())
+    client._ws = websocket
+    client._reader_task = reader
+    client._established_connection = (0, websocket, reader)
+    websocket.send.side_effect = OSError(errno.EIO, "stdio I/O failure")
+    try:
+        with pytest.raises(OSError):
+            await client.read_loaded_thread_ids()
+        assert client._pending_requests == {}
+    finally:
+        await client.close()
+
+
 @pytest.mark.parametrize(
     ("code", "message", "expected"),
     [
