@@ -21,7 +21,7 @@ import pytest
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.app import create_runner_app
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import SessionResourceRegistry, _TerminalRoleRegistration
 from omnigent.terminals.pane_reaper import NativePaneReaper, NativePaneStillAlive, PaneRef
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import NullServerClient
@@ -408,10 +408,10 @@ async def test_retired_tail_skips_successor_pane(
         "conv_successor", terminal_resource_id("codex", "main"), "codex", old.socket_path, old
     )
     reaper._record_pending(pane, old)
-    successor = SimpleNamespace(socket_path=tmp_path / "new.sock")
+    successor = SimpleNamespace(socket_path=tmp_path / "new.sock", diagnostic_id="successor")
     registry._by_conversation.setdefault("conv_successor", {})[("codex", "main")] = successor
     app.state.test_resource_registry._terminal_roles[("conv_successor", pane.terminal_id)] = (
-        "codex-native"
+        _TerminalRoleRegistration("codex-native", successor.diagnostic_id)
     )
     await reaper._retire_pending()
     assert registry.get("conv_successor", "codex", "main") is successor

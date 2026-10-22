@@ -19,6 +19,7 @@ import shutil
 import sys
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -64,6 +65,81 @@ def test_list_for_conversation_returns_empty_for_unknown_id() -> None:
     """
     reg = TerminalRegistry()
     assert reg.list_for_conversation("conv_nope") == []
+
+
+def test_registration_snapshot_preserves_identity_and_copies_stopped_state(tmp_path: Path) -> None:
+    """Owner moves retain identity; replacement and later flags cannot rewrite evidence."""
+    reg = TerminalRegistry()
+    assert reg.registration_snapshot() == ()
+    original = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "original.sock",
+        private_dir=tmp_path / "original",
+        running=True,
+    )
+    reg._by_conversation["conv_old"] = {("claude", "main"): original}
+    before = reg.registration_snapshot()
+    assert before[0].instance_id == original.diagnostic_id
+    assert not hasattr(before[0], "instance")
+    with pytest.raises(FrozenInstanceError):
+        before[0].conversation_id = "changed"  # type: ignore[misc]
+
+    assert reg.transfer("conv_old", "conv_new", "claude", "main")
+    original.running = False
+    moved = reg.registration_snapshot()
+    assert len(moved) == 1
+    assert moved[0].conversation_id == "conv_new"
+    assert moved[0].instance_id == before[0].instance_id
+    assert (moved[0].terminal_name, moved[0].session_key) == ("claude", "main")
+    assert moved[0].observed_running is False
+    assert before[0].conversation_id == "conv_old"
+    assert before[0].observed_running is True
+
+    replacement = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "replacement.sock",
+        private_dir=tmp_path / "replacement",
+        running=True,
+    )
+    with reg._lock:
+        reg._by_conversation["conv_new"][("claude", "main")] = replacement
+    replaced = reg.registration_snapshot()
+    assert replaced[0].instance_id == replacement.diagnostic_id
+    assert replaced[0].instance_id != moved[0].instance_id
+
+
+def test_registration_snapshot_cannot_lose_or_duplicate_a_transferred_owner(
+    tmp_path: Path,
+) -> None:
+    """A transfer racing the full inventory always leaves exactly one owner in each sample."""
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "codex.sock",
+        private_dir=tmp_path / "codex",
+        running=True,
+    )
+    reg._by_conversation["conv_left"] = {("codex", "main"): instance}
+
+    def transfer_repeatedly() -> None:
+        for _ in range(500):
+            reg.transfer("conv_left", "conv_right", "codex", "main")
+            reg.transfer("conv_right", "conv_left", "codex", "main")
+
+    thread = threading.Thread(target=transfer_repeatedly)
+    thread.start()
+    try:
+        for _ in range(500):
+            snapshot = reg.registration_snapshot()
+            assert len(snapshot) == 1
+            assert snapshot[0].instance_id == instance.diagnostic_id
+            assert snapshot[0].conversation_id in {"conv_left", "conv_right"}
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_conversation_link_for_id_uses_relative_path_by_default() -> None:
