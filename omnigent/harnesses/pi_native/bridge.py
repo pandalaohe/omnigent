@@ -388,6 +388,7 @@ def write_extension_files(
             plan_visible_tool_names(
                 [
                     "read",
+                    "manage_todo_list",
                     *(
                         tool.get("name")
                         for tool in tools or []

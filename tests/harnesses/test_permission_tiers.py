@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -99,6 +100,283 @@ def test_plan_visible_tools_only_include_registered_known_safe_names() -> None:
         "report_result",
         "sys_terminal_read",
     )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "sys_session_list",
+        "sys_session_get_info",
+        "sys_session_get_history",
+        "sys_agent_list",
+        "sys_agent_get",
+        "sys_list_models",
+        "sys_advise_models",
+        "sys_policy_registry",
+        "sys_instruction_layers_read",
+        "sys_project_settings_read",
+        "sys_scheduled_task_list",
+        "sys_flow_list",
+        "list_comments",
+        "load_skill",
+        "read_skill_file",
+        "browser_snapshot",
+        "browser_screenshot",
+        "sys_terminal_read",
+        "sys_terminal_list",
+        "sys_child_cap",
+    ],
+)
+def test_framework_reads_allow_every_tier_and_are_plan_visible(name: str) -> None:
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, {}).action == Verdict.ALLOW
+    assert plan_visible_tool_names((name, name)) == (name,)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "sys_session_create",
+        "sys_session_send",
+        "sys_session_open",
+        "sys_session_rename",
+        "sys_session_archive",
+        "sys_session_unarchive",
+        "sys_session_close",
+        "sys_cancel_task",
+        "sys_cancel_async",
+        "sys_flow_cancel",
+        "update_comment",
+        "sys_session_handover",
+        "sys_timer_set",
+        "sys_timer_cancel",
+        "sys_instruction_layer_update",
+        "sys_project_settings_update",
+        "sys_add_policy",
+        "sys_session_share",
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+        "browser_navigate",
+        "browser_click",
+        "browser_type",
+        "sys_terminal_close",
+    ],
+)
+def test_framework_operations_and_settings_follow_approved_tiers(name: str) -> None:
+    assert decision("ask", name, {}).action == Verdict.ASK
+    assert decision("plan", name, {}).action == Verdict.DENY
+    assert decision("accept-edits", name, {}).action == Verdict.ASK
+    assert decision("auto", name, {}).action == Verdict.ALLOW
+    assert decision("full", name, {}).action == Verdict.ALLOW
+    assert plan_visible_tool_names((name,)) == ()
+
+
+@pytest.mark.parametrize("args", [{"operation": "read"}, {"operation": "write", "todoList": []}])
+def test_session_task_list_control_allows_every_tier(args: dict) -> None:
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "manage_todo_list", args).action == Verdict.ALLOW
+    assert plan_visible_tool_names(("manage_todo_list",)) == ("manage_todo_list",)
+
+
+def test_panel_presentation_uses_operational_tiers_with_bound_target() -> None:
+    args = {"path": "report.html"}
+    intent = adapt_tool_call("open_in_panel", args, posix_host())
+    assert intent.target == ResolvedPath("/opt/work/project/report.html", "new-file")
+    assert decision("ask", "open_in_panel", args).action == Verdict.ASK
+    assert decision("plan", "open_in_panel", args).action == Verdict.DENY
+    assert decision("accept-edits", "open_in_panel", args).action == Verdict.ASK
+    assert decision("auto", "open_in_panel", args).action == Verdict.ALLOW
+    assert decision("full", "open_in_panel", args).action == Verdict.ALLOW
+    assert plan_visible_tool_names(("open_in_panel",)) == ()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {},
+        {"path": None},
+        {"path": 1},
+        {"path": False},
+        {"path": ""},
+        {"path": "\x00"},
+        {"path": "../report.html"},
+        {"path": "./report.html"},
+        {"path": "reports//index.html"},
+        {"path": "reports\\index.html"},
+    ],
+)
+def test_panel_presentation_rejects_missing_or_malformed_paths(args: dict) -> None:
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "open_in_panel", args).action == Verdict.DENY
+
+
+def test_panel_presentation_rejects_unconfirmed_target_paths() -> None:
+    def unresolved(path: str) -> ResolvedPath:
+        return ResolvedPath(path, "directory" if path == "/opt/work/project" else "unknown")
+
+    for tier in NON_FULL_TIERS:
+        assert (
+            decision(
+                tier, "open_in_panel", {"path": "report.html"}, posix_host(resolver=unresolved)
+            ).action
+            == Verdict.DENY
+        )
+    assert (
+        decision(
+            "full", "open_in_panel", {"path": "report.html"}, posix_host(resolver=unresolved)
+        ).action
+        == Verdict.ALLOW
+    )
+
+    def failed_resolution(path: str) -> ResolvedPath:
+        raise OSError("Cannot resolve target")
+
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(
+                tier,
+                "open_in_panel",
+                {"path": "report.html"},
+                posix_host(resolver=failed_resolution),
+            ).action
+            == Verdict.DENY
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("report.html", "/opt/work/project/report.html"),
+        ("~/report.html", "/opt/work/project/~/report.html"),
+    ],
+)
+def test_panel_relative_paths_use_workspace_and_preserve_literal_tilde(
+    path: str, expected: str
+) -> None:
+    host = posix_host(cwd="/opt/work/control")
+    intent = adapt_tool_call("open_in_panel", {"path": path}, host)
+    assert intent.target == ResolvedPath(expected, "new-file")
+    assert decide_tier("auto", intent, RULES).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize("cap", [1, 20, "none"])
+def test_child_cap_changes_use_operational_tiers(cap: object) -> None:
+    args = {"cap": cap}
+    assert decision("ask", "sys_child_cap", args).action == Verdict.ASK
+    assert decision("plan", "sys_child_cap", args).action == Verdict.DENY
+    assert decision("accept-edits", "sys_child_cap", args).action == Verdict.ASK
+    assert decision("auto", "sys_child_cap", args).action == Verdict.ALLOW
+    assert decision("full", "sys_child_cap", args).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize("cap", [None, True, False, 0, -1, 1.5, "1", "NONE", "", [], {}])
+def test_malformed_child_cap_never_falls_back_to_read(cap: object) -> None:
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "sys_child_cap", {"cap": cap}).action == Verdict.DENY
+
+
+@pytest.mark.parametrize("encode_arguments", [False, True], ids=["object", "json"])
+@pytest.mark.parametrize(
+    ("name", "args", "expected"),
+    [
+        ("sys_session_list", {}, (Verdict.ALLOW,) * 5),
+        ("browser_snapshot", {}, (Verdict.ALLOW,) * 5),
+        (
+            "sys_session_send",
+            {"session_id": "child-session", "message": "Inspect the task"},
+            (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW),
+        ),
+        (
+            "sys_instruction_layer_update",
+            {},
+            (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW),
+        ),
+        ("sys_child_cap", {}, (Verdict.ALLOW,) * 5),
+        (
+            "sys_child_cap",
+            {"cap": "none"},
+            (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW),
+        ),
+        ("sys_child_cap", {"cap": None}, (Verdict.DENY,) * 5),
+        ("manage_todo_list", {"operation": "read"}, (Verdict.ALLOW,) * 5),
+        (
+            "manage_todo_list",
+            {"operation": "write", "todoList": []},
+            (Verdict.ALLOW,) * 5,
+        ),
+        (
+            "open_in_panel",
+            {"path": "report.html"},
+            (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW),
+        ),
+        ("open_in_panel", {}, (Verdict.DENY,) * 5),
+        (
+            "open_in_panel",
+            {"path": "/opt/work/control/report.html"},
+            (Verdict.DENY, Verdict.DENY, Verdict.DENY, Verdict.DENY, Verdict.ALLOW),
+        ),
+    ],
+)
+def test_antigravity_mcp_calls_classify_the_omnigent_target(
+    name: str, args: dict, expected: tuple[Verdict, ...], encode_arguments: bool
+) -> None:
+    wrapper = {
+        "ServerName": "omnigent",
+        "ToolName": name,
+        "Arguments": json.dumps(args) if encode_arguments else args,
+    }
+    for tier, action in zip(PERMISSION_TIERS, expected, strict=True):
+        assert decision(tier, "call_mcp_tool", wrapper).action == action
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "sys_agent_download",
+        "sys_call_async",
+        "sys_flow_start",
+        "sys_terminal_launch",
+        "sys_future_read",
+        "browser_future_read",
+        "web_search",
+        "third_party",
+    ],
+)
+def test_deferred_and_unregistered_tools_keep_unknown_tiers(name: str) -> None:
+    assert decision("ask", name, {}).action == Verdict.ASK
+    assert decision("plan", name, {}).action == Verdict.DENY
+    assert decision("accept-edits", name, {}).action == Verdict.ASK
+    assert decision("auto", name, {}).action == Verdict.DENY
+    assert decision("full", name, {}).action == Verdict.ALLOW
+    assert plan_visible_tool_names((name,)) == ()
+    assert (
+        decision(
+            "auto",
+            "call_mcp_tool",
+            {"ServerName": "omnigent", "ToolName": name, "Arguments": {}},
+        ).action
+        == Verdict.DENY
+    )
+
+
+def test_third_party_mcp_server_cannot_reuse_known_omnigent_names() -> None:
+    for name in ("sys_session_list", "sys_session_send"):
+        args = {"ServerName": "third-party", "ToolName": name, "Arguments": {}}
+        assert decision("ask", "call_mcp_tool", args).action == Verdict.ASK
+        assert decision("plan", "call_mcp_tool", args).action == Verdict.DENY
+        assert decision("accept-edits", "call_mcp_tool", args).action == Verdict.ASK
+        assert decision("auto", "call_mcp_tool", args).action == Verdict.DENY
+        assert decision("full", "call_mcp_tool", args).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize("name", ["sys_session_list", "sys_session_send"])
+def test_framework_calls_preserve_fail_closed_host_and_rule_checks(name: str) -> None:
+    for tier in NON_FULL_TIERS:
+        for host in (posix_host(control_paths=()), posix_host(host_id="")):
+            assert decision(tier, name, {}, host).action == Verdict.DENY
+        intent = adapt_tool_call(name, {}, posix_host())
+        assert decide_tier(tier, intent, RelaxedRules({})).action == Verdict.DENY
 
 
 def test_auto_uses_only_fixed_relaxed_membership() -> None:
@@ -219,6 +497,11 @@ def test_local_new_file_resolves_existing_parent_and_symlink(tmp_path: Path) -> 
         decision("auto", "bash", {"command": f"echo full > {alias}/tier"}, host).rule_id
         == "control-path"
     )
+    for tier in NON_FULL_TIERS:
+        assert (
+            decision(tier, "open_in_panel", {"path": str(alias / "report.html")}, host).rule_id
+            == "control-path"
+        )
 
 
 def test_final_link_parent_and_symlink_home_protections(tmp_path: Path) -> None:

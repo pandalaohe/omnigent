@@ -144,9 +144,61 @@ _EDIT_PATH = {
     "replace_file_content": "TargetFile",
 }
 _EXEC_COMMAND = {"bash": "command", "sys_os_shell": "command", "run_command": "CommandLine"}
-_READ_NO_PATH = frozenset(("sys_terminal_read", "sys_terminal_list"))
+_READ_NO_PATH = frozenset(
+    (
+        "sys_session_list",
+        "sys_session_get_info",
+        "sys_session_get_history",
+        "sys_agent_list",
+        "sys_agent_get",
+        "sys_list_models",
+        "sys_advise_models",
+        "sys_policy_registry",
+        "sys_instruction_layers_read",
+        "sys_project_settings_read",
+        "sys_scheduled_task_list",
+        "sys_flow_list",
+        "list_comments",
+        "load_skill",
+        "read_skill_file",
+        "browser_snapshot",
+        "browser_screenshot",
+        "sys_terminal_read",
+        "sys_terminal_list",
+    )
+)
+# These operations retain server authorization and must not bypass the plan gate.
+_OPERATIONAL_TOOLS = frozenset(
+    (
+        "sys_session_create",
+        "sys_session_send",
+        "sys_session_open",
+        "sys_session_rename",
+        "sys_session_archive",
+        "sys_session_unarchive",
+        "sys_session_close",
+        "sys_cancel_task",
+        "sys_cancel_async",
+        "sys_flow_cancel",
+        "update_comment",
+        "sys_session_handover",
+        "sys_timer_set",
+        "sys_timer_cancel",
+        "sys_instruction_layer_update",
+        "sys_project_settings_update",
+        "sys_add_policy",
+        "sys_session_share",
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+        "browser_navigate",
+        "browser_click",
+        "browser_type",
+        "sys_terminal_close",
+    )
+)
 _QUESTION_TOOLS = frozenset(("ask_user", "ask_user_async", "request_user_input"))
-_CONTROL_TOOLS = frozenset(("report_result", "sys_read_inbox"))
+_CONTROL_TOOLS = frozenset(("report_result", "sys_read_inbox", "manage_todo_list"))
 
 
 def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:
@@ -155,7 +207,7 @@ def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:
     This filters the model's tool list; the execution gate still checks every
     actual call, including direct extension ``executeTool`` calls.
     """
-    allowed = {*_READ_PATH, *_READ_NO_PATH, *_QUESTION_TOOLS, *_CONTROL_TOOLS}
+    allowed = {*_READ_PATH, *_READ_NO_PATH, *_QUESTION_TOOLS, *_CONTROL_TOOLS, "sys_child_cap"}
     return tuple(dict.fromkeys(name for name in names if name in allowed))
 
 
@@ -374,6 +426,22 @@ def _adapt_unbound_call(
             if not isinstance(embedded, dict):
                 raise ValueError("MCP Arguments must be an object")
             name, arguments = tool, embedded
+        if name == "open_in_panel":
+            path = _required_text(arguments, "path")
+            if any(
+                not part or part in (".", "..") or "\\" in part or "\x00" in part
+                for part in path.lstrip("/").split("/")
+            ):
+                raise ValueError("Panel path must be a plain file path")
+            # Artifact-relative paths use the workspace, with no home expansion.
+            target = (
+                "/" + path.lstrip("/")
+                if path.startswith("/")
+                else context.workspace.rstrip("/\\") + "/" + path
+            )
+            return ToolIntent(
+                ToolKind.OTHER, name, digest, context, target=_resolve(target, context)
+            )
         if name in _READ_PATH:
             return ToolIntent(
                 ToolKind.READ,
@@ -432,6 +500,15 @@ def _adapt_unbound_call(
             )
         if name in _READ_NO_PATH:
             return ToolIntent(ToolKind.READ, name, digest, context)
+        if name == "sys_child_cap":
+            if "cap" not in arguments:
+                return ToolIntent(ToolKind.READ, name, digest, context)
+            cap = arguments["cap"]
+            if not ((type(cap) is int and cap > 0) or cap == "none"):
+                raise ValueError("Child cap must be a positive integer or 'none'")
+            return ToolIntent(ToolKind.OTHER, name, digest, context)
+        if name in _OPERATIONAL_TOOLS:
+            return ToolIntent(ToolKind.OTHER, name, digest, context)
         if name in _QUESTION_TOOLS:
             return ToolIntent(ToolKind.OTHER, name, digest, context, detail="framework-question")
         if name in _CONTROL_TOOLS:
