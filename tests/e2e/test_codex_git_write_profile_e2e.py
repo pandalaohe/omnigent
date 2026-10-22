@@ -145,7 +145,9 @@ def _loopback_overrides(provider: _ScriptedProvider) -> list[str]:
     ]
 
 
-def _git_probe_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def _git_probe_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool
+) -> tuple[Path, Path, list[str]]:
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source_home))
@@ -167,19 +169,6 @@ def _git_probe_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
         (workspace, ["push", "origin", "main"]),
     ):
         subprocess.run(["git", "-C", str(directory), *args], check=True, capture_output=True)
-    return workspace
-
-
-@pytest.mark.parametrize("linked", [False, True])
-async def test_native_codex_git_write_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool
-) -> None:
-    reason = cli_unavailable_reason("codex")
-    if reason is not None:
-        pytest.skip(reason)
-    codex_path = shutil.which("codex")
-    assert codex_path is not None
-    workspace = _git_probe_workspace(tmp_path, monkeypatch)
     common = workspace / ".git"
     commands = list(_COMMANDS)
     if linked:
@@ -193,6 +182,23 @@ async def test_native_codex_git_write_profile(
         commands[2] = f"echo x > {common / 'hooks' / 'probe'}"
         commands[3] = f"git config --file {common / 'config'} omniprobe.flag 1"
         commands.append(f"echo x > {common / 'worktrees' / 'linked-workspace' / 'commondir'}")
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    subprocess.run(["git", "-C", str(sibling), "init"], check=True, capture_output=True)
+    commands.append(f"echo x > {sibling / '.git' / 'probe'}")
+    return workspace, common, commands
+
+
+@pytest.mark.parametrize("linked", [False, True])
+async def test_native_codex_git_write_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool
+) -> None:
+    reason = cli_unavailable_reason("codex")
+    if reason is not None:
+        pytest.skip(reason)
+    codex_path = shutil.which("codex")
+    assert codex_path is not None
+    workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked)
     child_tmp = tmp_path / "child-tmp"
     child_tmp.mkdir()
     child_home = tmp_path / "child-home"
@@ -258,6 +264,7 @@ async def test_native_codex_git_write_profile(
         assert exits[1:3] == [0, 0], exits
         assert all(code != 0 for code in exits[3:]), exits
         assert not (common / "hooks" / "probe").exists()
+        assert not (tmp_path / "sibling" / ".git" / "probe").exists()
         configured = subprocess.run(
             ["git", "-C", str(workspace), "config", "--get", "omniprobe.flag"],
             capture_output=True,
@@ -273,8 +280,9 @@ async def test_native_codex_git_write_profile(
         provider_thread.join(timeout=5)
 
 
+@pytest.mark.parametrize("linked", [False, True])
 async def test_sdk_codex_git_write_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: bool
 ) -> None:
     reason = cli_unavailable_reason("codex")
     if reason is not None:
@@ -284,12 +292,12 @@ async def test_sdk_codex_git_write_profile(
     version = await _codex_cli_version(codex_path)
     if version is None or version < (0, 139, 0):
         pytest.skip("SDK Git profile requires Codex >= 0.139.0")
-    workspace = _git_probe_workspace(tmp_path, monkeypatch)
+    workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked)
     child_home = tmp_path / "child-home"
     child_home.mkdir()
     child_tmp = tmp_path / "child-tmp"
     child_tmp.mkdir()
-    provider = _ScriptedProvider(["git commit --allow-empty -m control", None, *_COMMANDS, None])
+    provider = _ScriptedProvider(["git commit --allow-empty -m control", None, *commands, None])
     provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
     provider_thread.start()
     executor = CodexExecutor(
@@ -314,12 +322,13 @@ async def test_sdk_codex_git_write_profile(
                     )
                 ]
             assert isinstance(events[-1], TurnComplete), events
-        assert len(provider.requests) == len(_COMMANDS) + 3
-        exits = _probe_exit_codes(provider, [0, *range(2, len(_COMMANDS) + 2)])
+        assert len(provider.requests) == len(commands) + 3
+        exits = _probe_exit_codes(provider, [0, *range(2, len(commands) + 2)])
         assert exits[0] != 0, exits
         assert exits[1:3] == [0, 0], exits
         assert all(code != 0 for code in exits[3:]), exits
-        assert not (workspace / ".git" / "hooks" / "probe").exists()
+        assert not (common / "hooks" / "probe").exists()
+        assert not (tmp_path / "sibling" / ".git" / "probe").exists()
         configured = subprocess.run(
             ["git", "-C", str(workspace), "config", "--get", "omniprobe.flag"],
             capture_output=True,
