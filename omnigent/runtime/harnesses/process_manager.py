@@ -477,6 +477,7 @@ class _SubprocessEntry:
         model: str | None = None,
         acp_config: dict[str, str] | None = None,
     ) -> None:
+        self.incarnation_id = uuid.uuid4().hex
         self.process = process
         self.client = client
         self.endpoint = endpoint
@@ -485,6 +486,30 @@ class _SubprocessEntry:
         self.acp_config = acp_config or {}
         self.last_used_at: float = 0.0
         self.exit_confirmed = False
+
+
+@dataclass(frozen=True)
+class HarnessResidentSnapshot:
+    """One registered or closing harness owner; no external aliases are inferred.
+
+    Unconfirmed owners and unsupported harnesses cannot be treated as zero capacity.
+    The snapshot does not establish whether an SDK has loaded a provider context.
+    """
+
+    incarnation_id: str
+    session_id: str
+    harness: str
+    closing: bool
+    wrapper_exited: bool
+    exit_confirmed: bool
+
+
+@dataclass(frozen=True)
+class HarnessInventorySnapshot:
+    """Registered and closing harness owners; incomplete exit coverage stays sticky."""
+
+    owners: tuple[HarnessResidentSnapshot, ...]
+    exit_coverage_complete: bool
 
 
 def _model_env_key(harness: str) -> str:
@@ -587,6 +612,8 @@ class HarnessProcessManager:
         # spawn's readiness latency relative to it (harness boot vs manager boot).
         self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
+        self._closing_entries: dict[str, tuple[str, _SubprocessEntry]] = {}
+        self._exit_coverage_complete = True
         # Per-conversation in-flight harness response_id. The runner's
         # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
         # the harness emits ``response.created`` and clears it via
@@ -686,6 +713,26 @@ class HarnessProcessManager:
         generation = self._release_generations.get(conversation_id, 0)
         return f"{generation}:{entry.last_used_at:.9f}"
 
+    async def resident_inventory(self) -> HarnessInventorySnapshot:
+        """Read owned harnesses without spawning, probing, or changing retention."""
+        async with self._registry_lock:
+            entries = [(session_id, entry, False) for session_id, entry in self._entries.items()]
+            entries.extend(
+                (session_id, entry, True) for session_id, entry in self._closing_entries.values()
+            )
+            snapshots = tuple(
+                HarnessResidentSnapshot(
+                    incarnation_id=entry.incarnation_id,
+                    session_id=session_id,
+                    harness=entry.harness,
+                    closing=closing,
+                    wrapper_exited=entry.process.returncode is not None,
+                    exit_confirmed=entry.exit_confirmed,
+                )
+                for session_id, entry, closing in entries
+            )
+            return HarnessInventorySnapshot(snapshots, self._exit_coverage_complete)
+
     async def retention_snapshot(
         self,
         conversation_id: str,
@@ -740,6 +787,7 @@ class HarnessProcessManager:
                 if time.monotonic() - entry.last_used_at < idle_threshold_s:
                     return "not_eligible"
                 released = self._entries.pop(conversation_id)
+                self._closing_entries[released.incarnation_id] = (conversation_id, released)
                 saved_expiry = self._retention_expiry(conversation_id)
                 self._retention_managed.pop(conversation_id, None)
                 previous_generation = self._release_generations.get(conversation_id, 0)
@@ -757,8 +805,15 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
+                    if (
+                        not released.exit_confirmed
+                        and self._entries.get(conversation_id) is not released
+                    ):
+                        self._exit_coverage_complete = False
+                    self._closing_entries.pop(released.incarnation_id, None)
                 raise
             if closed:
+                self._closing_entries.pop(released.incarnation_id, None)
                 return "released"
             async with self._registry_lock:
                 self._release_generations[conversation_id] = previous_generation
@@ -769,6 +824,7 @@ class HarnessProcessManager:
                             saved_expiry,
                             self._retention_managed.get(conversation_id, saved_expiry),
                         )
+                self._closing_entries.pop(released.incarnation_id, None)
             return "failed"
 
     @property
@@ -1084,8 +1140,17 @@ class HarnessProcessManager:
                 # this spawn lock, so a concurrent release cannot invalidate
                 # mid-spawn — it runs after we drop the lock.
                 if self._shutting_down:
-                    if not await self._close_entry(entry):
-                        self._entries[conversation_id] = entry
+                    self._closing_entries[entry.incarnation_id] = (conversation_id, entry)
+                    try:
+                        if not await self._close_entry(entry):
+                            self._entries[conversation_id] = entry
+                    finally:
+                        if (
+                            not entry.exit_confirmed
+                            and self._entries.get(conversation_id) is not entry
+                        ):
+                            self._exit_coverage_complete = False
+                        self._closing_entries.pop(entry.incarnation_id, None)
                     raise RuntimeError(
                         "HarnessProcessManager shut down during spawn for "
                         f"conversation {conversation_id!r}"
@@ -1358,6 +1423,8 @@ class HarnessProcessManager:
                 saved_expiry = self._retention_expiry(conversation_id)
                 self._retention_managed.pop(conversation_id, None)
                 entry = self._entries.pop(conversation_id, None)
+                if entry is not None:
+                    self._closing_entries[entry.incarnation_id] = (conversation_id, entry)
                 self._in_flight_response_ids.pop(conversation_id, None)
                 previous_generation = self._release_generations.get(conversation_id, 0)
                 self._release_generations[conversation_id] = previous_generation + 1
@@ -1379,8 +1446,15 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
+                    if (
+                        not entry.exit_confirmed
+                        and self._entries.get(conversation_id) is not entry
+                    ):
+                        self._exit_coverage_complete = False
+                    self._closing_entries.pop(entry.incarnation_id, None)
                 raise
             if closed:
+                self._closing_entries.pop(entry.incarnation_id, None)
                 return True
             # The process is still alive. Keep the exact handle retryable while
             # the spawn lock prevents a successor from taking this key.
@@ -1393,6 +1467,7 @@ class HarnessProcessManager:
                             saved_expiry,
                             self._retention_managed.get(conversation_id, saved_expiry),
                         )
+                self._closing_entries.pop(entry.incarnation_id, None)
             return False
 
     async def shutdown(self) -> None:
@@ -1747,6 +1822,7 @@ class HarnessProcessManager:
         finally:
             if closed:
                 entry.exit_confirmed = True
+                self._closing_entries.pop(entry.incarnation_id, None)
                 with contextlib.suppress(Exception):
                     close_subprocess_transport(entry.process)
                 # Best-effort socket cleanup. uvicorn's atexit usually

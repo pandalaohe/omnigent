@@ -33,7 +33,8 @@ import re
 import shutil
 import socket
 import subprocess
-from collections.abc import Mapping, Sequence
+import uuid
+from collections.abc import Coroutine, Mapping, Sequence
 from pathlib import Path
 
 import httpx
@@ -428,6 +429,12 @@ class OpenCodeNativeServer:
         self.port: int | None = port
         self.process: subprocess.Popen[bytes] | None = None
         self.version: str | None = None
+        self.resident_incarnation_id = uuid.uuid4().hex
+        self.exit_confirmed = False
+        self.process_exit_confirmed = False
+        self._resident_spawned = False
+        self._lifecycle_lock = asyncio.Lock()
+        self._start_generation = 0
 
     @property
     def base_url(self) -> str:
@@ -469,6 +476,14 @@ class OpenCodeNativeServer:
         ]
 
     async def start(self) -> None:
+        """Start without replacing an incarnation whose exit is unconfirmed."""
+        async with self._lifecycle_lock:
+            if (self._resident_spawned or self.process is not None) and not self.exit_confirmed:
+                raise RuntimeError("Previous OpenCode server exit is not confirmed")
+            self._start_generation += 1
+            await self._start()
+
+    async def _start(self) -> None:
         """
         Launch the server subprocess and wait until it is ready.
 
@@ -504,12 +519,16 @@ class OpenCodeNativeServer:
             stderr=subprocess.DEVNULL,
             **_proc.spawn_kwargs(),
         )
+        self.resident_incarnation_id = uuid.uuid4().hex
+        self._resident_spawned = True
+        self.exit_confirmed = False
+        self.process_exit_confirmed = False
         _proc.remember_process_group(self.process)
         try:
             await self._wait_until_ready()
         except BaseException:
             # No caller owns the child until startup succeeds.
-            await self.close()
+            await self._close_locked()
             raise
 
     async def _wait_until_ready(self, *, attempts: int = 60, delay: float = 0.5) -> None:
@@ -554,7 +573,16 @@ class OpenCodeNativeServer:
             directory=directory or str(self.workspace),
         )
 
-    async def close(self) -> None:
+    def close(self) -> Coroutine[None, None, None]:
+        """Bind teardown to this start attempt before a caller defers awaiting it."""
+        return self._close_generation(self._start_generation)
+
+    async def _close_generation(self, start_generation: int) -> None:
+        async with self._lifecycle_lock:
+            if start_generation == self._start_generation:
+                await self._close_locked()
+
+    async def _close_locked(self) -> None:
         """Terminate the server subprocess if running."""
         process = self.process
         if process is None:
@@ -566,6 +594,7 @@ class OpenCodeNativeServer:
         except subprocess.TimeoutExpired:
             await asyncio.to_thread(_proc.kill_tree, process)
             await asyncio.to_thread(process.wait, 1)
+        self.process_exit_confirmed = True
         if self.process is process:
             self.process = None
 

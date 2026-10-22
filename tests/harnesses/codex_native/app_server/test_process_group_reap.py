@@ -7,12 +7,14 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import (
     CodexNativeAppServer,
 )
+from tests.harnesses.codex_native.app_server._support import _test_app_server
 
 
 def _isolated_discovery_registry(
@@ -422,7 +424,11 @@ async def test_app_server_close_escalates_recorded_group_before_unregister(
             process_group_id=group_id,
         )
 
-    await _server(456789).close()
+    original = _server(456789)
+    replacement = _server(456790)
+    assert original.resident_incarnation_id != replacement.resident_incarnation_id
+    await original.close()
+    assert not original.exit_confirmed
 
     # The spawned wrapper already exited, but its group survives: TERM then
     # KILL, and the registry entry is kept for the next reconcile.
@@ -435,7 +441,10 @@ async def test_app_server_close_escalates_recorded_group_before_unregister(
     monkeypatch.setattr(codex_native_app_server.os, "killpg", _killpg_missing)
     monkeypatch.setattr(codex_process_registry, "_ps_output", lambda _columns: "")
 
-    await _server(456790).close()
+    await replacement.close()
+    assert replacement.exit_confirmed
+    await replacement.close()
+    assert replacement.exit_confirmed
 
     assert unregistered == ["codex-native-test-tag"]
 
@@ -481,6 +490,71 @@ async def test_discovery_stop_reaps_before_bounded_stderr_drain(monkeypatch) -> 
     assert stderr_task.cancelled()
 
 
+@pytest.mark.parametrize("has_exited_process", [False, True])
+async def test_non_posix_reclose_does_not_confirm_descendant_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, has_exited_process: bool
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as module
+
+    async def no_posix_group(*_args) -> bool:
+        return True
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(module, "_reap_process_group_survivors", no_posix_group)
+    server = _test_app_server(tmp_path, tmp_path / "home", tmp_path / "bridge", tmp_path)
+    if has_exited_process:
+        server.proc = SimpleNamespace(returncode=0)  # type: ignore[assignment]
+    await server.close()
+    assert not server.exit_confirmed
+    assert server.process_exit_confirmed is has_exited_process
+    await server.close()
+    assert not server.exit_confirmed
+
+
+async def test_close_serializes_restart_and_skips_stale_queued_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as module
+
+    server = _test_app_server(tmp_path, tmp_path / "home", tmp_path / "bridge", tmp_path)
+    server.proc = SimpleNamespace(returncode=0)  # type: ignore[assignment]
+    server._resident_spawned = True
+    old_id = server.resident_incarnation_id
+    entered, resume = asyncio.Event(), asyncio.Event()
+    groups: list[int | None] = []
+
+    async def reap(group, _tag):
+        groups.append(group)
+        entered.set()
+        await resume.wait()
+        return True
+
+    new_process = SimpleNamespace(returncode=None)
+
+    async def spawn():
+        server.resident_incarnation_id = "new-incarnation"
+        server.proc = new_process  # type: ignore[assignment]
+        server.exit_confirmed = False
+
+    monkeypatch.setattr(module, "_reap_process_group_survivors", reap)
+    monkeypatch.setattr(server, "_start", spawn)
+    closing = asyncio.create_task(server.close())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    starting = asyncio.create_task(server.start())
+    stale_close = asyncio.create_task(server.close())
+    try:
+        await asyncio.sleep(0)
+        assert not starting.done()
+        assert groups == [None]
+    finally:
+        resume.set()
+        await asyncio.gather(closing, starting, stale_close)
+    assert server.resident_incarnation_id != old_id
+    assert server.proc is new_process
+    assert not server.exit_confirmed
+    assert groups == [None]
+
+
 @pytest.mark.posix_only
 async def test_close_surviving_posix_child_finishes_cleanup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -524,11 +598,17 @@ async def test_close_surviving_posix_child_finishes_cleanup(
         process_group_id=456,
         process_owner_lock=lock,
     )
+    server._resident_spawned = True
+    incarnation_id = server.resident_incarnation_id
     await asyncio.wait_for(server.close(), timeout=0.5)
     assert process.waits == 1
     assert lock.closed
     assert server.proc is None
     assert server.process_owner_lock is None
+    assert not server.exit_confirmed
+    with pytest.raises(RuntimeError, match="exit is not confirmed"):
+        await server.start()
+    assert server.resident_incarnation_id == incarnation_id
     assert unregistered == []
 
 
@@ -588,6 +668,7 @@ async def test_close_live_process_uses_verified_group_signal(
     await server.close()
     assert signals == [signal.SIGTERM]
     assert unregistered == ["test-tag"]
+    assert server.exit_confirmed
 
 
 @pytest.mark.posix_only
@@ -645,6 +726,7 @@ async def test_close_cancellation_cleans_stderr_and_context_tasks(
     assert unregistered == []
     assert stderr_task.cancelled()
     assert context_task.cancelled()
+    assert not server.exit_confirmed
 
 
 @pytest.mark.posix_only

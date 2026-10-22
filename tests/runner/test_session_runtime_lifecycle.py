@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 
 import pytest
@@ -247,6 +248,9 @@ async def test_late_codex_forwarder_closes_only_its_app_server(
     class _Server:
         def __init__(self) -> None:
             self.closed = False
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             self.closed = True
@@ -286,6 +290,9 @@ async def test_late_opencode_forwarder_closes_only_its_server() -> None:
     class _Server:
         def __init__(self) -> None:
             self.closed = False
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             self.closed = True

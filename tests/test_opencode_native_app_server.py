@@ -158,6 +158,9 @@ def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeSe
 
 def test_build_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     server = _server(monkeypatch, tmp_path)
+    replacement = _server(monkeypatch, tmp_path)
+    assert server.resident_incarnation_id != replacement.resident_incarnation_id
+    assert not server.exit_confirmed
     server.port = 49231
     argv = server.build_argv()
     assert argv[0] == "/usr/bin/opencode"
@@ -177,8 +180,70 @@ def test_terminal_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert env["XDG_DATA_HOME"] == str(server.xdg_data_home)
 
 
-async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_close_serializes_restart_and_skips_stale_queued_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     server = _server(monkeypatch, tmp_path)
+    entered, resume = asyncio.Event(), asyncio.Event()
+    terminated: list[object] = []
+
+    class _Process:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, _timeout):
+            return self.returncode
+
+    old_process, new_process = _Process(), _Process()
+    server.process = old_process  # type: ignore[assignment]
+    server._resident_spawned = True
+    old_id = server.resident_incarnation_id
+
+    async def to_thread(fn, *args):
+        if fn is appsrv._proc.terminate_tree:
+            terminated.append(args[0])
+            entered.set()
+            await resume.wait()
+        else:
+            return fn(*args)
+        return None
+
+    async def spawn():
+        server.resident_incarnation_id = "new-incarnation"
+        server.process = new_process  # type: ignore[assignment]
+        server.exit_confirmed = False
+
+    monkeypatch.setattr(appsrv.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(server, "_start", spawn)
+    closing = asyncio.create_task(server.close())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    starting = asyncio.create_task(server.start())
+    stale_close = asyncio.create_task(server.close())
+    try:
+        await asyncio.sleep(0)
+        assert not starting.done()
+        assert terminated == [old_process]
+        # OpenCode has no tree proof; simulate a future authoritative owner proof.
+        server.exit_confirmed = True
+    finally:
+        resume.set()
+        await asyncio.gather(closing, starting, stale_close)
+    assert server.resident_incarnation_id != old_id
+    assert server.process is new_process
+    assert not server.exit_confirmed
+    assert terminated == [old_process]
+
+
+async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from omnigent.runner.native import orchestration
+
+    server = _server(monkeypatch, tmp_path)
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
     started: dict[str, object] = {}
 
     class _FakeProc:
@@ -187,6 +252,10 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
 
         def poll(self) -> None:
             return None
+
+        def wait(self, _timeout: float | None = None) -> int:
+            self.returncode = 0
+            return 0
 
     def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
         started["argv"] = argv
@@ -198,11 +267,35 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    monkeypatch.setattr(appsrv._proc, "terminate_tree", lambda _process: None)
+    construction_id = server.resident_incarnation_id
     await server.start()
+    assert server.resident_incarnation_id != construction_id
     assert started["ready"] is True
     assert started["argv"][1] == "serve"
     assert server.process is not None
     assert server.process.pid is None
+    incarnation_id, process = server.resident_incarnation_id, server.process
+    with pytest.raises(RuntimeError, match="exit is not confirmed"):
+        await server.start()
+    assert server.process is process
+    assert server.resident_incarnation_id == incarnation_id
+    await orchestration._close_native_backend("owned", "opencode-native", server)
+    assert server.process_exit_confirmed
+    assert not server.exit_confirmed
+    closing = orchestration.native_backend_resident_inventory()
+    assert closing.owners == ()
+    assert not closing.exit_coverage_complete
+    with pytest.raises(RuntimeError, match="exit is not confirmed"):
+        await server.start()
+    # A future lifecycle owner can supply authoritative descendant-exit proof.
+    server.exit_confirmed = True
+    await orchestration._close_native_backend("owned", "opencode-native", server)
+    assert (orchestration.native_backend_resident_inventory()).owners == ()
+    assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
+    await server.start()
+    assert server.resident_incarnation_id != incarnation_id
+    assert not server.exit_confirmed
 
 
 async def test_start_closes_process_when_readiness_is_cancelled(
@@ -248,6 +341,8 @@ async def test_start_closes_process_when_readiness_is_cancelled(
 
     assert process.terminated is True
     assert server.process is None
+    assert server.process_exit_confirmed
+    assert not server.exit_confirmed
 
 
 async def test_start_closes_process_when_readiness_fails(
@@ -288,6 +383,8 @@ async def test_start_closes_process_when_readiness_fails(
 
     assert process.terminated is True
     assert server.process is None
+    assert server.process_exit_confirmed
+    assert not server.exit_confirmed
 
 
 async def test_start_raises_on_unsupported_version_without_env(
