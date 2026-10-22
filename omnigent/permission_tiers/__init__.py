@@ -601,9 +601,13 @@ def _command_paths(
     raw_tokens = []
     if writes_only:
         if context.platform == "windows" or powershell:
-            raw_tokens = re.findall(r""""[^"]*"|'[^']*'|[;&|<>()]+|[^\s"'|;&<>()]+""", command)
+            raw_tokens = re.findall(r"""[;&|<>()]+|(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+""", command)
             tokens = [
-                token[1:-1] if token.startswith(("'", '"')) and token[-1:] == token[:1] else token
+                re.sub(
+                    r""""([^"]*)"|'([^']*)'""",
+                    lambda match: next(value for value in match.groups() if value is not None),
+                    token,
+                )
                 for token in raw_tokens
             ]
         else:
@@ -760,24 +764,32 @@ def _write_operands(tokens: list[str]) -> list[str]:
     for offset, token in enumerate(tokens):
         command = token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
         arguments = tokens[offset + 1 :]
+        if command in ("cp", "mv", "install", "ln"):
+            # Retain attached targets even when a prefix prevents precise binding.
+            stop = arguments.index("--") if "--" in arguments else len(arguments)
+            for index, value in enumerate(arguments[:stop], start=offset + 1):
+                attached = re.fullmatch(r"-[A-Za-z]*?t(.*)", value)
+                if attached:
+                    conservative[index] = attached[1]
+                    arguments[index - offset - 1] = "-t" + attached[1]
         operands = [value for value in arguments if value and not value.startswith("-")]
-        if command in ("cp", "copy", "copy-item"):
-            if offset:
+        if command in ("cp", "copy", "copy-item", "install", "ln"):
+            if offset and command not in ("install", "ln"):
                 return conservative
             options = arguments
-            if command == "cp" and "--" in arguments:
+            if command in ("cp", "install", "ln") and "--" in arguments:
                 stop = arguments.index("--")
                 options = arguments[:stop]
                 operands = [value for value in options if value and not value.startswith("-")]
                 operands.extend(arguments[stop + 1 :])
             for index, value in enumerate(options):
-                if (command == "cp" and value in ("-t", "--target-directory")) or (
-                    command == "copy-item" and value.lower() == "-destination"
-                ):
+                if (
+                    command in ("cp", "install", "ln") and value in ("-t", "--target-directory")
+                ) or (command == "copy-item" and value.lower() == "-destination"):
                     return options[index + 1 : index + 2] or conservative
-                if command == "cp" and value.startswith("--target-directory="):
+                if command in ("cp", "install", "ln") and value.startswith("--target-directory="):
                     return [value.split("=", 1)[1]]
-                if command == "cp" and value.startswith("-t") and value != "-t":
+                if command in ("cp", "install", "ln") and value.startswith("-t") and value != "-t":
                     return [value[2:]]
                 if command == "copy-item" and value.lower().startswith("-destination:"):
                     return [value.split(":", 1)[1]]

@@ -556,6 +556,82 @@ def test_shell_protected_write_denials_name_the_bound_destination(
     assert destination in result.reason
 
 
+@pytest.mark.parametrize("command", ["cp", "mv", "install", "ln"])
+@pytest.mark.parametrize("prefix", ["", "env "])
+@pytest.mark.parametrize(
+    "option",
+    [
+        "-t {path}",
+        "-t{path}",
+        "-vt {path}",
+        "-vt{path}",
+        "--target-directory {path}",
+        "--target-directory={path}",
+    ],
+)
+@pytest.mark.parametrize("path", ["/usr/local/probe", "~/.ssh/probe", "/opt/work/project/probe"])
+def test_shell_target_directory_option_forms(
+    command: str, prefix: str, option: str, path: str
+) -> None:
+    result = decision(
+        "auto", "bash", {"command": f"{prefix}{command} {option.format(path=path)} source"}
+    )
+    assert result.action == (
+        Verdict.ALLOW if path.startswith("/opt/work/project/") else Verdict.DENY
+    )
+    if result.action == Verdict.DENY:
+        assert result.rule_id == "protected-path"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "Copy-Item source -Destination:{path}",
+        "Move-Item source -Destination:{path}",
+        "Set-Content -Path:{path} x",
+        "Add-Content -LiteralPath:{path} x",
+        "Out-File -FilePath:{path} x",
+        "Remove-Item -Path:{path}",
+    ],
+)
+@pytest.mark.parametrize("path", ["/usr/local/probe", "~/.ssh/probe", "/opt/work/project/probe"])
+@pytest.mark.parametrize("quote", ["", '"'])
+def test_powershell_colon_path_option_forms(command: str, path: str, quote: str) -> None:
+    result = decision(
+        "auto",
+        "bash",
+        {"command": "pwsh -Command '" + command.format(path=quote + path + quote) + "'"},
+    )
+    assert result.action == (
+        Verdict.ALLOW if path.startswith("/opt/work/project/") else Verdict.DENY
+    )
+    if result.action == Verdict.DENY:
+        assert result.rule_id == "protected-path"
+
+
+@pytest.mark.parametrize("command", ["install", "ln"])
+@pytest.mark.parametrize("prefix", ["", "env "])
+@pytest.mark.parametrize(
+    "option",
+    [
+        "-t {path}",
+        "-t{path}",
+        "-vt {path}",
+        "-vt{path}",
+        "--target-directory {path}",
+        "--target-directory={path}",
+    ],
+)
+def test_install_and_link_only_write_the_target_directory(
+    command: str, prefix: str, option: str
+) -> None:
+    target = option.format(path="/opt/work/project/output")
+    result = decision(
+        "auto", "bash", {"command": f"{prefix}{command} {target} /usr/local/read-only"}
+    )
+    assert result.action == Verdict.ALLOW
+
+
 @pytest.mark.parametrize("command", ['echo x >"/us"r/local/report', r"echo x >/us\r/local/report"])
 def test_shell_write_paths_resolve_quoted_and_escaped_components(command: str) -> None:
     result = decision("auto", "bash", {"command": command})
