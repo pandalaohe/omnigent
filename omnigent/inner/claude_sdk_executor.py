@@ -1939,6 +1939,7 @@ class ClaudeSDKExecutor(Executor):
         self._elicitation_handler: ElicitationHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
+        self._resident_connecting: dict[object, tuple[str, _ClaudeClientState]] = {}
         self._resident_inventory_detached = False
         # Per-session query slots serializing real turns and keep-warm pings.
         self._query_slots: dict[str, _QuerySlot] = {}
@@ -2107,6 +2108,10 @@ class ClaudeSDKExecutor(Executor):
             client = sdk.ClaudeSDKClient(options)
             original_prompt = getattr(options, "system_prompt", None)
             original_extra_args = getattr(options, "extra_args", {})
+            state = _ClaudeClientState(client=client, model=model)
+            token = object()
+            self._resident_connecting[token] = (session_key, state)
+            connected = False
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2160,7 +2165,9 @@ class ClaudeSDKExecutor(Executor):
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
+                    connected = True
             except asyncio.TimeoutError as exc:
+                self._resident_inventory_detached = True
                 await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
@@ -2174,6 +2181,7 @@ class ClaudeSDKExecutor(Executor):
                     f"{int(_CONNECT_TIMEOUT_SECONDS)}s. CLI stderr tail:\n{detail}"
                 ) from exc
             except Exception as exc:
+                self._resident_inventory_detached = True
                 # The CLI may exit immediately (e.g. ``unknown option``) before
                 # the SDK's async stderr reader has flushed all output.  A brief
                 # yield lets pending reader callbacks deliver remaining lines so
@@ -2192,6 +2200,10 @@ class ClaudeSDKExecutor(Executor):
                     f"Claude SDK connect failed: {exc}\nCLI stderr:\n{detail}"
                 ) from exc
             finally:
+                if not connected:
+                    # Best-effort connect teardown cannot acknowledge context absence.
+                    self._resident_inventory_detached = True
+                    self._resident_connecting.pop(token, None)
                 # Restore on both paths so post-connect stderr flows
                 # directly to the original callback and ``connect_stderr``
                 # can be GC'd instead of growing for the session lifetime.
@@ -2199,18 +2211,14 @@ class ClaudeSDKExecutor(Executor):
                 if isinstance(original_prompt, str):
                     options.system_prompt = original_prompt
                     options.extra_args = original_extra_args
-            current_task: asyncio.Task[None] | None = cast(
-                "asyncio.Task[None] | None", asyncio.current_task()
-            )
-            state = _ClaudeClientState(
-                client=client,
-                model=model,
-                effort=getattr(options, "effort", None),
-                permission_mode=getattr(options, "permission_mode", None),
-                loop=asyncio.get_running_loop(),
-                task=current_task,
-            )
+            if session_key in self._clients:
+                self._resident_inventory_detached = True
+            state.effort = getattr(options, "effort", None)
+            state.permission_mode = getattr(options, "permission_mode", None)
+            state.loop = asyncio.get_running_loop()
+            state.task = cast("asyncio.Task[None] | None", asyncio.current_task())
             self._clients[session_key] = state
+            self._resident_connecting.pop(token, None)
             return client
 
         if state.model != model:
@@ -2821,14 +2829,16 @@ class ClaudeSDKExecutor(Executor):
     def resident_inventory(self) -> ExecutorResidentInventory | None:
         """Copy registered client owners without loading or probing the SDK.
 
-        Connecting clients and independent SDK subcontexts are not
-        covered. A retired client keeps absence unknown even after cleanup returns.
+        Connecting clients retain their incarnation on promotion. Independent SDK
+        subcontexts are not covered; retired clients keep absence unknown.
         """
         if self._resident_inventory_detached:
             return None
         owners: dict[str, ExecutorResidentOwner] = {}
         clients: set[int] = set()
-        for session_key, state in tuple(self._clients.items()):
+        candidates = [(key, state, True) for key, state in tuple(self._clients.items())]
+        candidates.extend((key, state, False) for key, state in self._resident_connecting.values())
+        for session_key, state, started in candidates:
             if (
                 not isinstance(state, _ClaudeClientState)
                 or not session_key
@@ -2844,7 +2854,7 @@ class ClaudeSDKExecutor(Executor):
                 incarnation_id=identity,
                 session_keys=(session_key,),
                 vendor_context_id=state.vendor_context_id,
-                started=True,
+                started=started,
                 closing=False,
                 cleanup_complete=False,
             )

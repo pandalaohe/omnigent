@@ -3062,6 +3062,46 @@ async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknow
             assert observed["owners"][0]["vendor_context_id"] == "vendor-context"
             assert observed["aliases_complete"] is False
             assert observed["context_coverage_complete"] is False
+            monkeypatch.setattr(
+                "omnigent.inner.claude_sdk_executor.uuid4", lambda: SimpleNamespace(hex="b" * 32)
+            )
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            class ConnectingClient:
+                def __init__(self, options):
+                    pass
+
+                async def connect(self):
+                    entered.set()
+                    await release.wait()
+
+            connecting = asyncio.create_task(
+                executor._get_or_create_client(
+                    SimpleNamespace(ClaudeSDKClient=ConnectingClient),
+                    session_key="connecting-key",
+                    options=SimpleNamespace(),
+                    model=None,
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                observed = (await client.get(route)).json()["inventory"]
+                assert len(observed["owners"]) == 2
+                pending = observed["owners"][1]
+                assert pending["incarnation_id"] == "b" * 32
+                assert pending["session_keys"] == ["connecting-key"]
+                assert pending["vendor_context_id"] is None
+                assert pending["started"] is False
+                assert pending["closing"] is pending["cleanup_complete"] is False
+                assert (
+                    observed["aliases_complete"] is observed["context_coverage_complete"] is False
+                )
+            finally:
+                release.set()
+                await connecting
+            promoted = (await client.get(route)).json()["inventory"]["owners"][1]
+            assert promoted["incarnation_id"] == pending["incarnation_id"]
+            assert promoted["started"] is True
             state.resident_context_conflict = True
             assert (await client.get(route)).json() == {"inventory": None}
         cleanup = asyncio.create_task(asyncio.sleep(0, result=True))

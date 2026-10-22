@@ -125,6 +125,207 @@ def test_resident_inventory_reads_registered_claude_clients_without_sdk(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_resident_inventory_keeps_connecting_client_incarnation(monkeypatch):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class ConnectingClient(_SDKClient):
+        async def connect(self):
+            entered.set()
+            await release.wait()
+
+    factory = Mock(side_effect=ConnectingClient)
+    sdk = SimpleNamespace(ClaudeSDKClient=factory)
+    options = SimpleNamespace()
+    connecting = asyncio.create_task(
+        executor._get_or_create_client(sdk, session_key="main", options=options, model=None)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        pending = executor.resident_inventory()
+        assert pending is not None and len(pending.owners) == 1
+        (owner,) = pending.owners
+        assert owner.session_keys == ("main",)
+        assert owner.vendor_context_id is None
+        assert not owner.started and not owner.closing and not owner.cleanup_complete
+        assert not pending.aliases_complete and not pending.context_coverage_complete
+        assert executor.resident_inventory() == pending
+    finally:
+        release.set()
+        client = await connecting
+    (connected,) = executor.resident_inventory().owners
+    assert connected.incarnation_id == owner.incarnation_id
+    assert connected.started
+    assert (
+        await executor._get_or_create_client(sdk, session_key="main", options=options, model=None)
+        is client
+    )
+    factory.assert_called_once()
+    assert pending.owners[0] == owner and not owner.started
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "cleanup"),
+    [
+        ("error", "ok"),
+        ("timeout", "ok"),
+        ("cancel", "none"),
+        ("error", "error"),
+        ("timeout", "cancel"),
+    ],
+)
+async def test_resident_inventory_connect_failure_keeps_absence_unknown(
+    monkeypatch, outcome, cleanup
+):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    entered, finish_connect = asyncio.Event(), asyncio.Event()
+    cleaning, finish_cleanup = asyncio.Event(), asyncio.Event()
+
+    class FailingClient(_SDKClient):
+        async def connect(self):
+            entered.set()
+            await finish_connect.wait()
+            if outcome == "timeout":
+                raise TimeoutError("connect timeout")
+            raise RuntimeError("connect failed")
+
+    async def force_close(client):
+        assert isinstance(client, FailingClient)
+        cleaning.set()
+        await finish_cleanup.wait()
+        if cleanup == "error":
+            raise RuntimeError("cleanup failed")
+        if cleanup == "cancel":
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(executor, "_force_close_client", force_close)
+    connecting = asyncio.create_task(
+        executor._get_or_create_client(
+            SimpleNamespace(ClaudeSDKClient=FailingClient),
+            session_key="main",
+            options=SimpleNamespace(),
+            model=None,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert len(executor.resident_inventory().owners) == 1
+        if outcome == "cancel":
+            connecting.cancel()
+        else:
+            finish_connect.set()
+            await asyncio.wait_for(cleaning.wait(), 2)
+            assert executor.resident_inventory() is None
+            finish_cleanup.set()
+        expected = (
+            asyncio.CancelledError
+            if "cancel" in (outcome, cleanup)
+            else (RuntimeError if outcome == "error" or cleanup == "error" else TimeoutError)
+        )
+        with pytest.raises(expected):
+            await connecting
+        assert executor.resident_inventory() is None
+        assert not executor._resident_connecting and not executor._clients
+        await executor._get_or_create_client(
+            SimpleNamespace(ClaudeSDKClient=_SDKClient),
+            session_key="replacement",
+            options=SimpleNamespace(),
+            model=None,
+        )
+        assert executor.resident_inventory() is None
+        assert cleaning.is_set() is (outcome != "cancel")
+    finally:
+        finish_connect.set()
+        finish_cleanup.set()
+        if not connecting.done():
+            connecting.cancel()
+        await asyncio.gather(connecting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["same-key", "different-key", "id-collision", "shared-client"])
+async def test_resident_inventory_separates_concurrent_connect_owners(monkeypatch, race):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    if race == "id-collision":
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor.uuid4", lambda: SimpleNamespace(hex="a" * 32)
+        )
+    executor = ClaudeSDKExecutor()
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    calls = []
+
+    class ConnectingClient(_SDKClient):
+        async def connect(self):
+            index = len(calls)
+            calls.append(self)
+            entered[index].set()
+            await release[index].wait()
+
+    shared = ConnectingClient(None)
+    sdk = SimpleNamespace(
+        ClaudeSDKClient=(lambda options: shared) if race == "shared-client" else ConnectingClient
+    )
+    tasks = []
+    try:
+        for index in range(2):
+            tasks.append(
+                asyncio.create_task(
+                    executor._get_or_create_client(
+                        sdk,
+                        session_key="main" if index == 0 or race == "same-key" else "side",
+                        options=SimpleNamespace(),
+                        model=None,
+                    )
+                )
+            )
+            await asyncio.wait_for(entered[index].wait(), 2)
+        pending = executor.resident_inventory()
+        if race in {"id-collision", "shared-client"}:
+            assert pending is None
+        else:
+            assert len(pending.owners) == 2
+            identities = {owner.incarnation_id for owner in pending.owners}
+            assert len(identities) == 2
+            assert all(not owner.started for owner in pending.owners)
+            assert [owner.session_keys for owner in pending.owners].count(("main",)) == (
+                2 if race == "same-key" else 1
+            )
+        release[0].set()
+        await tasks[0]
+        if race in {"same-key", "different-key"}:
+            during = executor.resident_inventory()
+            assert {owner.incarnation_id for owner in during.owners} == identities
+            assert sorted(owner.started for owner in during.owners) == [False, True]
+        release[1].set()
+        await tasks[1]
+        final = executor.resident_inventory()
+        if race == "different-key":
+            assert {owner.incarnation_id for owner in final.owners} == identities
+            assert all(owner.started for owner in final.owners)
+            assert not final.aliases_complete and not final.context_coverage_complete
+        else:
+            assert final is None
+        assert len(calls) == 2 and not executor._resident_connecting
+    finally:
+        for signal in release:
+            signal.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_resident_inventory_incarnation_follows_client_reuse_and_replacement(monkeypatch):
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
