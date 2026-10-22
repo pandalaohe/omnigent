@@ -4,16 +4,24 @@ import json
 
 import httpx
 import pytest
+from jsonschema import ValidationError, validate
 
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.spec import AgentSpec
+from omnigent.tools.builtins.child_cap import SysChildCapTool
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "arguments,method", [({}, "GET"), ({"cap": 4}, "PATCH"), ({"cap": "none"}, "PATCH")]
+    "arguments,method,expected_cap",
+    [
+        ({}, "GET", None),
+        ({"cap": 4}, "PATCH", 4),
+        ({"cap": "6"}, "PATCH", 6),
+        ({"cap": "none"}, "PATCH", "none"),
+    ],
 )
-async def test_child_cap_runner_reads_and_sets_own_session(arguments, method):
+async def test_child_cap_runner_reads_and_sets_own_session(arguments, method, expected_cap):
     seen = []
 
     def handle(request):
@@ -39,11 +47,32 @@ async def test_child_cap_runner_reads_and_sets_own_session(arguments, method):
     assert seen[0].url.path == "/v1/sessions/parent/child-cap"
     assert seen[0].method == method
     if method == "PATCH":
-        assert json.loads(seen[0].content) == arguments
+        assert json.loads(seen[0].content) == {"cap": expected_cap}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cap", [True, 0, 1.5, "4", None])
+@pytest.mark.parametrize(
+    "cap",
+    [
+        True,
+        0,
+        -1,
+        1.5,
+        None,
+        "0",
+        "04",
+        "+4",
+        "-4",
+        " 4",
+        "4 ",
+        "4\n",
+        "4.0",
+        "text",
+        "٤",
+        "６",
+        pytest.param("9" * 5000, id="too-many-digits"),
+    ],
+)
 async def test_child_cap_runner_rejects_invalid_values_without_server_write(cap):
     def handle(request):
         pytest.fail("invalid cap must not reach server")
@@ -61,3 +90,16 @@ async def test_child_cap_runner_rejects_invalid_values_without_server_write(cap)
             )
         )
     assert "error" in result
+
+
+@pytest.mark.parametrize("cap", [1, "6", "none"])
+def test_child_cap_schema_accepts_documented_values(cap):
+    parameters = SysChildCapTool().get_schema()["function"]["parameters"]
+    validate({"cap": cap}, parameters)
+
+
+@pytest.mark.parametrize("cap", ["0", "04", "+4", " 4", "4\n", "٤", None])
+def test_child_cap_schema_rejects_noncanonical_values(cap):
+    parameters = SysChildCapTool().get_schema()["function"]["parameters"]
+    with pytest.raises(ValidationError):
+        validate({"cap": cap}, parameters)
