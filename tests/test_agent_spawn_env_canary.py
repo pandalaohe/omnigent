@@ -175,6 +175,41 @@ def test_real_builder_does_not_leak_host_secrets(harness, hostile_env, monkeypat
 
 
 @pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
+def test_real_builder_honors_host_passthrough_without_bypassing_denies(
+    harness, hostile_env, monkeypatch
+):
+    monkeypatch.setattr(
+        "os.environ",
+        {
+            **hostile_env,
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": (
+                " , HOST_TOOL_TOKEN, , OPENAI_API_KEY, PI_SESSION_ID, "
+                "DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, MISSING_NAME, HOST_TOOL_TOKEN, "
+            ),
+            "HOST_TOOL_TOKEN": "fake-listed-token",
+            "HOST_TOOL_TOKEN_OTHER": "fake-unlisted-token",
+            "OPENAI_API_KEY": "fake-developer-key",
+            "PI_SESSION_ID": "inherited-session",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+        },
+    )
+
+    env = SPAWN_ENV_BUILDERS[harness]()
+
+    assert env.get("HOST_TOOL_TOKEN") == "fake-listed-token"
+    assert "HOST_TOOL_TOKEN_OTHER" not in env
+    assert "MISSING_NAME" not in env
+    assert CANARY_SECRETS.keys().isdisjoint(env)
+    assert "DBUS_SESSION_BUS_ADDRESS" not in env
+    assert "XDG_RUNTIME_DIR" not in env
+    if harness == "codex":
+        assert "OPENAI_API_KEY" not in env
+    if harness == "pi":
+        assert "PI_SESSION_ID" not in env
+
+
+@pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
 def test_real_builder_still_yields_a_usable_environment(harness, hostile_env, monkeypatch):
     monkeypatch.setattr("os.environ", dict(hostile_env))
 
@@ -334,6 +369,20 @@ def test_source_is_never_mutated(hostile_env):
     before = dict(hostile_env)
     clean_agent_env(allow_prefixes=("QWEN_",), source=hostile_env)
     assert hostile_env == before
+
+
+def test_host_passthrough_uses_only_the_supplied_source(monkeypatch):
+    monkeypatch.setattr("os.environ", {"OMNIGENT_RUNNER_ENV_PASSTHROUGH": "AMBIENT_TOOL_TOKEN"})
+    source = {
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "SOURCE_TOOL_TOKEN",
+        "SOURCE_TOOL_TOKEN": "fake-source-token",
+        "AMBIENT_TOOL_TOKEN": "fake-ambient-token",
+    }
+    before = dict(source)
+
+    assert clean_agent_env(source=source) == {"SOURCE_TOOL_TOKEN": "fake-source-token"}
+    assert source == before
+    assert clean_agent_env(source={"AMBIENT_TOOL_TOKEN": "fake-ambient-token"}) == {}
 
 
 def test_base_does_not_include_identity_vars():

@@ -75,6 +75,10 @@ async def test_app_server_start_passes_native_filter_only_to_enabled_subprocess(
     host_filter: str | None,
 ) -> None:
     monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1" if enabled else "0")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "HOST_TOOL_TOKEN,OPENAI_API_KEY")
+    monkeypatch.setenv("HOST_TOOL_TOKEN", "fake-listed-token")
+    monkeypatch.setenv("HOST_TOOL_TOKEN_OTHER", "fake-unlisted-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-developer-key")
     if host_filter is None:
         monkeypatch.delenv("RUST_LOG", raising=False)
     else:
@@ -112,6 +116,9 @@ async def test_app_server_start_passes_native_filter_only_to_enabled_subprocess(
     with pytest.raises(SpawnObserved):
         await server.start()
 
+    assert spawn_env.get("HOST_TOOL_TOKEN") == "fake-listed-token"
+    assert "HOST_TOOL_TOKEN_OTHER" not in spawn_env
+    assert "OPENAI_API_KEY" not in spawn_env
     expected = {
         **original_env,
         "CODEX_HOME": str(server.codex_home),
