@@ -3043,6 +3043,18 @@ async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknow
                 "context_coverage_complete": False,
             }
         }
+        if family == "codex":
+            app_session._cleaned = False
+            app_session._resident_maintenance["b" * 32] = "maintenance-thread"
+            observed = (await client.get(route)).json()["inventory"]
+            assert len(observed["owners"]) == 2
+            fork = observed["owners"][1]
+            assert fork["incarnation_id"] == "b" * 32
+            assert fork["vendor_context_id"] == "maintenance-thread"
+            assert fork["session_keys"] == ["owner-key"]
+            assert fork["cleanup_complete"] is False
+            assert observed["aliases_complete"] is False
+            assert observed["context_coverage_complete"] is False
         if family == "claude-sdk":
             state = executor._clients["owner-key"]
             state.vendor_context_id = "vendor-context"

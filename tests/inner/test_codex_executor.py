@@ -8613,3 +8613,273 @@ async def test_resident_inventory_retains_closing_owner_until_cleanup_and_replac
     assert app.resident_incarnation_id == "a" * 32
     executor._session_states["unsupported"] = _CodexSessionState(app_session=SimpleNamespace())
     assert executor.resident_inventory() is None
+
+
+@pytest.fixture
+def maintenance_inventory_owner():
+    app = _CodexAppServerSession(codex_path="/bin/echo", cwd=None, env={}, tool_executor=None)
+    app.thread_id = "main-thread"
+    app._started, app._cleaned = True, False
+    app._send_response = AsyncMock()
+    executor = CodexExecutor(codex_path="/bin/echo")
+    executor._session_states["main"] = _CodexSessionState(app_session=app)
+    return app, executor
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_keeps_pending_maintenance_attempt(maintenance_inventory_owner):
+    app, executor = maintenance_inventory_owner
+    entered = asyncio.Event()
+
+    async def request(method, params):
+        assert method == "thread/fork"
+        entered.set()
+        await asyncio.Event().wait()
+
+    app._request = request
+    ping = asyncio.create_task(app.keep_warm_ping())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        snapshot = executor.resident_inventory()
+        assert snapshot is not None and len(snapshot.owners) == 2
+        pending = [owner for owner in snapshot.owners if owner.vendor_context_id is None]
+        assert len(pending) == 1
+        assert pending[0].session_keys == ("main",)
+        assert pending[0].incarnation_id != app.resident_incarnation_id
+        assert not pending[0].started and not pending[0].cleanup_complete
+    finally:
+        ping.cancel()
+        await asyncio.gather(ping, return_exceptions=True)
+    assert executor.resident_inventory() == snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["ok", "failed", "cancel", "rpc-error", "timeout"])
+@pytest.mark.parametrize("early", [False, True])
+async def test_resident_inventory_retains_maintenance_after_routing_retirement(
+    maintenance_inventory_owner, outcome, early
+):
+    app, executor = maintenance_inventory_owner
+    executor._session_states["ui-alias"] = _CodexSessionState(app_session=app)
+    entered = asyncio.Event()
+    requests = []
+
+    async def request(method, params):
+        requests.append(method)
+        if method == "thread/fork":
+            if early:
+                app._keep_warm_fork_id_for(
+                    {
+                        "method": "thread/started",
+                        "params": {
+                            "thread": {
+                                "id": "maintenance-thread",
+                                "ephemeral": True,
+                                "threadSource": "omnigent-keep-warm",
+                                "forkedFromId": "main-thread",
+                            }
+                        },
+                    }
+                )
+            if outcome == "rpc-error":
+                raise RuntimeError("lost fork reply")
+            if outcome == "timeout":
+                raise TimeoutError("fork timed out")
+            return {"result": {"thread": {"id": "maintenance-thread"}}}
+        if method == "turn/start":
+            entered.set()
+            if outcome == "cancel":
+                await asyncio.Event().wait()
+            app._keep_warm_queues["maintenance-thread"].put_nowait(
+                {
+                    "method": "turn/completed" if outcome == "ok" else "turn/failed",
+                    "params": {"threadId": "maintenance-thread", "turn": {"id": "turn"}},
+                }
+            )
+            return {"result": {"turn": {"id": "turn"}}}
+        return {"result": {}}
+
+    app._request = request
+    ping = asyncio.create_task(app.keep_warm_ping())
+    try:
+        if outcome == "rpc-error":
+            with pytest.raises(RuntimeError, match="lost fork reply"):
+                await ping
+        elif outcome == "timeout":
+            assert (await ping).reason == "timeout"
+        else:
+            await asyncio.wait_for(entered.wait(), 2)
+            if outcome == "cancel":
+                ping.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await ping
+            else:
+                assert (await ping).outcome == ("ok" if outcome == "ok" else "failed")
+        before_reads = tuple(requests)
+        snapshot = executor.resident_inventory()
+        assert snapshot is not None and len(snapshot.owners) == 2
+        (fork,) = [
+            owner
+            for owner in snapshot.owners
+            if owner.incarnation_id != app.resident_incarnation_id
+        ]
+        assert fork.vendor_context_id == (
+            None if outcome in {"rpc-error", "timeout"} and not early else "maintenance-thread"
+        )
+        assert fork.session_keys == ("main", "ui-alias")
+        assert not fork.cleanup_complete
+        assert not snapshot.aliases_complete and not snapshot.context_coverage_complete
+        assert "maintenance-thread" not in app._keep_warm_queues
+        assert app._events.empty()
+        if fork.vendor_context_id is not None:
+            app._keep_warm_fork_id_for(
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "maintenance-thread",
+                            "ephemeral": True,
+                            "threadSource": "omnigent-keep-warm",
+                            "forkedFromId": "main-thread",
+                        }
+                    },
+                }
+            )
+            assert executor.resident_inventory() == snapshot
+        assert tuple(requests) == before_reads
+    finally:
+        if not ping.done():
+            ping.cancel()
+        await asyncio.gather(ping, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["reused-id", "conflicting-id", "overflow", "collision"])
+async def test_resident_inventory_maintenance_ambiguity_and_bounds(
+    maintenance_inventory_owner, monkeypatch, fault
+):
+    import omnigent.inner.codex_executor as module
+
+    app, executor = maintenance_inventory_owner
+    if fault == "overflow":
+        monkeypatch.setattr(module, "_KEEP_WARM_RETIRED_LIMIT", 2)
+    if fault == "collision":
+        monkeypatch.setattr(
+            module, "uuid4", lambda: SimpleNamespace(hex=app.resident_incarnation_id)
+        )
+
+    async def request(method, params):
+        if method == "thread/fork":
+            if fault == "conflicting-id":
+                app._keep_warm_fork_id_for(
+                    {
+                        "method": "thread/started",
+                        "params": {
+                            "thread": {
+                                "id": "early-fork",
+                                "ephemeral": True,
+                                "threadSource": "omnigent-keep-warm",
+                                "forkedFromId": "main-thread",
+                            }
+                        },
+                    }
+                )
+            return {"result": {"thread": {"id": "fork"}}}
+        if method == "turn/start":
+            app._keep_warm_queues["fork"].put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "fork"},
+                }
+            )
+            return {"result": {"turn": {"id": "turn"}}}
+        return {"result": {}}
+
+    app._request = request
+    for _ in range(3 if fault == "overflow" else 2 if fault == "reused-id" else 1):
+        assert (await app.keep_warm_ping()).outcome == "ok"
+    snapshot = executor.resident_inventory()
+    if fault == "reused-id":
+        assert len(snapshot.owners) == 3
+        assert snapshot.ambiguous_context_ids == ("fork",)
+        assert len({owner.incarnation_id for owner in snapshot.owners}) == 3
+    else:
+        assert snapshot is None
+        if fault == "overflow":
+            assert len(app._resident_maintenance) == 2
+        app._keep_warm_queues.clear()
+        app._keep_warm_retired.clear()
+        assert executor.resident_inventory() is None
+
+
+def test_resident_inventory_unknown_for_unregistered_maintenance(maintenance_inventory_owner):
+    app, executor = maintenance_inventory_owner
+    app._keep_warm_fork_id_for(
+        {
+            "method": "thread/started",
+            "params": {
+                "thread": {
+                    "id": "unregistered",
+                    "ephemeral": True,
+                    "threadSource": "omnigent-keep-warm",
+                    "forkedFromId": "main-thread",
+                }
+            },
+        }
+    )
+    assert executor.resident_inventory() is None
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_rejects_foreign_parent_during_fork_request(
+    maintenance_inventory_owner,
+):
+    app, executor = maintenance_inventory_owner
+
+    async def request(method, params):
+        app._keep_warm_fork_id_for(
+            {
+                "method": "thread/started",
+                "params": {
+                    "thread": {
+                        "id": "foreign-fork",
+                        "ephemeral": True,
+                        "threadSource": "omnigent-keep-warm",
+                        "forkedFromId": "another-parent",
+                    }
+                },
+            }
+        )
+        raise RuntimeError("lost fork reply")
+
+    app._request = request
+    with pytest.raises(RuntimeError, match="lost fork reply"):
+        await app.keep_warm_ping()
+    assert executor.resident_inventory() is None
+
+
+@pytest.mark.asyncio
+async def test_resident_inventory_maintenance_follows_owned_parent_cleanup(
+    maintenance_inventory_owner, monkeypatch
+):
+    app, executor = maintenance_inventory_owner
+    app._resident_maintenance["fork-incarnation"] = "fork-thread"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def close():
+        entered.set()
+        await release.wait()
+        app._cleaned = True
+
+    monkeypatch.setattr(app, "close", close)
+    closing = asyncio.create_task(executor.close_session("main"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        snapshot = executor.resident_inventory()
+        assert len(snapshot.owners) == 2
+        assert all(owner.closing and not owner.cleanup_complete for owner in snapshot.owners)
+    finally:
+        release.set()
+        await closing
+    snapshot = executor.resident_inventory()
+    assert snapshot.owners == () and not snapshot.context_coverage_complete
