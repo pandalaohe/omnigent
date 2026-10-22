@@ -1526,9 +1526,11 @@ async def test_forwarder_task_exit_paths_are_logged(
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
 
 
+@pytest.mark.parametrize("overwrite", [False, True])
 async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    overwrite: bool,
 ) -> None:
     """
     A refused ``thread/resume`` must not leak the app-server it started.
@@ -1543,6 +1545,12 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _: 0,
+    )
 
     session_id = "b7d2c1e0aa114b52b7c2f1d3e4a5b6c7"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
@@ -1596,7 +1604,24 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
             self.config_overrides: list[str] = []
 
         async def start(self) -> None:
-            """:returns: None."""
+            from omnigent.runner.native.orchestration import native_backend_resident_inventory
+
+            snapshot = native_backend_resident_inventory()
+            candidates = [owner for owner in snapshot.owners if session_id in owner.session_ids]
+            assert len(candidates) == 1
+            (owner,) = candidates
+            assert owner.incarnation_id == self.resident_incarnation_id
+            assert not owner.registered and not owner.closing and not owner.exit_confirmed
+            self.resident_incarnation_id = uuid.uuid4().hex
+            (spawned,) = native_backend_resident_inventory().owners
+            assert spawned.incarnation_id == self.resident_incarnation_id
+            assert owner.incarnation_id != spawned.incarnation_id
+            if overwrite:
+                orchestration._AUTO_CODEX_APP_SERVERS[session_id] = SimpleNamespace(
+                    resident_incarnation_id=uuid.uuid4().hex,
+                    exit_confirmed=False,
+                    process_exit_confirmed=False,
+                )
 
         async def close(self) -> None:
             """Record the teardown the failure path owes."""
@@ -1650,6 +1675,10 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         :raises RuntimeError: Always, mirroring the app-server error.
         """
         del transport, terminal_launch_args
+        snapshot = orchestration.native_backend_resident_inventory()
+        (owner,) = snapshot.owners
+        assert owner.registered and not owner.closing
+        assert snapshot.exit_coverage_complete is (not overwrite)
         raise RuntimeError(f"thread {loaded_thread_id} already has an active writer")
 
     class _UnreachableResourceRegistry:

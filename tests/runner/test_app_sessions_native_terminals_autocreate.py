@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -6170,12 +6171,15 @@ async def _run_opencode_launch(
     *,
     agent_spec: AgentSpec,
     global_instructions: str | None,
+    on_start: Callable[[Any], Awaitable[None]] | None = None,
 ) -> tuple[Path, Path]:
     """Drive ``_launch_opencode`` up to the server start.
 
     Stops at the fake server's ``start()`` and returns ``(bridge_dir,
     config_path)`` so callers can inspect the synthesized ``opencode.json``.
     """
+    from uuid import uuid4
+
     from omnigent.harnesses.opencode_native import app_server as opencode_app_server
     from omnigent.harnesses.opencode_native import bridge as opencode_bridge
     from omnigent.harnesses.opencode_native import provider as opencode_provider
@@ -6205,8 +6209,13 @@ async def _run_opencode_launch(
     class _FakeServer:
         def __init__(self, **kwargs: Any) -> None:
             del kwargs
+            self.resident_incarnation_id = uuid4().hex
+            self.process_exit_confirmed = False
+            self.exit_confirmed = False
 
         async def start(self) -> None:
+            if on_start is not None:
+                await on_start(self)
             raise _OpenCodeStartSentinel
 
     monkeypatch.setattr(opencode_app_server, "OpenCodeNativeServer", _FakeServer)
@@ -6227,6 +6236,106 @@ async def _run_opencode_launch(
         opencode_bridge.xdg_config_home_for_bridge_dir(bridge_dir) / "opencode" / "opencode.json"
     )
     return bridge_dir, config_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["sentinel", "spawn-error", "cancel", "collision", "alias"])
+async def test_native_inventory_keeps_opencode_start_and_unknown_unwind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from omnigent.runner.native import orchestration
+    from tests.runner.native_helpers import _harness_spec
+
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    entered, release = asyncio.Event(), asyncio.Event()
+    backends = []
+
+    async def on_start(backend):
+        backends.append(backend)
+        if outcome in {"alias", "collision"}:
+            orchestration._AUTO_OPENCODE_SERVERS["known-association"] = (
+                backend
+                if outcome == "alias"
+                else SimpleNamespace(
+                    resident_incarnation_id=backend.resident_incarnation_id,
+                    exit_confirmed=False,
+                    process_exit_confirmed=False,
+                )
+            )
+        entered.set()
+        await release.wait()
+        if outcome == "spawn-error":
+            backend.resident_incarnation_id = "b" * 32
+            raise RuntimeError("backend spawn failed")
+
+    launch = asyncio.create_task(
+        _run_opencode_launch(
+            tmp_path,
+            monkeypatch,
+            agent_spec=_harness_spec("opencode-native"),
+            global_instructions=None,
+            on_start=on_start,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        snapshot = orchestration.native_backend_resident_inventory()
+        if outcome == "collision":
+            assert snapshot.owners == () and not snapshot.exit_coverage_complete
+        else:
+            (owner,) = snapshot.owners
+            assert owner.incarnation_id == backends[0].resident_incarnation_id
+            assert owner.harness == "opencode-native"
+            assert owner.session_ids == (
+                ("known-association", "opencode-launch-session")
+                if outcome == "alias"
+                else ("opencode-launch-session",)
+            )
+            assert owner.registered is (outcome == "alias")
+            assert not owner.closing and not owner.exit_confirmed
+            assert not owner.process_exit_confirmed and not owner.aliases_complete
+            assert orchestration.native_backend_resident_inventory() == snapshot
+        app = create_runner_app(server_client=NullServerClient(), auth_token="inventory-auth")
+        async with _runner_client(app) as client:
+            route = "/v1/startup/owner-inventory?read_id=starting"
+            assert (await client.get(route)).status_code == 401
+            response = await client.get(route, headers={"Authorization": "Bearer inventory-auth"})
+            assert response.status_code == 200
+            body = response.json()
+            assert body["read_id"] == "starting"
+            assert body["executor_contexts_complete"] is False
+            assert body["external_owners_complete"] is False
+            native = body["native_backends"]
+            assert native["aliases_complete"] is False
+            if outcome == "collision":
+                assert native["owners"] == [] and native["exit_coverage_complete"] is False
+            else:
+                (observed,) = native["owners"]
+                assert observed["incarnation_id"] == backends[0].resident_incarnation_id
+                assert observed["registered"] is (outcome == "alias")
+                assert observed["closing"] is observed["exit_confirmed"] is False
+        if outcome == "cancel":
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+        else:
+            release.set()
+            if outcome == "spawn-error":
+                with pytest.raises(RuntimeError, match="backend spawn failed"):
+                    await launch
+            else:
+                await launch
+        assert not orchestration._STARTING_NATIVE_BACKENDS
+        assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
+        orchestration._AUTO_OPENCODE_SERVERS.clear()
+        final = orchestration.native_backend_resident_inventory()
+        assert final.owners == () and not final.exit_coverage_complete
+    finally:
+        release.set()
+        if not launch.done():
+            launch.cancel()
+        await asyncio.gather(launch, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -410,7 +410,7 @@ _NativeBackendHarness = Literal["codex-native", "opencode-native"]
 class NativeBackendResidentSnapshot:
     """An owned backend, independent of auxiliary terminals.
 
-    Session ids cover known owner-map associations only. Internal thread aliases
+    Session ids cover known backend associations only. Internal thread aliases
     and unregistered external backends are not covered by this inventory.
     Process exit alone does not confirm descendants or restore complete coverage.
     """
@@ -427,7 +427,7 @@ class NativeBackendResidentSnapshot:
 
 @dataclasses.dataclass(frozen=True)
 class NativeBackendInventorySnapshot:
-    """Registered native owners and closing owners, with boot-scoped exit coverage."""
+    """Native owners including starts and closes, with boot-scoped exit coverage."""
 
     owners: tuple[NativeBackendResidentSnapshot, ...]
     exit_coverage_complete: bool
@@ -443,11 +443,12 @@ class _ClosingNativeBackend:
 
 
 _CLOSING_NATIVE_BACKENDS: dict[object, _ClosingNativeBackend] = {}
+_STARTING_NATIVE_BACKENDS: dict[object, tuple[str, _NativeBackendHarness, _NativeBackend]] = {}
 _native_backend_exit_coverage_complete = True
 
 
 def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
-    """Read registered and unconfirmed closing owners without I/O or mutation."""
+    """Read registered, starting and unconfirmed closing owners without I/O."""
     owners: dict[str, tuple[_NativeBackendHarness, _NativeBackend, set[str], bool, bool]] = {}
     registries: tuple[tuple[_NativeBackendHarness, Mapping[str, _NativeBackend]], ...] = (
         ("codex-native", _AUTO_CODEX_APP_SERVERS),
@@ -459,6 +460,14 @@ def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
             if key not in owners:
                 owners[key] = (harness, backend, set(), True, False)
             owners[key][2].add(session_id)
+    for session_id, harness, backend in _STARTING_NATIVE_BACKENDS.values():
+        key = backend.resident_incarnation_id
+        if key in owners:
+            if owners[key][0] != harness or owners[key][1] is not backend:
+                return NativeBackendInventorySnapshot((), False)
+            owners[key][2].add(session_id)
+        else:
+            owners[key] = (harness, backend, {session_id}, False, False)
     for owner in _CLOSING_NATIVE_BACKENDS.values():
         key = owner.incarnation_id
         if key in owners:
@@ -482,6 +491,27 @@ def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
         for key, (harness, backend, sessions, registered, closing) in owners.items()
     )
     return NativeBackendInventorySnapshot(snapshots, _native_backend_exit_coverage_complete)
+
+
+async def _start_native_backend(
+    session_id: str, harness: _NativeBackendHarness, backend: _NativeBackend
+) -> None:
+    """Expose preparation without publishing a backend into the live map early."""
+    global _native_backend_exit_coverage_complete
+    token = object()
+    _STARTING_NATIVE_BACKENDS[token] = (session_id, harness, backend)
+    try:
+        await backend.start()
+        registered = (
+            _AUTO_CODEX_APP_SERVERS if harness == "codex-native" else _AUTO_OPENCODE_SERVERS
+        ).get(session_id)
+        if registered is not None and registered is not backend:
+            _native_backend_exit_coverage_complete = False
+    except BaseException:
+        _native_backend_exit_coverage_complete = False
+        raise
+    finally:
+        _STARTING_NATIVE_BACKENDS.pop(token, None)
 
 
 async def _close_native_backend(
@@ -1959,7 +1989,7 @@ async def _auto_create_opencode_terminal(
         workspace=launch_config.workspace,
         extra_env=policy_env or None,
     )
-    await server.start()
+    await _start_native_backend(session_id, "opencode-native", server)
     _AUTO_OPENCODE_SERVERS[session_id] = server
 
     try:
@@ -5885,7 +5915,7 @@ async def _auto_create_codex_terminal(
         turn_routing=launch_config.turn_routing,
     )
     app_server.listen_url = codex_ws_url
-    await app_server.start()
+    await _start_native_backend(session_id, "codex-native", app_server)
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
     _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
 

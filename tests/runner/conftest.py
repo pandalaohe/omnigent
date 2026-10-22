@@ -112,6 +112,7 @@ def _hermetic_omnigent_env(
     # providers from their own fixtures, never from the developer's machine.
     monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
     monkeypatch.setattr("omnigent.runner.native.orchestration._CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr("omnigent.runner.native.orchestration._STARTING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._native_backend_exit_coverage_complete", True
     )
