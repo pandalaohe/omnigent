@@ -5191,10 +5191,16 @@ def build_codex_remote_args(
     # below; reject caller pass-through args that would re-select or re-attach
     # that transport (e.g. ``codex app-server … --remote``, which clap rejects).
     reject_reserved_codex_transport_args(codex_args)
+    prompt_tail: tuple[str, ...] = ()
     if thread_id is not None:
         # Codex submits a positional ahead of ``resume`` as a new prompt to the
         # resumed thread; the persisted launch prompt was meant for the first start.
         codex_args = tuple(without_codex_positional_prompt(codex_args))
+    elif "--" in codex_args:
+        # Keep generated options out of the literal prompt tail.
+        separator = codex_args.index("--")
+        prompt_tail = codex_args[separator:]
+        codex_args = codex_args[:separator]
     override_args: list[str] = []
     for override in config_overrides:
         if override.lstrip().startswith("model_providers."):
@@ -5262,6 +5268,7 @@ def build_codex_remote_args(
             *agent_pid_args,
             "--remote",
             remote_url,
+            *prompt_tail,
         ]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
         return [

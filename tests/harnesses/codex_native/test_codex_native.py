@@ -1770,6 +1770,17 @@ def test_strip_approval_sandbox_flags_only_consumes_real_values(
     assert codex_native_app_server._strip_approval_sandbox_flags(codex_args) == expected
 
 
+def test_build_codex_remote_args_keeps_transport_before_prompt_separator() -> None:
+    """Prompt tokens cannot swallow the runner-owned transport option."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=("--", "explain --remote and --approve-for-me"),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    assert args.index("--remote") < args.index("--")
+    assert args[args.index("--") + 1 :] == ["explain --remote and --approve-for-me"]
+
+
 def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> None:
     """
     Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the

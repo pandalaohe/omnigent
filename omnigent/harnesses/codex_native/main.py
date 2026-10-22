@@ -56,7 +56,6 @@ from omnigent.harnesses.codex_native.app_server import (
     codex_terminal_env,
     native_codex_launch_base_url,
     native_codex_launch_pins_model_provider,
-    normalize_codex_permission_launch_args,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
 )
@@ -76,6 +75,7 @@ from omnigent.harnesses.codex_native.forwarder import (
     codex_rollout_last_turn_model,
     supervise_forwarder,
 )
+from omnigent.harnesses.codex_native.launch_args import _codex_resume_permission_params
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 from omnigent.host.daemon_launch import (
     error_text,
@@ -2553,39 +2553,11 @@ def _codex_turn_context_policy_fields_from_launch_args(
     terminal_launch_args: Sequence[str] | None,
 ) -> _JsonObject:
     """Return rollout policy fields matching persisted Codex launch args."""
-    approval_policy = "on-request"
-    sandbox_mode: str | None = None
-    args = normalize_codex_permission_launch_args(terminal_launch_args)
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--dangerously-bypass-approvals-and-sandbox":
-            approval_policy = "never"
-            sandbox_mode = "danger-full-access"
-        elif arg in ("--ask-for-approval", "-a") and i + 1 < len(args):
-            approval_policy = args[i + 1]
-            i += 1
-        elif arg.startswith("--ask-for-approval="):
-            approval_policy = arg.split("=", 1)[1]
-        elif arg in ("--sandbox", "-s") and i + 1 < len(args):
-            sandbox_mode = args[i + 1]
-            i += 1
-        elif arg.startswith("--sandbox="):
-            sandbox_mode = arg.split("=", 1)[1]
-        elif arg in ("--config", "-c") and i + 1 < len(args):
-            key, _, value = args[i + 1].partition("=")
-            if key == "approval_policy":
-                approval_policy = value.strip().strip('"')
-            elif key == "sandbox_mode":
-                sandbox_mode = value.strip().strip('"')
-            elif (
-                key == "default_permissions"
-                and value.strip().strip('"').strip("'") == ":danger-full-access"
-            ):
-                sandbox_mode = "danger-full-access"
-            i += 1
-        i += 1
-    fields: _JsonObject = {"approval_policy": approval_policy}
+    params = _codex_resume_permission_params(terminal_launch_args)
+    sandbox_mode = params.get("sandbox")
+    if params.get("permissions") in (":danger-full-access", ":danger-no-sandbox"):
+        sandbox_mode = "danger-full-access"
+    fields: _JsonObject = {"approval_policy": params.get("approvalPolicy", "on-request")}
     if sandbox_mode in {"read-only", "workspace-write", "danger-full-access"}:
         fields["sandbox_policy"] = {"type": sandbox_mode}
     return fields
