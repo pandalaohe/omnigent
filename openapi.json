@@ -4957,7 +4957,7 @@
                 "type": "null"
               }
             ],
-            "description": "The label's raw `k` code \u2014 the last ping's skip / fail reason, e.g. `\"btw_unavailable\"` \u2014 so a `failures` pause names its cause. `None` when no code is stored.",
+            "description": "The last ping's skip / fail reason without internal label prefixes, e.g. `\"btw_unavailable\"` \u2014 so a pause names its cause. `None` when no code is stored.",
             "title": "Last Reason"
           },
           "last_return": {
@@ -4972,7 +4972,7 @@
             "description": "The measured first turn after an absence, or `None` when none was recorded."
           },
           "state": {
-            "description": "Episode state \u2014 `\"on\"` while warming is active, `\"off\"` with no episode, `\"paused\"` after repeated failures or measured cache misses, `\"stopped\"` when the cap / window ended.",
+            "description": "Episode state \u2014 `\"on\"` while warming is active, `\"off\"` with no episode, `\"paused\"` after skipped pings, repeated failures or measured cache misses, `\"stopped\"` when the cap / window ended.",
             "enum": [
               "on",
               "off",
@@ -4996,7 +4996,8 @@
                   "expired",
                   "archive_revision",
                   "policy",
-                  "parent_inactive"
+                  "parent_inactive",
+                  "skipped"
                 ],
                 "type": "string"
               },

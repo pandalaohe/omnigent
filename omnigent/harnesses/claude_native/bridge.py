@@ -98,6 +98,7 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.terminals.program_status import ProgramStatusReader
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -6273,9 +6274,9 @@ def _claude_session_status(
 
     The ``sessions/<pid>.json`` file — not the pane, whose composer
     stays mounted mid-turn for queued input — says what Claude is
-    doing. Resolution mirrors the runner's status watcher: the pane
-    pid names the file, and the bridge-captured Claude session uuid
-    cross-checks it.
+    doing. The OSC relay's child pid names the file when the pane runs
+    through that relay; otherwise the pane pid does. Claude's captured
+    session uuid cross-checks the record.
 
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
@@ -6287,6 +6288,14 @@ def _claude_session_status(
     pane_pid = _tmux_pane_pid(socket_path, tmux_target)
     if pane_pid is None:
         return None
+    status_path = Path(socket_path).with_name("program-status.json")
+    relay = _read_json_file(status_path)
+    if relay is not None and relay.get("relay_pid") == pane_pid:
+        # The UUID scan only covers fresh files; an idle Claude's direct
+        # PID lookup must keep working after that scan window expires.
+        pane_pid = ProgramStatusReader(status_path).child_pid
+        if pane_pid is None:
+            return None
     path = resolve_status_file(
         pane_pid=pane_pid,
         expected_session_id=read_claude_session_id(bridge_dir),
@@ -9345,10 +9354,10 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
     socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
     tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
-        return KeepWarmBtwResult("skipped", "unknown")
+        return KeepWarmBtwResult("skipped", "tmux_metadata")
     running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
     if running is None:
-        return KeepWarmBtwResult("skipped", "unknown")
+        return KeepWarmBtwResult("skipped", "native_status")
     if running:
         return KeepWarmBtwResult("skipped", "busy")
     pane = _capture_pane(socket_path, tmux_target)
@@ -9356,16 +9365,16 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
         return KeepWarmBtwResult("skipped", "busy")
     draft = _composer_region_text(pane)
     if draft is None:
-        return KeepWarmBtwResult("skipped", "unknown")
+        return KeepWarmBtwResult("skipped", "composer_unreadable")
     if draft:
         return KeepWarmBtwResult("skipped", "composer_draft")
     if pre_close_deadline - time.monotonic() < _TMUX_LIST_TIMEOUT_S:
         # The client-activity query's own timeout no longer fits the ping's
         # budget; an unreadable answer never evidences an unattended pane.
-        return KeepWarmBtwResult("skipped", "unknown")
+        return KeepWarmBtwResult("skipped", "query_budget")
     readable, last_input_at = _tmux_last_client_input(socket_path, tmux_target)
     if not readable:
-        return KeepWarmBtwResult("skipped", "unknown")
+        return KeepWarmBtwResult("skipped", "client_activity")
     if (
         last_input_at is not None
         and time.time() - last_input_at < _KEEP_WARM_CLIENT_INPUT_WINDOW_S
@@ -9385,7 +9394,7 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
             return KeepWarmBtwResult("skipped", "card")
         running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
         if running is None:
-            return KeepWarmBtwResult("skipped", "unknown")
+            return KeepWarmBtwResult("skipped", "native_status")
         if running:
             return KeepWarmBtwResult("skipped", "busy")
         draft = _composer_region_text(pane)

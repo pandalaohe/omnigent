@@ -41,10 +41,13 @@ export function keepWarmStopReason(status: KeepWarmStatus): string | null {
     host: "host offline",
     switch_off: "switched off",
     runner_version: "runner too old",
-    expired: "window expired",
+    expired: status.last_reason
+      ? `window expired (last ping: ${status.last_reason})`
+      : "window expired",
     archive_revision: "archive state changed",
     policy: "policy stopped warming",
     parent_inactive: "parent inactive",
+    skipped: status.last_reason ? `ping skipped (${status.last_reason})` : "ping skipped",
   };
   const reason = reasons[status.stop_reason];
   if (!reason) return null;
