@@ -1124,6 +1124,10 @@ class CodexAppServerClient:
         # ``None`` marks the end of the event stream (reader exited).
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
+        self._connection_generation = 0
+        self._established_connection: tuple[int, ClientConnection, asyncio.Task[None]] | None = (
+            None
+        )
 
     async def connect(self) -> None:
         """
@@ -1131,6 +1135,9 @@ class CodexAppServerClient:
 
         :returns: None.
         """
+        self._connection_generation += 1
+        generation = self._connection_generation
+        self._established_connection = None
         if self._ws_url is not None:
             self._ws = await websockets.connect(
                 self._ws_url,
@@ -1151,6 +1158,7 @@ class CodexAppServerClient:
             self._reader_loop(),
             name="codex-native-app-server-reader",
         )
+        websocket, reader = self._ws, self._reader_task
         await self.request(
             "initialize",
             {
@@ -1164,6 +1172,12 @@ class CodexAppServerClient:
             },
         )
         await self.notify("initialized")
+        if (
+            self._connection_generation == generation
+            and self._ws is websocket
+            and self._reader_task is reader
+        ):
+            self._established_connection = (generation, websocket, reader)
 
     async def close(self) -> None:
         """
@@ -1171,6 +1185,8 @@ class CodexAppServerClient:
 
         :returns: None.
         """
+        self._connection_generation += 1
+        self._established_connection = None
         try:
             if self._reader_task is not None:
                 self._reader_task.cancel()
@@ -1187,6 +1203,77 @@ class CodexAppServerClient:
             finally:
                 self._ws = None
                 self._reader_task = None
+
+    async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
+        """Read bounded loaded-thread evidence on the current connection only.
+
+        None means unknown, including interrupted or incomplete pagination. IDs
+        alone establish neither Omnigent ownership nor aliases or context absence.
+        """
+        connection = self._established_connection
+        if connection is None:
+            return None
+        generation, websocket, reader = connection
+
+        def current() -> bool:
+            return (
+                self._established_connection is connection
+                and self._ws is websocket
+                and self._reader_task is reader
+                and self._connection_generation == generation
+                and not reader.done()
+                and not reader.cancelling()
+            )
+
+        if not 0 < timeout_s <= 5.0 or not current():
+            return None
+        ids: list[str] = []
+        cursors: set[str] = set()
+        cursor: str | None = None
+        try:
+            async with asyncio.timeout(timeout_s):
+                for _ in range(10):
+                    if not current():
+                        return None
+                    params: CodexParams = {"limit": 100}
+                    if cursor is not None:
+                        params["cursor"] = cursor
+                    response = await self.request("thread/list/loaded", params)
+                    if not current():
+                        return None
+                    result = response.get("result")
+                    if not isinstance(result, dict) or "nextCursor" not in result:
+                        return None
+                    page = result.get("data")
+                    if (
+                        not isinstance(page, list)
+                        or len(page) > 100
+                        or any(not isinstance(item, str) or not item for item in page)
+                    ):
+                        return None
+                    ids.extend(page)
+                    if len(set(ids)) != len(ids):
+                        return None
+                    cursor = result["nextCursor"]
+                    if cursor is None:
+                        return tuple(ids)
+                    if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                        return None
+                    cursors.add(cursor)
+        except asyncio.CancelledError:
+            # Closing a client cancels pending RPC futures, independently of the caller.
+            task = asyncio.current_task()
+            if task is None or task.cancelling():
+                raise
+        except (
+            TimeoutError,
+            ConnectionError,
+            ConnectionClosed,
+            CodexAppServerResponseError,
+            RuntimeError,
+        ):
+            pass
+        return None
 
     async def request(self, method: str, params: CodexParams) -> CodexMessage:
         """
