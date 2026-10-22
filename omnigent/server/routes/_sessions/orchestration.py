@@ -13464,9 +13464,11 @@ async def _create_session_from_existing_agent(
                 if admission_enabled
                 else parent_conv.host_id
             )
-            if admission_enabled and parent_host_id is not None:
+            if (admission_enabled and parent_host_id is not None) or (
+                parent_host_id is None and parent_conv.runner_id is not None
+            ):
                 inherited_fields: dict[str, Any] = {}
-                if body.host_id is None:
+                if body.host_id is None and parent_host_id is not None:
                     inherited_fields["host_id"] = parent_host_id
                 if (
                     "workspace" not in request_fields_set
