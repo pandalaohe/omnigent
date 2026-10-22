@@ -1,4 +1,5 @@
 import { sanitizeField } from "../../shared/evidence";
+import type { AppView } from "./model";
 
 export interface Rect {
   x: number;
@@ -34,7 +35,7 @@ export interface ItemV1 {
   geometry: {
     rect: Rect;
     viewport: { width: number; height: number };
-    bitmap_scale: { x: number; y: number };
+    bitmap_scale: { x: number; y: number } | null;
   };
   screenshot?: { file_id: string; sha256: string };
 }
@@ -76,6 +77,8 @@ export interface Activation {
 }
 
 export interface CapturePreview {
+  ownerKey?: string;
+  urlConsentKey?: string;
   capture_id: string;
   captured_at: string;
   selection: Selection;
@@ -87,6 +90,7 @@ export interface CapturePreview {
 export interface PanelState {
   message: string;
   preview?: CapturePreview;
+  app?: AppView;
 }
 
 export function record(value: unknown): Record<string, unknown> {
@@ -195,15 +199,15 @@ export function parseMetrics(input: unknown): Metrics {
   };
 }
 
-function parsePage(input: unknown): PageV1 {
+function parsePage(input: unknown, allowFull = false): PageV1 {
   const page = record(input);
   exactKeys(page, ["url", "title", "include_query_fragment"]);
-  if (page.include_query_fragment !== false)
+  if (page.include_query_fragment !== false && !(allowFull && page.include_query_fragment === true))
     throw new Error("Full URL requires extension preview consent");
   return {
-    url: pageUrl(field(page.url, 2000)),
+    url: pageUrl(field(page.url, 2000), page.include_query_fragment === true),
     title: field(page.title, 200),
-    include_query_fragment: false,
+    include_query_fragment: page.include_query_fragment === true,
   };
 }
 
@@ -278,6 +282,7 @@ export function serializeItem(item: ItemV1): string {
     ["viewport", 100000],
     ["bitmap_scale", 8],
   ] as const) {
+    if (key === "bitmap_scale" && geometry[key] === null && !item.screenshot) continue;
     const pair = record(geometry[key]);
     const keys = key === "viewport" ? ["width", "height"] : ["x", "y"];
     exactKeys(pair, keys);
@@ -294,7 +299,7 @@ export function serializeItem(item: ItemV1): string {
   return JSON.stringify({
     ...item,
     kind: parseKind(item.kind),
-    page: parsePage(item.page),
+    page: parsePage(item.page, true),
     target: parseTarget(item.target),
   });
 }

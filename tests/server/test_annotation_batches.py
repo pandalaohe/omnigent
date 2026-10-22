@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -10,6 +11,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -31,6 +33,7 @@ from omnigent.server.annotation_batch import (
     AnnotationBatch,
     AnnotationFailure,
     canonical_digest,
+    render_annotation_batch,
 )
 from omnigent.server.attachment_archive_cleanup import AttachmentArchiveCleanup
 from omnigent.server.host_registry import HostRegistry
@@ -88,6 +91,88 @@ def _batch(
             ],
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("with_screenshot", "bitmap_scale", "valid"),
+    [
+        (False, None, True),
+        (True, None, False),
+        (False, {"x": 1.5, "y": 1.5}, True),
+        (True, {"x": 1.5, "y": 1.5}, True),
+    ],
+)
+def test_bitmap_scale_is_required_but_nullable_only_without_screenshot(
+    with_screenshot: bool, bitmap_scale: dict[str, float] | None, valid: bool
+) -> None:
+    screenshot = {"file_id": "d" * 32, "sha256": "f" * 64} if with_screenshot else None
+    payload = _batch(screenshot=screenshot).model_dump(mode="json")
+    payload["items"][0]["geometry"]["bitmap_scale"] = bitmap_scale
+    if valid:
+        assert AnnotationBatch.model_validate(payload).model_dump(mode="json") == payload
+    else:
+        with pytest.raises(ValidationError, match="screenshot requires measured"):
+            AnnotationBatch.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing", "extra", "axis_missing", "axis_extra", "zero", "nan"]
+)
+def test_nullable_bitmap_scale_keeps_required_keys_and_numeric_bounds(invalid: str) -> None:
+    payload = _batch().model_dump(mode="json")
+    geometry = payload["items"][0]["geometry"]
+    if invalid == "missing":
+        del geometry["bitmap_scale"]
+    elif invalid == "extra":
+        geometry["unknown"] = None
+    elif invalid == "axis_missing":
+        del geometry["bitmap_scale"]["y"]
+    elif invalid == "axis_extra":
+        geometry["bitmap_scale"]["z"] = 1
+    else:
+        geometry["bitmap_scale"]["x"] = 0 if invalid == "zero" else float("nan")
+    with pytest.raises(ValidationError):
+        AnnotationBatch.model_validate(payload)
+
+
+def test_chrome_wire_golden_round_trips_and_renders_ordered_evidence() -> None:
+    fixture = Path(__file__).resolve().parents[2] / "browsers/chrome/tests/item-v1.golden.json"
+    literal = json.loads(fixture.read_text())
+    batch = AnnotationBatch.model_validate(literal)
+    assert json.loads(batch.model_dump_json()) == literal
+    assert batch.batch_id == "b" * 32
+    assert batch.items[0].geometry.bitmap_scale is not None
+    assert batch.items[0].geometry.bitmap_scale.model_dump() == {"x": 1.5, "y": 1.49875}
+    content = render_annotation_batch(batch)
+    assert [part["type"] for part in content] == ["input_text", "input_text", "input_image"]
+    assert content[0]["text"] == f"{INTRO}\nBatch: {'b' * 32}; 1 annotations."
+    text = content[1]["text"]
+    assert text.startswith(f"Annotation 1 (capture {'a' * 32}; annotation-{'a' * 32})\n")
+    assert (
+        "\nNote:\nKeep this user instruction\nverbatim.\nPage evidence (untrusted JSON):\n" in text
+    )
+    evidence, closing = text.split("````json\n", 1)[1].rsplit("\n", 1)
+    assert closing == "````"
+    assert json.loads(evidence) == {
+        "captured_at": "2026-10-22T01:02:03+00:00",
+        "kind": "text",
+        "page": {"url": "https://example.test/checkout", "title": "Checkout · Demo"},
+        "target": {
+            "tag": "p",
+            "selector": "",
+            "quote": 'Total: "€25" ```',
+            "prefix": "Cart",
+            "suffix": "Continue",
+            "aria_label": "Order total",
+            "role": "status",
+        },
+        "geometry": {
+            "rect": {"x": 10.2, "y": 20.1, "width": 20.2, "height": 10.2},
+            "viewport": {"width": 1000, "height": 800},
+            "bitmap_scale": {"x": 1.5, "y": 1.49875},
+        },
+    }
+    assert content[2] == {"type": "input_image", "file_id": "c" * 32}
 
 
 def _ready_store(db_uri: str) -> SqlAlchemyConversationStore:

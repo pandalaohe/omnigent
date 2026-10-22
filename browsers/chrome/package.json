@@ -17,6 +17,7 @@
   "devDependencies": {
     "@types/node": "^24.12.2",
     "esbuild": "^0.28.2",
+    "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.1.1",
     "oxlint": "^1.62.0",
     "prettier": "^3.8.3",

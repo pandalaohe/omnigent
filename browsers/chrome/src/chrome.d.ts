@@ -5,6 +5,7 @@ declare namespace chrome {
     removeListener(listener: T): void;
   }
   namespace tabs {
+    function create(options: { url: string }): Promise<Tab>;
     interface Tab {
       id?: number;
       windowId: number;
@@ -41,7 +42,14 @@ declare namespace chrome {
     }): Promise<{ frameId: number; documentId: string; result?: unknown }[]>;
   }
   namespace storage.local {
+    function get(key: string): Promise<Record<string, unknown>>;
+    function set(values: Record<string, unknown>): Promise<void>;
+    function remove(key: string): Promise<void>;
     function setAccessLevel(options: { accessLevel: "TRUSTED_CONTEXTS" }): Promise<void>;
+  }
+  namespace permissions {
+    function request(options: { origins: string[] }): Promise<boolean>;
+    function contains(options: { origins: string[] }): Promise<boolean>;
   }
   namespace runtime {
     const id: string;

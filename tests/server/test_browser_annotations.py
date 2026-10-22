@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import (
+    SqlAnnotationGrantOwner,
     SqlConversation,
     SqlConversationMetadata,
     SqlSessionPermission,
@@ -510,6 +511,30 @@ def test_browser_picker_and_first_party_receiver_routes(
         dispatch.assert_not_called()
         client.cookies.update(browser_cookies)
         assert client.get("/v1/me/annotation-receiver").json() == receiver_before
+        old_receipt_path = f"/v1/me/annotation-receipts/{grant.id}/{batch.batch_id}"
+        old_absent_path = f"/v1/me/annotation-receipts/{grant.id}/{'c' * 32}"
+        recorded_live = client.get(old_receipt_path)
+        assert recorded_live.status_code == 200, recorded_live.text
+        assert recorded_live.json() == receipt
+        assert recorded_live.json()["session_id"] == session_id
+        assert not {"note", "content", "items"}.intersection(recorded_live.json())
+        absent_live = client.get(old_absent_path)
+        assert absent_live.status_code == 200
+        assert absent_live.json() == {"batch_id": "c" * 32, "state": "unknown_record"}
+        assert client.get(old_receipt_path, headers=bearer).status_code == 401
+        with Session(get_or_create_engine(database_uri)) as session, session.begin():
+            session.add(
+                SqlAnnotationGrantOwner(
+                    grant_id="other-grant",
+                    user_id="other",
+                    account_generation="other-generation",
+                    approved_at=int(time.time()),
+                )
+            )
+        for unowned_grant in ("missing-grant", "other-grant"):
+            denied = client.get(f"/v1/me/annotation-receipts/{unowned_grant}/{batch.batch_id}")
+            assert denied.status_code == 404
+            assert denied.json() == {"error": "not_found"}
         assert (
             client.delete(
                 f"/v1/me/connected-apps/{issued.json()['grant_id']}",
@@ -517,6 +542,16 @@ def test_browser_picker_and_first_party_receiver_routes(
             ).status_code
             == 200
         )
+        recorded_closed = client.get(old_receipt_path)
+        assert recorded_closed.status_code == 200, recorded_closed.text
+        assert recorded_closed.json() == receipt
+        assert recorded_closed.json()["session_id"] == session_id
+        assert not {"note", "content", "items"}.intersection(recorded_closed.json())
+        absent_closed = client.get(old_absent_path)
+        assert absent_closed.status_code == 200
+        assert absent_closed.json() == {"batch_id": "c" * 32, "state": "not_admitted"}
+        dispatch.assert_not_called()
+        assert client.get("/v1/me/annotation-receiver").json() == receiver_before
         after_revoke = client.post(
             f"/v1/browser-annotations/sessions/{session_id}/screenshots",
             data={**screenshot_fields, "sha256": hashlib.sha256(image_bytes).hexdigest()},

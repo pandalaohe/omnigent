@@ -1,6 +1,12 @@
 import { CaptureQueue, captureCrop, matchesSender } from "./capture";
 import { canPickUrl, exactKeys, pageUrl, parseSelection, randomId, record } from "./protocol";
 import type { Activation, PanelState } from "./protocol";
+import { AnnotationApp } from "./application";
+import { Connection } from "./auth";
+import { TrayStore } from "./store";
+import type { CapturePreview } from "./protocol";
+import { identityKey } from "./model";
+import type { Identity } from "./model";
 
 const activations = new Map<number, Activation>();
 const panels = new Set<chrome.runtime.Port>();
@@ -8,6 +14,26 @@ const queue = new CaptureQueue();
 let state: PanelState = {
   message: "Invoke Pick page evidence from the Chrome toolbar or shortcut.",
 };
+let activeApplication: AnnotationApp | undefined;
+let application: Promise<AnnotationApp> | undefined;
+function getApplication(): Promise<AnnotationApp> {
+  application ??= (async () => {
+    const app = new AnnotationApp(new TrayStore(), new Connection(), (view) =>
+      publish({ ...state, app: view, message: view.message }),
+    );
+    await app.initialize();
+    activeApplication = app;
+    return app;
+  })();
+  return application;
+}
+function panelSender(sender: chrome.runtime.MessageSender): boolean {
+  return (
+    sender.id === chrome.runtime.id &&
+    !sender.tab &&
+    sender.url === chrome.runtime.getURL("sidepanel.html")
+  );
+}
 
 function publish(next: PanelState): void {
   state = next;
@@ -131,12 +157,52 @@ chrome.runtime.onConnect.addListener((port) => {
   }
   panels.add(port);
   publish(state);
+  void getApplication()
+    .then((app) => app.publish())
+    .catch(() =>
+      publish({
+        ...state,
+        message:
+          "Local storage could not open. Captures remain temporary; close and reopen the panel to try again.",
+      }),
+    );
   port.onDisconnect.addListener(() => {
     panels.delete(port);
   });
 });
 
 chrome.runtime.onMessage.addListener((input, sender, respond) => {
+  if (panelSender(sender)) {
+    try {
+      const message = record(input);
+      exactKeys(message, ["type", "command"]);
+      if (message.type !== "panel-command") return;
+      void getApplication()
+        .then((app) => {
+          const command = record(message.command);
+          if (command.type === "savePreview") {
+            const owner = app.identity();
+            if (!owner || command.key !== identityKey(owner) || !state.preview)
+              throw new Error("Capture or account changed. Review the current panel.");
+            return app.capture(state.preview, owner).then(() => {
+              publish({ ...state, preview: undefined });
+            });
+          }
+          return app.handle(command);
+        })
+        .then(() => respond({ ok: true }))
+        .catch((error: unknown) => {
+          const message =
+            error instanceof Error ? error.message : "Operation stopped. Local data is retained.";
+          publish({ ...state, message });
+          respond({ ok: false, error: message });
+        });
+      return true;
+    } catch {
+      respond({ ok: false, error: "Invalid panel command." });
+      return;
+    }
+  }
   const activation = sender.tab?.id === undefined ? undefined : activations.get(sender.tab.id);
   if (!activation) return;
   try {
@@ -150,6 +216,44 @@ chrome.runtime.onMessage.addListener((input, sender, respond) => {
       captured_at: new Date().toISOString(),
       selection,
     };
+    const captureOwner = activeApplication?.identity();
+    if (captureOwner) Object.assign(preview, { ownerKey: identityKey(captureOwner) });
+    const fullUrl =
+      activeApplication?.fullUrlEnabled() && captureOwner
+        ? pageUrl(sender.url ?? "", true)
+        : undefined;
+    const finish = async (full: CapturePreview, owner: Identity | undefined, ok: boolean) => {
+      if (fullUrl && owner)
+        full = {
+          ...full,
+          urlConsentKey: identityKey(owner),
+          selection: {
+            ...full.selection,
+            page: { ...full.selection.page, url: fullUrl, include_query_fragment: true },
+          },
+        };
+      publish({
+        ...state,
+        preview: full,
+        message: ok
+          ? "Capture preview ready; saving locally…"
+          : "Screenshot failed. Review the retained evidence and choose explicitly whether to omit it.",
+      });
+      try {
+        await (await getApplication()).capture(full, owner);
+        publish({ ...state, preview: undefined });
+      } catch (error) {
+        publish({
+          ...state,
+          preview: full,
+          message:
+            error instanceof Error
+              ? error.message
+              : "Not saved locally. The temporary capture remains visible.",
+        });
+      }
+      respond({ ok });
+    };
     publish({ ...state, message: "Capturing visible evidence…" });
     void queue
       .run(async () => {
@@ -157,22 +261,11 @@ chrome.runtime.onMessage.addListener((input, sender, respond) => {
           throw new Error("Source tab changed. Invoke Pick page evidence again.");
         return captureCrop(activation, selection, queue);
       })
-      .then((crop) => {
-        publish({
-          message:
-            "Preview only — review the image and page evidence. This build does not save or send annotations.",
-          preview: { ...preview, ...crop },
-        });
-        respond({ ok: true });
-      })
+      .then((crop) => finish({ ...preview, ...crop }, captureOwner, true))
       .catch((error: unknown) => {
         const screenshotFailure =
           error instanceof Error ? error.message : "Screenshot failed. Select again.";
-        publish({
-          message: "Screenshot failed. Select again; no screenshot was saved.",
-          preview: { ...preview, screenshotFailure },
-        });
-        respond({ ok: false });
+        void finish({ ...preview, screenshotFailure }, captureOwner, false);
       });
     return true;
   } catch {

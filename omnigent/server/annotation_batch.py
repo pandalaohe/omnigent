@@ -109,7 +109,7 @@ class BitmapScale(StrictModel):
 class AnnotationGeometry(StrictModel):
     rect: Rect
     viewport: Viewport
-    bitmap_scale: BitmapScale
+    bitmap_scale: BitmapScale | None
 
 
 class AnnotationScreenshot(StrictModel):
@@ -133,6 +133,12 @@ class AnnotationItem(StrictModel):
         if not value.strip():
             raise ValueError("note must not be empty")
         return value
+
+    @model_validator(mode="after")
+    def screenshot_requires_bitmap_scale(self) -> AnnotationItem:
+        if self.screenshot is not None and self.geometry.bitmap_scale is None:
+            raise ValueError("screenshot requires measured geometry.bitmap_scale")
+        return self
 
 
 class AnnotationBatch(StrictModel):

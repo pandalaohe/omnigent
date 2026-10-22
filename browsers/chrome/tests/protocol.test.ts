@@ -160,4 +160,30 @@ describe("server ItemV1 wire contract", () => {
     expect(result.target.quote).toBe("Save now");
     expect(result.note).toBe("Keep\nverbatim");
   });
+  it("allows unknown bitmap scale only without an attachment, and preserves trusted full URLs", () => {
+    const noBitmap = { ...item, geometry: { ...item.geometry, bitmap_scale: null } };
+    expect(JSON.parse(serializeItem(noBitmap)).geometry.bitmap_scale).toBeNull();
+    expect(() =>
+      serializeItem({
+        ...noBitmap,
+        screenshot: { file_id: "d".repeat(32), sha256: "0".repeat(64) },
+      }),
+    ).toThrow();
+    expect(
+      JSON.parse(
+        serializeItem({
+          ...item,
+          page: {
+            ...item.page,
+            include_query_fragment: true,
+            url: "https://example.test/page?filter=active#detail",
+          },
+        }),
+      ).page,
+    ).toEqual({
+      ...item.page,
+      include_query_fragment: true,
+      url: "https://example.test/page?filter=active#detail",
+    });
+  });
 });

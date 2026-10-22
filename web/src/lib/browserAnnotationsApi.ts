@@ -17,6 +17,21 @@ export interface ConnectedApp {
   last_used_at: number | null;
 }
 
+export type OldAnnotationReceipt =
+  | {
+      batch_id: string;
+      state: "accepted" | "delivery_unknown";
+      session_id: string;
+      dispatch_phase: "ready" | "dispatching" | "uncertain" | "confirmed";
+      retry_required: boolean;
+      item_id: string;
+      pending_id: string;
+      accepted_at: number;
+      session_path: string;
+    }
+  | { batch_id: string; state: "not_admitted" }
+  | { batch_id: string; state: "unknown_record" };
+
 export class BrowserAnnotationsApiError extends Error {
   readonly status: number;
 
@@ -63,5 +78,16 @@ export async function revokeConnectedApp(grantId: string): Promise<void> {
     await authenticatedFetch(`/v1/me/connected-apps/${encodeURIComponent(grantId)}`, {
       method: "DELETE",
     }),
+  );
+}
+
+export async function getOldAnnotationReceipt(
+  grantId: string,
+  batchId: string,
+): Promise<OldAnnotationReceipt> {
+  return jsonResponse<OldAnnotationReceipt>(
+    await authenticatedFetch(
+      `/v1/me/annotation-receipts/${encodeURIComponent(grantId)}/${encodeURIComponent(batchId)}`,
+    ),
   );
 }
