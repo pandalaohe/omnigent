@@ -4134,3 +4134,117 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
     )
     assert completed == [], "no completed should appear when nothing compacted"
+
+
+@pytest.mark.parametrize(
+    "mode,enabled,row,fail,ambiguous",
+    [
+        ("approve-for-me", True, True, False, False),
+        ("ask-for-approval", True, False, False, False),
+        ("approve-for-me", True, True, True, False),
+        ("approve-for-me", False, True, False, False),
+        ("full-access", True, True, False, False),
+        ("read-only", True, True, False, False),
+        ("approve-for-me", True, False, False, True),
+    ],
+)
+async def test_codex_workspace_switch_selects_generated_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    enabled: bool,
+    row: bool,
+    fail: bool,
+    ambiguous: bool,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.codex_approval_modes import codex_permission_preset
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "9864122f95f2f013c9599f4014725784"
+    preset = codex_permission_preset(mode)
+    state = bridge.CodexNativeBridgeState(
+        session_id=conv_id,
+        socket_path="ws://127.0.0.1:1234",
+        thread_id="thread",
+        codex_home=str(tmp_path / "home"),
+        permission_profile="omnigent-workspace" if enabled else None,
+    )
+    monkeypatch.setattr(bridge, "read_bridge_state", lambda _: state)
+    selected: str | None = None
+    actions: list[str] = []
+    opens = 0
+    digits = {
+        "1": "Ask for approval",
+        "2": "Approve for me",
+        "3": "Full Access",
+        "4": "Read Only",
+        "7": "omnigent-workspace",
+    }
+
+    def tmux(_socket: str, *args: str) -> None:
+        nonlocal opens, selected
+        key = args[-1]
+        if key == "/permissions":
+            opens += 1
+            selected = None
+            actions.append("popup")
+        elif key in digits and "-l" in args:
+            selected = digits[key]
+            actions.append(selected)
+        elif key == "Escape":
+            actions.append("escape")
+
+    def capture(*_args: object) -> str:
+        if selected is not None:
+            return f"Permissions updated to {preset.label}"
+        return ("3. omnigent-workspace\n" if ambiguous else "") + "\n".join(
+            f"{digit}. {label}" for digit, label in digits.items() if row or digit != "7"
+        )
+
+    async def update(*args: object) -> None:
+        actions.append("update")
+        if fail:
+            raise RuntimeError("rejected")
+
+    rpc = AsyncMock(side_effect=update)
+    monkeypatch.setattr(app_server, "apply_codex_thread_permissions", rpc)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(
+        native_controls, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None)
+    )
+    terminals = TerminalRegistry()
+    terminals._by_conversation.setdefault(conv_id, {})[("codex", "main")] = (
+        make_test_terminal_instance("codex", "main", tmp_path)
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"), terminal_registry=terminals)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_approval_mode_change", "approval_mode": mode},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"approval_mode": mode}
+    applies = enabled and mode in {"ask-for-approval", "approve-for-me"}
+    assert opens == (2 if applies else 1)
+    assert rpc.await_count == int(applies)
+    if applies:
+        rpc.assert_awaited_once_with(state.socket_path, state.thread_id, "omnigent-workspace")
+        assert actions.index(preset.label) < actions.index("update")
+        if row:
+            assert (
+                actions.index(preset.label)
+                < actions.index("omnigent-workspace")
+                < actions.index("update")
+            )
+        else:
+            assert actions[-2:] == ["escape", "update"]

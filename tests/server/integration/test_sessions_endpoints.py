@@ -43,6 +43,7 @@ from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
+    _merge_codex_permission_launch_args,
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
@@ -10979,6 +10980,71 @@ async def test_post_external_codex_approval_mode_change_preserves_other_args(
         "--add-dir",
         "/tmp/shared",
         *permission_args,
+    ]
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        ["--approve-for-me"],
+        ["--not-so-yolo"],
+        ["--yolo"],
+        ["--dangerously-bypass-approvals-and-sandbox"],
+        ["-s", "read-only"],
+        ["--sandbox", "read-only"],
+        ["-sread-only"],
+        ["-s=read-only"],
+        ["--sandbox=read-only"],
+        ["-a", "never"],
+        ["--ask-for-approval", "never"],
+        ["-anever"],
+        ["-a=never"],
+        ["--ask-for-approval=never"],
+        *[
+            [flag, f'{key}="old"']
+            for flag in ["-c", "--config"]
+            for key in [
+                "approval_policy",
+                "approvals_reviewer",
+                "default_permissions",
+                "sandbox_mode",
+            ]
+        ],
+        *[
+            [f'{flag}{key}="old"']
+            for flag in ["-c", "-c=", "--config="]
+            for key in [
+                "approval_policy",
+                "approvals_reviewer",
+                "default_permissions",
+                "sandbox_mode",
+            ]
+        ],
+    ],
+)
+async def test_merge_codex_permission_launch_args_strips_selectors(selector: list[str]) -> None:
+    readback = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
+    assert _merge_codex_permission_launch_args(
+        [
+            "--model",
+            "probe",
+            "-pwork",
+            "--cd=repo",
+            *selector,
+            "--search",
+            "-c",
+            "model_reasoning_effort=high",
+        ],
+        readback,
+    ) == [
+        "--model",
+        "probe",
+        "-pwork",
+        "--cd=repo",
+        "--search",
+        "-c",
+        "model_reasoning_effort=high",
+        *readback,
     ]
 
 

@@ -47,6 +47,7 @@ from omnigent.harnesses.claude_native.main import (
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
+    apply_codex_thread_permissions,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
@@ -1315,6 +1316,7 @@ async def _prepare_codex_terminal(
             ap_auth_headers=headers,
             developer_instructions=developer_instructions,
             terminal_launch_args=codex_args,
+            permission_launch_args=codex_args,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
@@ -1333,6 +1335,9 @@ async def _prepare_codex_terminal(
                     codex_ws_url,
                     thread_id,
                     terminal_launch_args=codex_args,
+                    permission_profile=app_server.workspace_profile.profile_id
+                    if app_server.workspace_profile
+                    else None,
                     cwd=Path.cwd(),
                     model_provider=(
                         codex_session_meta_model_provider(_codex_launch)
@@ -1353,6 +1358,9 @@ async def _prepare_codex_terminal(
                         thread_id=thread_id,
                         codex_home=str(codex_home),
                         cwd=str(Path.cwd()),
+                        permission_profile=app_server.workspace_profile.profile_id
+                        if app_server.workspace_profile
+                        else None,
                     ),
                 )
             if runner_id is not None:
@@ -1570,6 +1578,12 @@ async def _initialize_fresh_terminal_thread(
         raise click.ClickException("Codex event listener was not initialized.")
     app_server_url = _require_codex_app_server_url(prepared)
     thread_id = await _wait_for_thread_started(prepared.event_client)
+    profile = prepared.app_server.workspace_profile if prepared.app_server is not None else None
+    if profile is not None:
+        try:
+            await apply_codex_thread_permissions(app_server_url, thread_id, profile.profile_id)
+        except Exception:  # noqa: BLE001 - permissions are best-effort after discovery.
+            _logger.warning("Failed to apply Codex thread permissions", exc_info=True)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(
@@ -1586,6 +1600,7 @@ async def _initialize_fresh_terminal_thread(
             thread_id=thread_id,
             codex_home=str(codex_home_for_bridge_dir(prepared.bridge_dir)),
             cwd=str(Path.cwd()),
+            permission_profile=profile.profile_id if profile else None,
         ),
     )
     return thread_id

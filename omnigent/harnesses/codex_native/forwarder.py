@@ -34,6 +34,8 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
     CodexMessage,
+    _codex_resume_permission_params,
+    apply_codex_thread_permissions,
     client_for_transport,
 )
 from omnigent.harnesses.codex_native.bridge import (
@@ -67,6 +69,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.harnesses.codex_native.launch_args import PROFILE_ID, codex_stance_is_workspace_write
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -1516,7 +1519,9 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
         return None
 
     args: list[str] = []
-    if isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
+    if isinstance(active_profile, dict) and active_profile.get("id") == PROFILE_ID:
+        args.extend(["--sandbox", "workspace-write", "--ask-for-approval", approval_policy])
+    elif isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
         args.extend(
             [
                 "-c",
@@ -2644,6 +2649,17 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
         )
+        bridge_state = read_bridge_state(bridge_dir)
+        if bridge_state is not None and bridge_state.permission_profile:
+            try:
+                snapshot = await _fetch_session_snapshot(ap_client, session_id)
+                launch_args = snapshot.get("terminal_launch_args") or []
+                if isinstance(launch_args, list) and all(
+                    isinstance(arg, str) for arg in launch_args
+                ):
+                    forwarder_state.terminal_launch_args = launch_args
+            except Exception:  # noqa: BLE001 - live thread settings can still supply the stance.
+                _logger.warning("Failed to read Codex launch stance", exc_info=True)
         snapshots = NativeSubagentSnapshotPublisher(ap_client)
         forwarder_state.snapshot_publisher = snapshots
         try:
@@ -2987,6 +3003,25 @@ async def _maybe_rotate_session_on_thread_started(
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
         return False
+    bridge_state = read_bridge_state(bridge_dir)
+    if bridge_state is not None and bridge_state.permission_profile:
+        live_args = forwarder_state.terminal_launch_args if forwarder_state is not None else None
+        try:
+            if live_args is None:
+                snapshot = await _fetch_session_snapshot(ap_client, target.session_id)
+                launch_args = snapshot.get("terminal_launch_args") or []
+                if isinstance(launch_args, list) and all(
+                    isinstance(arg, str) for arg in launch_args
+                ):
+                    live_args = launch_args
+            if live_args is not None and codex_stance_is_workspace_write(
+                live_args, configured_sandbox_mode=None, bypass_sandbox=False
+            ):
+                await apply_codex_thread_permissions(
+                    app_server_url, new_thread_id, bridge_state.permission_profile
+                )
+        except Exception:  # noqa: BLE001 - rotation continues with the thread's legacy permissions.
+            _logger.warning("Failed to apply Codex rotated thread permissions", exc_info=True)
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -3137,6 +3172,7 @@ async def _create_thread_replacement_session(
             # Carry the workspace across the rotation, or the executor
             # falls back to the harness process's own cwd for new turns.
             cwd=state.cwd if state is not None else None,
+            permission_profile=state.permission_profile if state is not None else None,
         ),
     )
 
@@ -6189,10 +6225,19 @@ async def _start_clear_context_plan_implementation_turn(
             "developer_instructions state is unknown"
         )
         return
-    thread_response = await codex_client.request(
-        "thread/start",
-        {"model": forwarder_state.model, "sessionStartSource": "clear"},
-    )
+    params: _JsonObject = {"model": forwarder_state.model, "sessionStartSource": "clear"}
+    bridge_state = read_bridge_state(bridge_dir)
+    if (
+        bridge_state is not None
+        and bridge_state.permission_profile
+        and forwarder_state.terminal_launch_args is not None
+    ):
+        params.update(
+            _codex_resume_permission_params(
+                forwarder_state.terminal_launch_args, bridge_state.permission_profile
+            )
+        )
+    thread_response = await codex_client.request("thread/start", params)
     result = thread_response.get("result")
     thread = result.get("thread") if isinstance(result, dict) else None
     thread_id = thread.get("id") if isinstance(thread, dict) else None

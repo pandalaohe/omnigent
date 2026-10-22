@@ -206,6 +206,7 @@ class CodexNativeBridgeState:
     cwd: str | None = None
     usage_admission_id: str | None = None
     usage_turn_id: str | None = None
+    permission_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1217,6 +1218,11 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                         if state.usage_admission_id is not None
                         else {}
                     ),
+                    **(
+                        {"permission_profile": state.permission_profile}
+                        if state.permission_profile is not None
+                        else {}
+                    ),
                 },
                 handle,
                 sort_keys=True,
@@ -1701,6 +1707,7 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
     cwd = raw.get("cwd")
+    permission_profile = raw.get("permission_profile")
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -1728,6 +1735,9 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             else None,
             usage_turn_id=raw.get("usage_turn_id")
             if isinstance(raw.get("usage_turn_id"), str)
+            else None,
+            permission_profile=permission_profile
+            if isinstance(permission_profile, str) and permission_profile
             else None,
         ),
         "ready",

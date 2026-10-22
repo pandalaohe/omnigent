@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
@@ -451,3 +452,42 @@ def test_clear_context_plan_implementation_refuses_before_creating_thread_when_u
         "Bridge state's active thread must be unchanged — no orphaned "
         "empty thread switch on a refused gate."
     )
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (
+            ["--sandbox", "workspace-write", "-a", "on-request"],
+            {"permissions": "omnigent-workspace", "approvalPolicy": "on-request"},
+        ),
+        (["--sandbox", "read-only"], {"sandbox": "read-only"}),
+        (
+            ["-c", 'default_permissions="custom"', "-a", "on-request"],
+            {"permissions": "custom", "approvalPolicy": "on-request"},
+        ),
+        (None, {}),
+    ],
+)
+async def test_clear_context_uses_live_permission_stance(
+    tmp_path: Path, args: list[str] | None, expected: dict[str, Any]
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.harnesses.codex_native.bridge import write_bridge_state
+
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    bridge = read_bridge_state(tmp_path)
+    write_bridge_state(tmp_path, replace(bridge, permission_profile="omnigent-workspace"))
+    client = _FakeCodexAppServerClient()
+    state = codex_native_forwarder._CodexForwarderState(
+        model="mock-model", developer_instructions_known=True, terminal_launch_args=args
+    )
+    await codex_native_forwarder._start_clear_context_plan_implementation_turn(
+        client, bridge_dir=tmp_path, plan_text="implement", forwarder_state=state
+    )
+    assert client.requests[0] == (
+        "thread/start",
+        {"model": "mock-model", "sessionStartSource": "clear", **expected},
+    )
+    assert read_bridge_state(tmp_path).permission_profile == "omnigent-workspace"

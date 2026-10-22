@@ -846,3 +846,670 @@ def test_reject_reserved_codex_transport_args_allows(allowed_args: list[str]) ->
     )
     # Omnigent still appends exactly its own single attach.
     assert result[-2:] == ["--remote", "ws://127.0.0.1:9876"]
+
+
+@pytest.fixture
+def profile_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import subprocess
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / ".gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
+    repo = tmp_path / 'repo "quoted"'
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Probe",
+            "-c",
+            "user.email=probe@example.test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return repo
+
+
+@pytest.mark.parametrize(
+    "linked,subdirectory", [(False, False), (True, False), (False, True), (True, True)]
+)
+@pytest.mark.parametrize("extra_root", [None, "ancestor", "common", "unrelated", "alias"])
+def test_workspace_profile_repository_entries(
+    profile_repo: Path, linked: bool, subdirectory: bool, extra_root: str | None
+) -> None:
+    import subprocess
+
+    repo = profile_repo.resolve()
+    workspace = repo
+    common = repo / ".git"
+    expected = {
+        str(common): "write",
+        str(common / "hooks"): "read",
+        str(common / "config"): "read",
+        str(common / "config.worktree"): "read",
+        str(common / "modules"): "read",
+        str(common / "worktrees"): "read",
+    }
+    if linked:
+        workspace = repo.parent / "feature"
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-b", "feature", str(workspace)],
+            check=True,
+            capture_output=True,
+        )
+        own = common / "worktrees" / "feature"
+        expected.update(
+            {
+                str(common / "worktrees"): "read",
+                str(own): "write",
+                str(own / "commondir"): "read",
+                str(own / "gitdir"): "read",
+                str(own / "config.worktree"): "read",
+            }
+        )
+    if subdirectory:
+        workspace = workspace / "src"
+        workspace.mkdir()
+    roots = []
+    if extra_root is not None:
+        root = {
+            "ancestor": repo.parent,
+            "common": common,
+            "unrelated": repo.parent / "other",
+            "alias": repo.parent / "alias",
+        }[extra_root]
+        if extra_root == "alias":
+            root.symlink_to(repo, target_is_directory=True)
+        roots.append(str(root))
+        if extra_root != "unrelated":
+            del expected[str(common / "worktrees")]
+            del expected[str(common / "modules")]
+        if extra_root != "common":
+            expected[str(root)] = "write"
+    profile = launch_args.codex_workspace_profile(
+        workspace,
+        launch_args=["--approve-for-me"],
+        server_overrides=[],
+        private_config={"sandbox_workspace_write": {"writable_roots": roots}},
+        codex_version=(0, 162, 1),
+    )
+    assert profile is not None
+    assert profile.profile_id == "omnigent-workspace"
+    values = {
+        key: tomlkit.parse(f"v = {value}")["v"]
+        for key, value in (override.split("=", 1) for override in profile.config_overrides)
+    }
+    assert values == {
+        "permissions.omnigent-workspace.extends": ":workspace",
+        "permissions.omnigent-workspace.filesystem": expected,
+        "default_permissions": "omnigent-workspace",
+    }
+
+
+@pytest.mark.parametrize(
+    "args,configured,bypass,expected",
+    [
+        ((), None, False, True),
+        ((), "workspace-write", False, True),
+        ((), "danger-full-access", False, False),
+        ((), "read-only", False, False),
+        (("--approve-for-me",), "danger-full-access", False, True),
+        (("--not-so-yolo",), None, False, True),
+        (("--sandbox=workspace-write",), None, False, True),
+        (("-sworkspace-write",), None, False, True),
+        (("-s=workspace-write",), None, False, True),
+        (("--config=sandbox_mode=workspace-write",), None, False, True),
+        (('-cdefault_permissions=":workspace"',), "read-only", False, True),
+        (("--approve-for-me", "-sread-only"), None, False, False),
+        (("-sread-only", "--approve-for-me"), None, False, False),
+        (("--yolo",), None, False, False),
+        (("--approve-for-me",), None, True, False),
+        (("--profile", "strict"), None, False, False),
+        (("--model", "--yolo"), None, False, True),
+        (("--sandbox", "read-only", "-c", 'sandbox_mode="workspace-write"'), None, False, False),
+        (("--", "--yolo"), None, False, True),
+        (("--", "--approve-for-me"), "read-only", False, False),
+        (("--sandbox=read-only", "-c", 'default_permissions=":workspace"'), None, False, False),
+        (("-sread-only", "-c", 'default_permissions=":workspace"'), None, False, False),
+        (("-s=read-only", "-c", 'default_permissions=":workspace"'), None, False, False),
+        (("--yolo", "-c", 'default_permissions=":workspace"'), None, False, False),
+        (("--sandbox", "read-only", "-c", 'default_permissions=":workspace"'), None, False, False),
+        (("-aon-request",), None, False, True),
+    ],
+)
+def test_workspace_write_stance(
+    args: tuple[str, ...], configured: str | None, bypass: bool, expected: bool
+) -> None:
+    assert (
+        launch_args.codex_stance_is_workspace_write(
+            args, configured_sandbox_mode=configured, bypass_sandbox=bypass
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "args,config,version,platform",
+    [
+        (("--sandbox", "danger-full-access"), {}, (0, 162, 1), "posix"),
+        (("-sread-only",), {}, (0, 162, 1), "posix"),
+        (("--yolo",), {}, (0, 162, 1), "posix"),
+        (("--profile", "strict"), {}, (0, 162, 1), "posix"),
+        (("--approve-for-me",), {"default_permissions": "custom"}, (0, 162, 1), "posix"),
+        (("-cdefault_permissions=custom", "--approve-for-me"), {}, (0, 162, 1), "posix"),
+        ((), {"sandbox_mode": "danger-full-access"}, (0, 162, 1), "posix"),
+        ((), {}, None, "posix"),
+        ((), {}, (0, 138, 9), "posix"),
+        ((), {}, (0, 162, 1), "nt"),
+    ],
+)
+def test_workspace_profile_closed_gates(
+    profile_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+    config: dict,
+    version: tuple[int, int, int] | None,
+    platform: str,
+) -> None:
+    monkeypatch.setattr(launch_args, "os", SimpleNamespace(name=platform))
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=args,
+            server_overrides=[],
+            private_config=config,
+            codex_version=version,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("layout", ["absent", "broken", "submodule", "mismatch"])
+def test_workspace_profile_invalid_repository(profile_repo: Path, layout: str) -> None:
+    import subprocess
+
+    workspace = profile_repo.parent / "invalid"
+    workspace.mkdir()
+    if layout == "broken":
+        (workspace / ".git").write_text("gitdir: missing\n")
+    elif layout == "submodule":
+        (profile_repo / ".git" / "modules").mkdir()
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "init",
+                "--separate-git-dir",
+                str(profile_repo / ".git" / "modules" / "child"),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    elif layout == "mismatch":
+        subprocess.run(
+            ["git", "-C", str(profile_repo), "worktree", "add", "-b", "invalid", str(workspace)],
+            check=True,
+            capture_output=True,
+        )
+        own = profile_repo / ".git" / "worktrees" / "invalid"
+        relocated = profile_repo / ".git" / "misplaced"
+        own.rename(relocated)
+        (relocated / "commondir").write_text("..\n")
+        (workspace / ".git").write_text(f"gitdir: {relocated}\n")
+    assert (
+        launch_args.codex_workspace_profile(
+            workspace,
+            launch_args=["--approve-for-me"],
+            server_overrides=[],
+            private_config={},
+            codex_version=(0, 162, 1),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "include",
+        "conditional",
+        "worktree-include",
+        "hooks",
+        "absolute",
+        "global-include",
+        "global-conditional",
+        "malformed",
+    ],
+)
+def test_workspace_profile_declines_unsafe_config(
+    profile_repo: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str
+) -> None:
+    import json
+
+    config = profile_repo / ".git" / "config"
+    if unsafe == "include":
+        content = "[include]\npath = missing\n"
+    elif unsafe == "conditional":
+        content = '[includeIf "gitdir:/never/"]\npath = missing\n'
+    elif unsafe == "worktree-include":
+        config = profile_repo / ".git" / "config.worktree"
+        content = "[include]\npath = missing\n"
+    elif unsafe == "hooks":
+        content = "[core]\nhooksPath = .git/x\n"
+    elif unsafe == "absolute":
+        content = f"[core]\nfsmonitor = {json.dumps(str(profile_repo / '.git' / 'probe'))}\n"
+    elif unsafe.startswith("global"):
+        config = profile_repo.parent / ".gitconfig"
+        section = 'includeIf "gitdir:/never/"' if unsafe == "global-conditional" else "include"
+        content = f"[{section}]\npath = {json.dumps(str(profile_repo / '.git' / 'extra'))}\n"
+    else:
+        content = "invalid config [\n"
+    with config.open("a") as stream:
+        stream.write(content)
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=["--approve-for-me"],
+            server_overrides=[],
+            private_config={},
+            codex_version=(0, 162, 1),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,args,expected_roots,network",
+    [
+        ([], [], ["/opt/work/file"], True),
+        (
+            ['sandbox_workspace_write.writable_roots=["/opt/work/server"]'],
+            ["-c", "sandbox_workspace_write.network_access=false"],
+            ["/opt/work/server"],
+            False,
+        ),
+        (
+            ["sandbox_workspace_write.network_access=false"],
+            [
+                "-c",
+                'sandbox_workspace_write={writable_roots=["/opt/work/launch"],network_access=true}',
+            ],
+            ["/opt/work/launch"],
+            True,
+        ),
+        (
+            ["sandbox_workspace_write={network_access=false}"],
+            ["-c", 'sandbox_workspace_write.writable_roots=["/opt/work/leaf"]'],
+            ["/opt/work/leaf"],
+            False,
+        ),
+    ],
+)
+def test_workspace_profile_roots_and_network(
+    profile_repo: Path,
+    overrides: list[str],
+    args: list[str],
+    expected_roots: list[str],
+    network: bool,
+) -> None:
+    profile = launch_args.codex_workspace_profile(
+        profile_repo,
+        launch_args=["--cd", "src", "--add-dir", "../extra", *args],
+        server_overrides=overrides,
+        private_config={
+            "default_permissions": ":workspace",
+            "sandbox_workspace_write": {
+                "writable_roots": ["/opt/work/file"],
+                "network_access": True,
+            },
+        },
+        codex_version=(0, 139, 0),
+    )
+    assert profile is not None
+    filesystem = tomlkit.parse(f"v = {profile.config_overrides[1].split('=', 1)[1]}")["v"]
+    for root in expected_roots:
+        assert filesystem[root] == "write"
+    assert filesystem[str(profile_repo / "extra")] == "write"
+    assert (
+        "permissions.omnigent-workspace.network.enabled=true" in profile.config_overrides
+    ) is network
+    assert set(profile.writable_roots) == {
+        *(str(Path(root).resolve()) for root in expected_roots),
+        str((profile_repo / "extra").resolve()),
+    }
+    assert profile.network_access is network
+
+
+@pytest.mark.parametrize("source", ["config", "server", "launch"])
+def test_workspace_profile_declines_relative_roots(profile_repo: Path, source: str) -> None:
+    assignment = 'sandbox_workspace_write.writable_roots=["../shared"]'
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=["-c", assignment] if source == "launch" else [],
+            server_overrides=[assignment] if source == "server" else [],
+            private_config={"sandbox_workspace_write": {"writable_roots": ["../shared"]}}
+            if source == "config"
+            else {},
+            codex_version=(0, 162, 1),
+        )
+        is None
+    )
+
+
+def test_workspace_profile_git_error_falls_back(
+    profile_repo: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(launch_args, "detect_git_root", fail)
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=["--approve-for-me"],
+            server_overrides=[],
+            private_config={},
+            codex_version=(0, 162, 1),
+        )
+        is None
+    )
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert warnings[0].getMessage() == "Failed to build Codex workspace permission profile"
+    assert warnings[0].exc_info is not None
+    assert isinstance(warnings[0].exc_info[1], OSError)
+
+
+def test_native_server_stores_normalized_permission_args(tmp_path: Path) -> None:
+    server = app_server.build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+        permission_launch_args=["--not-so-yolo"],
+        bypass_sandbox=True,
+    )
+    assert server.permission_launch_args == ("--approve-for-me",)
+    assert server.bypass_sandbox is True
+    assert server.workspace_profile is None
+
+
+async def test_native_start_builds_profile_from_final_config_off_loop(
+    profile_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from tests.harnesses.codex_native.app_server._support import (
+        _disable_codex_startup_rpc,
+        _test_app_server,
+    )
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        '[sandbox_workspace_write]\nwritable_roots=["/configured"]\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=(0, 162, 1)))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", profile_repo)
+    server.permission_launch_args = ("--approve-for-me",)
+    server.writable_roots = (str(tmp_path / "extra"),)
+    server.reconcile_process_registry = False
+    main_thread = threading.get_ident()
+    original = app_server.codex_workspace_profile
+    observed_config = []
+    observed_argv = []
+
+    def build(workspace: Path, **kwargs):
+        assert threading.get_ident() != main_thread
+        observed_config.append(kwargs["private_config"])
+        return original(workspace, **kwargs)
+
+    original_argv = app_server._build_native_codex_app_server_argv
+
+    def argv(**kwargs):
+        observed_argv.extend(kwargs["config_overrides"])
+        return original_argv(**kwargs)
+
+    monkeypatch.setattr(app_server, "codex_workspace_profile", build)
+    monkeypatch.setattr(app_server, "_build_native_codex_app_server_argv", argv)
+    try:
+        await server.start()
+        assert server.workspace_profile is not None
+        assert observed_config[0]["sandbox_workspace_write"]["writable_roots"] == [
+            "/configured",
+            str(tmp_path / "extra"),
+        ]
+        assert observed_argv == list(server.workspace_profile.config_overrides)
+        assert server.config_overrides == []
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ".git",
+        "./.git",
+        "a/.git/b",
+        "metadata/probe",
+        "sh .git/probe",
+        'python ".git"',
+        "!sh a/.git/probe",
+        "sh metadata/probe",
+        'sh "metadata/probe',
+        "sh -c 'exec metadata/probe' ignored",
+        '''sh -c "sh -c 'metadata/probe'"''',
+        '!f() { sh "$GIT_DIR/x"; }; f',
+        'sh "${GIT_DIR}/x"',
+        'sh "$GIT_COMMON_DIR/x"',
+        'sh "${GIT_COMMON_DIR}/x"',
+        "sh $(git rev-parse --git-dir)/x",
+        "sh $(git rev-parse --git-common-dir)/x",
+        "sh $(git rev-parse --absolute-git-dir)/x",
+        "sh $(git rev-parse --git-path hooks)/x",
+        '''sh -c "sh 'metadata/probe"''',
+    ],
+)
+@pytest.mark.parametrize("key", ["core.hooksPath", "core.fsmonitor"])
+def test_workspace_profile_rejects_git_config_paths(
+    profile_repo: Path, value: str, key: str
+) -> None:
+    import subprocess
+
+    (profile_repo / "metadata").symlink_to(profile_repo / ".git", target_is_directory=True)
+    subprocess.run(["git", "-C", str(profile_repo), "config", key, value], check=True)
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=[],
+            server_overrides=[],
+            private_config={},
+            codex_version=(0, 162, 1),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize(
+    "root",
+    [
+        "hooks/probe",
+        "config",
+        "config.worktree",
+        "modules/m",
+        "worktrees/sibling/commondir",
+        "own/commondir",
+        "own/gitdir",
+        "own/config.worktree",
+        "objects/probe",
+        "own",
+    ],
+)
+def test_workspace_profile_extra_root_boundaries(
+    profile_repo: Path, linked: bool, root: str
+) -> None:
+    import subprocess
+
+    workspace = profile_repo
+    common = profile_repo / ".git"
+    if linked:
+        workspace = profile_repo.parent / "linked"
+        subprocess.run(
+            ["git", "-C", str(profile_repo), "worktree", "add", str(workspace)],
+            check=True,
+            capture_output=True,
+        )
+    if root.startswith("own"):
+        if not linked:
+            return
+        extra = common / "worktrees" / "linked" / root.removeprefix("own").lstrip("/")
+    else:
+        extra = common / root
+    profile = launch_args.codex_workspace_profile(
+        workspace,
+        launch_args=["--add-dir", str(extra)],
+        server_overrides=[],
+        private_config={},
+        codex_version=(0, 162, 1),
+    )
+    if root in {"objects/probe", "own"}:
+        assert profile is not None
+        assert (
+            str(extra)
+            not in tomlkit.parse(f"v = {profile.config_overrides[1].split('=', 1)[1]}")["v"]
+            or root == "own"
+        )
+    else:
+        assert profile is None
+
+
+def test_workspace_profile_git_reads_ignore_parent_redirects(
+    profile_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_DIR", str(profile_repo / "missing"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", ".git")
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=[],
+            server_overrides=[],
+            private_config={},
+            codex_version=(0, 139, 0),
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize("version", [None, (0, 139, 0), (0, 161, 9), (0, 162, 0)])
+async def test_native_profile_version_floor(
+    profile_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int, int] | None,
+) -> None:
+    from tests.harnesses.codex_native.app_server._support import (
+        _disable_codex_startup_rpc,
+        _test_app_server,
+    )
+
+    source = tmp_path / "source-home"
+    source.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=version))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", profile_repo)
+    server.reconcile_process_registry = False
+    builder = AsyncMock()  # The synchronous builder must never run below the native floor.
+    if version is None or version < (0, 162, 0):
+        monkeypatch.setattr(app_server, "codex_workspace_profile", builder)
+    try:
+        await server.start()
+        assert (server.workspace_profile is not None) == (version == (0, 162, 0))
+        builder.assert_not_called()
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize("source", ["launch", "config", "server"])
+def test_workspace_profile_resolved_roots_cannot_reopen_hooks(
+    profile_repo: Path, source: str
+) -> None:
+    import json
+
+    alias = profile_repo.parent / "alias"
+    alias.symlink_to(profile_repo / ".git" / "hooks", target_is_directory=True)
+    assignment = f"sandbox_workspace_write.writable_roots={json.dumps([str(alias / 'probe')])}"
+    profile = launch_args.codex_workspace_profile(
+        profile_repo,
+        launch_args=["-c", assignment] if source == "launch" else [],
+        server_overrides=[assignment] if source == "server" else [],
+        private_config={"sandbox_workspace_write": {"writable_roots": [str(alias / "probe")]}}
+        if source == "config"
+        else {},
+        codex_version=(0, 162, 1),
+    )
+    assert profile is None
+
+
+@pytest.mark.parametrize("layer", ["private", "server", "launch"])
+@pytest.mark.parametrize(
+    "override",
+    [
+        "permissions.omnigent-workspace.network.enabled=true",
+        'permissions."omnigent-workspace".network.enabled=true',
+        "permissions.omnigent-workspace={network={enabled=true}}",
+        "permissions={omnigent-workspace={network={enabled=true}}}",
+    ],
+)
+def test_workspace_profile_declines_name_collision(
+    profile_repo: Path, layer: str, override: str
+) -> None:
+    import tomlkit
+
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=["-c", override] if layer == "launch" else [],
+            server_overrides=[override] if layer == "server" else [],
+            private_config=tomlkit.parse(override).unwrap() if layer == "private" else {},
+            codex_version=(0, 162, 1),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("value", ["echo probe", "sh -c 'echo probe'"])
+def test_workspace_profile_safe_command(profile_repo: Path, value: str) -> None:
+    import subprocess
+
+    subprocess.run(["git", "-C", str(profile_repo), "config", "core.fsmonitor", value], check=True)
+    assert (
+        launch_args.codex_workspace_profile(
+            profile_repo,
+            launch_args=[],
+            server_overrides=[],
+            private_config={},
+            codex_version=(0, 162, 1),
+        )
+        is not None
+    )

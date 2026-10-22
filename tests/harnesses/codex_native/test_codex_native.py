@@ -8623,6 +8623,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
         start=AsyncMock(),
         close=close_server,
         codex_cli_version=(0, 154, 0),
+        workspace_profile=None,
         config_overrides=[],
         env={},
         codex_home=tmp_path / "codex-home",
