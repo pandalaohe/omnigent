@@ -36,7 +36,7 @@ from omnigent.server.project_placement import project_code_locations
 from omnigent.startup_protocol import StartupAttemptRef
 
 if TYPE_CHECKING:
-    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.registry import RunnerGenerationGuard, TunnelRegistry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import ConversationStore
@@ -308,6 +308,13 @@ class RunnerSessionInitializer:
         """Prevent delayed recovery work from following a replacement tunnel."""
         if self.generation_for(runner_id, runner_client) != generation:
             raise ConnectionError("runner tunnel changed during session recovery")
+
+    def generation_guard(
+        self, runner_id: str, runner_client: httpx.AsyncClient, generation: int
+    ) -> RunnerGenerationGuard:
+        """Retain the tunnel identity through an inventory transaction's commit."""
+        self.require_generation(runner_id, runner_client, generation)
+        return self._registry.generation_guard(runner_id, generation)
 
     async def _migrate_legacy_permission_state(
         self,

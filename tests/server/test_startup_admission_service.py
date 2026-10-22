@@ -19,6 +19,12 @@ from omnigent.stores.session_startup_store import SessionStartupStore
 from tests.server.test_host_registry import FakeWebSocket
 
 
+@pytest.fixture(autouse=True)
+def isolated_resident_accounting(monkeypatch):
+    # These dispatch scenarios assume inventory reconciliation has already passed.
+    monkeypatch.setattr(StartupAdmission, "inventory_ready", AsyncMock(return_value=True))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["codex", "claude-sdk"])
 async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_uri, source):

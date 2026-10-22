@@ -212,6 +212,15 @@ def register_resource_routes(
     """
     from omnigent.runtime.filesystem_registry import detect_git_root
 
+    @app.get("/v1/startup/owner-inventory")
+    async def read_owner_inventory(
+        read_id: str = Query(min_length=1, max_length=128),
+    ) -> JSONResponse:
+        from omnigent.runner.resident_inventory import owner_registration_snapshot
+
+        snapshot = owner_registration_snapshot(resource_registry)
+        return JSONResponse({"read_id": read_id, **dataclasses.asdict(snapshot)})
+
     async def _resolve_conversation_id(response_id: str) -> str | None:
         return _resp_to_conv.get(response_id)
 

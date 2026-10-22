@@ -1,0 +1,546 @@
+"""Incomplete owner evidence cannot become startup or resident permission."""
+
+import asyncio
+import threading
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
+
+import httpx
+import pytest
+from sqlalchemy import update
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session
+
+from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.db_models import SqlUser
+from omnigent.db.session_startup import SqlStartupBudget
+from omnigent.entities.session_startup import StartupReceipt
+from omnigent.host.frames import HostHelloFrame
+from omnigent.runner import create_runner_app
+from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, ResponseHeadFrame
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.server.host_registry import HostRegistry
+from omnigent.server.resident_inventory import retain_unknown_owner_inventory
+from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.server_config import StartupAdmissionPolicy
+from omnigent.server.startup_admission import StartupAdmission
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.session_startup_store import SessionStartupStore
+from omnigent.terminals import TerminalRegistry
+from tests.runner.helpers import NullServerClient
+from tests.server.test_host_registry import FakeWebSocket
+
+
+@pytest.mark.asyncio
+async def test_admission_cannot_bypass_missing_owner_inventory_capability(db_uri):
+    conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
+    hosts, host = HostRegistry(), uuid4().hex
+    conn = hosts.register(
+        host,
+        FakeWebSocket(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="sample-host",
+            capabilities=["startup_admission_v1", "startup_receipts:codex"],
+        ),
+        owner=None,
+    )
+    startups.register_host_generation(host, conn.startup_generation)
+    conversation = conversations.create_conversation()
+    conversations.set_host_id(conversation.id, host, "/opt/work/project")
+    admission = StartupAdmission(startups, conversations, hosts, StartupAdmissionPolicy(4, 4, 2))
+    admission.bind(SimpleNamespace(state=SimpleNamespace(startup_inputs=None)))
+    admission.resolve_harness = AsyncMock(return_value="codex")
+    queued = await admission.queue_session(conn, conversation.id)
+    try:
+        assert not await admission._eligible(queued)
+        await admission.coordinator.advance(host)
+        await admission.coordinator.drain()
+        current = startups.get(queued.id)
+        assert current.state == "queued" and not current.resident and not current.occupied
+    finally:
+        await admission.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminals", [None, []])
+async def test_partial_reader_veto_survives_reorder_reload_and_reconnect(
+    db_uri, monkeypatch, terminals
+):
+    conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
+    hosts, host = HostRegistry(), uuid4().hex
+    conn = hosts.register(
+        host,
+        FakeWebSocket(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="sample-host",
+            capabilities=["startup_admission_v1", "resident_inventory_v1"],
+        ),
+        owner=None,
+    )
+    startups.configure(host, host_resident_limit=10, deployment_resident_limit=10)
+    startups.register_host_generation(host, conn.startup_generation)
+    conversation = conversations.create_conversation()
+    conversations.set_host_id(conversation.id, host, "/opt/work/project")
+    conversations.set_runner_id(conversation.id, "runner")
+    queued = startups.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=conversation.id,
+        operation_key="existing",
+        input_id=None,
+    )
+    attempt = startups.reserve(host)
+    assert startups.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="existing",
+        host_generation=conn.startup_generation,
+        boundary="runner_prepare",
+        claim_id="owned",
+    )
+    requests = []
+    first_read, release_first = asyncio.Event(), asyncio.Event()
+
+    async def read(request):
+        requests.append(request.url.params["read_id"])
+        if len(requests) == 1:
+            first_read.set()
+            await release_first.wait()
+
+    monkeypatch.setattr("omnigent.runner.native.orchestration._AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr("omnigent.runner.native.orchestration._AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr("omnigent.runner.native.orchestration._CLOSING_NATIVE_BACKENDS", {})
+    resources = SessionResourceRegistry(TerminalRegistry() if terminals is not None else None)
+    runner_app = create_runner_app(server_client=NullServerClient(), resource_registry=resources)
+
+    tunnels = TunnelRegistry()
+    tunnels.register("runner", FakeWebSocket(), HelloFrame("test", 1))
+    initializer = RunnerSessionInitializer(tunnels, server_version="test")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=runner_app),
+        base_url="http://runner",
+        event_hooks={"request": [read]},
+    ) as runner:
+        router = Mock()
+        router.runner_has_capability.return_value = True
+        router.client_for_existing_conversation.return_value = SimpleNamespace(
+            runner_id="runner", client=runner
+        )
+        app = SimpleNamespace(
+            state=SimpleNamespace(
+                runner_router=router, runner_session_initializer=initializer, startup_inputs=None
+            )
+        )
+        first = asyncio.create_task(
+            retain_unknown_owner_inventory(
+                app, conversations, hosts, startups, conn, conversation.id
+            )
+        )
+        await asyncio.wait_for(first_read.wait(), 2)
+        try:
+            assert await retain_unknown_owner_inventory(
+                app, conversations, hosts, startups, conn, conversation.id
+            )
+        finally:
+            release_first.set()
+            assert await asyncio.wait_for(first, 2)
+        # A duplicate read is monotonic too; neither delivery order releases usage.
+        assert await retain_unknown_owner_inventory(
+            app, conversations, hosts, startups, conn, conversation.id
+        )
+        admission = StartupAdmission(
+            startups, conversations, hosts, StartupAdmissionPolicy(10, 10, 2)
+        )
+        admission.bind(app)
+        try:
+            assert not await admission._eligible(queued)
+        finally:
+            await admission.shutdown()
+    assert requests[0] != requests[1]
+    retained = startups.get(queued.id)
+    assert retained.resident and retained.occupied
+    assert retained.attempt_id == attempt.attempt_id and retained.runtime_id == "existing"
+    assert not startups.claim(queued.id, attempt.attempt_id, runtime_id="existing")
+    assert not startups.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="existing",
+        host_generation=conn.startup_generation,
+        boundary="executor_prepare",
+        claim_id="late",
+    )
+    # Positive owner observations and an owned stop still work under the veto.
+    for phase in ("runtime_ready", "tools_ready"):
+        assert startups.observe(
+            StartupReceipt(
+                startup_id=queued.id,
+                attempt_id=attempt.attempt_id,
+                runtime_id="existing",
+                source="runner",
+                phase=phase,
+            )
+        )
+    assert startups.get(queued.id).state == "ready_empty"
+    startups.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=uuid4().hex,
+        operation_key="new",
+        input_id=None,
+    )
+    replacement = SessionStartupStore(db_uri)
+    assert replacement.reserve(host) is None
+    replacement.register_host_generation(host, "reconnected")
+    replacement.configure(host, host_resident_limit=20, deployment_resident_limit=20)
+    assert replacement.reserve(host) is None
+    assert replacement.confirm_stopped(queued.id, attempt.attempt_id)
+    assert not replacement.get(queued.id).resident
+    assert replacement.reserve(host) is None
+    # An unknown host also leaves the deployment budget unknown.
+    other = uuid4().hex
+    replacement.configure(other, host_resident_limit=20, deployment_resident_limit=20)
+    replacement.enqueue(
+        owner_user_id="owner",
+        host_id=other,
+        session_id=uuid4().hex,
+        operation_key="other-host",
+        input_id=None,
+    )
+    assert replacement.reserve(other) is None
+    with replacement._session("inspect_unknown_veto") as db:
+        budget = db.get(SqlStartupBudget, f"0:{host}")
+        assert budget.resident_inventory_unknown and not budget.fenced and budget.recovery is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "race",
+    [
+        "host",
+        "runner",
+        "binding",
+        "account",
+        "read_id",
+        "queued_write",
+        "commit_retry",
+    ],
+)
+async def test_stale_owner_response_cannot_write_inventory_veto(db_uri, monkeypatch, race):
+    conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
+    hosts, host = HostRegistry(), uuid4().hex
+    with startups._session("seed_inventory_owner") as db:
+        db.add(SqlUser(id="alice", account_generation="account-one"))
+    with account_authority_scope("alice", "account-one"):
+        conn = hosts.register(
+            host,
+            FakeWebSocket(),
+            HostHelloFrame(
+                version="test",
+                frame_protocol_version=1,
+                name="sample-host",
+                capabilities=["resident_inventory_v1"],
+            ),
+            owner="alice",
+        )
+    startups.configure(host, host_resident_limit=10, deployment_resident_limit=10)
+    startups.register_host_generation(host, conn.startup_generation)
+    conversation = conversations.create_conversation()
+    conversations.set_host_id(conversation.id, host, "/opt/work/project")
+    conversations.set_runner_id(conversation.id, "runner")
+    tunnels = TunnelRegistry()
+    tunnels.register("runner", FakeWebSocket(), HelloFrame("test", 1))
+    initializer = RunnerSessionInitializer(tunnels, server_version="test")
+    write_waiting, release_write = threading.Event(), threading.Event()
+    if race == "queued_write":
+        budgets = startups._budgets
+
+        def paused_budgets(db, host_id):
+            locked = budgets(db, host_id)
+            write_waiting.set()
+            assert release_write.wait(5), "test did not release the locked transaction"
+            return locked
+
+        monkeypatch.setattr(startups, "_budgets", paused_budgets)
+    elif race == "commit_retry":
+        commit = Session.commit
+        failure_pending = True
+
+        class SerializationFailure(Exception):
+            sqlstate = "40001"
+
+        def fail_first_inventory_commit(db):
+            nonlocal failure_pending
+            if failure_pending and any(
+                isinstance(row, SqlStartupBudget) and row.resident_inventory_unknown
+                for row in db.dirty
+            ):
+                failure_pending = False
+                raise DBAPIError("commit", None, SerializationFailure())
+            return commit(db)
+
+        def pause_before_retry(_operation, outcome):
+            assert outcome == "scheduled"
+            write_waiting.set()
+            assert release_write.wait(5), "test did not release the transaction retry"
+
+        monkeypatch.setattr(Session, "commit", fail_first_inventory_commit)
+        monkeypatch.setattr("omnigent.db.utils.is_cockroachdb", lambda _dialect: True)
+        monkeypatch.setattr("omnigent.db.utils.record_transaction_retry", pause_before_retry)
+
+    async def read(request):
+        if race == "host":
+            new = hosts.register(host, FakeWebSocket(), conn.hello, owner="alice")
+            startups.register_host_generation(host, new.startup_generation)
+        elif race == "runner":
+            tunnels.register("runner", FakeWebSocket(), HelloFrame("test", 1))
+        elif race == "binding":
+            conversations.replace_runner_id(conversation.id, "replacement")
+        elif race == "account":
+            with startups._session("replace_inventory_owner") as db:
+                db.execute(
+                    update(SqlUser)
+                    .where(SqlUser.id == "alice")
+                    .values(account_generation="account-two")
+                )
+        return httpx.Response(
+            200,
+            json={
+                "read_id": "older-read" if race == "read_id" else request.url.params["read_id"],
+                "native_backends": {"owners": []},
+                "terminals": [],
+                "executor_contexts_complete": False,
+                "external_owners_complete": False,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(read), base_url="http://runner"
+    ) as runner:
+        router = Mock()
+        router.runner_has_capability.return_value = True
+        router.client_for_existing_conversation.return_value = SimpleNamespace(
+            runner_id="runner", client=runner
+        )
+        app = SimpleNamespace(
+            state=SimpleNamespace(runner_router=router, runner_session_initializer=initializer)
+        )
+        pending = asyncio.create_task(
+            retain_unknown_owner_inventory(
+                app, conversations, hosts, startups, conn, conversation.id
+            )
+        )
+        if race in ("queued_write", "commit_retry"):
+
+            async def reconnect():
+                tunnels.register("runner", FakeWebSocket(), HelloFrame("test", 1))
+
+            try:
+                assert await asyncio.to_thread(write_waiting.wait, 5)
+                # A registry lock held while waiting for DB locks must not block reconnect.
+                await asyncio.wait_for(asyncio.to_thread(asyncio.run, reconnect()), 2)
+            finally:
+                release_write.set()
+        assert not await asyncio.wait_for(pending, 5)
+    with startups._session("inspect_rejected_inventory") as db:
+        assert not db.get(SqlStartupBudget, f"0:{host}").resident_inventory_unknown
+
+
+@pytest.mark.asyncio
+async def test_unknown_inventory_preserves_reserved_resident_reuse_dispatch(db_uri):
+    store, conversations = SessionStartupStore(db_uri), SqlAlchemyConversationStore(db_uri)
+    host = uuid4().hex
+    store.configure(host, host_resident_limit=2, deployment_resident_limit=2)
+    store.register_host_generation(host, "host-generation")
+    conversation = conversations.create_conversation()
+    conversations.set_host_id(conversation.id, host, "/opt/work/project")
+    conversations.set_runner_id(conversation.id, "runner")
+    empty = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=conversation.id,
+        operation_key="empty",
+        input_id=None,
+    )
+    reserved = store.reserve(host)
+    assert store.claim_boundary(
+        empty.id,
+        reserved.attempt_id,
+        runtime_id="warm-context",
+        host_generation="host-generation",
+        boundary="runner_prepare",
+        claim_id="prepare",
+    )
+    for phase in ("runtime_ready", "tools_ready"):
+        assert store.observe(
+            StartupReceipt(
+                startup_id=empty.id,
+                attempt_id=reserved.attempt_id,
+                runtime_id="warm-context",
+                source="runner",
+                phase=phase,
+            )
+        )
+    reused = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=conversation.id,
+        operation_key="first-input",
+        input_id=uuid4().hex,
+        runtime_generation=2,
+        reuse_startup_id=empty.id,
+    )
+    dispatch = store.reserve(host)
+    assert dispatch.id == reused.id
+    cold = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=uuid4().hex,
+        operation_key="independent-cold",
+        input_id=None,
+    )
+    cold_attempt = store.reserve(host)
+    assert cold_attempt.id == cold.id
+    tunnels = TunnelRegistry()
+    runner = tunnels.register("runner", FakeWebSocket(), HelloFrame("test", 1))
+    # The veto arrives after this resident reuse was already reserved.
+    assert store.note_unknown_resident_inventory(
+        host,
+        host_generation="host-generation",
+        session_id=conversation.id,
+        expected_runner_id="runner",
+        account=None,
+        runner_generation=tunnels.generation_guard("runner", runner.generation),
+    )
+    assert not store.claim_boundary(
+        cold.id,
+        cold_attempt.attempt_id,
+        runtime_id="cold-context",
+        host_generation="host-generation",
+        boundary="executor_prepare",
+        claim_id="new-cold",
+    )
+    assert not store.claim_boundary(
+        reused.id,
+        dispatch.attempt_id,
+        runtime_id="warm-context",
+        host_generation="host-generation",
+        boundary="executor_prepare",
+        claim_id="cold",
+    )
+    assert store.claim_boundary(
+        reused.id,
+        dispatch.attempt_id,
+        runtime_id="warm-context",
+        host_generation="host-generation",
+        boundary="input_dispatch",
+        claim_id="warm",
+    )
+    assert store.get(empty.id).resident and store.get(reused.id).resident
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", [None, "register", "deregister", "close", "cancel"])
+async def test_inventory_commit_keeps_unrelated_traffic_and_eventloop_moving(
+    db_uri, monkeypatch, lifecycle
+):
+    store, conversations = SessionStartupStore(db_uri), SqlAlchemyConversationStore(db_uri)
+    host = uuid4().hex
+    store.configure(host, host_resident_limit=2, deployment_resident_limit=2)
+    store.register_host_generation(host, "generation")
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, host, "/opt/work/project")
+    conversations.set_runner_id(conv.id, "target")
+    tunnels = TunnelRegistry()
+    target = tunnels.register("target", FakeWebSocket(), HelloFrame("test", 1))
+    other = tunnels.register("other", FakeWebSocket(), HelloFrame("test", 1))
+    entered, release, ticked, progressed = (threading.Event() for _ in range(4))
+    observations = []
+    commit = Session.commit
+
+    def paused_commit(db):
+        if any(
+            isinstance(row, SqlStartupBudget) and row.resident_inventory_unknown
+            for row in db.dirty
+        ):
+            entered.set()
+            assert release.wait(5), "test did not release the real commit"
+        return commit(db)
+
+    def watchdog():
+        observations.append((progressed.wait(2), ticked.is_set()))
+        release.set()
+
+    monkeypatch.setattr(Session, "commit", paused_commit)
+    write = asyncio.create_task(
+        asyncio.to_thread(
+            store.note_unknown_resident_inventory,
+            host,
+            host_generation="generation",
+            session_id=conv.id,
+            expected_runner_id="target",
+            account=None,
+            runner_generation=tunnels.generation_guard("target", target.generation),
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    watcher = threading.Thread(target=watchdog, daemon=True)
+    watcher.start()
+    waiter = None
+    try:
+        asyncio.get_running_loop().call_soon(ticked.set)
+        if lifecycle in ("register", "cancel"):
+            waiter = asyncio.create_task(
+                tunnels.register_async("target", FakeWebSocket(), HelloFrame("test", 1))
+            )
+        elif lifecycle == "deregister":
+            waiter = asyncio.create_task(tunnels.deregister_async("target", target))
+        elif lifecycle == "close":
+            waiter = asyncio.create_task(
+                tunnels.record_close_async(target, code=4003, reason="test-close")
+            )
+        if waiter is not None:
+            await asyncio.sleep(0)
+            assert not waiter.done(), "target lifecycle bypassed the pending commit"
+            if lifecycle == "cancel":
+                waiter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiter
+        assert tunnels.mark_frame_seen(other)
+        assert tunnels.get("other") is other
+        await tunnels.send_text(other, "warm-control")
+        request = tunnels.open_request("other", "response")
+        assert tunnels.route_response_frame("other", ResponseHeadFrame("response", 200, []))
+        assert (await asyncio.wait_for(request.head_future, 1)).status == 200
+        tunnels.close_request("other", "response")
+        independent = await tunnels.register_async(
+            "independent", FakeWebSocket(), HelloFrame("test", 1)
+        )
+        assert independent.loop is asyncio.get_running_loop()
+        progressed.set()
+    finally:
+        release.set()
+        await asyncio.to_thread(watcher.join, 3)
+        assert await asyncio.wait_for(write, 5)
+    assert observations == [(True, True)], (
+        "unrelated receive/send/response routing or loop tick waited for commit"
+    )
+    if waiter is not None and lifecycle != "cancel":
+        result = await asyncio.wait_for(waiter, 2)
+        if lifecycle == "register":
+            assert result.generation != target.generation
+            assert result.loop is asyncio.get_running_loop()
+        elif lifecycle == "deregister":
+            assert result is target and tunnels.get("target") is None
+        else:
+            assert target.close_code == 4003
+    if lifecycle == "cancel":
+        assert (
+            await tunnels.register_async("target", FakeWebSocket(), HelloFrame("test", 1))
+        ).generation != target.generation
+    assert not tunnels._lifecycle_locks

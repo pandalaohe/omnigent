@@ -30,6 +30,11 @@ from tests.server.test_member_snapshot import joint_bundle
 
 @pytest.fixture(autouse=True)
 def enable_admission(monkeypatch):
+    # This suite tests create preparation after resident inventory reconciliation.
+    monkeypatch.setattr(
+        "omnigent.server.startup_admission.StartupAdmission.inventory_ready",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         "omnigent.server.server_config.load_server_config",
         lambda: {
