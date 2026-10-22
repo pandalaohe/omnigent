@@ -79,6 +79,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     from omnigent.entities.environment_filesystem import FilesystemEntry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -203,6 +204,7 @@ def register_resource_routes(
     auth_token_factory: Callable[[], str | None] | None,
     filesystem_registry: FilesystemRegistry | None,
     resource_registry: SessionResourceRegistry,
+    process_manager: HarnessProcessManager | None,
     server_client: httpx.AsyncClient,
     terminal_registry: TerminalRegistry | None,
 ) -> ResourceRoutes:
@@ -218,7 +220,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         from omnigent.runner.resident_inventory import owner_registration_snapshot
 
-        snapshot = owner_registration_snapshot(resource_registry)
+        snapshot = await owner_registration_snapshot(resource_registry, process_manager)
         return JSONResponse({"read_id": read_id, **dataclasses.asdict(snapshot)})
 
     async def _resolve_conversation_id(response_id: str) -> str | None:

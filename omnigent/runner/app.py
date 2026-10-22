@@ -11159,6 +11159,7 @@ def create_runner_app(
         auth_token_factory=auth_token_factory,
         filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
+        process_manager=process_manager,
         server_client=server_client,
         terminal_registry=terminal_registry,
     )

@@ -517,6 +517,8 @@ class HarnessInventorySnapshot:
 
     owners: tuple[HarnessResidentSnapshot, ...]
     exit_coverage_complete: bool
+    # When requested, each position belongs to the same position in owners; None is unknown.
+    contexts: tuple[HarnessContextInventorySnapshot | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -729,7 +731,9 @@ class HarnessProcessManager:
         generation = self._release_generations.get(conversation_id, 0)
         return f"{generation}:{entry.last_used_at:.9f}"
 
-    async def resident_inventory(self) -> HarnessInventorySnapshot:
+    async def resident_inventory(
+        self, *, context_reads: tuple[HarnessContextInventorySnapshot, ...] | None = None
+    ) -> HarnessInventorySnapshot:
         """Read owned harnesses without spawning, probing, or changing retention."""
         async with self._registry_lock:
             entries = [(session_id, entry, False) for session_id, entry in self._entries.items()]
@@ -747,7 +751,33 @@ class HarnessProcessManager:
                 )
                 for session_id, entry, closing in entries
             )
-            return HarnessInventorySnapshot(snapshots, self._exit_coverage_complete)
+            contexts = None
+            if context_reads is not None:
+                reads = {
+                    (read.owner.session_id, read.owner.incarnation_id): read
+                    for read in context_reads
+                }
+                contexts = tuple(
+                    read
+                    if (
+                        (read := reads.get((session_id, entry.incarnation_id))) is not None
+                        and read.owner == snapshot
+                        and self._entries.get(session_id) is entry
+                        and self._started
+                        and not self._shutting_down
+                        and not closing
+                        and not entry.teardown_started
+                        and not entry.exit_confirmed
+                        and entry.process.returncode is None
+                        and not entry.client.is_closed
+                        and self._release_generations.get(session_id, 0) == read.release_generation
+                    )
+                    else None
+                    for snapshot, (session_id, entry, closing) in zip(
+                        snapshots, entries, strict=True
+                    )
+                )
+            return HarnessInventorySnapshot(snapshots, self._exit_coverage_complete, contexts)
 
     async def read_resident_inventory(
         self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
