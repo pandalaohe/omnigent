@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities.session_startup import StartupReceipt
 
+SDK_STARTUP_SOURCES = frozenset({"codex", "claude-sdk"})
+
 
 class StartupAttemptRef(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -21,7 +23,9 @@ class StartupBoundaryClaim(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     attempt: StartupAttemptRef
-    boundary: Literal["harness_prepare", "native_prepare", "executor_prepare"]
+    boundary: Literal[
+        "harness_prepare", "native_prepare", "executor_construct", "executor_prepare"
+    ]
     claim_id: str = Field(min_length=1, max_length=128)
 
 

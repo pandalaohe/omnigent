@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
-from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
+from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef, StartupObservation
 
 
 class StartupAdmission:
@@ -55,9 +55,17 @@ class StartupAdmission:
         self._observations.pop(session_id, None)
 
     def record_observation(self, session_id: str, observation: StartupObservation) -> bool:
-        """Keep one typed Codex observation per phase for the current attempt."""
+        """Keep one typed SDK observation per phase for the current attempt."""
         attempt = self._attempts.get(session_id)
-        if attempt is None or attempt != observation.attempt or observation.source != "codex":
+        if (
+            attempt is None
+            or attempt != observation.attempt
+            or observation.source not in SDK_STARTUP_SOURCES
+            or any(
+                item.source != observation.source
+                for item in self._observations.get(session_id, {}).values()
+            )
+        ):
             return False
         metadata = observation.model_copy(update={"reason": None})
         self._observations.setdefault(session_id, {}).setdefault(observation.phase, metadata)
@@ -85,7 +93,7 @@ class StartupAdmission:
         return admit
 
     async def admit_harness(self, session_id: str, harness: str) -> None:
-        if self._enabled and harness != "codex":
+        if self._enabled and harness not in SDK_STARTUP_SOURCES:
             raise RuntimeError("startup_proof_unavailable")
         await self.claim(session_id, "harness_prepare")
 

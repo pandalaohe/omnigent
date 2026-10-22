@@ -409,5 +409,5 @@ def create_app() -> FastAPI:
         :class:`CodexExecutor` is constructed lazily on the
         first turn.
     """
-    adapter = ExecutorAdapter(executor_factory=_build_codex_executor)
+    adapter = ExecutorAdapter(executor_factory=_build_codex_executor, startup_source="codex")
     return adapter.build()

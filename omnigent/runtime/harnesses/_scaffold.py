@@ -775,7 +775,9 @@ class TurnContext:
         return True
 
     async def claim_startup(
-        self, attempt: StartupAttemptRef, boundary: Literal["executor_prepare"]
+        self,
+        attempt: StartupAttemptRef,
+        boundary: Literal["executor_construct", "executor_prepare"],
     ) -> bool:
         if self.cancelled.is_set():
             return False

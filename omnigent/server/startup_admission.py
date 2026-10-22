@@ -18,7 +18,7 @@ from omnigent.server.startup_registration import (
     STARTUP_REGISTRATION_LABEL_KEY,
     STARTUP_REGISTRATION_PENDING,
 )
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore, StartupSnapshot
 
@@ -420,7 +420,7 @@ class StartupAdmission:
             and current.attempt_id is not None
             and current.runtime_id is not None
             and current.host_generation == conn.startup_generation
-            and await self.resolve_harness(current) == "codex"
+            and await self.resolve_harness(current) in SDK_STARTUP_SOURCES
             and await self._runner_available(session_id)
         ):
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)

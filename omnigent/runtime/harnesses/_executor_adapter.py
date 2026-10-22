@@ -19,7 +19,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Response
 
@@ -67,7 +67,7 @@ from omnigent.server.schemas import (
     SDKPeerReceiptEvent,
     StartupProofEvent,
 )
-from omnigent.startup_evidence import startup_evidence_scope
+from omnigent.startup_evidence import StartupPermissionUnavailable, startup_evidence_scope
 
 _logger = logging.getLogger(__name__)
 
@@ -197,9 +197,12 @@ class ExecutorAdapter(HarnessApp):
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
         harness_label: str = "Claude",
+        *,
+        startup_source: Literal["codex", "claude-sdk"] | None = None,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
+        self._startup_source = startup_source
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
@@ -243,14 +246,17 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
-        executor = self._ensure_executor()
         startup_attempt = request.startup_attempt
         startup_required = request.startup_required or startup_attempt is not None
         if startup_required:
-            from omnigent.inner.codex_executor import CodexExecutor
-
-            if not isinstance(executor, CodexExecutor):
+            if self._startup_source is None:
                 raise RuntimeError("startup_proof_unavailable")
+            if self._executor is None:
+                if startup_attempt is None or not await ctx.claim_startup(
+                    startup_attempt, "executor_construct"
+                ):
+                    raise RuntimeError("Startup permission unavailable")
+        executor = self._ensure_executor()
         messages = _translate_input_to_messages(request.input)
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -578,6 +584,8 @@ class ExecutorAdapter(HarnessApp):
             if self._executor is not None:
                 await self._executor.interrupt_session(self._session_key)
         except BaseException as exc:
+            if isinstance(exc, StartupPermissionUnavailable):
+                clean_exit = True
             _turn_outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
             if input_identity and not input_outcome_logged:
                 log_input_event(

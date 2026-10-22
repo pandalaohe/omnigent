@@ -885,6 +885,7 @@ class SessionStartupStore:
             "runner_spawn",
             "harness_prepare",
             "native_prepare",
+            "executor_construct",
             "executor_prepare",
         ):
             raise ValueError("Unknown cold startup boundary")
@@ -1253,6 +1254,7 @@ class SessionStartupStore:
                     boundary in row.cold_claims
                     for boundary in (
                         "harness_prepare",
+                        "executor_construct",
                         "executor_prepare",
                         "native_prepare",
                         "input_dispatch",

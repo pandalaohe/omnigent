@@ -34,6 +34,9 @@ def test_physical_boundary_grants_are_once_only_and_generation_bound(db_uri):
     )
     assert store.claim_boundary(**{**args, "claim_id": uuid4().hex}, boundary="runner_spawn")
     assert not store.claim_boundary(**{**args, "claim_id": uuid4().hex}, boundary="runner_spawn")
+    assert store.claim_boundary(**args, boundary="executor_construct")
+    assert not SessionStartupStore(db_uri).claim_boundary(**args, boundary="executor_construct")
+    assert store.claim_boundary(**args, boundary="executor_prepare")
     assert store.cancel(handle.id).state == "cancelling"
     assert not store.claim_boundary(**args, boundary="native_prepare")
 

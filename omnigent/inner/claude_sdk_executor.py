@@ -68,6 +68,11 @@ from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.session_default_modes import CLAUDE_FAST_MODE_SETTINGS
 from omnigent.spec.types import RetryPolicy
+from omnigent.startup_evidence import (
+    ClaudeTurnEvidence,
+    StartupPermissionUnavailable,
+    claim_startup_boundary,
+)
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -346,6 +351,7 @@ class _ClaudeSDK(Protocol):
     # at our boundary so that's the right abstraction level here.
     ClaudeSDKClient: Callable[..., _ClaudeClient]  # type: ignore[explicit-any]
     ClaudeAgentOptions: Callable[..., Any]  # type: ignore[explicit-any]
+    HookMatcher: Callable[..., Any]  # type: ignore[explicit-any]
     tool: Callable[..., Any]  # type: ignore[explicit-any]
     create_sdk_mcp_server: Callable[..., Any]  # type: ignore[explicit-any]
 
@@ -1929,6 +1935,7 @@ class ClaudeSDKExecutor(Executor):
         self._clients: dict[str, _ClaudeClientState] = {}
         # Per-session query slots serializing real turns and keep-warm pings.
         self._query_slots: dict[str, _QuerySlot] = {}
+        self._active_turns: set[str] = set()
         self._pending_framework_context: dict[str, str] = {}
         self._peer_pending: dict[str, list[_ClaudePeerPending]] = {}
         self._peer_late: dict[str, list[_ClaudePeerPending]] = {}
@@ -3216,6 +3223,24 @@ class ClaudeSDKExecutor(Executor):
         system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
+        """Keep one exclusive SDK response stream per session."""
+        session_key = self._session_key(messages)
+        if session_key in self._active_turns:
+            raise RuntimeError("Claude SDK query already active")
+        self._active_turns.add(session_key)
+        try:
+            async for event in self._run_turn_impl(messages, tools, system_prompt, config):
+                yield event
+        finally:
+            self._active_turns.remove(session_key)
+
+    async def _run_turn_impl(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[ExecutorEvent]:
         """Run one turn via the Claude Agent SDK.
 
         The SDK receives the latest user message as a prompt and runs its full
@@ -3250,14 +3275,16 @@ class ClaudeSDKExecutor(Executor):
             cfg.permission_mode if cfg.permission_mode is not None else self._permission_mode
         )
         state = self._clients.get(session_key)
-        if state is not None and (
+        replacing_client = state is not None and (
             state.permission_mode != permission_mode
             or (
                 state.effort != reasoning_effort
                 and (next_input := self._extract_trailing_user_content(messages))
                 and next_input != "/compact"
             )
-        ):
+        )
+        if replacing_client:
+            await claim_startup_boundary("executor_prepare")
             await self._close_live_client(session_key)
         resume_session = session_key in self._clients
         prompt = self._build_prompt(
@@ -3269,6 +3296,19 @@ class ClaudeSDKExecutor(Executor):
             # completion with no assistant text instead of an empty string.
             yield TurnComplete(response=None)
             return
+
+        startup_evidence = ClaudeTurnEvidence(
+            prompt if isinstance(prompt, str) else "",
+            tool_bridge_installed=not tools or self._tool_executor is not None,
+        )
+        if startup_evidence.enabled and (
+            resume_session
+            or not isinstance(prompt, str)
+            or not callable(getattr(sdk, "HookMatcher", None))
+        ):
+            raise RuntimeError("Claude SDK startup proof unavailable")
+        if not resume_session and not replacing_client:
+            await claim_startup_boundary("executor_prepare")
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
@@ -3485,6 +3525,21 @@ class ClaudeSDKExecutor(Executor):
         self._install_subagent_router_hook(sdk, options, model, session_key)
         self._install_framework_context_hook(sdk, options, session_key)
         self._install_keep_warm_maintenance_hook(sdk, options, session_key)
+        if startup_evidence.enabled:
+            hook_matcher = sdk.HookMatcher
+
+            async def observe_startup_prompt(
+                payload: object, _tool_use_id: str | None, _context: object
+            ) -> _JsonObject:
+                if isinstance(payload, dict):
+                    startup_evidence.prompt_submitted(payload)
+                return {}
+
+            hooks = dict(getattr(options, "hooks", None) or {})
+            hooks.setdefault("UserPromptSubmit", []).append(
+                hook_matcher(hooks=[observe_startup_prompt])
+            )
+            options.hooks = hooks
         if claude_peer_receipts_supported() and getattr(sdk, "HookMatcher", None) is not None:
             options.session_store = _ClaudePeerReceiptStore(self, session_key)
             options.session_store_flush = "eager"
@@ -3680,11 +3735,11 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
-        # Mark the session busy for this turn's duration. A real turn never
-        # waits on the slot lock, so an abandoned generator cannot block a
-        # later turn; its stale busy mark only makes pings skip.
+        # The outer run_turn keeps another real turn from sharing this stream;
+        # this busy mark retains the query-stage timing used by peer delivery.
         slot = self._query_slot(session_key)
         slot.busy += 1
+        replacement_admitted = False
         try:
             if slot.maintenance:
                 # A keep-warm ping owns the client: ask it to yield, then
@@ -3695,6 +3750,8 @@ class ClaudeSDKExecutor(Executor):
                         slot.ping_done.wait(), timeout=_KEEP_WARM_PREEMPT_WAIT_S
                     )
                 except asyncio.TimeoutError:
+                    await claim_startup_boundary("executor_prepare")
+                    replacement_admitted = True
                     logger.warning(
                         "Claude SDK keep-warm ping did not yield for session %s; "
                         "closing the live client so the turn starts fresh",
@@ -3711,6 +3768,8 @@ class ClaudeSDKExecutor(Executor):
             # prior session state, replay full history.
             live_state = self._clients.get(session_key)
             if live_state is None or live_state.client is not client:
+                if not replacement_admitted:
+                    await claim_startup_boundary("executor_prepare")
                 client = await self._get_or_create_client(
                     sdk,
                     session_key=session_key,
@@ -3769,6 +3828,10 @@ class ClaudeSDKExecutor(Executor):
                         message = next_task.result()
                     except StopAsyncIteration:
                         break
+                    if isinstance(
+                        message, (_StreamEvent, sdk.AssistantMessage, sdk.ResultMessage)
+                    ):
+                        startup_evidence.message(message)
                     if isinstance(message, _StreamEvent):
                         got_stream_events = True
                         stream_evt = cast(_StreamEventObj, message)
@@ -4099,6 +4162,8 @@ class ClaudeSDKExecutor(Executor):
                 if aclose is not None:
                     await aclose()
 
+        except StartupPermissionUnavailable:
+            raise
         except asyncio.CancelledError:
             # CancelledError is a BaseException, so a watchdog-cancelled turn
             # skips the boundary below. Evict the wedged client (no crash
