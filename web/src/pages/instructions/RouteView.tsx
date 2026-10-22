@@ -3,7 +3,11 @@ import { CopyIcon } from "lucide-react";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
 import { copyText } from "@/lib/clipboard";
-import type { InstructionPreview, LayerKey } from "@/hooks/useInstructionLayers";
+import {
+  hasInstructionText,
+  type InstructionPreview,
+  type LayerKey,
+} from "@/hooks/useInstructionLayers";
 
 const LABELS: Record<string, string> = {
   shared: "Shared",
@@ -45,11 +49,8 @@ export function RouteView({
   const [copyState, setCopyState] = useState("");
   const sent = data.parts.filter((part) => part.sent);
   const unsent = data.parts.filter((part) => !part.sent && part.scope);
-  const hasText = (part: InstructionPreview["parts"][number]) =>
-    // eslint-disable-next-line no-control-regex -- Match Python str.strip() control whitespace.
-    /[^\p{White_Space}\u001c-\u001f]/u.test(part.text ?? "");
-  const replaced = unsent.filter(hasText);
-  const empty = unsent.filter((part) => !hasText(part));
+  const replaced = unsent.filter((part) => hasInstructionText(part.text));
+  const empty = unsent.filter((part) => !hasInstructionText(part.text));
   const section = (part: InstructionPreview["parts"][number], index: number) => {
     const label = LABELS[part.scope ?? part.kind] ?? part.kind.replaceAll("_", " ");
     const partIndex = data.parts.indexOf(part);

@@ -60,6 +60,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "calling_last",
         "session_collab",
         "host_colors",
+        "instruction_grid",
         "keep_warm",
         "child_idle",
         "worktree_location",

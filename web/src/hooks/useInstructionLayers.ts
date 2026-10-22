@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { harnessSection, reportedOnAnyHost, type RegistryItem } from "@/hooks/useAgentRegistry";
 import type { Host } from "@/hooks/useHosts";
 import type { HarnessCapability } from "@/lib/agentLabels";
+import type { InstructionGridLayout } from "@/lib/instructionGridPreferences";
 import { authenticatedFetch } from "@/lib/identity";
 
 export type LayerScope = "shared" | "agent" | "host" | "independent" | "mother" | "child";
@@ -67,18 +68,54 @@ export function instructionRegistryItems(
   });
 }
 
-export function visibleInstructionAgents(
+export function hasInstructionText(text: string | null | undefined): boolean {
+  // eslint-disable-next-line no-control-regex -- Match Python str.strip() control whitespace.
+  return /[^\p{White_Space}\u001c-\u001f]/u.test(text ?? "");
+}
+
+export function instructionGridAxes(
   data: InstructionLayers,
-  added: ReadonlySet<string>,
-): InstructionLayers["agents"] {
-  const configured = new Set(
-    data.data
-      .filter(
-        (layer) => (layer.scope === "agent" || layer.scope === "independent") && layer.text.trim(),
-      )
-      .map((layer) => layer.agent_key),
-  );
-  return data.agents.filter((agent) => added.has(agent.key) || configured.has(agent.key));
+  hosts: Host[],
+  layout: InstructionGridLayout,
+) {
+  const hostIds = new Set(hosts.map((host) => host.host_id));
+  const agentKeys = new Set(data.agents.map((agent) => agent.key));
+  const agentLayers = new Map<string, InstructionLayer[]>();
+  const hostLayers = new Map<string, InstructionLayer[]>();
+  const eligibleLayers = data.data.filter((layer) => {
+    if (!hasInstructionText(layer.text)) return false;
+    if (layer.scope === "agent") return agentKeys.has(layer.agent_key);
+    const existingHost = hostIds.has(layer.host_id) && !layer.host_removed;
+    return (
+      existingHost &&
+      (layer.scope === "host" || (layer.scope === "independent" && agentKeys.has(layer.agent_key)))
+    );
+  });
+  const append = (map: Map<string, InstructionLayer[]>, id: string, layer: InstructionLayer) => {
+    map.set(id, [...(map.get(id) ?? []), layer]);
+  };
+  for (const layer of eligibleLayers) {
+    if (layer.scope === "agent" || layer.scope === "independent") {
+      append(agentLayers, layer.agent_key, layer);
+    }
+    if (layer.scope === "host" || layer.scope === "independent") {
+      append(hostLayers, layer.host_id, layer);
+    }
+  }
+  const ordered = <T>(items: T[], ids: string[], key: (item: T) => string, held: Set<string>) => {
+    const byId = new Map(items.map((item) => [key(item), item]));
+    const listed = new Set(ids);
+    return [
+      ...ids.flatMap((id) => (byId.has(id) ? [byId.get(id)!] : [])),
+      ...items.filter((item) => !listed.has(key(item)) && held.has(key(item))),
+    ];
+  };
+  return {
+    agents: ordered(data.agents, layout.agents, (agent) => agent.key, new Set(agentLayers.keys())),
+    hosts: ordered(hosts, layout.hosts, (host) => host.host_id, new Set(hostLayers.keys())),
+    agentLayers,
+    hostLayers,
+  };
 }
 
 export interface InstructionPreview {
@@ -155,7 +192,7 @@ export function useInstructionRevisions(layer: LayerKey) {
 export function useSaveInstructionLayer() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (layer: LayerKey & { text: string }) =>
+    mutationFn: (layer: LayerKey & { text: string; expected_revision_id?: string | null }) =>
       read<InstructionLayer & { over_budget_routes: InstructionRouteSize[] }>(
         "/v1/instruction-layers",
         {
