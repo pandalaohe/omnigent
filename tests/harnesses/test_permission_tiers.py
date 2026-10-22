@@ -409,6 +409,199 @@ def test_control_path_and_protected_path() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat /opt/work/control*/tier",
+        "rm -rf /opt/work/control*",
+        "cat /opt/work/control${suffix}/tier",
+    ],
+)
+def test_control_path_expansions_remain_conservatively_blocked(command: str) -> None:
+    for tier in NON_FULL_TIERS:
+        assert decision(tier, "bash", {"command": command}).rule_id == "control-path"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env cp source /usr/local/probe",
+        "sudo cp source /usr/local/probe",
+        "X=1 cp source /usr/local/probe",
+        "if true; then cp source /usr/local/probe; fi",
+        "cd /usr/local; cp source probe",
+        "X=1 cd /usr/local; cp source probe",
+        "if true; then cd /usr/local; fi; cp source probe",
+        "command cd /usr/local; cp source probe",
+        "! cd /usr/local; cp source probe",
+        "command -p cd /usr/local; cp source probe",
+        "command -- cd /usr/local; cp source probe",
+        "builtin cd /usr/local; cp source probe",
+        "chmod 700 /usr${suffix}",
+    ],
+)
+def test_unbound_mutation_structure_does_not_allow_protected_writes(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
+
+
+def test_shell_continued_write_target_does_not_bind_as_workspace_file() -> None:
+    command = "echo x > " + "\\\n" + "/usr/local/probe"
+    assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd build && echo x > report.log",
+        'echo x > "$OUTPUT"',
+        "echo x > " + "\\\n" + "report.log",
+    ],
+)
+def test_legal_unbound_shell_writes_retain_approval_and_full_tiers(command: str) -> None:
+    assert decision("ask", "bash", {"command": command}).action == Verdict.ASK
+    assert decision("plan", "bash", {"command": command}).action == Verdict.DENY
+    assert decision("accept-edits", "bash", {"command": command}).action == Verdict.ASK
+    assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
+    assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
+
+    def failed_resolution(path: str) -> ResolvedPath:
+        raise OSError("Host path resolution failed")
+
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(
+                tier, "bash", {"command": command}, posix_host(resolver=failed_resolution)
+            ).action
+            == Verdict.DENY
+        )
+
+
+def test_unbound_shell_writes_preserve_common_control_and_ares_checks() -> None:
+    control = "cd build && echo x > /opt/work/control/tier"
+    for tier in NON_FULL_TIERS:
+        assert decision(tier, "bash", {"command": control}).rule_id == "control-path"
+    dangerous = "cd build && echo x > report.log; mkfs.ext4 /dev/disk4"
+    assert decision("auto", "bash", {"command": dangerous}).rule_id == "disk-destroy"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ".venv/bin/python script.py 2>&1",
+        ".venv/bin/python script.py > report.log 2>&1",
+        "/opt/homebrew/bin/python script.py > report.log",
+        "/usr/bin/python script.py > report.log",
+        "cat /usr/share/example > local.txt",
+        "cp /usr/share/example local.txt",
+        "cat /usr/share/example | tee local.txt",
+        "sed 's/a/b/' /usr/share/example > local.txt",
+        '''/usr/bin/python -c "print('> /usr/local/report')"''',
+        "printf '%s' '>' /usr/share/example",
+        "echo /usr/share/example 2>&1",
+        "cp local.txt /usr-local/report",
+        "rm -rf ./build/bin",
+        "echo x > /opt/work/control-other/report",
+        "echo 'a'\"b\"",
+        r"echo x > report\ with\ spaces.log",
+        """/usr/bin/python -c "print('a>b')" 2>&1""",
+        """env /usr/bin/python -c "print('> /usr/local/report')" 2>&1""",
+        "if true; then cat /usr/share/example; fi",
+        "cd /usr/local; cat /usr/share/example",
+        "echo 'env cp /usr/local/probe' 2>&1",
+        "chmod 700 /usr-other",
+        "cp -- source local.txt",
+        "cp -- -tlocal local.txt",
+        "command -v cd; cp source probe",
+        "command -V cd; cp source probe",
+        "command -p -v cd; cp source probe",
+        "command cd /usr/local; cat /usr/share/example",
+    ],
+)
+def test_shell_reads_and_workspace_writes_do_not_mutate_protected_locations(command: str) -> None:
+    assert decision("auto", "sys_os_shell", {"command": command}).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    ("command", "destination"),
+    [
+        ("echo x >/usr/local/report", "/usr/local/report"),
+        ("echo x >> ~/.ssh/config", "/opt/home/.ssh/config"),
+        ("cat local.txt 2>/usr/local/errors", "/usr/local/errors"),
+        ("cp local.txt /usr/local/report", "/usr/local/report"),
+        ("cp -T source /usr/local/probe", "/usr/local/probe"),
+        ("cp -t/usr/local source", "/usr/local"),
+        ("cp -- -tlocal /usr/local/probe", "/usr/local/probe"),
+        ("mv /usr/local/report local.txt", "/usr/local/report"),
+        ("rm /usr/local/report", "/usr/local/report"),
+        ("sed -i '' 's/a/b/' /usr/local/report", "/usr/local/report"),
+        ("tee /usr/local/report", "/usr/local/report"),
+        ("chmod 600 ~/.ssh/config", "/opt/home/.ssh/config"),
+        ("chmod 700 /usr*", "/usr*"),
+        ("echo x > ../../../../usr/local/report", "/usr/local/report"),
+        ("rm /usr/local/*", "/usr/local/*"),
+        ("echo x > /usr/local/report=a", "/usr/local/report=a"),
+        ("cat /usr/share/example;\necho x > /usr/local/report", "/usr/local/report"),
+        ("echo x ># note\n/usr/local/probe", "/usr/local/probe"),
+        ("echo x > /usr/local/probe # note", "/usr/local/probe"),
+        ("echo ok\nrm /usr/local/probe", "/usr/local/probe"),
+        ("echo ok # note\nrm /usr/local/probe", "/usr/local/probe"),
+    ],
+)
+def test_shell_protected_write_denials_name_the_bound_destination(
+    command: str, destination: str
+) -> None:
+    result = decision("auto", "sys_os_shell", {"command": command})
+    assert result.action == Verdict.DENY
+    assert result.rule_id == "protected-path"
+    assert destination in result.reason
+
+
+@pytest.mark.parametrize("command", ['echo x >"/us"r/local/report', r"echo x >/us\r/local/report"])
+def test_shell_write_paths_resolve_quoted_and_escaped_components(command: str) -> None:
+    result = decision("auto", "bash", {"command": command})
+    assert result.action == Verdict.DENY
+    assert result.rule_id == "protected-path"
+    assert "/usr/local/report" in result.reason
+
+
+@pytest.mark.parametrize("shell", ["sh -c", "bash -lc", "pwsh -Command", "cmd /c"])
+def test_shell_wrapper_write_targets_are_separate_from_read_sources(shell: str) -> None:
+    assert (
+        decision(
+            "auto", "bash", {"command": f'{shell} "cat /usr/share/example > local.txt"'}
+        ).action
+        == Verdict.ALLOW
+    )
+    result = decision("auto", "bash", {"command": f'{shell} "echo x > /usr/local/report"'})
+    assert result.rule_id == "protected-path"
+    assert "/usr/local/report" in result.reason
+
+
+def test_pi_1_3_0_advertised_edit_batch_obeys_existing_edit_tiers() -> None:
+    # Pi 1.3.0 core/tools/edit.js advertises path + edits[{oldText, newText}].
+    args = {
+        "path": "src/a.py",
+        "edits": [
+            {"oldText": "enabled = False", "newText": "enabled = True"},
+            {"oldText": "limit = 1", "newText": "limit = 2"},
+        ],
+    }
+    assert decision("ask", "edit", args).action == Verdict.ASK
+    assert decision("plan", "edit", args).action == Verdict.DENY
+    assert decision("accept-edits", "edit", args).action == Verdict.ALLOW
+    assert decision("auto", "edit", args).action == Verdict.ALLOW
+    assert decision("full", "edit", args).action == Verdict.ALLOW
+    assert (
+        decision("accept-edits", "edit", {**args, "path": "/opt/outside/a.py"}).action
+        == Verdict.ASK
+    )
+    for tier in NON_FULL_TIERS:
+        assert (
+            decision(tier, "edit", {**args, "path": "/opt/work/control/a.py"}).rule_id
+            == "control-path"
+        )
+
+
 def test_accept_edits_final_path_and_kind() -> None:
     assert (
         decision("accept-edits", "write", {"path": "src/a.py", "content": "x"}).action
@@ -529,6 +722,10 @@ def test_final_link_parent_and_symlink_home_protections(tmp_path: Path) -> None:
         decision("auto", "write", {"path": "~/.ssh/config", "content": "x"}, host).rule_id
         == "protected-path"
     )
+    (workspace / "keys").symlink_to(real_home / ".ssh", target_is_directory=True)
+    result = decision("auto", "bash", {"command": "echo x > keys/config"}, host)
+    assert result.rule_id == "protected-path"
+    assert str(real_home / ".ssh" / "config") in result.reason
     for tier in NON_FULL_TIERS:
         assert (
             decision(tier, "bash", {"command": "echo full > ../control/tier"}, host).rule_id
@@ -537,13 +734,12 @@ def test_final_link_parent_and_symlink_home_protections(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "edits", [[None], [{"oldText": "x"}], [{"oldText": 3, "newText": "x"}], "bad"]
+    "edits", [None, [None], [{"oldText": "x"}], [{"oldText": 3, "newText": "x"}], "bad"]
 )
-def test_malformed_batch_edits_are_protocol_errors(edits: object) -> None:
-    for tier in NON_FULL_TIERS:
-        assert (
-            decision(tier, "sys_os_edit", {"path": "a.py", "edits": edits}).action == Verdict.DENY
-        )
+@pytest.mark.parametrize("name", ["edit", "sys_os_edit"])
+def test_malformed_batch_edits_are_protocol_errors(name: str, edits: object) -> None:
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, {"path": "a.py", "edits": edits}).action == Verdict.DENY
 
 
 @pytest.mark.parametrize(
@@ -560,7 +756,19 @@ def test_supported_shell_wrappers_bind_inner_control_paths(command: str) -> None
         assert decision(tier, "bash", {"command": command}).rule_id == "control-path"
 
 
-def test_windows_drive_unc_ads_device_and_system() -> None:
+@pytest.mark.parametrize(
+    ("option_command", "expected"),
+    [
+        (r"Set-Content -Value x C:\Windows\report", Verdict.DENY),
+        (r"Set-Content -Path:C:\Windows\report x", Verdict.DENY),
+        (r"Copy-Item source -Destination:C:\Windows\report", Verdict.DENY),
+        (r"Remove-Item -LiteralPath:C:\Windows\probe", Verdict.DENY),
+        (r"Set-Content -Value x C:\work\project\report", Verdict.ALLOW),
+        (r"Set-Content -Path:C:\work\project\report x", Verdict.ALLOW),
+        (r"Copy-Item source -Destination:C:\Windows-old\report", Verdict.ALLOW),
+    ],
+)
+def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: Verdict) -> None:
     def resolve(path: str) -> ResolvedPath:
         return ResolvedPath(
             path, "directory" if path.lower() == "c:\\work\\project" else "new-file"
@@ -611,10 +819,29 @@ def test_windows_drive_unc_ads_device_and_system() -> None:
             ).rule_id
             == "protected-path"
         )
+    for command in (
+        r"Get-Content C:\Windows\example > local.txt",
+        r"Copy-Item C:\Windows\example local.txt",
+        r"Set-Content C:\Windows-old\report x",
+        r'Write-Output ">" C:\Windows\example',
+    ):
+        assert (
+            decision("auto", "run_command", {"CommandLine": command}, host).action == Verdict.ALLOW
+        )
+    for command in (
+        r"Get-Content local.txt > C:\Windows\report",
+        r"Copy-Item local.txt -Destination C:\Windows\report",
+    ):
+        result = decision("auto", "run_command", {"CommandLine": command}, host)
+        assert result.rule_id == "protected-path"
+        assert r"C:\Windows\report" in result.reason
     for path in (r"\\?\C:\work\project\a.py", r"C:\work\project\a.py:stream", r"D:a.py"):
         assert (
             decision("auto", "write", {"path": path, "content": "x"}, host).action == Verdict.DENY
         )
+    assert (
+        decision("auto", "run_command", {"CommandLine": option_command}, host).action == expected
+    )
 
 
 def test_terminal_and_malformed_calls_fail_closed() -> None:

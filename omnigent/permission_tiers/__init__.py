@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import io
 import json
 import ntpath
 import os
@@ -94,6 +95,7 @@ class ToolIntent:
     protected_exact_paths: tuple[str, ...] = ()
     protected_prefix_paths: tuple[str, ...] = ()
     command_paths: tuple[str, ...] = ()
+    command_write_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -461,9 +463,7 @@ def _adapt_unbound_call(
                     and all(isinstance(edit.get(key), str) for key in ("oldText", "newText"))
                     for edit in edits
                 )
-                if (name == "edit" and not pair) or (
-                    name == "sys_os_edit" and not (pair or batch)
-                ):
+                if not (pair or batch):
                     raise ValueError("Missing or malformed edit content")
                 if edits is not None and not batch:
                     raise ValueError("Malformed batch edit content")
@@ -533,7 +533,7 @@ def adapt_tool_call(
             raise ValueError("Workspace cannot be confirmed")
         controls = tuple(_resolve(path, context).path for path in context.control_paths)
         exact, prefixes = _protected_paths(context)
-        return replace(
+        bound = replace(
             intent,
             workspace_path=workspace,
             resolved_control_paths=controls,
@@ -541,6 +541,17 @@ def adapt_tool_call(
             protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
             command_paths=_command_paths(intent.command, context) if intent.command else (),
         )
+        try:
+            return replace(
+                bound,
+                command_write_paths=(
+                    _command_paths(intent.command, context, writes_only=True)
+                    if intent.command
+                    else ()
+                ),
+            )
+        except _UnboundShellWrite as exc:
+            return replace(bound, status="unknown", detail=str(exc))
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return replace(intent, status="invalid", detail=str(exc))
 
@@ -572,13 +583,48 @@ def _protected_paths(context: TrustedHostContext) -> tuple[tuple[str, ...], tupl
     return (), tuple(prefixes)
 
 
+class _UnboundShellWrite(ValueError):
+    """Legal shell execution whose write locations cannot be bound reliably."""
+
+
 def _command_paths(
-    command: str, context: TrustedHostContext, *, powershell: bool = False, depth: int = 0
+    command: str,
+    context: TrustedHostContext,
+    *,
+    powershell: bool = False,
+    depth: int = 0,
+    writes_only: bool = False,
 ) -> tuple[str, ...]:
     """Bind direct path operands; this does not interpret scripts or terminal state."""
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
-    if context.platform == "windows" or powershell:
+    raw_tokens = []
+    if writes_only:
+        if context.platform == "windows" or powershell:
+            raw_tokens = re.findall(r""""[^"]*"|'[^']*'|[;&|<>()]+|[^\s"'|;&<>()]+""", command)
+            tokens = [
+                token[1:-1] if token.startswith(("'", '"')) and token[-1:] == token[:1] else token
+                for token in raw_tokens
+            ]
+        else:
+            stream = io.StringIO(command)
+            lexer = shlex.shlex(stream, posix=True, punctuation_chars=";&|<>()\n")
+            lexer.whitespace_split = True
+            lexer.whitespace = " \t\r"
+            tokens = []
+            lookahead = getattr(lexer, "_pushback_chars", None)
+            if lookahead is None:
+                raise ValueError("Shell token positions unavailable")
+            while True:
+                # Exclude shlex's lookahead to retain each operator's original quoting.
+                start = stream.tell() - len(lookahead)
+                token = lexer.get_token()
+                if token is None:
+                    break
+                end = stream.tell() - len(lookahead)
+                tokens.append(token)
+                raw_tokens.append(command[start:end].strip(" \t\r"))
+    elif context.platform == "windows" or powershell:
         tokens = [
             next(value for value in match if value)
             for match in re.findall(r""""([^"]+)"|'([^']+)'|([^\s|;&<>()]+)""", command)
@@ -603,30 +649,176 @@ def _command_paths(
             )
             if supported:
                 inner = (
-                    " ".join(tokens[option_index + 1 :])
+                    " ".join(
+                        raw_tokens[option_index + 1 :]
+                        if writes_only and len(tokens) > option_index + 2
+                        else tokens[option_index + 1 :]
+                    )
                     if shell in ("cmd", "powershell", "pwsh")
                     else tokens[option_index + 1]
                 )
                 paths.extend(
                     _command_paths(
-                        inner, context, powershell=shell in ("powershell", "pwsh"), depth=depth + 1
+                        inner,
+                        context,
+                        powershell=shell in ("powershell", "pwsh"),
+                        depth=depth + 1,
+                        writes_only=writes_only,
                     )
                 )
                 break
             if not option.startswith(("-", "/")):
                 break
+    if writes_only:
+        candidates = []
+        segments = []
+        segment = []
+        index = 0
+        while index < len(tokens):
+            raw = raw_tokens[index]
+            if raw.startswith("#") and "\n" in raw:
+                segments.append(segment)
+                segment = []
+                raw = raw.rsplit("\n", 1)[-1]
+            if (
+                raw.startswith(tokens[index])
+                and tokens[index]
+                and all(char in ";|&<>()\n" for char in tokens[index])
+            ):
+                raw = tokens[index]
+            if raw and all(char in ";|&()\n" for char in raw):
+                segments.append(segment)
+                segment = []
+            elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>"):
+                if index + 1 >= len(tokens):
+                    raise ValueError("Missing shell redirection target")
+                index += 1
+                destination = tokens[index]
+                if raw in (">", ">>", ">|", "&>", "&>>", "<>") or (
+                    raw == ">&" and not destination.isdigit() and destination != "-"
+                ):
+                    candidates.append(destination)
+            else:
+                segment.append(tokens[index])
+            index += 1
+        segments.append(segment)
+        cwd_changed = False
+        for segment in segments:
+            candidates.extend(_write_operands(segment))
+            prefix = 0
+            while prefix < len(segment) and (
+                segment[prefix] in ("if", "then", "else", "elif", "do", "!", "command", "builtin")
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[prefix], re.DOTALL)
+            ):
+                execution_command = segment[prefix] == "command"
+                prefix += 1
+                if execution_command:
+                    while prefix < len(segment) and segment[prefix] == "-p":
+                        prefix += 1
+                    if prefix < len(segment) and segment[prefix] == "--":
+                        prefix += 1
+            if prefix < len(segment) and segment[prefix].lower() in (
+                "cd",
+                "pushd",
+                "popd",
+                "set-location",
+            ):
+                cwd_changed = True
+        if (candidates or paths) and cwd_changed:
+            raise _UnboundShellWrite("Shell cwd changes mixed with writes cannot be bound")
+        tokens = candidates
     for token in tokens:
-        if token.startswith("-") or token in (";", "&&", "||", "|", ">", ">>", "<", "(", ")"):
+        if writes_only and any(char in token for char in "\r\n"):
+            raise _UnboundShellWrite("Shell write target with a newline cannot be bound")
+        if (
+            not token
+            or token.startswith("-")
+            or token in (";", "&&", "||", "|", ">", ">>", "<", "(", ")")
+        ):
             continue
         if context.platform != "windows":
             if token == "$HOME" or token.startswith("$HOME/"):
                 token = context.home + token[5:]
             elif token == "${HOME}" or token.startswith("${HOME}/"):
                 token = context.home + token[7:]
-        if "$" in token or "*" in token or "?" in token or "=" in token:
+        if writes_only and "$" in token:
+            raise _UnboundShellWrite("Shell write target expansion cannot be bound")
+        if "$" in token or (not writes_only and any(char in token for char in "*?=")):
             continue
         paths.append(_resolve(token, context).path)
     return tuple(paths)
+
+
+def _write_operands(tokens: list[str]) -> list[str]:
+    """Select reliable direct targets; retain all locations for unbound mutations."""
+    conservative = [
+        value.split(":" if ":" in value else "=", 1)[1]
+        if value.startswith("-") and (":" in value or "=" in value)
+        else value
+        for value in tokens
+    ]
+    for offset, token in enumerate(tokens):
+        command = token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+        arguments = tokens[offset + 1 :]
+        operands = [value for value in arguments if value and not value.startswith("-")]
+        if command in ("cp", "copy", "copy-item"):
+            if offset:
+                return conservative
+            options = arguments
+            if command == "cp" and "--" in arguments:
+                stop = arguments.index("--")
+                options = arguments[:stop]
+                operands = [value for value in options if value and not value.startswith("-")]
+                operands.extend(arguments[stop + 1 :])
+            for index, value in enumerate(options):
+                if (command == "cp" and value in ("-t", "--target-directory")) or (
+                    command == "copy-item" and value.lower() == "-destination"
+                ):
+                    return options[index + 1 : index + 2] or conservative
+                if command == "cp" and value.startswith("--target-directory="):
+                    return [value.split("=", 1)[1]]
+                if command == "cp" and value.startswith("-t") and value != "-t":
+                    return [value[2:]]
+                if command == "copy-item" and value.lower().startswith("-destination:"):
+                    return [value.split(":", 1)[1]]
+            if any(
+                value.startswith("-") and value not in ("-T", "--no-target-directory", "--")
+                for value in options
+            ):
+                return conservative
+            return operands[-1:]
+        if command in ("set-content", "add-content", "out-file"):
+            if offset:
+                return conservative
+            for index, value in enumerate(arguments):
+                if value.lower() in ("-path", "-literalpath", "-filepath"):
+                    return arguments[index + 1 : index + 2] or conservative
+                if value.lower().startswith(("-path:", "-literalpath:", "-filepath:")):
+                    return [value.split(":", 1)[1]]
+            return (
+                conservative if any(value.startswith("-") for value in arguments) else operands[:1]
+            )
+        if command == "sed":
+            return (
+                conservative
+                if any(value.startswith(("-i", "--in-place")) for value in arguments)
+                else []
+            )
+        if command in (
+            "rm",
+            "mv",
+            "tee",
+            "chmod",
+            "chown",
+            "del",
+            "erase",
+            "rd",
+            "rmdir",
+            "remove-item",
+            "move-item",
+        ):
+            return conservative
+    return []
 
 
 def _under(target: str, parent: str, windows: bool) -> bool:
@@ -663,16 +855,12 @@ def _path_forms(path: str, context: TrustedHostContext) -> set[str]:
 def _mentions_path(command: str, path: str, context: TrustedHostContext) -> bool:
     if context.platform == "windows":
         command = command.casefold().replace("/", "\\")
-        return any(
-            form.casefold().replace("/", "\\") in command for form in _path_forms(path, context)
-        )
-    return any(form in command for form in _path_forms(path, context))
-
-
-_MUTATING_COMMAND = re.compile(
-    r"(?i)(?:[>]|\b(?:rm|mv|cp|tee|sed|chmod|chown|del|erase|rd|rmdir|"
-    r"Remove-Item|Set-Content|Add-Content|Out-File|Move-Item|Copy-Item)\b)"
-)
+    for form in _path_forms(path, context):
+        if context.platform == "windows":
+            form = form.casefold().replace("/", "\\")
+        if re.search(r"(?<![\w./~\\-])" + re.escape(form) + r"(?![\w.-])", command):
+            return True
+    return False
 
 
 def _validated_rules(
@@ -838,15 +1026,18 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 _under(target.path, value, windows) for value in intent.protected_prefix_paths
             )
             if is_protected and tier == "auto":
-                return TierDecision(Verdict.DENY, protected_reason, "protected-path")
+                return TierDecision(
+                    Verdict.DENY, f"{protected_reason}: {target.path}", "protected-path"
+                )
         if intent.kind == ToolKind.EXEC and tier == "auto":
-            if _MUTATING_COMMAND.search(intent.command):
+            for candidate in intent.command_write_paths:
                 if any(
-                    _mentions_path(intent.command, path, context)
-                    or any(_under(candidate, path, windows) for candidate in intent.command_paths)
+                    _under(candidate, path, windows) or _mentions_path(candidate, path, context)
                     for path in intent.protected_prefix_paths
                 ):
-                    return TierDecision(Verdict.DENY, protected_reason, "protected-path")
+                    return TierDecision(
+                        Verdict.DENY, f"{protected_reason}: {candidate}", "protected-path"
+                    )
             for rule_id, name, reason, pattern in active:
                 if pattern.search(intent.command):
                     explanation = _explanation(intent.command, context.platform, rules.signatures)
