@@ -5,9 +5,19 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_MSG, BRIDGE_SOURCE } from "@/shell/htmlCommentBridge";
+import { ANNOTATE_MSG, ANNOTATE_SOURCE } from "@/shell/htmlAnnotateBridge";
+import {
+  clampElementAnchor,
+  decodeElementAnchor,
+  encodeElementAnchor,
+} from "@/shell/annotationAnchor";
 import { encodeRenderedTextAnchor } from "@/shell/renderedTextAnchor";
 import { readVisitConfig, type VisitConfig } from "./visitConfig";
 import { mountVisitShell, type VisitShellWindow } from "./visitShell";
+
+vi.mock("@/shell/annotate/runtimeSources", () => ({
+  loadRuntimeSources: async (part: string) => [`${part}-source`],
+}));
 
 const FRAME_URL = "/v1/artifacts/h-token/reports/index.html";
 const LINKED_URL = "/v1/artifacts/h-token/reports/page2.html";
@@ -84,6 +94,19 @@ async function sendFromFrame(
   });
 }
 
+async function sendAnnotateFromFrame(
+  postMessage: ReturnType<typeof vi.fn>,
+  message: Record<string, unknown>,
+) {
+  const call = postMessage.mock.calls.find(([payload]) => payload.source === ANNOTATE_SOURCE);
+  if (!call) throw new Error("no annotate init was posted");
+  const port = call[2][0] as MessagePort;
+  port.postMessage({ source: ANNOTATE_SOURCE, nonce: NONCE, ...message });
+  await new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 function mockFetch(handlers: (url: string) => Response | Promise<Response> | null) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const response = handlers(String(input));
@@ -119,6 +142,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -128,8 +152,12 @@ describe("visitor shell handshake", () => {
     mount();
     const { postMessage } = loadFrame();
 
-    expect(postMessage).toHaveBeenCalledTimes(1);
-    const [message, target, ports] = postMessage.mock.calls[0] as [
+    expect(postMessage).toHaveBeenCalledTimes(2);
+    expect(postMessage.mock.calls[0]?.[0]).toMatchObject({
+      source: "omni-html-annotate",
+      type: "annotate:init",
+    });
+    const [message, target, ports] = postMessage.mock.calls[1] as [
       Record<string, unknown>,
       string,
       MessagePort[],
@@ -147,7 +175,7 @@ describe("visitor shell handshake", () => {
     expect(get("omni-visit-comment").hidden).toBe(true);
 
     await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: FRAME_URL });
-    expect(get("omni-visit-comment").hidden).toBe(false);
+    await vi.waitFor(() => expect(get("omni-visit-comment").hidden).toBe(false));
     expect(get("omni-visit-unavailable").hidden).toBe(true);
   });
 
@@ -173,6 +201,101 @@ describe("visitor shell handshake", () => {
 
     expect(document.getElementById("omni-visit-comment")).toBeNull();
     expect(document.getElementById("omni-visit-selection-comment")).toBeNull();
+  });
+});
+
+describe("visitor element annotations", () => {
+  const pick = {
+    type: ANNOTATE_MSG.picked,
+    anchor: {
+      v: 1,
+      kind: "element",
+      page: { url: "https://example.test/report", title: "Report" },
+      target: { label: "Save button" },
+      rect: { x: 1, y: 2, w: 40, h: 20 },
+      screenshot: { file_id: "forged-file", filename: "old.png", width: 1, height: 1 },
+    },
+    viewportRect: { x: 1, y: 2, w: 40, h: 20 },
+    screenshot: { dataUrl: "data:image/png;base64,AQID", width: 1, height: 1 },
+  };
+
+  it("keeps the note and element draft when the screenshot exceeds storage quota", () => {
+    const elementAnchor = clampElementAnchor({ ...pick.anchor, screenshot: null });
+    if (elementAnchor === null) throw new Error("invalid draft fixture");
+    const anchor = encodeElementAnchor(elementAnchor);
+    sessionStorage.setItem(
+      DRAFT_KEY,
+      JSON.stringify({
+        path: baseConfig().path,
+        text: "Before edit",
+        name: "Ada",
+        anchor_content: anchor,
+        screenshot: pick.screenshot,
+      }),
+    );
+    mount();
+    const setItem = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+      if (JSON.parse(value).screenshot) throw new DOMException("Full", "QuotaExceededError");
+      setItem.call(this, key, value);
+    });
+    fillComposer("Ada", "Keep this note");
+    const stored = JSON.parse(sessionStorage.getItem(DRAFT_KEY) ?? "null");
+    expect(stored.text).toBe("Keep this note");
+    expect(stored.name).toBe("Ada");
+    expect(decodeElementAnchor(stored.anchor_content)).toMatchObject({
+      target: { label: "Save button" },
+      rect: { x: 1, y: 2, w: 40, h: 20 },
+    });
+    expect(stored.screenshot).toBeNull();
+    expect(get<HTMLFormElement>("omni-visit-form").hidden).toBe(false);
+  });
+
+  it("requires parent activation, then keeps the annotated draft on quota refusal", async () => {
+    const fetchMock = mockFetch((url) =>
+      url === ENDPOINT
+        ? new Response(JSON.stringify({ reason: "screenshot_quota" }), { status: 429 })
+        : null,
+    );
+    mount();
+    const { postMessage } = loadFrame();
+    await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: FRAME_URL });
+    await sendAnnotateFromFrame(postMessage, { type: ANNOTATE_MSG.ready, pathname: FRAME_URL });
+
+    await sendAnnotateFromFrame(postMessage, pick);
+    expect(get<HTMLFormElement>("omni-visit-form").hidden).toBe(true);
+
+    get<HTMLButtonElement>("omni-visit-annotate").click();
+    await sendAnnotateFromFrame(postMessage, {
+      type: ANNOTATE_MSG.runtimeLoaded,
+      part: "core",
+      ok: true,
+    });
+    await sendAnnotateFromFrame(postMessage, {
+      type: ANNOTATE_MSG.runtimeLoaded,
+      part: "pick",
+      ok: true,
+    });
+    await sendAnnotateFromFrame(postMessage, pick);
+    expect(get<HTMLFormElement>("omni-visit-form").hidden).toBe(false);
+    expect(get("omni-visit-expiry").textContent).toContain("30 days");
+
+    fillComposer("Ada", "Please move this button");
+    sendComment();
+    await vi.waitFor(() =>
+      expect(get("omni-visit-error").textContent).toContain("100 screenshot limit"),
+    );
+    expect(get<HTMLFormElement>("omni-visit-form").hidden).toBe(false);
+    expect(get<HTMLTextAreaElement>("omni-visit-body").value).toBe("Please move this button");
+    expect(postedBody(fetchMock).screenshot).toEqual(
+      pick.screenshot && {
+        data_url: pick.screenshot.dataUrl,
+        width: 1,
+        height: 1,
+      },
+    );
+    expect(String(postedBody(fetchMock).anchor_content)).toContain("__element__");
+    expect(String(postedBody(fetchMock).anchor_content)).not.toContain("forged-file");
   });
 });
 

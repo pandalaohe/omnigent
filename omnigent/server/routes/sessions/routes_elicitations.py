@@ -140,7 +140,10 @@ def register_elicitations_routes(
         from omnigent.server.permission_tiers import require_permission_protocol
 
         require_permission_protocol(
-            request, harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=None)
+            request,
+            harness=await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=None
+            ),
         )
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(

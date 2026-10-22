@@ -13,6 +13,7 @@ import { ApiError, createProjectSession, postEvent } from "@/lib/sessionsApi";
 import { useHosts } from "@/hooks/useHosts";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useSystemStatusSettings } from "@/hooks/useSystemStatus";
+import { getProject } from "@/lib/projectsApi";
 import type { Session } from "@/lib/types";
 
 export interface HealthCheckNotice {
@@ -104,7 +105,12 @@ export function useStartHealthCheck(): {
 
       let session: Session;
       try {
-        session = await createProjectSession({ projectId, hostId, title: healthCheckTitle() });
+        const project = await getProject(projectId);
+        session = await createProjectSession({
+          projectId: project.archived_at ? null : projectId,
+          hostId,
+          title: healthCheckTitle(),
+        });
       } catch (error) {
         const ownership =
           error instanceof ApiError && (error.status === 403 || error.status === 404)

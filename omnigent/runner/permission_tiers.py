@@ -25,6 +25,7 @@ from omnigent.server.permission_tiers import (
     PERMISSION_STATE_LABEL_KEY,
     TIER_HARNESSES,
     BoundToolCall,
+    permission_execution_host_id,
     read_permission_state,
 )
 
@@ -71,12 +72,18 @@ class PermissionTierRuntime:
         """Place a deny-safe cache before any tiered harness can launch."""
         if harness not in TIER_HARNESSES:
             return
-        if envelope is None or not envelope.snapshot.host_id or not envelope.snapshot.workspace:
+        if (
+            envelope is None
+            or not envelope.snapshot.workspace
+            or not (envelope.snapshot.host_id or envelope.snapshot.runner_id)
+        ):
             raise ValueError("Permission-tier startup requires a trusted host snapshot")
         if self._leases.get(envelope.session_id):
             raise ValueError("Permission-tier reinitialization requires idle tool execution")
         snapshot = envelope.snapshot
-        host_id = snapshot.host_id
+        host_id = permission_execution_host_id(
+            host_id=snapshot.host_id, runner_id=snapshot.runner_id
+        )
         workspace = snapshot.worktree or snapshot.workspace
         if not host_id or not workspace:
             raise ValueError("Incomplete permission host snapshot")
@@ -115,7 +122,9 @@ class PermissionTierRuntime:
         if envelope is None:
             raise ValueError("A permission-tier session requires a current server envelope")
         snapshot = envelope.snapshot
-        host_id = snapshot.host_id
+        host_id = permission_execution_host_id(
+            host_id=snapshot.host_id, runner_id=snapshot.runner_id
+        )
         workspace = snapshot.worktree or snapshot.workspace
         if not host_id or not workspace:
             raise ValueError("Permission-tier session is missing host or workspace")

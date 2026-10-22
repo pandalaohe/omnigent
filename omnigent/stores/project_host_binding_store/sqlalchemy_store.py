@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import replace
+from typing import Any
 
 from sqlalchemy import asc, or_, select
 from sqlalchemy.orm import Session
@@ -34,6 +37,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_store.sqlalchemy_store import _decode_config, _encode_config
+from omnigent.stores.project_store.sqlalchemy_store import _to_entity as _project_to_entity
 
 
 def _to_entity(row: SqlProjectHostBinding) -> ProjectHostBinding:
@@ -77,6 +81,16 @@ def _entry_to_entity(row: SqlProjectHostEntry) -> ProjectHostEntry:
         updated_at=row.updated_at,
         workspace_id=row.workspace_id,
     )
+
+
+def _settings_revision(config: dict[str, Any], entries: list[ProjectHostEntry]) -> str:
+    """Hash the explicit settings, ignoring timestamps and row ordering."""
+    payload = {
+        "config": config,
+        "entries": {entry.host_id: entry.workspace for entry in entries},
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _lock_project(session: Session, *, project_id: str) -> SqlProject:
@@ -468,6 +482,131 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             rows = session.execute(stmt).scalars().all()
             return [_entry_to_entity(r) for r in rows]
 
+    def settings_snapshot(
+        self, project_id: str, *, caller_id: str | None, is_admin: bool = False
+    ) -> tuple[Any, list[ProjectHostEntry], str]:
+        """Read config and entries under the same project-row lock as every entry writer."""
+
+        def read(session: Session) -> tuple[Any, list[ProjectHostEntry], str]:
+            project = _lock_project(session, project_id=project_id)
+            if not is_admin and project.user_id != caller_id:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            entries = [
+                _entry_to_entity(row)
+                for row in session.scalars(
+                    select(SqlProjectHostEntry)
+                    .where(
+                        SqlProjectHostEntry.workspace_id == current_workspace_id(),
+                        SqlProjectHostEntry.project_id == project_id,
+                    )
+                    .order_by(asc(SqlProjectHostEntry.host_id))
+                )
+            ]
+            entity = _project_to_entity(project)
+            return entity, entries, _settings_revision(entity.config, entries)
+
+        return run_write_transaction(self._session_immediate, "project_settings.snapshot", read)
+
+    def update_settings(
+        self,
+        project_id: str,
+        *,
+        caller_id: str | None,
+        is_admin: bool,
+        expected_revision: str,
+        config: dict[str, Any],
+        entry_host_id: str | None = None,
+        entry_workspace: str | None = None,
+        entry_change: bool = False,
+        initial_agent_id: str | None = None,
+    ) -> tuple[Any, list[ProjectHostEntry], str, bool, bool, str | None]:
+        """Guard and commit a config/entry update atomically after external validation."""
+
+        def write(
+            session: Session,
+        ) -> tuple[Any, list[ProjectHostEntry], str, bool, bool, str | None]:
+            project = _lock_project(session, project_id=project_id)
+            if not is_admin and project.user_id != caller_id:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            rows = list(
+                session.scalars(
+                    select(SqlProjectHostEntry)
+                    .where(
+                        SqlProjectHostEntry.workspace_id == current_workspace_id(),
+                        SqlProjectHostEntry.project_id == project_id,
+                    )
+                    .order_by(asc(SqlProjectHostEntry.host_id))
+                )
+            )
+            before = [_entry_to_entity(row) for row in rows]
+            if _settings_revision(_decode_config(project.config), before) != expected_revision:
+                raise OmnigentError(
+                    "Project settings changed. Read again before updating.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if "calling_defaults" in config:
+                from omnigent.calling_defaults import validate_project_calling_defaults
+
+                validate_project_calling_defaults(config["calling_defaults"])
+            encoded = _encode_config(config)
+            config_changed = project.config != encoded
+            if config_changed:
+                project.config = encoded
+                project.updated_at = now_epoch()
+            entry_changed = False
+            seeded_agent = None
+            if entry_change and entry_host_id is not None:
+                row = next((item for item in rows if item.host_id == entry_host_id), None)
+                if entry_workspace is None:
+                    if row is not None:
+                        session.delete(row)
+                        rows.remove(row)
+                        entry_changed = True
+                elif row is None:
+                    seeded_agent = _initialize_host_agent(
+                        session, project, entry_host_id, initial_agent_id
+                    )
+                    row = SqlProjectHostEntry(
+                        project_id=project_id,
+                        host_id=entry_host_id,
+                        workspace=entry_workspace,
+                        created_at=now_epoch(),
+                        updated_at=None,
+                    )
+                    session.add(row)
+                    rows.append(row)
+                    entry_changed = True
+                elif row.workspace != entry_workspace:
+                    row.workspace = entry_workspace
+                    row.updated_at = now_epoch()
+                    entry_changed = True
+            session.flush()
+            entity = _project_to_entity(project)
+            after = [_entry_to_entity(row) for row in rows]
+            return (
+                entity,
+                after,
+                _settings_revision(entity.config, after),
+                config_changed or seeded_agent is not None,
+                entry_changed,
+                seeded_agent,
+            )
+
+        token = None
+        if entry_change and entry_host_id and entry_workspace is not None:
+            token = self._host_store.acquire_worktree_admission(entry_host_id)
+        try:
+            if entry_change and entry_host_id and entry_workspace is not None:
+                if self._worktree_admission_fenced(entry_host_id, entry_workspace):
+                    raise OmnigentError(
+                        "Worktree was removed during project entry admission; refresh its path",
+                        code=ErrorCode.CONFLICT,
+                    )
+            return run_write_transaction(self._session_immediate, "project_settings.update", write)
+        finally:
+            if token is not None and entry_host_id is not None:
+                self._host_store.release_cli_retention(entry_host_id, token)
+
     def put_entry(
         self,
         project_id: str,
@@ -522,10 +661,10 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
         """Delete a host's entry. Idempotent; ``False`` if not found."""
 
         def write(session: Session) -> bool:
+            _lock_project(session, project_id=project_id)
             row = session.get(SqlProjectHostEntry, (current_workspace_id(), project_id, host_id))
             if row is None:
                 return False
-            _lock_project(session, project_id=project_id)
             session.delete(row)
             return True
 

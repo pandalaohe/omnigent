@@ -75,8 +75,8 @@ def _comment(comment_id: str, created_by: str | None, anchor_content: str | None
     )
 
 
-def test_comment_rows_adds_annotation_to_owner_element_rows_only() -> None:
-    """Only an owner row with a parsable anchor gains the ``annotation`` key."""
+def test_comment_rows_adds_annotation_to_valid_element_rows() -> None:
+    """Visitor geometry is visible as untrusted evidence without granting image access."""
     anchor_content = (
         ELEMENT_ANCHOR_PREFIX
         + '{"v":1,"kind":"element","rect":{"x":0,"y":0,"w":1,"h":1},"target":{"label":"div.a"}}'
@@ -95,7 +95,22 @@ def test_comment_rows_adds_annotation_to_owner_element_rows_only() -> None:
     }
 
     assert rows["owner-element"]["annotation"]["target"]["label"] == "div.a"
-    assert "annotation" not in rows["visitor-element"]
+    assert rows["visitor-element"]["annotation"]["target"]["label"] == "div.a"
+    assert rows["visitor-element"]["annotation"]["screenshot"] is None
     assert "annotation" not in rows["owner-text"]
     assert "annotation" not in rows["owner-bad"]
     assert rows["visitor-element"]["source"] == visitor_comments.VISITOR_SOURCE
+
+
+def test_visitor_expiry_label_survives_missing_file() -> None:
+    anchor = ELEMENT_ANCHOR_PREFIX + (
+        '{"v":1,"kind":"element","rect":{"x":0,"y":0,"w":1,"h":1},'
+        '"screenshot":{"file_id":"missing","filename":"old.png","width":1,'
+        '"height":1,"expires_at":1000}}'
+    )
+    row = visitor_comments.comment_rows(
+        [_comment("visitor", "visitor:Alice", anchor)], include_visitor_drafts=True
+    )[0]
+    assert row["screenshot_expires_at"] == 1000
+    assert row["annotation"]["screenshot"] is None
+    assert row["annotation"]["rect"]["w"] == 1

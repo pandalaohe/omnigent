@@ -6,10 +6,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PlusIcon, Trash2Icon } from "lucide-react";
 
+import { AgentPicker } from "@/components/AgentPicker";
 import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
 import { HelpTip } from "@/components/HelpTip";
-import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import { sessionDefaultModeOptions, sessionModeHandler } from "@/lib/sessionDefaultModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,15 +22,18 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useHosts, type Host } from "@/hooks/useHosts";
+import { useAgentRegistry, type RegistryItem } from "@/hooks/useAgentRegistry";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useHarnessCapabilities, type HarnessCapability } from "@/lib/agentLabels";
 import {
   addCallingDefaultEntry,
   type CallingDefaultEntry,
   type CallingDefaultsTable,
-  CALLING_DEFAULT_HARNESSES,
+  callingDefaultHarnesses,
+  callingDefaultHasModels,
+  callingDefaultParent,
   callingHarnessLabel,
   removeCallingDefaultEntry,
-  SDK_NATIVE_PARENT,
   setCallingDefaultField,
   useCallingDefaults,
   useCallingLastEnabled,
@@ -81,14 +85,6 @@ function lastSyncLabel(fetchedAt: number | null): string {
   if (fetchedAt === null) return "Not synced yet";
   const relative = relativeTime(fetchedAt * 1000);
   return relative === "now" ? "Last sync just now" : `Last sync ${relative} ago`;
-}
-
-/** Whether the host reports this harness as configured; unknown passes. */
-function harnessOnHost(host: Host, harness: string): boolean {
-  const readiness = host.configured_harnesses;
-  if (!readiness) return true;
-  const value = readiness[harness];
-  return value === undefined || value === true;
 }
 
 function modelLabelFor(model: string, catalog: CallingDefaultsCatalogRow | undefined): string {
@@ -252,52 +248,53 @@ function DeleteEntryButton({ harness, onRemove }: { harness: string; onRemove: (
 }
 
 function AddHarnessControl({
-  options,
+  items,
+  taken,
+  capabilities,
+  isLoading,
+  isError,
+  onRetry,
   onAdd,
 }: {
-  options: readonly string[];
+  items: RegistryItem[];
+  taken: ReadonlySet<string>;
+  capabilities: Readonly<Record<string, HarnessCapability>>;
+  isLoading: boolean;
+  isError: boolean;
+  onRetry: () => void;
   onAdd: (harness: string) => void;
 }) {
-  const [adding, setAdding] = useState(false);
-  if (options.length === 0) return null;
-  if (!adding) {
-    return (
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="text-primary"
-        onClick={() => setAdding(true)}
-        data-testid="calling-defaults-add-row"
-      >
-        <PlusIcon />
-        Add harness settings
-      </Button>
-    );
-  }
   return (
-    <Select
-      value=""
-      onValueChange={(harness) => {
-        onAdd(harness);
-        setAdding(false);
+    <AgentPicker
+      items={items}
+      taken={taken}
+      supports={(item) => {
+        if (!item.key.startsWith("harness:")) return "Calling defaults apply to harnesses";
+        const legacyAcp =
+          item.harness?.startsWith("acp:") && callingDefaultHasModels(item.harness, capabilities);
+        return callingDefaultHarnesses(capabilities).includes(item.harness ?? "") || legacyAcp
+          ? null
+          : "This harness does not declare calling defaults";
       }}
-    >
-      <SelectTrigger
-        className="h-8 w-full max-w-56"
-        aria-label="Add harness settings"
-        data-testid="calling-defaults-add-harness"
-      >
-        <SelectValue placeholder="Choose a harness" />
-      </SelectTrigger>
-      <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        {options.map((harness) => (
-          <SelectItem key={harness} value={harness}>
-            {callingHarnessLabel(harness)}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
+      onPick={(key) => onAdd(key.slice("harness:".length))}
+      isLoading={isLoading}
+      isError={isError}
+      onRetry={onRetry}
+      title="Add harness settings"
+      description="Choose a harness for this host's defaults."
+      trigger={
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="text-primary"
+          data-testid="calling-defaults-add-row"
+        >
+          <PlusIcon />
+          Add harness settings
+        </Button>
+      }
+    />
   );
 }
 
@@ -306,19 +303,30 @@ function HostDefaultsTable({
   master,
   catalogs,
   isMobile,
+  capabilities,
+  registry,
   onLoadCatalog,
 }: {
   host: Host;
   master: CallingDefaultsTable;
   catalogs: CallingDefaultsCatalogRow[];
   isMobile: boolean;
+  capabilities: Readonly<Record<string, HarnessCapability>>;
+  registry: ReturnType<typeof useAgentRegistry>;
   onLoadCatalog: (hostId: string, harness: string) => void;
 }) {
   const hostId = host.host_id;
   const hostTable = master[hostId] ?? {};
+  const declared = Object.values(capabilities).some(
+    (capability) => "calling_defaults" in capability,
+  );
   const harnesses = [
-    ...CALLING_DEFAULT_HARNESSES,
-    ...Object.keys(host.configured_harnesses ?? {}).filter((harness) => harness.startsWith("acp:")),
+    ...callingDefaultHarnesses(capabilities),
+    ...(declared && !capabilities.acp?.calling_defaults
+      ? []
+      : Object.keys(host.configured_harnesses ?? {}).filter((harness) =>
+          harness.startsWith("acp:"),
+        )),
   ];
 
   const entryRows: { harness: string; entry: CallingDefaultEntry }[] = [];
@@ -333,13 +341,13 @@ function HostDefaultsTable({
   for (const [harness, entry] of Object.entries(hostTable)) {
     if (!known.has(harness)) entryRows.push({ harness, entry });
   }
-  const followsRows = Object.entries(SDK_NATIVE_PARENT)
-    .filter(([sdk]) => !(sdk in hostTable))
-    .map(([sdk, native]) => ({ sdk, native }));
-  const candidates = harnesses.filter(
-    (harness) =>
-      !(harness in hostTable) && !(harness in SDK_NATIVE_PARENT) && harnessOnHost(host, harness),
-  );
+  const followsRows = harnesses
+    .map((sdk) => ({ sdk, native: callingDefaultParent(sdk, capabilities) }))
+    .filter(
+      (row): row is { sdk: string; native: string } =>
+        row.native !== null && !(row.sdk in hostTable),
+    );
+  const taken = new Set(Object.keys(hostTable).map((harness) => `harness:${harness}`));
 
   const setModel = (harness: string, entry: CallingDefaultEntry, next: string | null) => {
     setCallingDefaultField(hostId, harness, "model", next);
@@ -348,7 +356,10 @@ function HostDefaultsTable({
     if (reconciled !== (entry.effort ?? null)) {
       setCallingDefaultField(hostId, harness, "effort", reconciled);
     }
-    if (entry.speed && (harness === "codex" || harness === "codex-native")) {
+    if (
+      entry.speed &&
+      sessionModeHandler(harness, "speed", capabilities) === "codex-service-tier"
+    ) {
       const reconciledSpeed = reconcileSpeed(entry.speed, rows, next);
       if (reconciledSpeed !== entry.speed) {
         setCallingDefaultField(hostId, harness, "speed", reconciledSpeed);
@@ -357,15 +368,21 @@ function HostDefaultsTable({
   };
 
   const renderEntryControls = (harness: string, entry: CallingDefaultEntry) => [
-    <ModelSettingSelect
-      key="model"
-      hostId={hostId}
-      harness={harness}
-      value={entry.model}
-      catalog={catalogFor(catalogs, hostId, harness)}
-      onChange={(next) => setModel(harness, entry, next)}
-      onOpen={onLoadCatalog}
-    />,
+    callingDefaultHasModels(harness, capabilities) ? (
+      <ModelSettingSelect
+        key="model"
+        hostId={hostId}
+        harness={harness}
+        value={entry.model}
+        catalog={catalogFor(catalogs, hostId, harness)}
+        onChange={(next) => setModel(harness, entry, next)}
+        onOpen={onLoadCatalog}
+      />
+    ) : (
+      <span key="model" className="text-xs text-muted-foreground">
+        No model options
+      </span>
+    ),
     <EffortSettingSelect
       key="effort"
       hostId={hostId}
@@ -384,6 +401,7 @@ function HostDefaultsTable({
         value={entry[field]}
         models={catalogFor(catalogs, hostId, harness)?.models ?? []}
         model={entry.model}
+        capabilities={capabilities}
         label={`${field === "speed" ? "Speed" : "Permission"} for ${callingHarnessLabel(harness)}`}
         testId={`calling-defaults-${field}-${harness}`}
         onChange={(next) => setCallingDefaultField(hostId, harness, field, next)}
@@ -505,14 +523,17 @@ function HostDefaultsTable({
             })}
           </tbody>
         </table>
-        {candidates.length > 0 && (
-          <div className="border-t border-border px-1 py-2">
-            <AddHarnessControl
-              options={candidates}
-              onAdd={(harness) => addCallingDefaultEntry(hostId, harness)}
-            />
-          </div>
-        )}
+        <div className="border-t border-border px-1 py-2">
+          <AddHarnessControl
+            items={registry.items}
+            taken={taken}
+            capabilities={capabilities}
+            isLoading={registry.isLoading}
+            isError={registry.isError}
+            onRetry={registry.retry}
+            onAdd={(harness) => addCallingDefaultEntry(hostId, harness)}
+          />
+        </div>
       </div>
     );
   }
@@ -563,7 +584,8 @@ function HostDefaultsTable({
               {effortControl}
             </label>
             {(["speed", "permission"] as const).map((field, index) =>
-              sessionDefaultModeOptions(harness, field).length > 0 ? (
+              sessionDefaultModeOptions(harness, field, [], null, "default", capabilities).length >
+              0 ? (
                 <label key={field} className="flex min-w-0 flex-col gap-1">
                   <span className="text-xs text-muted-foreground">
                     {field === "speed" ? "Speed" : "Permission"}
@@ -603,7 +625,12 @@ function HostDefaultsTable({
         );
       })}
       <AddHarnessControl
-        options={candidates}
+        items={registry.items}
+        taken={taken}
+        capabilities={capabilities}
+        isLoading={registry.isLoading}
+        isError={registry.isError}
+        onRetry={registry.retry}
         onAdd={(harness) => addCallingDefaultEntry(hostId, harness)}
       />
     </div>
@@ -612,6 +639,8 @@ function HostDefaultsTable({
 
 export function CallingDefaultsSection() {
   const { data: hosts } = useHosts();
+  const capabilities = useHarnessCapabilities();
+  const registry = useAgentRegistry();
   const master = useCallingDefaults();
   const carryOver = useCallingLastEnabled();
   const { data: agents } = useAvailableAgents();
@@ -832,6 +861,8 @@ export function CallingDefaultsSection() {
               master={master}
               catalogs={catalogs}
               isMobile={isMobile}
+              capabilities={capabilities}
+              registry={registry}
               onLoadCatalog={loadCatalog}
             />
           )}

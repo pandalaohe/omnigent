@@ -1088,7 +1088,7 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
 
     app, _ = await _build_app_for_spec(pi_native_spec)
 
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         # Seeds _session_spec_cache so the dispatch detects "pi-native".
         create_resp = await client.post(
             "/v1/sessions",
@@ -1165,7 +1165,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
 
     app, _ = await _build_app_for_spec(pi_native_spec)
 
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         create_resp = await client.post(
             "/v1/sessions",
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
@@ -1185,6 +1185,40 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
     assert body.get("error") == "pi_native_compact_failed", (
         f"503 body must carry the pi bridge-failure error code; got {body!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_pi_native_web_clear_types_pi_new(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A Web /clear reaches Pi's supported /new command in the live pane."""
+    from tests.runner.helpers import make_test_terminal_instance
+
+    typed: list[tuple[str, ...]] = []
+
+    def _record_tmux(_socket_path: str, *args: str) -> None:
+        typed.append(args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _record_tmux)
+    conv_id = "6ca51d776da842b49be6379058c70f4a"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("pi", "main", tmp_path)
+    terminals._by_conversation.setdefault(conv_id, {})[("pi", "main")] = instance
+    app, _ = await _build_app_for_spec(_harness_spec("pi-native"), terminal_registry=terminals)
+
+    async with _runner_client(app, permission_harness="pi-native") as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "ag_pi_native"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "message", "content": [{"type": "input_text", "text": "/clear"}]},
+        )
+
+    assert response.status_code == 200
+    assert [args for args in typed if "-l" in args] == [("send-keys", "-l", "-t", "main", "/new")]
 
 
 @pytest.mark.asyncio
@@ -3556,7 +3590,7 @@ async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn(harn
     )
 
     sid = "b1d0f6a2c3e14f5a9b8c7d6e5f403122"
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi" if harness == "pi" else None) as client:
         create_resp = await client.post(
             "/v1/sessions",
             json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
@@ -3604,7 +3638,9 @@ async def test_pi_effort_change_forwards_idle_settings(monkeypatch, effort) -> N
 
     hc = _ScriptedHarnessClient([])
     pm = _FakeProcessManager(hc)
-    forwarded = AsyncMock(return_value=httpx.Response(200, json={"applied": True}))
+    forwarded = AsyncMock(
+        return_value=httpx.Response(200, json={"applied": True, "installed": True})
+    )
     monkeypatch.setattr(hc, "post", forwarded)
 
     async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -3614,11 +3650,12 @@ async def test_pi_effort_change_forwards_idle_settings(monkeypatch, effort) -> N
         process_manager=pm, spec_resolver=resolve, server_client=NullServerClient()
     )
     sid = "pi-effort-control"
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi") as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": sid, "agent_id": "test-agent"}
         )
         assert created.status_code == 201, created.text
+        forwarded.reset_mock()
         response = await client.post(
             f"/v1/sessions/{sid}/events", json={"type": "effort_change", "effort": effort}
         )

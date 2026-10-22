@@ -531,6 +531,7 @@ function CommentCard({
 
   const statusLabel = c.status === "addressed" ? "Sent" : null;
   const authorLabel = commentAuthorLabel(c.created_by);
+  const screenshotExpiry = c.screenshot_expires_at;
 
   function startEdit() {
     setEditBody(c.body);
@@ -560,6 +561,13 @@ function CommentCard({
       {c.anchor_content && (
         <p className="truncate font-mono text-sm text-muted-foreground">
           {displayAnchorContent(c.anchor_content)}
+        </p>
+      )}
+      {screenshotExpiry && (
+        <p className="text-xs text-muted-foreground">
+          {now.getTime() >= screenshotExpiry * 1000
+            ? "截图已过期"
+            : `Screenshot expires ${new Date(screenshotExpiry * 1000).toLocaleDateString()}`}
         </p>
       )}
       {isOrphan && (

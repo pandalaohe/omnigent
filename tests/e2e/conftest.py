@@ -42,6 +42,7 @@ import pytest
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -951,7 +952,7 @@ def http_client(live_server: str) -> Iterator[httpx.Client]:
     with httpx.Client(
         base_url=live_server,
         timeout=300,
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, "X-Omnigent-Permission-Tiers": "1"},
     ) as client:
         yield client
 
@@ -1628,6 +1629,13 @@ def send_user_message_to_session(
     snapshot with :func:`poll_session_until_terminal` instead of
     ``GET /v1/responses/{id}``.
 
+    A session whose startup has not finished — a host-launched session
+    whose runner boots after the message is accepted, e.g. ``pi-native`` —
+    answers ``{"queued": True, "pending_id": "..."}`` instead: the message
+    is saved in the startup input queue with no turn yet. This helper waits
+    for that dispatch (see :func:`_pending_input_response_id`) and still
+    returns a transcript response id.
+
     :param client: HTTP client pointed at the live server.
     :param session_id: Runner-bound session id returned by
         :func:`create_runner_bound_session`.
@@ -1657,6 +1665,10 @@ def send_user_message_to_session(
     # bare ``["item_id"]`` index raise a cryptic ``KeyError`` — that masked a
     # real prompt-policy classifier flake as an unreadable crash. Callers that
     # expect the synchronous-verdict path should use ``_post_user_message``.
+    if "item_id" not in payload and "pending_id" in payload:
+        return _pending_input_response_id(
+            client, session_id=session_id, content=blocks, pending_id=str(payload["pending_id"])
+        )
     if "item_id" not in payload:
         raise AssertionError(
             f"events endpoint did not queue a turn for session {session_id!r}: "
@@ -1672,6 +1684,66 @@ def send_user_message_to_session(
             return str(item["response_id"])
     raise AssertionError(
         f"persisted item {item_id!r} not found in session {session_id!r} snapshot"
+    )
+
+
+def _posted_input_text(content: list[dict[str, Any]]) -> str:
+    """Return the conversational text of posted content blocks, for matching."""
+    return "\n".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "input_text"
+        and isinstance(block.get("text"), str)
+    )
+
+
+def _pending_input_response_id(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    content: list[dict[str, Any]],
+    pending_id: str,
+    timeout: float = 300,
+) -> str:
+    """
+    Wait for a startup-queued message to be dispatched, then return its id.
+
+    A session that has not finished starting saves the message in its startup
+    input queue, so the transcript holds a user item stamped
+    :data:`~omnigent.stores.conversation_store.PENDING_INPUT_RESPONSE_ID` until
+    the runner dispatches the turn and stamps the real response id on the
+    replacing item (which keeps the queued item's transcript position).
+
+    :param client: HTTP client pointed at the live server.
+    :param session_id: Session the message was posted to.
+    :param content: Content blocks that were posted.
+    :param pending_id: ``pending_id`` the events endpoint answered with.
+    :param timeout: Max seconds to wait for the dispatch.
+    :returns: The dispatched user item's ``response_id``.
+    :raises AssertionError: If the queued message is not dispatched in time.
+    """
+    text = _posted_input_text(content)
+    deadline = time.monotonic() + timeout
+    last_body: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{session_id}")
+        resp.raise_for_status()
+        last_body = resp.json()
+        for item in reversed(last_body.get("items", [])):
+            flattened = _flatten_session_item(item)
+            if flattened.get("type") != "message" or flattened.get("role") != "user":
+                continue
+            # Newest first: an identical earlier message must not answer for this one.
+            if _posted_input_text(flattened.get("content") or []) != text:
+                continue
+            if flattened.get("response_id") == PENDING_INPUT_RESPONSE_ID:
+                break
+            return str(flattened["response_id"])
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(
+        f"queued message {pending_id!r} was not dispatched on session "
+        f"{session_id!r} within {timeout}s; last snapshot={last_body}"
     )
 
 

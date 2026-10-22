@@ -22,21 +22,31 @@ export const BUILTIN_AGENTS = new Set([
   "goose-native-ui", // Goose
   "qwen-native-ui", // Qwen Code
   "kimi-native-ui", // Kimi
-  "codex-sdk",
-  "claude-sdk",
   "devin-native-ui", // Devin
   "polly",
   "debby",
 ]);
 
-export const SDK_PRODUCT_AGENTS: ReadonlyMap<string, string> = new Map([
-  ["codex-sdk", "codex"],
-  ["claude-sdk", "claude-sdk"],
-]);
-
-/** A standalone SDK product has both its built-in identity and expected harness. */
-export function isSdkAgent(agent: Pick<AvailableAgent, "name" | "harness">): boolean {
-  return SDK_PRODUCT_AGENTS.get(agent.name) === agent.harness;
+/** A standalone SDK product is declared by the server, with an older-server fallback. */
+export function isSdkAgent(
+  agent: Pick<AvailableAgent, "name" | "harness"> &
+    Partial<Pick<AvailableAgent, "builtin" | "mine" | "product_of" | "integration_mode">>,
+): boolean {
+  if (agent.product_of !== undefined || agent.integration_mode !== undefined) {
+    return (
+      agent.builtin === true &&
+      agent.harness != null &&
+      agent.product_of === agent.harness &&
+      (agent.integration_mode === "sdk-in-process" || agent.integration_mode === "cli-subprocess")
+    );
+  }
+  // Older servers send neither declaration. Keep their two seeded SDK rows
+  // recognizable without using these names for a new server's membership.
+  if (agent.builtin === false || agent.mine === true) return false;
+  return (
+    (agent.name === "codex-sdk" && agent.harness === "codex") ||
+    (agent.name === "claude-sdk" && agent.harness === "claude-sdk")
+  );
 }
 
 /** The vendor product mark an SDK harness runs, keyed by harness spelling. */
@@ -49,7 +59,7 @@ const SDK_HARNESS_ICON_KINDS: ReadonlyMap<string, "claude" | "codex"> = new Map(
  * The vendor whose product mark an SDK row / trigger draws, or null when the
  * agent is not an SDK product.
  *
- * A named agent must match the SDK product pair ({@link isSdkAgent}); an
+ * A named agent must be a declared SDK product ({@link isSdkAgent}); an
  * anonymous harness-only trigger (an `AgentMemberTrigger` icon, a session
  * icon with no resolved agent name) is recognized by the harness spelling
  * alone. A composed agent on an SDK harness (Polly) keeps its own identity.
@@ -59,7 +69,7 @@ const SDK_HARNESS_ICON_KINDS: ReadonlyMap<string, "claude" | "codex"> = new Map(
 export function sdkProductVendor(
   agent: Pick<AvailableAgent, "name" | "harness">,
 ): "claude" | "codex" | null {
-  if (isSdkAgent(agent)) return agent.harness === "codex" ? "codex" : "claude";
+  if (isSdkAgent(agent)) return SDK_HARNESS_ICON_KINDS.get(agent.harness ?? "") ?? null;
   if (!agent.name && agent.harness) return SDK_HARNESS_ICON_KINDS.get(agent.harness) ?? null;
   return null;
 }
@@ -107,8 +117,6 @@ export const AGENT_DISPLAY_ORDER = [
   "Antigravity",
   "Qwen Code",
   "Kimi",
-  "Codex SDK",
-  "Claude SDK",
   "Polly",
   "Debby",
 ];
@@ -174,7 +182,7 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
   // agents; the {@link BUILTIN_AGENTS} allowlist is only a fallback for older
   // servers that don't send the field. Without this, seeded ACP agents (Devin,
   // grok, …) — whose names aren't in the static allowlist — fall to "custom".
-  const isBuiltin = (a: T): boolean => a.builtin ?? BUILTIN_AGENTS.has(a.name);
+  const isBuiltin = (a: T): boolean => a.builtin ?? (BUILTIN_AGENTS.has(a.name) || isSdkAgent(a));
   return {
     builtins: sorted.filter(isBuiltin),
     customs: sorted.filter((a) => !isBuiltin(a)),

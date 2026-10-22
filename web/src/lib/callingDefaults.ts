@@ -14,7 +14,11 @@
 import { useEffect, useState } from "react";
 import type { ProjectConfig } from "./projectsApi";
 import { normalizeAgyPermissionTier } from "./nativeHarnessModes";
-import { PERMISSION_DEFAULT_OPTIONS } from "./sessionDefaultModes";
+import {
+  sessionDefaultModeOptions,
+  sessionModeHandler,
+  type HarnessCapabilityMap,
+} from "./sessionDefaultModes";
 
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 
@@ -23,8 +27,8 @@ const CALLING_DEFAULTS_CHANGED_EVENT = "omnigent:calling-defaults-changed";
 const CALLING_LAST_STORAGE_KEY = "omnigent:calling-last";
 const CALLING_LAST_CHANGED_EVENT = "omnigent:calling-last-changed";
 
-/** Harnesses a host can answer model-options requests for, mirroring the server. */
-export const CALLING_DEFAULT_HARNESSES = [
+/** Compatibility for catalogs served before `calling_defaults` was declared. */
+const LEGACY_CALLING_DEFAULT_HARNESSES = [
   "codex-native",
   "codex",
   "claude-native",
@@ -34,11 +38,45 @@ export const CALLING_DEFAULT_HARNESSES = [
   "antigravity-native",
 ] as const;
 
-/** SDK harnesses whose entries fall back to a native sibling's master row. */
-export const SDK_NATIVE_PARENT: Record<string, string> = {
+const LEGACY_SDK_NATIVE_PARENT: Record<string, string> = {
   codex: "codex-native",
   "claude-sdk": "claude-native",
 };
+
+/** Declared row membership; a missing declaration uses the older catalog's set. */
+export function callingDefaultHarnesses(capabilities?: HarnessCapabilityMap): string[] {
+  const rows = Object.entries(capabilities ?? {});
+  if (rows.some(([, capability]) => "calling_defaults" in capability))
+    return rows
+      .filter(([, capability]) => capability.calling_defaults != null)
+      .map(([harness]) => harness);
+  return [...LEGACY_CALLING_DEFAULT_HARNESSES];
+}
+
+export function callingDefaultParent(
+  harness: string,
+  capabilities?: HarnessCapabilityMap,
+): string | null {
+  const capability =
+    capabilities?.[harness] ?? (harness.startsWith("acp:") ? capabilities?.acp : undefined);
+  if (capability && "calling_defaults" in capability)
+    return capability.calling_defaults?.inherits_from ?? null;
+  return LEGACY_SDK_NATIVE_PARENT[harness] ?? null;
+}
+
+export function callingDefaultHasModels(
+  harness: string,
+  capabilities?: HarnessCapabilityMap,
+): boolean {
+  const capability =
+    capabilities?.[harness] ?? (harness.startsWith("acp:") ? capabilities?.acp : undefined);
+  if (capability && "calling_defaults" in capability)
+    return capability.calling_defaults?.model_options ?? false;
+  return (
+    LEGACY_CALLING_DEFAULT_HARNESSES.some((entry) => entry === harness) ||
+    harness.startsWith("acp:")
+  );
+}
 
 const HARNESS_LABELS: Record<string, string> = {
   "codex-native": "Codex",
@@ -51,9 +89,9 @@ const HARNESS_LABELS: Record<string, string> = {
 };
 
 /** Display label for a canonical harness id; unknown ids render as-is. */
-export function callingHarnessLabel(harness: string): string {
+export function callingHarnessLabel(harness: string, capabilities?: HarnessCapabilityMap): string {
   if (harness.startsWith("acp:")) return `ACP · ${harness.slice(4)}`;
-  return HARNESS_LABELS[harness] ?? harness;
+  return capabilities?.[harness]?.label ?? HARNESS_LABELS[harness] ?? harness;
 }
 
 // EFFORT_CLEAR_VALUES server-side, plus the pickers' no-override sentinels.
@@ -123,10 +161,11 @@ export function resolveProjectInheritedField(
   harness: string,
   field: CallingDefaultField,
   agentId: string | null,
+  capabilities?: HarnessCapabilityMap,
 ): { value: string | null; source: ProjectDefaultSource } {
   const projectHost = config.calling_defaults?.[hostId]?.harnesses;
   const masterHost = master[hostId];
-  const parent = SDK_NATIVE_PARENT[harness];
+  const parent = callingDefaultParent(harness, capabilities);
   const candidates: [string | undefined, ProjectDefaultSource][] = [];
   if (field === "model" && agentId && agentId === config.agent_id) {
     candidates.push([config.model, "project_legacy"]);
@@ -138,20 +177,27 @@ export function resolveProjectInheritedField(
   }
   for (const [candidate, source] of candidates) {
     const value =
-      harness === "antigravity-native" && field === "permission"
+      sessionModeHandler(harness, "permission", capabilities) === "agy-tier" &&
+      field === "permission"
         ? normalizeAgyPermissionTier(candidate)
         : candidate;
     if (!value) continue;
     if (
       field === "permission" &&
-      !PERMISSION_DEFAULT_OPTIONS[harness]?.some((option) => option.value === value)
+      !sessionDefaultModeOptions(harness, "permission", [], null, "default", capabilities).some(
+        (option) => option.value === value,
+      )
     )
       continue;
     if (
       field === "speed" &&
-      !(["codex", "codex-native"].includes(harness)
+      !(capabilities?.[harness]?.session_modes?.speed?.options === "per-model" ||
+      (capabilities?.[harness]?.session_modes === undefined &&
+        sessionModeHandler(harness, "speed", capabilities) === "codex-service-tier")
         ? /^[a-z][a-z0-9_-]{0,63}$/.test(value)
-        : ["claude-native", "claude-sdk"].includes(harness) && ["standard", "fast"].includes(value))
+        : sessionDefaultModeOptions(harness, "speed", [], null, "default", capabilities).some(
+            (option) => option.value === value,
+          ))
     )
       continue;
     return { value, source };

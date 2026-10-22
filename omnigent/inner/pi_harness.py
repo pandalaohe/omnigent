@@ -75,7 +75,9 @@ import json
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -86,6 +88,7 @@ from omnigent.inner.executor import Executor, ExecutorConfig
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.inner.pi_executor import PiExecutor, _pi_thinking_from_config
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+from omnigent.util.json_types import JsonValue
 
 _logger = logging.getLogger(__name__)
 
@@ -252,6 +255,51 @@ def _build_pi_executor() -> Executor:
     )
 
 
+async def _post_pi_session_usage(
+    session_id: str, data: dict[str, JsonValue]
+) -> dict[str, JsonValue]:
+    """Use only this session's owner-only loopback relay for Pi usage."""
+    from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+    from omnigent.native.native_policy_hook import read_relay_policy_config
+
+    relay = read_relay_policy_config(bridge_dir_for_session_id(session_id))
+    if relay is None:
+        raise RuntimeError("Pi session usage relay unavailable")
+    relay_url, token, bound_session_id = relay
+    try:
+        parsed = urlsplit(relay_url)
+        valid_url = (
+            parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "::1"}
+            and parsed.port is not None
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid_url = False
+    if not valid_url or not token or bound_session_id != session_id:
+        raise RuntimeError("Pi session usage relay binding invalid")
+    async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+        response = await client.post(
+            f"{relay_url.rstrip('/')}/pi/session-usage",
+            json=data,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    response.raise_for_status()
+    result = response.json()
+    if not isinstance(result, dict):
+        raise RuntimeError("Pi session usage relay response invalid")
+    if (
+        data == {"pi_cache_warming_probe": True}
+        and type(result.get("pi_cache_warming_allowed")) is not bool
+    ):
+        raise RuntimeError("Pi session usage relay decision unavailable")
+    return result
+
+
 def _resolve_skills_filter() -> str | list[str]:
     """
     Resolve the inner-executor ``skills_filter`` from env config.
@@ -303,7 +351,28 @@ def create_app() -> FastAPI:
         ``pi`` CLI surfaces as a request-time error, not a
         FastAPI app-boot crash).
     """
-    adapter = ExecutorAdapter(executor_factory=_build_pi_executor)
+
+    def build_executor() -> Executor:
+        # A restarted harness has not seen bootstrap; its runner binding is stable.
+        session_id = getattr(app.state, "conversation_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Pi requires a trusted conversation binding")
+        adapter._session_key = session_id
+        executor = _build_pi_executor()
+        bound_session_id = session_id
+
+        async def report_pi_session_event(
+            session_id: str, data: dict[str, JsonValue]
+        ) -> dict[str, JsonValue]:
+            if session_id != bound_session_id:
+                raise RuntimeError("Pi session usage belongs to another session")
+            return await _post_pi_session_usage(bound_session_id, data)
+
+        if isinstance(executor, PiExecutor):
+            executor._pi_session_event = report_pi_session_event
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor)
     app = adapter.build()
 
     @app.post("/v1/sessions/{conversation_id}/settings")

@@ -45,6 +45,7 @@ from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 # ── _is_url ──────────────────────────────────────────
 
@@ -1161,6 +1162,7 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
         prompt: str,
         runner_id: str | None = None,
         session_bundle: bytes | None = None,
+        permission_tier: str | None = None,
     ) -> None:
         """Record one-shot prompt inputs instead of making an API call."""
         captured["headless"] = {
@@ -2789,7 +2791,8 @@ def test_remote_headers_prefers_explicit_remote_token_env(monkeypatch: pytest.Mo
     )
 
     assert _remote_headers(server_url="https://srv.example.com", host_id=None) == {
-        "Authorization": "Bearer env-token"
+        **PERMISSION_TIERS_HEADERS,
+        "Authorization": "Bearer env-token",
     }
 
 
@@ -2819,7 +2822,7 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
 
     # The ambient token reached the Authorization header.
-    assert headers == {"Authorization": "Bearer ambient-token"}
+    assert headers == {**PERMISSION_TIERS_HEADERS, "Authorization": "Bearer ambient-token"}
     # Ambient resolution: exactly one lookup, with no profile threaded
     # (None) — a non-None value here means profile plumbing came back.
     assert read_calls == [None]
@@ -2845,6 +2848,7 @@ def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
     assert headers == {
+        **PERMISSION_TIERS_HEADERS,
         "Authorization": "Bearer rec-tok",
         "X-Databricks-Org-Id": "2850744067564480",
     }
@@ -2867,7 +2871,7 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
         server_url="https://single.databricks.com/api/2.0/omnigent", host_id=None
     )
 
-    assert headers == {"Authorization": "Bearer rec-tok"}
+    assert headers == {**PERMISSION_TIERS_HEADERS, "Authorization": "Bearer rec-tok"}
     assert "X-Databricks-Org-Id" not in headers
 
 
@@ -4083,8 +4087,11 @@ class _FakeSessionsNamespace:
         self._forbid_list_items = list_items_must_not_be_called
         self.list_items_calls = 0
 
-    async def create(self, bundle: bytes, *, filename: str, workspace: str) -> SimpleNamespace:
-        """Pretend to create a session; return an object with an ``id``."""
+    async def create(
+        self, bundle: bytes, *, filename: str, workspace: str, permission_tier: str | None = None
+    ) -> SimpleNamespace:
+        """Capture caller-selected creation permissions without changing existing sessions."""
+        self.created_permission_tier = permission_tier
         return SimpleNamespace(id="conv_test")
 
     async def bind_runner(self, session_id: str, *, runner_id: str) -> SimpleNamespace:
@@ -4220,6 +4227,8 @@ async def _run_one_shot(
     client: _FakeAPClient,
     query_impl: Callable[[str], object],
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    permission_tier: str | None = None,
 ) -> str | None:
     """
     Drive ``_query_sessions_once`` with a faked ``SessionsChat.query``.
@@ -4241,6 +4250,7 @@ async def _run_one_shot(
         session_bundle=b"bundle-bytes",
         session_bundle_filename="agent.tar.gz",
         runner_id="runner_test",
+        permission_tier=permission_tier,
     )
 
 
@@ -4319,8 +4329,26 @@ async def test_query_sessions_once_returns_none_when_no_text_and_no_error(
     assert result is None
 
 
+@pytest.mark.parametrize("permission_tier", ["auto", "full"])
+async def test_query_sessions_once_refuses_creation_tier_on_resume(permission_tier: str) -> None:
+    with pytest.raises(ValueError, match="only be selected for a new session"):
+        await _query_sessions_once(
+            client=_FakeAPClient([]),
+            agent_name="test",
+            tool_handler=None,
+            prompt="hello",
+            session_bundle=b"bundle",
+            session_bundle_filename="agent.tar.gz",
+            runner_id="runner-test",
+            resume_conversation_id="existing-session",
+            permission_tier=permission_tier,
+        )
+
+
+@pytest.mark.parametrize("permission_tier", [None, "full"])
 async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     monkeypatch: pytest.MonkeyPatch,
+    permission_tier: str | None,
 ) -> None:
     """The normal completion path returns the live text and skips the transcript.
 
@@ -4328,7 +4356,10 @@ async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     on every turn, adding a needless round-trip to the happy path.
     """
     client = _FakeAPClient([], list_items_must_not_be_called=True)
-    result = await _run_one_shot(client, _return_text, monkeypatch)
+    result = await _run_one_shot(
+        client, _return_text, monkeypatch, permission_tier=permission_tier
+    )
+    assert client.sessions.created_permission_tier == permission_tier
     assert result == "direct answer"
     assert client.sessions.list_items_calls == 0  # no reconcile on success
 

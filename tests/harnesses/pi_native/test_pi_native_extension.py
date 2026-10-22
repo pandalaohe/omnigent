@@ -9,21 +9,7 @@ from pathlib import Path
 
 import pytest
 
-
-def _ready_permission_state(tmp_path: Path, session_id: str) -> None:
-    """Model the runner's trusted, ready host cache for extension calls."""
-    (tmp_path / "permission_state.json").write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "host_id": "test-host",
-                "workspace": str(tmp_path),
-                "tier": "ask",
-                "revision": 1,
-                "status": "ready",
-            }
-        )
-    )
+from tests.harnesses.pi_native.helpers import ready_permission_state as _ready_permission_state
 
 
 def test_delivery_cap_drops_followup_without_failed_session_status(
@@ -78,6 +64,7 @@ process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
 const postedEvents = [];
 global.fetch = async (_url, request) => {
+  assert.equal(request.headers["X-Omnigent-Permission-Tiers"], "1");
   postedEvents.push(JSON.parse(request.body));
   return { ok: true };
 };
@@ -281,6 +268,150 @@ def test_message_end_posts_external_session_usage(tmp_path: Path) -> None:
 """
     )
     _run_extension_script(node, extension_path, script)
+
+
+def test_pi_context_usage_posts_observed_snapshot_and_preserves_unknown_tokens() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  let snapshot = { tokens: 321, contextWindow: 200000, percent: 0.16 };
+  ctx.getContextUsage = () => snapshot;
+  const message = { role: "assistant", responseId: "r-1", timestamp: 123,
+    usage: { input: 3, output: 2, cacheRead: 1, cacheWrite: 0 } };
+  await handlers.message_end({ message }, ctx);
+  assert.equal(usageEvents()[0].data.context_tokens, 321);
+  assert.equal(usageEvents()[0].data.context_window, 200000);
+  snapshot = { tokens: null, contextWindow: 200000, percent: null };
+  await handlers.turn_end({ message }, ctx);
+  assert.equal(usageEvents().length, 2);
+  assert.equal("context_tokens" in usageEvents()[1].data, false);
+  assert.equal(usageEvents()[1].data.context_window, 200000);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_pi_provider_response_forwards_only_bounded_rate_limit_headers() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  await handlers.after_provider_response({ status: 200, headers: {
+    "Anthropic-RateLimit-Requests-Limit": "100",
+    "anthropic-ratelimit-requests-remaining": "60",
+    "authorization": "must-not-forward",
+    "x-private": "must-not-forward",
+    "anthropic-ratelimit-tokens-reset": "x".repeat(129),
+  }}, ctx);
+  const usage = usageEvents();
+  assert.equal(usage.length, 1);
+  assert.deepEqual(usage[0].data.pi_provider_usage_limits_headers, {
+    "anthropic-ratelimit-requests-limit": "100",
+    "anthropic-ratelimit-requests-remaining": "60",
+  });
+  await handlers.after_provider_response({ status: 200, headers: {} }, ctx);
+  assert.deepEqual(usageEvents()[1].data.pi_provider_usage_limits_headers, {});
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_pi_cache_observation_and_idle_decision_use_provider_and_owner_policy() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  let allow = true;
+  global.fetch = async (_url, request) => {
+    postedEvents.push(JSON.parse(request.body));
+    return { ok: true, json: async () => ({ pi_cache_warming_allowed: allow }) };
+  };
+  ctx.model = { id: "model-1", provider: "provider-a", promptCache: { short: 300 } };
+  const message = { role: "assistant", responseId: "r-1", timestamp: 123,
+    model: "model-1", provider: "provider-a",
+    usage: { input: 100, output: 2, cacheRead: 80, cacheWrite: 20 } };
+  await handlers.message_end({ message }, ctx);
+  const observed = usageEvents()[0].data;
+  assert.equal(observed.pi_cache_ttl_seconds, 300);
+  assert.equal(observed.pi_cache_read_input_tokens, 80);
+  assert.equal(observed.pi_cache_write_input_tokens, 20);
+  assert.ok(Number.isInteger(observed.pi_cache_observed_at));
+
+  const decision = { action: "warm", continuationProbability: 0.15 };
+  assert.deepEqual(await handlers.cache_warming_decision(decision, ctx), { action: "warm" });
+  assert.deepEqual(usageEvents().at(-1).data, { pi_cache_warming_probe: true });
+  allow = false;
+  assert.deepEqual(await handlers.cache_warming_decision(decision, ctx), { action: "stop" });
+  const before = usageEvents().length;
+  assert.deepEqual(await handlers.cache_warming_decision(
+    { action: "warm", continuationProbability: 1 }, ctx), { action: "warm" });
+  assert.equal(usageEvents().length, before);
+
+  ctx.model = { id: "model-1", provider: "provider-b", promptCache: { short: 300 } };
+  await handlers.model_select({ source: "user", model: ctx.model }, ctx);
+  assert.equal(usageEvents().at(-1).data.pi_cache_ttl_seconds, null);
+  await handlers.message_end({ message: { ...message, responseId: "r-2",
+    provider: "provider-b",
+    usage: { input: 100, output: 2, cacheRead: 0, cacheWrite: 0 } } }, ctx);
+  assert.equal(usageEvents().at(-1).data.pi_cache_ttl_seconds, 300);
+  assert.equal(usageEvents().at(-1).data.pi_cache_read_input_tokens, 0);
+  assert.equal(usageEvents().at(-1).data.pi_cache_write_input_tokens, 0);
+
+  ctx.model = undefined;
+  await handlers.model_select({ source: "user", model: undefined }, ctx);
+  assert.equal(usageEvents().at(-1).data.pi_cache_ttl_seconds, null);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_pi_builtin_cache_warm_usage_refreshes_observation_without_message() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  const timers = new Map();
+  global.setInterval = (callback, ms) => {
+    timers.set(ms, callback);
+    return { unref() {} };
+  };
+  const entries = [];
+  ctx.model = { id: "model-1", provider: "provider-a", promptCache: { short: 300 } };
+  ctx.sessionManager = { getEntries: () => entries };
+  await handlers.session_start({}, ctx);
+  assert.equal(usageEvents().length, 0);
+  entries.push({ id: "warm-1", type: "usage", kind: "cache_warm",
+    model: "model-1", provider: "provider-a", timestamp: new Date().toISOString(),
+    usage: { input: 0, output: 1, cacheRead: 150, cacheWrite: 0 } });
+  timers.get(15000)();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(usageEvents().length, 1);
+  assert.equal(usageEvents()[0].data.pi_cache_read_input_tokens, 150);
+  assert.equal(usageEvents()[0].data.pi_cache_ttl_seconds, 300);
+  timers.get(15000)();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(usageEvents().length, 1);
+  await handlers.session_shutdown();
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
 
 
 def test_usage_accumulates_and_dedupes_across_messages(tmp_path: Path) -> None:

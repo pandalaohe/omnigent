@@ -19,6 +19,7 @@ describe("session collab preferences", () => {
   it("defaults to the server defaults with nothing stored", () => {
     expect(SESSION_COLLAB_DEFAULTS.openRateCount).toBe(10);
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmEnabled).toBe(false);
+    expect(SESSION_COLLAB_DEFAULTS.sessionRestrictions).toBe("subagents");
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmClaudeIntervalSeconds).toBe(3300);
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmCodexIntervalSeconds).toBe(1500);
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmMaxSeconds).toBe(28800);
@@ -77,6 +78,7 @@ describe("session collab preferences", () => {
         duplicateWindowSeconds: 0,
         undeliveredTtlSeconds: 300,
         flowTimerEnabled: 1,
+        sessionRestrictions: "invalid",
       }),
     );
 
@@ -135,7 +137,8 @@ describe("session collab preferences", () => {
       quotaTightBelowPct: 45.5,
       quotaLowBelowPct: 15,
       quotaFloorPct: 0,
-      quotaPeriods: { claude: "5h", codex: "7d" },
+      quotaPeriodDefault: "month",
+      quotaPeriods: { claude: "5h", codex: "7d", kite: "2d" },
     };
     writeSessionCollabPreferences(value);
     expect(readSessionCollabPreferences()).toEqual(value);
@@ -145,7 +148,8 @@ describe("session collab preferences", () => {
     expect(readSessionCollabPreferences()).toMatchObject({
       openRateCount: 7,
       childCap: 4,
-      quotaPeriods: { claude: "5h", codex: "7d" },
+      quotaPeriodDefault: "month",
+      quotaPeriods: { claude: "5h", codex: "7d", kite: "2d" },
     });
   });
 
@@ -158,6 +162,7 @@ describe("session collab preferences", () => {
         quotaTightBelowPct: 50,
         quotaLowBelowPct: 60,
         quotaFloorPct: -1,
+        quotaPeriodDefault: "bad period",
         quotaPeriods: {
           claude: "5h",
           codex: "bad period",
@@ -169,7 +174,7 @@ describe("session collab preferences", () => {
     expect(readSessionCollabPreferences()).toEqual({
       ...SESSION_COLLAB_DEFAULTS,
       relayDepthMax: 3,
-      quotaPeriods: { claude: "5h" },
+      quotaPeriods: { claude: "5h", unknown: "month" },
     });
   });
 });

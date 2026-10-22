@@ -86,6 +86,41 @@ export interface Project {
   config?: ProjectConfig;
   /** Content revision used by narrow project-default writes. */
   config_revision?: string;
+  archived_at?: number | null;
+  archive_summary?: { sessions: number; tasks: number };
+}
+
+export interface ProjectArchivePreview {
+  sessions: {
+    id: string;
+    title: string;
+    status: string;
+    project_id: string | null;
+    parent_id?: string | null;
+    belongs_to_project?: boolean;
+    via_parent_outside_project: boolean;
+    host_keeps_cli: boolean;
+  }[];
+  scheduled_tasks: {
+    id: string;
+    name: string;
+    state: string;
+    next_run_at: string | null;
+    last_run_status: string | null;
+  }[];
+  health_check_uses_project: boolean;
+}
+
+export interface ProjectArchiveResult {
+  status: "complete" | "incomplete";
+  project: Project;
+  batch: string | null;
+  sessions: { done: string[]; skipped: { id: string; reason: string }[] };
+  tasks: {
+    done: { id: string; name: string; next_run_at: string | null }[];
+    skipped: { id: string; reason: string }[];
+  };
+  failed: { id: string; kind: string; error: string }[];
 }
 
 interface ProjectListResponse {
@@ -103,11 +138,41 @@ async function readError(res: Response): Promise<string> {
 }
 
 /** List the caller's projects in their preferred display order. */
-export async function listProjects(): Promise<Project[]> {
-  const res = await authenticatedFetch("/v1/projects");
+export async function listProjects(options?: {
+  includeArchived?: boolean;
+  archivedOnly?: boolean;
+}): Promise<Project[]> {
+  const suffix = options?.archivedOnly
+    ? "?archived=only"
+    : options?.includeArchived
+      ? "?include_archived=true"
+      : "";
+  const res = await authenticatedFetch(`/v1/projects${suffix}`);
   if (!res.ok) throw new Error(await readError(res));
   const body = (await res.json()) as ProjectListResponse;
   return body.data;
+}
+
+export async function previewProjectArchive(id: string): Promise<ProjectArchivePreview> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/archive-preview`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectArchivePreview;
+}
+
+export async function archiveProject(id: string): Promise<ProjectArchiveResult> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/archive`, {
+    method: "POST",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectArchiveResult;
+}
+
+export async function unarchiveProject(id: string): Promise<ProjectArchiveResult> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/unarchive`, {
+    method: "POST",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as ProjectArchiveResult;
 }
 
 /** Fetch a single project (including its `config`) by id. 404s if not owned. */
@@ -208,7 +273,7 @@ export async function createProject(name: string, config?: ProjectConfig): Promi
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(config ? { name, config } : { name }),
   });
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 
@@ -219,7 +284,7 @@ export async function renameProject(id: string, name: string): Promise<Project> 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 

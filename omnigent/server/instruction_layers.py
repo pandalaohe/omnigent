@@ -70,11 +70,17 @@ async def resolve_instruction_route(conversation: Conversation) -> InstructionRo
     from omnigent.server.routes._sessions.helpers import _resolve_harness_async
 
     harness = (
-        canonicalize_harness(conversation.harness_override)
+        conversation.harness_override
+        if conversation.harness_override and conversation.harness_override.startswith("acp:")
+        else canonicalize_harness(conversation.harness_override)
         if conversation.harness_override
         else await _resolve_harness_async(conversation)
     )
     spec = await asyncio.to_thread(_session_spec, conversation)
+    if harness == "acp" and not conversation.harness_override and spec is not None:
+        declared = spec.executor.config.get("harness")
+        if isinstance(declared, str) and declared.startswith("acp:"):
+            harness = declared
     return InstructionRoute(conversation.host_id, agent_key_for_harness(harness), harness, spec)
 
 

@@ -150,6 +150,9 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
     )
     monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0)
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 20)
+    state = bridge._read_json_file(tmp_path / bridge._STATE_FILE)
+    state["accepted_input_tmux"] = bridge._tmux_input_identity(tmp_path)
+    bridge._write_json_file(tmp_path / bridge._STATE_FILE, state)
     with (
         caplog.at_level(logging.INFO, logger=delivery_diagnostics.__name__),
         input_delivery_scope({"input_stable_id": "a" * 32, "pending_id": "pending_" + "b" * 32}),
@@ -157,7 +160,7 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
     ):
         bridge.inject_user_message(tmp_path, content=content)
 
-    assert enters == (1 if stops else 5)
+    assert enters == (1 if stops else 5), str(caught.value)
     if stops:
         assert type(caught.value).__name__ == "ClaudeSubmitBlockedUnconfirmed"
         assert "could not be confirmed" in str(caught.value)

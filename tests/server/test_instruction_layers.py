@@ -199,3 +199,27 @@ async def test_missing_store_is_no_injection(monkeypatch):
         "omnigent.server.instruction_layers.get_global_instructions_store", lambda: None
     )
     assert await session_instructions_text(conversation()) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [True, False])
+async def test_acp_layer_reaches_session_composition(instructions, monkeypatch, override):
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda: [SimpleNamespace(slug="neutral_agent", name="Neutral agent")],
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="ACP worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "acp:neutral_agent"}),
+    )
+    monkeypatch.setattr("omnigent.server.instruction_layers._session_spec", lambda _conv: spec)
+
+    async def resolve(_conv):
+        return "acp"
+
+    monkeypatch.setattr("omnigent.server.routes._sessions.helpers._resolve_harness_async", resolve)
+    instructions.save("ACP layer", created_by=None, scope="agent", agent_key="acp:neutral_agent")
+    conv = conversation()
+    conv.harness_override = "acp:neutral_agent" if override else None
+    assert await session_instructions_text(conv) == "S\n\nACP layer\n\nH"

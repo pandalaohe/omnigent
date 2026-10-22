@@ -30,6 +30,10 @@ def test_populated_startup_migrations_round_trip(db_uri):
                 occupied=True,
                 resident=True,
                 cancel_requested=False,
+                runtime_ready=False,
+                tools_ready=False,
+                input_accepted=False,
+                work_started=False,
                 created_at=100,
                 updated_at=100,
             )

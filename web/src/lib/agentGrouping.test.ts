@@ -110,4 +110,51 @@ describe("isSdkAgent", () => {
     ];
     expect(rows.filter(isSdkAgent).map((row) => row.name)).toEqual(["codex-sdk", "claude-sdk"]);
   });
+
+  it("uses declared product identity and SDK mode before older-server names", () => {
+    expect(
+      isSdkAgent(
+        agent({
+          name: "new-product",
+          harness: "plugin-sdk",
+          builtin: true,
+          product_of: "plugin-sdk",
+          integration_mode: "sdk-in-process",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isSdkAgent(
+        agent({
+          name: "codex-sdk",
+          harness: "codex",
+          builtin: true,
+          product_of: null,
+          integration_mode: "cli-subprocess",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isSdkAgent(
+        agent({
+          name: "codex-sdk",
+          harness: "codex",
+          builtin: false,
+          product_of: "codex",
+          integration_mode: "cli-subprocess",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isSdkAgent(
+        agent({
+          name: "native-product",
+          harness: "native-x",
+          builtin: true,
+          product_of: "native-x",
+          integration_mode: "native-tui",
+        }),
+      ),
+    ).toBe(false);
+  });
 });

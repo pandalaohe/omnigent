@@ -24,6 +24,7 @@ import pytest
 from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
 from omnigent.inner._proc import process_alive
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from tests._helpers.host import isolated_host
 from tests._helpers.live_server import isolated_local_server, local_server_env, terminate_process
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e._harness_probes import cli_unavailable_reason
@@ -171,7 +172,10 @@ def pi_fork_rig(
                 base_url=base_url,
                 trust_env=False,
                 timeout=30,
-                headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+                headers={
+                    "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+                    "X-Omnigent-Permission-Tiers": "1",
+                },
             ) as client,
             (tmp_path / "runner.log").open("w") as log,
         ):
@@ -217,7 +221,7 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         client.post,
         "/v1/sessions",
         bundle_files({spec.name: spec.read_bytes()}),
-        metadata={"labels": dict(_SESSION_LABELS)},
+        metadata={"labels": dict(_SESSION_LABELS), "workspace": str(tmp_path / "workspace")},
     )
     created.raise_for_status()
     session_ids = [created.json()["session_id"]]
@@ -264,9 +268,31 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         fork.raise_for_status()
         fork_id = fork.json()["id"]
         session_ids.append(fork_id)
-        bind_session_runner(client.patch, "", fork_id, runner_id)
-        send_message(fork_id, "What did the tools return?")
-        _wait(lambda: items_with_reply(fork_id, "FORK-RESUME-OK"))
+        # A fork is unbound; use the directory-picker's validated host launch.
+        # Keep the helper-owned identity while installing this fixture's provider.
+        command = [
+            sys.executable,
+            "-c",
+            "import json,os,runpy,sys,yaml; from pathlib import Path; "
+            "p=Path(os.environ['OMNIGENT_CONFIG_HOME'])/'config.yaml'; "
+            "config=yaml.safe_load(p.read_text()); "
+            "config.update(json.loads(Path(sys.argv[1]).read_text())); "
+            "p.write_text(yaml.safe_dump(config)); "
+            "sys.argv=['omnigent.host._daemon_entry','--server',sys.argv[2]]; "
+            "runpy.run_module('omnigent.host._daemon_entry',run_name='__main__')",
+            str(tmp_path / "config" / "config.yaml"),
+            str(client.base_url),
+        ]
+        with isolated_host(tmp_path / "fork-host", str(client.base_url), command=command) as host:
+            host.wait_online(client)
+            launched = client.post(
+                f"/v1/hosts/{host.host_id}/runners",
+                json={"session_id": fork_id, "workspace": str(tmp_path / "workspace")},
+                timeout=120,
+            )
+            launched.raise_for_status()
+            send_message(fork_id, "What did the tools return?")
+            _wait(lambda: items_with_reply(fork_id, "FORK-RESUME-OK"))
 
         assert len(requests) == 3
         history = requests[-1]["messages"]
@@ -305,7 +331,7 @@ def test_pi_native_token_failure_recovers_without_replaying_tools(
         client.post,
         "/v1/sessions",
         bundle_files({spec.name: spec.read_bytes()}),
-        metadata={"labels": dict(_SESSION_LABELS)},
+        metadata={"labels": dict(_SESSION_LABELS), "workspace": str(workspace)},
     )
     created.raise_for_status()
     session_id = created.json()["session_id"]

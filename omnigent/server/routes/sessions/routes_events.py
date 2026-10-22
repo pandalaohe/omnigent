@@ -108,6 +108,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.child_keep_warm import pi_cache_warming_allowed
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.native_subagent_watchdog import (
@@ -310,6 +311,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
+from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -317,6 +319,7 @@ from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
 )
+from omnigent.server.user_preferences_store import read_keep_warm_settings
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     MAX_SESSION_EVENT_REQUEST_BYTES,
@@ -1360,24 +1363,27 @@ def register_events_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         events = body if isinstance(body, list) else [body]
-        if any(event.type in {"message", "approval"} for event in events):
+        if events and (
+            request.headers.get("X-Omnigent-Permission-Tiers") != "1"
+            or any(event.type in {"message", "approval"} for event in events)
+        ):
             from omnigent.server.permission_tiers import require_permission_protocol
 
-            access = await _require_access_and_level(
-                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            _, protocol_conv = await _authorized_conversation(
+                request,
+                session_id,
+                external_transcript=events[0].type
+                in (_EXTERNAL_CONVERSATION_ITEM_TYPE, _EXTERNAL_ASSISTANT_MESSAGE_TYPE),
             )
-            protocol_conv = access.conversation
-            if protocol_conv is None:
-                protocol_conv = await asyncio.to_thread(
-                    conversation_store.get_conversation, session_id
-                )
-            if protocol_conv is not None:
-                require_permission_protocol(
-                    request,
-                    harness=_resolve_harness(
-                        protocol_conv, agent_store=agent_store, agent_cache=agent_cache
-                    ),
-                )
+            require_permission_protocol(
+                request,
+                harness=await asyncio.to_thread(
+                    _resolve_harness,
+                    protocol_conv,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                ),
+            )
         with contextlib.ExitStack() as in_flight:
             if isinstance(body, list):
                 if not body:
@@ -1498,6 +1504,19 @@ def register_events_routes(
             )
         if not authorized:
             return session_id
+
+        if addressed.archived:
+            from omnigent.server.session_collab import require_session_action_allowed
+
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                addressed,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+                action="send",
+                target=addressed,
+            )
 
         def _chain_has_pre_release_link() -> bool:
             current = session_id
@@ -2014,6 +2033,28 @@ def register_events_routes(
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
         }
+        from omnigent.server.session_collab import (
+            AGENT_SESSION_HEADER,
+            require_session_action_allowed,
+        )
+
+        if (
+            archived_user_work
+            and conv.archived
+            and (
+                AGENT_SESSION_HEADER in request.headers
+                or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+            )
+        ):
+            await asyncio.to_thread(
+                require_session_action_allowed,
+                conv,
+                conversation_store,
+                permission_store,
+                getattr(request.app.state, "user_preferences_store", None),
+                action="send",
+                target=conv,
+            )
         if (
             archived_user_work or archived_start_work
         ) and await _archive_blocks_external_user_work(
@@ -2230,6 +2271,24 @@ def register_events_routes(
                 else:
                     return _output_verdict
         elif body.type == "function_call" and body.data.get("evaluate_policy"):
+            from omnigent.server.session_collab import require_session_tool_allowed
+
+            arguments = body.data.get("arguments")
+            if isinstance(arguments, str):
+                with contextlib.suppress(ValueError):
+                    arguments = json.loads(arguments)
+            try:
+                await asyncio.to_thread(
+                    require_session_tool_allowed,
+                    conv,
+                    body.data.get("name"),
+                    arguments,
+                    conversation_store,
+                    permission_store,
+                    getattr(request.app.state, "user_preferences_store", None),
+                )
+            except OmnigentError as exc:
+                return {"verdict": "deny", "reason": exc.message}
             _tool_verdict = await _evaluate_tool_call_policy(
                 session_id,
                 conv,
@@ -3498,6 +3557,24 @@ def register_events_routes(
             _publish_mcp_startup(session_id, mcp_servers)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
+            if body.data.get("pi_cache_warming_probe") is True:
+                harness = await asyncio.to_thread(
+                    _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                allowed = False
+                if harness in ("pi", "pi-native"):
+                    owner = await asyncio.to_thread(
+                        collab_owner_for, conv, conversation_store, permission_store
+                    )
+                    settings = await asyncio.to_thread(
+                        read_keep_warm_settings,
+                        getattr(request.app.state, "user_preferences_store", None),
+                        owner,
+                    )
+                    allowed = pi_cache_warming_allowed(conv, settings, int(time.time()))
+                    if pending_elicitations.snapshot_for(session_id):
+                        allowed = False
+                return {"queued": False, "pi_cache_warming_allowed": allowed}
             # Persist the harness-reported cumulative usage so the
             # tool-call cost gate can read the running
             # ``total_cost_usd`` on the next tool call. (Cost budgets
@@ -4558,7 +4635,9 @@ def register_events_routes(
 
         require_permission_protocol(
             request,
-            harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache),
+            harness=await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            ),
             allow_query=True,
         )
         runner_client = await _get_runner_client(

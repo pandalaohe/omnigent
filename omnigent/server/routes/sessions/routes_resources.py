@@ -31,6 +31,7 @@ from PIL import Image
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
+from omnigent.db.utils import now_epoch
 from omnigent.entities import (
     Conversation,
     StoredFile,
@@ -2316,6 +2317,11 @@ def register_resources_routes(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        from omnigent.server.visitor_screenshots import screenshot_expiry
+
+        expiry = screenshot_expiry(stored)
+        if expiry is not None and now_epoch() >= expiry:
+            raise HTTPException(status_code=410, detail="Visitor screenshot expired")
         # The archive cleanup deleted the original; the row stays for its chip
         # and metadata, but the bytes are gone for good. Checked before the
         # ETag so a cached 304 can never resurrect them.
@@ -3590,4 +3596,6 @@ def register_resources_routes(
         _read_workspace_via_host=_read_workspace_via_host,
         _runner_path_segment=_runner_path_segment,
         comment_store=comment_store,
+        file_store=file_store,
+        artifact_store=artifact_store,
     )

@@ -26,6 +26,7 @@ vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
 import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseSkillsModule from "@/hooks/useSkills";
+import type * as AgentRegistryModule from "@/hooks/useAgentRegistry";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
@@ -311,8 +312,24 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
+const emptyHarnessCapabilities = vi.hoisted(() => ({}));
+afterEach(() => {
+  Reflect.deleteProperty(emptyHarnessCapabilities, "codex-native");
+});
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<typeof AgentRegistryModule>()),
+  useAgentRegistry: () => ({
+    items: [],
+    legacyProducts: {},
+    legacyLabels: {},
+    isLoading: false,
+    isError: false,
+    retry: vi.fn(),
+  }),
+}));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
+  useHarnessCapabilities: () => emptyHarnessCapabilities,
   // Mirrors the real hook: the "auto" sentinel leads the map only when the
   // server enables routing, so the Auto-harness tests exercise the real gate.
   useBrainHarnessLabels: (smartRoutingEnabled = false) => ({
@@ -7177,6 +7194,41 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("seeds the bypass-sandbox label in the create body when armed", async () => {
+    Object.assign(emptyHarnessCapabilities, {
+      "codex-native": {
+        session_modes: {
+          permission: {
+            handler: "codex-approval-preset",
+            options: [
+              {
+                value: "ask-for-approval",
+                label: "Ask for approval",
+                concept: "automatic",
+                contexts: ["default", "create"],
+              },
+              {
+                value: "approve-for-me",
+                label: "Approve for me",
+                concept: "automatic",
+                contexts: ["default", "create"],
+              },
+              {
+                value: "full-access",
+                label: "Full Access",
+                concept: "full-access",
+                contexts: ["default", "create"],
+              },
+              {
+                value: "read-only",
+                label: "Read Only",
+                concept: "read-only",
+                contexts: ["default", "create"],
+              },
+            ],
+          },
+        },
+      },
+    });
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),

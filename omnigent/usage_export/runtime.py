@@ -8,6 +8,7 @@ import json
 import os
 import random
 import sqlite3
+import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -51,8 +52,42 @@ async def prepare_capture(client: httpx.AsyncClient, session_id: str, harness: s
         "codex-native",
         "claude-sdk",
         "claude-native",
+        "pi",
+        "pi-native",
     }:
         await outbox().prepare(client, session_id, "codex-sdk" if harness == "codex" else harness)
+
+
+def register_pi_native_sessions(directory: Path, session_id: str) -> None:
+    if capture_enabled():
+        outbox().register_pi_root(directory, session_id)
+
+
+def capture_pi_rpc_message(session_id: str, message: Mapping[str, Any]) -> None:
+    """Persist one RPC assistant response; RPC mode has no session transcript."""
+    if not capture_enabled() or not session_id or session_id == "__default__":
+        return
+    response_id = message.get("responseId")
+    timestamp = message.get("timestamp")
+    unit_id = (
+        response_id
+        if isinstance(response_id, str) and response_id
+        else f"ts:{timestamp}"
+        if type(timestamp) is int and timestamp >= 0
+        else uuid.uuid4().hex
+    )
+    metering = {
+        "role": message.get("role"),
+        "model": message.get("model"),
+        "responseId": response_id,
+        "usage": message.get("usage"),
+    }
+    outbox().append(
+        session_id,
+        "pi",
+        {"harness_family": "pi", "identity_namespace": "pi/rpc/v1", "thread_kind": "main"},
+        {"type": "message", "id": unit_id, "message": metering},
+    )
 
 
 def capture_codex_home(
@@ -178,14 +213,49 @@ def capture_claude_mirror(
         "thread_kind": "subagent" if child else "internal" if internal else "main",
         "harness_family": "claude",
         "identity_namespace": "claude-code/transcript/v1",
-        # SessionStore keys do not carry the physical path. F1 remains
-        # pending until independently captured, rather than guessing it.
+        # The outbox supplies a path only after an SDK hook proves this tuple.
         "physical_transcript_path": None,
     }
     spool = outbox()
     for record in entries:
         if isinstance(record, dict):
             spool.append(session_id, "claude-sdk", physical, record)
+
+
+def capture_claude_hook_path(session_id: str, payload: Mapping[str, Any]) -> None:
+    """Bind the SDK mirror key to the actual path reported by a CLI hook."""
+    if not capture_enabled():
+        return
+    event = payload.get("hook_event_name")
+    parent = payload.get("session_id")
+    if not isinstance(parent, str) or not parent:
+        return
+    child: str | None = None
+    if event == "SubagentStop":
+        child = payload.get("agent_id")
+        raw_path = payload.get("agent_transcript_path")
+        if not isinstance(child, str) or not child:
+            return
+    elif event in {"UserPromptSubmit", "Stop"} and payload.get("agent_id") is None:
+        raw_path = payload.get("transcript_path")
+    else:
+        return
+    if not isinstance(raw_path, str) or not raw_path:
+        return
+    try:
+        reported_path = Path(raw_path)
+        if not reported_path.is_absolute():
+            return
+        path = reported_path.resolve(strict=True)
+        if not path.is_file():
+            return
+        physical = claude_physical_identity(path)
+    except (OSError, ValueError):
+        return
+    if physical["physical_session_id"] != parent or physical["physical_subagent_id"] != child:
+        outbox().bind_claude_path(session_id, parent, child, None)
+        return
+    outbox().bind_claude_path(session_id, parent, child, str(path))
 
 
 def retry_delay(attempt: int, retry_after: str = "") -> float:

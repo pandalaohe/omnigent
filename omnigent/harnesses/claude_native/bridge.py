@@ -251,6 +251,57 @@ _TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
 # The control POST carries an empty JSON object; anything larger is not ours.
 _TOOLS_CHANGED_BODY_MAX_BYTES = 4096
+_NATIVE_RELAY_BODY_MAX_BYTES = 1_048_576
+_PI_SESSION_USAGE_TIMEOUT_S = 5.0
+_PI_SESSION_USAGE_FIELDS = frozenset(
+    {
+        "context_tokens",
+        "context_window",
+        "pi_cache_ttl_seconds",
+        "pi_cache_observed_at",
+        "pi_cache_read_input_tokens",
+        "pi_cache_write_input_tokens",
+        "pi_provider_usage_limits_headers",
+    }
+)
+_PI_USAGE_HEADER = re.compile(
+    r"anthropic-ratelimit-(requests|tokens|input-tokens|output-tokens)-"
+    r"(limit|remaining|reset)"
+)
+
+
+def _valid_pi_session_usage(payload: Mapping[str, object]) -> bool:
+    """Accept only the Pi extension's bounded usage fields or exact probe."""
+    if payload == {"pi_cache_warming_probe": True}:
+        return True
+    if not payload or not payload.keys() <= _PI_SESSION_USAGE_FIELDS:
+        return False
+    for key, value in payload.items():
+        if key == "pi_provider_usage_limits_headers":
+            if (
+                not isinstance(value, dict)
+                or len(value) > 12
+                or any(
+                    not isinstance(name, str)
+                    or _PI_USAGE_HEADER.fullmatch(name) is None
+                    or not isinstance(header_value, str)
+                    or len(header_value) > 128
+                    for name, header_value in value.items()
+                )
+            ):
+                return False
+        elif key == "pi_cache_ttl_seconds" and value is None:
+            continue
+        elif (
+            type(value) is not int
+            or not 0 <= value < 2**53
+            or (key == "context_window" and value == 0)
+            or (key == "pi_cache_ttl_seconds" and not 1 <= value <= 86400)
+        ):
+            return False
+    return True
+
+
 # Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
 # tool dispatch to complete on the harness event loop.
 _TOOL_CALL_TIMEOUT_S = 300.0
@@ -7698,6 +7749,7 @@ def _tool_relay_handler_factory(
             if self.path not in (
                 "/tool",
                 "/policies/evaluate",
+                "/pi/session-usage",
                 "/hook/claude/evaluate-policy",
                 "/hook/observe-tool",
                 "/permission-tiers/state",
@@ -7708,9 +7760,24 @@ def _tool_relay_handler_factory(
             if self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
+            if self.path == "/pi/session-usage":
+                try:
+                    body_length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self.send_error(HTTPStatus.BAD_REQUEST)
+                    return
+                if body_length > _NATIVE_RELAY_BODY_MAX_BYTES:
+                    self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                    return
+                if body_length <= 0:
+                    self.send_error(HTTPStatus.BAD_REQUEST)
+                    return
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/pi/session-usage":
+                self._handle_pi_session_usage(payload)
                 return
             if self.path == "/hook/observe-tool":
                 from omnigent.runner.pr_observer import observe_hook
@@ -7917,6 +7984,44 @@ def _tool_relay_handler_factory(
                 return
             self._send_json(result)
 
+        def _handle_pi_session_usage(self, payload: _JsonObject) -> None:
+            """Forward only Pi usage or a warm probe for this relay's session."""
+            if policy_client is None or session_id is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            if not _valid_pi_session_usage(payload):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            from urllib.parse import quote
+
+            future = asyncio.run_coroutine_threadsafe(
+                policy_client.post(
+                    f"/v1/sessions/{quote(session_id, safe='')}/events",
+                    json={"type": "external_session_usage", "data": payload},
+                ),
+                loop,
+            )
+            try:
+                response = future.result(timeout=_PI_SESSION_USAGE_TIMEOUT_S)
+                response.raise_for_status()
+                result = response.json()
+                if not isinstance(result, dict):
+                    raise ValueError("Invalid Pi session usage response")
+                if (
+                    "pi_cache_warming_probe" in payload
+                    and type(result.get("pi_cache_warming_allowed")) is not bool
+                ):
+                    raise ValueError("Missing Pi cache warming decision")
+            except Exception:  # noqa: BLE001 - unavailable policy must stop warming
+                future.cancel()
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self._send_json(
+                {"pi_cache_warming_allowed": result["pi_cache_warming_allowed"]}
+                if "pi_cache_warming_probe" in payload
+                else {}
+            )
+
         def _handle_permission_state(self) -> None:
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
@@ -8020,7 +8125,10 @@ def _tool_relay_handler_factory(
                 length = int(length_raw)
             except ValueError:
                 return None
-            if self.path == "/hook/observe-tool" and not 0 <= length <= 1_048_576:
+            if (
+                self.path == "/hook/observe-tool"
+                and not 0 <= length <= _NATIVE_RELAY_BODY_MAX_BYTES
+            ):
                 return None
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")

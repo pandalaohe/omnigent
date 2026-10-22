@@ -15,7 +15,12 @@ import httpx
 from filelock import FileLock, Timeout
 
 from omnigent.usage_export.models import UsageObservation
-from omnigent.usage_export.transcripts import claude_measurement, codex_measurement
+from omnigent.usage_export.transcripts import (
+    claude_measurement,
+    claude_physical_identity,
+    codex_measurement,
+    pi_measurement,
+)
 
 
 class UsageOutbox:
@@ -29,6 +34,7 @@ class UsageOutbox:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.path = directory / "outbox.sqlite3"
         self._drain_lock = FileLock(str(directory / "drain.lock"), mode=0o600)
+        self._proof_lock = FileLock(str(directory / "claude-proof.lock"), mode=0o600)
         with self._connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS producers (
@@ -62,6 +68,20 @@ class UsageOutbox:
                     session_id TEXT, harness TEXT, physical TEXT, turn_id TEXT,
                     ended_at TEXT NOT NULL,
                     PRIMARY KEY (session_id,harness,physical,turn_id)
+                );
+                CREATE TABLE IF NOT EXISTS pi_roots (
+                    path TEXT PRIMARY KEY, session_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pi_seen (
+                    session_id TEXT NOT NULL, entry_id TEXT NOT NULL,
+                    PRIMARY KEY (session_id, entry_id)
+                );
+                CREATE TABLE IF NOT EXISTS claude_path_proofs (
+                    session_id TEXT NOT NULL, harness TEXT NOT NULL,
+                    physical_session_id TEXT NOT NULL,
+                    physical_subagent_id TEXT NOT NULL,
+                    path TEXT, conflicted INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (session_id,harness,physical_session_id,physical_subagent_id)
                 );
             """)
 
@@ -151,6 +171,22 @@ class UsageOutbox:
         record: Mapping[str, Any],
     ) -> None:
         """Associate only explicit terminal records with their physical turn."""
+        if harness in {"pi-native", "pi"}:
+            measurement = pi_measurement(record)
+            if measurement is None:
+                return
+            if harness == "pi-native":
+                entry_identity = self._json(
+                    [measurement["producer_unit_id"], record.get("timestamp")]
+                )
+                seen = db.execute(
+                    "INSERT OR IGNORE INTO pi_seen VALUES (?,?)",
+                    (session_id, entry_identity),
+                )
+                if seen.rowcount == 0:
+                    return
+            self._append(db, session_id, harness, {**physical, **measurement})
+            return
         source = self._json(
             [physical.get("physical_session_id"), physical.get("physical_subagent_id")]
         )
@@ -246,7 +282,103 @@ class UsageOutbox:
     ) -> None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if harness == "claude-sdk":
+                parent = physical.get("physical_session_id")
+                child = physical.get("physical_subagent_id")
+                if (
+                    not isinstance(parent, str)
+                    or not parent
+                    or (child is not None and not isinstance(child, str))
+                ):
+                    raise ValueError("missing_physical_identity")
+                proof = db.execute(
+                    "SELECT path,conflicted FROM claude_path_proofs WHERE "
+                    "session_id=? AND harness=? AND physical_session_id=? AND "
+                    "physical_subagent_id=?",
+                    (session_id, harness, parent, child or ""),
+                ).fetchone()
+                physical = {
+                    **physical,
+                    "physical_transcript_path": proof[0] if proof and not proof[1] else None,
+                }
             self._observe(db, session_id, harness, physical, record)
+
+    def bind_claude_path(
+        self,
+        session_id: str,
+        physical_session_id: str,
+        physical_subagent_id: str | None,
+        path: str | None,
+    ) -> None:
+        """Persist hook path evidence and release earlier metering-only SDK rows."""
+        if path is not None:
+            try:
+                source = Path(path)
+                if not source.is_absolute() or not source.is_file():
+                    return
+                if str(source.resolve(strict=True)) != path or len(path.encode("utf-8")) > 1024:
+                    return
+                physical = claude_physical_identity(source)
+            except (OSError, ValueError):
+                return
+            if (
+                physical["physical_session_id"] != physical_session_id
+                or physical["physical_subagent_id"] != physical_subagent_id
+            ):
+                path = None
+        child = physical_subagent_id or ""
+        scope = (session_id, "claude-sdk", physical_session_id, child)
+        with self._proof_lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT path,conflicted FROM claude_path_proofs WHERE "
+                "session_id=? AND harness=? AND physical_session_id=? AND physical_subagent_id=?",
+                scope,
+            ).fetchone()
+            conflicted = path is None or (
+                current is not None and (current[1] or current[0] != path)
+            )
+            if current is None:
+                db.execute(
+                    "INSERT INTO claude_path_proofs VALUES (?,?,?,?,?,?)",
+                    (*scope, path if not conflicted else None, int(conflicted)),
+                )
+            elif conflicted:
+                db.execute(
+                    "UPDATE claude_path_proofs SET path=NULL,conflicted=1 WHERE "
+                    "session_id=? AND harness=? AND physical_session_id=? AND "
+                    "physical_subagent_id=?",
+                    scope,
+                )
+            if conflicted:
+                return
+            producer = db.execute(
+                "SELECT producer_id FROM producers WHERE session_id=? AND harness='claude-sdk'",
+                (session_id,),
+            ).fetchone()
+            if producer is None:
+                return
+            for table, keys in (("observations", "sequence"), ("latest", "producer_id,unit_key")):
+                rows = db.execute(
+                    f"SELECT {keys},payload FROM {table} WHERE producer_id=? AND "
+                    "json_extract(payload,'$.physical_session_id')=? AND "
+                    "coalesce(json_extract(payload,'$.physical_subagent_id'),'')=? AND "
+                    "json_extract(payload,'$.physical_transcript_path') IS NULL",
+                    (producer[0], physical_session_id, child),
+                ).fetchall()
+                for row in rows:
+                    payload = json.loads(row[-1])
+                    payload["physical_transcript_path"] = path
+                    if table == "observations":
+                        db.execute(
+                            "UPDATE observations SET payload=? WHERE sequence=?",
+                            (self._json(payload), row[0]),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE latest SET payload=? WHERE producer_id=? AND unit_key=?",
+                            (self._json(payload), row[0], row[1]),
+                        )
 
     def register_source(
         self,
@@ -313,6 +445,9 @@ class UsageOutbox:
                     if not isinstance(record, dict):
                         raise ValueError("invalid_usage_source_record")
                     payload = record.get("payload")
+                    if harness == "pi-native" and record.get("type") == "session":
+                        physical["physical_session_id"] = record.get("id")
+                        physical["upstream_thread_id"] = record.get("id")
                     if harness.startswith("codex-") and isinstance(payload, dict):
                         if record.get("type") == "session_meta":
                             physical["physical_session_id"] = payload.get("id")
@@ -337,10 +472,111 @@ class UsageOutbox:
 
     def scan_registered_sources(self) -> None:
         with self._connect() as db:
+            pi_roots = list(db.execute("SELECT path,session_id FROM pi_roots"))
+        for root, session_id in pi_roots:
+            self._discover_pi_sources(Path(root), session_id, baseline=False)
+        with self._connect() as db:
             sources = [Path(row[0]) for row in db.execute("SELECT path FROM sources")]
         for path in sources:
             if path.is_file():
                 self.scan(path)
+
+    def register_pi_root(self, directory: Path, session_id: str) -> None:
+        """Freeze inherited files only on first registration; retain reconnect cursors."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT session_id FROM pi_roots WHERE path=?", (str(directory),)
+            ).fetchone()
+        if row is not None:
+            if row[0] != session_id:
+                raise ValueError("pi_usage_root_changed")
+            self._discover_pi_sources(directory, session_id, baseline=False, rebase=True)
+            return
+        self._discover_pi_sources(directory, session_id, baseline=True, rebase=True)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR IGNORE INTO pi_roots VALUES (?,?)", (str(directory), session_id))
+
+    def _discover_pi_sources(
+        self, directory: Path, session_id: str, *, baseline: bool, rebase: bool = False
+    ) -> None:
+        if not directory.is_dir():
+            return
+        for path in directory.glob("*.jsonl"):
+            if not path.is_file():
+                continue
+            if self.has_source(path):
+                if not rebase:
+                    continue
+                stat = path.stat()
+                with self._connect() as db:
+                    current = db.execute(
+                        "SELECT identity,offset,metadata FROM sources WHERE path=?",
+                        (str(path),),
+                    ).fetchone()
+                identity = self._json([stat.st_dev, stat.st_ino])
+                if current[0] != identity or current[1] > stat.st_size:
+                    offset = self._remember_pi_baseline(path, session_id)
+                    metadata = json.loads(current[2])
+                    physical_id = self._pi_header_id(path)
+                    metadata["physical_session_id"] = physical_id
+                    metadata["upstream_thread_id"] = physical_id
+                    with self._connect() as db:
+                        db.execute(
+                            "UPDATE sources SET identity=?,offset=?,metadata=? WHERE path=?",
+                            (identity, offset, self._json(metadata), str(path)),
+                        )
+                continue
+            physical = {
+                "harness_family": "pi",
+                "identity_namespace": "pi/session/v1",
+                "physical_transcript_path": str(path.resolve()),
+                "thread_kind": "main",
+            }
+            if baseline:
+                physical_id = self._pi_header_id(path)
+                physical["physical_session_id"] = physical_id
+                physical["upstream_thread_id"] = physical_id
+                offset = self._remember_pi_baseline(path, session_id)
+            else:
+                offset = 0
+            self.register_source(
+                path,
+                session_id,
+                "pi-native",
+                physical,
+                start_offset=offset,
+            )
+
+    @staticmethod
+    def _pi_header_id(path: Path) -> str:
+        with path.open("rb") as transcript:
+            header = json.loads(transcript.readline(1024 * 1024))
+        if (
+            not isinstance(header, dict)
+            or header.get("type") != "session"
+            or not isinstance(header.get("id"), str)
+            or not header["id"]
+        ):
+            raise ValueError("missing_physical_identity")
+        return header["id"]
+
+    def _remember_pi_baseline(self, path: Path, session_id: str) -> int:
+        """Exclude inherited usage entries later copied into a Pi branch file."""
+        with path.open("rb") as transcript, self._connect() as db:
+            while True:
+                line = transcript.readline(16 * 1024 * 1024 + 1)
+                if not line or not line.endswith(b"\n"):
+                    break
+                if len(line) > 16 * 1024 * 1024:
+                    raise ValueError("usage_source_line_too_large")
+                record = json.loads(line)
+                if isinstance(record, dict) and pi_measurement(record) is not None:
+                    db.execute(
+                        "INSERT OR IGNORE INTO pi_seen VALUES (?,?)",
+                        (session_id, self._json([record["id"], record.get("timestamp")])),
+                    )
+            return transcript.tell() - (len(line) if line and not line.endswith(b"\n") else 0)
 
     def has_source(self, path: Path) -> bool:
         with self._connect() as db:
@@ -394,8 +630,17 @@ class UsageOutbox:
             for _ in range(limit):
                 with self._connect() as db:
                     row = db.execute(
-                        "SELECT sequence,producer_id,payload FROM observations "
-                        "ORDER BY sequence LIMIT 1"
+                        "SELECT o.sequence,o.producer_id,o.payload FROM observations o "
+                        "JOIN producers p ON p.producer_id=o.producer_id "
+                        "WHERE p.harness!='claude-sdk' OR EXISTS ("
+                        "SELECT 1 FROM claude_path_proofs c WHERE "
+                        "c.session_id=p.session_id AND c.harness=p.harness AND "
+                        "c.physical_session_id=json_extract("
+                        "o.payload,'$.physical_session_id') AND "
+                        "c.physical_subagent_id=coalesce(json_extract("
+                        "o.payload,'$.physical_subagent_id'),'') AND c.conflicted=0 AND "
+                        "c.path=json_extract(o.payload,'$.physical_transcript_path')) "
+                        "ORDER BY o.sequence LIMIT 1"
                     ).fetchone()
                     if row is None:
                         return
@@ -423,27 +668,61 @@ class UsageOutbox:
                         )
                 else:
                     binding = json.loads(binding_text)
-                observation = {
-                    "ended_at": None,
-                    "time_quality": "reported",
-                    "cost_usd": None,
-                    "cost_basis": "unknown",
-                    "cost_estimated": None,
-                    "account_hint": None,
-                    **{key: value for key, value in binding.items() if key != "producer_id"},
-                    **json.loads(payload),
-                }
-                if observation.get("occurred_at") is None:
-                    observation["time_quality"] = "unknown"
-                response = await client.post(
-                    "/v1/usage-observations",
-                    json={"producer_id": producer_id, "observation": observation},
-                    timeout=30,
-                )
-                response.raise_for_status()
-                if not isinstance(response.json().get("event_id"), str):
-                    raise ValueError("usage_ack_missing")
-                with self._connect() as db:
-                    db.execute("DELETE FROM observations WHERE sequence=?", (sequence,))
+                if harness == "claude-sdk":
+                    try:
+                        self._proof_lock.acquire(timeout=0)
+                    except Timeout:
+                        return
+                try:
+                    if harness == "claude-sdk":
+                        with self._connect() as db:
+                            current = db.execute(
+                                "SELECT payload FROM observations WHERE sequence=?", (sequence,)
+                            ).fetchone()
+                            if current is None or current[0] != payload:
+                                continue
+                            physical = json.loads(payload)
+                            proof = db.execute(
+                                "SELECT path,conflicted FROM claude_path_proofs WHERE "
+                                "session_id=? AND harness=? AND physical_session_id=? AND "
+                                "physical_subagent_id=?",
+                                (
+                                    session_id,
+                                    harness,
+                                    physical["physical_session_id"],
+                                    physical.get("physical_subagent_id") or "",
+                                ),
+                            ).fetchone()
+                            if (
+                                proof is None
+                                or proof[1]
+                                or proof[0] != physical.get("physical_transcript_path")
+                            ):
+                                continue
+                    observation = {
+                        "ended_at": None,
+                        "time_quality": "reported",
+                        "cost_usd": None,
+                        "cost_basis": "unknown",
+                        "cost_estimated": None,
+                        "account_hint": None,
+                        **{key: value for key, value in binding.items() if key != "producer_id"},
+                        **json.loads(payload),
+                    }
+                    if observation.get("occurred_at") is None:
+                        observation["time_quality"] = "unknown"
+                    response = await client.post(
+                        "/v1/usage-observations",
+                        json={"producer_id": producer_id, "observation": observation},
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    if not isinstance(response.json().get("event_id"), str):
+                        raise ValueError("usage_ack_missing")
+                    with self._connect() as db:
+                        db.execute("DELETE FROM observations WHERE sequence=?", (sequence,))
+                finally:
+                    if harness == "claude-sdk":
+                        self._proof_lock.release()
         finally:
             self._drain_lock.release()

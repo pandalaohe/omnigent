@@ -34,6 +34,7 @@ export interface Comment {
   updated_at: number;
   anchor_content: string | null;
   created_by: string | null;
+  screenshot_expires_at?: number;
 }
 
 // ── Query helpers ────────────────────────────────────────────────────────────

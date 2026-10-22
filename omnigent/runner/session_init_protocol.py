@@ -63,6 +63,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     workspace: str | None = None
     worktree: str | None = None
     host_id: str | None = None
+    runner_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -145,6 +146,7 @@ def build_runner_session_init_payload(
             workspace=conversation.workspace,
             worktree=conversation.worktree,
             host_id=conversation.host_id,
+            runner_id=conversation.runner_id,
             labels=drop_server_secret_labels(conversation.labels),
             reasoning_effort=conversation.reasoning_effort,
             model_override=conversation.model_override,

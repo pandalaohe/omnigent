@@ -30,6 +30,7 @@ const {
   session,
   shell,
   systemPreferences,
+  webContents: electronWebContents,
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
@@ -72,7 +73,7 @@ const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
 const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
-const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { createBrowserViewRegistry, persistentAgentPartition } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
@@ -3711,7 +3712,32 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 const guardedAgentSessions = new WeakSet();
 
 /** Enforce the agent navigation policy on document requests at the network layer. */
-function guardAgentPartitionRequests(partition, registry) {
+function registryForAgentWebContents(webContentsId) {
+  for (const state of windows.values()) {
+    const registry = state.browserRegistry;
+    if (registry?.ownsWebContents(webContentsId)) return registry;
+  }
+  return null;
+}
+
+function waitForBrowserContentsDestroyed(contents) {
+  if (contents.isDestroyed()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      contents.removeListener("destroyed", onDestroyed);
+      reject(new Error("browser view did not close"));
+    }, 5000);
+    const onDestroyed = () => {
+      clearTimeout(timer);
+      contents.removeListener("destroyed", onDestroyed);
+      resolve();
+    };
+    contents.once("destroyed", onDestroyed);
+    if (contents.isDestroyed()) onDestroyed();
+  });
+}
+
+function guardAgentPartitionRequests(partition) {
   const ses = session.fromPartition(partition);
   if (guardedAgentSessions.has(ses)) return;
   guardedAgentSessions.add(ses);
@@ -3725,16 +3751,25 @@ function guardAgentPartitionRequests(partition, registry) {
       (cancel) => callback({ cancel }),
       () => callback({ cancel: true }),
     );
-  ses.webRequest.onBeforeRequest(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentRequest(details), callback),
-  );
+  ses.webRequest.onBeforeRequest(filter, (details, callback) => {
+    const registry = registryForAgentWebContents(details.webContentsId);
+    answer(registry ? registry.shouldCancelAgentRequest(details) : Promise.resolve(true), callback);
+  });
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
-    callback(registry.agentRequestHeaders(details)),
+    callback(
+      registryForAgentWebContents(details.webContentsId)?.agentRequestHeaders(details) ?? {},
+    ),
   );
-  ses.webRequest.onHeadersReceived(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentResponse(details), callback),
-  );
+  ses.webRequest.onHeadersReceived(filter, (details, callback) => {
+    const registry = registryForAgentWebContents(details.webContentsId);
+    answer(
+      registry ? registry.shouldCancelAgentResponse(details) : Promise.resolve(true),
+      callback,
+    );
+  });
 }
+
+const clearingBrowserPartitions = new Set();
 
 /**
  * Extra internal hosts/ranges a server lets its agent browse, from the
@@ -3853,7 +3888,7 @@ function createBrowserRegistryForWindow(win) {
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
-      guardAgentPartitionRequests(opts.webPreferences.partition, registry);
+      guardAgentPartitionRequests(opts.webPreferences.partition);
       return view;
     },
     // Resolve and look up proxies through the view's own Chromium session, so
@@ -3863,6 +3898,13 @@ function createBrowserRegistryForWindow(win) {
       return endpoints.map((endpoint) => endpoint.address);
     },
     resolveProxy: (url, partition) => session.fromPartition(partition).resolveProxy(url),
+    partitionForView: (_viewId, defaultPartition) => {
+      const origin = pinnedOrigin(win);
+      return origin && loadSettings().browser_persistent_login === true
+        ? persistentAgentPartition(origin)
+        : defaultPartition();
+    },
+    isPartitionUnavailable: (partition) => clearingBrowserPartitions.has(partition),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
@@ -5038,6 +5080,45 @@ function registerIpc() {
 
   // Embedded browser pane — the `omnigent:browser-*` surface lives in
   // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  ipcMain.handle("omnigent:browser-login-setting:get", (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return { ok: true, enabled: loadSettings().browser_persistent_login === true };
+  });
+  ipcMain.handle("omnigent:browser-login-setting:set", (event, enabled) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    if (typeof enabled !== "boolean") return { ok: false, error: "expected boolean" };
+    const settings = loadSettings();
+    settings.browser_persistent_login = enabled;
+    saveSettings(settings);
+    return { ok: true, enabled };
+  });
+  ipcMain.handle("omnigent:browser-login:clear", async (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const origin = pinnedOrigin(BrowserWindow.fromWebContents(event.sender));
+    const partition = persistentAgentPartition(origin);
+    if (clearingBrowserPartitions.has(partition)) {
+      return { ok: false, error: "browser login is already being cleared" };
+    }
+    clearingBrowserPartitions.add(partition);
+    try {
+      const ses = session.fromPartition(partition);
+      // Closed views can leave their registry before Chromium destroys them.
+      const closing = electronWebContents
+        .getAllWebContents()
+        .filter((contents) => !contents.isDestroyed() && contents.session === ses);
+      for (const state of windows.values()) {
+        closing.push(...(state.browserRegistry?.closePartition(partition, "login-cleared") ?? []));
+      }
+      await Promise.all(closing.map(waitForBrowserContentsDestroyed));
+      await ses.clearStorageData();
+      await ses.clearCache();
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "could not clear browser login" };
+    } finally {
+      clearingBrowserPartitions.delete(partition);
+    }
+  });
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender,

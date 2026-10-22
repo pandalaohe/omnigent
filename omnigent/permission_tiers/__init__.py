@@ -146,7 +146,7 @@ _EDIT_PATH = {
 _EXEC_COMMAND = {"bash": "command", "sys_os_shell": "command", "run_command": "CommandLine"}
 _READ_NO_PATH = frozenset(("sys_terminal_read", "sys_terminal_list"))
 _QUESTION_TOOLS = frozenset(("ask_user", "ask_user_async", "request_user_input"))
-_CONTROL_TOOLS = frozenset(("report_result",))
+_CONTROL_TOOLS = frozenset(("report_result", "sys_read_inbox"))
 
 
 def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:

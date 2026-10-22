@@ -1,9 +1,12 @@
 """Receipt-bound peer delivery through Claude SDK hooks."""
 
 import asyncio
+import json
+import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -13,6 +16,7 @@ from omnigent.inner.claude_sdk_executor import (
     claude_peer_receipts_supported,
 )
 from omnigent.sdk_peer_delivery import SDKPeerInput
+from omnigent.usage_export.outbox import UsageOutbox
 
 
 def _delivery(number: int) -> SDKPeerInput:
@@ -255,3 +259,128 @@ async def test_store_load_none_keeps_sdk_local_resume_path() -> None:
         session_store=cast(Any, store),
     )
     assert await materialize_resume_session(options) is None
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_mirror_and_hook_adapter_bind_child_path_after_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import claude_agent_sdk as sdk
+    from claude_agent_sdk._internal.query import Query
+    from claude_agent_sdk._internal.transcript_mirror_batcher import TranscriptMirrorBatcher
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    projects = tmp_path / "projects"
+    child = projects / "project" / "parent" / "subagents" / "agent-child.jsonl"
+    child.parent.mkdir(parents=True)
+    child.write_text("")
+    executor = ClaudeSDKExecutor()
+    store = _ClaudePeerReceiptStore(executor, "run")
+    options = sdk.ClaudeAgentOptions(session_store=store, session_store_flush="eager")
+    executor._install_usage_path_hooks(cast(Any, sdk), cast(Any, options), "run")
+
+    async def on_error(_key, _error):
+        pytest.fail("SDK mirror delivery failed")
+
+    batcher = TranscriptMirrorBatcher(store, str(projects), on_error)
+    batcher.enqueue(
+        str(child),
+        [
+            {
+                "type": "assistant",
+                "sessionId": "observed-child",
+                "message": {"id": "response", "usage": {"input_tokens": 4, "output_tokens": 2}},
+            }
+        ],
+    )
+    await batcher.flush()
+    spool = UsageOutbox(tmp_path / "runtime" / "usage-export")
+    with sqlite3.connect(spool.path) as db:
+        before = json.loads(db.execute("SELECT payload FROM observations").fetchone()[0])
+    assert before["physical_transcript_path"] is None
+    assert before["physical_session_id"] == "parent"
+    assert before["physical_subagent_id"] == "child"
+
+    transport = SimpleNamespace(write=AsyncMock())
+    hooks = {
+        event: [
+            {"hooks": matcher.hooks, "matcher": matcher.matcher, "timeout": matcher.timeout}
+            for matcher in matchers
+        ]
+        for event, matchers in options.hooks.items()
+    }
+    query = Query(cast(Any, transport), is_streaming_mode=True, hooks=hooks)
+    query._send_control_request = AsyncMock(return_value={})
+    await query.initialize()
+    config = query._send_control_request.call_args.args[0]["hooks"]
+    callback_id = config["SubagentStop"][0]["hookCallbackIds"][0]
+    await query._handle_control_request(
+        cast(
+            Any,
+            {
+                "type": "control_request",
+                "request_id": "hook-1",
+                "request": {
+                    "subtype": "hook_callback",
+                    "callback_id": callback_id,
+                    "input": {
+                        "hook_event_name": "SubagentStop",
+                        "session_id": "parent",
+                        "agent_id": "child",
+                        "transcript_path": str(projects / "project" / "parent.jsonl"),
+                        "agent_transcript_path": str(child),
+                    },
+                },
+            },
+        )
+    )
+    assert json.loads(transport.write.await_args.args[0])["response"]["subtype"] == "success"
+    with sqlite3.connect(spool.path) as db:
+        after = json.loads(db.execute("SELECT payload FROM observations").fetchone()[0])
+    assert after["physical_transcript_path"] == str(child.resolve())
+    assert after["transcript_session_id"] == "observed-child"
+
+
+@pytest.mark.asyncio
+async def test_sdk_batcher_retries_transient_capture_failure_after_peer_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_agent_sdk._internal.transcript_mirror_batcher import TranscriptMirrorBatcher
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    projects = tmp_path / "projects"
+    path = projects / "project" / "parent.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("")
+    executor = ClaudeSDKExecutor()
+    executor._observe_peer_mirror = AsyncMock()
+    store = _ClaudePeerReceiptStore(executor, "run")
+    actual_append = UsageOutbox.append
+    attempts = 0
+
+    def fail_first_append(self, session_id, harness, physical, record):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("temporary write failure")
+        return actual_append(self, session_id, harness, physical, record)
+
+    monkeypatch.setattr(UsageOutbox, "append", fail_first_append)
+    errors = []
+
+    async def on_error(key, message):
+        errors.append((key, message))
+
+    batcher = TranscriptMirrorBatcher(store, str(projects), on_error)
+    batcher.enqueue(
+        str(path),
+        [{"type": "assistant", "message": {"id": "response", "usage": {"input_tokens": 1}}}],
+    )
+    await batcher.flush()
+    assert attempts == 2
+    assert executor._observe_peer_mirror.await_count == 2
+    assert errors == []
+    with sqlite3.connect(UsageOutbox(tmp_path / "runtime" / "usage-export").path) as db:
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1

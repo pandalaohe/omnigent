@@ -125,7 +125,7 @@ def test_native_picker_label_and_wrapper_payload(
         ),
     }
     if harness == "antigravity-native":
-        expected_labels["omnigent.antigravity_native.permission_tier"] = "auto-relaxed"
+        assert body["permission_tier"] == "auto"
     assert body.get("labels") == expected_labels, body
     assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
 

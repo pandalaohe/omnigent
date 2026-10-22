@@ -9,6 +9,8 @@ drift.
 
 from __future__ import annotations
 
+import json
+
 from omnigent import harness_plugins as hp
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
@@ -166,6 +168,9 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "shell_tool_name": None,
         "shell_tool_prompt": None,
         "instruction_delivery": "unknown",
+        "keep_warm_family": None,
+        "calling_defaults": None,
+        "session_modes": None,
     }
 
 
@@ -202,9 +207,8 @@ def test_catalog_rows_include_capabilities() -> None:
     for row in rows:
         if row["id"] in caps:
             assert "capabilities" in row, row["id"]
-            # JSON-serializable: values are primitives, not enums.
-            for value in row["capabilities"].values():
-                assert value is None or isinstance(value, (str, bool))
+            # Nested session-mode and calling-default declarations are wire objects.
+            json.dumps(row["capabilities"])
 
 
 def test_catalog_includes_hermes() -> None:
@@ -218,6 +222,20 @@ def test_catalog_includes_hermes() -> None:
     # The catalog only lists valid harnesses and hermes declares capabilities,
     # so the row must carry the feature matrix like its subprocess peers.
     assert "capabilities" in hermes
+
+
+def test_capabilities_by_harness_covers_non_picker_native_and_sdk_products() -> None:
+    from omnigent.harness_plugins import capabilities_by_harness
+
+    declared = capabilities_by_harness()
+    assert set(declared) == valid_harnesses()
+    assert declared["claude-native"]["integration_mode"] == "native-tui"
+    assert declared["claude-native"]["native_agent_key"] == "claude"
+    assert declared["codex"]["integration_mode"] == "cli-subprocess"
+    assert declared["codex"]["native_agent_key"] is None
+    assert declared["acp"]["integration_mode"] == "acp-subprocess"
+    assert declared["openai-agents"]["label"] is None
+    assert all("session_modes" in row and "calling_defaults" in row for row in declared.values())
 
 
 def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
@@ -365,6 +383,11 @@ def test_every_canonical_harness_declares_instruction_delivery() -> None:
     caps = harness_capabilities()
     for harness in valid_harnesses():
         assert caps[harness].instruction_delivery is not InstructionDelivery.UNKNOWN, harness
+
+
+def test_pi_native_uses_agent_startup_instructions() -> None:
+    caps = harness_capabilities()
+    assert caps["pi-native"].instruction_delivery is InstructionDelivery.AGENT_STARTUP_ADDITIVE
 
 
 def test_sdk_harnesses_only_advertise_effort_their_executor_applies() -> None:

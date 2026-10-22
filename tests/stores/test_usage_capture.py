@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.usage_export.outbox import UsageOutbox
@@ -41,6 +43,136 @@ def _rows(spool: UsageOutbox) -> list[dict]:
             json.loads(row[0])
             for row in db.execute("SELECT payload FROM observations ORDER BY sequence")
         ]
+
+
+def test_pi_native_resume_baseline_and_cache_warm_are_content_free(tmp_path: Path) -> None:
+    spool = UsageOutbox(tmp_path / "spool")
+    root = tmp_path / "pi-sessions"
+    root.mkdir()
+    source = root / "physical.jsonl"
+    header = {"type": "session", "id": "physical-1", "timestamp": "2026-10-20T00:00:00Z"}
+    old = {
+        "type": "message",
+        "id": "old",
+        "timestamp": "2026-10-20T00:00:01Z",
+        "message": {"role": "assistant", "usage": {"input": 100, "output": 1}},
+    }
+    source.write_text(json.dumps(header) + "\n" + json.dumps(old) + "\n")
+    spool.register_pi_root(root, "session")
+    response = {
+        "type": "message",
+        "id": "entry-1",
+        "timestamp": "2026-10-20T00:00:02Z",
+        "message": {
+            "role": "assistant",
+            "model": "model-1",
+            "responseId": "r-1",
+            "content": "must-not-be-stored",
+            "usage": {"input": 3, "output": 2, "cacheRead": 4, "cacheWrite": 5},
+        },
+    }
+    warm = {
+        "type": "usage",
+        "id": "warm-1",
+        "kind": "cache_warm",
+        "timestamp": "2026-10-20T00:00:03Z",
+        "model": "model-1",
+        "note": "must-not-be-stored",
+        "usage": {"input": 0, "output": 0, "cacheRead": 8, "cacheWrite": 2},
+    }
+    compact = {
+        "type": "compaction",
+        "id": "compact-1",
+        "timestamp": "2026-10-20T00:00:04Z",
+        "summary": "must-not-be-stored",
+        "usage": {"input": 1, "output": 3, "cacheRead": 0, "cacheWrite": 0},
+    }
+    with source.open("a") as file:
+        file.write(
+            json.dumps(response) + "\n" + json.dumps(warm) + "\n" + json.dumps(compact) + "\n"
+        )
+    spool.scan_registered_sources()
+    clone = root / "clone.jsonl"
+    clone.write_text(
+        json.dumps({**header, "id": "physical-2"})
+        + "\n"
+        + json.dumps(old)
+        + "\n"
+        + json.dumps(response)
+        + "\n"
+        + json.dumps(warm)
+        + "\n"
+        + json.dumps(compact)
+        + "\n"
+    )
+    UsageOutbox(tmp_path / "spool").scan_registered_sources()
+    rows = _rows(spool)
+    assert [row["producer_unit_id"] for row in rows] != ["old"]
+    assert [
+        (row["input_tokens"], row["cached_input_tokens"], row["cache_write_input_tokens"])
+        for row in rows
+    ] == [(3, 4, 5), (0, 8, 2), (1, 0, 0)]
+    assert rows[0]["logical_call_id"] == "r-1"
+    assert rows[0]["physical_session_id"] == "physical-1"
+    assert rows[1]["logical_call_id"] is None
+    assert "must-not-be-stored" not in str(rows)
+
+
+def test_pi_native_reconnect_before_scan_retains_new_file_usage(tmp_path: Path) -> None:
+    root = tmp_path / "pi-sessions"
+    root.mkdir()
+    spool_dir = tmp_path / "spool"
+    UsageOutbox(spool_dir).register_pi_root(root, "session")
+    source = root / "physical.jsonl"
+    source.write_text(
+        json.dumps({"type": "session", "id": "physical-1"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "message",
+                "id": "entry-1",
+                "timestamp": "2026-10-20T00:00:02Z",
+                "message": {
+                    "role": "assistant",
+                    "responseId": "r-1",
+                    "usage": {"input": 3, "output": 2, "cacheRead": 1, "cacheWrite": 0},
+                },
+            }
+        )
+        + "\n"
+    )
+    reconnected = UsageOutbox(spool_dir)
+    reconnected.register_pi_root(root, "session")
+    reconnected.scan_registered_sources()
+    UsageOutbox(spool_dir).scan_registered_sources()
+    rows = _rows(reconnected)
+    assert len(rows) == 1
+    assert rows[0]["input_tokens"] == 3
+    assert rows[0]["logical_call_id"] == "r-1"
+
+
+def test_pi_rpc_message_preserves_unknown_counters_and_dedupes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.runtime import capture_pi_rpc_message
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    message = {
+        "role": "assistant",
+        "responseId": "r-1",
+        "model": "model-1",
+        "content": "must-not-be-stored",
+        "usage": {"input": 2, "output": 3},
+    }
+    capture_pi_rpc_message("session", message)
+    capture_pi_rpc_message("session", message)
+    rows = _rows(UsageOutbox(tmp_path / "runtime" / "usage-export"))
+    assert len(rows) == 1
+    assert rows[0]["cached_input_tokens"] is None
+    assert rows[0]["cache_write_input_tokens"] is None
+    assert rows[0]["usage_status"] == "partial"
+    assert "must-not-be-stored" not in str(rows)
 
 
 def test_clone_ignores_inherited_calls_and_commits_checkpoint_once(tmp_path: Path) -> None:
@@ -223,6 +355,295 @@ async def test_sdk_mirror_is_persisted_before_peer_routing(
     assert rows[0]["physical_session_id"] == "parent"
     assert rows[0]["physical_subagent_id"] == "child"
     assert rows[0]["physical_transcript_path"] is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_hook_proves_parent_and_child_paths_after_pending_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.runtime import capture_claude_hook_path, capture_claude_mirror
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    project = tmp_path / "projects" / "project"
+    project.mkdir(parents=True)
+    parent = project / "parent.jsonl"
+    parent.write_text("")
+    child = project / "parent" / "subagents" / "agent-child.jsonl"
+    child.parent.mkdir(parents=True)
+    child.write_text("")
+    record = {
+        "type": "assistant",
+        "sessionId": "observed-child",
+        "message": {
+            "id": "response-child",
+            "content": "private-content-must-not-persist",
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+        },
+    }
+    capture_claude_mirror(
+        "run",
+        {"session_id": "parent", "subpath": "subagents/agent-child"},
+        [record],
+        internal=False,
+    )
+    spool = UsageOutbox(tmp_path / "runtime" / "usage-export")
+    assert _rows(spool)[0]["physical_transcript_path"] is None
+
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/usage-producers":
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    **payload,
+                    "agent_id": "agent",
+                    "host_id": "host",
+                    "parent_session_id": None,
+                },
+            )
+        return httpx.Response(200, json={"event_id": "event"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://unit.test"
+    ) as client:
+        await UsageOutbox(spool.path.parent).drain(client)
+        assert requests == []
+        capture_claude_hook_path(
+            "run",
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "parent",
+                "agent_id": "child",
+                "transcript_path": str(parent),
+                "agent_transcript_path": str(child),
+            },
+        )
+        assert _rows(UsageOutbox(spool.path.parent))[0]["physical_transcript_path"] == str(
+            child.resolve()
+        )
+        await UsageOutbox(spool.path.parent).drain(client)
+    assert [request.url.path for request in requests] == [
+        "/v1/usage-producers",
+        "/v1/usage-observations",
+    ]
+    sent = json.loads(requests[-1].content)["observation"]
+    assert sent["physical_session_id"] == "parent"
+    assert sent["physical_subagent_id"] == "child"
+    assert sent["transcript_session_id"] == "observed-child"
+    assert sent["physical_transcript_path"] == str(child.resolve())
+    assert "private-content-must-not-persist" not in str(sent)
+
+    capture_claude_hook_path(
+        "run",
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "parent",
+            "transcript_path": str(parent),
+        },
+    )
+    capture_claude_mirror(
+        "run",
+        {"session_id": "parent"},
+        [{**record, "message": {**record["message"], "id": "response-parent"}}],
+        internal=False,
+    )
+    assert _rows(UsageOutbox(spool.path.parent))[-1]["physical_transcript_path"] == str(
+        parent.resolve()
+    )
+
+
+def test_sdk_conflicting_hook_path_keeps_mirror_identity_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.runtime import capture_claude_hook_path, capture_claude_mirror
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    child = tmp_path / "projects" / "project" / "parent" / "subagents" / "agent-other.jsonl"
+    child.parent.mkdir(parents=True)
+    child.write_text("")
+    capture_claude_hook_path(
+        "run",
+        {
+            "hook_event_name": "SubagentStop",
+            "session_id": "parent",
+            "agent_id": "child",
+            "agent_transcript_path": str(child),
+        },
+    )
+    child = child.with_name("agent-child.jsonl")
+    child.write_text("")
+    capture_claude_hook_path(
+        "run",
+        {
+            "hook_event_name": "SubagentStop",
+            "session_id": "parent",
+            "agent_id": "child",
+            "agent_transcript_path": str(child),
+        },
+    )
+    capture_claude_mirror(
+        "run",
+        {"session_id": "parent", "subpath": "subagents/agent-child"},
+        [{"type": "assistant", "message": {"id": "response", "usage": {"input_tokens": 1}}}],
+        internal=False,
+    )
+    assert (
+        _rows(UsageOutbox(tmp_path / "runtime" / "usage-export"))[0]["physical_transcript_path"]
+        is None
+    )
+
+
+def test_sdk_path_proof_uses_canonical_identity_across_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export.runtime import capture_claude_hook_path, capture_claude_mirror
+
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "runtime"))
+    project = tmp_path / "projects" / "project"
+    project.mkdir(parents=True)
+    parent = project / "parent.jsonl"
+    parent.write_text("")
+    alias_dir = tmp_path / "project-alias"
+    alias_dir.symlink_to(project, target_is_directory=True)
+    record = {"type": "assistant", "message": {"id": "call", "usage": {"input_tokens": 1}}}
+    capture_claude_hook_path(
+        "run",
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "parent",
+            "transcript_path": str(alias_dir / "parent.jsonl"),
+        },
+    )
+    capture_claude_mirror("run", {"session_id": "parent"}, [record], internal=False)
+    rows = _rows(UsageOutbox(tmp_path / "runtime" / "usage-export"))
+    assert rows[0]["physical_transcript_path"] == str(parent.resolve())
+
+    wrong = project / "other.jsonl"
+    wrong.write_text("")
+    alias_file = project / "parent-alias.jsonl"
+    alias_file.symlink_to(wrong)
+    capture_claude_hook_path(
+        "other-run",
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "parent",
+            "transcript_path": str(alias_file),
+        },
+    )
+    capture_claude_mirror("other-run", {"session_id": "parent"}, [record], internal=False)
+    rows = _rows(UsageOutbox(tmp_path / "runtime" / "usage-export"))
+    assert rows[-1]["physical_transcript_path"] is None
+
+    capture_claude_hook_path(
+        "third-run",
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "parent",
+            "transcript_path": "relative/parent.jsonl",
+        },
+    )
+    capture_claude_mirror("third-run", {"session_id": "parent"}, [record], internal=False)
+    rows = _rows(UsageOutbox(tmp_path / "runtime" / "usage-export"))
+    assert rows[-1]["physical_transcript_path"] is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_drain_rechecks_path_after_producer_registration(
+    tmp_path: Path,
+) -> None:
+    spool = UsageOutbox(tmp_path / "spool")
+    project = tmp_path / "projects" / "project"
+    project.mkdir(parents=True)
+    parent = project / "parent.jsonl"
+    other = project / "other.jsonl"
+    parent.write_text("")
+    other.write_text("")
+    spool.bind_claude_path("run", "parent", None, str(parent.resolve()))
+    spool.append(
+        "run",
+        "claude-sdk",
+        {"physical_session_id": "parent", "physical_subagent_id": None},
+        {"type": "assistant", "message": {"id": "response", "usage": {"input_tokens": 1}}},
+    )
+    paths = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/v1/usage-producers":
+            spool.bind_claude_path("run", "parent", None, str(other.resolve()))
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    **payload,
+                    "agent_id": "agent",
+                    "host_id": "host",
+                    "parent_session_id": None,
+                },
+            )
+        pytest.fail("conflicted SDK observation was sent")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://unit.test"
+    ) as client:
+        await spool.drain(client)
+    assert paths == ["/v1/usage-producers"]
+    assert len(_rows(spool)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sdk_drain_serializes_conflict_with_observation_post(tmp_path: Path) -> None:
+    spool = UsageOutbox(tmp_path / "spool")
+    project = tmp_path / "projects" / "project"
+    project.mkdir(parents=True)
+    parent = project / "parent.jsonl"
+    other = project / "other.jsonl"
+    parent.write_text("")
+    other.write_text("")
+    spool.bind_claude_path("run", "parent", None, str(parent.resolve()))
+    spool.append(
+        "run",
+        "claude-sdk",
+        {"physical_session_id": "parent", "physical_subagent_id": None},
+        {"type": "assistant", "message": {"id": "response", "usage": {"input_tokens": 1}}},
+    )
+    conflict_task = None
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal conflict_task
+        if request.url.path == "/v1/usage-producers":
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    **payload,
+                    "agent_id": "agent",
+                    "host_id": "host",
+                    "parent_session_id": None,
+                },
+            )
+        conflict_task = asyncio.create_task(
+            asyncio.to_thread(spool.bind_claude_path, "run", "parent", None, str(other.resolve()))
+        )
+        await asyncio.sleep(0.05)
+        assert not conflict_task.done()
+        return httpx.Response(200, json={"event_id": "event"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://unit.test"
+    ) as client:
+        await spool.drain(client)
+    assert conflict_task is not None
+    await asyncio.wait_for(conflict_task, timeout=5)
+    assert _rows(spool) == []
+    with sqlite3.connect(spool.path) as db:
+        assert db.execute("SELECT conflicted FROM claude_path_proofs").fetchone()[0] == 1
 
 
 def test_sdk_cleanup_persists_usage_before_removing_its_home(

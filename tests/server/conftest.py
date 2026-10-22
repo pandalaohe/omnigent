@@ -49,6 +49,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 # ── Controllable mock LLM ─────────────────────────────
 
@@ -674,7 +675,11 @@ async def _app_client(
 
     try:
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers=PERMISSION_TIERS_HEADERS,
+        ) as c:
             yield c
     finally:
         # Release blocked mock calls so background threads can finish.

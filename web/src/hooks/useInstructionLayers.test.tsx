@@ -1,9 +1,13 @@
+import type { InstructionLayers } from "./useInstructionLayers";
+import type { Host } from "@/hooks/useHosts";
 import type { ReactNode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import {
+  instructionRegistryItems,
+  visibleInstructionAgents,
   useInstructionPreview,
   useInstructionRevisions,
   useSaveInstructionLayer,
@@ -91,4 +95,37 @@ it("loads revision history for just the selected layer", async () => {
   );
   expect(result.current.data?.data[0]?.text).toBe("older");
   client.clear();
+});
+
+it("shows only nonblank agent/independent layers and this-visit additions", () => {
+  const data = {
+    data: [
+      { scope: "agent", agent_key: "codex", text: "C" },
+      { scope: "independent", agent_key: "claude", text: "I" },
+      { scope: "agent", agent_key: "empty", text: "  " },
+      { scope: "host", agent_key: "", text: "Host" },
+    ],
+    agents: ["codex", "claude", "empty", "new"].map((key) => ({ key, display_name: key })),
+  } as InstructionLayers;
+  expect(visibleInstructionAgents(data, new Set()).map((a) => a.key)).toEqual(["codex", "claude"]);
+  expect(visibleInstructionAgents(data, new Set(["new"])).map((a) => a.key)).toEqual([
+    "codex",
+    "claude",
+    "new",
+  ]);
+});
+it("uses descriptor harnesses for section and owner-host deployment", () => {
+  const agents = [{ key: "plugin", display_name: "Plugin", harnesses: ["acp:plugin"] }];
+  const capabilities = { acp: { integration_mode: "acp-subprocess" } };
+  const items = instructionRegistryItems(agents, capabilities, [
+    {
+      host_id: "host-a",
+      name: "Example",
+      owner: "local",
+      status: "offline",
+      configured_harnesses: { "acp:plugin": false },
+    } satisfies Host,
+  ]);
+  expect(items[0]).toMatchObject({ key: "plugin", section: "acp", deployed: false });
+  expect(instructionRegistryItems(agents, capabilities, [])[0].deployed).toBe(true);
 });

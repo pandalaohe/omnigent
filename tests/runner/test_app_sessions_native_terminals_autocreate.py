@@ -4377,7 +4377,13 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         terminal_registry=terminal_registry,
     )
 
-    async with _runner_client(app) as client:
+    async with _runner_client(
+        app,
+        permission_harness="antigravity-native",
+        permission_snapshot={
+            "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: scenario.bridge_id_label}
+        },
+    ) as client:
         resp = await client.post(
             "/v1/sessions",
             json={

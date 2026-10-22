@@ -522,6 +522,7 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
                 {
                     "host_id": host.host_id,
                     "workspace": str(workspace),
+                    "permission_tier": "full",
                     "labels": {
                         "omnigent.ui": "terminal",
                         "omnigent.wrapper": "pi-native-ui",

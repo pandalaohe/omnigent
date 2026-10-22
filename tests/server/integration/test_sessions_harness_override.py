@@ -35,12 +35,11 @@ class _CaptureClient:
         self._captured["body"] = json
         self._captured.setdefault("posts", []).append((path, json))
 
-        class _Resp:
-            status_code = 202
-            headers: dict[str, str] = {}
-            text = ""
-
-        return _Resp()
+        return httpx.Response(
+            202,
+            json=self._captured.get("response_body", {}),
+            request=httpx.Request("POST", "http://runner" + path),
+        )
 
     async def get(self, *_: Any, **__: Any) -> Any:
         raise NotImplementedError
@@ -291,10 +290,12 @@ async def test_create_session_init_carries_harness_override(
 
 
 @pytest.mark.parametrize("override", ["pi", "acp:goose"])
+@pytest.mark.parametrize("permission_ack", [False, True])
 async def test_patch_rebind_init_carries_harness_override(
     client: httpx.AsyncClient,
     override: str,
     monkeypatch: pytest.MonkeyPatch,
+    permission_ack: bool,
 ) -> None:
     """The PATCH rebind's runner notification must carry the override.
 
@@ -326,8 +327,21 @@ async def test_patch_rebind_init_carries_harness_override(
     sid = resp.json()["id"]
     captured.pop("posts", None)
 
+    if permission_ack:
+        captured["response_body"] = {
+            "permission_tiers_capability": "permission_tiers_v1",
+            "permission_tier_revision": 1,
+            "permission_tier_runtime_id": "a" * 32,
+        }
+
     patch = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_bound_late"})
     assert patch.status_code == 200, patch.text
+    if override == "pi":
+        snapshot_after = (await client.get(f"/v1/sessions/{sid}")).json()
+        assert snapshot_after["permission_tier_state"] == (
+            "ready" if permission_ack else "blocked"
+        )
+        assert snapshot_after["permission_tiers_capability"] is permission_ack
 
     init_posts = [body for path, body in captured.get("posts", []) if path == "/v1/sessions"]
     assert init_posts, (

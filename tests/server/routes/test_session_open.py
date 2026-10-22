@@ -307,8 +307,12 @@ async def test_runner_token_is_required(open_env: dict[str, Any]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_sender_refused(open_env: dict[str, Any]) -> None:
-    """A child session may not open another session."""
+@pytest.mark.parametrize("mode", ["off", "subagents", "all"])
+@pytest.mark.parametrize("caller_is_child", [False, True])
+async def test_child_sender_open_switch(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, mode: str, caller_is_child: bool
+) -> None:
+    """The root owner's opt-in controls a child's open request."""
     env = open_env
     child_token = secrets.token_hex(16)
     child = env["conversations"].create_conversation(
@@ -318,10 +322,22 @@ async def test_child_sender_refused(open_env: dict[str, Any]) -> None:
         runner_id=token_bound_runner_id(child_token),
     )
     env["permissions"].grant(ALICE, child.id, LEVEL_OWNER)
+    env["app"].state.user_preferences_store = _FakePreferences({"sessionRestrictions": mode})
+    captured = _patch_create(env, monkeypatch)
     async with await _client(env) as client:
-        data = await _post(client, child.id, child_token)
-    assert data["state"] == "refused"
-    assert data["reason"] == "is_subagent"
+        data = await _post(
+            client,
+            child.id if caller_is_child else env["sender"].id,
+            child_token if caller_is_child else env["sender_token"],
+        )
+    if mode == "off" or not caller_is_child:
+        assert data["state"] == "opened", data
+        assert captured["body"].parent_session_id is None
+    else:
+        assert data["state"] == "refused"
+        assert data["reason"] == "is_subagent"
+        assert "final output" in data["message"]
+        assert captured == {}
 
 
 @pytest.mark.asyncio
@@ -369,6 +385,23 @@ async def test_host_not_found_lists_rooted_hosts(open_env: dict[str, Any]) -> No
     assert data["state"] == "needs_input"
     assert data["reason"] == "host_not_found"
     assert data["candidates"] == [{"id": HOST_ID, "name": HOST_NAME}]
+
+
+@pytest.mark.parametrize("by_id", [False, True])
+async def test_archived_project_is_refused(open_env: dict[str, Any], by_id: bool) -> None:
+    env = open_env
+    project = env["projects"].list(user_id=ALICE)[0]
+    env["projects"].begin_archive_op(project.id, user_id=ALICE, kind="archive")
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            project=project.id if by_id else project.name,
+        )
+    assert data["state"] == "refused"
+    assert data["reason"] == "project_archived"
+    assert project.name in data["message"]
 
 
 @pytest.mark.asyncio

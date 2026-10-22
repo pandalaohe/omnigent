@@ -59,6 +59,57 @@ def _stub_permission_start_for_routing_test(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_pi_rpc_relay_is_ready_before_permission_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+    from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
+
+    _stub_permission_start_for_routing_test(monkeypatch)
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-relay-agent",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+    )
+    app, process_manager = await _build_app_for_spec(spec)
+    session_id = "5b0c1f7a4d2e4c8fa1b3d6e9c0f2a4b6"
+    observed: list[str] = []
+    original_post = process_manager._client.post
+
+    async def post(url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if url == "/v1/permission-tier/bootstrap":
+            import json as json_module
+
+            relay_file = pi_bridge.bridge_dir_for_session_id(session_id) / "tool_relay.json"
+            info = json_module.loads(relay_file.read_text(encoding="utf-8"))
+            assert info["session_id"] == session_id
+            observed.append("relay-before-bootstrap")
+        return await original_post(url, json=json, timeout=timeout)
+
+    process_manager._client.post = post  # type: ignore[method-assign]
+    payload = {
+        "session_id": session_id,
+        "agent_id": "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d",
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "test",
+            "session_id": session_id,
+            "agent_id": "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d",
+            "snapshot": {
+                "created_at": 1,
+                "updated_at": 1,
+                "labels": {PERMISSION_STATE_LABEL_KEY: "full"},
+            },
+        },
+    }
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+        assert response.status_code == 201, response.text
+        assert observed == ["relay-before-bootstrap"]
+
+
+@pytest.mark.asyncio
 async def test_session_labels_for_runner_spawn_timeout_is_quiet(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

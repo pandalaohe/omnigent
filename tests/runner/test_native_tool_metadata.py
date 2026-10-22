@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
+from omnigent.harnesses.pi_native.bridge import write_extension_files
+from omnigent.inner.codex_executor import _dynamic_tool_specs
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.runner import create_runner_app, tool_dispatch
 from omnigent.runner.app import ResolvedSpec
@@ -17,6 +20,40 @@ from omnigent.spec.types import AgentSpec, LocalToolInfo, ToolRuntime
 from omnigent.tools import ToolManager
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient
+
+
+def test_history_and_peer_send_reach_codex_sdk_and_pi_registration(tmp_path: Path) -> None:
+    """A peer child receives read/history and by-id send at both tool entrypoints."""
+    spec = AgentSpec(spec_version=1)
+    manager = ToolManager(spec, peer_messaging_enabled=True)
+    try:
+        codex_tools = _dynamic_tool_specs(
+            [schema["function"] for schema in manager.get_tool_schemas()]
+        )
+    finally:
+        manager.shutdown()
+    codex_names = {tool["name"] for tool in codex_tools}
+    assert {"sys_session_get_history", "sys_session_send"} <= codex_names
+    codex_send = next(tool for tool in codex_tools if tool["name"] == "sys_session_send")
+    assert "session_id" in codex_send["inputSchema"]["properties"]
+    assert "agent" not in codex_send["inputSchema"]["properties"]
+
+    native_tools = tool_dispatch.build_native_relay_tool_schemas(spec, peer_messaging_enabled=True)
+    _extension, config = write_extension_files(
+        tmp_path / "pi-bridge",
+        session_id="conv_child",
+        server_url="http://omnigent.example/",
+        conversation_url="http://omnigent.example/c/conv_child",
+        auth_headers={},
+        tools=native_tools,
+    )
+    pi_tools = json.loads(config.read_text())["tools"]
+    pi_names = {tool["name"] for tool in pi_tools}
+    assert {"sys_session_get_history", "sys_session_send"} <= pi_names
+    pi_send = next(tool for tool in pi_tools if tool["name"] == "sys_session_send")
+    assert "session_id" in pi_send["parameters"]["properties"]
+    assert "agent" not in pi_send["parameters"]["properties"]
+    assert "sys_session_create" not in codex_names | pi_names
 
 
 @pytest.mark.posix_only

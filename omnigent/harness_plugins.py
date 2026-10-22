@@ -11,7 +11,7 @@ import importlib
 import importlib.metadata
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TypeVar, cast
 
 from omnigent._wrapper_labels import (
@@ -34,6 +34,7 @@ from omnigent._wrapper_labels import (
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
+    CallingDefaultsSupport,
     EffortFamily,
     Elicitation,
     ForkHistory,
@@ -44,6 +45,11 @@ from omnigent.harness_capabilities import (
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.session_default_modes import (
+    BUILTIN_MODE_HANDLERS,
+    BUILTIN_SESSION_MODES,
+    ModeHandler,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -136,6 +142,9 @@ class HarnessContribution:
     # Declared feature set per harness id ("what can this harness do?"). Sparse
     # is allowed — a harness with no entry simply has no declared capabilities.
     capabilities: dict[str, HarnessCapabilities] = field(default_factory=dict)
+    # Harness id -> seeded product agent name. Native products use native_agents.
+    product_agents: dict[str, str] = field(default_factory=dict)
+    mode_handlers: dict[str, ModeHandler] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -369,6 +378,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        keep_warm_family="claude",
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
@@ -384,6 +394,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        keep_warm_family="codex",
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -404,7 +415,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
-        instruction_delivery=_ID.FIRST_USER_PREFIX,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -592,6 +603,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
         instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
+        keep_warm_family="claude",
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
@@ -604,6 +616,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
+        keep_warm_family="codex",
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,
@@ -753,6 +766,29 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 # same generic wrap as the "acp" harness, so they share its declared profile.
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
+
+# The capability record owns the settings affordance; these values match the
+# pre-registry model-options and SDK fallback paths.
+for _harness, _parent in {
+    "codex-native": None,
+    "codex": "codex-native",
+    "claude-native": None,
+    "claude-sdk": "claude-native",
+    "pi-native": None,
+    "pi": "pi-native",
+    "devin-native": None,
+    "antigravity-native": None,
+    "acp": None,
+    **dict.fromkeys(ACP_CLI_HARNESSES),
+}.items():
+    _BUILTIN_CAPABILITIES[_harness] = replace(
+        _BUILTIN_CAPABILITIES[_harness],
+        calling_defaults=CallingDefaultsSupport(model_options=True, inherits_from=_parent),
+    )
+for _harness, _modes in BUILTIN_SESSION_MODES.items():
+    _BUILTIN_CAPABILITIES[_harness] = replace(
+        _BUILTIN_CAPABILITIES[_harness], session_modes=_modes
+    )
 
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
@@ -946,6 +982,12 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
+    mode_handlers=BUILTIN_MODE_HANDLERS,
+    product_agents={
+        "claude-sdk": "claude-sdk",
+        "codex": "codex-sdk",
+        **{name: name for name in ACP_CLI_HARNESSES},
+    },
 )
 
 _state: HarnessPluginState | None = None
@@ -987,6 +1029,7 @@ def _harness_spellings(contribution: HarnessContribution) -> set[str]:
         | set(contribution.missing_install_package)
         | set(contribution.harness_labels)
         | set(contribution.capabilities)
+        | set(contribution.product_agents)
     )
 
 
@@ -1005,6 +1048,12 @@ def _native_agent_identity_values(contribution: HarnessContribution) -> set[str]
         if agent.subagent_wrapper_label:
             values.add(agent.subagent_wrapper_label)
     return values
+
+
+def _product_agent_names(contribution: HarnessContribution) -> list[str]:
+    return [agent.agent_name for agent in contribution.native_agents] + list(
+        contribution.product_agents.values()
+    )
 
 
 def _validate_community_contribution(
@@ -1032,10 +1081,24 @@ def _validate_community_contribution(
     existing_harness_spellings: set[str] = set()
     existing_install_keys: set[str] = set()
     existing_native_agent_values: set[str] = set()
+    existing_product_agent_names: set[str] = set()
     for accepted in existing:
         existing_harness_spellings.update(_harness_spellings(accepted))
         existing_install_keys.update(accepted.install_specs)
         existing_native_agent_values.update(_native_agent_identity_values(accepted))
+        existing_product_agent_names.update(_product_agent_names(accepted))
+
+    product_agent_names = _product_agent_names(contribution)
+    duplicate_product_names = sorted(
+        name
+        for name in set(product_agent_names)
+        if product_agent_names.count(name) > 1 or name in existing_product_agent_names
+    )
+    if duplicate_product_names:
+        return (
+            f"community harness plugin {entry_point_name!r} attempts to override "
+            f"product agent names: {duplicate_product_names}"
+        )
 
     harness_collisions = existing_harness_spellings.intersection(_harness_spellings(contribution))
     if harness_collisions:
@@ -1060,6 +1123,30 @@ def _validate_community_contribution(
             f"existing native-agent keys: {sorted(native_agent_collisions)}"
         )
 
+    existing_handlers = {name for item in existing for name in item.mode_handlers}
+    handler_collisions = existing_handlers.intersection(contribution.mode_handlers)
+    if handler_collisions:
+        return (
+            f"community harness plugin {entry_point_name!r} attempts to override "
+            f"existing mode handlers: {sorted(handler_collisions)}"
+        )
+    for name, handler in contribution.mode_handlers.items():
+        if not name or not callable(handler):
+            return (
+                f"community harness plugin {entry_point_name!r} has invalid mode handler {name!r}"
+            )
+    available_handlers = existing_handlers | set(contribution.mode_handlers)
+    for harness, capability in contribution.capabilities.items():
+        modes = capability.session_modes
+        if modes is None:
+            continue
+        for mode in (modes.permission, modes.speed):
+            if mode is not None and mode.handler not in available_handlers:
+                return (
+                    f"community harness plugin {entry_point_name!r} declares unregistered "
+                    f"mode handler {mode.handler!r} for {harness!r}"
+                )
+
     allowed_targets = set(contribution.valid_harnesses)
     for harness, spec in contribution.background_title_generators.items():
         if harness not in allowed_targets:
@@ -1077,6 +1164,12 @@ def _validate_community_contribution(
             return (
                 f"community harness plugin {entry_point_name!r} alias {alias!r} "
                 f"targets {target!r}, which is not contributed by the plugin"
+            )
+    for harness in contribution.product_agents:
+        if harness not in allowed_targets:
+            return (
+                f"community harness plugin {entry_point_name!r} declares a product agent "
+                f"for undeclared harness {harness!r}"
             )
     return None
 
@@ -1243,6 +1336,58 @@ def harness_capabilities() -> dict[str, HarnessCapabilities]:
     harness do?".
     """
     return _merge_dict(lambda contribution: contribution.capabilities)
+
+
+def capability_for_harness(harness: str | None) -> HarnessCapabilities | None:
+    """Read a concrete harness, retaining generic ACP agents' base capability."""
+    capabilities = harness_capabilities()
+    if harness is None:
+        return None
+    return capabilities.get(harness) or (
+        capabilities.get("acp") if harness.startswith("acp:") else None
+    )
+
+
+def mode_handlers() -> dict[str, ModeHandler]:
+    """Return handlers from accepted contributions only."""
+    return _merge_dict(lambda contribution: contribution.mode_handlers)
+
+
+def product_agent_harnesses() -> dict[str, str]:
+    """Map seeded product-agent names to the harness they represent."""
+    products = {agent.agent_name: agent.harness for agent in native_agents()}
+    for harness, agent_name in _merge_dict(
+        lambda contribution: contribution.product_agents
+    ).items():
+        products[agent_name] = harness
+    return products
+
+
+def capabilities_by_harness() -> dict[str, dict[str, object]]:
+    """Describe every canonical harness, including ones absent from picker rows."""
+    labels = harness_labels()
+    native = {agent.harness: agent for agent in native_agents()}
+    capabilities = harness_capabilities()
+    return {
+        harness: {
+            "label": labels.get(harness)
+            or (native[harness].display_name if harness in native else None),
+            "native_agent_key": native[harness].key if harness in native else None,
+            **(
+                capabilities[harness].as_dict()
+                if harness in capabilities
+                else {
+                    "integration_mode": None,
+                    "fork_history": None,
+                    "instruction_delivery": None,
+                    "keep_warm_family": None,
+                    "calling_defaults": None,
+                    "session_modes": None,
+                }
+            ),
+        }
+        for harness in sorted(valid_harnesses())
+    }
 
 
 def harness_catalog() -> list[dict[str, object]]:

@@ -501,10 +501,10 @@ def test_owner_element_anchor_row_carries_annotation(
     store: _InMemoryCommentStore,
 ) -> None:
     """
-    An owner element anchor surfaces as a parsed ``annotation`` on its row.
+    Owner and sent visitor anchors surface parsed ``annotation`` geometry.
 
     The agent reads the structured payload to re-find the annotated element;
-    visitor rows with the same anchor shape must not gain the key.
+    Visitor geometry retains its untrusted source marker and note.
     """
     anchor_content = (
         ELEMENT_ANCHOR_PREFIX
@@ -526,7 +526,9 @@ def test_owner_element_anchor_row_carries_annotation(
     rows = {c["id"]: c for c in result["comments"]}
 
     assert rows[owner.id]["annotation"]["target"]["label"] == "div.a"
-    assert "annotation" not in rows[visitor.id]
+    assert rows[visitor.id]["annotation"]["target"]["label"] == "div.a"
+    assert rows[visitor.id]["source"] == "visitor"
+    assert rows[visitor.id]["note"] == VISITOR_COMMENT_NOTE
 
 
 def test_comment_fields_are_complete(

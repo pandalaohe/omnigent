@@ -1,4 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { harnessSection, reportedOnAnyHost, type RegistryItem } from "@/hooks/useAgentRegistry";
+import type { Host } from "@/hooks/useHosts";
+import type { HarnessCapability } from "@/lib/agentLabels";
 import { authenticatedFetch } from "@/lib/identity";
 
 export type LayerScope = "shared" | "agent" | "host" | "independent" | "mother" | "child";
@@ -28,11 +31,56 @@ export interface InstructionRouteSize {
 }
 export interface InstructionLayers {
   data: InstructionLayer[];
-  agents: { key: string; display_name: string }[];
+  agents: {
+    key: string;
+    display_name: string;
+    harnesses?: string[];
+    subject?: { name: string; harness: string };
+  }[];
   order: string[];
   route_sizes: InstructionRouteSize[];
   size_reminder_chars: number;
 }
+/** Picker membership comes from the same descriptors that validate saved layer keys. */
+export function instructionRegistryItems(
+  agents: InstructionLayers["agents"],
+  capabilities: Record<string, HarnessCapability>,
+  hosts: readonly Host[],
+): RegistryItem[] {
+  return agents.map((agent) => {
+    const harnesses =
+      agent.harnesses ??
+      Object.keys(capabilities).filter((h) => capabilities[h].native_agent_key === agent.key);
+    const harness = harnesses[0] ?? null;
+    const capability = (h: string | null) =>
+      h ? (capabilities[h] ?? (h.startsWith("acp:") ? capabilities.acp : undefined)) : undefined;
+    return {
+      key: agent.key,
+      label: agent.display_name,
+      harness,
+      source: "builtin",
+      description: null,
+      section: harnessSection(capability(harness)?.integration_mode, harness),
+      deployed:
+        harnesses.length === 0 || harnesses.some((h) => reportedOnAnyHost(h, capability(h), hosts)),
+    };
+  });
+}
+
+export function visibleInstructionAgents(
+  data: InstructionLayers,
+  added: ReadonlySet<string>,
+): InstructionLayers["agents"] {
+  const configured = new Set(
+    data.data
+      .filter(
+        (layer) => (layer.scope === "agent" || layer.scope === "independent") && layer.text.trim(),
+      )
+      .map((layer) => layer.agent_key),
+  );
+  return data.agents.filter((agent) => added.has(agent.key) || configured.has(agent.key));
+}
+
 export interface InstructionPreview {
   subject: { name: string; harness: string | null };
   route: {

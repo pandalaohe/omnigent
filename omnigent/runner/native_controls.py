@@ -1905,16 +1905,17 @@ def build_native_controls(
         *,
         error_code: str,
         context: str,
+        terminal_name: str = "codex",
     ) -> Response:
-        """Type one slash command into a live codex pane."""
+        """Type one slash command into a live native pane."""
         registry = resource_registry.terminal_registry
-        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        instance = registry.get(conv_id, terminal_name, "main") if registry is not None else None
         if instance is None or not instance.running:
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": error_code,
-                    "detail": "Codex terminal is not running; reconnect first.",
+                    "detail": f"{terminal_name.title()} terminal is not running; reconnect first.",
                 },
             )
 

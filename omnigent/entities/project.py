@@ -42,3 +42,5 @@ class Project:
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = field(default_factory=dict)
+    archived_at: int | None = None
+    archive_state: dict[str, Any] = field(default_factory=dict)

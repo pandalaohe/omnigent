@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { useCodexRateLimits, useHosts } from "@/hooks/useHosts";
+import { registrySourceLabels, useAgentRegistry } from "@/hooks/useAgentRegistry";
 import { useSession } from "@/hooks/useSession";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
@@ -8,7 +9,6 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { SavedContextSources } from "@/components/SavedContextSources";
 import { Switch } from "@/components/ui/switch";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { formatTokenCountShort } from "@/lib/formatCost";
 import {
   formatProviderUsageLimits,
@@ -51,6 +51,7 @@ function SourceValue({ label, value }: { label: string; value: string }) {
 
 export function ContextUsageSettings() {
   const preferences = useUsageContextPreferences();
+  const registry = useAgentRegistry();
   const conversationId = useChatStore((state) => state.conversationId);
   const agentName = useChatStore((state) => state.boundAgentName);
   const harness = useChatStore((state) => state.sessionHarness);
@@ -159,7 +160,8 @@ export function ContextUsageSettings() {
   const hostName = session?.hostId
     ? (hosts.find((host) => host.host_id === session.hostId)?.name ?? "Unknown computer")
     : "Server";
-  const harnessName = harness ? (BRAIN_HARNESS_LABELS[harness] ?? harness) : "Unknown";
+  const sourceLabels = registrySourceLabels(registry.items, agentName, harness);
+  const harnessName = sourceLabels.harnessLabel;
   const providerLimits: ProviderUsageLimitsSnapshot | null = useStableProviderUsageLimits({
     preferences,
     sourceKey,
@@ -200,7 +202,7 @@ export function ContextUsageSettings() {
         </div>
         <div className="grid gap-2 rounded-xl border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2">
           <SourceValue label="Computer" value={hostName} />
-          <SourceValue label="Agent" value={agentName || "Unknown"} />
+          <SourceValue label="Agent" value={sourceLabels.agentLabel} />
           <SourceValue label="Harness" value={harnessName} />
           <SourceValue label="Model" value={model || "Auto"} />
         </div>
@@ -287,6 +289,7 @@ export function ContextUsageSettings() {
           session’s reported values. Manual values change only this indicator.
         </p>
         <SavedContextSources
+          registryItems={registry.items}
           preferences={preferences}
           currentSourceKey={sourceKey}
           hosts={hosts}

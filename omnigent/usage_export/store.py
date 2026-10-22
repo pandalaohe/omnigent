@@ -240,7 +240,14 @@ class UsageEventStore:
                 raise UsageExportError(400, "invalid_producer_binding")
             else:
                 result[name] = value
-        if result["harness"] not in {"codex-native", "codex-sdk", "claude-native", "claude-sdk"}:
+        if result["harness"] not in {
+            "codex-native",
+            "codex-sdk",
+            "claude-native",
+            "claude-sdk",
+            "pi-native",
+            "pi",
+        }:
             raise UsageExportError(400, "invalid_producer_binding")
         return result
 
@@ -293,11 +300,11 @@ class UsageEventStore:
     def _call_digest(observation: UsageObservation) -> bytes | None:
         if observation.logical_call_id is None:
             return None
-        expected = (
-            ("claude-code/message-id/v1", "claude-code/request-id/v1")
-            if observation.harness_family == "claude"
-            else ("codex-responses/response-id/v1",)
-        )
+        expected = {
+            "claude": ("claude-code/message-id/v1", "claude-code/request-id/v1"),
+            "codex": ("codex-responses/response-id/v1",),
+            "pi": ("pi/response-id/v1",),
+        }[observation.harness_family]
         namespace = next(
             namespace
             for namespace in expected

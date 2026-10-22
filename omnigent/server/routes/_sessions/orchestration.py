@@ -95,6 +95,7 @@ from omnigent.policies.types import (
 )
 from omnigent.provider_usage_limits import (
     parse_provider_usage_limits_snapshot_json,
+    pi_provider_usage_limits_from_headers,
     validate_provider_usage_limits_snapshot,
 )
 from omnigent.runner.mcp_execution_registry import (
@@ -133,7 +134,6 @@ from omnigent.runtime.policies.builder import (
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.sdk_permission_modes import (
-    CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODES,
 )
@@ -169,6 +169,7 @@ from omnigent.server.child_keep_warm import (
     ARCHIVE_REASON_LABEL,
     keep_warm_family_for_harness,
     keep_warm_status_from_labels,
+    pi_cache_label,
     warm_state_for_labels,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
@@ -198,7 +199,6 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import agent_removed as _agent_removed
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
-    CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
     _authorize_host_for_workspace,
     validate_session_agent,
     validate_session_model_metadata,
@@ -450,9 +450,10 @@ from omnigent.server.subagent_activity import (
 )
 from omnigent.server.user_preferences_store import read_worktree_path_template
 from omnigent.session_default_modes import (
-    CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
-    PERMISSION_DEFAULT_VALUES,
     SPEED_TIER_LABEL_KEY,
+    apply_mode,
+    mode_values,
+    valid_mode,
     valid_speed_tier,
 )
 from omnigent.spec.types import (
@@ -2417,7 +2418,7 @@ def _build_session_list_item(
     agent_template_ids: Mapping[str, str] | None = None,
     last_message_preview: str | None = None,
     keep_warm_families: (
-        Mapping[tuple[str | None, str | None, str | None], Literal["claude", "codex"] | None]
+        Mapping[tuple[str | None, str | None, str | None], Literal["claude", "codex", "pi"] | None]
         | None
     ) = None,
     cold_after_by_session: Mapping[str, int | None] | None = None,
@@ -3501,6 +3502,12 @@ async def _persist_external_session_usage(
         )
     has_provider_usage_limits = "provider_usage_limits" in body.data
     raw_provider_usage_limits = body.data.get("provider_usage_limits")
+    has_pi_provider_headers = "pi_provider_usage_limits_headers" in body.data
+    if has_pi_provider_headers:
+        raw_provider_usage_limits = pi_provider_usage_limits_from_headers(
+            body.data["pi_provider_usage_limits_headers"], captured_at=now_epoch()
+        )
+        has_provider_usage_limits = True
     try:
         provider_usage_limits = validate_provider_usage_limits_snapshot(raw_provider_usage_limits)
     except ValueError as exc:
@@ -3514,6 +3521,34 @@ async def _persist_external_session_usage(
     last_cache_read = _optional_label_int(body.data.get("last_cache_read_input_tokens"))
     last_cache_creation = _optional_label_int(body.data.get("last_cache_creation_input_tokens"))
     last_cache_observed_at = _optional_label_int(body.data.get("last_usage_observed_at"))
+    has_pi_cache = "pi_cache_ttl_seconds" in body.data
+    pi_cache_ttl = body.data.get("pi_cache_ttl_seconds")
+    pi_cache_values: list[int] = []
+    if (
+        has_pi_cache
+        and pi_cache_ttl is not None
+        and (
+            isinstance(pi_cache_ttl, bool)
+            or not isinstance(pi_cache_ttl, int)
+            or not 1 <= pi_cache_ttl <= 86400
+        )
+    ):
+        raise OmnigentError(
+            "external_session_usage has invalid Pi cache data", code=ErrorCode.INVALID_INPUT
+        )
+    if has_pi_cache and pi_cache_ttl is not None:
+        for key in (
+            "pi_cache_observed_at",
+            "pi_cache_read_input_tokens",
+            "pi_cache_write_input_tokens",
+        ):
+            value = body.data.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**53:
+                raise OmnigentError(
+                    "external_session_usage has invalid Pi cache data",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            pi_cache_values.append(value)
     _CUMULATIVE_USAGE_KEYS = (
         "cumulative_cost_usd",
         # ``policy_cost_usd`` alone is a valid post: mid-turn the displayed
@@ -3529,12 +3564,14 @@ async def _persist_external_session_usage(
         and raw_window is None
         and not has_auto_compact_token_limit
         and not has_provider_usage_limits
+        and not has_pi_cache
         and not has_cumulative
     ):
         raise OmnigentError(
             "external_session_usage requires at least one of "
             "data.context_tokens, data.context_window, data.auto_compact_token_limit, "
             "data.provider_usage_limits, "
+            "data.pi_cache_ttl_seconds, "
             "or a cumulative usage field",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -3571,6 +3608,8 @@ async def _persist_external_session_usage(
             )
         )
     label_updates: dict[str, str] = {}
+    if has_pi_cache and pi_cache_ttl is not None:
+        label_updates["omnigent.pi_cache"] = pi_cache_label(pi_cache_ttl, *pi_cache_values)
     if raw_tokens is not None:
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
     if raw_window is not None:
@@ -3597,6 +3636,8 @@ async def _persist_external_session_usage(
             session_id,
             _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
         )
+    if has_pi_cache and pi_cache_ttl is None:
+        await asyncio.to_thread(conversation_store.delete_label, session_id, "omnigent.pi_cache")
     if has_provider_usage_limits:
         await asyncio.to_thread(
             conversation_store.set_provider_usage_limits,
@@ -3604,7 +3645,10 @@ async def _persist_external_session_usage(
             provider_usage_limits,
         )
         if quota_service is not None and conv is not None:
-            await asyncio.to_thread(quota_service.report_claude, conv, provider_usage_limits)
+            report_quota = (
+                quota_service.report_pi if has_pi_provider_headers else quota_service.report_claude
+            )
+            await asyncio.to_thread(report_quota, conv, provider_usage_limits)
         # Remove the legacy label after the metadata write. Old snapshots can
         # exceed conversation_labels.value (256 chars) and become invalid JSON.
         await asyncio.to_thread(
@@ -13233,6 +13277,7 @@ async def _create_session_from_existing_agent(
     )
 
     request_fields_set = body.model_fields_set
+    explicit_project_label = "omni_project" in (body.labels or {})
     admission_enabled = getattr(request.app.state, "startup_admission", None) is not None
     # The owner-checked project / host lookup feeds a child's calling defaults,
     # so it runs before the resolver; a child naming a workspace takes the
@@ -13361,6 +13406,9 @@ async def _create_session_from_existing_agent(
 
     _strip_succession_operation_labels(body.labels)
     _reject_reserved_cost_control_label_seed(body.labels)
+    from omnigent.server.permission_tiers import strip_creation_permission_labels
+
+    strip_creation_permission_labels(body.labels)
     _reject_server_reserved_label_seed(body.labels)
 
     agent = await validate_session_agent(
@@ -13626,29 +13674,35 @@ async def _create_session_from_existing_agent(
         )
 
     sdk_permission_labels: dict[str, str] = {}
+    explicit_permission_application = None
     if body.permission_mode is not None or body.approval_mode is not None:
-        if body.sub_agent_name is not None or body.parent_session_id is not None:
+        if body.sub_agent_name is not None:
             raise OmnigentError(
-                "permission_mode and approval_mode are only supported for top-level sessions",
+                "permission_mode and approval_mode are not supported for named sub-agent sessions",
                 code=ErrorCode.INVALID_INPUT,
             )
         resolved_harness = await asyncio.to_thread(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
         if body.permission_mode is not None:
-            if resolved_harness != "claude-sdk":
+            if not valid_mode(body.permission_mode, resolved_harness, "permission", "create"):
                 raise OmnigentError(
-                    "permission_mode is only supported for claude-sdk sessions, "
-                    f"not {resolved_harness!r}",
+                    f"permission_mode {body.permission_mode!r} is not supported "
+                    f"for {resolved_harness!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            if body.permission_mode not in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES:
+            explicit_permission_application = apply_mode(
+                resolved_harness, "permission", body.permission_mode
+            )
+            if (
+                explicit_permission_application.tier is not None
+                and body.permission_tier is not None
+            ):
                 raise OmnigentError(
-                    "permission_mode must be one of "
-                    f"{sorted(CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES)}",
+                    "permission_mode and permission_tier cannot both select a tier",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            sdk_permission_labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = body.permission_mode
+            sdk_permission_labels.update(explicit_permission_application.labels)
         if body.approval_mode is not None:
             if resolved_harness != "codex":
                 raise OmnigentError(
@@ -13737,7 +13791,11 @@ async def _create_session_from_existing_agent(
     inherited_runner_id: str | None = None
     # The project lookup ran before the resolver; it only counts for
     # inheritance when this caller still owns it.
-    child_project_id: str | None = parent_project.id if parent_project is not None else None
+    child_project_id: str | None = (
+        parent_project.id
+        if parent_project is not None and parent_project.archived_at is None
+        else None
+    )
     if body.parent_session_id is not None and parent_conv is not None:
         inherited_runner_id = parent_conv.runner_id
         if body.host_id is not None and body.host_id != effective_host_id(
@@ -13846,12 +13904,21 @@ async def _create_session_from_existing_agent(
         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
     )
 
-    selected_harness = (
-        harness_override or _spec_harness(selection_spec)
-        if selection_spec is not None
-        else await asyncio.to_thread(
-            _create_resolved_harness, agent, harness_override, agent_cache
+    sub_spec = (
+        await asyncio.to_thread(
+            _resolve_subagent_spec,
+            agent=agent,
+            sub_agent_name=body.sub_agent_name,
+            agent_cache=agent_cache,
         )
+        if body.sub_agent_name
+        else None
+    )
+    selected_harness = (
+        harness_override
+        or (_spec_harness(sub_spec) if sub_spec is not None else None)
+        or (_spec_harness(selection_spec) if selection_spec is not None else None)
+        or await asyncio.to_thread(_create_resolved_harness, agent, harness_override, agent_cache)
     )
     from omnigent.server.permission_tiers import TIER_HARNESSES, require_permission_protocol
 
@@ -14096,14 +14163,7 @@ async def _create_session_from_existing_agent(
     # mirrors the multipart create + PATCH paths. When the body carries no
     # args, the agent's own trusted spec seeds them below — explicit
     # opt-ins only, never the headless worker default bypass.
-    sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
-        sub_spec = await asyncio.to_thread(
-            _resolve_subagent_spec,
-            agent=agent,
-            sub_agent_name=body.sub_agent_name,
-            agent_cache=agent_cache,
-        )
         try:
             validated_launch_args = (
                 _derive_terminal_launch_args_from_spec(sub_spec) if sub_spec is not None else None
@@ -14126,7 +14186,11 @@ async def _create_session_from_existing_agent(
     # spec-level reasoning effort and, when the body carried no launch args,
     # its explicit native-bypass opt-ins; one tolerant load serves both.
     own_spec: AgentSpec | None = None
-    needs_launch_args_from_spec = not body.sub_agent_name and validated_launch_args is None
+    needs_launch_args_from_spec = (
+        not body.sub_agent_name
+        and validated_launch_args is None
+        and not (explicit_permission_application and explicit_permission_application.args)
+    )
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
     needs_speed_from_spec = sub_spec is None and SPEED_TIER_LABEL_KEY not in (body.labels or {})
     if (
@@ -14161,6 +14225,17 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    if explicit_permission_application is not None and explicit_permission_application.args:
+        try:
+            validated_launch_args = _validate_terminal_launch_args(
+                [*(validated_launch_args or []), *explicit_permission_application.args]
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args with permission mode: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
     if body.sub_agent_name is None and (
         project_resolution.speed is not None or project_resolution.permission is not None
     ):
@@ -14169,34 +14244,26 @@ async def _create_session_from_existing_agent(
         )
         permission = project_resolution.permission
         if permission is not None:
-            if permission not in PERMISSION_DEFAULT_VALUES.get(
-                resolved_harness or "", frozenset()
-            ):
+            if permission not in mode_values(resolved_harness, "permission", "default"):
                 _logger.warning(
                     "Ignoring unsupported permission default %r for %s",
                     permission,
                     resolved_harness,
                 )
             elif (
-                resolved_harness != "antigravity-native"
-                and body.permission_mode is None
+                body.permission_mode is None
                 and body.approval_mode is None
                 and CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in (body.labels or {})
                 and not _launch_args_set_permission(validated_launch_args, resolved_harness)
             ):
-                if resolved_harness == "codex":
-                    sdk_permission_labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission
-                elif resolved_harness == "claude-sdk":
-                    sdk_permission_labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = permission
-                else:
-                    preset_args = (
-                        CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[permission]
-                        if resolved_harness == "codex-native"
-                        else ["--permission-mode", permission]
-                    )
+                application = apply_mode(
+                    resolved_harness, "permission", permission, context="default"
+                )
+                sdk_permission_labels.update(application.labels)
+                if application.args:
                     try:
                         validated_launch_args = _validate_terminal_launch_args(
-                            [*(validated_launch_args or []), *preset_args]
+                            [*(validated_launch_args or []), *application.args]
                         )
                     except ValueError as exc:
                         raise OmnigentError(
@@ -14205,12 +14272,26 @@ async def _create_session_from_existing_agent(
                         ) from exc
         speed = project_resolution.speed
         if speed is not None:
-            if not valid_speed_tier(speed, resolved_harness):
+            speed_context: Literal["default", "create"] = (
+                "create" if SPEED_TIER_LABEL_KEY in (body.labels or {}) else "default"
+            )
+            if not valid_mode(speed, resolved_harness, "speed", speed_context):
                 _logger.warning(
                     "Ignoring unsupported speed default %r for %s", speed, resolved_harness
                 )
-            elif SPEED_TIER_LABEL_KEY not in (body.labels or {}):
-                sdk_permission_labels[SPEED_TIER_LABEL_KEY] = speed
+            else:
+                application = apply_mode(resolved_harness, "speed", speed, context=speed_context)
+                sdk_permission_labels.update(application.labels)
+                if application.args:
+                    try:
+                        validated_launch_args = _validate_terminal_launch_args(
+                            [*(validated_launch_args or []), *application.args]
+                        )
+                    except ValueError as exc:
+                        raise OmnigentError(
+                            f"invalid terminal_launch_args with speed default: {exc}",
+                            code=ErrorCode.INVALID_INPUT,
+                        ) from exc
 
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
@@ -14224,10 +14305,25 @@ async def _create_session_from_existing_agent(
 
     selected_spec = sub_spec if sub_spec is not None else own_spec
     spec_speed = selected_spec.executor.config.get("service_tier") if selected_spec else None
-    if spec_speed is not None and SPEED_TIER_LABEL_KEY not in (body.labels or {}):
+    if (
+        spec_speed is not None
+        and project_resolution.speed is None
+        and SPEED_TIER_LABEL_KEY not in (body.labels or {})
+    ):
         spec_harness = selected_spec.executor.harness_kind if selected_spec else None
         if valid_speed_tier(spec_speed, spec_harness):
-            sdk_permission_labels[SPEED_TIER_LABEL_KEY] = spec_speed
+            application = apply_mode(spec_harness, "speed", spec_speed, context="default")
+            sdk_permission_labels.update(application.labels)
+            if application.args:
+                try:
+                    validated_launch_args = _validate_terminal_launch_args(
+                        [*(validated_launch_args or []), *application.args]
+                    )
+                except ValueError as exc:
+                    raise OmnigentError(
+                        f"invalid terminal_launch_args with spec speed: {exc}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
@@ -14292,13 +14388,7 @@ async def _create_session_from_existing_agent(
     if sdk_permission_labels:
         initial_labels.update(sdk_permission_labels)
 
-    create_harness = (
-        sub_spec.executor.harness_kind
-        if sub_spec is not None
-        else await asyncio.to_thread(
-            _create_resolved_harness, agent, harness_override, agent_cache
-        )
-    )
+    create_harness = selected_harness
     require_permission_protocol(request, harness=create_harness)
     if body.permission_tier is not None and create_harness not in TIER_HARNESSES:
         raise OmnigentError(
@@ -14315,20 +14405,31 @@ async def _create_session_from_existing_agent(
 
         inherited_tier = None
         if parent_conv is not None:
-            try:
-                inherited_tier = legacy_permission_tier(
-                    harness=create_harness,
-                    labels=parent_conv.labels or {},
-                    launch_args=parent_conv.terminal_launch_args or [],
-                )
-            except ValueError as exc:
-                raise OmnigentError(
-                    f"Parent permission tier requires recovery: {exc}",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
+            parent_harness = await asyncio.to_thread(
+                _resolve_harness, parent_conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            if parent_harness in TIER_HARNESSES:
+                assert parent_harness is not None
+                try:
+                    inherited_tier = legacy_permission_tier(
+                        harness=parent_harness,
+                        labels=parent_conv.labels or {},
+                        launch_args=parent_conv.terminal_launch_args or [],
+                    )
+                except ValueError as exc:
+                    raise OmnigentError(
+                        f"Parent permission tier requires recovery: {exc}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
         tier = creation_permission_tier(
             harness=create_harness,
-            explicit=body.permission_tier,
+            explicit=(
+                body.permission_tier
+                if body.permission_tier is not None
+                else explicit_permission_application.tier
+                if explicit_permission_application is not None
+                else None
+            ),
             default=project_resolution.permission if body.sub_agent_name is None else None,
             inherited=inherited_tier,
         )
@@ -14365,6 +14466,9 @@ async def _create_session_from_existing_agent(
             }
         )
         with creation_stage("create_persistence_ms"):
+            project_owner_kwargs: dict[str, Any] = (
+                {"project_owner_user_id": user_id} if "omni_project" in initial_labels else {}
+            )
             conv = conversation_store.create_conversation(
                 conversation_id=conversation_id,
                 agent_id=agent.id,
@@ -14379,6 +14483,10 @@ async def _create_session_from_existing_agent(
                 git_branch=git_branch,
                 terminal_launch_args=validated_launch_args,
                 project_id=project_resolution.project_id or child_project_id,
+                project_admission="reject"
+                if "project_id" in request_fields_set or explicit_project_label
+                else "inherit",
+                **project_owner_kwargs,
                 labels=initial_labels or None,
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
@@ -14678,6 +14786,7 @@ def _create_session_from_bundle(
     worktree: str | None = None,
     git_branch: str | None = None,
     agent_store: AgentStore | None = None,
+    project_admission: Literal["reject", "inherit"] = "reject",
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -14809,6 +14918,7 @@ def _create_session_from_bundle(
                 inference_model=inference_model,
                 worktree=worktree,
                 git_branch=git_branch,
+                project_owner_user_id=created_by,
             )
 
     agent_id = generate_agent_id()
@@ -14835,6 +14945,7 @@ def _create_session_from_bundle(
         created_by=created_by,
         worktree=worktree,
         git_branch=git_branch,
+        project_admission=project_admission,
     )
 
 
@@ -15987,7 +16098,13 @@ async def _run_runner_status_probe(
                     _note_running_edge(session_id, previous, raw)
                     _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
+                        session_live_state.persist_live_status(
+                            session_id,
+                            raw,
+                            check_real_turn_settle=(
+                                raw == "idle" and previous in (None, "running", "waiting")
+                            ),
+                        )
                     _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"

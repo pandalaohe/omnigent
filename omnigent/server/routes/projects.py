@@ -16,14 +16,16 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 
 from omnigent.calling_defaults import validate_project_calling_defaults
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import AuthProvider
+from omnigent.server.project_archive import ProjectArchiveService
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
@@ -33,12 +35,15 @@ from omnigent.server.schemas import (
     ProjectOrderResponse,
     UpdateProjectRequest,
 )
+from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import (
     ProjectOrderPreference,
     ProjectStore,
     apply_project_order,
     project_config_revision,
 )
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -55,6 +60,8 @@ def _to_response(project: Project) -> dict[str, Any]:
         "updated_at": project.updated_at,
         "config": project.config,
         "config_revision": project_config_revision(project.config),
+        "archived_at": project.archived_at,
+        "archive_summary": {"sessions": 0, "tasks": 0},
     }
 
 
@@ -71,6 +78,10 @@ def _validate_calling_defaults(config: dict[str, Any]) -> None:
 def create_projects_router(
     project_store: ProjectStore,
     auth_provider: AuthProvider | None = None,
+    conversation_store: ConversationStore | None = None,
+    permission_store: PermissionStore | None = None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
+    runner_router: RunnerRouter | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
@@ -80,6 +91,23 @@ def create_projects_router(
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
+    archive_service = (
+        ProjectArchiveService(
+            project_store,
+            conversation_store,
+            permission_store,
+            scheduled_task_store,
+            runner_router,
+        )
+        if conversation_store is not None
+        else None
+    )
+
+    async def response(project: Project) -> dict[str, Any]:
+        value = _to_response(project)
+        if archive_service is not None:
+            value["archive_summary"] = await archive_service.summary(project)
+        return value
 
     @router.post("/projects")
     async def create_project(
@@ -109,7 +137,11 @@ def create_projects_router(
         return _to_response(project)
 
     @router.get("/projects")
-    async def list_projects(request: Request) -> dict[str, Any]:
+    async def list_projects(
+        request: Request,
+        include_archived: bool = False,
+        archived: Literal["only"] | None = None,
+    ) -> dict[str, Any]:
         """List the caller's projects.
 
         :param request: The incoming request, used to identify the user.
@@ -120,14 +152,17 @@ def create_projects_router(
 
         def read_projects() -> list[Project]:
             return apply_project_order(
-                project_store.list(user_id=user_id),
+                project_store.list(
+                    user_id=user_id,
+                    archived="only" if archived else "include" if include_archived else "exclude",
+                ),
                 project_store.get_order(user_id=user_id),
                 project_id=lambda p: p.id,
                 project_name=lambda p: p.name,
             )
 
         projects = await asyncio.to_thread(read_projects)
-        return {"object": "list", "data": [_to_response(p) for p in projects]}
+        return {"object": "list", "data": [await response(p) for p in projects]}
 
     @router.get(
         "/projects/order", response_model=None, responses={200: {"model": ProjectOrderResponse}}
@@ -165,7 +200,39 @@ def create_projects_router(
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        return _to_response(project)
+        return await response(project)
+
+    @router.get("/projects/{project_id}/archive-preview")
+    async def archive_preview(request: Request, project_id: str) -> dict[str, Any]:
+        owner = require_user(request, auth_provider)
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=owner)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if archive_service is None:
+            raise OmnigentError("Session store unavailable", code=ErrorCode.INTERNAL_ERROR)
+        return await archive_service.preview(request, project)
+
+    async def transition_archive(
+        request: Request, project_id: str, kind: Literal["archive", "unarchive"]
+    ) -> dict[str, Any]:
+        owner = require_user(request, auth_provider)
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=owner)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if archive_service is None:
+            raise OmnigentError("Session store unavailable", code=ErrorCode.INTERNAL_ERROR)
+        result = await archive_service.transition(request, project, kind)
+        result["project"] = await response(result["project"])
+        announce_projects_changed(owner)
+        return result
+
+    @router.post("/projects/{project_id}/archive")
+    async def archive_project(request: Request, project_id: str) -> dict[str, Any]:
+        return await transition_archive(request, project_id, "archive")
+
+    @router.post("/projects/{project_id}/unarchive")
+    async def unarchive_project(request: Request, project_id: str) -> dict[str, Any]:
+        return await transition_archive(request, project_id, "unarchive")
 
     @router.patch("/projects/{project_id}")
     async def update_project(

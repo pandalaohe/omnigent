@@ -5583,13 +5583,19 @@ def _publish_status(
     previous_status = _session_status_cache.get(session_id)
     _note_running_edge(session_id, previous_status, status)
     _session_status_cache[session_id] = status
-    if previous_status != status:
-        _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
     if persist_live_status:
-        session_live_state.persist_live_status(session_id, status)
+        session_live_state.persist_live_status(
+            session_id,
+            status,
+            check_real_turn_settle=(
+                status == "idle" and previous_status in (None, "running", "waiting")
+            ),
+        )
+    if previous_status != status:
+        _publish_child_status_to_parent(session_id, status)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the
@@ -11742,6 +11748,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             "archive cascade labels are server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    if any(
+        key == "omnigent.project_archive" or key.startswith("omnigent.project_archive.")
+        for key in labels
+    ):
+        raise OmnigentError(
+            "Project archive labels are server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if any(key.startswith(ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX) for key in labels):
         raise OmnigentError(
             "worktree admission fence labels are server-internal and cannot be set by clients",
@@ -12260,6 +12274,7 @@ def _persist_stored_session_bundle(
     created_by: str | None = None,
     worktree: str | None = None,
     git_branch: str | None = None,
+    project_admission: Literal["reject", "inherit"] = "reject",
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -12311,6 +12326,7 @@ def _persist_stored_session_bundle(
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
             project_id=metadata.project_id,
+            project_admission=project_admission,
             host_id=metadata.host_id,
             created_by=created_by,
             **inference_kwargs,
@@ -12369,6 +12385,7 @@ def _persist_session_for_uploaded_agent(
     inference_model: str | None = None,
     worktree: str | None = None,
     git_branch: str | None = None,
+    project_owner_user_id: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -12384,6 +12401,11 @@ def _persist_session_for_uploaded_agent(
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
+    project_owner_kwargs: dict[str, Any] = (
+        {"project_owner_user_id": project_owner_user_id}
+        if "omni_project" in metadata.labels
+        else {}
+    )
     try:
         conversation = conversation_store.create_conversation(
             agent_id=agent.id,
@@ -12396,6 +12418,7 @@ def _persist_session_for_uploaded_agent(
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
+            **project_owner_kwargs,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             model_override=inference_model
@@ -13067,13 +13090,13 @@ def _child_session_summary_from_conversation(
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
         routing_decision_id=routing_decision_id,
-        warm_state=_warm_state_from_label(
+        warm_state=_warm_state_for_child(
             conv, harness=harness, busy=busy, cold_after_s=cold_after_s
         ),
     )
 
 
-def _warm_state_from_label(
+def _warm_state_for_child(
     conv: Conversation,
     *,
     harness: str | None,
@@ -13082,16 +13105,22 @@ def _warm_state_from_label(
 ) -> Literal["warm", "cold"] | None:
     """Derive the keep-warm pill state for a child summary (no settings read)."""
     from omnigent.db.utils import now_epoch
-    from omnigent.server.child_keep_warm import KEEP_WARM_LABEL, warm_state_from_label
+    from omnigent.server.child_keep_warm import (
+        keep_warm_family_for_harness,
+        warm_state_for_labels,
+    )
 
     if _is_harness_subagent_mirror(conv):
         return None
-    return warm_state_from_label(
-        conv.labels.get(KEEP_WARM_LABEL),
+    family = keep_warm_family_for_harness(harness)
+    if family is None:
+        return None
+    return warm_state_for_labels(
+        conv.labels,
         archived=bool(conv.archived),
-        harness=harness,
         busy=busy,
         now=now_epoch(),
+        family=family,
         cold_after_s=cold_after_s,
     )
 

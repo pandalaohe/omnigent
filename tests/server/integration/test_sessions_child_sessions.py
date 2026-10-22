@@ -210,6 +210,18 @@ async def test_child_sessions_expose_warm_state_from_the_keep_warm_label(
         title="researcher:unlabeled",
         harness_override="claude-native",
     )
+    recently_settled = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:recent-codex-turn",
+        harness_override="codex-native",
+    )
+    unsupported = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:unsupported",
+        harness_override="opencode-native",
+    )
     conv_store.set_labels(
         warm.id,
         {
@@ -222,13 +234,30 @@ async def test_child_sessions_expose_warm_state_from_the_keep_warm_label(
         cold.id,
         {"omnigent.keep_warm": json.dumps({"s": "p", "why": "fail", "t": now - 100})},
     )
+    conv_store.set_labels(
+        unsupported.id,
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "y": "claude", "t": now - 100, "u": now - 100, "w": now + 3600}
+            )
+        },
+    )
+    conv_store.set_labels(
+        recently_settled.id,
+        {
+            "omnigent.running_since": str(now - 3600),
+            "omnigent.last_real_turn_settled": str(now - 60),
+        },
+    )
 
     resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions?limit=100")
     assert resp.status_code == 200, resp.text
     by_id = {row["id"]: row for row in resp.json()["data"]}
     assert by_id[warm.id]["warm_state"] == "warm"
     assert by_id[cold.id]["warm_state"] == "cold"
-    assert by_id[unlabeled.id]["warm_state"] is None
+    assert by_id[unlabeled.id]["warm_state"] == "cold"
+    assert by_id[recently_settled.id]["warm_state"] == "warm"
+    assert by_id[unsupported.id]["warm_state"] is None
 
 
 async def test_replayed_unverified_native_child_is_not_busy_and_live_activity_restores_it(
@@ -3723,6 +3752,34 @@ async def test_child_status_fan_out_keeps_placement(
         await collector.stop()
         sessions_module._session_status_cache.pop(child.id, None)
         session_stream.close(root.id)
+
+
+async def test_first_idle_child_fan_out_reads_the_completed_turn_clock(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    parent = await _create_parent_session(client, "settled-fanout-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:long-turn",
+        harness_override="claude-native",
+    )
+    conv_store.set_labels(child.id, {"omnigent.running_since": str(int(time.time()) - 7200)})
+    conv_store.set_session_live_status(child.id, "running")
+    sessions_module._session_status_cache[child.id] = "running"
+    collector = await start_session_stream_collector(parent["id"])
+    try:
+        sessions_module._publish_status(child.id, "idle")
+        event = await _next_child_update(collector)
+        assert event["child"]["warm_state"] == "warm"
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(parent["id"])
 
 
 async def test_child_archive_transition_publishes_to_parent_stream(

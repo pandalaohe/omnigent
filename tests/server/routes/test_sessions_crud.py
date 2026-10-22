@@ -167,6 +167,42 @@ async def test_list_sessions_keep_warm_state_uses_harness_family(
     assert rows[unsupported.id].get("warm_state") is None
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_unlabelled_idle_session_uses_real_turn_settle_for_list_and_detail(
+    client: httpx.AsyncClient, db_uri: str, tmp_path: Path, harness: str
+) -> None:
+    now = int(time.time())
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    location = f"{agent_id}/bundle"
+    artifacts.put(location, _harness_bundle(harness))
+    agent_store.create(agent_id, name=f"idle-{harness}", bundle_location=location)
+    recently_settled = conv_store.create_conversation(agent_id=agent_id)
+    stale = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(
+        recently_settled.id,
+        {
+            "omnigent.running_since": str(now - 7200),
+            "omnigent.last_real_turn_settled": str(now - 60),
+        },
+    )
+    conv_store.set_labels(stale.id, {"omnigent.running_since": str(now - 7200)})
+    # A metadata edit after a stale turn must not make its provider cache warm.
+    conv_store.update_conversation(stale.id, title="renamed")
+
+    listed = await client.get("/v1/sessions")
+    assert listed.status_code == 200
+    rows = {row["id"]: row for row in listed.json()["data"]}
+    assert rows[recently_settled.id]["warm_state"] == "warm"
+    assert rows[stale.id]["warm_state"] == "cold"
+
+    detail = await client.get(f"/v1/sessions/{recently_settled.id}")
+    assert detail.status_code == 200
+    assert detail.json()["warm_state"] == "warm"
+
+
 async def test_list_sessions_agent_cold_after_zero_reads_warm(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -1026,7 +1062,7 @@ async def test_json_create_rejects_handoff_label(
     assert response.json()["error"]["code"] == "invalid_input"
 
 
-async def test_create_and_patch_reject_permission_authority_labels(
+async def test_create_strips_and_patch_rejects_permission_authority_labels(
     client: httpx.AsyncClient, session_id: str, db_uri: str
 ) -> None:
     from omnigent.server.permission_tiers import PERMISSION_LABEL_KEYS
@@ -1038,7 +1074,8 @@ async def test_create_and_patch_reject_permission_authority_labels(
     for key in (*PERMISSION_LABEL_KEYS, "OMNIGENT.PI.PERMISSION_TIER"):
         labels = {key: "full"}
         created = await client.post("/v1/sessions", json={"agent_id": agent_id, "labels": labels})
-        assert created.status_code == 400
+        assert created.status_code == 201, created.text
+        assert key not in created.json()["labels"]
         patched = await client.patch(f"/v1/sessions/{session_id}", json={"labels": labels})
         assert patched.status_code == 400
         current = store.get_conversation(session_id)

@@ -109,11 +109,11 @@ PEER_HOLD_LIFETIME = 24 * 3600
 # an identical resend is still a duplicate while the earlier copy sits here.
 _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 
-_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native"})
+_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
 
 # A dispatched child runs its own terminal turn, so a peer message reaches it;
-# other native harnesses are mirrors or SDK children without a result key.
-_PEER_REACHABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native"})
+# native mirrors and SDK children without a result key remain refused.
+_PEER_REACHABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
 
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
@@ -429,9 +429,9 @@ def _is_steerable_harness(conv: Conversation) -> bool:
     return harness in _STEERABLE_NATIVE_HARNESSES
 
 
-def _is_codex_native_harness(conv: Conversation) -> bool:
+def _needs_native_peer_receipt(conv: Conversation) -> bool:
     try:
-        return _native_terminal_runtime(conv)[2] == "codex-native"
+        return _native_terminal_runtime(conv)[2] in {"codex-native", "pi-native"}
     except OmnigentError:
         return False
 
@@ -439,7 +439,7 @@ def _is_codex_native_harness(conv: Conversation) -> bool:
 def _peer_reachable_child(conv: Conversation) -> bool:
     """Whether a child session may receive peer messages.
 
-    A dispatched Claude Code / Codex child runs its own terminal turn on the
+    A dispatched Claude Code / Codex / Pi child runs its own terminal turn on the
     envelope. Native mirrors route input through their parent's runtime, and
     SDK / other harnesses have no result key, so both stay refused. A read
     error refuses rather than admitting an unreachable child.
@@ -1252,10 +1252,10 @@ def register_peer_routes(
             return "failed", "not_ready"
         if sdk_delivery:
             return "uncertain", "awaiting_sdk_receipt"
-        if native_receiver and _is_codex_native_harness(receiver):
+        if native_receiver and _needs_native_peer_receipt(receiver):
             # The events POST only confirms that the runner has the message.
-            # Codex accepts it later through turn/start or turn/steer; the
-            # durable peer record settles from the native transcript mirror.
+            # The native terminal accepts it later; the durable record settles
+            # from the terminal-originated transcript mirror.
             return "uncertain", "awaiting_native_receipt"
         return "delivered", None
 
@@ -1354,6 +1354,19 @@ def register_peer_routes(
             wait_seconds=wait_seconds,
         )
         async with _PEER_ADMISSION._lock_for(sender.id):
+            from omnigent.server.session_collab import require_session_action_allowed
+
+            addressed = await asyncio.to_thread(conversation_store.get_conversation, receiver_id)
+            if addressed is not None and addressed.archived:
+                await asyncio.to_thread(
+                    require_session_action_allowed,
+                    sender,
+                    conversation_store,
+                    permission_store,
+                    getattr(app_state, "user_preferences_store", None),
+                    action="send",
+                    target=addressed,
+                )
             target_id = await asyncio.to_thread(
                 resolve_succeeded_by, conversation_store, receiver_id
             )
@@ -1447,6 +1460,10 @@ def register_peer_routes(
         cfg = await asyncio.to_thread(
             read_collab_settings, prefs_store, owner or RESERVED_USER_LOCAL
         )
+        if cfg.session_restrictions == "all" and receiver.archived:
+            from omnigent.server.session_collab import ARCHIVED_SESSION_DISABLED_MESSAGE
+
+            raise OmnigentError(ARCHIVED_SESSION_DISABLED_MESSAGE, code=ErrorCode.FORBIDDEN)
         # A pending record never outlives the owner's undelivered-message
         # lifetime: an explicit wait_seconds is capped by it.
         effective_wait = min(body.wait_seconds, cfg.undelivered_ttl_s)
@@ -1735,7 +1752,7 @@ def register_peer_routes(
                         sdk_attempt_reason(secrets.token_hex(16), "wait")
                         if _sdk_capable(receiver)
                         else f"{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
-                        if _is_codex_native_harness(receiver)
+                        if _needs_native_peer_receipt(receiver)
                         else None
                     ),
                     correlation_id=body.correlation_id,
@@ -2208,6 +2225,7 @@ def register_peer_routes(
     async def _resume_frozen_child(child: Conversation, claim: str) -> NoticeOutcome:
         from omnigent.server.peer_sweeper import PeerSweeper
         from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.session_overrides import AGENT_TEMPLATE_ID_LABEL
         from omnigent.server.user_preferences_store import read_child_idle_settings
 
         fresh = await asyncio.to_thread(conversation_store.get_conversation, child.id)
@@ -2228,7 +2246,11 @@ def register_peer_routes(
             getattr(child_idle._app.state, "user_preferences_store", None),
             owner,
         )
-        row = settings.agents.get(child.agent_id or "")
+        row = (
+            await asyncio.to_thread(child_idle._freeze_for, fresh, settings, {})
+            if fresh is not None
+            else None
+        )
         if (
             fresh is None
             or parent is None
@@ -2243,6 +2265,9 @@ def register_peer_routes(
             or fresh.parent_conversation_id != child.parent_conversation_id
             or fresh.runner_id != child.runner_id
             or fresh.agent_id != child.agent_id
+            or fresh.harness_override != child.harness_override
+            or fresh.labels.get(AGENT_TEMPLATE_ID_LABEL)
+            != child.labels.get(AGENT_TEMPLATE_ID_LABEL)
             or fresh.archive_revision != child.archive_revision
             or fresh.labels.get("omnigent.running_since")
             != child.labels.get("omnigent.running_since")

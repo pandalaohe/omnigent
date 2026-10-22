@@ -878,6 +878,9 @@ def build_agent_bundle(
     return buf.getvalue()
 
 
+PERMISSION_TIERS_HEADERS = {"X-Omnigent-Permission-Tiers": "1"}
+
+
 async def create_test_agent(
     client: httpx.AsyncClient,
     name: str = "test-agent",
@@ -940,7 +943,7 @@ async def create_test_agent(
         sub_agents=sub_agents,
     )
     metadata: dict[str, Any] = {}
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = dict(PERMISSION_TIERS_HEADERS)
     if user is not None:
         headers["X-Forwarded-Email"] = user
     resp = await client.post(

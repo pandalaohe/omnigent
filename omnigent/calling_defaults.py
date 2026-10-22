@@ -23,31 +23,30 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import is_harness_availability
 from omnigent.permission_tiers import normalize_permission_tier
 from omnigent.session_default_modes import (
-    PERMISSION_DEFAULT_VALUES,
+    mode_values,
     valid_speed_tier,
 )
 from omnigent.util.reasoning_effort import EFFORT_VALUES, efforts_for_harness, validate_effort
 
 _logger = logging.getLogger(__name__)
 
-#: SDK harnesses whose settings fall back to a native sibling's entries.
-SDK_NATIVE_PARENT: dict[str, str] = {
-    "codex": "codex-native",
-    "claude-sdk": "claude-native",
-    "pi": "pi-native",
-}
 
-#: Harnesses a host can answer a model-options request for.
-MODEL_OPTION_HARNESSES: tuple[str, ...] = (
-    "codex-native",
-    "codex",
-    "claude-native",
-    "claude-sdk",
-    "pi-native",
-    "pi",
-    "devin-native",
-    "antigravity-native",
-)
+def sdk_native_parent(harness: str | None) -> str | None:
+    from omnigent.harness_plugins import capability_for_harness
+
+    support = capability_for_harness(harness)
+    return support.calling_defaults.inherits_from if support and support.calling_defaults else None
+
+
+def model_option_harnesses() -> tuple[str, ...]:
+    from omnigent.harness_plugins import harness_capabilities
+
+    return tuple(
+        harness
+        for harness, capability in harness_capabilities().items()
+        if capability.calling_defaults and capability.calling_defaults.model_options
+    )
+
 
 _EXPLICIT_SOURCES = frozenset({"explicit", "none"})
 
@@ -272,7 +271,7 @@ def resolve_calling(
         master,
         host_id,
         mode_harness,
-        PERMISSION_DEFAULT_VALUES.get(mode_harness or "", frozenset()),
+        mode_values(mode_harness, "permission", "default"),
     )
     return CallingResolution(
         agent_id=agent_id,
@@ -318,7 +317,7 @@ def _resolve_model(
     value = _setting(entry.get("model")) if entry is not None else None
     if value is not None:
         return value, "master"
-    native = SDK_NATIVE_PARENT.get(harness) if harness is not None else None
+    native = sdk_native_parent(harness)
     if native is not None:
         entry = _project_harness_entry(project_config, host_id, native)
         value = _setting(entry.get("model")) if entry is not None else None
@@ -354,7 +353,7 @@ def _resolve_harness_setting(
     values: frozenset[str] | None = None,
 ) -> tuple[str | None, str]:
     """Walk one per-harness setting's chain, ignoring unsupported stored values."""
-    native = SDK_NATIVE_PARENT.get(harness) if harness is not None else None
+    native = sdk_native_parent(harness)
     entries = [
         (_project_harness_entry(project_config, host_id, harness), "project_host"),
         (_master_entry(master, host_id, harness), "master"),
@@ -756,7 +755,7 @@ def validate_project_calling_defaults(value: object) -> dict:
                     clean_entry["speed"] = speed
                 if "permission" in entry:
                     permission = entry["permission"]
-                    values = PERMISSION_DEFAULT_VALUES.get(harness, frozenset())
+                    values = mode_values(harness, "permission", "default")
                     if not isinstance(permission, str) or permission not in values:
                         raise _invalid(f"{base}.permission must be one of {sorted(values)}")
                     clean_entry["permission"] = permission

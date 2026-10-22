@@ -7,6 +7,7 @@ import {
   USAGE_CONTEXT_STORAGE_KEY,
 } from "@/lib/usageContextPreferences";
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
+import type { RegistryItem } from "@/hooks/useAgentRegistry";
 
 const mocks = vi.hoisted(() => ({
   conversationId: "session-1" as string | null,
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   contextWindow: 330_000 as number | null,
   autoCompactTokenLimit: null as number | null,
   providerUsageLimits: null as ProviderUsageLimitsSnapshot | null,
+  registryItems: [] as RegistryItem[],
 }));
 
 vi.mock("@/store/chatStore", () => ({
@@ -33,6 +35,11 @@ vi.mock("@/store/chatStore", () => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: () => ({ session: { hostId: "host-friendly" }, isLoading: false, error: null }),
+}));
+
+vi.mock("@/hooks/useAgentRegistry", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useAgentRegistry: () => ({ items: mocks.registryItems }),
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -61,6 +68,34 @@ describe("ContextUsageSettings", () => {
     mocks.contextWindow = 330_000;
     mocks.autoCompactTokenLimit = null;
     mocks.providerUsageLimits = null;
+    mocks.registryItems = [];
+  });
+
+  it("uses registry labels for the active source", () => {
+    mocks.registryItems = [
+      {
+        key: "agent-polly",
+        name: "polly",
+        label: "Polly · library",
+        section: "yours",
+        harness: "pi",
+        description: null,
+        deployed: true,
+        source: "library",
+      },
+      {
+        key: "harness:pi",
+        label: "Pi SDK",
+        section: "sdk",
+        harness: "pi",
+        description: null,
+        deployed: true,
+        source: "builtin",
+      },
+    ];
+    render(<ContextUsageSettings />);
+    expect(screen.getByText("Polly · library")).toBeInTheDocument();
+    expect(screen.getByText("Pi SDK")).toBeInTheDocument();
   });
 
   it("shows friendly source names and keeps overrides scoped to the exact source", async () => {

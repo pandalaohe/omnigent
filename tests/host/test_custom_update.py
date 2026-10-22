@@ -329,10 +329,12 @@ def test_custom_update_rollback_does_not_fall_back_to_second_source(
     assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
 
 
+@pytest.mark.parametrize("is_windows", [False, True])
 @pytest.mark.parametrize("extra_args", [[], ["--force"]])
 def test_custom_update_refuses_to_pause_when_session_query_fails(
     monkeypatch: pytest.MonkeyPatch,
     extra_args: list[str],
+    is_windows: bool,
 ) -> None:
     import omnigent.cli as cli_module
 
@@ -348,6 +350,7 @@ def test_custom_update_refuses_to_pause_when_session_query_fails(
         host_id="host-1",
     )
     paused: list[bool] = []
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", is_windows)
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
     monkeypatch.setattr(

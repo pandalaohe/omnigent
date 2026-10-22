@@ -1,6 +1,6 @@
 """First-message delivery of the launch-staged instructions preamble.
 
-Pi / cursor / kiro / goose / hermes / qwen prepend the staged text to the first
+Cursor / kiro / goose / hermes / qwen prepend the staged text to the first
 message they inject and clear it only after that injection lands, so a failed
 first turn retries with the instructions instead of losing them.
 """
@@ -17,14 +17,12 @@ from omnigent.inner import cursor_native_executor as cne
 from omnigent.inner import goose_native_executor as gne
 from omnigent.inner import hermes_native_executor as hne
 from omnigent.inner import kiro_native_executor as kne
-from omnigent.inner import pi_native_executor as pne
 from omnigent.inner import qwen_native_executor as qne
 from omnigent.inner.cursor_native_executor import CursorNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
 from omnigent.inner.goose_native_executor import GooseNativeExecutor
 from omnigent.inner.hermes_native_executor import HermesNativeExecutor
 from omnigent.inner.kiro_native_executor import KiroNativeExecutor
-from omnigent.inner.pi_native_executor import PiNativeExecutor
 from omnigent.inner.qwen_native_executor import QwenNativeExecutor
 from omnigent.native.native_bridge_common import (
     read_agent_instructions_preamble,
@@ -34,7 +32,6 @@ from omnigent.native.native_bridge_common import (
 #: (executor class, module holding the injection sink, sink name, whether the
 #: sink's failure propagates instead of surfacing as an ``ExecutorError``).
 _CASES = [
-    pytest.param(PiNativeExecutor, pne, "enqueue_user_message", True, id="pi"),
     pytest.param(CursorNativeExecutor, cne, "inject_user_message", False, id="cursor"),
     pytest.param(KiroNativeExecutor, kne, "inject_user_message", False, id="kiro"),
     pytest.param(GooseNativeExecutor, gne, "inject_user_message", False, id="goose"),

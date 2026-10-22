@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+import logging
 from dataclasses import asdict
 from typing import Any
 
@@ -16,6 +16,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, model_validator
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
+from omnigent.db.utils import now_epoch
 from omnigent.entities import Comment
 from omnigent.entities.comment_location import (
     TEXT_ANCHOR_PREFIX,
@@ -37,7 +38,9 @@ from omnigent.server.routes._auth_helpers import (
     require_access,
 )
 from omnigent.server.routes._errors import session_not_found
+from omnigent.server.visitor_screenshots import VisitorScreenshotFiles
 from omnigent.stores import ConversationStore
+from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.comment_store.visitor_comments import (
     VISITOR_FEEDBACK_HEADER,
@@ -45,7 +48,10 @@ from omnigent.stores.comment_store.visitor_comments import (
     is_visitor_author,
     visitor_author_label,
 )
+from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
+
+logger = logging.getLogger(__name__)
 
 
 def _escape_line_breaks(text: str) -> str:
@@ -154,12 +160,14 @@ def _location_lines(comment: Comment) -> list[str]:
 
 def _rows_by_path(
     comments: list[Comment],
+    screenshot_files: VisitorScreenshotFiles | None = None,
+    reference_time: int | None = None,
 ) -> list[tuple[str, list[tuple[Comment, dict[str, Any] | None]]]]:
-    """Group comments by file in message order, parsing owner element anchors.
+    """Group comments by file in message order, parsing element anchors.
 
     Files sort alphabetically and entries by ``start_index`` ascending. Each
     row pairs the comment with its parsed element anchor, or ``None`` for a
-    text row and for every visitor row (visitor anchors are never parsed).
+    text row. Visitor screenshots require matching stored provenance.
     This is the one ordering source shared by :func:`_format_message` and
     :func:`_annotation_attachments`, so image numbering and attachment order
     cannot drift.
@@ -176,9 +184,7 @@ def _rows_by_path(
         rows = [
             (
                 comment,
-                None
-                if is_visitor_author(comment.created_by)
-                else parse_element_anchor(comment.anchor_content),
+                _send_element_anchor(comment, screenshot_files, reference_time),
             )
             for comment in sorted(by_path[path], key=lambda c: c.start_index)
         ]
@@ -186,53 +192,41 @@ def _rows_by_path(
     return grouped
 
 
-def _comment_sections(
+def _send_element_anchor(
+    comment: Comment,
+    screenshot_files: VisitorScreenshotFiles | None,
+    reference_time: int | None,
+) -> dict[str, Any] | None:
+    anchor = parse_element_anchor(comment.anchor_content)
+    if anchor is None or not is_visitor_author(comment.created_by):
+        return anchor
+    screenshot = element_anchor_screenshot(anchor)
+    if screenshot is not None and (
+        screenshot_files is None
+        or not screenshot_files.is_bound(
+            comment,
+            screenshot["file_id"],
+            now_epoch() if reference_time is None else reference_time,
+        )
+    ):
+        anchor["screenshot"] = None
+    return anchor
+
+
+def _format_message(
     comments: list[Comment],
-    *,
-    bullet_label: Callable[[Comment], str] | None = None,
-) -> list[str]:
-    """Render the ``File:`` sections for text comments.
-
-    Each entry carries the character range (start–end), the anchor content
-    as an ``Excerpt:`` block quoted line by line, and the body as one escaped
-    double-quoted line, so a line break or an embedded quote cannot forge
-    another entry. The range lets the agent locate the relevant section
-    without pre-computed line numbers.
-
-    :param comments: The comments to render.
-    :param bullet_label: Optional label inserted into each entry's comment
-        line, used to attribute visitor comments to their author.
-    :returns: The section lines, or an empty list when there are no comments.
-    """
-    lines: list[str] = []
-    for path, rows in _rows_by_path(comments):
-        lines.append("")
-        lines.append(f"File: {_escape_line_breaks(path)}")
-        for index, (comment, _anchor) in enumerate(rows):
-            if index:
-                lines.append("")
-            lines.extend(_location_lines(comment))
-            prefix = (
-                f"Visitor comment ({bullet_label(comment)})"
-                if bullet_label is not None
-                else "User comment"
-            )
-            lines.append(f"{prefix}: {_quoted_comment_body(comment.body)}")
-
-    return lines
-
-
-def _format_message(comments: list[Comment]) -> str:
+    screenshot_files: VisitorScreenshotFiles | None = None,
+    reference_time: int | None = None,
+) -> str:
     """Format a list of comments into a human-readable message for the agent.
 
     Owner text rows keep the standard ``Location:`` / ``Excerpt:`` listing;
     owner element rows render as an ``Element annotation <n>`` block whose
     page-derived fields sit inside an ``<untrusted_page_evidence>`` wrapper,
     numbered in message order with ``(image <k>)`` on screenshot rows.
-    Visitor comments are appended in their own untrusted-feedback section,
-    each body on a labelled ``Visitor comment (…):`` line, so a comment
-    relayed from a shared link is never presented as an instruction from the
-    user.
+    Visitor comments follow in their own untrusted-feedback section, with
+    element evidence and labelled notes. Only live, comment-bound visitor
+    screenshots receive image numbers after owner images.
 
     :param comments: The comments to format.
     :returns: A multi-line string suitable for posting to the agent.
@@ -267,16 +261,35 @@ def _format_message(comments: list[Comment]) -> str:
     if visitor_comments:
         lines.append("")
         lines.append(VISITOR_FEEDBACK_HEADER)
-        lines.extend(
-            _comment_sections(
-                visitor_comments,
-                bullet_label=lambda c: visitor_author_label(c.created_by or ""),
-            )
-        )
+        for path, rows in _rows_by_path(visitor_comments, screenshot_files, reference_time):
+            lines.append("")
+            lines.append(f"File: {_escape_line_breaks(path)}")
+            for index, (comment, anchor) in enumerate(rows):
+                if index:
+                    lines.append("")
+                label = visitor_author_label(comment.created_by or "")
+                if anchor is None:
+                    lines.extend(_location_lines(comment))
+                else:
+                    element_count += 1
+                    heading = f"Element annotation {element_count}"
+                    if element_anchor_screenshot(anchor) is not None:
+                        image_count += 1
+                        heading += f" (image {image_count})"
+                    lines.append(heading)
+                    lines.append(_EVIDENCE_NOTICE)
+                    lines.append("<untrusted_page_evidence>")
+                    lines.append(element_anchor_evidence(anchor))
+                    lines.append("</untrusted_page_evidence>")
+                lines.append(f"Visitor comment ({label}): {_quoted_comment_body(comment.body)}")
     return "\n".join(lines)
 
 
-def _annotation_attachments(comments: list[Comment]) -> list[dict[str, str]]:
+def _annotation_attachments(
+    comments: list[Comment],
+    screenshot_files: VisitorScreenshotFiles | None = None,
+    reference_time: int | None = None,
+) -> list[dict[str, str | int]]:
     """Collect the screenshot attachments for element annotations.
 
     Uses the message's own row ordering, so attachment ``k`` is the image
@@ -286,8 +299,13 @@ def _annotation_attachments(comments: list[Comment]) -> list[dict[str, str]]:
     :returns: ``{"comment_id", "file_id", "filename"}`` dicts in message
         order, one per screenshot row.
     """
-    attachments: list[dict[str, str]] = []
-    for _path, rows in _rows_by_path(comments):
+    attachments: list[dict[str, str | int]] = []
+    ordered = [c for c in comments if not is_visitor_author(c.created_by)]
+    visitors = [c for c in comments if is_visitor_author(c.created_by)]
+    for _path, rows in [
+        *_rows_by_path(ordered),
+        *_rows_by_path(visitors, screenshot_files, reference_time),
+    ]:
         for comment, anchor in rows:
             if anchor is None:
                 continue
@@ -299,6 +317,11 @@ def _annotation_attachments(comments: list[Comment]) -> list[dict[str, str]]:
                     "comment_id": comment.id,
                     "file_id": screenshot["file_id"],
                     "filename": screenshot["filename"],
+                    **(
+                        {"expires_at": screenshot["expires_at"]}
+                        if is_visitor_author(comment.created_by) and "expires_at" in screenshot
+                        else {}
+                    ),
                 }
             )
     return attachments
@@ -417,6 +440,8 @@ def create_comments_router(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     conversation_store: ConversationStore | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> APIRouter:
     """Build the comments router.
 
@@ -442,6 +467,11 @@ def create_comments_router(
     if permission_store is not None and conversation_store is None:
         raise ValueError("conversation_store is required when permission_store is provided")
     router = APIRouter()
+    screenshot_files = (
+        VisitorScreenshotFiles(file_store, artifact_store)
+        if file_store is not None and artifact_store is not None
+        else None
+    )
 
     async def _require_session_access(user_id: str | None, session_id: str, level: int) -> None:
         """Require access and a real session before comment store mutations.
@@ -572,8 +602,19 @@ def create_comments_router(
         """
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_READ)
+        if screenshot_files is not None:
+            try:
+                await asyncio.to_thread(screenshot_files.clean_expired_and_count, session_id)
+            except Exception:  # noqa: BLE001 - cleanup must not hide comments
+                logger.warning(
+                    "Visitor screenshot cleanup failed for session %s", session_id, exc_info=True
+                )
         comments = store.list_for_conversation(session_id, path=path)
-        return comment_rows(comments, include_visitor_drafts=include_visitor_drafts)
+        return comment_rows(
+            comments,
+            include_visitor_drafts=include_visitor_drafts,
+            visitor_screenshot_allowed=screenshot_files.is_bound if screenshot_files else None,
+        )
 
     @router.patch("/sessions/{session_id}/comments/{comment_id}")
     async def update_comment(
@@ -705,11 +746,12 @@ def create_comments_router(
 
         to_send = await asyncio.to_thread(_fetch_and_mark)
 
-        formatted = _format_message(to_send)
+        reference_time = now_epoch()
+        formatted = _format_message(to_send, screenshot_files, reference_time)
         return {
             "formatted_message": formatted,
             "sent_comment_ids": [c.id for c in to_send],
-            "attachments": _annotation_attachments(to_send),
+            "attachments": _annotation_attachments(to_send, screenshot_files, reference_time),
         }
 
     return router

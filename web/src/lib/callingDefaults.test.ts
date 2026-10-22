@@ -221,5 +221,5 @@ it.each([
       "permission",
       null,
     ),
-  ).toEqual({ value: tier, source: "master" });
+  ).toEqual(tier === "full" ? { value: null, source: "none" } : { value: tier, source: "master" });
 });

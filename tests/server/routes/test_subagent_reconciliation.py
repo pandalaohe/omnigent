@@ -645,9 +645,11 @@ async def test_reconcile_route_repairs_stale_display_cache_when_db_is_terminal(
     persisted: list[tuple[str, str]] = []
 
     def _submit_now(_description: str, fn: Any, *args: Any, **_kwargs: Any) -> None:
-        if _description == "live_status":
-            persisted.append((args[0], args[1]))
         fn(*args)
+        if _description == "live_status":
+            current = store.get_conversation(child.id)
+            assert current is not None and current.live_status is not None
+            persisted.append((child.id, current.live_status))
 
     monkeypatch.setattr(
         session_live_state,
@@ -806,9 +808,11 @@ async def test_reconcile_route_preserves_same_status_new_turn_during_cas(
     persisted: list[tuple[str, str]] = []
 
     def _submit_now(_description: str, fn: Any, *args: Any, **_kwargs: Any) -> None:
-        if _description == "live_status":
-            persisted.append((args[0], args[1]))
         fn(*args)
+        if _description == "live_status":
+            current = store.get_conversation(child.id)
+            assert current is not None and current.live_status is not None
+            persisted.append((child.id, current.live_status))
 
     monkeypatch.setattr(session_live_state, "submit", _submit_now)
     monkeypatch.setattr(session_live_state, "_store", store)

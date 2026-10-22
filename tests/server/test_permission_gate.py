@@ -115,17 +115,27 @@ async def test_mismatched_execution_host_verdict_denies(store, arguments, monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["arguments", "revision", "read-only", "decline", "accept"])
-async def test_approval_is_bound_and_consumed_once(store, arguments, monkeypatch, change):
+@pytest.mark.parametrize("host_kind", ["host", "runner"])
+@pytest.mark.parametrize(
+    "change", ["arguments", "revision", "execution-host", "read-only", "decline", "accept"]
+)
+async def test_approval_is_bound_and_consumed_once(
+    store, arguments, monkeypatch, change, host_kind
+):
     from omnigent.server.routes._sessions import orchestration
 
     requests, cards = [], []
+    execution_host = "host"
+    if host_kind == "runner":
+        store.conversation.host_id = None
+        store.conversation.runner_id = "runner-a"
+        execution_host = "runner:runner-a"
     async with httpx.AsyncClient(
         base_url="http://runner",
         transport=httpx.MockTransport(
             lambda req: (
                 requests.append(json.loads(req.content))
-                or httpx.Response(200, json=response_body(arguments))
+                or httpx.Response(200, json=response_body(arguments, host_id=execution_host))
             )
         ),
     ) as client:
@@ -147,6 +157,11 @@ async def test_approval_is_bound_and_consumed_once(store, arguments, monkeypatch
 
         async def approve(*_, **kwargs):
             cards.append(kwargs)
+            if change == "execution-host":
+                if host_kind == "runner":
+                    store.conversation.runner_id = "runner-b"
+                else:
+                    store.conversation.host_id = "other-host"
             if change == "revision":
                 store.conversation.labels.update(
                     ConfirmedPermissionState("ask", 3, "ready").labels("pi")

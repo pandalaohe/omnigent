@@ -353,6 +353,7 @@ def write_extension_files(
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
+    startup_instructions: str | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -370,6 +371,8 @@ def write_extension_files(
         runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
         centralized server-side policy enforcement. ``None``/empty registers no
         tools (Pi falls back to its own built-in tool surface only).
+    :param startup_instructions: Composed session instructions appended to
+        Pi's native system prompt at every agent start.
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -394,6 +397,21 @@ def write_extension_files(
             )
         ),
     }
+    if startup_instructions and startup_instructions.strip():
+        payload["startupInstructions"] = startup_instructions
+    # A failed rotation can outlive its Pi process. Keep the successor identity
+    # across relaunches so recovery cannot mint a second replacement.
+    try:
+        previous = json.loads(config_path(bridge_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = None
+    if isinstance(previous, dict) and previous.get("sessionId") == session_id:
+        source = previous.get("pendingRotationSource")
+        successor = previous.get("pendingSuccessorId")
+        if isinstance(source, str) and source:
+            payload["pendingRotationSource"] = source
+            if isinstance(successor, str) and successor:
+                payload["pendingSuccessorId"] = successor
     # A marker left by a previous Pi process would report this launch ready early.
     (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
     source = _extension_source()

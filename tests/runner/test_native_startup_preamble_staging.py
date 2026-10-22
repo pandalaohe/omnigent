@@ -3,7 +3,7 @@
 The instructions a native session starts under — author text, framework
 instructions, the server-held global text — are staged in the session's bridge
 dir at terminal launch, then prefixed to the first message the executor injects.
-Pi / cursor / kiro / goose / hermes / qwen / kimi / antigravity reach the
+Cursor / kiro / goose / hermes / qwen / kimi / antigravity reach the
 channel through their launch adapters.
 """
 
@@ -24,16 +24,14 @@ from omnigent.runner.native import (
     _launch_hermes,
     _launch_kimi,
     _launch_kiro,
-    _launch_pi,
     _launch_qwen,
 )
 from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 _SESSION_ID = "47f049b9d13df4db397c7f46859b825f"
-_HARNESSES = ["pi", "cursor", "kiro", "goose", "hermes", "qwen", "kimi", "antigravity"]
+_HARNESSES = ["cursor", "kiro", "goose", "hermes", "qwen", "kimi", "antigravity"]
 _LAUNCHERS = {
-    "pi": _launch_pi,
     "cursor": _launch_cursor,
     "kiro": _launch_kiro,
     "goose": _launch_goose,
@@ -71,16 +69,7 @@ def _stub_launch(harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     from omnigent.runner.native import orchestration
 
     bridge_dir = tmp_path / harness / "bridge"
-    if harness == "pi":
-        import omnigent.harnesses.pi_native.bridge as pi_bridge
-
-        async def _fake_pi_launch_config(**_kwargs: Any) -> Any:
-            return SimpleNamespace(workspace=tmp_path)
-
-        monkeypatch.setattr(orchestration, "_pi_native_launch_config", _fake_pi_launch_config)
-        monkeypatch.setattr(pi_bridge, "prepare_bridge_dir", lambda session_id: bridge_dir)
-        monkeypatch.setattr(pi_bridge, "clear_inbox", _raise_stop)
-    elif harness == "cursor":
+    if harness == "cursor":
         import omnigent.harnesses.cursor_native.bridge as cursor_bridge
 
         monkeypatch.setattr(

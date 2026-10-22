@@ -11,7 +11,7 @@ alive and the tool is still running.
 
 Journey (real user path, mock-scripted model):
 
-1. ``omnigent run <agent.yaml> --harness pi -p ...``
+1. the headless startup helper creates an explicitly full Pi session
 2. the model issues one ``long_task`` tool call taking ~150s
 3. the tool finishes and the model's final answer (carrying a
    sentinel) must reach stdout — instead the turn errors at ~120s.
@@ -137,18 +137,14 @@ def test_pi_survives_long_tool_calling_turn(
     result = subprocess.run(
         [
             str(omnigent_python),
-            "-m",
-            "omnigent",
-            "run",
+            "-c",
+            "from omnigent.chat import ChatOverrides, _run_local_headless_prompt; "
+            "import sys; _run_local_headless_prompt(sys.argv[1], None, "
+            "overrides=ChatOverrides(harness='pi', model=sys.argv[2]), "
+            "prompt=sys.argv[3], ephemeral=True, permission_tier='full')",
             str(yaml_path),
-            "--model",
             mock_model,
-            "--harness",
-            "pi",
-            "-p",
             _PROMPT,
-            "--no-log",
-            "--no-session",
         ],
         env=env,
         cwd=str(omnigent_repo_root),

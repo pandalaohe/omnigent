@@ -1,16 +1,14 @@
 import { queueUserPreferencePatch } from "./userPreferencesSync";
-import { NATIVE_CODING_AGENTS } from "./nativeCodingAgents";
 
 export const SESSION_COLLAB_STORAGE_KEY = "omnigent:session-collab";
 export const SESSION_COLLAB_CHANGED_EVENT = "omnigent:session-collab-changed";
-export const QUOTA_PRODUCTS = NATIVE_CODING_AGENTS.map((agent) => agent.key);
-export type QuotaProduct = (typeof QUOTA_PRODUCTS)[number];
 export const QUOTA_PERIOD_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 
 /** Field names are the stored JSON keys the server accessor reads. */
 export interface SessionCollabPreferences {
   /** Master switch: off hides the collaboration tools and refuses peer routes. */
   enabled: boolean;
+  sessionRestrictions: "off" | "subagents" | "all";
   openRateCount: number;
   openRateWindowSeconds: number;
   relayDepthMax: number;
@@ -29,7 +27,8 @@ export interface SessionCollabPreferences {
   quotaTightBelowPct: number;
   quotaLowBelowPct: number;
   quotaFloorPct: number | null;
-  quotaPeriods: Partial<Record<QuotaProduct, string>>;
+  quotaPeriodDefault: string | null;
+  quotaPeriods: Record<string, string>;
 }
 
 export type SessionCollabNumericField =
@@ -67,6 +66,7 @@ export const SESSION_COLLAB_BOUNDS: Record<
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   enabled: true,
+  sessionRestrictions: "subagents",
   openRateCount: 10,
   openRateWindowSeconds: 60,
   relayDepthMax: 30,
@@ -85,6 +85,7 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   quotaTightBelowPct: 50,
   quotaLowBelowPct: 20,
   quotaFloorPct: null,
+  quotaPeriodDefault: null,
   quotaPeriods: {},
 };
 
@@ -109,12 +110,16 @@ function normalizePercentage(value: unknown, min: number, max: number): number |
 function normalizeQuotaPeriods(value: unknown): SessionCollabPreferences["quotaPeriods"] {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const raw = value as Record<string, unknown>;
-  const periods: SessionCollabPreferences["quotaPeriods"] = {};
-  for (const product of QUOTA_PRODUCTS) {
-    const period = raw[product];
-    if (typeof period === "string" && QUOTA_PERIOD_PATTERN.test(period)) periods[product] = period;
-  }
-  return periods;
+  return Object.fromEntries(
+    Object.entries(raw).filter((entry): entry is [string, string] => {
+      const [product, period] = entry;
+      return product.length > 0 && typeof period === "string" && QUOTA_PERIOD_PATTERN.test(period);
+    }),
+  );
+}
+
+function normalizeQuotaPeriod(value: unknown): string | null {
+  return typeof value === "string" && QUOTA_PERIOD_PATTERN.test(value) ? value : null;
 }
 
 function normalizePreferences(value: unknown): SessionCollabPreferences {
@@ -126,6 +131,10 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
   const validThresholds = low !== null && tight !== null && low > 0 && low < tight;
   return {
     enabled: normalizeBoolean(raw.enabled, SESSION_COLLAB_DEFAULTS.enabled),
+    sessionRestrictions:
+      raw.sessionRestrictions === "off" || raw.sessionRestrictions === "all"
+        ? raw.sessionRestrictions
+        : "subagents",
     openRateCount: normalizeInteger(raw.openRateCount, "openRateCount"),
     openRateWindowSeconds: normalizeInteger(raw.openRateWindowSeconds, "openRateWindowSeconds"),
     relayDepthMax: normalizeInteger(raw.relayDepthMax, "relayDepthMax"),
@@ -165,6 +174,7 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
     quotaTightBelowPct: validThresholds ? tight : SESSION_COLLAB_DEFAULTS.quotaTightBelowPct,
     quotaLowBelowPct: validThresholds ? low : SESSION_COLLAB_DEFAULTS.quotaLowBelowPct,
     quotaFloorPct: normalizePercentage(raw.quotaFloorPct, 0, 100),
+    quotaPeriodDefault: normalizeQuotaPeriod(raw.quotaPeriodDefault),
     quotaPeriods: normalizeQuotaPeriods(raw.quotaPeriods),
   };
 }

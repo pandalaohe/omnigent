@@ -453,4 +453,11 @@ def _parse_screenshot(value: Any) -> dict[str, Any] | None:
     height = _bounded_int(value.get("height"), 1, 4096)
     if filename is None or width is None or height is None:
         return None
-    return {"file_id": file_id, "filename": filename, "width": width, "height": height}
+    result = {"file_id": file_id, "filename": filename, "width": width, "height": height}
+    expiry = value.get("expires_at")
+    if isinstance(expiry, int) and not isinstance(expiry, bool) and expiry > 0:
+        result["expires_at"] = expiry
+    link_key = value.get("link_key")
+    if isinstance(link_key, str) and re.fullmatch(r"[0-9a-f]{64}", link_key):
+        result["link_key"] = link_key
+    return result
