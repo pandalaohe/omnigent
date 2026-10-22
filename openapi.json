@@ -24027,7 +24027,7 @@
     },
     "/v1/skills": {
       "get": {
-        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.",
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.\n`allow_pending` opts into a short host wait and retryable pending errors.",
         "operationId": "get_skills_v1_skills_get",
         "parameters": [
           {
@@ -24113,6 +24113,16 @@
                 }
               ],
               "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "allow_pending",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Allow Pending",
+              "type": "boolean"
             }
           }
         ],

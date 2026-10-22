@@ -5549,6 +5549,31 @@ describe("NewChatLandingScreen", () => {
     expect(picker).not.toHaveTextContent("Models unavailable");
   });
 
+  it("allows a default Codex launch after a cold model catalog timeout", async () => {
+    mockModelQueries((harness) =>
+      harness === "codex-native"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            data: undefined,
+            status: "error" as const,
+            isError: true,
+            isSuccess: false,
+            error: new DOMException("Host request timed out", "TimeoutError"),
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_default_codex" }),
+    } as Response);
+    renderLanding();
+    selectAgent("a2");
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a2");
+    expect(body.harness_override).toBeUndefined();
+    expect(body.model_override).toBeUndefined();
+  });
+
   it("shows unavailable only for a truly empty Codex catalog", () => {
     useHostModelOptionsMock.mockReturnValue({
       data: [],
@@ -8956,6 +8981,7 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(authenticatedFetchMock.mock.calls[0]![0]).toContain(
       "/v1/skills?host_id=host_1&harness=claude-native&path=%2FUsers%2Fcorey%2Frepo",
     );
+    expect(authenticatedFetchMock.mock.calls[0]![0]).toContain("allow_pending=true");
     await act(async () =>
       resolveSkills({
         ok: true,
@@ -9097,6 +9123,7 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByTestId("slash-menu-item-host-only")).not.toBeInTheDocument();
     expect(useSkills).toHaveBeenLastCalledWith(
       expect.objectContaining({
+        allowPending: true,
         target: {
           hostId: "host_1",
           harness: "claude-sdk",

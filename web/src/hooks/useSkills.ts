@@ -1,5 +1,6 @@
 import { skipToken, useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { withHostRequestTimeout } from "@/lib/hostRequestTimeout";
 import { ApiError } from "@/lib/sessionsApi";
 import type { Session, SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -26,24 +27,29 @@ export type SkillsTarget =
 export async function fetchSkills(
   target: SkillsTarget,
   signal: AbortSignal,
+  allowPending = false,
 ): Promise<SkillSummary[]> {
   const params =
     target.sessionId !== undefined
       ? new URLSearchParams({ session_id: target.sessionId })
       : new URLSearchParams({ host_id: target.hostId, harness: target.harness, path: target.path });
   if (target.agentId !== undefined) params.set("agent_id", target.agentId);
-  const response = await authenticatedFetch(`/v1/skills?${params}`, { signal });
-  if (!response.ok) {
-    throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
-  }
-  const body = (await response.json()) as { skills?: SkillSummary[] };
-  if (!Array.isArray(body.skills)) throw new Error("Invalid host skills response");
-  return body.skills;
+  if (allowPending) params.set("allow_pending", "true");
+  const request = async (requestSignal: AbortSignal) => {
+    const response = await authenticatedFetch(`/v1/skills?${params}`, { signal: requestSignal });
+    if (!response.ok) {
+      throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
+    }
+    const body = (await response.json()) as { skills?: SkillSummary[] };
+    if (!Array.isArray(body.skills)) throw new Error("Invalid host skills response");
+    return body.skills;
+  };
+  return allowPending ? withHostRequestTimeout(request, signal) : request(signal);
 }
 
-/** Shared cache key, so other host-scoped readers reuse the composer's catalogs. */
-export function skillsQueryKey(target: SkillsTarget | null) {
-  return ["skills", target?.sessionId, target] as const;
+/** Pending errors must not poison consumers that wait for the completed catalog. */
+export function skillsQueryKey(target: SkillsTarget | null, allowPending = false) {
+  return ["skills", target?.sessionId, target, allowPending] as const;
 }
 
 interface SkillsOptions {
@@ -51,14 +57,21 @@ interface SkillsOptions {
   target: SkillsTarget | null;
   enabled?: boolean;
   starting?: boolean;
+  /** Use the short host wait and client deadline in the new-session composer. */
+  allowPending?: boolean;
 }
 
 /** Discover composer skills, with optional session authorization and agent scope. */
-export function useSkills({ target, enabled = true, starting = false }: SkillsOptions) {
+export function useSkills({
+  target,
+  enabled = true,
+  starting = false,
+  allowPending = false,
+}: SkillsOptions) {
   const available = enabled && target !== null;
   const query = useQuery({
-    queryKey: skillsQueryKey(target),
-    queryFn: available ? ({ signal }) => fetchSkills(target, signal) : skipToken,
+    queryKey: skillsQueryKey(target, allowPending),
+    queryFn: available ? ({ signal }) => fetchSkills(target, signal, allowPending) : skipToken,
     enabled: available,
     staleTime: 30_000,
     refetchInterval: available && target.sessionId !== undefined ? 60_000 : false,

@@ -55,6 +55,27 @@ afterEach(() => {
 });
 
 describe("host catalog refresh", () => {
+  it("fetches without static abort APIs and clears the fallback timer on success", async () => {
+    const originalTimeout = AbortSignal.timeout;
+    const originalAny = AbortSignal.any;
+    Object.defineProperty(AbortSignal, "timeout", { configurable: true, value: undefined });
+    Object.defineProperty(AbortSignal, "any", { configurable: true, value: undefined });
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(mockResponse({ models: [{ id: "available" }] }));
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } });
+      await expect(refreshHostModelOptions(client, "host", "codex", "force")).resolves.toEqual([
+        { id: "available" },
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(AbortSignal, "timeout", { configurable: true, value: originalTimeout });
+      Object.defineProperty(AbortSignal, "any", { configurable: true, value: originalAny });
+    }
+  });
+
   it("sends auto and force to the same endpoint and keeps cached rows after a failed probe", async () => {
     const client = new QueryClient();
     const key = ["host-model-options", "host_1", "codex-native"];
@@ -661,6 +682,41 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
 });
 
 describe("useHostModelOptions", () => {
+  it("ends a stalled request without automatic timeout retries and allows retry", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    fetchMock
+      .mockImplementationOnce(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+          }),
+      )
+      .mockResolvedValue(mockResponse({ models: [{ id: "recovered" }] }));
+    try {
+      const { result } = renderHook(() => useHostModelOptions("host_1", "codex-native"), {
+        wrapper,
+      });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      expect(result.current.isLoading).toBe(true);
+      await act(async () =>
+        controller.abort(new DOMException("Host request timed out", "TimeoutError")),
+      );
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.isLoading).toBe(false);
+      expect(result.current.isFetching).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(timeout).toHaveBeenCalledWith(8_000);
+      timeout.mockRestore();
+      await act(async () => {
+        await result.current.refetch();
+      });
+      await waitFor(() => expect(result.current.data).toEqual([{ id: "recovered" }]));
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
   it("loads the selected host's pre-launch catalog", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({

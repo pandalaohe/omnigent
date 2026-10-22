@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
-import { useSkills, type SkillsTarget } from "./useSkills";
+import { skillsQueryKey, useSkills, type SkillsTarget } from "./useSkills";
 
 const fetchMock = vi.fn();
 const target = { hostId: "host", harness: "claude-native", path: "/repo" };
@@ -25,6 +25,75 @@ afterEach(() => {
 });
 
 describe("useSkills", () => {
+  it("exposes a pending host scan as an error and gets its real catalog on retry", async () => {
+    fetchMock.mockResolvedValueOnce(response([], 502)).mockResolvedValue(response());
+    const { result } = renderHook(() => useSkills({ target, allowPending: true }), { wrapper });
+    expect(skillsQueryKey(target, true)).not.toEqual(skillsQueryKey(target));
+    await waitFor(() => expect(result.current.skillsStatus).toBe("error"));
+    expect(fetchMock.mock.calls[0][0]).toContain("allow_pending=true");
+    expect(result.current.skills).toEqual([]);
+    await act(async () => {
+      await result.current.refetch();
+    });
+    await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
+    expect(result.current.skills).toEqual(skills);
+  });
+
+  it("fetches and follows caller cancellation without static abort APIs", async () => {
+    const originalTimeout = AbortSignal.timeout;
+    const originalAny = AbortSignal.any;
+    Object.defineProperty(AbortSignal, "timeout", { configurable: true, value: undefined });
+    Object.defineProperty(AbortSignal, "any", { configurable: true, value: undefined });
+    let abortSignal!: AbortSignal;
+    fetchMock.mockImplementation((_url, init) => {
+      abortSignal = init.signal;
+      return new Promise((_resolve, reject) => {
+        abortSignal.addEventListener("abort", () => reject(abortSignal.reason), { once: true });
+      });
+    });
+    try {
+      const { unmount } = renderHook(() => useSkills({ target, allowPending: true }), { wrapper });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      expect(abortSignal.aborted).toBe(false);
+      unmount();
+      expect(abortSignal.aborted).toBe(true);
+    } finally {
+      Object.defineProperty(AbortSignal, "timeout", { configurable: true, value: originalTimeout });
+      Object.defineProperty(AbortSignal, "any", { configurable: true, value: originalAny });
+    }
+  });
+
+  it("ends a stalled request with a retryable error", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    fetchMock
+      .mockImplementationOnce(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+          }),
+      )
+      .mockResolvedValue(response());
+    try {
+      const { result } = renderHook(() => useSkills({ target, allowPending: true }), { wrapper });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      expect(result.current.skillsStatus).toBe("loading");
+      await act(async () =>
+        controller.abort(new DOMException("Host request timed out", "TimeoutError")),
+      );
+      await waitFor(() => expect(result.current.skillsStatus).toBe("error"));
+      expect(timeout).toHaveBeenCalledWith(8_000);
+      timeout.mockRestore();
+      await act(async () => {
+        await result.current.refetch();
+      });
+      await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
+      expect(result.current.skills).toEqual(skills);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
   it("requires either a session ID or a complete host target", () => {
     expectTypeOf<{ sessionId: string }>().toExtend<SkillsTarget>();
     expectTypeOf<typeof target>().toExtend<SkillsTarget>();

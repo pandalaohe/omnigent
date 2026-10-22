@@ -5680,6 +5680,7 @@ export function NewChatLandingScreen() {
           }
         : null,
     enabled: canDiscoverHostSkills,
+    allowPending: true,
     starting: !sandboxSelected && (hostsLoading || agentsLoading),
   });
   const availableSkills = useMemo(
