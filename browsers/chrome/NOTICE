@@ -1,0 +1,8 @@
+Omnigent Chrome annotations
+Copyright Omnigent contributors
+Licensed under the repository's Apache License, Version 2.0.
+
+The unique CSS node address, dialog/inert checks and top-layer placement in
+src/picker/dom.ts and src/picker/index.ts adapt this repository's
+web/electron/src/designModeScript.js (base revision a841734b304639f3f27a9dcfea88d154a2bd39fb).
+No Agentation or third-party extension source is included.

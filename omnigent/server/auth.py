@@ -100,11 +100,14 @@ def annotation_path_allowed(method: str | None, path: str) -> bool:
 
     if (method, path) in {
         ("GET", "/v1/browser-annotations/sessions"),
+        ("POST", "/v1/browser-annotations/sessions"),
         ("POST", "/oauth/token"),
         ("POST", "/oauth/revoke"),
     }:
         return True
-    if method == "GET" and re.fullmatch(r"/v1/browser-annotations/batches/[0-9a-f]{32}", path):
+    if method in ("GET", "POST") and re.fullmatch(
+        r"/v1/browser-annotations/batches/[0-9a-f]{32}", path
+    ):
         return True
     if method == "POST" and re.fullmatch(
         r"/v1/browser-annotations/sessions/[A-Za-z0-9_-]+/(screenshots|batches)", path

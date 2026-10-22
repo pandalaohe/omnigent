@@ -1,0 +1,26 @@
+{
+  "name": "omnigent-chrome",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "prettier": {
+    "printWidth": 100
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run type-check && pnpm test && pnpm run build",
+    "type-check": "tsc --noEmit",
+    "lint": "cd .. && oxlint --deny-warnings --report-unused-disable-directives chrome/src chrome/tests chrome/scripts shared",
+    "format:check": "prettier --check src tests scripts *.json *.html README.md ../shared",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.2",
+    "esbuild": "^0.28.2",
+    "jsdom": "^29.1.1",
+    "oxlint": "^1.62.0",
+    "prettier": "^3.8.3",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.11"
+  }
+}

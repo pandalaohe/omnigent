@@ -246,13 +246,14 @@ def create_browser_annotations_router(
             status_code=204,
             headers={
                 "Access-Control-Allow-Origin": chrome_origin,
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "Authorization, Content-Type",
                 "Vary": "Origin",
             },
         )
 
     @router.get("/v1/browser-annotations/sessions")
+    @router.post("/v1/browser-annotations/sessions")
     async def list_sessions(
         request: Request,
         query: str = Query(default="", max_length=120),
@@ -383,6 +384,7 @@ def create_browser_annotations_router(
         return JSONResponse(receipt, headers=NO_STORE_HEADERS)
 
     @router.get("/v1/browser-annotations/batches/{batch_id}")
+    @router.post("/v1/browser-annotations/batches/{batch_id}")
     async def own_batch_receipt(request: Request, batch_id: str) -> Response:
         user_id, grant_id, _ = narrow_identity(request)
         conversation_store = require_delivery()

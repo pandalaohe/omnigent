@@ -1286,19 +1286,23 @@ def test_chrome_public_pairing_preserves_shared_secret_and_consent(
             with account_authority_scope(None, None):
                 return provider.get_user_id(request)
 
-        assert identity("GET", "/v1/browser-annotations/sessions", _CHROME_ORIGIN) == "admin"
-        assert identity("GET", "/v1/browser-annotations/sessions", None) is None
-        assert identity("GET", "/v1/browser-annotations/sessions", "http://localhost") is None
-        assert identity("POST", "/v1/browser-annotations/sessions", _CHROME_ORIGIN) is None
-        assert (
-            identity(
-                "GET",
+        for method in ("GET", "POST"):
+            for path in (
                 "/v1/browser-annotations/sessions",
-                _CHROME_ORIGIN,
-                raw_path=b"/v1/browser-annotations/%73essions",
+                "/v1/browser-annotations/batches/" + "a" * 32,
+            ):
+                assert identity(method, path, _CHROME_ORIGIN) == "admin"
+                assert identity(method, path, None) is None
+                assert identity(method, path, "http://localhost") is None
+            assert (
+                identity(
+                    method,
+                    "/v1/browser-annotations/sessions",
+                    _CHROME_ORIGIN,
+                    raw_path=b"/v1/browser-annotations/%73essions",
+                )
+                is None
             )
-            is None
-        )
         assert store.authorize_annotation_request(
             body["grant_id"], "admin", claims["account_generation"]
         )
@@ -1330,6 +1334,12 @@ def test_chrome_public_pairing_preserves_shared_secret_and_consent(
         assert not store.authorize_annotation_request(
             body["grant_id"], "admin", claims["account_generation"]
         )
+        for method in ("GET", "POST"):
+            assert identity(method, "/v1/browser-annotations/sessions", _CHROME_ORIGIN) is None
+            assert (
+                identity(method, "/v1/browser-annotations/batches/" + "a" * 32, _CHROME_ORIGIN)
+                is None
+            )
     finally:
         generator.close()
 
@@ -1403,14 +1413,31 @@ def test_connected_apps_lists_and_revokes_only_owned_delegations(
     ("method", "path", "allowed"),
     [
         ("GET", "/v1/browser-annotations/sessions", True),
+        ("POST", "/v1/browser-annotations/sessions", True),
         ("POST", "/v1/browser-annotations/sessions/sid_1/screenshots", True),
         ("POST", "/v1/browser-annotations/sessions/sid_1/batches", True),
         ("GET", "/v1/browser-annotations/batches/" + "a" * 32, True),
+        ("POST", "/v1/browser-annotations/batches/" + "a" * 32, True),
         ("POST", "/oauth/token", True),
         ("POST", "/oauth/revoke", True),
         ("GET", "/v1/browser-annotations/sessions/sid_1", False),
+        ("POST", "/v1/browser-annotations/sessions/", False),
+        ("POST", "/v1/browser-annotations/sessions-extra", False),
+        ("POST", "/v1/browser-annotations/batches/" + "a" * 32 + "/", False),
+        ("POST", "/v1/browser-annotations/batches/" + "a" * 33, False),
+        ("HEAD", "/v1/browser-annotations/sessions", False),
+        ("PUT", "/v1/browser-annotations/sessions", False),
+        ("PATCH", "/v1/browser-annotations/sessions", False),
+        ("DELETE", "/v1/browser-annotations/sessions", False),
+        ("OPTIONS", "/v1/browser-annotations/sessions", False),
+        ("HEAD", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("PUT", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("PATCH", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("DELETE", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("OPTIONS", "/v1/browser-annotations/batches/" + "a" * 32, False),
         ("POST", "/v1/browser-annotations/sessions/sid_1/stop", False),
         ("GET", "/v1/browser-annotations/batches/short", False),
+        ("POST", "/v1/browser-annotations/batches/short", False),
         ("GET", "/v1/sessions", False),
         ("PUT", "/v1/me/annotation-receiver", False),
         ("GET", "/v1/me/connected-apps", False),

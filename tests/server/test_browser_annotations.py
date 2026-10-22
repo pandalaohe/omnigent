@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -26,10 +27,12 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import OmnigentError
+from omnigent.server.annotation_batch import AnnotationBatch
 from omnigent.server.annotation_receiver_store import AnnotationReceiverStore, ReceiverConflict
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.routes.browser_annotations import _await_claimed_write
 from omnigent.server.routes.device_auth import create_device_auth_router
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.test_device_auth import _build_accounts_app, _login_admin
 
@@ -306,11 +309,49 @@ def test_browser_picker_and_first_party_receiver_routes(
         )
         assert issued.status_code == 200
         bearer = {**origin, "Authorization": f"Bearer {issued.json()['access_token']}"}
-        listed = client.get("/v1/browser-annotations/sessions", headers=bearer)
+        browser_cookies = dict(client.cookies)
+        client.cookies.clear()
+        dispatch = AsyncMock(side_effect=AssertionError("read-only request dispatched input"))
+        monkeypatch.setattr(client.app.state.startup_inputs, "dispatch_annotation", dispatch)
+        sessions_path = "/v1/browser-annotations/sessions"
+        list_params = {"query": "Review", "limit": 1}
+        listed = client.get(sessions_path, params=list_params, headers=bearer)
         assert listed.status_code == 200, listed.text
         assert listed.json()["sessions"][0]["id"] == session_id
         assert listed.json()["receiving_session_id"] == session_id
         assert "items" not in listed.json()["sessions"][0]
+        listed_post = client.post(sessions_path, params=list_params, headers=bearer)
+        assert listed_post.status_code == 200, listed_post.text
+        assert listed_post.json() == listed.json()
+        assert listed_post.headers["cache-control"] == "no-store"
+        assert listed_post.headers["access-control-allow-origin"] == CHROME_ORIGIN
+        preflight = client.options(
+            sessions_path,
+            headers={**origin, "Access-Control-Request-Method": "POST"},
+        )
+        assert preflight.status_code == 204
+        assert preflight.headers["access-control-allow-methods"] == "GET, POST, OPTIONS"
+        for method in ("GET", "POST"):
+            assert (
+                client.request(
+                    method, sessions_path, params={"query": "Absent"}, headers=bearer
+                ).json()["sessions"]
+                == []
+            )
+            assert (
+                client.request(
+                    method, sessions_path, params={"limit": 0}, headers=bearer
+                ).status_code
+                == 422
+            )
+            assert (
+                client.request(
+                    method, sessions_path, params={"cursor": "invalid"}, headers=bearer
+                ).status_code
+                == 400
+            )
+        dispatch.assert_not_called()
+        client.cookies.update(browser_cookies)
         assert (
             client.put(
                 "/v1/me/annotation-receiver",
@@ -409,6 +450,66 @@ def test_browser_picker_and_first_party_receiver_routes(
         )
         assert upload.status_code == 200, upload.text
         assert upload.json()["sha256"] == hashlib.sha256(image_bytes).hexdigest()
+
+        conversation_store = SqlAlchemyConversationStore(database_uri)
+        grant = DeviceGrantStore(database_uri).get_by_id(issued.json()["grant_id"])
+        assert grant is not None and grant.account_generation is not None
+        batch = AnnotationBatch.model_validate_json(offline_send.request.content)
+        batch.batch_id = "a" * 32
+        batch.items[0].capture_id = "b" * 32
+        receipt, created = conversation_store.admit_annotation_batch(
+            "admin", grant.id, grant.account_generation, session_id, batch, target_live=True
+        )
+        assert created
+        pending_ids = [item.id for item in conversation_store.list_pending_inputs(session_id)]
+        assert pending_ids == [receipt["item_id"]]
+        receiver_before = client.get("/v1/me/annotation-receiver").json()
+        receipt_path = f"/v1/browser-annotations/batches/{batch.batch_id}"
+        full_scope_bearer = {
+            **origin,
+            "Authorization": f"Bearer {browser_cookies['ap_session']}",
+        }
+        for method in ("GET", "POST"):
+            for path in (sessions_path, receipt_path):
+                assert client.request(method, path, headers=origin).status_code == 401
+        client.cookies.clear()
+        for method in ("GET", "POST"):
+            read_list = client.request(method, sessions_path, params=list_params, headers=bearer)
+            assert read_list.status_code == 200, read_list.text
+            assert read_list.json()["sessions"][0]["id"] == session_id
+            own_receipt = client.request(method, receipt_path, headers=bearer)
+            assert own_receipt.status_code == 200, own_receipt.text
+            assert own_receipt.json() == receipt
+            assert own_receipt.headers["cache-control"] == "no-store"
+            assert own_receipt.headers["access-control-allow-origin"] == CHROME_ORIGIN
+            not_recorded = client.request(
+                method, "/v1/browser-annotations/batches/" + "c" * 32, headers=bearer
+            )
+            assert not_recorded.status_code == 404
+            assert not_recorded.json() == {"error": "not_recorded"}
+            for path in (sessions_path, receipt_path):
+                assert client.request(method, path, headers=full_scope_bearer).status_code == 401
+                assert (
+                    client.request(
+                        method, path, headers={"Authorization": bearer["Authorization"]}
+                    ).status_code
+                    == 403
+                )
+                assert (
+                    client.request(
+                        method, path, headers={**bearer, "Origin": FIRST_PARTY_ORIGIN}
+                    ).status_code
+                    == 403
+                )
+        assert (
+            conversation_store.get_annotation_receipt("admin", grant.id, batch.batch_id) == receipt
+        )
+        assert [
+            item.id for item in conversation_store.list_pending_inputs(session_id)
+        ] == pending_ids
+        dispatch.assert_not_called()
+        client.cookies.update(browser_cookies)
+        assert client.get("/v1/me/annotation-receiver").json() == receiver_before
         assert (
             client.delete(
                 f"/v1/me/connected-apps/{issued.json()['grant_id']}",
