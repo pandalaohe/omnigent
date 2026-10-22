@@ -21,8 +21,6 @@ from typing import Any
 import click
 import httpx
 
-from omnigent.usage_export.cutover import FEED_HARNESSES
-
 EXIT_USAGE = 2
 EXIT_CONFLICT = 3
 EXIT_TIMEOUT = 4
@@ -33,6 +31,8 @@ EXIT_LOCAL = 8
 
 
 def _parse_domain(value: str) -> tuple[str, str]:
+    from omnigent.usage_export.cutover import FEED_HARNESSES
+
     host_id, _, harness = value.partition(",")
     host_id = host_id.strip()
     harness = harness.strip()
@@ -715,6 +715,8 @@ def bindings_activate(revision: int, digest: str, server: str | None) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Print the raw JSON body")
 def route(harness: str, server: str | None, as_json: bool) -> None:
     """Print the runner-attested billing route for one harness."""
+    from omnigent.usage_export.cutover import FEED_HARNESSES
+
     if harness not in FEED_HARNESSES:
         raise click.BadParameter(f"harness must be one of {', '.join(sorted(FEED_HARNESSES))}")
     base = _server_base(server)

@@ -2170,6 +2170,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "update",
         "upgrade",
         "usage",
+        "usage-export",
         "version",
     }
 )

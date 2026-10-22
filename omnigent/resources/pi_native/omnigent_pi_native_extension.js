@@ -2593,6 +2593,7 @@ module.exports = function (pi) {
           ? activeToolsForTier(pi, config, baselineActiveTools, target)
           : null;
         const attested = active && markPermissionInstallation(
+          pi,
           config,
           { ...state, tier: target,
             revision: state.revision + (target === state.tier ? 0 : 1) },

@@ -101,7 +101,6 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.native.failure_telemetry import FailureContext
-from omnigent.terminals.program_status import ProgramStatusReader
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -6310,6 +6309,8 @@ def _claude_session_status(
     status_path = Path(socket_path).with_name("program-status.json")
     relay = _read_json_file(status_path)
     if relay is not None and relay.get("relay_pid") == pane_pid:
+        from omnigent.terminals.program_status import ProgramStatusReader
+
         # The UUID scan only covers fresh files; an idle Claude's direct
         # PID lookup must keep working after that scan window expires.
         pane_pid = ProgramStatusReader(status_path).child_pid

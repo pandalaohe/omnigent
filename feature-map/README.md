@@ -198,7 +198,8 @@ map an area, remove it here in the same change.
 **CLI commands:**
 
 - Setup and diagnostics: `omnigent setup`, `omnigent config`, `omnigent doctor`,
-  `omnigent diagnose`, `omnigent debug`, `omnigent usage`
+  `omnigent diagnose`, `omnigent debug`, `omnigent usage`,
+  `omnigent usage-export`
 - Server status: `omnigent system`
 - Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`,
   `omnigent up`

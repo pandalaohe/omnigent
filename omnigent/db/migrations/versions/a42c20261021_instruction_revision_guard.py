@@ -22,7 +22,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     if op.get_bind().dialect.name == "cockroachdb":
         op.execute('DROP INDEX "global_instruction_revisions"@"uq_instruction_parent" CASCADE')
-        op.drop_column("global_instruction_revisions", "parent_revision_id")
+        with op.batch_alter_table("global_instruction_revisions") as batch:
+            batch.drop_column("parent_revision_id")
         return
     with op.batch_alter_table("global_instruction_revisions") as batch:
         batch.drop_constraint("uq_instruction_parent", type_="unique")

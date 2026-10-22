@@ -62,6 +62,8 @@ async def restore_pending_inputs(
     store: ConversationStore, session_id: str, *, annotation_only: bool = False
 ) -> None:
     """Restore native receipt matching after an AP restart, without submitting again."""
+    if annotation_only and not isinstance(store, SqlAlchemyConversationStore):
+        return
     for item in await asyncio.to_thread(store.list_pending_inputs, session_id):
         if annotation_only and (
             not isinstance(store, SqlAlchemyConversationStore)
