@@ -44,6 +44,7 @@ from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeAlias, cast
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from claude_agent_sdk import SessionKey, SessionStoreEntry
@@ -86,6 +87,8 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorResidentInventory,
+    ExecutorResidentOwner,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -865,6 +868,7 @@ class _ClaudeClientState:
     permission_mode: str | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
+    resident_incarnation_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 @dataclass
@@ -1933,6 +1937,7 @@ class ClaudeSDKExecutor(Executor):
         self._elicitation_handler: ElicitationHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
+        self._resident_inventory_detached = False
         # Per-session query slots serializing real turns and keep-warm pings.
         self._query_slots: dict[str, _QuerySlot] = {}
         self._active_turns: dict[str, int] = {}
@@ -2232,6 +2237,8 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        # Best-effort teardown is not an owned context-absence acknowledgment.
+        self._resident_inventory_detached = True
         try:
             current_loop = asyncio.get_running_loop()
             current_task = asyncio.current_task()
@@ -2270,6 +2277,7 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        self._resident_inventory_detached = True
         # Close in the background: an await here runs under an in-flight
         # cancellation and could itself be cancelled, leaking the CLI process.
         task = asyncio.create_task(self._force_close_client(state.client))
@@ -2767,6 +2775,36 @@ class ClaudeSDKExecutor(Executor):
 
         client._query = None
         client._transport = None
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Copy registered client owners without loading or probing the SDK.
+
+        Connecting clients, vendor IDs and independent SDK subcontexts are not
+        covered. A retired client keeps absence unknown even after cleanup returns.
+        """
+        if self._resident_inventory_detached:
+            return None
+        owners: dict[str, ExecutorResidentOwner] = {}
+        clients: set[int] = set()
+        for session_key, state in tuple(self._clients.items()):
+            if not isinstance(state, _ClaudeClientState) or not session_key:
+                return None
+            identity = state.resident_incarnation_id
+            # A shared SDK client does not prove keys are read-only context aliases.
+            if id(state.client) in clients or identity in owners:
+                return None
+            clients.add(id(state.client))
+            owners[identity] = ExecutorResidentOwner(
+                incarnation_id=identity,
+                session_keys=(session_key,),
+                vendor_context_id=None,
+                started=True,
+                closing=False,
+                cleanup_complete=False,
+            )
+        return ExecutorResidentInventory(
+            owners=tuple(owners[identity] for identity in sorted(owners))
+        )
 
     def supports_streaming(self) -> bool:
         return True

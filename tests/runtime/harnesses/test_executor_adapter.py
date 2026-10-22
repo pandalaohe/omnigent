@@ -2979,8 +2979,10 @@ async def test_resident_inventory_read_is_authenticated_bound_and_never_construc
 
 
 @pytest.mark.asyncio
-async def test_resident_inventory_http_reads_codex_owner_and_preserves_detached_unknown(
+@pytest.mark.parametrize("family", ["codex", "claude-sdk"])
+async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknown(
     monkeypatch,
+    family,
 ):
     import asyncio
     from types import SimpleNamespace
@@ -2993,17 +2995,27 @@ async def test_resident_inventory_http_reads_codex_owner_and_preserves_detached_
     )
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
-    monkeypatch.setattr(
-        "omnigent.inner.codex_executor.uuid4", lambda: SimpleNamespace(hex="a" * 32)
-    )
     factory = Mock(side_effect=AssertionError("read must not construct"))
     adapter = ExecutorAdapter(factory)
     adapter._ensure_executor = Mock(side_effect=AssertionError("read must not prepare"))
-    executor = CodexExecutor(codex_path="/bin/echo")
-    app_session = _CodexAppServerSession(
-        codex_path="/bin/echo", cwd=None, env={}, tool_executor=None
-    )
-    executor._session_states["owner-key"] = _CodexSessionState(app_session=app_session)
+    if family == "codex":
+        monkeypatch.setattr(
+            "omnigent.inner.codex_executor.uuid4", lambda: SimpleNamespace(hex="a" * 32)
+        )
+        executor = CodexExecutor(codex_path="/bin/echo")
+        app_session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd=None, env={}, tool_executor=None
+        )
+        executor._session_states["owner-key"] = _CodexSessionState(app_session=app_session)
+    else:
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor.uuid4", lambda: SimpleNamespace(hex="a" * 32)
+        )
+        executor = ClaudeSDKExecutor()
+        executor._clients["owner-key"] = _ClaudeClientState(client=SimpleNamespace(), model=None)
     adapter._executor = executor
     app = adapter.build()
     app.state.conversation_id = "conversation"
@@ -3021,9 +3033,9 @@ async def test_resident_inventory_http_reads_codex_owner_and_preserves_detached_
                         "incarnation_id": "a" * 32,
                         "session_keys": ["owner-key"],
                         "vendor_context_id": None,
-                        "started": False,
+                        "started": family == "claude-sdk",
                         "closing": False,
-                        "cleanup_complete": True,
+                        "cleanup_complete": family == "codex",
                     }
                 ],
                 "ambiguous_context_ids": [],
