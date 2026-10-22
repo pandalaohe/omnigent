@@ -87,12 +87,23 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
         ):
             return None
         native_ids = [o.incarnation_id for o in snapshot.native_backends.owners]
-        if not all(native_ids) or len(set(native_ids)) != len(native_ids):
+        if (
+            not all(native_ids)
+            or len(set(native_ids)) != len(native_ids)
+            or any(
+                not owner.session_ids or not all(owner.session_ids)
+                for owner in snapshot.native_backends.owners
+            )
+        ):
             return None
         harnesses = snapshot.harnesses
         if harnesses is not None:
             ids = [o.incarnation_id for o in harnesses.owners]
-            if not all(ids) or len(set(ids)) != len(ids):
+            if (
+                not all(ids)
+                or len(set(ids)) != len(ids)
+                or any(not owner.session_id for owner in harnesses.owners)
+            ):
                 return None
             if harnesses.contexts is not None:
                 if len(harnesses.contexts) != len(harnesses.owners):

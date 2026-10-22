@@ -1372,6 +1372,11 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "empty",
         "unknown",
         "ambiguous",
+        "native-valid",
+        "native-empty-sessions",
+        "native-empty-session-id",
+        "harness-empty-session-id",
+        "harness-empty-session-id-unknown",
         "bool-string",
         "extra",
         "missing",
@@ -1425,12 +1430,34 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "executor_contexts_complete": False,
         "external_owners_complete": False,
     }
+    if case.startswith("native-"):
+        payload["native_backends"]["owners"] = [
+            {
+                "incarnation_id": "native-one",
+                "harness": "codex-native",
+                "session_ids": ["native-main", "native-ui"],
+                "registered": True,
+                "closing": False,
+                "process_exit_confirmed": False,
+                "exit_confirmed": False,
+                "aliases_complete": False,
+            }
+        ]
+        if case == "native-empty-sessions":
+            payload["native_backends"]["owners"][0]["session_ids"] = []
+        elif case == "native-empty-session-id":
+            payload["native_backends"]["owners"][0]["session_ids"] = ["native-main", ""]
     if case == "empty":
         contexts["owners"] = []
     elif case == "unknown":
         payload["harnesses"]["contexts"] = [None]
     elif case == "ambiguous":
         contexts["ambiguous_context_ids"] = ["thread-one"]
+    elif case.startswith("harness-empty-session-id"):
+        owner["session_id"] = ""
+        payload["harnesses"]["contexts"][0]["owner"]["session_id"] = ""
+        if case == "harness-empty-session-id-unknown":
+            payload["harnesses"]["contexts"] = [None]
     elif case == "bool-string":
         contexts["owners"][0]["started"] = "false"
     elif case == "extra":
@@ -1454,7 +1481,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
         owner["closing"] = True
         payload["harnesses"]["contexts"][0]["owner"]["closing"] = True
     result = _decode_runner_context_inventory(payload)
-    if case not in {"valid", "empty", "unknown", "ambiguous"}:
+    if case not in {"valid", "empty", "unknown", "ambiguous", "native-valid"}:
         assert result is None
     else:
         assert result is not None
@@ -1469,3 +1496,5 @@ def test_runner_context_inventory_strict_wire_decode(case):
             assert read.inventory.aliases_complete is False
         else:
             assert read.inventory.owners[0].session_keys == ("main", "ui")
+        if case == "native-valid":
+            assert result.native_backends.owners[0].session_ids == ("native-main", "native-ui")
