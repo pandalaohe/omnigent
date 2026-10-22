@@ -335,8 +335,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["terminal_name"] == "pi"
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
-    assert captured["spec"].command == "/opt/launchers/controlled-pi"
-    assert len(ordered_calls) == 1
+    expected_command = "pi" if permission_tier == "full" else "/opt/launchers/controlled-pi"
+    assert captured["spec"].command == expected_command
+    assert len(ordered_calls) == (0 if permission_tier == "full" else 1)
     # Preserve the exited pane so the idle watcher can report its output.
     assert captured["spec"].keep_alive_after_exit is True
     assert captured["spec"].env_unset == expected_env_unset
@@ -764,6 +765,37 @@ def _pi_launch_test_stubs(
 
     captured["registry"] = _FakeResourceRegistry()
     return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission_tier", ["full", "ask"])
+async def test_pi_launcher_requires_sdk_only_for_restricted_tiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, permission_tier: str
+) -> None:
+    captured = _pi_launch_test_stubs(tmp_path, monkeypatch, None)
+    executable = tmp_path / "pi"
+    executable.touch()
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: str(executable)
+    )
+    session_id = "47f049b9d13df4db397c7f46859b825f"
+    seed_pi_permission_state(tmp_path, session_id, permission_tier)
+
+    async def launch() -> None:
+        await _auto_create_pi_terminal(
+            session_id,
+            captured["registry"],
+            lambda _sid, _event: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+
+    if permission_tier == "full":
+        await launch()
+        assert captured["spec"].command == str(executable)
+    else:
+        with pytest.raises(ValueError, match="does not expose the supported Pi SDK loader"):
+            await launch()
+        assert "spec" not in captured
 
 
 @pytest.mark.asyncio

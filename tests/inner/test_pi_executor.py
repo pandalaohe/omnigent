@@ -3169,9 +3169,15 @@ def test_controlled_rpc_launch_orders_user_extensions_before_guard(
         [], 12345, "test-token", None, permission_session_id="session"
     )
     try:
-        assert config.executable == "/opt/launchers/permission-pi"
-        assert observed == ["/opt/bin/pi"]
-        assert config.extra_args == ["--approve", "--model", "demo", "--tools", "read"]
+        if permission_tier == "full":
+            assert config.executable is None
+            assert observed == []
+            assert "--extension" in config.extra_args
+            assert config.extra_args[-2:] == ["--tools", "read"]
+        else:
+            assert config.executable == "/opt/launchers/permission-pi"
+            assert observed == ["/opt/bin/pi"]
+            assert config.extra_args == ["--approve", "--model", "demo", "--tools", "read"]
     finally:
         shutil.rmtree(config.tmp_dir)
 
