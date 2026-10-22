@@ -631,6 +631,7 @@ class HarnessProcessManager:
         self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
         self._closing_entries: dict[str, tuple[str, _SubprocessEntry]] = {}
+        self._spawning_sessions: set[str] = set()
         self._exit_coverage_complete = True
         # Per-conversation in-flight harness response_id. The runner's
         # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
@@ -777,7 +778,11 @@ class HarnessProcessManager:
                         snapshots, entries, strict=True
                     )
                 )
-            return HarnessInventorySnapshot(snapshots, self._exit_coverage_complete, contexts)
+            return HarnessInventorySnapshot(
+                snapshots,
+                self._exit_coverage_complete and not self._spawning_sessions,
+                contexts,
+            )
 
     async def read_resident_inventory(
         self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
@@ -1253,7 +1258,14 @@ class HarnessProcessManager:
                         f"no live harness subprocess for conversation {conversation_id!r}"
                     )
                 await admit_cold()
-                entry = await self._spawn_entry(conversation_id, harness, env)
+                self._spawning_sessions.add(conversation_id)
+                try:
+                    entry = await self._spawn_entry(conversation_id, harness, env)
+                except BaseException:
+                    self._exit_coverage_complete = False
+                    raise
+                finally:
+                    self._spawning_sessions.discard(conversation_id)
                 # Shutdown may have begun while we awaited readiness; discard
                 # rather than registering a process that ``shutdown``'s entry
                 # walk would miss. Release bumps generation only while holding

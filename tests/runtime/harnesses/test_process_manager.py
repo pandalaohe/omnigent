@@ -2791,6 +2791,106 @@ class _CleanupCountingEndpoint:
         self.cleanup_calls += 1
 
 
+@pytest.mark.parametrize("outcome", ["ready", "raises", "cancelled"])
+async def test_inventory_keeps_spawn_unknown_until_registration(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._started = True
+    entry = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def spawn(*_args, **_kwargs):
+        entered.set()
+        await resume.wait()
+        if outcome == "raises":
+            raise RuntimeError("spawn ownership unconfirmed")
+        return entry
+
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    task = asyncio.create_task(manager.get_client("preparing", "codex"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        pending = await manager.resident_inventory()
+        assert pending.owners == ()
+        assert not pending.exit_coverage_complete
+        assert manager._entries == {}
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            resume.set()
+            if outcome == "raises":
+                with pytest.raises(RuntimeError, match="spawn ownership unconfirmed"):
+                    await task
+            else:
+                assert await task is entry.client
+        after = await manager.resident_inventory()
+        assert after.exit_coverage_complete is (outcome == "ready")
+        assert len(after.owners) == (1 if outcome == "ready" else 0)
+        assert not pending.exit_coverage_complete and pending.owners == ()
+        if outcome != "ready":
+
+            async def retry(*_args, **_kwargs):
+                return entry
+
+            monkeypatch.setattr(manager, "_spawn_entry", retry)
+            assert await manager.get_client("preparing", "codex") is entry.client
+            assert len((await manager.resident_inventory()).owners) == 1
+            assert not (await manager.resident_inventory()).exit_coverage_complete
+    finally:
+        resume.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_inventory_waits_for_every_overlapping_spawn(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._started = True
+    entered = {key: asyncio.Event() for key in ("one", "two")}
+    resume = {key: asyncio.Event() for key in entered}
+
+    async def spawn(session, harness, _env):
+        entered[session].set()
+        await resume[session].wait()
+        return _SubprocessEntry(
+            process=SimpleNamespace(returncode=None),
+            client=_NoopHarnessClient(),  # type: ignore[arg-type]
+            endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+            harness=harness,
+        )
+
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    tasks = {key: asyncio.create_task(manager.get_client(key, "codex")) for key in entered}
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered.values())), 1)
+        assert not (await manager.resident_inventory()).exit_coverage_complete
+        resume["one"].set()
+        await tasks["one"]
+        partial = await manager.resident_inventory()
+        assert [owner.session_id for owner in partial.owners] == ["one"]
+        assert not partial.exit_coverage_complete
+        resume["two"].set()
+        await tasks["two"]
+        complete = await manager.resident_inventory()
+        assert {owner.session_id for owner in complete.owners} == {"one", "two"}
+        assert complete.exit_coverage_complete
+    finally:
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+
 @pytest.mark.parametrize("outcome", ["confirmed", "raises", "cancelled"])
 async def test_shutdown_spawn_close_remains_in_inventory(
     short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch, outcome: str

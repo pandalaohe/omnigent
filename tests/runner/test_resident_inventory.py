@@ -310,13 +310,15 @@ async def test_runner_owner_inventory_auth_precedes_harness_reads(harness_invent
 
 
 @pytest.mark.parametrize(
-    "state", ["empty-manager", "empty-owner", "unsupported", "failed", "closing"]
+    "state", ["empty-manager", "spawning", "empty-owner", "unsupported", "failed", "closing"]
 )
 async def test_runner_owner_inventory_keeps_unknown_distinct_from_empty(
-    harness_inventory_reader, state
+    harness_inventory_reader, monkeypatch, state
 ):
     manager, add, client, requests = harness_inventory_reader
-    if state != "empty-manager":
+    if state == "spawning":
+        monkeypatch.setattr(manager, "_spawning_sessions", {"preparing"}, raising=False)
+    if state not in {"empty-manager", "spawning"}:
         inventory = ExecutorResidentInventory(owners=())
         if state == "unsupported":
             inventory = None
@@ -331,8 +333,12 @@ async def test_runner_owner_inventory_keeps_unknown_distinct_from_empty(
     body = response.json()
     assert body["executor_contexts_complete"] is False
     assert body["external_owners_complete"] is False
-    if state == "empty-manager":
-        assert body["harnesses"] == {"owners": [], "exit_coverage_complete": True, "contexts": []}
+    if state in {"empty-manager", "spawning"}:
+        assert body["harnesses"] == {
+            "owners": [],
+            "exit_coverage_complete": state == "empty-manager",
+            "contexts": [],
+        }
     elif state == "empty-owner":
         assert body["harnesses"]["contexts"][0]["inventory"] == {
             "owners": [],
@@ -343,7 +349,7 @@ async def test_runner_owner_inventory_keeps_unknown_distinct_from_empty(
     else:
         assert body["harnesses"]["contexts"] == [None]
         assert body["harnesses"]["owners"][0]["closing"] is (state == "closing")
-    if state in {"closing", "empty-manager"}:
+    if state in {"closing", "empty-manager", "spawning"}:
         assert requests == []
 
 
