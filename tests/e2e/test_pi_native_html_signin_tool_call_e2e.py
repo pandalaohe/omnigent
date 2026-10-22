@@ -133,6 +133,14 @@ def _prepare_bridge(tmp_path: Path) -> tuple[Path, Path]:
             }
         ],
     )
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    write_host_permission_state(
+        bridge_dir / "permission_state.json",
+        HostPermissionState(
+            "conv_html_signin_e2e", "test-host", str(tmp_path), "full", 1, "ready"
+        ),
+    )
     return extension_path, config_path
 
 

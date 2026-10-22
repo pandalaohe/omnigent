@@ -261,8 +261,16 @@ async def test_agent_child_inherits_effective_host_without_host_io(
 
 @pytest.mark.asyncio
 async def test_nested_child_inherits_host_through_hostless_parent(
-    client, conv_store, register_host
+    app, client, conv_store, register_host, db_uri
 ):
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL, "session_collab", {"sessionRestrictions": "off"}
+    )
     capture = register_host()
     root = await _multipart_create(
         client, {"host_id": _HOST_ID, "workspace": "/Users/sample/project"}

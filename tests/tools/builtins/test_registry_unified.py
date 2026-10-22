@@ -160,6 +160,10 @@ def test_builtin_names_size_matches_registry() -> None:
                 # execution is runner-dispatched via the _PANEL_TOOLS branch
                 # in runner/tool_dispatch.py).
                 "open_in_panel",
+                "sys_instruction_layers_read",
+                "sys_instruction_layer_update",
+                "sys_project_settings_read",
+                "sys_project_settings_update",
             }
         )
         == BUILTIN_NAMES

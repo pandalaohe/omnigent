@@ -3002,6 +3002,7 @@ global.fetch = async () => ({ ok: true, status: 200,
 const pi = {
   registerCommand() {}, registerTool() {},
   on(name, fn) { handlers[name] = fn; },
+  getAllTools() { return activeTools.map((name) => ({ name })); },
   getActiveTools() { return activeTools; },
   setActiveTools(names) { activeTools = names; },
 };

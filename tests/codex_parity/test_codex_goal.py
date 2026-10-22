@@ -40,6 +40,8 @@ def _app_session_for_test(executor: CodexExecutor) -> Any:
 
 
 class _CodexGoalConversationStore:
+    storage_location = "sqlite://"
+
     def __init__(self) -> None:
         self._conversations = {
             "conv_codex": Conversation(
@@ -65,6 +67,9 @@ class _CodexGoalConversationStore:
                 },
             ),
         }
+
+    def get_session_owner_authority(self, conversation_id: str, *, owner_only: bool) -> None:
+        return None
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
@@ -448,7 +453,16 @@ async def test_omnigent_codex_goal_status_api_forwards_pause_resume() -> None:
 
 
 @pytest.mark.asyncio
-async def test_omnigent_codex_goal_get_and_clear_sync_session_marker() -> None:
+async def test_omnigent_codex_goal_get_and_clear_sync_session_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.usage_export import cutover
+
+    cutover_store = Mock()
+    cutover_factory = Mock(return_value=cutover_store)
+    monkeypatch.setattr(cutover, "UsageCutoverStore", cutover_factory)
     runner_client = _CodexGoalRunnerClient(response_status="budgetLimited")
     conversation_store = _CodexGoalConversationStore()
     app = _codex_goal_api_app(runner_client, conversation_store)
@@ -465,6 +479,8 @@ async def test_omnigent_codex_goal_get_and_clear_sync_session_marker() -> None:
         cleared = await client.delete("/v1/sessions/conv_codex/codex_goal")
 
     assert cleared.status_code == 200
+    cutover_factory.assert_called_once_with(conversation_store.storage_location)
+    cutover_store.end_goal_admissions.assert_called_once_with("local", "conv_codex")
     assert "omnigent.goal_state" not in conversation_store.get_conversation("conv_codex").labels
 
 

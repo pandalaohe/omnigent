@@ -154,8 +154,8 @@ def test_conversation_store_names_create_and_get_queries(
     with _capture_application_query_names(store._engine, store._conv_engine) as query_names:
         parent = store.create_conversation(title="parent")
         assert query_names == [
+            "omnigent.conversation_store.insert_conversation_project_admission",
             "omnigent.conversation_store.insert_conversation",
-            "omnigent.conversation_store.insert_conversation_metadata",
         ]
 
         query_names.clear()
@@ -167,12 +167,12 @@ def test_conversation_store_names_create_and_get_queries(
         # The routing snapshot is read before that write transaction opens.
         assert query_names == [
             "omnigent.conversation_store.select_conversation_metadata_by_id",
+            "omnigent.conversation_store.insert_conversation_project_admission",
             "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_duplicate_child_title",
             "omnigent.conversation_store.insert_conversation",
-            "omnigent.conversation_store.insert_conversation_metadata",
         ]
 
         query_names.clear()
