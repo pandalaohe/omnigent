@@ -247,7 +247,8 @@ export type KeepWarmStopReason =
   | "expired"
   | "archive_revision"
   | "policy"
-  | "parent_inactive";
+  | "parent_inactive"
+  | "skipped";
 
 /** Mirrors the server's `KeepWarmStatus`. */
 export interface KeepWarmStatus {

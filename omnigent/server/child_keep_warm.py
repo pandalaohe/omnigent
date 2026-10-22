@@ -144,6 +144,7 @@ _BLOCKER_STATUS: dict[str, str] = {
     "p": "pending_card",
 }
 _RECEIPT_OUTCOMES = frozenset({"ok", "skipped", "failed"})
+_SKIP_REASON_PREFIX = "skip:"
 #: Mirrored native sub-agent rows describe another harness's internal
 #: sub-agent, not an Omnigent session with its own cache.
 _MIRRORED_WRAPPER_LABELS = frozenset(
@@ -167,6 +168,11 @@ _STOP_REASON_CODES = frozenset(
     {
         "card",
         "unknown",
+        "tmux_metadata",
+        "native_status",
+        "composer_unreadable",
+        "query_budget",
+        "client_activity",
         "busy",
         "preempted",
         "composer_draft",
@@ -211,7 +217,8 @@ class _WarmState:
     baseline, ``v`` ``archive_revision`` at a miss pause, ``w``
     warm-until, ``o`` latest cache observation ``[epoch, 1=hit|0=miss]``,
     ``r`` late-usage retry pending, ``e`` pending late reading may count
-    as a miss, ``k`` stop reason, ``g`` first window blocker.
+    as a miss, ``k`` stop reason, ``g`` first window blocker, ``q`` consecutive
+    unsuccessful attempts, ``n`` parent notice already emitted this episode.
 
     :param s: Episode state.
     :param why: Reason for a cold / paused state — one of ``cap``, ``exp``,
@@ -237,10 +244,12 @@ class _WarmState:
     :param e: Whether the pending late reading may count as a miss —
         the episode-opening eligibility, stored because it cannot be
         re-derived once the episode's own state replaces the previous one.
-    :param k: Why warming currently does not ping — the first failing
-        eligibility gate or a receipt's reason code, else ``None``.
+    :param k: Eligibility gate or receipt reason; skipped receipts use a
+        ``skip:`` prefix so a cleared gate cannot erase their evidence.
     :param g: First eligibility blocker observed when a ping was due in
         this episode; retained until the next real-turn episode.
+    :param q: Consecutive unsuccessful attempts, bounded at the notice threshold.
+    :param n: Whether this episode already emitted a parent notice.
     """
 
     s: str
@@ -261,6 +270,8 @@ class _WarmState:
     e: bool = False
     k: str | None = None
     g: str | None = None
+    q: int = 0
+    n: bool = False
 
     def to_label(self) -> str:
         """Serialize to the compact JSON label value."""
@@ -299,6 +310,10 @@ class _WarmState:
             data["k"] = self.k
         if self.g is not None:
             data["g"] = self.g
+        if self.q:
+            data["q"] = self.q
+        if self.n:
+            data["n"] = 1
         return json.dumps(data, separators=(",", ":"))
 
     @classmethod
@@ -361,6 +376,8 @@ class _WarmState:
             e=bool(data.get("e")),
             k=stop_reason if isinstance(stop_reason, str) else None,
             g=blocker if isinstance(blocker, str) and blocker in _BLOCKER_STATUS else None,
+            q=min(max(_as_int(data.get("q")) or 0, 0), _FAILURE_PAUSE_THRESHOLD),
+            n=bool(data.get("n")),
         )
 
 
@@ -709,8 +726,8 @@ def warm_state_for_labels(
     with ``cold_after_s == 0`` read ``warm`` even with no label. The label's
     ``y`` stamp wins when present; otherwise the caller's ``family`` —
     resolved from the session's harness — supplies the per-family rule. A
-    session outside the sweeper's scan window uses its last real turn's
-    settled stamp (or its start stamp on older rows) for the family clock.
+    newer real-turn settlement supersedes the label's older cache touch or
+    observation. Without a label, older rows may use their turn-start stamp.
 
     :param labels: Conversation labels, or ``None``.
     :param archived: Whether the session row itself is archived.
@@ -750,6 +767,21 @@ def warm_state_for_labels(
         return "warm" if busy else "cold"
     if family is None:
         return None
+    state = _WarmState.parse(raw)
+    settled = labels.get(LAST_REAL_TURN_SETTLED_LABEL_KEY) if labels else None
+    if isinstance(settled, str) and settled.isdigit():
+        settled_at = int(settled)
+        touches = (
+            [state.u, state.c, state.t, state.o[0] if state.o else None]
+            if state is not None
+            else []
+        )
+        last_touch = max((stamp for stamp in touches if stamp is not None), default=0)
+        if settled_at <= now and settled_at > last_touch:
+            window = cold_after_s or (
+                _CLAUDE_TTL_S if family == "claude" else _CODEX_DEFAULT_STALENESS_S
+            )
+            return "warm" if busy or now - settled_at < window else "cold"
     return warm_state_from_label(
         raw,
         archived=False,
@@ -796,13 +828,14 @@ def keep_warm_status_from_labels(
     Build the ``keep_warm`` status object from a session's labels.
 
     ``state`` mirrors the episode label: ``s == "w"`` reads ``on`` unless a
-    gate blocks the ping (``switch`` → ``off``; ``runner`` / ``host`` /
-    ``card`` → ``paused``), ``s == "p"`` reads ``paused``, and ``s == "c"``
+    gate blocks the ping or a receipt skipped it (``switch`` → ``off``;
+    ``runner`` / ``host`` / ``card`` / skipped receipt → ``paused``),
+    ``s == "p"`` reads ``paused``, and ``s == "c"``
     reads ``stopped`` when the label records a reason (``why`` / ``k``), else
     ``off``. ``stop_reason`` is the first recognized reason mapped onto the
     status vocabulary; an unrecognized code reads ``None``, never an error.
-    ``last_reason`` always carries the label's raw ``k`` code (the last ping's
-    skip / fail reason). Costs convert integer micro-USD to float USD.
+    ``last_reason`` carries the receipt reason without its internal skip
+    prefix. Costs convert integer micro-USD to float USD.
 
     :param labels: Conversation labels, or ``None``.
     :param archived: Whether the session row itself is archived.
@@ -815,10 +848,9 @@ def keep_warm_status_from_labels(
     state = _WarmState.parse(labels.get(KEEP_WARM_LABEL))
     if state is None:
         return None
+    skipped = state.k is not None and state.k.startswith(_SKIP_REASON_PREFIX)
     if state.s == "w":
-        # A blocked warm episode reports the gate, not ``on``; a receipt
-        # code (``busy``, ``btw_unavailable``) keeps reading ``on``.
-        status = _WARM_GATE_STATUS.get(state.k or "", "on")
+        status = "paused" if skipped else _WARM_GATE_STATUS.get(state.k or "", "on")
     elif state.s == "p":
         status = "paused"
     elif state.why is not None or state.k is not None:
@@ -830,6 +862,8 @@ def keep_warm_status_from_labels(
         stop_reason = _STOP_REASON_STATUS.get(state.why or "") or _STOP_REASON_STATUS.get(
             state.k or ""
         )
+        if stop_reason is None and skipped:
+            stop_reason = "skipped"
     stats = _WarmStats.parse(labels.get(KEEP_WARM_STATS_LABEL))
     last_return = (
         {"at": stats.lr_at, "result": stats.lr_r or "unknown"} if stats.lr_at is not None else None
@@ -849,7 +883,7 @@ def keep_warm_status_from_labels(
             "estimated": stats.tot_e,
         },
         "last_return": last_return,
-        "last_reason": state.k,
+        "last_reason": state.k.removeprefix(_SKIP_REASON_PREFIX) if state.k else None,
         "blocked_by": _BLOCKER_STATUS.get(state.g or ""),
     }
 
@@ -1613,6 +1647,8 @@ class ChildKeepWarmSweeper:
         outcome = self._outcomes.pop(session_id, None)
         if state is not None and state.a is not None and outcome is not None:
             state.f += 1
+            state.q = min(state.q + 1, _FAILURE_PAUSE_THRESHOLD)
+            state.k = "forward_failed"
             state.a = None
             state.p = None
             retry_deferred = True
@@ -1625,6 +1661,8 @@ class ChildKeepWarmSweeper:
             and now - state.p > _ATTEMPT_TIMEOUT_S
         ):
             state.f += 1
+            state.q = min(state.q + 1, _FAILURE_PAUSE_THRESHOLD)
+            state.k = "timeout"
             state.a = None
             state.p = None
             retry_deferred = True
@@ -1762,7 +1800,15 @@ class ChildKeepWarmSweeper:
             and not (state.s == "p" and state.why == "fail")
         ):
             state.s, state.why = "p", "fail"
-            notices.append(("fail", {}))
+            notices.append((f"fail:{state.k or 'unknown'}", {}))
+        if (
+            is_child
+            and state is not None
+            and state.s == "w"
+            and state.q >= _FAILURE_PAUSE_THRESHOLD
+        ):
+            reason = (state.k or "unknown").removeprefix(_SKIP_REASON_PREFIX)
+            notices.append((f"trouble:{reason}", {}))
 
         # Record once, only inside the due window, before a close can erase
         # eligibility evidence. Quiet ticks and later blockers leave it alone.
@@ -1790,11 +1836,18 @@ class ChildKeepWarmSweeper:
                 state.s = "c"
                 state.why = "exp"
 
-        # Stop-reason visibility: an idle inspectable episode records the
-        # first gate blocking its ping, and clears it once the gates pass or
-        # the episode leaves warm. Written only on change so a quiet session
-        # churns no label.
+        # A skipped receipt stays visible through retries and expiry until
+        # a newer gate, receipt, or real turn supersedes it.
         desired_k = gate if state is not None and state.s == "w" else None
+        if (
+            desired_k is None
+            and state is not None
+            and state.k
+            and state.k.startswith(_SKIP_REASON_PREFIX)
+        ):
+            desired_k = state.k
+        if state is not None and state.s == "p" and state.why == "fail":
+            desired_k = state.k
         if inspectable and not busy and state is not None and state.k != desired_k:
             state.k = desired_k
 
@@ -1816,6 +1869,9 @@ class ChildKeepWarmSweeper:
                 state.a = secrets.token_hex(4)
                 ping_due = True
 
+        if state is not None and notices and is_child:
+            notices = [] if state.n else notices[:1]
+            state.n = True
         updates: dict[str, str] = {}
         new_label = state.to_label() if state is not None else None
         if new_label is not None and new_label != raw_label:
@@ -1860,10 +1916,10 @@ class ChildKeepWarmSweeper:
         Unknown or already-settled attempt ids are ignored (``False``).
         ``ok`` advances the last cache touch, counts the ping and its cost,
         clears any recorded stop reason, and applies the measured miss rule
-        on the normalized usage fields; ``skipped`` clears the attempt with
-        no other change (the cache may expire); ``failed`` counts a failure
-        (three pause warming). A ``skipped`` / ``failed`` receipt's
-        ``reason`` is recorded as the stop reason.
+        on the normalized usage fields; ``skipped`` clears the attempt without
+        refreshing the cache; ``failed`` counts a failure (three pause warming).
+        The receipt reason stays visible, and repeated unsuccessful attempts
+        may emit the episode's one parent notice.
 
         :param session_id: Session the receipt belongs to.
         :param data: The ``external_keep_warm_receipt`` payload.
@@ -1946,6 +2002,7 @@ class ChildKeepWarmSweeper:
         if outcome == "ok":
             state.u = now
             state.f = 0
+            state.q = 0
             state.w = now + interval + _SLACK_S
             state.k = None
             if stats.ep_s is None:
@@ -1973,10 +2030,16 @@ class ChildKeepWarmSweeper:
                 if family == "codex":
                     state.o = [now, 1]
         else:
+            state.q = min(state.q + 1, _FAILURE_PAUSE_THRESHOLD)
             if outcome == "failed":
                 state.f += 1
             reason = data.get("reason")
-            if isinstance(reason, str) and reason:
+            if outcome == "skipped":
+                code = (
+                    reason if isinstance(reason, str) and reason in _STOP_REASON_CODES else "other"
+                )
+                state.k = _SKIP_REASON_PREFIX + code
+            elif isinstance(reason, str) and reason:
                 state.k = reason if reason in _STOP_REASON_CODES else "other"
             if outcome == "failed" and reason == "dismiss_failed":
                 state.f = _FAILURE_PAUSE_THRESHOLD
@@ -1984,7 +2047,14 @@ class ChildKeepWarmSweeper:
         state.p = None
         if state.f >= _FAILURE_PAUSE_THRESHOLD and not (state.s == "p" and state.why == "fail"):
             state.s, state.why = "p", "fail"
-            notices.append(("fail", {}))
+            notices.append((f"fail:{state.k or 'unknown'}", {}))
+
+        if is_child and state_warm_before and state.q >= _FAILURE_PAUSE_THRESHOLD and not notices:
+            reason = (state.k or "unknown").removeprefix(_SKIP_REASON_PREFIX)
+            notices.append((f"trouble:{reason}", {}))
+        if notices and is_child:
+            notices = [] if state.n else notices[:1]
+            state.n = True
 
         updates: dict[str, str] = {}
         new_label = state.to_label()
@@ -2180,8 +2250,14 @@ class ChildKeepWarmSweeper:
                 "It restarts after the child's next real turn."
             )
             prefix = "keep-warm stopped"
-        elif kind == "fail":
+        elif kind.startswith("trouble:"):
+            reason = kind.removeprefix("trouble:")
+            body = f"3 consecutive pings were skipped or failed ({reason}); its cache may expire."
+            prefix = "keep-warm needs attention"
+        elif kind == "fail" or kind.startswith("fail:"):
             body = "3 keep-warm pings failed; it restarts after the child's next real turn."
+            if kind.startswith("fail:"):
+                body += f" Reason: {kind.removeprefix('fail:')}."
             prefix = "keep-warm paused"
         else:
             read = detail.get("read", 0)

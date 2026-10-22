@@ -3346,16 +3346,16 @@ class KeepWarmStatus(BaseModel):
     session has no keep-warm label or is archived.
 
     :param state: Episode state — ``"on"`` while warming is active,
-        ``"off"`` with no episode, ``"paused"`` after repeated failures or
-        measured cache misses, ``"stopped"`` when the cap / window ended.
+        ``"off"`` with no episode, ``"paused"`` after skipped pings, repeated
+        failures or measured cache misses, ``"stopped"`` when the cap / window ended.
     :param stop_reason: Why warming stopped or paused, or ``None`` when the
         stored code has no vocabulary entry.
     :param episode: Pings / cost since the last real turn.
     :param total: Pings / cost over the session's lifetime.
     :param last_return: The measured first turn after an absence, or
         ``None`` when none was recorded.
-    :param last_reason: The label's raw ``k`` code — the last ping's skip /
-        fail reason, e.g. ``"btw_unavailable"`` — so a ``failures`` pause
+    :param last_reason: The last ping's skip / fail reason without internal
+        label prefixes, e.g. ``"btw_unavailable"`` — so a pause
         names its cause. ``None`` when no code is stored.
     :param blocked_by: First eligibility blocker observed in a due ping
         window, retained after the episode closes. ``None`` if unobserved.
@@ -3375,6 +3375,7 @@ class KeepWarmStatus(BaseModel):
             "archive_revision",
             "policy",
             "parent_inactive",
+            "skipped",
         ]
         | None
     ) = None

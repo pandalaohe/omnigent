@@ -740,6 +740,22 @@ describe("AgentInfoContent keep-warm block", () => {
     });
   }
 
+  it("shows a skipped ping reason on a main session", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    seedListCache(qc, {
+      keep_warm: {
+        ...keepWarmStatus,
+        state: "paused",
+        stop_reason: "skipped",
+        last_reason: "native_status",
+      },
+    });
+    renderContent("conv_keep_warm", LEVEL_OWNER, qc);
+    const block = screen.getByTestId("agent-info-keep-warm");
+    expect(block).toHaveTextContent("paused");
+    expect(block).toHaveTextContent("ping skipped (native_status)");
+  });
+
   it("renders the state, reason, counters and last return for a keep-warm session", () => {
     // The block reads the session's row from the sidebar list caches it
     // shares with the stream, not a dedicated status endpoint.

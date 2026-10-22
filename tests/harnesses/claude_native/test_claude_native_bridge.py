@@ -15593,14 +15593,14 @@ def test_keep_warm_btw_pending_prompt_skips_card(
     assert sends == []
 
 
-def test_keep_warm_btw_missing_tmux_info_skips_unknown(tmp_path: Path) -> None:
-    """Guard 2: no advertised tmux metadata skips ``unknown``, pane untouched."""
+def test_keep_warm_btw_missing_tmux_info_names_guard(tmp_path: Path) -> None:
+    """Missing advertised metadata skips without touching the pane."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "unknown")
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "tmux_metadata")
 
 
 def test_keep_warm_btw_running_turn_skips_busy(
@@ -15619,19 +15619,19 @@ def test_keep_warm_btw_running_turn_skips_busy(
     assert sends == []
 
 
-def test_keep_warm_btw_unreadable_turn_tracker_skips_unknown(
+def test_keep_warm_btw_unreadable_turn_tracker_names_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     btw_guard_trackers: None,
 ) -> None:
-    """Guard 3: an unreadable status file is never evidence of idle — ``unknown``."""
+    """An unreadable status file is never evidence of idle."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: None)
     sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "unknown")
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "native_status")
     assert sends == []
 
 
@@ -15695,19 +15695,41 @@ def test_keep_warm_btw_recent_client_input_skips_user_active(
     assert sends == []
 
 
-def test_keep_warm_btw_unreadable_client_activity_skips_unknown(
+def test_keep_warm_btw_unreadable_client_activity_names_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     btw_guard_trackers: None,
 ) -> None:
-    """Guard 6: a failed tmux client query is never evidence of unattended — ``unknown``."""
+    """A failed client query is never evidence that the pane is unattended."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_tmux_last_client_input", lambda *_: (False, None))
     sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "unknown")
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "client_activity")
+    assert sends == []
+
+
+@pytest.mark.parametrize(
+    "guard,reason", [("composer", "composer_unreadable"), ("budget", "query_budget")]
+)
+def test_keep_warm_btw_names_unreadable_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+    guard: str,
+    reason: str,
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+    if guard == "composer":
+        monkeypatch.setattr(claude_native_bridge, "_composer_region_text", lambda _: None)
+    else:
+        monkeypatch.setattr(claude_native_bridge, "_TMUX_LIST_TIMEOUT_S", 1000.0)
+    assert claude_native_bridge.run_keep_warm_btw(
+        bridge_dir
+    ) == claude_native_bridge.KeepWarmBtwResult("skipped", reason)
     assert sends == []
 
 
@@ -17041,6 +17063,43 @@ def test_claude_turn_running_reads_the_status_file(
     assert (
         claude_native_bridge._claude_turn_running(bridge_dir, "/tmp/x.sock", "claude:0.0") is None
     )
+
+
+@pytest.mark.parametrize(
+    "raw_status,expected", [("idle", False), ("busy", True), ("waiting", True)]
+)
+def test_claude_turn_guard_uses_relay_child_pid_after_long_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_status: str, expected: bool
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    config = tmp_path / "config"
+    sessions = config / "sessions"
+    sessions.mkdir(parents=True)
+    status = sessions / "4242.json"
+    status.write_text(
+        json.dumps({"kind": "interactive", "sessionId": "claude-session", "status": raw_status})
+    )
+    old = time.time() - 7200
+    os.utime(status, (old, old))
+    terminal = tmp_path / "terminal"
+    terminal.mkdir()
+    (terminal / "program-status.json").write_text(
+        json.dumps({"pid": 4242, "relay_pid": os.getpid(), "status": None})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setattr(claude_native_bridge, "_tmux_pane_pid", lambda *_: os.getpid())
+    monkeypatch.setattr(claude_native_bridge, "read_claude_session_id", lambda _: "claude-session")
+    socket_path = str(terminal / "tmux.sock")
+    assert claude_native_bridge._claude_turn_running(bridge_dir, socket_path, "main") is expected
+    # A stale relay snapshot cannot authorize input to a different pane or session.
+    monkeypatch.setattr(claude_native_bridge, "_tmux_pane_pid", lambda *_: os.getpid() + 1)
+    assert claude_native_bridge._claude_turn_running(bridge_dir, socket_path, "main") is None
+    monkeypatch.setattr(claude_native_bridge, "_tmux_pane_pid", lambda *_: os.getpid())
+    monkeypatch.setattr(
+        claude_native_bridge, "read_claude_session_id", lambda _: "different-session"
+    )
+    assert claude_native_bridge._claude_turn_running(bridge_dir, socket_path, "main") is None
 
 
 def test_keep_warm_composer_reads_claude_no_break_space_separator() -> None:

@@ -5353,6 +5353,11 @@ def create_runner_app(
     _KEEP_WARM_USER_ACTIVE_WINDOW_S = 60.0
     _KEEP_WARM_LOG_REASONS = frozenset(
         {
+            "tmux_metadata",
+            "native_status",
+            "composer_unreadable",
+            "query_budget",
+            "client_activity",
             "card",
             "unknown",
             "busy",
