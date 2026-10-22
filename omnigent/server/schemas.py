@@ -3357,6 +3357,8 @@ class KeepWarmStatus(BaseModel):
     :param last_reason: The label's raw ``k`` code — the last ping's skip /
         fail reason, e.g. ``"btw_unavailable"`` — so a ``failures`` pause
         names its cause. ``None`` when no code is stored.
+    :param blocked_by: First eligibility blocker observed in a due ping
+        window, retained after the episode closes. ``None`` if unobserved.
     """
 
     state: Literal["on", "off", "paused", "stopped"]
@@ -3369,6 +3371,10 @@ class KeepWarmStatus(BaseModel):
             "host",
             "switch_off",
             "runner_version",
+            "expired",
+            "archive_revision",
+            "policy",
+            "parent_inactive",
         ]
         | None
     ) = None
@@ -3376,6 +3382,7 @@ class KeepWarmStatus(BaseModel):
     total: KeepWarmTotal = Field(default_factory=KeepWarmTotal)
     last_return: KeepWarmLastReturn | None = None
     last_reason: str | None = None
+    blocked_by: str | None = None
 
 
 class SessionListItem(BaseModel):
