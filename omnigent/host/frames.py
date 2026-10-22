@@ -3622,6 +3622,8 @@ def _decode_owner_inventory_result(msg: _JsonObject) -> HostOwnerInventoryResult
                 and len({item.incarnation_id for item in candidate.runners})
                 == len(candidate.runners)
                 and all(item.runner_id and item.incarnation_id for item in candidate.runners)
+                and all(candidate.pending_runner_ids)
+                and len(set(candidate.pending_runner_ids)) == len(candidate.pending_runner_ids)
             ):
                 inventory = candidate
     except ValueError:

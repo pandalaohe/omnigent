@@ -823,6 +823,8 @@ async def test_host_owner_inventory_compatibility_unknown_never_enqueues(
         "missing-field",
         "extra-field",
         "duplicate-owner",
+        "empty-pending",
+        "duplicate-pending",
         "complete-coverage",
         "wrong-generation",
         "wrong-connection",
@@ -844,6 +846,10 @@ async def test_host_owner_inventory_invalid_reply_is_unknown(host_owner_control,
             body["inventory"]["runners"][0]["unexpected"] = "field"
         elif fault_kind == "duplicate-owner":
             body["inventory"]["runners"] *= 2
+        elif fault_kind == "empty-pending":
+            body["inventory"]["pending_runner_ids"] = [""]
+        elif fault_kind == "duplicate-pending":
+            body["inventory"]["pending_runner_ids"] = ["runner-pending", "runner-pending"]
         elif fault_kind == "complete-coverage":
             body["inventory"]["context_coverage_complete"] = True
         elif fault_kind == "wrong-generation":
