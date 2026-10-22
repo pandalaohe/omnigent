@@ -462,6 +462,8 @@ def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
             key = backend.resident_incarnation_id
             if key not in owners:
                 owners[key] = (harness, backend, set(), True, False)
+            elif owners[key][0] != harness or owners[key][1] is not backend:
+                return NativeBackendInventorySnapshot((), False)
             owners[key][2].add(session_id)
     for session_id, harness, backend in _STARTING_NATIVE_BACKENDS.values():
         key = backend.resident_incarnation_id
@@ -475,6 +477,8 @@ def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
         key = owner.incarnation_id
         if key in owners:
             harness, backend, sessions, registered, _closing = owners[key]
+            if harness != owner.harness or backend is not owner.backend:
+                return NativeBackendInventorySnapshot((), False)
             owners[key] = (harness, backend, sessions, registered, True)
             sessions.add(owner.session_id)
         else:

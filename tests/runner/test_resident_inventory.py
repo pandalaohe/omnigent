@@ -57,7 +57,10 @@ async def test_owner_reader_preserves_missing_registry_and_incomplete_aliases(
 
 
 @pytest.mark.asyncio
-async def test_reader_keeps_shared_backend_aliases_as_evidence_without_probing(monkeypatch):
+@pytest.mark.parametrize("conflict", [None, "backend", "harness"])
+async def test_reader_keeps_shared_backend_aliases_as_evidence_without_probing(
+    monkeypatch, conflict
+):
     backend = SimpleNamespace(
         resident_incarnation_id="backend-one",
         process_exit_confirmed=False,
@@ -65,20 +68,25 @@ async def test_reader_keeps_shared_backend_aliases_as_evidence_without_probing(m
         close=Mock(side_effect=AssertionError("read must not close")),
         is_alive=Mock(side_effect=AssertionError("read must not probe")),
     )
+    alias = SimpleNamespace(**vars(backend)) if conflict == "backend" else backend
     monkeypatch.setattr(
         orchestration,
         "_AUTO_CODEX_APP_SERVERS",
         {
             "session-one": backend,
-            "ui-alias": backend,
+            **({"ui-alias": alias} if conflict != "harness" else {}),
         },
     )
-    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(
+        orchestration,
+        "_AUTO_OPENCODE_SERVERS",
+        {"ui-alias": alias} if conflict == "harness" else {},
+    )
     app = create_runner_app(server_client=NullServerClient())
     async with _runner_client(app) as client:
         response = await client.get("/v1/startup/owner-inventory?read_id=owners")
     assert response.status_code == 200
-    assert response.json()["native_backends"] == {
+    expected = {
         "owners": [
             {
                 "incarnation_id": "backend-one",
@@ -94,9 +102,73 @@ async def test_reader_keeps_shared_backend_aliases_as_evidence_without_probing(m
         "exit_coverage_complete": True,
         "aliases_complete": False,
     }
+    if conflict:
+        expected = {"owners": [], "exit_coverage_complete": False, "aliases_complete": False}
+    assert response.json()["native_backends"] == expected
     assert response.json()["executor_contexts_complete"] is False
     backend.close.assert_not_called()
     backend.is_alive.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "phases",
+    [
+        ("registered", "registered"),
+        ("registered", "starting"),
+        ("registered", "closing"),
+        ("starting", "starting"),
+        ("starting", "closing"),
+        ("closing", "closing"),
+    ],
+)
+@pytest.mark.parametrize("conflict", [None, "backend", "harness"])
+def test_native_owner_union_checks_identity_across_lifecycle_maps(monkeypatch, phases, conflict):
+    backend = SimpleNamespace(
+        resident_incarnation_id="shared-incarnation",
+        process_exit_confirmed=False,
+        exit_confirmed=False,
+    )
+    other = SimpleNamespace(**vars(backend)) if conflict == "backend" else backend
+    codex, opencode, starting, closing = {}, {}, {}, {}
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", codex)
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", opencode)
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", starting)
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", closing)
+    for session, phase, owner, harness in zip(
+        ("one", "two"),
+        phases,
+        (backend, other),
+        ("codex-native", "opencode-native" if conflict == "harness" else "codex-native"),
+        strict=True,
+    ):
+        if phase == "registered":
+            (codex if harness == "codex-native" else opencode)[session] = owner
+        elif phase == "starting":
+            starting[object()] = (session, harness, owner)
+        else:
+            closing[object()] = orchestration._ClosingNativeBackend(
+                owner.resident_incarnation_id, session, harness, owner
+            )
+
+    snapshot = orchestration.native_backend_resident_inventory()
+    assert orchestration.native_backend_resident_inventory() == snapshot
+    assert snapshot.aliases_complete is False
+    if conflict:
+        assert snapshot.owners == ()
+        assert snapshot.exit_coverage_complete is False
+    else:
+        assert snapshot.exit_coverage_complete is True
+        assert snapshot.owners == (
+            orchestration.NativeBackendResidentSnapshot(
+                "shared-incarnation",
+                "codex-native",
+                ("one", "two"),
+                "registered" in phases,
+                "closing" in phases,
+                False,
+                False,
+            ),
+        )
 
 
 @pytest.fixture
