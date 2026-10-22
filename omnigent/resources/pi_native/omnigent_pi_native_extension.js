@@ -1089,6 +1089,11 @@ const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
 const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
 const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+const _PREVIEW_POST_TIMEOUT_MS = 1_000;
+const _PREVIEW_FLUSH_TIMEOUT_MS = 300;
+const _PREVIEW_MAX_QUEUED_EVENTS = 32;
+const _PREVIEW_MAX_QUEUED_CHARS = 32_768;
+const _PREVIEW_MAX_DELTA_CHARS = 8_192;
 
 function boundedSourceId(sourceId) {
   const value = typeof sourceId === "string" ? sourceId.trim() : "";
@@ -1718,13 +1723,12 @@ module.exports = function (pi) {
   // message_update events carrying an assistantMessageEvent of type
   // "text_delta" (token chunk) / "text_end" (block complete) during a
   // turn — see @earendil-works/pi-ai AssistantMessageEvent. We forward
-  // each token as a transient external_output_text_delta so the web UI
-  // paints a live preview before the final message lands.
+  // adjacent tokens as transient external_output_text_delta events so the
+  // web UI paints a live preview before the final message lands.
   //
-  // The preview is keyed by ASSISTANT MESSAGE, not per text block: the
-  // web UI (chatStore.pumpStreamEvents) finalizes the OLDEST in-flight
-  // "live:<message_id>" preview when the authoritative text_done arrives,
-  // FIFO, and message_end posts ONE combined external_conversation_item
+  // The preview is keyed by ASSISTANT MESSAGE, not per text block.
+  // message_end carries the same id on its authoritative item, retiring late
+  // previews, and posts ONE combined external_conversation_item
   // per assistant message (textFromMessage joins all text blocks). So a
   // 1:1 message-scoped id keeps exactly one preview per item; a per-block
   // id would orphan extra previews when a message has multiple text
@@ -1740,6 +1744,104 @@ module.exports = function (pi) {
   // ones — see the message_end handler for why it advances there (not on
   // message_start) so deltas and the finalize agree on the id.
   let streamingMessageOrdinal = 0;
+  // The sender serializes text and reasoning previews. Slow preview HTTP
+  // cannot hold Pi's token producer or the authoritative message indefinitely.
+  const previewQueue = [];
+  let previewQueuedChars = 0;
+  let previewTask = null;
+  let previewController = null;
+  let previewDisabled = false;
+  function disablePreviews() {
+    previewDisabled = true;
+    previewQueue.length = 0;
+    previewQueuedChars = 0;
+    if (previewController) previewController.abort();
+  }
+  function queuePreview(type, data, key) {
+    if (previewDisabled) return;
+    const delta = data.delta;
+    const last = previewQueue[previewQueue.length - 1];
+    if (last && key && last.key === key &&
+        last.data.delta.length + delta.length <= _PREVIEW_MAX_DELTA_CHARS) {
+      last.data.delta += delta;
+      previewQueuedChars += delta.length;
+    } else if (previewQueue.length < _PREVIEW_MAX_QUEUED_EVENTS &&
+               delta.length <= _PREVIEW_MAX_DELTA_CHARS) {
+      previewQueue.push({ type, data, key });
+      previewQueuedChars += delta.length;
+    } else {
+      previewDisabled = true;
+    }
+    if (previewQueuedChars > _PREVIEW_MAX_QUEUED_CHARS || previewDisabled) {
+      previewQueue.length = 0;
+      previewQueuedChars = 0;
+      return;
+    }
+    queuePreviewPump();
+  }
+
+  function queuePreviewPump() {
+    if (previewTask || !previewQueue.length) return;
+    previewTask = drainPreviews().finally(() => {
+      previewTask = null;
+      if (previewQueue.length) queuePreviewPump();
+    });
+  }
+
+  async function drainPreviews() {
+    while (previewQueue.length) {
+      const next = previewQueue.shift();
+      previewQueuedChars -= next.data.delta.length;
+      if (next.type === "external_output_text_delta") {
+        const messageId = next.data.message_id;
+        const index = streamedTextIndex.get(messageId) || 0;
+        next.data.index = index;
+        streamedTextIndex.set(messageId, index + 1);
+      }
+      const controller = new AbortController();
+      previewController = controller;
+      let timeout;
+      try {
+        const deadline = new Promise((_, reject) => {
+          controller.signal.addEventListener("abort", () => {
+            reject(new Error("preview POST aborted"));
+          }, { once: true });
+          timeout = setTimeout(() => {
+            controller.abort();
+          }, _PREVIEW_POST_TIMEOUT_MS);
+        });
+        await Promise.race([
+          postEventChecked(config, { type: next.type, data: next.data }, controller.signal),
+          deadline,
+        ]);
+      } catch (_err) {
+        // A partial preview is repaired by the authoritative item.
+        disablePreviews();
+      } finally {
+        clearTimeout(timeout);
+        if (previewController === controller) previewController = null;
+      }
+    }
+  }
+
+  async function flushPreviews() {
+    const deadline = Date.now() + _PREVIEW_FLUSH_TIMEOUT_MS;
+    while (previewTask) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        disablePreviews();
+        await previewTask;
+        return;
+      }
+      let timeout;
+      await Promise.race([
+        previewTask,
+        new Promise((resolve) => { timeout = setTimeout(resolve, remaining); }),
+      ]);
+      clearTimeout(timeout);
+    }
+  }
+
   // streamedTextIndex: message_id -> next 0-based chunk index.
   const streamedTextIndex = new Map();
   // finalizedTextBlocks: message_ids whose final delta was already posted,
@@ -2216,11 +2318,10 @@ module.exports = function (pi) {
     postedReasoning.add(key);
     postedReasoning.add(textKey);
     if (!streamed) {
-      await postEvent(config, {
-        type: "external_output_reasoning_delta",
-        data: { delta: text, started: true },
-      });
+      queuePreview("external_output_reasoning_delta",
+        { delta: text, started: true }, null);
     }
+    await flushPreviews();
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -2239,15 +2340,13 @@ module.exports = function (pi) {
     return `${responseId}:msg:${streamingMessageOrdinal}:thinking:${contentIndex}`;
   }
 
-  async function postReasoningDelta(update, responseId) {
+  function postReasoningDelta(update, responseId) {
     if (typeof update.delta !== "string" || !update.delta) return;
     const blockKey = reasoningBlockKey(responseId, update.contentIndex);
     const started = !streamedReasoningBlocks.has(blockKey);
     streamedReasoningBlocks.add(blockKey);
-    await postEvent(config, {
-      type: "external_output_reasoning_delta",
-      data: { delta: update.delta, started },
-    });
+    queuePreview("external_output_reasoning_delta",
+      { delta: update.delta, started }, blockKey);
   }
 
   function streamingMessageId(responseId) {
@@ -2261,7 +2360,7 @@ module.exports = function (pi) {
     return `${responseId}:msg:${streamingMessageOrdinal}`;
   }
 
-  async function postOutputTextDelta(messageId, delta, options) {
+  function postOutputTextDelta(messageId, delta, options) {
     // Transient assistant-text chunk for live preview (Responses-style
     // response.output_text.delta on the wire). Not persisted; the
     // authoritative final text arrives separately via
@@ -2270,27 +2369,19 @@ module.exports = function (pi) {
     const final = !!(options && options.final);
     if (typeof delta !== "string") return;
     if (!delta && !final) return;
-    const index = streamedTextIndex.get(messageId) || 0;
-    streamedTextIndex.set(messageId, index + 1);
-    await postEvent(config, {
-      type: "external_output_text_delta",
-      data: {
-        delta,
-        message_id: messageId,
-        index,
-        final,
-      },
-    });
+    queuePreview("external_output_text_delta",
+      { delta, message_id: messageId, final },
+      final ? null : `${messageId}:block:${options && options.contentIndex}`);
   }
 
-  async function postTextDelta(update, responseId) {
+  function postTextDelta(update, responseId) {
     // assistantMessageEvent of type "text_delta": one streamed token of
     // the current assistant message. All text blocks of the message share
     // its id, so the preview reads as one growing message.
     if (!update || typeof update.delta !== "string" || !update.delta) return;
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
-    await postOutputTextDelta(messageId, update.delta);
+    postOutputTextDelta(messageId, update.delta, { contentIndex: update.contentIndex });
   }
 
   async function finalizeStreamingMessage(responseId) {
@@ -2302,9 +2393,11 @@ module.exports = function (pi) {
     // message with no text_delta has no live preview to close).
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
-    if (!streamedTextIndex.has(messageId)) return;
+    if (!streamedTextIndex.has(messageId) &&
+        !previewQueue.some((entry) => entry.data.message_id === messageId)) return;
     finalizedTextBlocks.add(messageId);
-    await postOutputTextDelta(messageId, "", { final: true });
+    postOutputTextDelta(messageId, "", { final: true });
+    await flushPreviews();
   }
 
   async function mirrorAssistantMessage(message, responseId) {
@@ -2589,6 +2682,8 @@ module.exports = function (pi) {
     // this loop and can still arm/replay; agent_end clears once the loop
     // completes. See F18.
     clearPendingInterrupt();
+    await flushPreviews();
+    previewDisabled = false;
     agentRunning = true;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
@@ -2630,6 +2725,7 @@ module.exports = function (pi) {
       accumulateUsage(message);
     }
     await postSessionUsage(ctx);
+    await flushPreviews();
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
     const endResponseId =
@@ -2661,14 +2757,15 @@ module.exports = function (pi) {
     const update = event ? event.assistantMessageEvent : undefined;
     if (!update || typeof update !== "object") return;
     if (update.type === "text_delta") {
-      await postTextDelta(update, responseId);
+      postTextDelta(update, responseId);
       return;
     }
     if (update.type === "thinking_delta") {
-      await postReasoningDelta(update, responseId);
+      postReasoningDelta(update, responseId);
       return;
     }
     if (update.type === "toolcall_end") {
+      await flushPreviews();
       await postToolCall(update.toolCall, responseId);
       return;
     }
@@ -2809,6 +2906,7 @@ module.exports = function (pi) {
         ctx.ui.notify(authFailure.message, "error");
     }
     const responseId = currentResponseId();
+    const messageId = streamingMessageId(responseId);
     // Close the live preview for this message (no-op if nothing streamed),
     // then bump the ordinal so the NEXT assistant message of this turn
     // streams under a fresh, distinct id and never reuses this one's. The
@@ -2817,6 +2915,7 @@ module.exports = function (pi) {
     // fires message_start.
     await finalizeStreamingMessage(responseId);
     await mirrorAssistantMessage(message, responseId);
+    previewDisabled = false;
     streamingMessageOrdinal += 1;
     // ``message_end`` is the primary usage-capture site (one completed
     // assistant message per LLM call); fold its token counts into the
@@ -2854,13 +2953,12 @@ module.exports = function (pi) {
     if (!text) return;
     const sourceId = assistantMessageSourceId(message, responseId, text);
     if (postedAssistantMessages.has(sourceId)) return;
-    // The authoritative assistant item. The web UI retires + replaces the
-    // oldest in-flight live preview in place with this (FIFO; one preview
-    // per message), so the streamed partials never duplicate the final.
+    // The durable identity also suppresses a timed-out preview applied late.
     await postConversationItem(
       config,
       {
         response_id: responseId,
+        message_id: messageId,
         item_type: "message",
         item_data: {
           role: "assistant",

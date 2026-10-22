@@ -727,8 +727,8 @@ function assistantText(item) {
 """
 
 
-def test_text_deltas_post_incrementally_with_stable_id() -> None:
-    """Each token posts as an external_output_text_delta with a stable id.
+def test_text_deltas_post_incrementally_with_stable_id(tmp_path: Path) -> None:
+    """Coalesced preview chunks have a stable id and authoritative replacement.
 
     Drives the real extension with a sequence of Pi ``text_delta`` events for
     one assistant message, then ``message_end``. Asserts: every chunk shares one
@@ -749,10 +749,10 @@ def test_text_deltas_post_incrementally_with_stable_id() -> None:
   await endMessage(chunks.join(""));
 
   const ds = deltas();
-  // One text chunk per delta plus a single final marker.
+  // Adjacent tokens may share a preview request; one final marker closes it.
   const textChunks = ds.filter((d) => d.data.delta !== "");
   const finals = ds.filter((d) => d.data.final === true);
-  assert.equal(textChunks.length, chunks.length, JSON.stringify(ds));
+  assert.ok(textChunks.length >= 1 && textChunks.length <= chunks.length, JSON.stringify(ds));
   assert.equal(finals.length, 1, JSON.stringify(ds));
 
   // Stable message_id across every chunk and the final marker.
@@ -781,7 +781,7 @@ def test_text_deltas_post_incrementally_with_stable_id() -> None:
 })().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
 """
     )
-    result = _run_node(script, str(_extension_path()), "/tmp")
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -810,13 +810,9 @@ def test_thinking_deltas_post_live_reasoning(tmp_path: Path) -> None:
   await handlers.turn_end({ message, toolResults: [] }, ctx);
 
   const reasoning = posted.filter((e) => e.type === "external_output_reasoning_delta");
-  assert.deepEqual(
-    reasoning.map((e) => e.data),
-    [
-      { delta: "plan ", started: true },
-      { delta: "step", started: false },
-    ],
-  );
+  assert.equal(reasoning.map((e) => e.data.delta).join(""), "plan step");
+  assert.equal(reasoning.filter((e) => e.data.started).length, 1);
+  assert.equal(reasoning[0].data.started, true);
   const completed = items().filter((e) => e.data.item_type === "reasoning");
   assert.equal(completed.length, 1, JSON.stringify(completed));
   assert.deepEqual(completed[0].data.item_data.content, [
@@ -859,7 +855,7 @@ def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
   assert.equal(ids.size, 1, "both blocks must share one id: " + JSON.stringify([...ids]));
 
   const textChunks = ds.filter((d) => d.data.delta !== "");
-  assert.equal(textChunks.length, 4, JSON.stringify(ds));
+  assert.ok(textChunks.length >= 1 && textChunks.length <= 4, JSON.stringify(ds));
   // Single monotonic index spanning both blocks.
   const indices = ds.map((d) => d.data.index);
   assert.deepEqual(indices, indices.map((_, i) => i), JSON.stringify(indices));
@@ -945,6 +941,111 @@ def test_message_without_streamed_text_posts_no_delta(tmp_path: Path) -> None:
 
   assert.equal(deltas().length, 0, JSON.stringify(deltas()));
 })().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_slow_preview_transport_coalesces_without_stalling_tokens(tmp_path: Path) -> None:
+    """Slow event POSTs do not impose one round trip per Pi token."""
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return { ok: true, status: 204 };
+  };
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "plan " });
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "step" });
+  await feed({ type: "thinking_end", contentIndex: 0, content: "plan step" });
+  const first = "片".repeat(100);
+  const start = Date.now();
+  for (let n = 0; n < 100; n += 1) await feed(textDelta(1, "片"));
+  assert.ok(Date.now() - start < 100, "producer stalled on HTTP");
+  await endMessage(first);
+  await feed(textDelta(0, "next"));
+  await endMessage("next");
+
+  const preview = deltas();
+  const ids = [...new Set(preview.map((event) => event.data.message_id))];
+  assert.equal(ids.length, 2);
+  for (const [ordinal, expected] of [first, "next"].entries()) {
+    const stream = preview.filter((event) => event.data.message_id === ids[ordinal]);
+    assert.equal(stream.filter((event) => event.data.final).length, 1);
+    assert.deepEqual(stream.map((event) => event.data.index),
+      stream.map((_, index) => index));
+    assert.equal(stream.filter((event) => !event.data.final)
+      .map((event) => event.data.delta).join(""), expected);
+    const item = items().filter((event) => event.data.item_type === "message")[ordinal];
+    assert.equal(assistantText(item), expected);
+    assert.equal(item.data.message_id, ids[ordinal]);
+    assert.ok(posted.indexOf(stream[stream.length - 1]) < posted.indexOf(item));
+  }
+  const reasoning = posted.filter((event) =>
+    event.type === "external_output_reasoning_delta");
+  assert.equal(reasoning.map((event) => event.data.delta).join(""), "plan step");
+  assert.equal(reasoning.filter((event) => event.data.started).length, 1);
+  const reasonItemIndex = posted.findIndex((event) =>
+    event.type === "external_conversation_item" && event.data.item_type === "reasoning");
+  assert.ok(reasonItemIndex >= 0 && reasonItemIndex < posted.indexOf(preview[0]));
+  assert.ok(posted.length < 15, "too many preview requests: " + posted.length);
+})().catch((error) => { console.error(error.stack || error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_failed_preview_does_not_block_final_item_or_idle(tmp_path: Path) -> None:
+    """Hung and rejected preview requests leave final delivery available."""
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  let failure = "hung";
+  let delayedApply;
+  global.fetch = async (_url, request) => {
+    const event = JSON.parse(request.body);
+    if (event.type === "external_output_text_delta") {
+      if (failure === "rejected") throw new Error("preview offline");
+      // A server can apply a request after the client has aborted it.
+      delayedApply = new Promise((resolve) => {
+        setTimeout(() => { posted.push(event); resolve({ ok: true, status: 204 }); }, 600);
+      });
+      return delayedApply;
+    }
+    posted.push(event);
+    return { ok: true, status: 204 };
+  };
+  const began = Date.now();
+  await feed(textDelta(0, "first"));
+  for (let index = 1; index <= 20; index += 1) {
+    await feed(textDelta(index, "x"));
+  }
+  await endMessage("first");
+  failure = "rejected";
+  await feed(textDelta(0, "second"));
+  await endMessage("second");
+  await handlers.agent_end({ messages: [] }, ctx);
+  await delayedApply;
+  assert.ok(Date.now() - began < 1500, "final delivery waited on preview");
+  const messages = items().filter((event) => event.data.item_type === "message");
+  assert.deepEqual(messages.map(assistantText), ["first", "second"]);
+  const late = deltas()[0];
+  assert.ok(posted.indexOf(messages[0]) < posted.indexOf(late));
+  assert.equal(messages[0].data.message_id, late.data.message_id,
+    "final item must retire its unseen late preview");
+  assert.notEqual(messages[0].data.message_id, messages[1].data.message_id);
+  assert.ok(posted.some((event) => event.type === "external_session_status" &&
+    event.data.status === "idle"));
+})().catch((error) => { console.error(error.stack || error); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
