@@ -3055,6 +3055,15 @@ async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknow
             assert fork["cleanup_complete"] is False
             assert observed["aliases_complete"] is False
             assert observed["context_coverage_complete"] is False
+            conflicting = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd=None, env={}, tool_executor=None
+            )
+            executor._session_states["conflicting-owner"] = _CodexSessionState(
+                app_session=conflicting
+            )
+            assert (await client.get(route)).json() == {"inventory": None}
+            executor._session_states.pop("conflicting-owner")
+            assert (await client.get(route)).json()["inventory"] == observed
         if family == "claude-sdk":
             state = executor._clients["owner-key"]
             state.vendor_context_id = "vendor-context"

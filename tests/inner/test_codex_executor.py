@@ -8503,7 +8503,8 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
     _run(_t())
 
 
-def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monkeypatch):
+@pytest.mark.parametrize("collision", [None, "side", "ambiguous-alias"])
+def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monkeypatch, collision):
     from dataclasses import asdict
 
     identities = iter(["1" * 32, "2" * 32, "3" * 32])
@@ -8528,6 +8529,16 @@ def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monke
         "side": _CodexSessionState(app_session=sessions[1], closing=True),
         "ambiguous-alias": _CodexSessionState(app_session=sessions[2]),
     }
+    if collision:
+        other = sessions[1 if collision == "side" else 2]
+        monkeypatch.setattr(other, "_resident_incarnation_id", sessions[0].resident_incarnation_id)
+        for _ in range(2):
+            assert executor.resident_inventory() is None
+            executor._session_states = dict(reversed(tuple(executor._session_states.items())))
+        for app in sessions:
+            app.start.assert_not_called()
+            app.close.assert_not_called()
+        return
     snapshot = executor.resident_inventory()
     assert asdict(snapshot) == {
         "owners": (

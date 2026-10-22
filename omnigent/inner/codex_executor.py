@@ -5741,6 +5741,8 @@ class CodexExecutor(Executor):
             if previous is None:
                 owners[identity] = (app, [session_key], state.closing)
             else:
+                if previous[0] is not app:
+                    return None
                 previous[1].append(session_key)
                 owners[identity] = (app, previous[1], previous[2] or state.closing)
         snapshots: list[ExecutorResidentOwner] = []
