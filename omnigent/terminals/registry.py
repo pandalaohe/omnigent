@@ -108,6 +108,21 @@ class TerminalListEntry:
     instance: TerminalInstance
 
 
+@dataclass(frozen=True)
+class TerminalRegistrationSnapshot:
+    """Immutable registry evidence, without probing the terminal's current liveness.
+
+    ``observed_running`` only copies the instance's in-memory flag. The owner
+    and terminal keys come from the registry, including retained stopped entries.
+    """
+
+    conversation_id: str
+    terminal_name: str
+    session_key: str
+    instance_id: str
+    observed_running: bool
+
+
 class TerminalExitedDuringLaunch(RuntimeError):
     """Retain a dead launch's captured evidence after its private server is closed."""
 
@@ -514,6 +529,21 @@ class TerminalRegistry:
             )
             for (name, key), instance in slot.items()
         ]
+
+    def registration_snapshot(self) -> tuple[TerminalRegistrationSnapshot, ...]:
+        """Copy all registrations under one map lock, without terminal I/O."""
+        with self._lock:
+            return tuple(
+                TerminalRegistrationSnapshot(
+                    conversation_id=conversation_id,
+                    terminal_name=name,
+                    session_key=key,
+                    instance_id=instance.diagnostic_id,
+                    observed_running=instance.running,
+                )
+                for conversation_id, slot in self._by_conversation.items()
+                for (name, key), instance in slot.items()
+            )
 
     def native_panes(self) -> list[tuple[str, str, Path]]:
         """Return live native-harness CLI panes as ``(conversation_id, name, socket_path)``.

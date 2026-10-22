@@ -57,3 +57,47 @@ def test_populated_startup_migrations_round_trip(db_uri):
     )
     command.upgrade(config, "head")
     assert "session_startups" in sa.inspect(engine).get_table_names()
+
+
+def test_inventory_veto_migration_backfills_and_downgrades(db_uri):
+    engine = get_or_create_engine(db_uri)
+    config = _build_alembic_config(db_uri)
+    command.downgrade(config, "a44c20261021")
+    budgets = sa.Table("session_startup_budgets", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            budgets.insert().values(
+                scope="legacy-host",
+                resident_limit=7,
+                startup_limit=2,
+                next_sequence=5,
+                fenced=False,
+                work_revision=0,
+                work_fence_epoch=0,
+            )
+        )
+    command.upgrade(config, "head")
+    budgets = sa.Table("session_startup_budgets", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as connection:
+        row = connection.execute(sa.select(budgets).where(budgets.c.scope == "legacy-host")).one()
+        assert row.resident_inventory_unknown is False
+        assert row.resident_limit == 7 and row.next_sequence == 5
+        connection.execute(
+            budgets.update()
+            .where(budgets.c.scope == "legacy-host")
+            .values(resident_inventory_unknown=True)
+        )
+    command.downgrade(config, "a44c20261021")
+    budgets = sa.Table("session_startup_budgets", sa.MetaData(), autoload_with=engine)
+    assert "resident_inventory_unknown" not in budgets.c
+    inspector = sa.inspect(engine)
+    assert {"archived_at", "archive_state"} <= {
+        column["name"] for column in inspector.get_columns("projects")
+    }
+    assert "paused_by_archive_batch" in {
+        column["name"] for column in inspector.get_columns("scheduled_tasks")
+    }
+    with engine.connect() as connection:
+        row = connection.execute(sa.select(budgets).where(budgets.c.scope == "legacy-host")).one()
+        assert row.resident_limit == 7 and row.next_sequence == 5
+    command.upgrade(config, "head")

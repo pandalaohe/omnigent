@@ -37,13 +37,14 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeAlias, cast
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from claude_agent_sdk import SessionKey, SessionStoreEntry
@@ -68,6 +69,11 @@ from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.session_default_modes import CLAUDE_FAST_MODE_SETTINGS
 from omnigent.spec.types import RetryPolicy
+from omnigent.startup_evidence import (
+    ClaudeTurnEvidence,
+    StartupPermissionUnavailable,
+    claim_startup_boundary,
+)
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -81,6 +87,8 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorResidentInventory,
+    ExecutorResidentOwner,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -346,6 +354,7 @@ class _ClaudeSDK(Protocol):
     # at our boundary so that's the right abstraction level here.
     ClaudeSDKClient: Callable[..., _ClaudeClient]  # type: ignore[explicit-any]
     ClaudeAgentOptions: Callable[..., Any]  # type: ignore[explicit-any]
+    HookMatcher: Callable[..., Any]  # type: ignore[explicit-any]
     tool: Callable[..., Any]  # type: ignore[explicit-any]
     create_sdk_mcp_server: Callable[..., Any]  # type: ignore[explicit-any]
 
@@ -859,6 +868,9 @@ class _ClaudeClientState:
     permission_mode: str | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
+    resident_incarnation_id: str = field(default_factory=lambda: uuid4().hex)
+    vendor_context_id: str | None = None
+    resident_context_conflict: bool = False
 
 
 @dataclass
@@ -1934,8 +1946,12 @@ class ClaudeSDKExecutor(Executor):
         self._elicitation_handler: ElicitationHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
+        self._resident_connecting: dict[object, tuple[str, _ClaudeClientState]] = {}
+        self._resident_inventory_detached = False
         # Per-session query slots serializing real turns and keep-warm pings.
         self._query_slots: dict[str, _QuerySlot] = {}
+        self._active_turns: dict[str, int] = {}
+        self._startup_turns: set[str] = set()
         self._pending_framework_context: dict[str, str] = {}
         self._peer_pending: dict[str, list[_ClaudePeerPending]] = {}
         self._peer_late: dict[str, list[_ClaudePeerPending]] = {}
@@ -2099,6 +2115,10 @@ class ClaudeSDKExecutor(Executor):
             client = sdk.ClaudeSDKClient(options)
             original_prompt = getattr(options, "system_prompt", None)
             original_extra_args = getattr(options, "extra_args", {})
+            state = _ClaudeClientState(client=client, model=model)
+            token = object()
+            self._resident_connecting[token] = (session_key, state)
+            connected = False
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2152,7 +2172,9 @@ class ClaudeSDKExecutor(Executor):
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
+                    connected = True
             except asyncio.TimeoutError as exc:
+                self._resident_inventory_detached = True
                 await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
@@ -2166,6 +2188,7 @@ class ClaudeSDKExecutor(Executor):
                     f"{int(_CONNECT_TIMEOUT_SECONDS)}s. CLI stderr tail:\n{detail}"
                 ) from exc
             except Exception as exc:
+                self._resident_inventory_detached = True
                 # The CLI may exit immediately (e.g. ``unknown option``) before
                 # the SDK's async stderr reader has flushed all output.  A brief
                 # yield lets pending reader callbacks deliver remaining lines so
@@ -2184,6 +2207,10 @@ class ClaudeSDKExecutor(Executor):
                     f"Claude SDK connect failed: {exc}\nCLI stderr:\n{detail}"
                 ) from exc
             finally:
+                if not connected:
+                    # Best-effort connect teardown cannot acknowledge context absence.
+                    self._resident_inventory_detached = True
+                    self._resident_connecting.pop(token, None)
                 # Restore on both paths so post-connect stderr flows
                 # directly to the original callback and ``connect_stderr``
                 # can be GC'd instead of growing for the session lifetime.
@@ -2191,18 +2218,14 @@ class ClaudeSDKExecutor(Executor):
                 if isinstance(original_prompt, str):
                     options.system_prompt = original_prompt
                     options.extra_args = original_extra_args
-            current_task: asyncio.Task[None] | None = cast(
-                "asyncio.Task[None] | None", asyncio.current_task()
-            )
-            state = _ClaudeClientState(
-                client=client,
-                model=model,
-                effort=getattr(options, "effort", None),
-                permission_mode=getattr(options, "permission_mode", None),
-                loop=asyncio.get_running_loop(),
-                task=current_task,
-            )
+            if session_key in self._clients:
+                self._resident_inventory_detached = True
+            state.effort = getattr(options, "effort", None)
+            state.permission_mode = getattr(options, "permission_mode", None)
+            state.loop = asyncio.get_running_loop()
+            state.task = cast("asyncio.Task[None] | None", asyncio.current_task())
             self._clients[session_key] = state
+            self._resident_connecting.pop(token, None)
             return client
 
         if state.model != model:
@@ -2231,6 +2254,8 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        # Best-effort teardown is not an owned context-absence acknowledgment.
+        self._resident_inventory_detached = True
         try:
             current_loop = asyncio.get_running_loop()
             current_task = asyncio.current_task()
@@ -2269,6 +2294,7 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        self._resident_inventory_detached = True
         # Close in the background: an await here runs under an in-flight
         # cancellation and could itself be cancelled, leaking the CLI process.
         task = asyncio.create_task(self._force_close_client(state.client))
@@ -2486,6 +2512,7 @@ class ClaudeSDKExecutor(Executor):
         :returns: The drained outcome, receipt-ready.
         """
         sdk = cast(_ClaudeSDK, _ensure_sdk())
+        resident_owner = self._clients.get(session_key)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _KEEP_WARM_PING_BUDGET_S
         try:
@@ -2536,6 +2563,7 @@ class ClaudeSDKExecutor(Executor):
                     message = next_task.result()
                 except StopAsyncIteration:
                     break
+                self._observe_resident_context(session_key, client, resident_owner, message, sdk)
                 if isinstance(message, sdk.AssistantMessage):
                     ping_model = (
                         concrete_reported_model(getattr(message, "model", None)) or ping_model
@@ -2766,6 +2794,89 @@ class ClaudeSDKExecutor(Executor):
 
         client._query = None
         client._transport = None
+
+    def _observe_resident_context(
+        self,
+        session_key: str,
+        client: _ClaudeClient,
+        owner: _ClaudeClientState | None,
+        message: object,
+        sdk: _ClaudeSDK,
+    ) -> None:
+        if (
+            owner is None
+            or self._clients.get(session_key) is not owner
+            or owner.client is not client
+        ):
+            return
+        if getattr(message, "parent_tool_use_id", None) is not None:
+            return
+        if isinstance(message, sdk.ResultMessage):
+            context_id = getattr(message, "session_id", None)
+        elif isinstance(message, sdk.SystemMessage):
+            system = cast(_SystemMessageObj, message)
+            data = system.data
+            if (
+                system.subtype != "init"
+                or not isinstance(data, dict)
+                or data.get("agent_id") is not None
+                or data.get("parent_tool_use_id") is not None
+            ):
+                return
+            context_id = data.get("session_id")
+        else:
+            return
+        if not isinstance(context_id, str) or not context_id.strip():
+            return
+        if owner.vendor_context_id is None:
+            owner.vendor_context_id = context_id
+        elif owner.vendor_context_id != context_id:
+            owner.resident_context_conflict = True
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Copy registered client owners without loading or probing the SDK.
+
+        Connecting clients retain their incarnation on promotion. Independent SDK
+        subcontexts are not covered; retired clients keep absence unknown.
+        """
+        if self._resident_inventory_detached:
+            return None
+        owners: dict[str, ExecutorResidentOwner] = {}
+        clients: set[int] = set()
+        candidates = [(key, state, True) for key, state in tuple(self._clients.items())]
+        candidates.extend((key, state, False) for key, state in self._resident_connecting.values())
+        for session_key, state, started in candidates:
+            if (
+                not isinstance(state, _ClaudeClientState)
+                or not session_key
+                or state.resident_context_conflict
+            ):
+                return None
+            identity = state.resident_incarnation_id
+            # A shared SDK client does not prove keys are read-only context aliases.
+            if id(state.client) in clients or identity in owners:
+                return None
+            clients.add(id(state.client))
+            owners[identity] = ExecutorResidentOwner(
+                incarnation_id=identity,
+                session_keys=(session_key,),
+                vendor_context_id=state.vendor_context_id,
+                started=started,
+                closing=False,
+                cleanup_complete=False,
+            )
+        context_counts: dict[str, int] = {}
+        for owner in owners.values():
+            if owner.vendor_context_id is not None:
+                context_counts[owner.vendor_context_id] = (
+                    context_counts.get(owner.vendor_context_id, 0) + 1
+                )
+        return ExecutorResidentInventory(
+            owners=tuple(owners[identity] for identity in sorted(owners)),
+            ambiguous_context_ids=tuple(
+                sorted(key for key, count in context_counts.items() if count > 1)
+            ),
+        )
 
     def supports_streaming(self) -> bool:
         return True
@@ -3259,6 +3370,38 @@ class ClaudeSDKExecutor(Executor):
         system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
+        """Reserve startup streams without changing warm-turn recovery."""
+        session_key = self._session_key(messages)
+        startup_turn = ClaudeTurnEvidence("").enabled
+        active_count = self._active_turns.get(session_key, 0)
+        if session_key in self._startup_turns or (startup_turn and active_count):
+            raise StartupPermissionUnavailable("Claude SDK query already active")
+        self._active_turns[session_key] = active_count + 1
+        if startup_turn:
+            self._startup_turns.add(session_key)
+        turn = self._run_turn_impl(messages, tools, system_prompt, config)
+        try:
+            async for event in turn:
+                yield event
+        finally:
+            try:
+                await turn.aclose()
+            finally:
+                if startup_turn:
+                    self._startup_turns.remove(session_key)
+                remaining = self._active_turns[session_key] - 1
+                if remaining:
+                    self._active_turns[session_key] = remaining
+                else:
+                    del self._active_turns[session_key]
+
+    async def _run_turn_impl(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncGenerator[ExecutorEvent, None]:
         """Run one turn via the Claude Agent SDK.
 
         The SDK receives the latest user message as a prompt and runs its full
@@ -3293,14 +3436,16 @@ class ClaudeSDKExecutor(Executor):
             cfg.permission_mode if cfg.permission_mode is not None else self._permission_mode
         )
         state = self._clients.get(session_key)
-        if state is not None and (
+        replacing_client = state is not None and (
             state.permission_mode != permission_mode
             or (
                 state.effort != reasoning_effort
                 and (next_input := self._extract_trailing_user_content(messages))
                 and next_input != "/compact"
             )
-        ):
+        )
+        if replacing_client:
+            await claim_startup_boundary("executor_prepare")
             await self._close_live_client(session_key)
         resume_session = session_key in self._clients
         prompt = self._build_prompt(
@@ -3312,6 +3457,19 @@ class ClaudeSDKExecutor(Executor):
             # completion with no assistant text instead of an empty string.
             yield TurnComplete(response=None)
             return
+
+        startup_evidence = ClaudeTurnEvidence(
+            prompt if isinstance(prompt, str) else "",
+            tool_bridge_installed=not tools or self._tool_executor is not None,
+        )
+        if startup_evidence.enabled and (
+            resume_session
+            or not isinstance(prompt, str)
+            or not callable(getattr(sdk, "HookMatcher", None))
+        ):
+            raise StartupPermissionUnavailable("Claude SDK startup proof unavailable")
+        if not resume_session and not replacing_client:
+            await claim_startup_boundary("executor_prepare")
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
@@ -3529,6 +3687,21 @@ class ClaudeSDKExecutor(Executor):
         self._install_subagent_router_hook(sdk, options, model, session_key)
         self._install_framework_context_hook(sdk, options, session_key)
         self._install_keep_warm_maintenance_hook(sdk, options, session_key)
+        if startup_evidence.enabled:
+            hook_matcher = sdk.HookMatcher
+
+            async def observe_startup_prompt(
+                payload: object, _tool_use_id: str | None, _context: object
+            ) -> _JsonObject:
+                if isinstance(payload, dict):
+                    startup_evidence.prompt_submitted(payload)
+                return {}
+
+            hooks = dict(getattr(options, "hooks", None) or {})
+            hooks.setdefault("UserPromptSubmit", []).append(
+                hook_matcher(hooks=[observe_startup_prompt])
+            )
+            options.hooks = hooks
         if claude_peer_receipts_supported() and getattr(sdk, "HookMatcher", None) is not None:
             options.session_store = _ClaudePeerReceiptStore(self, session_key)
             options.session_store_flush = "eager"
@@ -3725,11 +3898,11 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
-        # Mark the session busy for this turn's duration. A real turn never
-        # waits on the slot lock, so an abandoned generator cannot block a
-        # later turn; its stale busy mark only makes pings skip.
+        # The outer run_turn keeps another real turn from sharing this stream;
+        # this busy mark retains the query-stage timing used by peer delivery.
         slot = self._query_slot(session_key)
         slot.busy += 1
+        replacement_admitted = False
         try:
             if slot.maintenance:
                 # A keep-warm ping owns the client: ask it to yield, then
@@ -3740,6 +3913,8 @@ class ClaudeSDKExecutor(Executor):
                         slot.ping_done.wait(), timeout=_KEEP_WARM_PREEMPT_WAIT_S
                     )
                 except asyncio.TimeoutError:
+                    await claim_startup_boundary("executor_prepare")
+                    replacement_admitted = True
                     logger.warning(
                         "Claude SDK keep-warm ping did not yield for session %s; "
                         "closing the live client so the turn starts fresh",
@@ -3756,6 +3931,8 @@ class ClaudeSDKExecutor(Executor):
             # prior session state, replay full history.
             live_state = self._clients.get(session_key)
             if live_state is None or live_state.client is not client:
+                if not replacement_admitted:
+                    await claim_startup_boundary("executor_prepare")
                 client = await self._get_or_create_client(
                     sdk,
                     session_key=session_key,
@@ -3770,6 +3947,7 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") == "user"
                 for notice in framework_notices(message.get("content"))
             )
+            resident_owner = self._clients.get(session_key)
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
                 if isinstance(prompt, list):
@@ -3814,6 +3992,13 @@ class ClaudeSDKExecutor(Executor):
                         message = next_task.result()
                     except StopAsyncIteration:
                         break
+                    self._observe_resident_context(
+                        session_key, client, resident_owner, message, sdk
+                    )
+                    if isinstance(
+                        message, (_StreamEvent, sdk.AssistantMessage, sdk.ResultMessage)
+                    ):
+                        startup_evidence.message(message)
                     if isinstance(message, _StreamEvent):
                         got_stream_events = True
                         stream_evt = cast(_StreamEventObj, message)
@@ -4144,6 +4329,8 @@ class ClaudeSDKExecutor(Executor):
                 if aclose is not None:
                     await aclose()
 
+        except StartupPermissionUnavailable:
+            raise
         except asyncio.CancelledError:
             # CancelledError is a BaseException, so a watchdog-cancelled turn
             # skips the boundary below. Evict the wedged client (no crash

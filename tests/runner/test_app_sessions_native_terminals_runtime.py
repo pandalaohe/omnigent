@@ -649,6 +649,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         def __init__(self) -> None:
             """:returns: None."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test", "IGNORED": "nope"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -1247,6 +1250,9 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         def __init__(self) -> None:
             """:returns: None."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id(session_id))
             self.listen_url: str | None = None
@@ -1566,6 +1572,9 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         def __init__(self) -> None:
             """:returns: None."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id(session_id))
             self.listen_url: str | None = None
@@ -1817,6 +1826,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         def __init__(self) -> None:
             """:returns: None."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "codex-home"
             self.listen_url: str | None = None
@@ -2084,6 +2096,9 @@ async def test_auto_create_codex_terminal_fresh_launch_loads_relaunch_graph(
         def __init__(self) -> None:
             """:returns: None."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "codex-home"
             self.listen_url: str | None = None
@@ -2343,6 +2358,9 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         def __init__(self) -> None:
             """:returns: None."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "codex-home"
             self.listen_url: str | None = None
@@ -4036,6 +4054,11 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
     class _AppServer:
         workspace_profile = None
 
+        def __init__(self) -> None:
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
+
         async def close(self) -> None:
             closed.append("server")
 
@@ -4106,6 +4129,9 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
     class _AppServer:
         def __init__(self, name: str) -> None:
             self.name = name
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             closed.append(self.name)
@@ -4209,6 +4235,11 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
     class _AppServer:
         workspace_profile = None
 
+        def __init__(self) -> None:
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
+
         async def close(self) -> None:
             return None
 
@@ -4251,6 +4282,82 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("forwarder", ["discovery", "known_thread"])
+async def test_codex_forwarder_client_close_keeps_backend_visible_on_second_cancel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, forwarder: str
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.runner.native import orchestration
+
+    entered, close_client, wait_thread = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    closed: list[str] = []
+
+    class _Client:
+        async def close(self) -> None:
+            entered.set()
+            try:
+                await close_client.wait()
+            finally:
+                closed.append("client")
+
+    class _Backend:
+        resident_incarnation_id = uuid.uuid4().hex
+        exit_confirmed = False
+        process_exit_confirmed = False
+
+        async def close(self) -> None:
+            closed.append("backend")
+
+    async def wait(*_args, **_kwargs):
+        wait_thread.set()
+        await asyncio.Event().wait()
+
+    backend = _Backend()
+    session_id = "closing_client"
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {session_id: backend})
+    monkeypatch.setattr(codex_forwarder, "wait_for_thread_started", wait)
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", wait)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://server.test")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    common = {
+        "session_id": session_id,
+        "bridge_dir": tmp_path,
+        "codex_ws_url": "ws://127.0.0.1:1",
+        "app_server": backend,
+    }
+    if forwarder == "discovery":
+        operation = orchestration._codex_discover_thread_and_forward(
+            **common,
+            codex_home=tmp_path / "home",
+            workspace="/opt/work/project",
+            event_client=_Client(),
+            routing_summary="test",
+        )
+    else:
+        operation = orchestration._codex_forward_known_thread(
+            **common,
+            thread_id="thread-test",
+            client=_Client(),
+        )
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(wait_thread.wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        snapshot = orchestration.native_backend_resident_inventory()
+        assert len(snapshot.owners) == 1
+        assert snapshot.owners[0].closing
+        task.cancel()
+    finally:
+        close_client.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert closed == ["client", "backend"]
+    assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
+    assert not orchestration._CLOSING_NATIVE_BACKENDS
+
+
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4274,6 +4381,11 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
     class _AppServer:
         workspace_profile = None
+
+        def __init__(self) -> None:
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             closed["app_server"] = True
@@ -4348,6 +4460,11 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
     class _AppServer:
         workspace_profile = None
+
+        def __init__(self) -> None:
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             return None
@@ -4454,6 +4571,11 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
 
     class _AppServer:
         workspace_profile = None
+
+        def __init__(self) -> None:
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             timeline.append("app_server_closed")
@@ -4590,6 +4712,11 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before
 
     class _AppServer:
         workspace_profile = None
+
+        def __init__(self) -> None:
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             return None
@@ -4829,7 +4956,11 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
 
     session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
     codex_native_bridge.write_bridge_startup_timeout(tmp_path, 120.0)
-    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    backend = _AppServer()
+    backend.resident_incarnation_id = uuid.uuid4().hex
+    backend.exit_confirmed = False
+    backend.process_exit_confirmed = False
+    _AUTO_CODEX_APP_SERVERS[session_id] = backend
     try:
         await _codex_discover_thread_and_forward(
             session_id=session_id,
@@ -5088,6 +5219,9 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -5334,6 +5468,9 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
             self.session_id = session_id
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -5504,9 +5641,15 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
         proc=SimpleNamespace(returncode=None),
         listen_url=server_url,
         codex_home=tmp_path,
+        resident_incarnation_id=uuid.uuid4().hex,
+        exit_confirmed=False,
+        process_exit_confirmed=False,
     )
     forwarder = asyncio.create_task(asyncio.Event().wait())
-    monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, session_id, fake_server)
+    monkeypatch.setattr(native, "_AUTO_CODEX_APP_SERVERS", {session_id: fake_server})
+    monkeypatch.setattr(native, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(native, "_CLOSING_NATIVE_BACKENDS", {})
+    inventory = native.native_backend_resident_inventory()
     monkeypatch.setitem(native._AUTO_FORWARDER_TASKS, session_id, forwarder)
     monkeypatch.setattr(native, "_codex_native_launch_config", AsyncMock(return_value=config))
     cancel = AsyncMock()
@@ -5539,6 +5682,7 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
         assert launch.await_args.kwargs["app_server"] is fake_server
         assert launch.await_args.kwargs["thread_id"] == thread_id
         assert launch.await_args.kwargs["bridge_dir"] == bridge_dir
+        assert native.native_backend_resident_inventory() == inventory
     finally:
         forwarder.cancel()
         with contextlib.suppress(asyncio.CancelledError):

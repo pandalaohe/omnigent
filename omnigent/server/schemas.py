@@ -5764,7 +5764,7 @@ class StartupClaimRequestEvent(_SSEEventBase):
     type: Literal["startup.claim.requested"] = "startup.claim.requested"
     claim_id: str = Field(min_length=1, max_length=128)
     attempt: StartupAttemptRef
-    boundary: Literal["executor_prepare"]
+    boundary: Literal["executor_construct", "executor_prepare"]
 
 
 HarnessStreamEvent = (

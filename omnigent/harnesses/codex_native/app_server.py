@@ -17,7 +17,7 @@ import sys
 import tempfile
 import urllib.parse
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -2252,8 +2252,22 @@ class CodexNativeAppServer:
     auto_title_relay: asyncio.Server | None = field(default=None, init=False)
     _auto_title_relay_identity: tuple[int, int] | None = field(default=None, init=False)
     agent_pid: int | None = field(default=None, init=False)
+    resident_incarnation_id: str = field(default_factory=lambda: uuid.uuid4().hex, init=False)
+    exit_confirmed: bool = field(default=False, init=False)
+    process_exit_confirmed: bool = field(default=False, init=False)
+    _resident_spawned: bool = field(default=False, init=False, repr=False)
+    _lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _start_generation: int = field(default=0, init=False, repr=False)
 
     async def start(self) -> None:
+        """Start without replacing an incarnation whose exit is unconfirmed."""
+        async with self._lifecycle_lock:
+            if (self._resident_spawned or self.proc is not None) and not self.exit_confirmed:
+                raise RuntimeError("Previous Codex app-server exit is not confirmed")
+            self._start_generation += 1
+            await self._start()
+
+    async def _start(self) -> None:
         """
         Start the Codex app-server and wait for the socket.
 
@@ -2498,6 +2512,10 @@ class CodexNativeAppServer:
                 executable=self.codex_path,
                 **_proc.spawn_kwargs(),
             )
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self._resident_spawned = True
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
         except BaseException:
             if self.process_owner_lock is not None:
                 self.process_owner_lock.close()
@@ -2624,7 +2642,7 @@ class CodexNativeAppServer:
         except BaseException as exc:
             if isinstance(exc, Exception):
                 self._log_startup_failure_snapshot(exc)
-            await self.close()
+            await self._close_locked()
             raise
 
     def _log_startup_failure_snapshot(self, exc: Exception) -> None:
@@ -2786,13 +2804,23 @@ class CodexNativeAppServer:
         else:
             _logger.info(message, self.policy_hook_disabled_reason)
 
-    async def close(self) -> None:
+    def close(self) -> Coroutine[None, None, None]:
+        """Bind teardown to this start attempt before a caller defers awaiting it."""
+        return self._close_generation(self._start_generation)
+
+    async def _close_generation(self, start_generation: int) -> None:
+        async with self._lifecycle_lock:
+            if start_generation == self._start_generation:
+                await self._close_locked()
+
+    async def _close_locked(self) -> None:
         """
         Stop the app-server subprocess.
 
         :returns: None.
         """
         group_empty = False
+        process = self.proc
         try:
             if self.proc is not None and self.proc.returncode is None:
                 if os.name == "posix":
@@ -2852,10 +2880,18 @@ class CodexNativeAppServer:
                     self.process_owner_lock = None
                     self.process_group_id = None
                     self.agent_pid = None
-                    if diagnostics is not None:
-                        diagnostics.finish()
-                        with contextlib.suppress(Exception):
-                            await asyncio.to_thread(diagnostics.close)
+                    try:
+                        if diagnostics is not None:
+                            diagnostics.finish()
+                            with contextlib.suppress(Exception):
+                                await asyncio.to_thread(diagnostics.close)
+                    finally:
+                        self.process_exit_confirmed = self.process_exit_confirmed or (
+                            process is not None and process.returncode is not None
+                        )
+                        self.exit_confirmed = self.exit_confirmed or (
+                            os.name == "posix" and group_empty
+                        )
 
     async def _populate_context_catalog(self, source_home: Path) -> None:
         """Best-effort host model metadata for truthful compact progress."""

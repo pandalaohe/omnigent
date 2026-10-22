@@ -32,10 +32,12 @@ from tests.harnesses.codex_native.app_server._support import (
 
 
 @pytest.mark.parametrize("inheritance_fails", [False, True])
+@pytest.mark.parametrize("close_timing", ["before_start", "during_start"])
 async def test_start_reuses_initialized_readiness_client_for_hook_trust(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     inheritance_fails: bool,
+    close_timing: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Startup trusts hooks over the readiness connection, then closes it."""
@@ -76,8 +78,46 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
         workspace,
     )
 
-    await server.start()
+    construction_id = server.resident_incarnation_id
+    spawning, allow_spawn = asyncio.Event(), asyncio.Event()
+    create_process = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+
+    async def gated_spawn(*args, **kwargs):
+        spawning.set()
+        await allow_spawn.wait()
+        process = await create_process(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", gated_spawn)
+    if close_timing == "before_start":
+        await server._lifecycle_lock.acquire()
+        starting = asyncio.create_task(server.start())
+        await asyncio.sleep(0)
+        queued_close = asyncio.create_task(server.close())
+        await asyncio.sleep(0)
+        server._lifecycle_lock.release()
+        await asyncio.wait_for(spawning.wait(), timeout=5)
+    else:
+        starting = asyncio.create_task(server.start())
+        await asyncio.wait_for(spawning.wait(), timeout=5)
+        queued_close = asyncio.create_task(server.close())
+        await asyncio.sleep(0)
+    allow_spawn.set()
+    await starting
+    await queued_close
     try:
+        incarnation_id, process = server.resident_incarnation_id, server.proc
+        assert incarnation_id != construction_id
+        if close_timing == "during_start":
+            assert process is None and server.exit_confirmed
+            return
+        assert process is spawned[0] and not server.exit_confirmed
+        with pytest.raises(RuntimeError, match="exit is not confirmed"):
+            await server.start()
+        assert server.proc is process
+        assert server.resident_incarnation_id == incarnation_id
         assert trusted_with == [startup_client]
         inherit.assert_awaited_once_with(
             startup_client.request,
@@ -88,7 +128,89 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
         assert startup_client.close_calls == 1
         if inheritance_fails:
             assert "Codex user hook approval inheritance failed" in caplog.text
+        await server.close()
+        assert server.exit_confirmed
+        await server.start()
+        assert server.resident_incarnation_id != incarnation_id
+        assert not server.exit_confirmed
     finally:
+        await server.close()
+
+
+async def test_delayed_helper_close_cannot_adopt_restart_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as module
+    from omnigent.runner.native import orchestration
+
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(module, "_codex_cli_version", AsyncMock(return_value=(0, 147, 0)))
+    _disable_codex_startup_rpc(monkeypatch)
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    server = _test_app_server(tmp_path, tmp_path / "home", tmp_path / "bridge", tmp_path)
+    await server.start()
+    old_id = server.resident_incarnation_id
+    client_entered, allow_client, client_finished = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    spawning, allow_spawn = asyncio.Event(), asyncio.Event()
+    spawned: list[asyncio.subprocess.Process] = []
+    create_process = asyncio.create_subprocess_exec
+
+    async def close_client():
+        client_entered.set()
+        await allow_client.wait()
+        client_finished.set()
+
+    async def gated_spawn(*args, **kwargs):
+        spawning.set()
+        await allow_spawn.wait()
+        process = await create_process(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    closing = asyncio.create_task(
+        orchestration._close_native_backend(
+            "owned",
+            "codex-native",
+            server,
+            close_client=close_client,
+        )
+    )
+    starting = None
+    try:
+        await asyncio.wait_for(client_entered.wait(), timeout=1)
+        await server.close()
+        assert server.exit_confirmed
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", gated_spawn)
+        starting = asyncio.create_task(server.start())
+        await asyncio.wait_for(spawning.wait(), timeout=5)
+        assert server.resident_incarnation_id == old_id
+        allow_client.set()
+        await asyncio.wait_for(client_finished.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not closing.done()
+        allow_spawn.set()
+        await starting
+        await closing
+        assert server.proc is spawned[0]
+        assert server.resident_incarnation_id != old_id
+        assert not server.exit_confirmed
+        snapshot = orchestration.native_backend_resident_inventory()
+        assert snapshot.owners == () and not snapshot.exit_coverage_complete
+    finally:
+        allow_client.set()
+        allow_spawn.set()
+        await asyncio.gather(
+            closing, *([starting] if starting is not None else []), return_exceptions=True
+        )
         await server.close()
 
 
@@ -615,12 +737,14 @@ async def test_start_reports_a_removed_workspace_before_any_setup(
     _disable_codex_startup_rpc(monkeypatch)
     codex_home = tmp_path / "codex-home"
     server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", tmp_path / "removed")
+    construction_id = server.resident_incarnation_id
 
     with pytest.raises(OmnigentError) as failure:
         await server.start()
 
     assert failure.value.code == ErrorCode.WORKSPACE_MISSING
     assert server.proc is None
+    assert server.resident_incarnation_id == construction_id
     assert not codex_home.exists()
 
 

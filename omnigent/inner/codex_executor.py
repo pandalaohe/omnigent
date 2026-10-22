@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
+from uuid import uuid4
 
 import psutil
 import tomllib
@@ -121,6 +122,8 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorResidentInventory,
+    ExecutorResidentOwner,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -3104,6 +3107,7 @@ class _CodexAppServerSession:
         thread_model_provider: str | None = None,
     ) -> None:
         self._codex_path = codex_path
+        self._resident_incarnation_id = uuid4().hex
         self._cwd = cwd
         self._env = env
         self._usage_session_id: str | None = None
@@ -3204,6 +3208,14 @@ class _CodexAppServerSession:
         # retirement would otherwise retire the first ping's live fork queue.
         # Held across the whole ping, including the cleanup retirement.
         self._keep_warm_lock = asyncio.Lock()
+        self._resident_maintenance: dict[str, str | None] = {}
+        self._resident_maintenance_current: str | None = None
+        self._resident_maintenance_unknown = False
+
+    @property
+    def resident_incarnation_id(self) -> str:
+        """Identity of this owner object, independent of session keys and vendor thread."""
+        return self._resident_incarnation_id
 
     async def start(self) -> None:
         """Start signer and worker transactionally."""
@@ -5123,6 +5135,13 @@ class _CodexAppServerSession:
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             if isinstance(thread_id, str) and thread_id:
                 if thread_id not in self._keep_warm_retired:
+                    if (
+                        not isinstance(thread, dict)
+                        or thread.get("forkedFromId") != self.thread_id
+                    ):
+                        self._resident_maintenance_unknown = True
+                    else:
+                        self._observe_maintenance_context(thread_id)
                     self._keep_warm_queues.setdefault(thread_id, asyncio.Queue())
                 return thread_id
             return None
@@ -5138,6 +5157,17 @@ class _CodexAppServerSession:
     def keep_warm_busy(self) -> bool:
         """Whether a keep-warm ping currently owns this session (lock held)."""
         return self._keep_warm_lock.locked()
+
+    def _observe_maintenance_context(self, thread_id: str) -> None:
+        attempt = self._resident_maintenance_current
+        if attempt is None:
+            self._resident_maintenance_unknown = True
+            return
+        previous = self._resident_maintenance[attempt]
+        if previous is None:
+            self._resident_maintenance[attempt] = thread_id
+        elif previous != thread_id:
+            self._resident_maintenance_unknown = True
 
     async def keep_warm_ping(self) -> KeepWarmPingResult:
         """
@@ -5164,6 +5194,16 @@ class _CodexAppServerSession:
         :returns: The ping outcome and raw usage.
         """
         assert self.thread_id is not None  # the executor gates on a live thread
+        # Routing retirement and turn completion do not acknowledge context close.
+        if len(self._resident_maintenance) >= _KEEP_WARM_RETIRED_LIMIT:
+            self._resident_maintenance_unknown = True
+        else:
+            attempt = uuid4().hex
+            if attempt == self.resident_incarnation_id or attempt in self._resident_maintenance:
+                self._resident_maintenance_unknown = True
+            else:
+                self._resident_maintenance[attempt] = None
+                self._resident_maintenance_current = attempt
         queue: asyncio.Queue[CodexMessage] = asyncio.Queue()
         fork_id_holder: list[str] = []
         # The reader may divert the fork's early ``thread/started`` into its
@@ -5176,6 +5216,7 @@ class _CodexAppServerSession:
             # The reader may already have seen the fork's thread/started and
             # created its queue; reuse it so those messages are not stranded.
             fork_id_holder.append(fork_id)
+            self._observe_maintenance_context(fork_id)
             return _keep_warm_queue_events(self._keep_warm_queues.setdefault(fork_id, queue))
 
         try:
@@ -5186,6 +5227,7 @@ class _CodexAppServerSession:
                 parent_thread_id=self.thread_id,
             )
         finally:
+            self._resident_maintenance_current = None
             retired_ids = set(fork_id_holder)
             retired_ids.update(
                 fork_id for fork_id in self._keep_warm_queues if fork_id not in registered_before
@@ -5775,6 +5817,71 @@ class CodexExecutor(Executor):
             logger.exception("codex: keep-warm ping failed")
             return keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
         return keep_warm_result_receipt(attempt_id, result)
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Copy registered app-session owners, including unconfirmed closing owners.
+
+        Maintenance attempts remain uncertain after routing retirement. Unregistered
+        contexts and cross-owner aliases are not covered; equal IDs stay ambiguous.
+        """
+        owners: dict[str, tuple[_CodexAppServerSession, list[str], bool]] = {}
+        for session_key, state in tuple(self._session_states.items()):
+            app = state.app_session
+            if app is None:
+                continue
+            if not isinstance(app, _CodexAppServerSession):
+                return None
+            identity = app.resident_incarnation_id
+            previous = owners.get(identity)
+            if previous is None:
+                owners[identity] = (app, [session_key], state.closing)
+            else:
+                if previous[0] is not app:
+                    return None
+                previous[1].append(session_key)
+                owners[identity] = (app, previous[1], previous[2] or state.closing)
+        snapshots: list[ExecutorResidentOwner] = []
+        for identity, (app, keys, closing) in sorted(owners.items()):
+            if app._resident_maintenance_unknown:
+                return None
+            snapshots.append(
+                ExecutorResidentOwner(
+                    incarnation_id=identity,
+                    session_keys=tuple(sorted(keys)),
+                    vendor_context_id=app.thread_id,
+                    started=app._started,
+                    closing=closing or app._closing,
+                    cleanup_complete=app.cleaned,
+                )
+            )
+            for attempt, thread_id in app._resident_maintenance.items():
+                snapshots.append(
+                    ExecutorResidentOwner(
+                        incarnation_id=attempt,
+                        session_keys=tuple(sorted(keys)),
+                        vendor_context_id=thread_id,
+                        started=thread_id is not None,
+                        closing=closing or app._closing,
+                        cleanup_complete=app.cleaned,
+                    )
+                )
+        if len({owner.incarnation_id for owner in snapshots}) != len(snapshots):
+            return None
+        snapshots.sort(key=lambda owner: owner.incarnation_id)
+        context_owners: dict[str, set[str]] = {}
+        for owner in snapshots:
+            if owner.vendor_context_id is not None:
+                context_owners.setdefault(owner.vendor_context_id, set()).add(owner.incarnation_id)
+        return ExecutorResidentInventory(
+            owners=tuple(snapshots),
+            ambiguous_context_ids=tuple(
+                sorted(
+                    context_id
+                    for context_id, identities in context_owners.items()
+                    if len(identities) > 1
+                )
+            ),
+        )
 
     def _live_app_session(self) -> _CodexAppServerSession | None:
         """

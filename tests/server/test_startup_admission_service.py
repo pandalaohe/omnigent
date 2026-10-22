@@ -19,8 +19,15 @@ from omnigent.stores.session_startup_store import SessionStartupStore
 from tests.server.test_host_registry import FakeWebSocket
 
 
+@pytest.fixture(autouse=True)
+def isolated_resident_accounting(monkeypatch):
+    # These dispatch scenarios assume inventory reconciliation has already passed.
+    monkeypatch.setattr(StartupAdmission, "inventory_ready", AsyncMock(return_value=True))
+
+
 @pytest.mark.asyncio
-async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_uri):
+@pytest.mark.parametrize("source", ["codex", "claude-sdk"])
+async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_uri, source):
     conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
     registry, host = HostRegistry(), uuid4().hex
     conn = registry.register(
@@ -30,7 +37,7 @@ async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_
             version="test",
             frame_protocol_version=1,
             name="sample-host",
-            capabilities=["startup_admission_v1", "startup_receipts:codex"],
+            capabilities=["startup_admission_v1", f"startup_receipts:{source}"],
         ),
         owner=None,
     )
@@ -43,7 +50,7 @@ async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_
     admission.bind(
         SimpleNamespace(state=SimpleNamespace(startup_inputs=inputs, runner_router=router))
     )
-    admission.resolve_harness = AsyncMock(return_value="codex")
+    admission.resolve_harness = AsyncMock(return_value=source)
     conv = conversations.create_conversation()
     conversations.set_host_id(conv.id, host, "/Users/sample/project")
     prepared = []

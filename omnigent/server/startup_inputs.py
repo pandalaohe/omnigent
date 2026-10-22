@@ -29,7 +29,7 @@ from omnigent.runtime import pending_inputs
 from omnigent.server.annotation_batch import AnnotationFailure
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     ConversationNotFoundError,
@@ -96,7 +96,7 @@ async def reconcile_accepted_startup_input(
     """Finish an interrupted handoff from durable acceptance without dispatching again."""
     if not (
         startup.input_accepted
-        and startup.proof_source == "codex"
+        and startup.proof_source in SDK_STARTUP_SOURCES
         and startup.input_id
         and startup.attempt_id
     ):

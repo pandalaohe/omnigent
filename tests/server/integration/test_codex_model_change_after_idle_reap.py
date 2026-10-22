@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -21,7 +22,7 @@ from omnigent.harnesses.codex_native import app_server, bridge
 from omnigent.native import native_cost_popup
 from omnigent.runner import native_controls
 from omnigent.runner.native import orchestration as native_runtime
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import SessionResourceRegistry, _TerminalRoleRegistration
 from omnigent.runtime import session_stream
 from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -62,9 +63,16 @@ class _LoopbackCodex:
     response_errors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     refuse_handshake: bool = False
     proc: SimpleNamespace | None = None
+    resident_incarnation_id: str = field(default_factory=lambda: uuid4().hex, init=False)
+    exit_confirmed: bool = field(default=False, init=False)
+    process_exit_confirmed: bool = field(default=False, init=False)
 
     async def start(self) -> None:
         assert self.server is None
+        if self.launches:
+            self.resident_incarnation_id = uuid4().hex
+        self.exit_confirmed = False
+        self.process_exit_confirmed = False
         bridge.clear_bridge_state(self.bridge_dir)
         self.ready.clear()
         self.proc = SimpleNamespace(returncode=None)
@@ -115,6 +123,8 @@ class _LoopbackCodex:
     async def close(self) -> None:
         if self.proc is not None:
             self.proc.returncode = 0
+            # The fake models process exit, not confirmation that descendants exited.
+            self.process_exit_confirmed = True
         if self.startup_task is not None:
             self.startup_task.cancel()
             await asyncio.gather(self.startup_task, return_exceptions=True)
@@ -291,7 +301,9 @@ async def native_session(
         monkeypatch.setattr(pane, "_tmux", AsyncMock())
         terminals._by_conversation[sid] = {("codex", "main"): pane}
         terminal_id = terminal_resource_id("codex", "main")
-        resources._terminal_roles[(sid, terminal_id)] = "codex-native"
+        resources._terminal_roles[(sid, terminal_id)] = _TerminalRoleRegistration(
+            "codex-native", pane.diagnostic_id
+        )
         native_runtime._AUTO_CODEX_APP_SERVERS[sid] = codex  # type: ignore[assignment]
         return SessionResourceView(
             id=terminal_id, type="terminal", session_id=sid, name="codex:main"

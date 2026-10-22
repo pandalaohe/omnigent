@@ -9,6 +9,7 @@ lookup while stubbing the control bridge itself.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
@@ -262,15 +263,15 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         stale.running = False
         return False
 
-    stale.is_alive = dead_tmux  # type: ignore[method-assign]
     _seed_registry(registry, "conv_abc", stale)
 
     resource_registry = SessionResourceRegistry(terminal_registry=registry)
-    # Role stamped at auto-create time in production (resource_role);
-    # seeded directly here to avoid spawning real tmux.
-    resource_registry._terminal_roles[("conv_abc", "terminal_tui_main")] = (
-        OMNIGENT_REPL_TERMINAL_ROLE
+    asyncio.run(
+        resource_registry.observe_auxiliary_terminal(
+            "conv_abc", "tui", "main", stale, resource_role=OMNIGENT_REPL_TERMINAL_ROLE
+        )
     )
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
 
     app = create_runner_app(
         terminal_registry=registry,
@@ -390,13 +391,15 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         stale.running = False
         return False
 
-    stale.is_alive = dead_tmux  # type: ignore[method-assign]
     _seed_registry(registry, "conv_abc", stale)
 
     resource_registry = SessionResourceRegistry(terminal_registry=registry)
-    resource_registry._terminal_roles[("conv_abc", "terminal_qwen_main")] = (
-        QWEN_NATIVE_TERMINAL_ROLE
+    asyncio.run(
+        resource_registry.observe_auxiliary_terminal(
+            "conv_abc", "qwen", "main", stale, resource_role=QWEN_NATIVE_TERMINAL_ROLE
+        )
     )
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
 
     app = create_runner_app(
         terminal_registry=registry,
@@ -497,13 +500,15 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal_forwards_agent_spec
         stale.running = False
         return False
 
-    stale.is_alive = dead_tmux  # type: ignore[method-assign]
     _seed_registry(registry, "conv_abc", stale)
 
     resource_registry = SessionResourceRegistry(terminal_registry=registry)
-    resource_registry._terminal_roles[("conv_abc", "terminal_qwen_main")] = (
-        QWEN_NATIVE_TERMINAL_ROLE
+    asyncio.run(
+        resource_registry.observe_auxiliary_terminal(
+            "conv_abc", "qwen", "main", stale, resource_role=QWEN_NATIVE_TERMINAL_ROLE
+        )
     )
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
 
     def _handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_abc":

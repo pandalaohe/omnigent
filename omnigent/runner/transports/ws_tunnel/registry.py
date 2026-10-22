@@ -35,11 +35,13 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Callable
+from _thread import RLock as RLockType
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
 from typing import Protocol
+from weakref import WeakValueDictionary
 
 import httpx
 
@@ -213,6 +215,29 @@ class RunnerConnectWaitState:
     waiters: set[asyncio.Future[RunnerSession]] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class RunnerGenerationGuard:
+    """Order a prepared database commit against tunnel replacement and retirement."""
+
+    registry: TunnelRegistry
+    runner_id: str
+    generation: int
+
+    @contextlib.contextmanager
+    def hold(self) -> Iterator[None]:
+        # DB locks precede the target lifecycle lock; traffic uses only the map lock.
+        with self.registry._lifecycle_lock(self.runner_id):
+            with self.registry._lock:
+                session = self.registry._sessions.get(self.runner_id)
+                if (
+                    session is None
+                    or session.generation != self.generation
+                    or session.close_code is not None
+                ):
+                    raise ConnectionError("runner tunnel changed before inventory commit")
+            yield
+
+
 class TunnelRegistry:
     """In-memory map of runner_id → :class:`RunnerSession`.
 
@@ -262,8 +287,52 @@ class TunnelRegistry:
         self._connect_waiter_total = 0
         self._on_retire = on_retire
         self._lock = threading.RLock()
+        self._lifecycle_locks: WeakValueDictionary[str, RLockType] = WeakValueDictionary()
 
     # ── Session lifecycle ────────────────────────────────
+
+    def generation_guard(self, runner_id: str, generation: int) -> RunnerGenerationGuard:
+        """Bind a delayed inventory transaction to one registered tunnel generation."""
+        return RunnerGenerationGuard(self, runner_id, generation)
+
+    def _lifecycle_lock(self, runner_id: str) -> RLockType:
+        with self._lock:
+            lock = self._lifecycle_locks.get(runner_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._lifecycle_locks[runner_id] = lock
+            return lock
+
+    @contextlib.asynccontextmanager
+    async def _lifecycle_update(self, runner_id: str) -> AsyncIterator[None]:
+        lock = self._lifecycle_lock(runner_id)
+        # Cross-loop waiters never block a route loop or own a cancelled acquisition.
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        try:
+            # Only synchronous mutations run in this thread-owned RLock body.
+            yield
+        finally:
+            lock.release()
+
+    async def register_async(
+        self, runner_id: str, ws: WebSocketLike, hello: HelloFrame, *, owner: str | None = None
+    ) -> RunnerSession:
+        """Wait for this runner's inventory commit without blocking its route loop."""
+        async with self._lifecycle_update(runner_id):
+            return self.register(runner_id, ws, hello, owner=owner)
+
+    async def deregister_async(
+        self, runner_id: str, session: RunnerSession | None = None, *, retire: bool = True
+    ) -> RunnerSession | None:
+        """Retire one tunnel after any target commit; other runner traffic continues."""
+        async with self._lifecycle_update(runner_id):
+            return self.deregister(runner_id, session, retire=retire)
+
+    async def record_close_async(self, session: RunnerSession, *, code: int, reason: str) -> None:
+        """Record a route-owned close after waiting asynchronously for its target."""
+        async with self._lifecycle_update(session.runner_id):
+            self.record_close(session, code=code, reason=reason)
 
     def register(
         self,
@@ -303,7 +372,7 @@ class TunnelRegistry:
             owner=owner,
             last_frame_monotonic=time.monotonic(),
         )
-        with self._lock:
+        with self._lifecycle_lock(runner_id), self._lock:
             old = self._sessions.pop(runner_id, None)
             if old is not None:
                 self.record_close(old, code=4000, reason="tunnel replaced")
@@ -353,7 +422,7 @@ class TunnelRegistry:
         :returns: The removed session, or ``None`` when the runner is
             already offline or the guard did not match.
         """
-        with self._lock:
+        with self._lifecycle_lock(runner_id), self._lock:
             current = self._sessions.get(runner_id)
             if current is None or (session is not None and current is not session):
                 return None
@@ -400,7 +469,7 @@ class TunnelRegistry:
         :param reason: Requested WebSocket close reason.
         :returns: None.
         """
-        with self._lock:
+        with self._lifecycle_lock(session.runner_id), self._lock:
             if session.close_code is None:
                 session.close_code = code
                 session.close_reason = reason

@@ -23,12 +23,14 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from typing import TypeAlias
+
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
@@ -44,6 +46,8 @@ if TYPE_CHECKING:
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
+
+    _NativeBackend: TypeAlias = CodexNativeAppServer | OpenCodeNativeServer
 
 import click
 import httpx
@@ -261,7 +265,7 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     ):
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
     with contextlib.suppress(Exception):
-        await app_server.close()
+        await _close_native_backend(session_id, "codex-native", app_server)
 
 
 async def teardown_all_codex_native_app_servers() -> None:
@@ -298,7 +302,7 @@ async def teardown_opencode_native_server(session_id: str) -> None:
     leftover_server = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
     if leftover_server is not None:
         with contextlib.suppress(Exception):
-            await leftover_server.close()
+            await _close_native_backend(session_id, "opencode-native", leftover_server)
 
 
 async def teardown_all_opencode_native_servers() -> None:
@@ -401,6 +405,152 @@ def codex_native_bridge_dir(session_id: str) -> Path:
 # opencode-native runners, kept referenced so they aren't garbage-collected
 # mid-run (mirrors ``_AUTO_CODEX_APP_SERVERS``).
 _AUTO_OPENCODE_SERVERS: dict[str, OpenCodeNativeServer] = {}
+
+_NativeBackendHarness = Literal["codex-native", "opencode-native"]
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeBackendResidentSnapshot:
+    """An owned backend, independent of auxiliary terminals.
+
+    Session ids cover known backend associations only. Internal thread aliases
+    and unregistered external backends are not covered by this inventory.
+    Process exit alone does not confirm descendants or restore complete coverage.
+    """
+
+    incarnation_id: str
+    harness: _NativeBackendHarness
+    session_ids: tuple[str, ...]
+    registered: bool
+    closing: bool
+    process_exit_confirmed: bool
+    exit_confirmed: bool
+    aliases_complete: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeBackendInventorySnapshot:
+    """Native owners including starts and closes, with boot-scoped exit coverage."""
+
+    owners: tuple[NativeBackendResidentSnapshot, ...]
+    exit_coverage_complete: bool
+    aliases_complete: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _ClosingNativeBackend:
+    incarnation_id: str
+    session_id: str
+    harness: _NativeBackendHarness
+    backend: _NativeBackend
+
+
+_CLOSING_NATIVE_BACKENDS: dict[object, _ClosingNativeBackend] = {}
+_STARTING_NATIVE_BACKENDS: dict[object, tuple[str, _NativeBackendHarness, _NativeBackend]] = {}
+_native_backend_exit_coverage_complete = True
+
+
+def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
+    """Read registered, starting and unconfirmed closing owners without I/O."""
+    owners: dict[str, tuple[_NativeBackendHarness, _NativeBackend, set[str], bool, bool]] = {}
+    registries: tuple[tuple[_NativeBackendHarness, Mapping[str, _NativeBackend]], ...] = (
+        ("codex-native", _AUTO_CODEX_APP_SERVERS),
+        ("opencode-native", _AUTO_OPENCODE_SERVERS),
+    )
+    for harness, registry in registries:
+        for session_id, backend in registry.items():
+            key = backend.resident_incarnation_id
+            if key not in owners:
+                owners[key] = (harness, backend, set(), True, False)
+            elif owners[key][0] != harness or owners[key][1] is not backend:
+                return NativeBackendInventorySnapshot((), False)
+            owners[key][2].add(session_id)
+    for session_id, harness, backend in _STARTING_NATIVE_BACKENDS.values():
+        key = backend.resident_incarnation_id
+        if key in owners:
+            if owners[key][0] != harness or owners[key][1] is not backend:
+                return NativeBackendInventorySnapshot((), False)
+            owners[key][2].add(session_id)
+        else:
+            owners[key] = (harness, backend, {session_id}, False, False)
+    for owner in _CLOSING_NATIVE_BACKENDS.values():
+        key = owner.incarnation_id
+        if key in owners:
+            harness, backend, sessions, registered, _closing = owners[key]
+            if harness != owner.harness or backend is not owner.backend:
+                return NativeBackendInventorySnapshot((), False)
+            owners[key] = (harness, backend, sessions, registered, True)
+            sessions.add(owner.session_id)
+        else:
+            owners[key] = (owner.harness, owner.backend, {owner.session_id}, False, True)
+    snapshots = tuple(
+        NativeBackendResidentSnapshot(
+            incarnation_id=key,
+            harness=harness,
+            session_ids=tuple(sorted(sessions)),
+            registered=registered,
+            closing=closing,
+            process_exit_confirmed=(
+                key == backend.resident_incarnation_id and backend.process_exit_confirmed
+            ),
+            exit_confirmed=key == backend.resident_incarnation_id and backend.exit_confirmed,
+        )
+        for key, (harness, backend, sessions, registered, closing) in owners.items()
+    )
+    return NativeBackendInventorySnapshot(snapshots, _native_backend_exit_coverage_complete)
+
+
+async def _start_native_backend(
+    session_id: str, harness: _NativeBackendHarness, backend: _NativeBackend
+) -> None:
+    """Expose preparation without publishing a backend into the live map early."""
+    global _native_backend_exit_coverage_complete
+    token = object()
+    _STARTING_NATIVE_BACKENDS[token] = (session_id, harness, backend)
+    try:
+        await backend.start()
+        registered = (
+            _AUTO_CODEX_APP_SERVERS if harness == "codex-native" else _AUTO_OPENCODE_SERVERS
+        ).get(session_id)
+        if registered is not None and registered is not backend:
+            _native_backend_exit_coverage_complete = False
+    except BaseException:
+        _native_backend_exit_coverage_complete = False
+        raise
+    finally:
+        _STARTING_NATIVE_BACKENDS.pop(token, None)
+
+
+async def _close_native_backend(
+    session_id: str,
+    harness: _NativeBackendHarness,
+    backend: _NativeBackend,
+    *,
+    close_client: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Keep an in-flight close visible; remember unknown exit without retaining owners."""
+    global _native_backend_exit_coverage_complete
+    incarnation_id = backend.resident_incarnation_id
+    close_backend = backend.close()
+    token = object()
+    _CLOSING_NATIVE_BACKENDS[token] = _ClosingNativeBackend(
+        incarnation_id, session_id, harness, backend
+    )
+    try:
+        try:
+            if close_client is not None:
+                with contextlib.suppress(Exception):
+                    await close_client()
+        finally:
+            if incarnation_id == backend.resident_incarnation_id:
+                await close_backend
+            else:
+                close_backend.close()
+    finally:
+        if incarnation_id != backend.resident_incarnation_id or not backend.exit_confirmed:
+            _native_backend_exit_coverage_complete = False
+        _CLOSING_NATIVE_BACKENDS.pop(token, None)
+
 
 # Bound repeated terminal GET miss logs from tight client poll loops.
 _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
@@ -1636,7 +1786,7 @@ async def _auto_create_opencode_terminal(
     leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
     if leftover is not None:
         with contextlib.suppress(Exception):
-            await leftover.close()
+            await _close_native_backend(session_id, "opencode-native", leftover)
     clear_bridge_state(bridge_dir)
 
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
@@ -1846,7 +1996,7 @@ async def _auto_create_opencode_terminal(
         workspace=launch_config.workspace,
         extra_env=policy_env or None,
     )
-    await server.start()
+    await _start_native_backend(session_id, "opencode-native", server)
     _AUTO_OPENCODE_SERVERS[session_id] = server
 
     try:
@@ -1908,7 +2058,7 @@ async def _auto_create_opencode_terminal(
         # cannot leave a stale entry or replace the startup error.
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):
-            await server.close()
+            await _close_native_backend(session_id, "opencode-native", server)
         raise
 
     # Start the SSE forwarder in the background so session creation never
@@ -1980,7 +2130,7 @@ async def _auto_create_opencode_terminal(
         await _cancel_auto_forwarder_task(session_id)
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):
-            await server.close()
+            await _close_native_backend(session_id, "opencode-native", server)
         raise
 
     _logger.info(
@@ -2015,7 +2165,7 @@ async def _supervise_opencode_forwarder(
         if _AUTO_OPENCODE_SERVERS.get(session_id) is server:
             _AUTO_OPENCODE_SERVERS.pop(session_id)
         with contextlib.suppress(Exception):
-            await server.close()
+            await _close_native_backend(session_id, "opencode-native", server)
 
 
 # Permission decisions can park a human approval card server-side
@@ -5802,7 +5952,7 @@ async def _auto_create_codex_terminal(
     if ensure_comment_relay is not None:
         await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
     app_server.listen_url = codex_ws_url
-    await app_server.start()
+    await _start_native_backend(session_id, "codex-native", app_server)
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
     _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
 
@@ -5840,7 +5990,7 @@ async def _auto_create_codex_terminal(
                 # without this close, every retry stacked another live codex
                 # process (and only the newest stayed tracked for teardown).
                 with contextlib.suppress(Exception):
-                    await app_server.close()
+                    await _close_native_backend(session_id, "codex-native", app_server)
                 _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
                 raise
             # Codex cannot load this thread's rollout, so no retry can resume
@@ -5875,7 +6025,7 @@ async def _auto_create_codex_terminal(
             # app-server.
             with contextlib.suppress(Exception):
                 await event_client.close()
-            await app_server.close()
+            await _close_native_backend(session_id, "codex-native", app_server)
             _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             raise
 
@@ -5954,7 +6104,7 @@ async def _auto_create_codex_terminal(
         with contextlib.suppress(Exception):
             await event_client.close()
         with contextlib.suppress(Exception):
-            await app_server.close()
+            await _close_native_backend(session_id, "codex-native", app_server)
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
@@ -6630,13 +6780,23 @@ async def _codex_discover_thread_and_forward(
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
-        with contextlib.suppress(Exception):
-            await event_client.close()
-        if leftover_app_server is not None:
-            with contextlib.suppress(Exception):
-                await leftover_app_server.close()
-        await _shutdown_session_router_async(session_id, subagent_router)
-        await _shutdown_session_turn_router_async(session_id, turn_router)
+        try:
+            if leftover_app_server is not None:
+                with contextlib.suppress(Exception):
+                    await _close_native_backend(
+                        session_id,
+                        "codex-native",
+                        leftover_app_server,
+                        close_client=event_client.close,
+                    )
+            else:
+                with contextlib.suppress(Exception):
+                    await event_client.close()
+        finally:
+            try:
+                await _shutdown_session_router_async(session_id, subagent_router)
+            finally:
+                await _shutdown_session_turn_router_async(session_id, turn_router)
 
 
 async def _codex_forward_known_thread(
@@ -6699,9 +6859,6 @@ async def _codex_forward_known_thread(
         cancelled = True
         raise
     finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.close()
         _logger.info(
             "Codex native input stopped",
             extra=debug_event(
@@ -6717,11 +6874,23 @@ async def _codex_forward_known_thread(
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
-        if leftover_app_server is not None:
-            with contextlib.suppress(Exception):
-                await leftover_app_server.close()
-        await _shutdown_session_router_async(session_id, subagent_router)
-        await _shutdown_session_turn_router_async(session_id, turn_router)
+        try:
+            if leftover_app_server is not None:
+                with contextlib.suppress(Exception):
+                    await _close_native_backend(
+                        session_id,
+                        "codex-native",
+                        leftover_app_server,
+                        close_client=client.close if client is not None else None,
+                    )
+            elif client is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+        finally:
+            try:
+                await _shutdown_session_router_async(session_id, subagent_router)
+            finally:
+                await _shutdown_session_turn_router_async(session_id, turn_router)
 
 
 async def _run_antigravity_reader(

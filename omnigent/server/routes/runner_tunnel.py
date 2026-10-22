@@ -538,7 +538,7 @@ def create_runner_tunnel_router(
             #    (and an unauthenticated non-loopback peer already
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
-            session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            session = await registry.register_async(runner_id, ws, frame, owner=tunnel_owner)
             session.diagnostics.settings.update(
                 tunnel_side="server",
                 app_ping_interval_s=PING_INTERVAL_S,
@@ -697,7 +697,7 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
-                registry.deregister(runner_id, session, retire=False)
+                await registry.deregister_async(runner_id, session, retire=False)
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id, session)
@@ -1024,7 +1024,7 @@ async def _ping_loop(
                     **diagnostics,
                 ),
             )
-            registry.record_close(session, code=4003, reason="ping timeout")
+            await registry.record_close_async(session, code=4003, reason="ping timeout")
             try:
                 await ws.close(code=4003, reason="ping timeout")
             except RuntimeError:

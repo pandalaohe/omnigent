@@ -9,6 +9,7 @@ import pytest
 
 from omnigent.entities import Conversation
 from omnigent.runner import create_runner_app
+from omnigent.runner.app import _relay_startup_proof
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -56,6 +57,40 @@ class _Accepted:
 
     def raise_for_status(self) -> None:
         pass
+
+
+@pytest.mark.asyncio
+async def test_proof_cannot_change_the_owning_harness_or_mix_cached_sources():
+    ref = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="context",
+        host_generation="generation",
+    )
+    server = _RecordingServer()
+    admission = create_runner_app(server_client=server).state.startup_admission
+    admission.register(SESSION, ref)
+    proof = StartupObservation(
+        attempt=ref,
+        phase="input_dispatched",
+        source="claude-sdk",
+        vendor_session_id="session",
+        vendor_turn_id="query",
+    )
+    event = {"type": "startup.proof", "observation": proof.model_dump()}
+    assert not await _relay_startup_proof(
+        server, SESSION, event, ref, admission=admission, expected_source="codex"
+    )
+    assert server.receipts == []
+    assert admission.observations_for(SESSION, ref) == []
+    assert await _relay_startup_proof(
+        server, SESSION, event, ref, admission=admission, expected_source="claude-sdk"
+    )
+    assert not admission.record_observation(
+        SESSION, proof.model_copy(update={"phase": "input_accepted", "source": "codex"})
+    )
+    assert admission.observations_for(SESSION, ref) == [proof]
 
 
 @pytest.mark.asyncio
@@ -109,7 +144,8 @@ async def test_stop_fences_late_observations_without_disabling_admission():
 
 
 @pytest.mark.asyncio
-async def test_codex_internal_claim_and_proof_reach_server_without_public_frames():
+@pytest.mark.parametrize("source", ["codex", "claude-sdk"])
+async def test_sdk_internal_claim_and_proof_reach_server_without_public_frames(source):
     ref = StartupAttemptRef(
         startup_id="a" * 32,
         attempt_id="b" * 32,
@@ -120,7 +156,7 @@ async def test_codex_internal_claim_and_proof_reach_server_without_public_frames
     observation = StartupObservation(
         attempt=ref,
         phase="input_accepted",
-        source="codex",
+        source=source,
         vendor_session_id="thread",
         vendor_turn_id="turn",
     )
@@ -143,7 +179,7 @@ async def test_codex_internal_claim_and_proof_reach_server_without_public_frames
     spec = AgentSpec(
         spec_version=1,
         name="agent",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        executor=ExecutorSpec(type="omnigent", config={"harness": source}),
     )
 
     async def resolve(_agent_id: str, _session_id: str | None = None) -> AgentSpec:
@@ -191,7 +227,8 @@ async def test_codex_internal_claim_and_proof_reach_server_without_public_frames
 
 
 @pytest.mark.asyncio
-async def test_failed_receipt_can_be_requeried_only_for_current_attempt():
+@pytest.mark.parametrize("source", ["codex", "claude-sdk"])
+async def test_failed_receipt_can_be_requeried_only_for_current_attempt(source):
     ref = StartupAttemptRef(
         startup_id="a" * 32,
         attempt_id="b" * 32,
@@ -202,7 +239,7 @@ async def test_failed_receipt_can_be_requeried_only_for_current_attempt():
     observation = StartupObservation(
         attempt=ref,
         phase="input_dispatched",
-        source="codex",
+        source=source,
         vendor_session_id="thread",
         vendor_turn_id="turn",
         reason="not cached",
@@ -219,7 +256,7 @@ async def test_failed_receipt_can_be_requeried_only_for_current_attempt():
     spec = AgentSpec(
         spec_version=1,
         name="agent",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        executor=ExecutorSpec(type="omnigent", config={"harness": source}),
     )
 
     async def resolve(_agent_id: str, _session_id: str | None = None) -> AgentSpec:

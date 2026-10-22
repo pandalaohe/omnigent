@@ -261,7 +261,7 @@ from omnigent.server.schemas import (
 from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
 from omnigent.spec.skill_sources import resolve_session_skills, session_skill_roots
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -896,6 +896,7 @@ async def _relay_startup_proof(
     expected: StartupAttemptRef,
     *,
     admission: StartupAdmission | None = None,
+    expected_source: str = "codex",
 ) -> bool:
     """Consume a harness control frame using the runner's authenticated AP client."""
     try:
@@ -903,12 +904,16 @@ async def _relay_startup_proof(
     except ValueError:
         return False
     observation = proof.observation
-    if observation.attempt != expected or observation.source != "codex":
+    if (
+        observation.attempt != expected
+        or observation.source not in SDK_STARTUP_SOURCES
+        or observation.source != expected_source
+    ):
         return False
     if admission is not None and not admission.record_observation(session_id, observation):
         return False
     # The store accepts runner readiness before an input has a vendor binding.
-    # This runner reports it only after a typed Codex thread/tool observation.
+    # This runner reports it only after an owning SDK observation.
     if observation.phase in ("runtime_ready", "tools_ready"):
         observation = observation.model_copy(update={"source": "runner"})
     for _ in range(3):
@@ -7946,7 +7951,9 @@ def create_runner_app(
         }
         if startup_admission.required(conv):
             harness_body["startup_required"] = True
-        if harness_name == "codex" and isinstance(msg_body.get("startup_attempt"), dict):
+        if harness_name in SDK_STARTUP_SOURCES and isinstance(
+            msg_body.get("startup_attempt"), dict
+        ):
             with contextlib.suppress(ValueError):
                 startup_ref = StartupAttemptRef.model_validate(msg_body["startup_attempt"])
                 harness_body["startup_attempt"] = startup_ref.model_dump()
@@ -8612,7 +8619,9 @@ def create_runner_app(
 
             turn_input_stable_id = _input_stable_id(body)
             startup_ref = None
-            if harness_name == "codex" and isinstance(body.get("startup_attempt"), dict):
+            if harness_name in SDK_STARTUP_SOURCES and isinstance(
+                body.get("startup_attempt"), dict
+            ):
                 with contextlib.suppress(ValueError):
                     startup_ref = StartupAttemptRef.model_validate(body["startup_attempt"])
 
@@ -8871,6 +8880,7 @@ def create_runner_app(
                                             event,
                                             startup_ref,
                                             admission=startup_admission,
+                                            expected_source=harness_name,
                                         )
                                     continue
                                 if _evt_type == SDK_PEER_STREAM_EVENT:
@@ -11313,6 +11323,7 @@ def create_runner_app(
         auth_token_factory=auth_token_factory,
         filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
+        process_manager=process_manager,
         server_client=server_client,
         terminal_registry=terminal_registry,
     )

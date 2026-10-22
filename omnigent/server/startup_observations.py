@@ -14,7 +14,7 @@ from omnigent.runtime import session_stream
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.schemas import SessionStartupEvent
 from omnigent.server.startup_inputs import reconcile_accepted_startup_input
-from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
+from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef, StartupObservation
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore, StartupSnapshot
 
@@ -111,7 +111,7 @@ async def accept_observation(
     ):
         return False
     receipt = body.receipt()
-    if body.source == "codex" and body.phase in ("runtime_ready", "tools_ready"):
+    if body.source in SDK_STARTUP_SOURCES and body.phase in ("runtime_ready", "tools_ready"):
         receipt = body.model_copy(update={"source": "runner"}).receipt()
     try:
         accepted = await asyncio.to_thread(
@@ -178,7 +178,10 @@ async def reconcile_startup_observations(
         conn is None
         or conn.startup_generation != startup.host_generation
         or "startup_admission_v1" not in conn.hello.capabilities
-        or "startup_receipts:codex" not in conn.hello.capabilities
+        or not any(
+            f"startup_receipts:{source}" in conn.hello.capabilities
+            for source in SDK_STARTUP_SOURCES
+        )
     ):
         return False
     router = getattr(app.state, "runner_router", None)
@@ -244,7 +247,9 @@ async def reconcile_startup_observations(
             return False
         if (
             observation.attempt != ref
-            or observation.source != "codex"
+            or observation.source not in SDK_STARTUP_SOURCES
+            or f"startup_receipts:{observation.source}" not in conn.hello.capabilities
+            or (observations and observation.source != observations[0].source)
             or observation.phase in seen_phases
         ):
             return False

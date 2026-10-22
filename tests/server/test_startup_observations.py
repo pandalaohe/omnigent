@@ -28,7 +28,7 @@ from omnigent.stores.session_startup_store import SessionStartupStore
 from tests.server.test_host_registry import FakeWebSocket
 
 
-def _startup(app, db_uri, *, owner=None):
+def _startup(app, db_uri, *, owner=None, source="codex"):
     conversations = SqlAlchemyConversationStore(db_uri)
     startups = SessionStartupStore(db_uri)
     hosts = app.state.host_registry
@@ -45,7 +45,7 @@ def _startup(app, db_uri, *, owner=None):
                 frame_protocol_version=1,
                 name="sample-host",
                 connection_id="generation",
-                capabilities=["startup_admission_v1", "startup_receipts:codex"],
+                capabilities=["startup_admission_v1", f"startup_receipts:{source}"],
             ),
             owner=owner,
         )
@@ -98,16 +98,19 @@ def _observation(ref, phase, *, source="codex"):
         attempt=ref,
         phase=phase,
         source=source,
-        vendor_session_id="thread" if source == "codex" else None,
-        vendor_turn_id="turn" if source == "codex" else None,
+        vendor_session_id="thread" if source in ("codex", "claude-sdk") else None,
+        vendor_turn_id="turn" if source in ("codex", "claude-sdk") else None,
     )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["codex", "claude-sdk"])
 async def test_lost_receipts_reconcile_from_exact_runner_cache_once(
-    app, client, db_uri, monkeypatch
+    app, client, db_uri, monkeypatch, source
 ):
-    conversations, startups, hosts, conn, conv, item, ref, runner_id = _startup(app, db_uri)
+    conversations, startups, hosts, conn, conv, item, ref, runner_id = _startup(
+        app, db_uri, source=source
+    )
     phases = (
         "input_dispatched",
         "runtime_ready",
@@ -115,7 +118,7 @@ async def test_lost_receipts_reconcile_from_exact_runner_cache_once(
         "input_accepted",
         "work_started",
     )
-    observations = [_observation(ref, phase).model_dump() for phase in phases]
+    observations = [_observation(ref, phase, source=source).model_dump() for phase in phases]
     requests = []
 
     def runner_handler(request):

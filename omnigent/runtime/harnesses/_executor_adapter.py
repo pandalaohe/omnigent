@@ -19,7 +19,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Response
 
@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorResidentInventory,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -68,7 +69,7 @@ from omnigent.server.schemas import (
     SDKPeerReceiptEvent,
     StartupProofEvent,
 )
-from omnigent.startup_evidence import startup_evidence_scope
+from omnigent.startup_evidence import StartupPermissionUnavailable, startup_evidence_scope
 
 _logger = logging.getLogger(__name__)
 
@@ -198,14 +199,19 @@ class ExecutorAdapter(HarnessApp):
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
         harness_label: str = "Claude",
+        *,
+        startup_source: Literal["codex", "claude-sdk"] | None = None,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
+        self._startup_source = startup_source
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
         # Lazily-constructed inner executor, reused across turns for the conversation lifetime.
         self._executor: Executor | None = None
+        # Stable callbacks and tool-call correlation state belong to one admitted turn.
+        self._turn_active = False
         # Per-turn turn context. The stable tool/elicitation/policy bridges read this at call
         # time so MCP handlers that closure-captured the bridge on turn 1 dispatch into the
         # current turn's ctx, not turn 1's dead ctx.
@@ -221,6 +227,8 @@ class ExecutorAdapter(HarnessApp):
         # until completion; drained before recovery and on shutdown.
         self._bg_tasks: set[asyncio.Task[bool]] = set()
         self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
+        # Cleanup cannot prove complete coverage of owners left outside the current executor.
+        self._resident_inventory_detached = False
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -244,14 +252,26 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
-        executor = self._ensure_executor()
+        if self._turn_active:
+            raise StartupPermissionUnavailable(f"{self._harness_label} query already active")
+        self._turn_active = True
+        try:
+            await self._run_admitted_turn(request, ctx)
+        finally:
+            self._turn_active = False
+
+    async def _run_admitted_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         startup_attempt = request.startup_attempt
         startup_required = request.startup_required or startup_attempt is not None
         if startup_required:
-            from omnigent.inner.codex_executor import CodexExecutor
-
-            if not isinstance(executor, CodexExecutor):
+            if self._startup_source is None:
                 raise RuntimeError("startup_proof_unavailable")
+            if self._executor is None:
+                if startup_attempt is None or not await ctx.claim_startup(
+                    startup_attempt, "executor_construct"
+                ):
+                    raise RuntimeError("Startup permission unavailable")
+        executor = self._ensure_executor()
         messages = _translate_input_to_messages(request.input)
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -579,6 +599,8 @@ class ExecutorAdapter(HarnessApp):
             if self._executor is not None:
                 await self._executor.interrupt_session(self._session_key)
         except BaseException as exc:
+            if isinstance(exc, StartupPermissionUnavailable):
+                clean_exit = True
             _turn_outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
             if input_identity and not input_outcome_logged:
                 log_input_event(
@@ -631,6 +653,8 @@ class ExecutorAdapter(HarnessApp):
             # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
                 abandoned_executor = self._executor
+                if abandoned_executor is not None:
+                    self._resident_inventory_detached = True
                 self._executor = None
                 interrupt_task = asyncio.create_task(
                     self._safe_interrupt(abandoned_executor, self._session_key)
@@ -649,6 +673,17 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is not None:
             await self._executor.interrupt_session(self._session_key)
         return response
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Read only the current owner; detached cleanup leaves coverage unknown."""
+        if (
+            self._executor is None
+            or self._resident_inventory_detached
+            or self._abandoned_executor_cleanup is not None
+            or self._bg_tasks
+        ):
+            return None
+        return self._executor.resident_inventory()
 
     async def _keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
         """Answer a keep-warm ping through the inner executor's channel."""
@@ -735,6 +770,8 @@ class ExecutorAdapter(HarnessApp):
                     self._session_key,
                 )
                 executor = self._executor
+                if executor is not None:
+                    self._resident_inventory_detached = True
                 self._executor = None
                 self._current_ctx = None
                 self._current_agent = None
@@ -1351,6 +1388,7 @@ class ExecutorAdapter(HarnessApp):
             await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
             self._bg_tasks.clear()
         if self._executor is not None:
+            self._resident_inventory_detached = True
             await self._executor.close_session(self._session_key)
             await self._executor.close()
             self._executor = None

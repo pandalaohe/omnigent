@@ -1421,6 +1421,10 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         host_deregistered.append(host_id)
         host_registry_state["conn"] = None
 
+    async def _deregister_runner(runner_id: str, session: object, *, retire: bool) -> None:
+        assert session is fresh_runner_session
+        runner_deregistered.append((runner_id, retire))
+
     monkeypatch.setattr(sessions_module, "_kick_managed_wake", _finish_wake)
     app_state = SimpleNamespace(
         host_store=host_store,
@@ -1433,9 +1437,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         tunnel_registry=SimpleNamespace(
             get=lambda _runner_id: fresh_runner_session,
             seconds_since_last_frame=lambda _session: 0.0,
-            deregister=lambda runner_id, *, retire: runner_deregistered.append(
-                (runner_id, retire)
-            ),
+            deregister_async=_deregister_runner,
         ),
     )
 

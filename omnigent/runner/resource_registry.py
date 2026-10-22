@@ -46,6 +46,7 @@ from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
+from omnigent.terminals.registry import TerminalRegistrationSnapshot
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
@@ -176,6 +177,24 @@ class TerminalLifecycle(Enum):
 
     REQUIRED = "required"
     AUXILIARY = "auxiliary"
+
+
+@dataclass(frozen=True)
+class TerminalResourceRegistrationSnapshot(TerminalRegistrationSnapshot):
+    """Registered terminal evidence with a generation-matched private role.
+
+    ``resource_role=None`` means unmarked or uncertain, including ownership
+    transfers before role metadata catches up. It cannot prove native absence.
+    Native TUIs remain terminal resources, not separate backend owners.
+    """
+
+    resource_role: str | None
+
+
+@dataclass(frozen=True)
+class _TerminalRoleRegistration:
+    role: str
+    instance_id: str
 
 
 @dataclass(frozen=True)
@@ -496,7 +515,7 @@ class SessionResourceRegistry:
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._claude_skill_bundle_dirs: dict[str, list[tempfile.TemporaryDirectory[str]]] = {}
-        self._terminal_roles: dict[tuple[str, str], str] = {}
+        self._terminal_roles: dict[tuple[str, str], _TerminalRoleRegistration] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
@@ -879,7 +898,44 @@ class SessionResourceRegistry:
         :returns: Role marker such as ``"codex-native"``, or ``None``.
         """
         with self._lock:
-            return self._terminal_roles.get((session_id, terminal_id))
+            registration = self._terminal_roles.get((session_id, terminal_id))
+            return registration.role if registration is not None else None
+
+    def terminal_registration_snapshot(
+        self,
+    ) -> tuple[TerminalResourceRegistrationSnapshot, ...] | None:
+        """Read registered terminals and roles without probing or managing resources.
+
+        ``None`` means no terminal registry is configured. The resource lock is
+        acquired before the terminal map lock; terminal map operations never
+        acquire the resource lock. Transfers can precede their role update, so
+        only matching instance identities carry a role in this snapshot.
+        """
+        if self._terminal_registry is None:
+            return None
+        with self._lock:
+            registrations = self._terminal_registry.registration_snapshot()
+            snapshots = []
+            for registration in registrations:
+                role = self._terminal_roles.get(
+                    (
+                        registration.conversation_id,
+                        terminal_resource_id(registration.terminal_name, registration.session_key),
+                    )
+                )
+                snapshots.append(
+                    TerminalResourceRegistrationSnapshot(
+                        conversation_id=registration.conversation_id,
+                        terminal_name=registration.terminal_name,
+                        session_key=registration.session_key,
+                        instance_id=registration.instance_id,
+                        observed_running=registration.observed_running,
+                        resource_role=role.role
+                        if role is not None and role.instance_id == registration.instance_id
+                        else None,
+                    )
+                )
+            return tuple(snapshots)
 
     def list_resources(
         self,
@@ -1491,7 +1547,9 @@ class SessionResourceRegistry:
                 )
             self._terminal_lifecycles[(session_id, resource_id)] = lifecycle
             if resource_role is not None:
-                self._terminal_roles[(session_id, resource_id)] = resource_role
+                self._terminal_roles[(session_id, resource_id)] = _TerminalRoleRegistration(
+                    resource_role, instance.diagnostic_id
+                )
         self._start_terminal_activity_watcher(
             session_id,
             terminal_name,
@@ -1916,7 +1974,7 @@ class SessionResourceRegistry:
             session_key=session_key,
             lifecycle=lifecycle,
             instance=instance,
-            resource_role=observed_role,
+            resource_role=observed_role.role if observed_role is not None else None,
         )
 
     async def _finalize_terminal_exit(
@@ -2191,9 +2249,12 @@ class SessionResourceRegistry:
             if not moved:
                 return None
             with self._lock:
-                role = self._terminal_roles.pop((source_session_id, terminal_id), None)
-                if role is not None:
-                    self._terminal_roles[(target_session_id, terminal_id)] = role
+                role_registration = self._terminal_roles.pop(
+                    (source_session_id, terminal_id), None
+                )
+                role = role_registration.role if role_registration is not None else None
+                if role_registration is not None:
+                    self._terminal_roles[(target_session_id, terminal_id)] = role_registration
                 if role == CLAUDE_NATIVE_TERMINAL_ROLE and terminal_id == terminal_resource_id(
                     "claude", "main"
                 ):

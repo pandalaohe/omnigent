@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import uuid
+from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -437,6 +438,11 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
     class _FakeAppServer:
         closed = False
 
+        def __init__(self) -> None:
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
+
         async def close(self) -> None:
             self.closed = True
 
@@ -539,6 +545,9 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
     class _FakeAppServer:
         def __init__(self, sid: str) -> None:
             self._sid = sid
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             closed.append(self._sid)
@@ -589,6 +598,9 @@ async def test_teardown_all_opencode_native_servers_closes_every_session() -> No
     class _FakeServer:
         def __init__(self, sid: str) -> None:
             self._sid = sid
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             closed.append(self._sid)
@@ -639,6 +651,9 @@ async def test_teardown_all_opencode_native_servers_survives_a_failing_close() -
         def __init__(self, sid: str, *, fail: bool) -> None:
             self._sid = sid
             self._fail = fail
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
 
         async def close(self) -> None:
             attempted.append(self._sid)
@@ -667,6 +682,271 @@ async def test_teardown_all_opencode_native_servers_survives_a_failing_close() -
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
             runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
         await _drain_forwarder_runs(runs)
+
+
+def test_native_backend_inventory_keeps_owner_identity_without_tui_or_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    backend = SimpleNamespace(
+        resident_incarnation_id=uuid.uuid4().hex,
+        exit_confirmed=False,
+        process_exit_confirmed=False,
+    )
+    replacement = SimpleNamespace(
+        resident_incarnation_id=uuid.uuid4().hex, exit_confirmed=True, process_exit_confirmed=True
+    )
+    codex_owners = {"parent": backend, "known-alias": backend}
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", codex_owners)
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"other": replacement})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("inventory must not probe, spawn, connect, or clean up")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected)
+    monkeypatch.setattr(orchestration, "_cancel_auto_forwarder_task", unexpected)
+    monkeypatch.setattr(orchestration, "_close_native_backend", unexpected)
+
+    snapshot = orchestration.native_backend_resident_inventory()
+    assert len(snapshot.owners) == 2
+    assert snapshot.owners[0].incarnation_id == backend.resident_incarnation_id
+    assert snapshot.owners[0].session_ids == ("known-alias", "parent")
+    assert snapshot.owners[0].registered and not snapshot.owners[0].closing
+    assert not snapshot.owners[0].exit_confirmed and not snapshot.owners[0].aliases_complete
+    assert snapshot.owners[1].harness == "opencode-native" and snapshot.owners[1].exit_confirmed
+    with pytest.raises(FrozenInstanceError):
+        snapshot.owners[0].closing = True  # type: ignore[misc]
+
+    # Auxiliary terminal replacement never changes these backend owner maps.
+    assert orchestration.native_backend_resident_inventory() == snapshot
+    codex_owners["parent"] = SimpleNamespace(
+        resident_incarnation_id=uuid.uuid4().hex,
+        exit_confirmed=False,
+        process_exit_confirmed=False,
+    )
+    after = orchestration.native_backend_resident_inventory()
+    assert after.owners[0].incarnation_id != snapshot.owners[0].incarnation_id
+    assert snapshot.owners[0].session_ids == ("known-alias", "parent")
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "opencode-native"])
+async def test_native_backend_concurrent_start_preserves_the_live_incarnation(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
+    from omnigent.harnesses.opencode_native import app_server as opencode_app_server
+    from omnigent.runner.native import orchestration
+
+    root = Path("/opt/work/omnigent")
+    if harness == "codex-native":
+        backend = CodexNativeAppServer(
+            codex_path="/opt/work/bin/codex",
+            socket_path=root / "server.sock",
+            codex_home=root / "codex-home",
+            env={},
+            config_overrides=[],
+            cwd=root,
+            bridge_dir=root / "bridge",
+        )
+    else:
+        monkeypatch.setattr(
+            opencode_app_server, "find_opencode_cli", lambda _: "/opt/work/bin/opencode"
+        )
+        monkeypatch.setattr(opencode_app_server, "ensure_auth_secret", lambda _: "test-only")
+        backend = opencode_app_server.OpenCodeNativeServer(bridge_dir=root, workspace=root)
+    monkeypatch.setattr(
+        orchestration,
+        "_AUTO_CODEX_APP_SERVERS",
+        {"owned": backend} if harness == "codex-native" else {},
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_AUTO_OPENCODE_SERVERS",
+        {"owned": backend} if harness == "opencode-native" else {},
+    )
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    entered, resume = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def start_once() -> None:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await resume.wait()
+        backend._resident_spawned = True
+
+    monkeypatch.setattr(backend, "_start", start_once)
+    first = asyncio.create_task(backend.start())
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        snapshot = orchestration.native_backend_resident_inventory()
+        second = asyncio.create_task(backend.start())
+        await asyncio.sleep(0)
+        assert calls == 1
+    finally:
+        resume.set()
+    await first
+    assert second is not None
+    with pytest.raises(RuntimeError, match="exit is not confirmed"):
+        await second
+    assert calls == 1
+    assert orchestration.native_backend_resident_inventory() == snapshot
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "opencode-native"])
+@pytest.mark.parametrize("outcome", ["confirmed", "unconfirmed", "raises", "cancelled"])
+async def test_native_backend_inventory_records_unknown_exit_without_retaining_owners(
+    monkeypatch: pytest.MonkeyPatch, harness: str, outcome: str
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    class _FakeServer:
+        resident_incarnation_id = uuid.uuid4().hex
+        exit_confirmed = False
+        process_exit_confirmed = False
+
+        async def close(self) -> None:
+            entered.set()
+            await resume.wait()
+            if outcome == "raises":
+                raise RuntimeError("close failed")
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            self.exit_confirmed = outcome == "confirmed"
+
+    backend = _FakeServer()
+    codex_owners = {"owned": backend} if harness == "codex-native" else {}
+    opencode_owners = {"owned": backend} if harness == "opencode-native" else {}
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", codex_owners)
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", opencode_owners)
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    before = orchestration.native_backend_resident_inventory()
+    teardown = (
+        orchestration.teardown_codex_native_app_server
+        if harness == "codex-native"
+        else orchestration.teardown_opencode_native_server
+    )
+    closing_task = asyncio.create_task(teardown("owned"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        during = orchestration.native_backend_resident_inventory()
+        assert len(during.owners) == 1
+        assert during.owners[0].incarnation_id == before.owners[0].incarnation_id
+        assert during.owners[0].closing and not during.owners[0].registered
+        assert not during.owners[0].exit_confirmed
+    finally:
+        resume.set()
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await closing_task
+    else:
+        await closing_task
+
+    after = orchestration.native_backend_resident_inventory()
+    assert after.owners == ()
+    assert not orchestration._CLOSING_NATIVE_BACKENDS
+    if outcome == "confirmed":
+        assert after.exit_coverage_complete
+    else:
+        assert not after.exit_coverage_complete
+        backend.exit_confirmed = True
+        outcome = "confirmed"
+        await orchestration._close_native_backend("owned", harness, backend)  # type: ignore[arg-type]
+        assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
+
+
+async def test_client_close_does_not_retarget_a_new_backend_incarnation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    entered, resume = asyncio.Event(), asyncio.Event()
+    closed: list[str] = []
+
+    class _Backend:
+        resident_incarnation_id = "old-incarnation"
+        exit_confirmed = False
+        process_exit_confirmed = False
+
+        async def close(self):
+            closed.append(self.resident_incarnation_id)
+
+    async def close_client():
+        entered.set()
+        await resume.wait()
+
+    backend = _Backend()
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    closing = asyncio.create_task(
+        orchestration._close_native_backend(
+            "owned",
+            "codex-native",
+            backend,
+            close_client=close_client,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        # Another completed close and safe start replaced the physical child.
+        backend.resident_incarnation_id = "new-incarnation"
+        backend.exit_confirmed = True
+        backend.process_exit_confirmed = True
+        snapshot = orchestration.native_backend_resident_inventory()
+        assert snapshot.owners[0].incarnation_id == "old-incarnation"
+        assert not snapshot.owners[0].exit_confirmed
+        assert not snapshot.owners[0].process_exit_confirmed
+    finally:
+        resume.set()
+        await closing
+    assert not closed
+    assert not orchestration._CLOSING_NATIVE_BACKENDS
+    assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
+
+
+async def test_overlapping_backend_close_keeps_each_inflight_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    entered = [asyncio.Event(), asyncio.Event()]
+    resume = [asyncio.Event(), asyncio.Event()]
+    calls = 0
+
+    class _Backend:
+        resident_incarnation_id = uuid.uuid4().hex
+        exit_confirmed = False
+        process_exit_confirmed = False
+
+        async def close(self):
+            nonlocal calls
+            index = calls
+            calls += 1
+            entered[index].set()
+            await resume[index].wait()
+
+    backend = _Backend()
+    tasks = [
+        asyncio.create_task(orchestration._close_native_backend("owned", "codex-native", backend))
+        for _ in range(2)
+    ]
+    try:
+        for event in entered:
+            await asyncio.wait_for(event.wait(), timeout=1)
+        resume[0].set()
+        await tasks[0]
+        snapshot = orchestration.native_backend_resident_inventory()
+        assert len(snapshot.owners) == 1
+        assert snapshot.owners[0].closing
+    finally:
+        for event in resume:
+            event.set()
+        await asyncio.gather(*tasks)
+    assert not orchestration._CLOSING_NATIVE_BACKENDS
 
 
 @pytest.mark.asyncio
@@ -969,6 +1249,9 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.listen_url: str | None = None
             self.config_overrides: list[str] = []
             self.proc = SimpleNamespace(returncode=None)
@@ -1243,9 +1526,11 @@ async def test_forwarder_task_exit_paths_are_logged(
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
 
 
+@pytest.mark.parametrize("overwrite", [False, True])
 async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    overwrite: bool,
 ) -> None:
     """
     A refused ``thread/resume`` must not leak the app-server it started.
@@ -1260,6 +1545,12 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _: 0,
+    )
 
     session_id = "b7d2c1e0aa114b52b7c2f1d3e4a5b6c7"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
@@ -1306,11 +1597,31 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
             """:returns: None."""
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.listen_url: str | None = None
             self.config_overrides: list[str] = []
 
         async def start(self) -> None:
-            """:returns: None."""
+            from omnigent.runner.native.orchestration import native_backend_resident_inventory
+
+            snapshot = native_backend_resident_inventory()
+            candidates = [owner for owner in snapshot.owners if session_id in owner.session_ids]
+            assert len(candidates) == 1
+            (owner,) = candidates
+            assert owner.incarnation_id == self.resident_incarnation_id
+            assert not owner.registered and not owner.closing and not owner.exit_confirmed
+            self.resident_incarnation_id = uuid.uuid4().hex
+            (spawned,) = native_backend_resident_inventory().owners
+            assert spawned.incarnation_id == self.resident_incarnation_id
+            assert owner.incarnation_id != spawned.incarnation_id
+            if overwrite:
+                orchestration._AUTO_CODEX_APP_SERVERS[session_id] = SimpleNamespace(
+                    resident_incarnation_id=uuid.uuid4().hex,
+                    exit_confirmed=False,
+                    process_exit_confirmed=False,
+                )
 
         async def close(self) -> None:
             """Record the teardown the failure path owes."""
@@ -1364,6 +1675,10 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         :raises RuntimeError: Always, mirroring the app-server error.
         """
         del transport, terminal_launch_args
+        snapshot = orchestration.native_backend_resident_inventory()
+        (owner,) = snapshot.owners
+        assert owner.registered and not owner.closing
+        assert snapshot.exit_coverage_complete is (not overwrite)
         raise RuntimeError(f"thread {loaded_thread_id} already has an active writer")
 
     class _UnreachableResourceRegistry:
@@ -1526,6 +1841,9 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
             self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.resident_incarnation_id = uuid.uuid4().hex
+            self.exit_confirmed = False
+            self.process_exit_confirmed = False
             self.listen_url: str | None = None
             self.config_overrides: list[str] = []
 

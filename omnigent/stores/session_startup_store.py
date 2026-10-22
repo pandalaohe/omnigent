@@ -1,6 +1,7 @@
 """Atomic host startup admission shared by application replicas."""
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from sqlalchemy import case, func, select
@@ -20,6 +21,9 @@ from omnigent.db.utils import (
 from omnigent.entities.host_recovery import HostRecoveryPlan
 from omnigent.entities.session_startup import SessionStartupStatus, StartupReceipt
 from omnigent.errors import ErrorCode, OmnigentError
+
+if TYPE_CHECKING:
+    from omnigent.runner.transports.ws_tunnel.registry import RunnerGenerationGuard
 
 
 @dataclass(frozen=True)
@@ -154,6 +158,55 @@ class SessionStartupStore:
             return (
                 HostRecoveryPlan.model_validate(host.recovery) if host and host.recovery else None
             )
+
+    def note_unknown_resident_inventory(
+        self,
+        host_id: str,
+        *,
+        host_generation: str,
+        session_id: str,
+        expected_runner_id: str,
+        account: AccountAuthority | None,
+        runner_generation: "RunnerGenerationGuard",
+    ) -> bool:
+        """A trusted partial owner read can veto admission, never release residents."""
+
+        def write(db: Session) -> bool:
+            if account is not None:
+                if account.workspace_id != current_workspace_id():
+                    raise OmnigentError(
+                        "account authority has been revoked", code=ErrorCode.UNAUTHORIZED
+                    )
+                require_active_account(db, account.user_id, generation=account.generation)
+            _, host = self._budgets(db, host_id)
+            binding = db.get(
+                SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
+            )
+            if (
+                host.current_generation != host_generation
+                or binding is None
+                or (binding.host_id, binding.runner_id) != (host_id, expected_runner_id)
+            ):
+                return False
+            # All DB locks precede the registry guard; no budget wait holds it.
+            with runner_generation.hold():
+                host.resident_inventory_unknown = True
+                db.commit()
+            return True
+
+        return run_write_transaction(self._session, "retain_unknown_resident_inventory", write)
+
+    @staticmethod
+    def _resident_inventory_unknown(db: Session) -> bool:
+        # Unknown host usage also makes the shared deployment budget unknown.
+        return (
+            db.scalar(
+                select(SqlStartupBudget.scope)
+                .where(SqlStartupBudget.resident_inventory_unknown.is_(True))
+                .limit(1)
+            )
+            is not None
+        )
 
     def begin_recovery(
         self,
@@ -770,6 +823,7 @@ class SessionStartupStore:
 
             if (
                 host.fenced
+                or self._resident_inventory_unknown(db)
                 or deployment.resident_limit == 0
                 or host.resident_limit == 0
                 or count(*scope, SqlSessionStartup.occupied.is_(True)) >= host.startup_limit
@@ -862,6 +916,7 @@ class SessionStartupStore:
             db.refresh(row, with_for_update=True)
             if (
                 host.fenced
+                or self._resident_inventory_unknown(db)
                 or row.cancel_requested
                 or row.state == "blocked"
                 or row.attempt_id != attempt_id
@@ -895,6 +950,7 @@ class SessionStartupStore:
             "runner_spawn",
             "harness_prepare",
             "native_prepare",
+            "executor_construct",
             "executor_prepare",
         ):
             raise ValueError("Unknown cold startup boundary")
@@ -915,6 +971,10 @@ class SessionStartupStore:
             db.refresh(row, with_for_update=True)
             if (
                 host.fenced
+                or (
+                    self._resident_inventory_unknown(db)
+                    and not (boundary == "input_dispatch" and "resident_reuse" in row.cold_claims)
+                )
                 or row.cancel_requested
                 or row.state == "blocked"
                 or row.attempt_id != attempt_id
@@ -1263,6 +1323,7 @@ class SessionStartupStore:
                     boundary in row.cold_claims
                     for boundary in (
                         "harness_prepare",
+                        "executor_construct",
                         "executor_prepare",
                         "native_prepare",
                         "input_dispatch",

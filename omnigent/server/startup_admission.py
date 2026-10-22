@@ -18,7 +18,7 @@ from omnigent.server.startup_registration import (
     STARTUP_REGISTRATION_LABEL_KEY,
     STARTUP_REGISTRATION_PENDING,
 )
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore, StartupSnapshot
 
@@ -139,6 +139,8 @@ class StartupAdmission:
         capabilities = conn.hello.capabilities
         if "startup_admission_v1" not in capabilities:
             return False
+        if not await self.inventory_ready(conn, startup.session_id):
+            return False
         harness = await self.resolve_harness(startup)
         return (
             self.hosts.get(startup.host_id) is conn
@@ -146,6 +148,18 @@ class StartupAdmission:
             and "startup_admission_v1" in conn.hello.capabilities
             and f"startup_receipts:{harness}" in conn.hello.capabilities
         )
+
+    async def inventory_ready(self, conn: HostConnection, session_id: str) -> bool:
+        """Compatibility and partial owner evidence cannot authorize resident adoption."""
+        if self._app is not None and "resident_inventory_v1" in conn.hello.capabilities:
+            from omnigent.server.resident_inventory import retain_unknown_owner_inventory
+
+            await retain_unknown_owner_inventory(
+                self._app, self.conversations, self.hosts, self.startups, conn, session_id
+            )
+        # SDK contexts live in harness owners, and native side-thread aliases
+        # remain incomplete. No current snapshot establishes full host coverage.
+        return False
 
     async def queue_session(self, conn: HostConnection, session_id: str) -> StartupSnapshot:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
@@ -442,7 +456,7 @@ class StartupAdmission:
             and current.attempt_id is not None
             and current.runtime_id is not None
             and current.host_generation == conn.startup_generation
-            and await self.resolve_harness(current) == "codex"
+            and await self.resolve_harness(current) in SDK_STARTUP_SOURCES
             and await self._runner_available(session_id)
         ):
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)

@@ -33,7 +33,9 @@ import tempfile
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -529,6 +531,8 @@ async def test_release_reaps_term_resistant_process_when_graceful_wait_is_cancel
     monkeypatch.setattr(process_manager_module, "close_subprocess_transport", close_transport)
     manager = object.__new__(HarnessProcessManager)
     manager._entries = {}
+    manager._closing_entries = {}
+    manager._exit_coverage_complete = True
     manager._spawn_locks = {"conv_real": asyncio.Lock()}
     manager._registry_lock = asyncio.Lock()
     manager._release_generations = {}
@@ -630,6 +634,8 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
     )
     manager = object.__new__(HarnessProcessManager)
     manager._entries = {}
+    manager._closing_entries = {}
+    manager._exit_coverage_complete = True
     manager._spawn_locks = {"conv_a": asyncio.Lock()}
     manager._registry_lock = asyncio.Lock()
     manager._release_generations = {}
@@ -2459,6 +2465,7 @@ async def test_failed_harness_release_preserves_concurrent_renewal(
     manager.manage_for_retention("conv_renew")
     saved_expiry = manager._retention_managed["conv_renew"]
     activity_token = manager._retention_activity_token("conv_renew", entry)
+    before = await manager.resident_inventory()
     entered = asyncio.Event()
     resume = asyncio.Event()
 
@@ -2479,6 +2486,10 @@ async def test_failed_harness_release_preserves_concurrent_renewal(
             )
         )
     await asyncio.wait_for(entered.wait(), timeout=1)
+    closing = await manager.resident_inventory()
+    assert len(closing.owners) == 1
+    assert closing.owners[0].incarnation_id == before.owners[0].incarnation_id
+    assert closing.owners[0].closing and not closing.owners[0].exit_confirmed
     manager.manage_for_retention("conv_renew")
     renewed_expiry = manager._retention_managed["conv_renew"]
     resume.set()
@@ -2493,6 +2504,102 @@ async def test_failed_harness_release_preserves_concurrent_renewal(
     assert manager._entries["conv_renew"] is entry
     assert manager._retention_managed["conv_renew"] == renewed_expiry
     assert manager._retention_activity_token("conv_renew", entry) == activity_token
+    assert await manager.resident_inventory() == before
+    assert not manager._closing_entries
+
+
+async def test_resident_inventory_is_immutable_and_does_not_probe_or_manage(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    entry = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=object(),  # type: ignore[arg-type]
+        endpoint=object(),  # type: ignore[arg-type]
+        harness="unsupported-harness",
+    )
+    manager._entries["conv_owned"] = entry
+    manager._retention_managed["conv_owned"] = 0.0
+    manager.mark_in_flight("conv_owned", "response-owned")
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("inventory must only read existing owner state")
+
+    for name in ("start", "get_client", "_spawn_entry", "_retention_expiry", "note_activity"):
+        monkeypatch.setattr(manager, name, unexpected)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected)
+    monkeypatch.setattr(pm_mod._proc, "process_alive", unexpected)
+    monkeypatch.setattr(pm_mod, "cli_family_for_resident_harness", unexpected)
+
+    snapshot = await manager.resident_inventory()
+    assert len(snapshot.owners) == 1
+    assert snapshot.owners[0].session_id == "conv_owned"
+    assert snapshot.owners[0].harness == "unsupported-harness"
+    assert not snapshot.owners[0].closing and not snapshot.owners[0].exit_confirmed
+    assert manager._retention_managed == {"conv_owned": 0.0}
+    assert manager._in_flight_response_ids == {"conv_owned": "response-owned"}
+    assert entry.last_used_at == 0.0
+    assert not manager._started
+    with pytest.raises(FrozenInstanceError):
+        snapshot.owners[0].closing = True  # type: ignore[misc]
+
+    entry.process.returncode = 1
+    exited_wrapper = (await manager.resident_inventory()).owners[0]
+    assert exited_wrapper.wrapper_exited and not exited_wrapper.exit_confirmed
+    assert not snapshot.owners[0].exit_confirmed
+    entry.exit_confirmed = True
+    entry.process.returncode = None
+    assert (await manager.resident_inventory()).owners[0].exit_confirmed
+
+    replacement = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=object(),  # type: ignore[arg-type]
+        endpoint=object(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    manager._entries["conv_owned"] = replacement
+    assert (await manager.resident_inventory()).owners[0].incarnation_id != snapshot.owners[
+        0
+    ].incarnation_id
+
+
+@pytest.mark.parametrize("release_kind", ["explicit", "retention"])
+async def test_inventory_records_unknown_exit_without_retaining_the_wrapper(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch, release_kind: str
+) -> None:
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    entry = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    manager._entries["conv_wrapper"] = entry
+    close = manager._close_entry
+
+    async def failed_close(_entry: _SubprocessEntry) -> bool:
+        _entry.process.returncode = 0
+        raise RuntimeError("owned exit unconfirmed")
+
+    monkeypatch.setattr(manager, "_close_entry", failed_close)
+    with pytest.raises(RuntimeError, match="owned exit unconfirmed"):
+        if release_kind == "explicit":
+            await manager.release("conv_wrapper")
+        else:
+            await manager.release_if_retention_idle(
+                "conv_wrapper",
+                idle_threshold_s=0,
+                expected_activity_token=manager._retention_activity_token("conv_wrapper", entry),
+            )
+    snapshot = await manager.resident_inventory()
+    assert snapshot.owners == ()
+    assert not snapshot.exit_coverage_complete
+    assert not manager._closing_entries
+    assert await close(entry)
+    assert (await manager.resident_inventory()).owners == ()
+    assert not (await manager.resident_inventory()).exit_coverage_complete
 
 
 async def test_expired_harness_lease_returns_to_sdk_idle_reaper(
@@ -2684,6 +2791,153 @@ class _CleanupCountingEndpoint:
         self.cleanup_calls += 1
 
 
+@pytest.mark.parametrize("outcome", ["ready", "raises", "cancelled"])
+async def test_inventory_keeps_spawn_unknown_until_registration(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._started = True
+    entry = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def spawn(*_args, **_kwargs):
+        entered.set()
+        await resume.wait()
+        if outcome == "raises":
+            raise RuntimeError("spawn ownership unconfirmed")
+        return entry
+
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    task = asyncio.create_task(manager.get_client("preparing", "codex"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        pending = await manager.resident_inventory()
+        assert pending.owners == ()
+        assert not pending.exit_coverage_complete
+        assert manager._entries == {}
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            resume.set()
+            if outcome == "raises":
+                with pytest.raises(RuntimeError, match="spawn ownership unconfirmed"):
+                    await task
+            else:
+                assert await task is entry.client
+        after = await manager.resident_inventory()
+        assert after.exit_coverage_complete is (outcome == "ready")
+        assert len(after.owners) == (1 if outcome == "ready" else 0)
+        assert not pending.exit_coverage_complete and pending.owners == ()
+        if outcome != "ready":
+
+            async def retry(*_args, **_kwargs):
+                return entry
+
+            monkeypatch.setattr(manager, "_spawn_entry", retry)
+            assert await manager.get_client("preparing", "codex") is entry.client
+            assert len((await manager.resident_inventory()).owners) == 1
+            assert not (await manager.resident_inventory()).exit_coverage_complete
+    finally:
+        resume.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_inventory_waits_for_every_overlapping_spawn(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._started = True
+    entered = {key: asyncio.Event() for key in ("one", "two")}
+    resume = {key: asyncio.Event() for key in entered}
+
+    async def spawn(session, harness, _env):
+        entered[session].set()
+        await resume[session].wait()
+        return _SubprocessEntry(
+            process=SimpleNamespace(returncode=None),
+            client=_NoopHarnessClient(),  # type: ignore[arg-type]
+            endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+            harness=harness,
+        )
+
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    tasks = {key: asyncio.create_task(manager.get_client(key, "codex")) for key in entered}
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered.values())), 1)
+        assert not (await manager.resident_inventory()).exit_coverage_complete
+        resume["one"].set()
+        await tasks["one"]
+        partial = await manager.resident_inventory()
+        assert [owner.session_id for owner in partial.owners] == ["one"]
+        assert not partial.exit_coverage_complete
+        resume["two"].set()
+        await tasks["two"]
+        complete = await manager.resident_inventory()
+        assert {owner.session_id for owner in complete.owners} == {"one", "two"}
+        assert complete.exit_coverage_complete
+    finally:
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "raises", "cancelled"])
+async def test_shutdown_spawn_close_remains_in_inventory(
+    short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    manager._started = True
+    entry = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def spawn(*_args, **_kwargs):
+        manager._shutting_down = True
+        return entry
+
+    async def close(_entry):
+        entered.set()
+        await resume.wait()
+        if outcome == "raises":
+            raise RuntimeError("close failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+        entry.exit_confirmed = True
+        return True
+
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    monkeypatch.setattr(manager, "_close_entry", close)
+    task = asyncio.create_task(manager.get_client("closing_spawn", "codex"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        snapshot = await manager.resident_inventory()
+        assert len(snapshot.owners) == 1
+        assert snapshot.owners[0].incarnation_id == entry.incarnation_id
+        assert snapshot.owners[0].closing
+    finally:
+        resume.set()
+        with pytest.raises(asyncio.CancelledError if outcome == "cancelled" else RuntimeError):
+            await task
+    snapshot = await manager.resident_inventory()
+    assert snapshot.owners == ()
+    assert snapshot.exit_coverage_complete is (outcome == "confirmed")
+    assert not manager._closing_entries
+
+
 async def test_shutdown_during_spawn_leaves_no_live_process(
     manager: HarnessProcessManager,
     monkeypatch: pytest.MonkeyPatch,
@@ -2760,3 +3014,286 @@ async def test_shutdown_during_spawn_leaves_no_live_process(
         await _cancel_pending(get_task, shutdown_task)
         # Idempotent if the test already shut down; still safe if it failed early.
         await manager.shutdown()
+
+
+@pytest.fixture
+async def resident_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from omnigent.inner.executor import Executor, ExecutorResidentInventory, ExecutorResidentOwner
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses.process_manager import _HarnessEndpoint
+
+    class Owner(Executor):
+        inventory = ExecutorResidentInventory(
+            owners=(
+                ExecutorResidentOwner(
+                    "context-a", ("owner-key", "ui-key"), "thread-a", True, True, False
+                ),
+            ),
+        )
+
+        def resident_inventory(self):
+            return self.inventory
+
+    owner = Owner()
+    adapter = ExecutorAdapter(lambda: pytest.fail("read must not construct an executor"))
+    adapter._executor = owner
+    app = adapter.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = "test-auth"
+    requests = []
+
+    async def record(request):
+        requests.append((request.method, request.url.path))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer test-auth"},
+        event_hooks={"request": [record]},
+    ) as client:
+        manager = HarnessProcessManager(tmp_parent=tmp_path)
+        manager._started = True
+        entry = _SubprocessEntry(_FakeReapProc(), client, _HarnessEndpoint(), "codex")
+        manager._entries["conversation"] = entry
+        manager._retention_managed["conversation"] = 0.0
+        manager.mark_in_flight("conversation", "response-working")
+
+        def forbidden(*_args, **_kwargs):
+            pytest.fail("read must not spawn, probe, or mutate retention")
+
+        for name in ("start", "get_client", "_spawn_entry", "_retention_expiry", "note_activity"):
+            monkeypatch.setattr(manager, name, forbidden)
+        yield manager, entry, owner, app, requests
+
+
+async def test_read_resident_inventory_uses_existing_authenticated_owner(resident_reader):
+    from dataclasses import asdict
+
+    from omnigent.inner.executor import ExecutorResidentInventory
+
+    manager, entry, owner, _app, requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    result = await manager.read_resident_inventory(selected)
+    assert asdict(result) == {
+        "owner": {
+            "incarnation_id": entry.incarnation_id,
+            "session_id": "conversation",
+            "harness": "codex",
+            "closing": False,
+            "wrapper_exited": False,
+            "exit_confirmed": False,
+        },
+        "release_generation": 0,
+        "inventory": {
+            "owners": (
+                {
+                    "incarnation_id": "context-a",
+                    "session_keys": ("owner-key", "ui-key"),
+                    "vendor_context_id": "thread-a",
+                    "started": True,
+                    "closing": True,
+                    "cleanup_complete": False,
+                },
+            ),
+            "ambiguous_context_ids": (),
+            "aliases_complete": False,
+            "context_coverage_complete": False,
+        },
+    }
+    assert await manager.read_resident_inventory(selected) == result
+    with pytest.raises(FrozenInstanceError):
+        result.release_generation = 1
+    owner.inventory = None
+    assert await manager.read_resident_inventory(selected) is None
+    owner.inventory = ExecutorResidentInventory(owners=())
+    empty = await manager.read_resident_inventory(selected)
+    assert empty.inventory.owners == ()
+    assert not empty.inventory.aliases_complete and not empty.inventory.context_coverage_complete
+    assert requests == [("GET", "/v1/sessions/conversation/resident-inventory")] * 4
+    assert manager._retention_managed == {"conversation": 0.0}
+    assert manager._in_flight_response_ids == {"conversation": "response-working"}
+    assert entry.last_used_at == 0.0
+    assert not entry.process.killed
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "absent",
+        "incarnation",
+        "harness",
+        "closing",
+        "exited",
+        "confirmed",
+        "shutdown",
+        "closed-client",
+    ],
+)
+async def test_read_resident_inventory_rejects_invalid_selection_without_http(
+    resident_reader, invalid
+):
+    from dataclasses import replace
+
+    manager, entry, _owner, _app, requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    if invalid == "absent":
+        manager._entries.clear()
+    elif invalid in {"incarnation", "harness"}:
+        selected = replace(
+            selected, **{f"{invalid}_id" if invalid == "incarnation" else invalid: "other"}
+        )
+    elif invalid == "closing":
+        selected = replace(selected, closing=True)
+    elif invalid == "exited":
+        entry.process.returncode = 0
+    elif invalid == "confirmed":
+        entry.exit_confirmed = True
+    elif invalid == "shutdown":
+        manager._shutting_down = True
+    else:
+        await entry.client.aclose()
+    assert await manager.read_resident_inventory(selected) is None
+    assert requests == []
+
+
+@pytest.mark.parametrize("race", ["release", "replacement", "failed-release", "shutdown"])
+async def test_read_resident_inventory_discards_late_response(resident_reader, monkeypatch, race):
+    from unittest.mock import AsyncMock
+
+    manager, entry, _owner, _app, _requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def pause(_response):
+        entered.set()
+        await asyncio.wait_for(resume.wait(), timeout=2)
+
+    entry.client.event_hooks["response"].append(pause)
+    read = asyncio.create_task(manager.read_resident_inventory(selected))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        # Teardown uses the existing release path and its real _close_entry.
+        monkeypatch.setattr(manager, "_retention_expiry", lambda _session: None)
+        if race == "failed-release":
+            monkeypatch.setattr(entry.client, "aclose", AsyncMock())
+            monkeypatch.setattr(entry.process, "terminate", lambda: None)
+            monkeypatch.setattr(entry.process, "kill", lambda: None)
+            monkeypatch.setattr(
+                entry.process, "wait", AsyncMock(side_effect=RuntimeError("still alive"))
+            )
+            assert await manager.release("conversation") is False
+            assert manager._entries["conversation"] is entry
+            assert manager._release_generations["conversation"] == 0
+            assert not entry.client.is_closed
+        elif race == "replacement":
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=_app), base_url="http://harness"
+            ) as new_client:
+                replacement = _SubprocessEntry(
+                    _FakeReapProc(), new_client, entry.endpoint, "other"
+                )
+                monkeypatch.setattr(manager, "_spawn_entry", AsyncMock(return_value=replacement))
+                await HarnessProcessManager.get_client(manager, "conversation", "other")
+                assert manager._entries["conversation"] is replacement
+                resume.set()
+                assert await asyncio.wait_for(read, timeout=2) is None
+        elif race == "shutdown":
+            await manager.shutdown()
+        else:
+            assert await manager.release("conversation") is True
+        resume.set()
+        assert await asyncio.wait_for(read, timeout=2) is None
+    finally:
+        resume.set()
+        await _cancel_pending(read)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "auth",
+        "session",
+        "http500",
+        "bad-json",
+        "missing",
+        "missing-coverage",
+        "extra-owner",
+        "bool-string",
+        "complete-aliases",
+        "complete-contexts",
+        "duplicate-owner",
+        "http-error",
+        "timeout",
+    ],
+)
+async def test_read_resident_inventory_invalid_response_is_unknown(resident_reader, failure):
+    import json
+    from dataclasses import asdict
+
+    manager, entry, owner, app, _requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    payload = {"inventory": asdict(owner.inventory)}
+
+    async def respond(request):
+        assert request.method == "GET"
+        assert request.url.path == "/v1/sessions/conversation/resident-inventory"
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        if failure == "http-error":
+            raise httpx.ConnectError("channel unavailable", request=request)
+        if failure == "missing":
+            payload.clear()
+        elif failure == "missing-coverage":
+            payload["inventory"].pop("context_coverage_complete")
+        elif failure == "extra-owner":
+            payload["inventory"]["owners"][0]["unexpected"] = "field"
+        elif failure == "bool-string":
+            payload["inventory"]["owners"][0]["started"] = "false"
+        elif failure == "complete-aliases":
+            payload["inventory"]["aliases_complete"] = True
+        elif failure == "complete-contexts":
+            payload["inventory"]["context_coverage_complete"] = True
+        elif failure == "duplicate-owner":
+            payload["inventory"]["owners"] *= 2
+        return httpx.Response(
+            500 if failure == "http500" else 200,
+            content=b"not-json" if failure == "bad-json" else json.dumps(payload).encode(),
+        )
+
+    if failure == "auth":
+        entry.client.headers.clear()
+        assert await manager.read_resident_inventory(selected) is None
+    elif failure == "session":
+        app.state.conversation_id = "different-conversation"
+        assert await manager.read_resident_inventory(selected) is None
+    else:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://harness"
+        ) as client:
+            entry.client = client
+            assert await manager.read_resident_inventory(selected, timeout_s=0.01) is None
+    assert manager._retention_managed == {"conversation": 0.0}
+    assert entry.last_used_at == 0.0
+    assert not entry.process.killed
+
+
+async def test_read_resident_inventory_cancellation_propagates(resident_reader):
+    manager, entry, _owner, _app, _requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    entered = asyncio.Event()
+
+    async def pause(_response):
+        entered.set()
+        await asyncio.Event().wait()
+
+    entry.client.event_hooks["response"].append(pause)
+    read = asyncio.create_task(manager.read_resident_inventory(selected))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(read, timeout=2)
+        assert not entry.client.is_closed
+        assert not entry.process.killed
+    finally:
+        await _cancel_pending(read)

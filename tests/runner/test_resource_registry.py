@@ -362,6 +362,61 @@ def test_list_resources_filters_by_type(tmp_path: Path) -> None:
     assert all(r.type == "terminal" for r in term_page.data)
 
 
+def test_terminal_registration_snapshot_distinguishes_unavailable_from_empty() -> None:
+    """Missing terminal ownership evidence must not become an empty inventory."""
+    assert SessionResourceRegistry().terminal_registration_snapshot() is None
+    assert SessionResourceRegistry(TerminalRegistry()).terminal_registration_snapshot() == ()
+
+
+async def test_terminal_registration_snapshot_uses_roles_without_probing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native-looking user terminals stay unmarked, and stopped resources stay visible."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry)
+    instances = {}
+    for session, role in [("native", CODEX_NATIVE_TERMINAL_ROLE), ("user", None)]:
+        instance = make_test_terminal_instance("codex", "main", tmp_path / session)
+        instances[session] = instance
+        terminal_registry._by_conversation[session] = {("codex", "main"): instance}
+        await registry.observe_auxiliary_terminal(
+            session, "codex", "main", instance, resource_role=role
+        )
+    instances["native"].running = False
+
+    forbidden = Mock(side_effect=AssertionError("inventory must remain read-only"))
+    for instance in instances.values():
+        for name in ("is_alive", "launch", "close", "_tmux", "_tmux_output"):
+            monkeypatch.setattr(instance, name, forbidden)
+        monkeypatch.setattr(instance.lifecycle_trace, "note_activity", forbidden)
+    for name in ("launch", "close", "cleanup_conversation", "list_for_conversation"):
+        monkeypatch.setattr(terminal_registry, name, forbidden)
+    monkeypatch.setattr(registry, "resolve_environment", forbidden)
+    monkeypatch.setattr(registry, "_start_terminal_activity_watcher", forbidden)
+
+    snapshot = registry.terminal_registration_snapshot()
+
+    assert snapshot is not None
+    by_owner = {entry.conversation_id: entry for entry in snapshot}
+    assert by_owner["native"].resource_role == CODEX_NATIVE_TERMINAL_ROLE
+    assert by_owner["native"].observed_running is False
+    assert by_owner["user"].resource_role is None
+    assert by_owner["user"].observed_running is True
+    assert by_owner["native"].instance_id == instances["native"].diagnostic_id
+    forbidden.assert_not_called()
+
+    replacement = make_test_terminal_instance("codex", "main", tmp_path / "replacement")
+    with terminal_registry._lock:
+        terminal_registry._by_conversation["native"][("codex", "main")] = replacement
+    replaced = registry.terminal_registration_snapshot()
+    assert replaced is not None
+    replacement_entry = next(entry for entry in replaced if entry.conversation_id == "native")
+    assert replacement_entry.instance_id != by_owner["native"].instance_id
+    assert replacement_entry.resource_role is None
+    assert by_owner["native"].resource_role == CODEX_NATIVE_TERMINAL_ROLE
+    forbidden.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_terminal_resource_role_is_private_and_cleared_on_close(
     tmp_path: Path,
@@ -518,11 +573,30 @@ async def test_terminal_resource_role_moves_on_transfer(
         resource_role=CODEX_NATIVE_TERMINAL_ROLE,
     )
 
+    original = registry.terminal_registration_snapshot()
+    transfer = terminal_registry.transfer
+
+    def transfer_before_role_update(*args: str) -> bool:
+        moved = transfer(*args)
+        during = registry.terminal_registration_snapshot()
+        assert during is not None and len(during) == 1
+        assert during[0].conversation_id == "conv_new"
+        assert during[0].instance_id == instance.diagnostic_id
+        assert during[0].resource_role is None
+        return moved
+
+    monkeypatch.setattr(terminal_registry, "transfer", transfer_before_role_update)
     moved = await registry.transfer_terminal("conv_old", "conv_new", view.id)
 
     assert moved is not None
     assert registry.terminal_resource_role("conv_old", view.id) is None
     assert registry.terminal_resource_role("conv_new", view.id) == CODEX_NATIVE_TERMINAL_ROLE
+    snapshot = registry.terminal_registration_snapshot()
+    assert snapshot is not None and len(snapshot) == 1
+    assert snapshot[0].conversation_id == "conv_new"
+    assert snapshot[0].instance_id == instance.diagnostic_id
+    assert snapshot[0].resource_role == CODEX_NATIVE_TERMINAL_ROLE
+    assert original is not None and original[0].conversation_id == "conv_old"
 
 
 @pytest.mark.asyncio
@@ -541,7 +615,9 @@ async def test_claude_fallback_bundle_follows_transferred_terminal(
     target_skill.write_text("target", encoding="utf-8")
     instance.args = ["--plugin-dir", str(source_bundle)]
     terminal_registry._by_conversation.setdefault("source", {})[("claude", "main")] = instance
-    registry._terminal_roles[("source", "terminal_claude_main")] = CLAUDE_NATIVE_TERMINAL_ROLE
+    await registry.observe_auxiliary_terminal(
+        "source", "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
 
     async def _close() -> None:
         instance.running = False
@@ -582,7 +658,9 @@ async def test_non_claude_transfer_does_not_move_fallback_bundle(
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     source_bundle = registry.claude_skill_bundle_dir("source")
     terminal_registry._by_conversation.setdefault("source", {})[("codex", "main")] = instance
-    registry._terminal_roles[("source", "terminal_codex_main")] = CODEX_NATIVE_TERMINAL_ROLE
+    await registry.observe_auxiliary_terminal(
+        "source", "codex", "main", instance, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
 
     async def _close() -> None:
         instance.running = False

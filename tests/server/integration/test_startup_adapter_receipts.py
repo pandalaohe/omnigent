@@ -20,7 +20,7 @@ from tests.server.test_host_registry import FakeWebSocket
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("race", ["runner", "host"])
-@pytest.mark.parametrize("source", ["codex", "codex-native"])
+@pytest.mark.parametrize("source", ["codex", "claude-sdk", "codex-native"])
 async def test_bound_runner_exact_receipts_join_both_orders_and_reject_owner_forgery(
     app, client, db_uri, monkeypatch, race, source
 ):
@@ -125,7 +125,7 @@ async def test_bound_runner_exact_receipts_join_both_orders_and_reject_owner_for
         message = {**payload, "phase": phase}
         if phase.endswith("ready"):
             message = {"attempt": payload["attempt"], "phase": phase, "source": "runner"}
-        if phase == "input_accepted" and source == "codex":
+        if phase == "input_accepted" and source in ("codex", "claude-sdk"):
             append = SqlAlchemyConversationStore.append
 
             def fail_handoff(*args, **kwargs):
@@ -151,7 +151,7 @@ async def test_bound_runner_exact_receipts_join_both_orders_and_reject_owner_for
                 "accepted": True
             }
     assert store.get(startup.id).state == "working"
-    if source == "codex":
+    if source in ("codex", "claude-sdk"):
         assert conversations.list_pending_inputs(conv.id) == []
         consumed = conversations.get_item(conv.id, item.id)
         assert consumed.response_id != PENDING_INPUT_RESPONSE_ID

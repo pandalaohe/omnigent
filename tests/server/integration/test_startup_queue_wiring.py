@@ -21,6 +21,11 @@ from tests.server.integration.test_multipart_create_host_launch import (
 
 @pytest.fixture(autouse=True)
 def enable_admission(monkeypatch):
+    # Queue/preparation tests assume independently reconciled resident accounting.
+    monkeypatch.setattr(
+        "omnigent.server.startup_admission.StartupAdmission.inventory_ready",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         "omnigent.server.server_config.load_server_config",
         lambda: {
