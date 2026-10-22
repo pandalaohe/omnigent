@@ -551,6 +551,84 @@ def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
     return NativeBackendInventorySnapshot(tuple(snapshots), _native_backend_exit_coverage_complete)
 
 
+@dataclasses.dataclass(frozen=True)
+class NativeBackendThreadInventorySnapshot:
+    """Loaded IDs aligned with current owners; None is unknown, () is observed empty."""
+
+    inventory: NativeBackendInventorySnapshot
+    thread_ids: tuple[tuple[str, ...] | None, ...]
+    context_coverage_complete: bool = False
+
+
+async def read_native_backend_thread_inventory(
+    *, timeout_s: float = 5.0
+) -> NativeBackendThreadInventorySnapshot:
+    """Use retained clients only, reconciling every binding after all reads finish.
+
+    Loaded IDs are vendor evidence, not independent-context or alias proof. The
+    separate frozen result does not change the existing pure owner endpoint.
+    """
+    selected = native_backend_resident_inventory()
+
+    def binding_for(owner: NativeBackendResidentSnapshot) -> _CodexInventoryClient | None:
+        if owner.transport_generation is None or not owner.session_ids:
+            return None
+        backend = _AUTO_CODEX_APP_SERVERS.get(owner.session_ids[0])
+        binding = _CODEX_INVENTORY_CLIENTS.get(id(backend))
+        if (
+            binding is not None
+            and binding.backend is backend
+            and binding.incarnation_id == owner.incarnation_id
+            and binding.generation == owner.transport_generation
+            and binding.client.resident_connection_generation == binding.generation
+            and all(_AUTO_CODEX_APP_SERVERS.get(key) is backend for key in owner.session_ids)
+        ):
+            return binding
+        return None
+
+    candidates = {
+        owner.incarnation_id: (owner, binding)
+        for owner in selected.owners
+        if (binding := binding_for(owner)) is not None
+    }
+    reads: dict[str, tuple[str, ...]] = {}
+    pending = iter(candidates.values())
+
+    async def read_owners() -> None:
+        for owner, binding in pending:
+            if (
+                binding_for(owner) is not binding
+                or owner not in native_backend_resident_inventory().owners
+            ):
+                continue
+            try:
+                ids = await binding.client.read_loaded_thread_ids(timeout_s=timeout_s)
+            except (ConnectionError, RuntimeError, TimeoutError):
+                continue
+            if ids is not None:
+                reads[owner.incarnation_id] = ids
+
+    if 0 < timeout_s <= 5.0:
+        try:
+            async with asyncio.timeout(timeout_s), asyncio.TaskGroup() as workers:
+                for _ in range(min(4, len(candidates))):
+                    workers.create_task(read_owners())
+        except TimeoutError:
+            pass
+    current = native_backend_resident_inventory()
+    thread_ids = tuple(
+        reads.get(owner.incarnation_id)
+        if (
+            (candidate := candidates.get(owner.incarnation_id)) is not None
+            and candidate[0] == owner
+            and binding_for(owner) is candidate[1]
+        )
+        else None
+        for owner in current.owners
+    )
+    return NativeBackendThreadInventorySnapshot(current, thread_ids)
+
+
 async def _start_native_backend(
     session_id: str, harness: _NativeBackendHarness, backend: _NativeBackend
 ) -> None:

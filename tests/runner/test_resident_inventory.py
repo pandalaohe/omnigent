@@ -230,6 +230,296 @@ def test_native_owner_union_checks_identity_across_lifecycle_maps(monkeypatch, p
 
 
 @pytest.fixture
+def native_thread_inventory(monkeypatch):
+    for name in (
+        "_AUTO_CODEX_APP_SERVERS",
+        "_AUTO_OPENCODE_SERVERS",
+        "_STARTING_NATIVE_BACKENDS",
+        "_CLOSING_NATIVE_BACKENDS",
+        "_CODEX_INVENTORY_CLIENTS",
+    ):
+        monkeypatch.setattr(orchestration, name, {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+
+    def add(key, *, ids=("thread-one",), bind=True):
+        backend = SimpleNamespace(
+            resident_incarnation_id=f"backend-{key}",
+            process_exit_confirmed=False,
+            exit_confirmed=False,
+            close=Mock(side_effect=AssertionError("read must not close")),
+            start=Mock(side_effect=AssertionError("read must not start")),
+        )
+        client = SimpleNamespace(
+            resident_connection_generation=3,
+            read_loaded_thread_ids=AsyncMock(return_value=ids),
+            connect=Mock(side_effect=AssertionError("read must not connect")),
+            close=Mock(side_effect=AssertionError("read must not close")),
+        )
+        orchestration._AUTO_CODEX_APP_SERVERS[key] = backend
+        if bind:
+            orchestration._bind_codex_inventory_client(
+                key, backend, client, incarnation_id=backend.resident_incarnation_id
+            )
+        return backend, client
+
+    return add
+
+
+@pytest.mark.parametrize(
+    "state", ["loaded", "empty", "unknown", "unretained", "closing", "exited", "unsupported"]
+)
+async def test_native_thread_inventory_preserves_owner_evidence(native_thread_inventory, state):
+    backend, client = native_thread_inventory(
+        "main",
+        ids={"empty": (), "unknown": None}.get(state, ("thread-one",)),
+        bind=state != "unretained",
+    )
+    orchestration._AUTO_CODEX_APP_SERVERS["ui"] = backend
+    if state == "closing":
+        orchestration._CLOSING_NATIVE_BACKENDS[object()] = orchestration._ClosingNativeBackend(
+            "backend-main", "main", "codex-native", backend
+        )
+    elif state == "exited":
+        backend.process_exit_confirmed = True
+    elif state == "unsupported":
+        orchestration._AUTO_CODEX_APP_SERVERS.clear()
+        orchestration._AUTO_OPENCODE_SERVERS["main"] = backend
+    result = await orchestration.read_native_backend_thread_inventory()
+    assert result.thread_ids == (
+        ("thread-one",) if state == "loaded" else () if state == "empty" else None,
+    )
+    assert result.inventory == orchestration.native_backend_resident_inventory()
+    assert not result.context_coverage_complete and not result.inventory.aliases_complete
+    if state in {"loaded", "empty", "unknown"}:
+        client.read_loaded_thread_ids.assert_awaited_once_with(timeout_s=5.0)
+        assert result.inventory.owners[0].session_ids == ("main", "ui")
+    else:
+        client.read_loaded_thread_ids.assert_not_called()
+    client.connect.assert_not_called()
+    client.close.assert_not_called()
+    backend.start.assert_not_called()
+    backend.close.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "none",
+        "rebind",
+        "client",
+        "backend",
+        "generation",
+        "incarnation",
+        "alias",
+        "closing",
+        "release",
+        "new-owner",
+    ],
+)
+async def test_native_thread_inventory_reconciles_after_later_owner_waits(
+    native_thread_inventory, change
+):
+    first, client = native_thread_inventory("first")
+    _, second = native_thread_inventory("second", ids=())
+    waiting, resume = asyncio.Event(), asyncio.Event()
+
+    async def pause(**_kwargs):
+        waiting.set()
+        await resume.wait()
+        return ()
+
+    second.read_loaded_thread_ids.side_effect = pause
+    read = asyncio.create_task(orchestration.read_native_backend_thread_inventory())
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=2)
+        assert client.read_loaded_thread_ids.await_count == 1
+        if change in {"client", "backend", "rebind"}:
+            backend = SimpleNamespace(**vars(first)) if change == "backend" else first
+            new_client = SimpleNamespace(**vars(client)) if change == "client" else client
+            orchestration._AUTO_CODEX_APP_SERVERS["first"] = backend
+            orchestration._bind_codex_inventory_client(
+                "first", backend, new_client, incarnation_id="backend-first"
+            )
+        elif change == "generation":
+            client.resident_connection_generation = 4
+        elif change == "incarnation":
+            first.resident_incarnation_id = "restarted-first"
+        elif change == "alias":
+            orchestration._AUTO_CODEX_APP_SERVERS["ui"] = first
+        elif change == "closing":
+            orchestration._CLOSING_NATIVE_BACKENDS[object()] = orchestration._ClosingNativeBackend(
+                "backend-first", "first", "codex-native", first
+            )
+        elif change == "release":
+            orchestration._AUTO_CODEX_APP_SERVERS.pop("first")
+        elif change == "new-owner":
+            native_thread_inventory("new")
+        resume.set()
+        result = await asyncio.wait_for(read, timeout=2)
+        by_session = {
+            owner.session_ids[0]: ids
+            for owner, ids in zip(result.inventory.owners, result.thread_ids, strict=True)
+        }
+        assert by_session["second"] == ()
+        if change == "release":
+            assert "first" not in by_session
+        else:
+            assert by_session["first"] == (
+                ("thread-one",) if change in {"none", "new-owner"} else None
+            )
+        if change == "new-owner":
+            assert by_session["new"] is None
+    finally:
+        resume.set()
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize("end", ["complete", "timeout", "cancel"])
+async def test_native_thread_inventory_bounds_workers_and_drains(native_thread_inventory, end):
+    active, entered, resume = set(), asyncio.Event(), asyncio.Event()
+    clients = []
+
+    async def pause(key, **_kwargs):
+        active.add(key)
+        if len(active) == 4:
+            entered.set()
+        try:
+            await resume.wait()
+            return ()
+        finally:
+            active.remove(key)
+
+    for index in range(6):
+        _, client = native_thread_inventory(str(index))
+
+        async def bound_pause(key=index, **kwargs):
+            return await pause(key, **kwargs)
+
+        client.read_loaded_thread_ids.side_effect = bound_pause
+        clients.append(client)
+    read = asyncio.create_task(orchestration.read_native_backend_thread_inventory(timeout_s=0.2))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert len(active) == 4
+        if end == "cancel":
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        else:
+            if end == "complete":
+                resume.set()
+            result = await asyncio.wait_for(read, timeout=2)
+            assert result.thread_ids == (((),) * 6 if end == "complete" else (None,) * 6)
+        assert not active
+        assert all(client.close.call_count == 0 for client in clients)
+    finally:
+        resume.set()
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, 5.1, float("inf"), float("nan")])
+async def test_native_thread_inventory_invalid_deadline_does_not_read(
+    native_thread_inventory, timeout_s
+):
+    _, client = native_thread_inventory("one")
+    result = await orchestration.read_native_backend_thread_inventory(timeout_s=timeout_s)
+    assert result.thread_ids == (None,)
+    client.read_loaded_thread_ids.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state", ["no-owners", "collision", "read-error", "same-vendor-id", "partial-timeout"]
+)
+async def test_native_thread_inventory_keeps_unknown_sources_separate(
+    native_thread_inventory, state
+):
+    if state == "no-owners":
+        result = await orchestration.read_native_backend_thread_inventory()
+        assert result.thread_ids == () and result.inventory.owners == ()
+    else:
+        _, first = native_thread_inventory("first")
+        backend, second = native_thread_inventory("second")
+        if state == "collision":
+            backend.resident_incarnation_id = "backend-first"
+        elif state == "read-error":
+            first.read_loaded_thread_ids.side_effect = RuntimeError("channel unavailable")
+        elif state == "partial-timeout":
+
+            async def pause(**_kwargs):
+                await asyncio.Event().wait()
+
+            second.read_loaded_thread_ids.side_effect = pause
+        result = await orchestration.read_native_backend_thread_inventory(timeout_s=0.1)
+        if state == "collision":
+            assert result.thread_ids == () and result.inventory.owners == ()
+            assert not result.inventory.exit_coverage_complete
+            first.read_loaded_thread_ids.assert_not_called()
+            second.read_loaded_thread_ids.assert_not_called()
+        else:
+            assert result.thread_ids == (
+                None if state == "read-error" else ("thread-one",),
+                None if state == "partial-timeout" else ("thread-one",),
+            )
+    assert not result.context_coverage_complete and not result.inventory.aliases_complete
+
+
+@pytest.mark.parametrize("replace_connection", [False, True])
+async def test_native_thread_inventory_uses_established_client_pages(
+    native_thread_inventory, replace_connection
+):
+    import json
+
+    from websockets.asyncio.client import ClientConnection
+
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
+
+    backend, _ = native_thread_inventory("main", bind=False)
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:1")
+    websocket = AsyncMock(spec=ClientConnection)
+    reader = asyncio.create_task(asyncio.Event().wait())
+    client._ws = websocket
+    client._reader_task = reader
+    client._established_connection = (0, websocket, reader)
+    client.connect = AsyncMock(side_effect=AssertionError("must not connect"))
+    requests = []
+
+    async def respond(raw):
+        message = json.loads(raw)
+        requests.append((message["method"], message["params"]))
+        first = len(requests) == 1
+        if not first and replace_connection:
+            client._connection_generation += 1
+        client._pending_requests[message["id"]].set_result(
+            {
+                "id": message["id"],
+                "result": {
+                    "data": ["main" if first else "side"],
+                    "nextCursor": "second" if first else None,
+                },
+            }
+        )
+
+    websocket.send.side_effect = respond
+    orchestration._bind_codex_inventory_client(
+        "main", backend, client, incarnation_id="backend-main"
+    )
+    try:
+        result = await orchestration.read_native_backend_thread_inventory()
+        assert result.thread_ids == (None if replace_connection else ("main", "side"),)
+        assert requests == [
+            ("thread/list/loaded", {"limit": 100}),
+            ("thread/list/loaded", {"limit": 100, "cursor": "second"}),
+        ]
+        assert client._pending_requests == {}
+        client.connect.assert_not_called()
+        websocket.close.assert_not_called()
+    finally:
+        await client.close()
+
+
+@pytest.fixture
 async def harness_inventory_reader(monkeypatch, tmp_path):
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
