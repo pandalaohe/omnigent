@@ -370,6 +370,114 @@ async def test_loaded_thread_inventory_uses_only_current_connected_channel(case)
         await client.close()
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "started-loaded",
+        "started-empty",
+        "started-page-two",
+        "earlier-started",
+        "unrelated",
+        "server-request",
+        "stale-reader",
+    ],
+)
+async def test_loaded_thread_inventory_observes_new_threads_on_existing_reader(case):
+    client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")
+    websocket = AsyncMock(spec=ClientConnection)
+    incoming = asyncio.Queue()
+    old_incoming = asyncio.Queue()
+    old_reader = None
+
+    async def events(queue=incoming):
+        while True:
+            yield await queue.get()
+
+    if case == "stale-reader":
+        old = AsyncMock(spec=ClientConnection)
+        old.__aiter__.side_effect = lambda: events(old_incoming)
+        client._ws = old
+        old_reader = asyncio.create_task(client._reader_loop())
+        await asyncio.sleep(0)
+    websocket.__aiter__.side_effect = events
+    client._ws = websocket
+    reader = asyncio.create_task(client._reader_loop())
+    client._reader_task = reader
+    client._established_connection = (0, websocket, reader)
+    client.connect = AsyncMock(side_effect=AssertionError("read must not connect"))
+    stream = client.iter_events()
+    requests = []
+    resample = False
+
+    async def notify(message, queue=incoming):
+        await queue.put(json.dumps(message))
+        assert await asyncio.wait_for(anext(stream), 1) == message
+
+    async def respond(raw):
+        message = json.loads(raw)
+        assert message["method"] == "thread/list/loaded"
+        requests.append(message)
+        index = len(requests)
+        if not resample and (
+            (
+                case
+                in {
+                    "started-loaded",
+                    "started-empty",
+                    "unrelated",
+                    "server-request",
+                    "stale-reader",
+                }
+                and index == 1
+            )
+            or (case == "started-page-two" and index == 2)
+        ):
+            event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+            if case == "unrelated":
+                event["method"] = "turn/completed"
+            elif case == "server-request":
+                event["id"] = 99
+            await notify(event, old_incoming if case == "stale-reader" else incoming)
+        data = [] if case == "started-empty" else ["thread-main"]
+        if resample or case == "earlier-started":
+            data = ["thread-main", "new"]
+        cursor = "second" if not resample and case == "started-page-two" and index == 1 else None
+        if case == "started-page-two" and index == 2:
+            data = ["side"]
+        await incoming.put(
+            json.dumps({"id": message["id"], "result": {"data": data, "nextCursor": cursor}})
+        )
+
+    websocket.send.side_effect = respond
+    try:
+        assert client.resident_thread_observation_revision is None
+        if case == "earlier-started":
+            await notify({"method": "thread/started", "params": {"thread": {"id": "new"}}})
+            assert client.resident_thread_observation_revision is None
+        result = await client.read_loaded_thread_ids(timeout_s=1)
+        if case.startswith("started-"):
+            assert result is None
+            resample = True
+            assert await client.read_loaded_thread_ids(timeout_s=1) == ("thread-main", "new")
+        else:
+            assert result == (
+                ("thread-main", "new") if case == "earlier-started" else ("thread-main",)
+            )
+        client.connect.assert_not_called()
+        websocket.close.assert_not_called()
+        assert client.resident_thread_observation_revision == (
+            1 if case.startswith("started-") else 0
+        )
+        assert not reader.done() and client._pending_requests == {}
+    finally:
+        await client.close()
+        if old_reader is not None:
+            old_reader.cancel()
+            await asyncio.gather(old_reader, return_exceptions=True)
+        await stream.aclose()
+        assert client.resident_thread_observation_revision is None
+
+
 @pytest.mark.parametrize("action", ["connect", "close"])
 async def test_client_generation_changes_before_lifecycle_await(monkeypatch, action):
     client = CodexAppServerClient(ws_url="ws://127.0.0.1:12345")

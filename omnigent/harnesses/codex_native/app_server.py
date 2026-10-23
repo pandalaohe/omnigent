@@ -1126,6 +1126,7 @@ class CodexAppServerClient:
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
         self._connection_generation = 0
+        self._resident_thread_started_revision: int | None = None
         self._established_connection: tuple[int, ClientConnection, asyncio.Task[None]] | None = (
             None
         )
@@ -1139,6 +1140,7 @@ class CodexAppServerClient:
         self._connection_generation += 1
         generation = self._connection_generation
         self._established_connection = None
+        self._resident_thread_started_revision = None
         if self._ws_url is not None:
             self._ws = await websockets.connect(
                 self._ws_url,
@@ -1188,6 +1190,7 @@ class CodexAppServerClient:
         """
         self._connection_generation += 1
         self._established_connection = None
+        self._resident_thread_started_revision = None
         try:
             if self._reader_task is not None:
                 self._reader_task.cancel()
@@ -1228,6 +1231,15 @@ class CodexAppServerClient:
         connection = self._current_established_connection()
         return connection[0] if connection is not None else None
 
+    @property
+    def resident_thread_observation_revision(self) -> int | None:
+        """Locally observed thread additions after inventory starts, not vendor freshness."""
+        return (
+            self._resident_thread_started_revision
+            if self._current_established_connection() is not None
+            else None
+        )
+
     async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
         """Read bounded loaded-thread evidence on the current connection only.
 
@@ -1237,10 +1249,16 @@ class CodexAppServerClient:
         connection = self._current_established_connection()
         if not 0 < timeout_s <= 5.0 or connection is None:
             return None
+        if self._resident_thread_started_revision is None:
+            self._resident_thread_started_revision = 0
+        revision = self.resident_thread_observation_revision
         try:
             return await read_loaded_codex_thread_ids(
                 self.request,
-                lambda: self._current_established_connection() is connection,
+                lambda: (
+                    self._current_established_connection() is connection
+                    and self.resident_thread_observation_revision == revision
+                ),
                 timeout_s=timeout_s,
             )
         except ConnectionClosed:
@@ -1354,8 +1372,9 @@ class CodexAppServerClient:
         :returns: None.
         """
         assert self._ws is not None
+        websocket = self._ws
         try:
-            async for raw in self._ws:
+            async for raw in websocket:
                 if not isinstance(raw, str):
                     continue
                 decoded: object = json.loads(raw)
@@ -1383,6 +1402,15 @@ class CodexAppServerClient:
                     if future is not None and not future.done():
                         future.set_result(message)
                     continue
+                if (
+                    self._resident_thread_started_revision is not None
+                    and message.get("method") == "thread/started"
+                    and "id" not in message
+                    and (connection := self._current_established_connection()) is not None
+                    and connection[1] is websocket
+                    and connection[2] is asyncio.current_task()
+                ):
+                    self._resident_thread_started_revision += 1
                 await self._events.put(message)
         finally:
             # Wake iter_events() consumers: no further events can arrive.
