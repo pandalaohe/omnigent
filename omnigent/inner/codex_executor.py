@@ -120,6 +120,7 @@ from .executor import (
     ExecutorEvent,
     ExecutorResidentInventory,
     ExecutorResidentOwner,
+    ExecutorThreadInventorySnapshot,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -5342,14 +5343,6 @@ class _CodexSessionState:
     close_task: asyncio.Task[None] | None = None
 
 
-@dataclass(frozen=True)
-class CodexThreadInventorySnapshot:
-    """Loaded IDs aligned with registered owners; None is unknown, () is empty."""
-
-    inventory: ExecutorResidentInventory | None
-    thread_ids: tuple[tuple[str, ...] | None, ...] | None
-
-
 class _AppSessionFactory(Protocol):
     """Constructor signature shared by ``_CodexAppServerSession`` and test fakes.
 
@@ -5882,7 +5875,7 @@ class CodexExecutor(Executor):
 
     async def prepare_resident_thread_inventory(
         self, *, timeout_s: float = 5.0
-    ) -> Callable[[], CodexThreadInventorySnapshot]:
+    ) -> Callable[[], ExecutorThreadInventorySnapshot]:
         """Read registered clients; reconcile synchronously after other sources await.
 
         Loaded IDs establish neither independent-context nor alias coverage.
@@ -5939,7 +5932,7 @@ class CodexExecutor(Executor):
             except TimeoutError:
                 pass
 
-        def reconcile() -> CodexThreadInventorySnapshot:
+        def reconcile() -> ExecutorThreadInventorySnapshot:
             inventory = self.resident_inventory()
             ids = (
                 tuple(
@@ -5955,7 +5948,7 @@ class CodexExecutor(Executor):
                 if inventory is not None
                 else None
             )
-            return CodexThreadInventorySnapshot(inventory, ids)
+            return ExecutorThreadInventorySnapshot(inventory, ids)
 
         return reconcile
 

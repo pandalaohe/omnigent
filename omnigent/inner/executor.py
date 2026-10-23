@@ -11,7 +11,7 @@ import contextlib
 import enum
 import json
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
@@ -667,6 +667,14 @@ class ExecutorResidentInventory:
     context_coverage_complete: bool = False
 
 
+@dataclass(frozen=True)
+class ExecutorThreadInventorySnapshot:
+    """Loaded IDs aligned with registered owners; None is unknown, () is empty."""
+
+    inventory: ExecutorResidentInventory | None
+    thread_ids: tuple[tuple[str, ...] | None, ...] | None
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -712,6 +720,14 @@ class Executor:
     def resident_inventory(self) -> ExecutorResidentInventory | None:
         """Read owned context evidence without construction or probes; None is unknown."""
         return None
+
+    async def prepare_resident_thread_inventory(
+        self, *, timeout_s: float = 5.0
+    ) -> Callable[[], ExecutorThreadInventorySnapshot]:
+        """Unsupported thread enumeration retains unknown IDs and fresh owner metadata."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: ExecutorThreadInventorySnapshot(None, None)
+        return lambda: ExecutorThreadInventorySnapshot(self.resident_inventory(), None)
 
     async def close_session(self, session_key: str) -> None:  # noqa: ARG002 — default no-op; subclasses with per-session state override
         """

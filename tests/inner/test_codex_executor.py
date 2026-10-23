@@ -747,6 +747,35 @@ async def test_sdk_executor_thread_inventory_bounds_reads_and_preserves_unknowns
         await asyncio.gather(read, return_exceptions=True)
 
 
+@pytest.mark.parametrize("replace_transport", [False, True])
+async def test_sdk_thread_inventory_through_existing_adapter(
+    sdk_inventory_owners, replace_transport
+):
+    from unittest.mock import Mock
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor, add = sdk_inventory_owners
+    app = add("main", ["main", "sub"])
+    factory = Mock(side_effect=AssertionError("must not construct executor"))
+    adapter = ExecutorAdapter(factory)
+    adapter._executor = executor
+    reconcile = await adapter.prepare_resident_thread_inventory(timeout_s=0.1)
+    initial = reconcile()
+    assert initial.inventory == executor.resident_inventory()
+    assert initial.thread_ids == (("main", "sub"),)
+    assert not initial.inventory.aliases_complete
+    assert not initial.inventory.context_coverage_complete
+    if replace_transport:
+        app._proc.stdin = _FakePipe()
+        await asyncio.sleep(0)
+        assert reconcile().thread_ids == (None,)
+    else:
+        assert reconcile() == initial
+    assert initial.thread_ids == (("main", "sub"),)
+    factory.assert_not_called()
+
+
 class TestCodexExecutor(unittest.TestCase):
     def test_databricks_codex_config_overrides(self):
         overrides = _databricks_codex_config_overrides(

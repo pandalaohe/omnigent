@@ -2978,6 +2978,124 @@ async def test_resident_inventory_read_is_authenticated_bound_and_never_construc
     factory.assert_not_called()
 
 
+@pytest.mark.parametrize("phase", ["before", "during", "after"])
+@pytest.mark.parametrize("change", ["replace", "detach", "cleanup", "background", "shutdown"])
+async def test_thread_inventory_adapter_rechecks_owner_without_constructing(phase, change):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    snapshot = ExecutorThreadInventorySnapshot(ExecutorResidentInventory(owners=()), ())
+    entered, release = asyncio.Event(), asyncio.Event()
+    inner_reconcile = Mock(return_value=snapshot)
+
+    async def prepare(*, timeout_s):
+        assert timeout_s == 0.1
+        entered.set()
+        await release.wait()
+        return inner_reconcile
+
+    executor = Executor()
+    executor.prepare_resident_thread_inventory = AsyncMock(side_effect=prepare)
+    factory = Mock(side_effect=AssertionError("must not construct"))
+    adapter = ExecutorAdapter(factory)
+    adapter._ensure_executor = factory
+    adapter._executor = executor
+    cleanup = asyncio.create_task(asyncio.Event().wait())
+
+    def change_owner():
+        if change == "replace":
+            adapter._executor = Executor()
+        elif change == "detach":
+            adapter._resident_inventory_detached = True
+        elif change == "cleanup":
+            adapter._abandoned_executor_cleanup = cleanup
+        elif change == "background":
+            adapter._bg_tasks.add(cleanup)
+        else:
+            adapter._shutting_down.set()
+
+    read = None
+    try:
+        if phase == "before":
+            change_owner()
+        read = asyncio.create_task(adapter.prepare_resident_thread_inventory(timeout_s=0.1))
+        if phase != "before":
+            await asyncio.wait_for(entered.wait(), 2)
+            if phase == "during":
+                change_owner()
+        release.set()
+        reconcile = await asyncio.wait_for(read, 2)
+        if phase == "after":
+            assert reconcile() is snapshot
+            inner_reconcile.reset_mock()
+            change_owner()
+            await asyncio.sleep(0)
+        assert reconcile() == ExecutorThreadInventorySnapshot(None, None)
+        inner_reconcile.assert_not_called()
+        assert executor.prepare_resident_thread_inventory.await_count == (phase != "before")
+        factory.assert_not_called()
+    finally:
+        cleanup.cancel()
+        if read is not None:
+            read.cancel()
+        await asyncio.gather(
+            cleanup, *([read] if read is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.parametrize("case", ["none", "unsupported", "invalid", "empty", "failure", "cancel"])
+async def test_thread_inventory_adapter_preserves_unknown_and_cancellation(case):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    factory = Mock(side_effect=AssertionError("must not construct"))
+    adapter = ExecutorAdapter(factory)
+    executor = Executor()
+    adapter._executor = executor if case != "none" else None
+    if case in {"empty", "invalid"}:
+        executor.resident_inventory = Mock(return_value=ExecutorResidentInventory(owners=()))
+    if case == "failure":
+        executor.prepare_resident_thread_inventory = AsyncMock(side_effect=RuntimeError("failed"))
+        with pytest.raises(RuntimeError, match="failed"):
+            await adapter.prepare_resident_thread_inventory(timeout_s=0.1)
+    elif case == "cancel":
+        entered = asyncio.Event()
+
+        async def blocked(**kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        executor.prepare_resident_thread_inventory = AsyncMock(side_effect=blocked)
+        read = asyncio.create_task(adapter.prepare_resident_thread_inventory(timeout_s=0.1))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        finally:
+            read.cancel()
+            await asyncio.gather(read, return_exceptions=True)
+    else:
+        reconcile = await adapter.prepare_resident_thread_inventory(
+            timeout_s=0 if case == "invalid" else 0.1
+        )
+        assert reconcile() == ExecutorThreadInventorySnapshot(
+            ExecutorResidentInventory(owners=()) if case == "empty" else None, None
+        )
+        if case == "empty":
+            executor.resident_inventory.return_value = None
+            assert reconcile() == ExecutorThreadInventorySnapshot(None, None)
+        elif case == "invalid":
+            executor.resident_inventory.assert_not_called()
+    factory.assert_not_called()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", ["codex", "claude-sdk"])
 async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknown(
