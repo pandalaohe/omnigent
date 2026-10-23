@@ -117,7 +117,10 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                 return None
             for owner, ids in zip(snapshot.native_backends.owners, native_threads, strict=True):
                 if ids is not None and (
-                    owner.transport_generation is None or not all(ids) or len(set(ids)) != len(ids)
+                    owner.transport_generation is None
+                    or len(ids) > 1000
+                    or not all(ids)
+                    or len(set(ids)) != len(ids)
                 ):
                     return None
         harnesses = snapshot.harnesses

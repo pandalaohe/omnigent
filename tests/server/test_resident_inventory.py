@@ -1467,6 +1467,9 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "native-thread-non-string",
         "native-thread-unsupported",
         "native-thread-exited",
+        "native-thread-too-many",
+        "native-thread-max",
+        "native-thread-owner-max",
         "native-negative-transport",
         "native-closing-transport",
         "native-empty-sessions",
@@ -1687,6 +1690,16 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 payload["native_thread_ids"] = [[]]
             elif case == "native-thread-unknown":
                 payload["native_thread_ids"] = [None]
+            elif case == "native-thread-too-many":
+                payload["native_thread_ids"] = [[str(i) for i in range(1001)]]
+            elif case in {"native-thread-max", "native-thread-owner-max"}:
+                payload["native_thread_ids"] = [[f" thread-{i} " for i in range(1000)]]
+                if case == "native-thread-owner-max":
+                    first = payload["native_backends"]["owners"][0]
+                    payload["native_backends"]["owners"].append(
+                        {**first, "incarnation_id": "native-two"}
+                    )
+                    payload["native_thread_ids"].append(list(payload["native_thread_ids"][0]))
             elif case == "native-thread-unaligned":
                 payload["native_thread_ids"] = []
             elif case == "native-thread-duplicate":
@@ -1783,6 +1796,8 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "native-thread-empty",
         "native-thread-unknown",
         "sdk-loaded",
+        "native-thread-max",
+        "native-thread-owner-max",
         "sdk-empty",
         "sdk-unknown",
         "sdk-empty-owner",
@@ -1832,6 +1847,11 @@ def test_runner_context_inventory_strict_wire_decode(case):
                     "native-thread-loaded": (("main", "side"),),
                     "native-thread-empty": ((),),
                     "native-thread-unknown": (None,),
+                    "native-thread-max": (tuple(f" thread-{i} " for i in range(1000)),),
+                    "native-thread-owner-max": (
+                        tuple(f" thread-{i} " for i in range(1000)),
+                        tuple(f" thread-{i} " for i in range(1000)),
+                    ),
                 }[case]
             )
         if case == "ambiguous-literals":
