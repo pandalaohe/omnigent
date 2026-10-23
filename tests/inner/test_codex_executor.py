@@ -776,6 +776,40 @@ async def test_sdk_thread_inventory_through_existing_adapter(
     factory.assert_not_called()
 
 
+@pytest.mark.parametrize("empty", [False, True])
+async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owners, empty):
+    from unittest.mock import Mock
+
+    import httpx
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor, add = sdk_inventory_owners
+    owner = add("main", [] if empty else ["main", "sub"])
+    factory = Mock(side_effect=AssertionError("must not construct executor"))
+    adapter = ExecutorAdapter(factory)
+    adapter._executor = executor
+    app = adapter.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = "test-auth"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer test-auth"},
+    ) as client:
+        legacy = await client.get("/v1/sessions/conversation/resident-inventory")
+        assert legacy.status_code == 200 and set(legacy.json()) == {"inventory"}
+        assert owner._proc.stdin.writes == []
+        response = await client.get("/v1/sessions/conversation/resident-thread-inventory")
+    assert response.status_code == 200
+    assert response.json() == {
+        "inventory": legacy.json()["inventory"],
+        "thread_ids": [[] if empty else ["main", "sub"]],
+    }
+    assert len(owner._proc.stdin.writes) == 1
+    factory.assert_not_called()
+
+
 class TestCodexExecutor(unittest.TestCase):
     def test_databricks_codex_config_overrides(self):
         overrides = _databricks_codex_config_overrides(

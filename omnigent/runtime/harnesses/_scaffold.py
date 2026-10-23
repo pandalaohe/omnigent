@@ -52,7 +52,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
-from omnigent.inner.executor import ExecutorResidentInventory
+from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -112,6 +112,7 @@ _POLICY_EVAL_TIMEOUT_S = 86400.0
 _HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
 _UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
 _STARTUP_CLAIM_TIMEOUT_S = 10.0
+_RESIDENT_THREAD_INVENTORY_TIMEOUT_S = 5.0
 
 # Stable, client-visible error code for a turn-context desync (the inner SDK
 # generation outlived its turn — an orphaned tool/policy callback, or a turn
@@ -1001,6 +1002,14 @@ class HarnessApp:
         """Unsupported owners provide unknown coverage rather than an empty inventory."""
         return None
 
+    async def prepare_resident_thread_inventory(
+        self, *, timeout_s: float = 5.0
+    ) -> Callable[[], ExecutorThreadInventorySnapshot]:
+        """Unsupported enumeration retains fresh metadata and unknown loaded IDs."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: ExecutorThreadInventorySnapshot(None, None)
+        return lambda: ExecutorThreadInventorySnapshot(self.resident_inventory(), None)
+
     async def on_shutdown(self) -> None:
         """
         Subclass hook invoked during lifespan teardown.
@@ -1221,6 +1230,8 @@ class HarnessApp:
           ``tool_result``, ``approval``). The body's ``type``
           field discriminates the variant; FastAPI / Pydantic
           rejects unknown values with 422.
+        - ``GET /v1/sessions/{conversation_id}/resident-thread-inventory`` —
+          bounded loaded-thread evidence on existing owners; unknown is not empty.
 
         The handler validates the path's ``conversation_id``
         against :attr:`fastapi.applications.FastAPI.state.conversation_id`
@@ -1234,6 +1245,12 @@ class HarnessApp:
             "/sessions/{conversation_id}/resident-inventory",
             self._get_resident_inventory,
             methods=["GET"],
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/resident-thread-inventory",
+            self._get_resident_thread_inventory,
+            methods=["GET"],
+            response_model=ExecutorThreadInventorySnapshot,
         )
         router.add_api_route(
             "/sessions/{conversation_id}/events",
@@ -1255,6 +1272,30 @@ class HarnessApp:
         self._check_conversation_id(request, conversation_id)
         snapshot = self.resident_inventory()
         return JSONResponse({"inventory": asdict(snapshot) if snapshot is not None else None})
+
+    async def _get_resident_thread_inventory(
+        self, conversation_id: str, request: Request
+    ) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        read = None
+        deadline = asyncio.timeout(_RESIDENT_THREAD_INVENTORY_TIMEOUT_S)
+        try:
+            async with deadline:
+                read = await self.prepare_resident_thread_inventory(
+                    timeout_s=_RESIDENT_THREAD_INVENTORY_TIMEOUT_S
+                )
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        snapshot = read() if read is not None else ExecutorThreadInventorySnapshot(None, None)
+        return JSONResponse(asdict(snapshot))
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
         """

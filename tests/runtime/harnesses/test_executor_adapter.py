@@ -3096,6 +3096,173 @@ async def test_thread_inventory_adapter_preserves_unknown_and_cancellation(case)
     factory.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing-auth",
+        "wrong-auth",
+        "wrong-session",
+        "unbound",
+        "embedded",
+        "base",
+        "unsupported",
+        "fallback",
+        "empty",
+        "loaded",
+        "unknown",
+        "detached",
+        "replaced",
+        "timeout",
+        "failure",
+        "cancel",
+        "revoked",
+        "timeout-revoked",
+        "rebound",
+        "early-timeout",
+    ],
+)
+async def test_thread_inventory_http_contract_and_late_guards(monkeypatch, case):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import (
+        ExecutorResidentInventory,
+        ExecutorResidentOwner,
+        ExecutorThreadInventorySnapshot,
+    )
+    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    budget = 0.05 if case in {"timeout", "timeout-revoked"} else 5.0
+    monkeypatch.setattr(_scaffold, "_RESIDENT_THREAD_INVENTORY_TIMEOUT_S", budget, raising=False)
+    inventory = ExecutorResidentInventory(
+        owners=(ExecutorResidentOwner("owner", ("key",), "thread", True, False, False),)
+    )
+    snapshot = ExecutorThreadInventorySnapshot(inventory, (("thread", "side"),))
+    if case == "empty":
+        snapshot = ExecutorThreadInventorySnapshot(ExecutorResidentInventory(owners=()), ())
+    elif case == "unknown":
+        snapshot = ExecutorThreadInventorySnapshot(inventory, (None,))
+    getter = Mock(return_value=snapshot)
+    entered, release = asyncio.Event(), asyncio.Event()
+    blocked = {"timeout", "cancel", "revoked", "timeout-revoked", "rebound", "replaced"}
+
+    async def prepare(*, timeout_s):
+        assert timeout_s == budget
+        entered.set()
+        if case == "failure":
+            raise RuntimeError("owner failed")
+        if case == "early-timeout":
+            raise TimeoutError("producer failed before the endpoint deadline")
+        if case in blocked:
+            await release.wait()
+        return getter
+
+    factory = Mock(side_effect=AssertionError("must not construct executor"))
+    harness = ExecutorAdapter(factory)
+    executor = Executor()
+    prepared = AsyncMock(side_effect=prepare)
+    if case not in {"unsupported", "fallback"}:
+        executor.prepare_resident_thread_inventory = prepared
+    if case == "fallback":
+        executor.resident_inventory = Mock(return_value=inventory)
+    harness._executor = executor
+    if case == "detached":
+        harness._resident_inventory_detached = True
+    elif case == "base":
+        harness = _scaffold.HarnessApp()
+    app = harness.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = None if case == "embedded" else "test-auth"
+    if case == "unbound":
+        del app.state.conversation_id
+    headers = {"Authorization": "Bearer test-auth"}
+    if case in {"missing-auth", "embedded"}:
+        headers = {}
+    elif case == "wrong-auth":
+        headers = {"Authorization": "Bearer wrong-auth"}
+    path = "other" if case == "wrong-session" else "conversation"
+    read = None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://harness",
+            headers=headers,
+        ) as client:
+            read = asyncio.create_task(
+                client.get(f"/v1/sessions/{path}/resident-thread-inventory")
+            )
+            if case in blocked:
+                await asyncio.wait_for(entered.wait(), 2)
+                if case in {"revoked", "timeout-revoked"}:
+                    app.state.harness_auth_token = "changed-auth"
+                elif case == "rebound":
+                    app.state.conversation_id = "other"
+                elif case == "replaced":
+                    harness._executor = Executor()
+                if case == "cancel":
+                    read.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await read
+                    getter.assert_not_called()
+                    return
+                if case not in {"timeout", "timeout-revoked"}:
+                    release.set()
+            response = await asyncio.wait_for(read, 2)
+        status = (
+            401
+            if case in {"missing-auth", "wrong-auth", "revoked", "timeout-revoked"}
+            else (
+                404
+                if case in {"wrong-session", "rebound"}
+                else 500
+                if case in {"unbound", "failure", "early-timeout"}
+                else 200
+            )
+        )
+        assert response.status_code == status
+        if status != 200:
+            assert "thread_ids" not in response.text
+        elif case in {"base", "unsupported", "detached", "replaced", "timeout"}:
+            assert response.json() == {"inventory": None, "thread_ids": None}
+        else:
+            expected = {
+                "inventory": {
+                    "owners": [
+                        {
+                            "incarnation_id": "owner",
+                            "session_keys": ["key"],
+                            "vendor_context_id": "thread",
+                            "started": True,
+                            "closing": False,
+                            "cleanup_complete": False,
+                        }
+                    ],
+                    "ambiguous_context_ids": [],
+                    "aliases_complete": False,
+                    "context_coverage_complete": False,
+                },
+                "thread_ids": [["thread", "side"]],
+            }
+            if case == "empty":
+                expected["inventory"]["owners"] = []
+                expected["thread_ids"] = []
+            elif case == "fallback":
+                expected["thread_ids"] = None
+            elif case == "unknown":
+                expected["thread_ids"] = [None]
+            assert response.json() == expected
+        assert getter.call_count == (case in {"embedded", "loaded", "empty", "unknown"})
+        if case in {"missing-auth", "wrong-auth", "wrong-session", "unbound", "detached", "base"}:
+            prepared.assert_not_awaited()
+    finally:
+        factory.assert_not_called()
+        release.set()
+        if read is not None:
+            read.cancel()
+            await asyncio.gather(read, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", ["codex", "claude-sdk"])
 async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknown(
