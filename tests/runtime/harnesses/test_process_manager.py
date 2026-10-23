@@ -3066,6 +3066,154 @@ async def resident_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         yield manager, entry, owner, app, requests
 
 
+async def _read_selected_inventory(manager, selected, threads, *, timeout_s=5.0):
+    if threads:
+        return (await manager.prepare_resident_thread_inventory(selected, timeout_s=timeout_s))()
+    return await manager.read_resident_inventory(selected, timeout_s=timeout_s)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["loaded", "owner-empty", "empty", "unknown", "unsupported", "literal", "overlap", "max"],
+)
+async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_reader, case):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
+
+    manager, entry, owner, _app, requests = resident_reader
+    ids = (("thread-a", "side"),)
+    if case == "owner-empty":
+        ids = ((),)
+    elif case == "empty":
+        owner.inventory = ExecutorResidentInventory(owners=())
+        ids = ()
+    elif case == "unknown":
+        ids = (None,)
+    elif case == "unsupported":
+        ids = None
+    elif case == "literal":
+        ids = ((" thread-a ", "thread-a"),)
+    elif case == "overlap":
+        first = owner.inventory.owners[0]
+        owner.inventory = replace(
+            owner.inventory, owners=(first, replace(first, incarnation_id="context-b"))
+        )
+        ids = (("shared",), ("shared",))
+    elif case == "max":
+        ids = (tuple(f"thread-{i}" for i in range(1000)),)
+    snapshot = ExecutorThreadInventorySnapshot(owner.inventory, ids)
+    owner.prepare_resident_thread_inventory = AsyncMock(return_value=lambda: snapshot)
+    selected = (await manager.resident_inventory()).owners[0]
+    reconcile = await manager.prepare_resident_thread_inventory(selected)
+    result = reconcile()
+    assert result.context.owner == selected
+    assert result.context.release_generation == 0
+    assert result.context.inventory == owner.inventory
+    assert result.thread_ids == ids
+    assert (
+        not result.context.inventory.aliases_complete
+        and not result.context.inventory.context_coverage_complete
+    )
+    with pytest.raises(FrozenInstanceError):
+        result.thread_ids = None
+    assert reconcile() == result
+    assert requests == [("GET", "/v1/sessions/conversation/resident-thread-inventory")]
+    assert manager._retention_managed == {"conversation": 0.0}
+    assert manager._in_flight_response_ids == {"conversation": "response-working"}
+    assert entry.last_used_at == 0.0 and not entry.process.killed
+
+
+@pytest.mark.parametrize("change", ["client", "process", "generation", "teardown"])
+async def test_prepare_resident_thread_inventory_rechecks_after_later_await(
+    resident_reader, change
+):
+    manager, entry, _owner, app, requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    reconcile = await manager.prepare_resident_thread_inventory(selected)
+    observed = reconcile()
+    assert observed is not None
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://harness"
+    ) as replacement:
+        if change == "client":
+            entry.client = replacement
+        elif change == "process":
+            entry.process = _FakeReapProc()
+        elif change == "generation":
+            manager._release_generations["conversation"] = 1
+        else:
+            entry.teardown_started = True
+        await asyncio.sleep(0)
+        assert reconcile() is None
+    assert observed.context.release_generation == 0
+    assert requests == [("GET", "/v1/sessions/conversation/resident-thread-inventory")]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "legacy-shape",
+        "extra-top",
+        "alignment",
+        "flat",
+        "int",
+        "bool",
+        "empty-id",
+        "duplicate-id",
+        "too-many",
+        "http404",
+        "redirect",
+        "null-root",
+        "unknown-owner",
+    ],
+)
+async def test_prepare_resident_thread_inventory_invalid_ids_are_unknown(resident_reader, failure):
+    import json
+    from dataclasses import asdict
+
+    manager, entry, owner, _app, _requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    payload = {"inventory": asdict(owner.inventory), "thread_ids": [["thread-a"]]}
+    if failure == "legacy-shape":
+        payload.pop("thread_ids")
+    elif failure == "extra-top":
+        payload["extra"] = True
+    elif failure == "null-root":
+        payload = None
+    elif failure == "unknown-owner":
+        payload = {"inventory": None, "thread_ids": None}
+    elif failure not in {"http404", "redirect"}:
+        payload["thread_ids"] = {
+            "alignment": [],
+            "flat": ["thread-a"],
+            "int": [[1]],
+            "bool": [[True]],
+            "empty-id": [[""]],
+            "duplicate-id": [["a", "a"]],
+            "too-many": [[f"thread-{i}" for i in range(1001)]],
+        }[failure]
+    calls = []
+
+    async def respond(request):
+        calls.append(request.url.path)
+        return httpx.Response(
+            404 if failure == "http404" else 307 if failure == "redirect" else 200,
+            headers={"Location": "/other"} if failure == "redirect" else {},
+            content=json.dumps(payload).encode(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://harness"
+    ) as client:
+        entry.client = client
+        reconcile = await manager.prepare_resident_thread_inventory(selected)
+        assert reconcile() is None
+    assert calls == ["/v1/sessions/conversation/resident-thread-inventory"]
+    assert entry.last_used_at == 0.0 and not entry.process.killed
+
+
 async def test_read_resident_inventory_uses_existing_authenticated_owner(resident_reader):
     from dataclasses import asdict
 
@@ -3129,8 +3277,9 @@ async def test_read_resident_inventory_uses_existing_authenticated_owner(residen
         "closed-client",
     ],
 )
+@pytest.mark.parametrize("threads", [False, True])
 async def test_read_resident_inventory_rejects_invalid_selection_without_http(
-    resident_reader, invalid
+    resident_reader, invalid, threads
 ):
     from dataclasses import replace
 
@@ -3152,12 +3301,15 @@ async def test_read_resident_inventory_rejects_invalid_selection_without_http(
         manager._shutting_down = True
     else:
         await entry.client.aclose()
-    assert await manager.read_resident_inventory(selected) is None
+    assert await _read_selected_inventory(manager, selected, threads) is None
     assert requests == []
 
 
 @pytest.mark.parametrize("race", ["release", "replacement", "failed-release", "shutdown"])
-async def test_read_resident_inventory_discards_late_response(resident_reader, monkeypatch, race):
+@pytest.mark.parametrize("threads", [False, True])
+async def test_read_resident_inventory_discards_late_response(
+    resident_reader, monkeypatch, race, threads
+):
     from unittest.mock import AsyncMock
 
     manager, entry, _owner, _app, _requests = resident_reader
@@ -3169,7 +3321,7 @@ async def test_read_resident_inventory_discards_late_response(resident_reader, m
         await asyncio.wait_for(resume.wait(), timeout=2)
 
     entry.client.event_hooks["response"].append(pause)
-    read = asyncio.create_task(manager.read_resident_inventory(selected))
+    read = asyncio.create_task(_read_selected_inventory(manager, selected, threads))
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
         # Teardown uses the existing release path and its real _close_entry.
@@ -3226,17 +3378,23 @@ async def test_read_resident_inventory_discards_late_response(resident_reader, m
         "timeout",
     ],
 )
-async def test_read_resident_inventory_invalid_response_is_unknown(resident_reader, failure):
+@pytest.mark.parametrize("threads", [False, True])
+async def test_read_resident_inventory_invalid_response_is_unknown(
+    resident_reader, failure, threads
+):
     import json
     from dataclasses import asdict
 
     manager, entry, owner, app, _requests = resident_reader
     selected = (await manager.resident_inventory()).owners[0]
     payload = {"inventory": asdict(owner.inventory)}
+    if threads:
+        payload["thread_ids"] = None
 
     async def respond(request):
         assert request.method == "GET"
-        assert request.url.path == "/v1/sessions/conversation/resident-inventory"
+        suffix = "resident-thread-inventory" if threads else "resident-inventory"
+        assert request.url.path == f"/v1/sessions/conversation/{suffix}"
         if failure == "timeout":
             await asyncio.Event().wait()
         if failure == "http-error":
@@ -3262,22 +3420,25 @@ async def test_read_resident_inventory_invalid_response_is_unknown(resident_read
 
     if failure == "auth":
         entry.client.headers.clear()
-        assert await manager.read_resident_inventory(selected) is None
+        assert await _read_selected_inventory(manager, selected, threads) is None
     elif failure == "session":
         app.state.conversation_id = "different-conversation"
-        assert await manager.read_resident_inventory(selected) is None
+        assert await _read_selected_inventory(manager, selected, threads) is None
     else:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(respond), base_url="http://harness"
         ) as client:
             entry.client = client
-            assert await manager.read_resident_inventory(selected, timeout_s=0.01) is None
+            assert (
+                await _read_selected_inventory(manager, selected, threads, timeout_s=0.01) is None
+            )
     assert manager._retention_managed == {"conversation": 0.0}
     assert entry.last_used_at == 0.0
     assert not entry.process.killed
 
 
-async def test_read_resident_inventory_cancellation_propagates(resident_reader):
+@pytest.mark.parametrize("threads", [False, True])
+async def test_read_resident_inventory_cancellation_propagates(resident_reader, threads):
     manager, entry, _owner, _app, _requests = resident_reader
     selected = (await manager.resident_inventory()).owners[0]
     entered = asyncio.Event()
@@ -3287,7 +3448,7 @@ async def test_read_resident_inventory_cancellation_propagates(resident_reader):
         await asyncio.Event().wait()
 
     entry.client.event_hooks["response"].append(pause)
-    read = asyncio.create_task(manager.read_resident_inventory(selected))
+    read = asyncio.create_task(_read_selected_inventory(manager, selected, threads))
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
         read.cancel()
