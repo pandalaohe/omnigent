@@ -17,6 +17,7 @@ from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
@@ -721,6 +722,16 @@ class Executor:
     def resident_inventory(self) -> ExecutorResidentInventory | None:
         """Read owned context evidence without construction or probes; None is unknown."""
         return None
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """Legacy owner IDs do not establish canonical context birth or provenance."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id, read_id, "context_source_unimplemented", unsupported=True
+        )
 
     async def prepare_resident_thread_inventory(
         self, *, timeout_s: float = 5.0

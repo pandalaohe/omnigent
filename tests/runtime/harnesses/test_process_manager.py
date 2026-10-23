@@ -3072,6 +3072,617 @@ async def _read_selected_inventory(manager, selected, threads, *, timeout_s=5.0)
     return await manager.read_resident_inventory(selected, timeout_s=timeout_s)
 
 
+@pytest.fixture
+def context_wire_v2():
+    from omnigent.startup_protocol import unknown_context_evidence_v2
+
+    return unknown_context_evidence_v2("conversation", "read", "unimplemented").model_dump(
+        mode="json"
+    )
+
+
+@pytest.fixture
+def context_record_v2():
+    return {
+        "key": {"source_owner_incarnation": "owner", "context_incarnation": "birth-a"},
+        "vendor_id": {"namespace": "provider/store", "value": "literal:shared/id"},
+        "operation": {"operation_id": "operation-a", "action": "create", "parent": None},
+        "execution_keys": ["execution-a"],
+        "provenance": "primary",
+        "lifecycle": "live",
+        "aliases": [],
+        "revision": 0,
+        "stop_proof": None,
+        "continuity_proof": None,
+    }
+
+
+@pytest.fixture
+def complete_context_wire_v2(context_wire_v2, context_record_v2):
+    import copy
+
+    from omnigent.startup_protocol import ContextAuthorityV2, ScopeKeyV2
+
+    authority = ContextAuthorityV2(
+        session_id="conversation",
+        account_id="account",
+        host_id="host",
+        host_generation="host-generation",
+        runner_id="runner",
+        runner_generation="runner-generation",
+        connection_generation="current",
+    )
+    raw = context_wire_v2
+    raw["authority"] = authority.model_dump(mode="json")
+    first = context_record_v2
+    second = copy.deepcopy(first)
+    second["key"]["context_incarnation"] = "birth-b"
+    second["operation"]["operation_id"] = "operation-b"
+    second["execution_keys"] = ["execution-b"]
+    for record, views in ((first, ("view-a", "view-a-2")), (second, ("view-b",))):
+        record["aliases"] = [
+            {
+                "view_key": view,
+                "generation": "current",
+                "target": copy.deepcopy(record["key"]),
+                "read_only": True,
+                "operation_id": view + "-operation",
+                "receipt_id": view + "-receipt",
+            }
+            for view in views
+        ]
+    raw["sources"][0].update(
+        producer_incarnation="owner",
+        coverage="complete",
+        contexts=[first, second],
+        unresolved=[],
+        membership_revision=1,
+        context_revision=2,
+        revision_authority="authoritative_membership",
+        age_upper_bound_s=0.0,
+    )
+    scopes = (ScopeKeyV2.model_validate(raw["expected_scopes"][0]),)
+    return raw, authority, scopes
+
+
+def _decode_complete_context_wire_v2(raw, authority, scopes):
+    import json
+
+    from omnigent.startup_protocol import decode_context_evidence_v2
+
+    return decode_context_evidence_v2(
+        json.dumps(raw).encode(),
+        read_id="read",
+        authority=authority,
+        expected_scopes=scopes,
+    )
+
+
+@pytest.mark.parametrize("case", ["two_targets", "another_execution"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+def test_context_inventory_v2_source_alias_conflicts_rejected_by_decoder(
+    complete_context_wire_v2,
+    case,
+    reverse,
+):
+    raw, authority, scopes = complete_context_wire_v2
+    assert (
+        _decode_complete_context_wire_v2(raw, authority, scopes).sources[0].coverage == "complete"
+    )
+    first, second = raw["sources"][0]["contexts"]
+    if case == "two_targets":
+        second["aliases"][0]["view_key"] = first["aliases"][0]["view_key"]
+    else:
+        first["aliases"][0]["view_key"] = second["execution_keys"][0]
+    if reverse:
+        raw["sources"][0]["contexts"].reverse()
+    with pytest.raises(ValueError, match="conflicting source alias"):
+        _decode_complete_context_wire_v2(raw, authority, scopes)
+
+
+def test_context_inventory_v2_source_aliases_keep_distinct_read_only_views(
+    complete_context_wire_v2,
+):
+    raw, authority, scopes = complete_context_wire_v2
+    evidence = _decode_complete_context_wire_v2(raw, authority, scopes)
+    first, second = evidence.sources[0].contexts
+    assert [alias.view_key for alias in first.aliases] == ["view-a", "view-a-2"]
+    assert all(alias.target == first.key and alias.read_only for alias in first.aliases)
+    assert second.aliases[0].target == second.key and first.key != second.key
+    assert first.vendor_id == second.vendor_id
+
+
+def test_context_inventory_v2_source_aliases_remain_scoped_to_independent_sources(
+    complete_context_wire_v2,
+):
+    import copy
+
+    from omnigent.startup_protocol import ScopeKeyV2
+
+    raw, authority, scopes = complete_context_wire_v2
+    other = copy.deepcopy(raw["sources"][0])
+    other["scope"]["namespace"] = "independent-provider"
+    other["producer_incarnation"] = "other-owner"
+    for record in other["contexts"]:
+        record["key"]["source_owner_incarnation"] = "other-owner"
+        for alias in record["aliases"]:
+            alias["target"]["source_owner_incarnation"] = "other-owner"
+    # Cross-source strings can coincide without identifying the same execution or view.
+    other["contexts"][0]["execution_keys"] = ["view-a"]
+    other["contexts"][0]["aliases"][0]["view_key"] = "execution-a"
+    raw["sources"].append(other)
+    raw["expected_scopes"].append(copy.deepcopy(other["scope"]))
+    scopes += (ScopeKeyV2.model_validate(other["scope"]),)
+    evidence = _decode_complete_context_wire_v2(raw, authority, scopes)
+    assert len(evidence.sources) == 2
+    assert evidence.sources[0].contexts[0].key != evidence.sources[1].contexts[0].key
+    assert evidence.sources[0].contexts[1].aliases[0].view_key == "view-b"
+    assert evidence.sources[1].contexts[1].aliases[0].view_key == "view-b"
+
+
+def _decode_context_wire_v2(payload):
+    from omnigent.startup_protocol import (
+        decode_context_evidence_v2,
+        executor_context_scope_v2,
+        harness_context_authority_v2,
+    )
+
+    return decode_context_evidence_v2(
+        payload,
+        read_id="read",
+        authority=harness_context_authority_v2("conversation"),
+        expected_scopes=(executor_context_scope_v2("conversation"),),
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "version_float",
+        "version_bool",
+        "version_old",
+        "unknown_field",
+        "missing_field",
+        "wrong_read",
+        "wrong_authority",
+        "manifest_shrunk",
+        "duplicate_scope",
+        "duplicate_source",
+        "bool_revision",
+        "float_revision",
+        "negative_revision",
+        "unknown_coverage",
+        "missing_reason",
+        "complete_observation",
+        "complete_unbound",
+        "negative_age",
+        "infinite_age",
+        "bool_age",
+        "too_many_contexts",
+        "null_contexts",
+        "too_many_scopes",
+        "oversize_id",
+    ],
+)
+def test_context_inventory_v2_strict_wire(context_wire_v2, case):
+    import json
+
+    raw = context_wire_v2
+    source = raw["sources"][0]
+    if case.startswith("version_"):
+        raw["wire_version"] = {"version_float": 2.0, "version_bool": True, "version_old": 1}[case]
+    elif case == "unknown_field":
+        raw["safe_to_restart"] = True
+    elif case == "missing_field":
+        del source["work_bindings"]
+    elif case == "wrong_read":
+        raw["read_id"] = "completed-read"
+    elif case == "wrong_authority":
+        raw["authority"]["host_generation"] = "previous"
+    elif case == "manifest_shrunk":
+        raw["expected_scopes"] = []
+    elif case == "duplicate_scope":
+        raw["expected_scopes"] *= 2
+    elif case == "duplicate_source":
+        raw["sources"] *= 2
+    elif case.endswith("revision"):
+        source["membership_revision"] = {
+            "bool_revision": True,
+            "float_revision": 1.0,
+            "negative_revision": -1,
+        }[case]
+    elif case == "unknown_coverage":
+        source["coverage"] = "ready"
+    elif case == "missing_reason":
+        source["unresolved"] = []
+    elif case.startswith("complete_"):
+        source.update(
+            coverage="complete",
+            producer_incarnation="owner",
+            membership_revision=1,
+            context_revision=1,
+            age_upper_bound_s=0.0,
+            unresolved=[],
+        )
+        if case == "complete_unbound":
+            source["revision_authority"] = "authoritative_membership"
+    elif case.endswith("age"):
+        source["age_upper_bound_s"] = {
+            "negative_age": -1,
+            "infinite_age": float("inf"),
+            "bool_age": True,
+        }[case]
+    elif case == "too_many_contexts":
+        source["contexts"] = [{}] * 1001
+    elif case == "null_contexts":
+        source["contexts"] = None
+    elif case == "too_many_scopes":
+        raw["expected_scopes"] *= 65
+    elif case == "oversize_id":
+        raw["read_id"] = "r" * 129
+    with pytest.raises(ValueError):
+        _decode_context_wire_v2(json.dumps(raw).encode())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"wire_version":2,"wire_version":2}',
+        b'{"sources":[{"coverage":"partial","coverage":"complete"}]}',
+        b"[" * 1500 + b"]" * 1500,
+        b" " * (1024 * 1024 + 1),
+    ],
+    ids=["duplicate_root", "duplicate_nested", "nesting", "bytes"],
+)
+def test_context_inventory_v2_rejects_duplicate_fields_and_resource_overflow(payload):
+    with pytest.raises(ValueError):
+        _decode_context_wire_v2(payload)
+
+
+def test_context_inventory_v2_retains_missing_extra_scopes_and_literal_independent_ids(
+    context_wire_v2,
+    context_record_v2,
+):
+    import copy
+    import json
+
+    raw = context_wire_v2
+    source = raw["sources"][0]
+    source["producer_incarnation"] = "owner"
+    context = context_record_v2
+    other = copy.deepcopy(context)
+    other["key"]["context_incarnation"] = "birth-b"
+    other["operation"]["operation_id"] = "operation-b"
+    other["execution_keys"] = ["execution-b"]
+    source["contexts"] = [context, other]
+    evidence = _decode_context_wire_v2(json.dumps(raw).encode())
+    records = evidence.sources[0].contexts
+    assert records[0].key != records[1].key and records[0].vendor_id == records[1].vendor_id
+    assert len(records) == 2 and not records[0].aliases
+    with pytest.raises(ValueError):
+        evidence.read_id = "changed"
+    raw["sources"] = []
+    assert _decode_context_wire_v2(json.dumps(raw).encode()).expected_scopes
+    source["scope"] = {**source["scope"], "population": "unmatched_actual_scope"}
+    raw["sources"] = [source]
+    assert (
+        _decode_context_wire_v2(json.dumps(raw).encode()).sources[0].scope
+        != evidence.expected_scopes[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "duplicate_context",
+        "foreign_owner",
+        "execution_alias",
+        "writable_alias",
+        "numeric_alias",
+        "stale_alias",
+        "foreign_alias",
+        "stopped_without_proof",
+        "foreign_stop",
+        "stale_stop",
+        "wrong_execution",
+        "duplicate_execution",
+        "unproven_side_chat",
+        "unknown_lifecycle",
+        "foreign_work_binding",
+    ],
+)
+def test_context_inventory_v2_rejects_conflicting_identity_and_proofs(
+    context_wire_v2,
+    context_record_v2,
+    case,
+):
+    import copy
+    import json
+
+    from omnigent.startup_protocol import ContextEvidenceV2
+
+    raw, context = context_wire_v2, context_record_v2
+    source = raw["sources"][0]
+    source.update(producer_incarnation="owner", contexts=[context])
+    if case == "duplicate_context":
+        source["contexts"].append(copy.deepcopy(context))
+    elif case == "foreign_owner":
+        context["key"]["source_owner_incarnation"] = "other-owner"
+    elif case.endswith("alias"):
+        raw["authority"]["connection_generation"] = "current"
+        alias = {
+            "view_key": "view",
+            "generation": "current",
+            "target": copy.deepcopy(context["key"]),
+            "read_only": True,
+            "operation_id": "view-operation",
+            "receipt_id": "view-receipt",
+        }
+        context["aliases"] = [alias]
+        if case == "execution_alias":
+            alias["view_key"] = "execution-a"
+        elif case == "writable_alias":
+            alias["read_only"] = False
+        elif case == "numeric_alias":
+            alias["read_only"] = 1
+        elif case == "stale_alias":
+            alias["generation"] = "old"
+        else:
+            alias["target"]["context_incarnation"] = "other-context"
+    elif case == "stopped_without_proof":
+        context["lifecycle"] = "stopped"
+    elif case in {"foreign_stop", "stale_stop", "wrong_execution"}:
+        context["lifecycle"] = "stopped"
+        proof = {
+            "context": copy.deepcopy(context["key"]),
+            "receipt_id": "stop-receipt",
+            "authority": copy.deepcopy(raw["authority"]),
+            "execution_keys": ["execution-a"],
+        }
+        context["stop_proof"] = proof
+        if case == "foreign_stop":
+            proof["context"]["context_incarnation"] = "other-context"
+        elif case == "stale_stop":
+            proof["authority"]["connection_generation"] = "previous"
+        else:
+            proof["execution_keys"] = []
+    elif case == "duplicate_execution":
+        context["execution_keys"] *= 2
+    elif case == "unproven_side_chat":
+        context["provenance"] = "managed_side_chat"
+    elif case == "unknown_lifecycle":
+        context["lifecycle"] = "safe_to_close"
+    else:
+        source["work_bindings"] = [
+            {
+                "context": {**context["key"], "context_incarnation": "other-context"},
+                "runtime_id": "runtime",
+                "generation": "work-generation",
+            }
+        ]
+    with pytest.raises(ValueError):
+        ContextEvidenceV2.model_validate_json(json.dumps(raw), strict=True)
+
+
+async def test_context_inventory_v2_real_channel_is_truthful_and_read_only(resident_reader):
+    manager, entry, owner, _app, requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    reconcile = await manager.prepare_context_inventory_v2(selected)
+    first = reconcile()
+    second = (await manager.prepare_context_inventory_v2(selected))()
+    assert first.evidence.wire_version == 2
+    assert first.evidence.read_id != second.evidence.read_id
+    assert first.evidence.sources[0].coverage == "unsupported"
+    assert first.evidence.sources[0].unresolved[0].reason == "context_source_unimplemented"
+    assert first.evidence.sources[0].contexts == ()
+    assert first.evidence.sources[0].producer_incarnation is None
+    assert first.evidence.authority.account_id is None
+    assert first.owner == selected and first.release_generation == 0
+    assert reconcile().request_elapsed_s >= first.request_elapsed_s
+    assert owner.resident_inventory().owners[0].vendor_context_id == "thread-a"
+    assert requests == [("GET", "/v2/sessions/conversation/resident-context-inventory")] * 2
+    assert manager._retention_managed == {"conversation": 0.0}
+    assert manager._in_flight_response_ids == {"conversation": "response-working"}
+    assert entry.last_used_at == 0.0 and not entry.process.killed
+
+
+@pytest.mark.parametrize(
+    "change", ["release", "process", "client", "closing", "shutdown", "entry"]
+)
+async def test_context_inventory_v2_reconciles_after_other_sources_wait(resident_reader, change):
+    manager, entry, _owner, _app, requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    reconcile = await manager.prepare_context_inventory_v2(selected)
+    if change == "release":
+        manager._release_generations["conversation"] = 1
+    elif change == "process":
+        entry.process.returncode = 0
+    elif change == "client":
+        await entry.client.aclose()
+    elif change == "closing":
+        entry.teardown_started = True
+    elif change == "shutdown":
+        manager._shutting_down = True
+    else:
+        manager._entries.pop("conversation")
+    assert reconcile().evidence.sources[0].unresolved[0].reason == "owner_changed"
+    assert len(requests) == 1
+    next_read = (await manager.prepare_context_inventory_v2(selected))()
+    assert next_read.evidence.sources[0].coverage == (
+        "unsupported" if change == "release" else "partial"
+    )
+    assert len(requests) == (2 if change == "release" else 1)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "old_peer",
+        "wrong_token",
+        "wrong_read",
+        "unknown_field",
+        "timeout",
+        "oversized",
+        "redirect",
+    ],
+)
+async def test_context_inventory_v2_mixed_peers_fail_closed(resident_reader, monkeypatch, case):
+    import json
+
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2, unknown_context_evidence_v2
+
+    manager, entry, _owner, _app, requests = resident_reader
+    calls = []
+
+    async def reply(request):
+        calls.append(request.url)
+        if case == "timeout":
+            raise httpx.ReadTimeout("no response")
+        payload = unknown_context_evidence_v2(
+            "conversation", request.url.params["read_id"], "unimplemented", unsupported=True
+        ).model_dump(mode="json")
+        if case == "wrong_read":
+            payload["read_id"] = "old"
+        elif case == "unknown_field":
+            payload["capacity"] = 0
+        return httpx.Response(
+            404 if case == "old_peer" else 302 if case == "redirect" else 200,
+            headers={
+                "Omnigent-Context-Inventory-Contract": "v1"
+                if case == "wrong_token"
+                else CONTEXT_INVENTORY_V2
+            },
+            content=b" " * (1024 * 1024 + 1)
+            if case == "oversized"
+            else json.dumps(payload).encode(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reply), base_url="http://existing"
+    ) as client:
+        monkeypatch.setattr(entry, "client", client)
+        selected = (await manager.resident_inventory()).owners[0]
+        result = (await manager.prepare_context_inventory_v2(selected))()
+    source = result.evidence.sources[0]
+    assert source.coverage == ("unsupported" if case == "old_peer" else "partial")
+    assert source.contexts == () and source.unresolved
+    assert len(calls) == 1 and calls[0].path.startswith("/v2/")
+    assert requests == [] and entry.last_used_at == 0.0
+
+
+@pytest.mark.parametrize(
+    "case", ["auth_before", "conversation_before", "auth_after", "conversation_after"]
+)
+async def test_context_inventory_v2_auth_and_conversation_rechecked(
+    resident_reader, monkeypatch, case
+):
+    from omnigent.startup_protocol import unknown_context_evidence_v2
+
+    _manager, entry, owner, app, _requests = resident_reader
+    reads = []
+
+    async def prepare(session_id, read_id, *, timeout_s):
+        reads.append(timeout_s)
+        if case == "auth_after":
+            app.state.harness_auth_token = "changed-auth"
+        elif case == "conversation_after":
+            app.state.conversation_id = "different"
+        return lambda: unknown_context_evidence_v2(session_id, read_id, "unimplemented")
+
+    monkeypatch.setattr(owner, "prepare_context_inventory_v2", prepare)
+    headers = {"Authorization": "Bearer wrong"} if case == "auth_before" else {}
+    target = "different" if case == "conversation_before" else "conversation"
+    response = await entry.client.get(
+        f"/v2/sessions/{target}/resident-context-inventory",
+        params={"read_id": "read"},
+        headers=headers,
+    )
+    assert response.status_code == (401 if case.startswith("auth") else 404)
+    assert len(reads) == (1 if case.endswith("after") else 0)
+
+
+async def test_context_inventory_v2_budget_includes_registry_wait_and_cancellation(
+    resident_reader,
+):
+    manager, _entry, _owner, _app, requests = resident_reader
+    selected = (await manager.resident_inventory()).owners[0]
+    async with manager._registry_lock:
+        result = (await manager.prepare_context_inventory_v2(selected, timeout_s=0.01))()
+        assert result.evidence.sources[0].unresolved[0].reason == "invalid_or_failed_read"
+        read = asyncio.create_task(manager.prepare_context_inventory_v2(selected))
+        await asyncio.sleep(0)
+        read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read
+    assert requests == []
+
+
+async def test_context_inventory_v2_preserves_source_age_across_reconciliation(
+    resident_reader, monkeypatch
+):
+    from omnigent.startup_protocol import unknown_context_evidence_v2
+
+    manager, _entry, owner, _app, _requests = resident_reader
+
+    async def prepare(session_id, read_id, *, timeout_s):
+        assert timeout_s == 5.0
+        evidence = unknown_context_evidence_v2(session_id, read_id, "incomplete")
+        return lambda: evidence.model_copy(
+            update={
+                "sources": (evidence.sources[0].model_copy(update={"age_upper_bound_s": 2.0}),),
+            }
+        )
+
+    monkeypatch.setattr(owner, "prepare_context_inventory_v2", prepare)
+    selected = (await manager.resident_inventory()).owners[0]
+    reconcile = await manager.prepare_context_inventory_v2(selected)
+    first = reconcile()
+    second = reconcile()
+    assert first.evidence.sources[0].age_upper_bound_s == 2.0 + first.request_elapsed_s
+    assert second.evidence.sources[0].age_upper_bound_s == 2.0 + second.request_elapsed_s
+    assert second.request_elapsed_s >= first.request_elapsed_s
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["", "?read_id=", "?read_id=a&read_id=b", "?read_id=" + "a" * 129],
+    ids=["missing", "empty", "duplicate", "too_long"],
+)
+async def test_context_inventory_v2_rejects_invalid_read_before_producer(
+    resident_reader, monkeypatch, query
+):
+    from unittest.mock import AsyncMock
+
+    _manager, entry, owner, _app, _requests = resident_reader
+    monkeypatch.setattr(
+        owner, "prepare_context_inventory_v2", AsyncMock(side_effect=AssertionError)
+    )
+    result = await entry.client.get("/v2/sessions/conversation/resident-context-inventory" + query)
+    assert result.status_code == 422
+
+
+@pytest.mark.parametrize("state", ["detached", "cleanup", "missing", "shutdown"])
+async def test_context_inventory_v2_adapter_never_fabricates_missing_owner(state):
+    from omnigent.inner.executor import Executor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(lambda: pytest.fail("inventory must not construct the executor"))
+    adapter._executor = Executor()
+    prepared = await adapter.prepare_context_inventory_v2("conversation", "read")
+    if state == "detached":
+        adapter._resident_inventory_detached = True
+    elif state == "cleanup":
+        adapter._abandoned_executor_cleanup = asyncio.get_running_loop().create_future()
+    elif state == "missing":
+        adapter._executor = None
+    else:
+        adapter._shutting_down.set()
+    assert prepared().sources[0].unresolved[0].reason == "executor_unbound"
+    assert (await adapter.prepare_context_inventory_v2("conversation", "next"))().sources[
+        0
+    ].coverage == "partial"
+
+
 @pytest.mark.parametrize(
     "case",
     [

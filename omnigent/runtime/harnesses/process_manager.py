@@ -61,6 +61,15 @@ from omnigent.runtime.harnesses.paths import (
     HARNESS_TMP_PARENT_ENV_VAR,
     harness_tmp_parent,
 )
+from omnigent.startup_protocol import (
+    CONTEXT_INVENTORY_MAX_BYTES,
+    CONTEXT_INVENTORY_V2,
+    ContextEvidenceV2,
+    decode_context_evidence_v2,
+    executor_context_scope_v2,
+    harness_context_authority_v2,
+    unknown_context_evidence_v2,
+)
 
 _logger = logging.getLogger(__name__)
 _RESIDENT_INVENTORY_DECODER = TypeAdapter(ExecutorResidentInventory)
@@ -541,6 +550,16 @@ class HarnessThreadInventorySnapshot:
     thread_ids: tuple[tuple[str, ...] | None, ...] | None
 
 
+@dataclass(frozen=True)
+class HarnessContextEvidenceSnapshotV2:
+    """Local binding and age-adjusted observations, without a held admission guard."""
+
+    owner: HarnessResidentSnapshot
+    release_generation: int
+    evidence: ContextEvidenceV2
+    request_elapsed_s: float
+
+
 def _model_env_key(harness: str) -> str:
     """
     Return the per-harness model env-var key for *harness*.
@@ -805,6 +824,85 @@ class HarnessProcessManager:
         snapshot = reconcile()
         return snapshot.context if snapshot is not None else None
 
+    async def prepare_context_inventory_v2(
+        self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
+    ) -> Callable[[], HarnessContextEvidenceSnapshotV2]:
+        """Negotiate v2 on the selected channel; old peers and stale bindings stay unknown."""
+        read_id = uuid.uuid4().hex
+        started = time.monotonic()
+        generation = 0
+
+        def unknown(reason: str, *, unsupported: bool = False) -> HarnessContextEvidenceSnapshotV2:
+            return HarnessContextEvidenceSnapshotV2(
+                owner,
+                generation,
+                unknown_context_evidence_v2(
+                    owner.session_id, read_id, reason, unsupported=unsupported
+                ),
+                time.monotonic() - started,
+            )
+
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown("invalid_read_budget")
+        try:
+            async with asyncio.timeout_at(started + timeout_s):
+                selection = await self._select_resident_inventory_owner(owner)
+                if selection is None:
+                    return lambda: unknown("owner_unbound")
+                client, generation, still_current = selection
+                async with client.stream(
+                    "GET",
+                    f"/v2/sessions/{quote(owner.session_id, safe='')}/resident-context-inventory",
+                    params={"read_id": read_id},
+                    timeout=timeout_s,
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code == 404:
+                        return lambda: unknown("peer_needs_update", unsupported=True)
+                    if (
+                        response.status_code != 200
+                        or response.headers.get("Omnigent-Context-Inventory-Contract")
+                        != CONTEXT_INVENTORY_V2
+                    ):
+                        return lambda: unknown("contract_unavailable")
+                    payload = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(payload) + len(chunk) > CONTEXT_INVENTORY_MAX_BYTES:
+                            return lambda: unknown("read_byte_budget")
+                        payload.extend(chunk)
+            evidence = decode_context_evidence_v2(
+                bytes(payload),
+                read_id=read_id,
+                authority=harness_context_authority_v2(owner.session_id),
+                expected_scopes=(executor_context_scope_v2(owner.session_id),),
+            )
+        except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+            return lambda: unknown("invalid_or_failed_read")
+
+        def reconcile() -> HarnessContextEvidenceSnapshotV2:
+            if not still_current():
+                return unknown("owner_changed")
+            elapsed = time.monotonic() - started
+            aged = evidence.model_copy(
+                update={
+                    "sources": tuple(
+                        source.model_copy(
+                            update={
+                                "age_upper_bound_s": (
+                                    source.age_upper_bound_s + elapsed
+                                    if source.age_upper_bound_s is not None
+                                    else None
+                                ),
+                            }
+                        )
+                        for source in evidence.sources
+                    ),
+                }
+            )
+            return HarnessContextEvidenceSnapshotV2(owner, generation, aged, elapsed)
+
+        return reconcile
+
     async def prepare_resident_thread_inventory(
         self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
     ) -> Callable[[], HarnessThreadInventorySnapshot | None]:
@@ -818,32 +916,10 @@ class HarnessProcessManager:
     ) -> Callable[[], HarnessThreadInventorySnapshot | None]:
         if not 0 < timeout_s <= 5.0:
             return lambda: None
-        async with self._registry_lock:
-            entry = self._entries.get(owner.session_id)
-            if entry is None or owner.closing or owner.wrapper_exited or owner.exit_confirmed:
-                return lambda: None
-            client, process = entry.client, entry.process
-            generation = self._release_generations.get(owner.session_id, 0)
-
-            def still_current() -> bool:
-                return (
-                    self._started
-                    and not self._shutting_down
-                    and self._entries.get(owner.session_id) is entry
-                    and entry.incarnation_id == owner.incarnation_id
-                    and entry.harness == owner.harness
-                    and entry.client is client
-                    and entry.process is process
-                    and not entry.teardown_started
-                    and not entry.exit_confirmed
-                    and entry.incarnation_id not in self._closing_entries
-                    and process.returncode is None
-                    and not client.is_closed
-                    and self._release_generations.get(owner.session_id, 0) == generation
-                )
-
-            if not still_current():
-                return lambda: None
+        selection = await self._select_resident_inventory_owner(owner)
+        if selection is None:
+            return lambda: None
+        client, generation, still_current = selection
         endpoint = "resident-thread-inventory" if include_threads else "resident-inventory"
         thread_ids = None
         try:
@@ -938,6 +1014,35 @@ class HarnessProcessManager:
                 HarnessContextInventorySnapshot(owner, generation, inventory), thread_ids
             )
         return lambda: snapshot if still_current() else None
+
+    async def _select_resident_inventory_owner(
+        self, owner: HarnessResidentSnapshot
+    ) -> tuple[httpx.AsyncClient, int, Callable[[], bool]] | None:
+        async with self._registry_lock:
+            entry = self._entries.get(owner.session_id)
+            if entry is None or owner.closing or owner.wrapper_exited or owner.exit_confirmed:
+                return None
+            client, process = entry.client, entry.process
+            generation = self._release_generations.get(owner.session_id, 0)
+
+            def still_current() -> bool:
+                return (
+                    self._started
+                    and not self._shutting_down
+                    and self._entries.get(owner.session_id) is entry
+                    and entry.incarnation_id == owner.incarnation_id
+                    and entry.harness == owner.harness
+                    and entry.client is client
+                    and entry.process is process
+                    and not entry.teardown_started
+                    and not entry.exit_confirmed
+                    and entry.incarnation_id not in self._closing_entries
+                    and process.returncode is None
+                    and not client.is_closed
+                    and self._release_generations.get(owner.session_id, 0) == generation
+                )
+
+            return (client, generation, still_current) if still_current() else None
 
     async def retention_snapshot(
         self,

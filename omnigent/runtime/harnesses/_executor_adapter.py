@@ -71,6 +71,7 @@ from omnigent.server.schemas import (
     StartupProofEvent,
 )
 from omnigent.startup_evidence import StartupPermissionUnavailable, startup_evidence_scope
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 _logger = logging.getLogger(__name__)
 
@@ -690,6 +691,28 @@ class ExecutorAdapter(HarnessApp):
         """Read only the current owner; detached cleanup leaves coverage unknown."""
         executor = self._resident_inventory_executor()
         return executor.resident_inventory() if executor is not None else None
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        executor = self._resident_inventory_executor()
+
+        def current() -> bool:
+            return (
+                executor is not None
+                and self._resident_inventory_executor() is executor
+                and not self._shutting_down.is_set()
+            )
+
+        def unknown() -> ContextEvidenceV2:
+            return unknown_context_evidence_v2(session_id, read_id, "executor_unbound")
+
+        if executor is None or not 0 < timeout_s <= 5.0 or not current():
+            return unknown
+        reconcile = await executor.prepare_context_inventory_v2(
+            session_id, read_id, timeout_s=timeout_s
+        )
+        return lambda: reconcile() if current() else unknown()
 
     async def prepare_resident_thread_inventory(
         self, *, timeout_s: float = 5.0

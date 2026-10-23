@@ -76,7 +76,12 @@ from omnigent.server.schemas import (
     StartupClaimRequestEvent,
     Usage,
 )
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import (
+    CONTEXT_INVENTORY_V2,
+    ContextEvidenceV2,
+    StartupAttemptRef,
+    unknown_context_evidence_v2,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -1002,6 +1007,15 @@ class HarnessApp:
         """Unsupported owners provide unknown coverage rather than an empty inventory."""
         return None
 
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id, read_id, "context_source_unimplemented", unsupported=True
+        )
+
     async def prepare_resident_thread_inventory(
         self, *, timeout_s: float = 5.0
     ) -> Callable[[], ExecutorThreadInventorySnapshot]:
@@ -1124,6 +1138,11 @@ class HarnessApp:
         # Health probe lives at root (matches AP's app.py:125).
         app.add_api_route("/health", _health, methods=["GET"])
         app.include_router(self._build_v1_router(), prefix="/v1")
+        app.add_api_route(
+            "/v2/sessions/{conversation_id}/resident-context-inventory",
+            self._get_context_inventory_v2,
+            methods=["GET"],
+        )
         return app
 
     def _check_auth(self, request: Request) -> Response | None:
@@ -1264,6 +1283,38 @@ class HarnessApp:
             response_model=None,
         )
         return router
+
+    async def _get_context_inventory_v2(self, conversation_id: str, request: Request) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        read_id = request.query_params.get("read_id", "")
+        if not read_id or len(read_id) > 128 or len(request.query_params.getlist("read_id")) != 1:
+            return JSONResponse({"error": "invalid read_id"}, status_code=422)
+        reconcile = None
+        deadline = asyncio.timeout(_RESIDENT_THREAD_INVENTORY_TIMEOUT_S)
+        try:
+            async with deadline:
+                reconcile = await self.prepare_context_inventory_v2(
+                    conversation_id, read_id, timeout_s=_RESIDENT_THREAD_INVENTORY_TIMEOUT_S
+                )
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        evidence = (
+            reconcile()
+            if reconcile is not None
+            else unknown_context_evidence_v2(conversation_id, read_id, "read_timeout")
+        )
+        return JSONResponse(
+            evidence.model_dump(mode="json"),
+            headers={"Omnigent-Context-Inventory-Contract": CONTEXT_INVENTORY_V2},
+        )
 
     async def _get_resident_inventory(self, conversation_id: str, request: Request) -> Response:
         denied = self._check_auth(request)
