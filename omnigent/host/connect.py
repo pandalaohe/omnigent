@@ -3545,46 +3545,63 @@ class HostProcess:
             payload=payload,
         )
 
-    def _handle_skills(self, frame: HostSkillsFrame) -> HostSkillsResultFrame:
-        """Discover directory or session skills in a worker thread."""
+    async def _handle_skills(self, frame: HostSkillsFrame) -> HostSkillsResultFrame:
+        """Discover directory or session skills with a bounded picker wait."""
         from pathlib import Path
 
-        try:
-            if not frame.path or "\x00" in frame.path:
-                raise ValueError("path must be an absolute or tilde-prefixed directory")
-            root = Path(frame.path).expanduser()
-            if not root.is_absolute():
-                raise ValueError("path must be an absolute or tilde-prefixed directory")
-            if not root.is_dir():
+        def resolve_root() -> Path | HostSkillsResultFrame:
+            try:
+                if not frame.path or "\x00" in frame.path:
+                    raise ValueError("path must be an absolute or tilde-prefixed directory")
+                root = Path(frame.path).expanduser()
+                if not root.is_absolute():
+                    raise ValueError("path must be an absolute or tilde-prefixed directory")
+                if not root.is_dir():
+                    return HostSkillsResultFrame(
+                        request_id=frame.request_id,
+                        status="failed",
+                        error_code="not_directory",
+                        error=(
+                            "skill discovery directory does not exist on host "
+                            "or is not a directory"
+                        ),
+                    )
+                root = root.resolve()
+            except (ValueError, RuntimeError) as exc:
                 return HostSkillsResultFrame(
                     request_id=frame.request_id,
                     status="failed",
-                    error_code="not_directory",
-                    error="skill discovery directory does not exist on host or is not a directory",
+                    error_code="invalid_path",
+                    error=str(exc),
                 )
-            root = root.resolve()
-        except (ValueError, RuntimeError) as exc:
-            return HostSkillsResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error_code="invalid_path",
-                error=str(exc),
-            )
-        except OSError as exc:
-            return HostSkillsResultFrame(
-                request_id=frame.request_id,
-                status="failed",
-                error_code="discovery_failed",
-                error=str(exc),
-            )
+            except OSError as exc:
+                return HostSkillsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error_code="discovery_failed",
+                    error=str(exc),
+                )
+
+            return root
+
+        root = await asyncio.to_thread(resolve_root)
+        if isinstance(root, HostSkillsResultFrame):
+            return root
 
         try:
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                skills=self._skill_discovery.discover(frame, root),
+                skills=await self._skill_discovery.discover_cached(frame, root),
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
+            )
+        except TimeoutError:
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="discovery_pending",
+                error="skill discovery is still running; retry shortly",
             )
         except Exception:
             _logger.exception("Skill discovery failed for %r", frame.harness)
@@ -3726,7 +3743,7 @@ class HostProcess:
         from omnigent.harnesses.codex_native.app_server import codex_launch_catalog
 
         try:
-            rows = await codex_launch_catalog(refresh=refresh)
+            rows = await codex_launch_catalog(refresh=refresh, preview=True)
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
@@ -4786,6 +4803,7 @@ class HostProcess:
                 from omnigent.models.model_catalog_store import shutdown_catalog_probes
 
                 await shutdown_catalog_probes()
+                await self._skill_discovery.shutdown()
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -5778,7 +5796,7 @@ class HostProcess:
             fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
             await self._send_text(ws, encode_host_frame(fs_write_result))
         elif isinstance(frame, HostSkillsFrame):
-            skills_result = await asyncio.to_thread(self._handle_skills, frame)
+            skills_result = await self._handle_skills(frame)
             await self._send_text(ws, encode_host_frame(skills_result))
         elif isinstance(frame, HostPluginsFrame):
             plugins_result = await asyncio.to_thread(self._handle_plugins, frame)

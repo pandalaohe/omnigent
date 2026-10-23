@@ -2170,6 +2170,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "update",
         "upgrade",
         "usage",
+        "usage-export",
         "version",
     }
 )
@@ -10307,6 +10308,16 @@ def host_update_custom(
 # ``update`` stays upstream's alias of ``upgrade`` (installs the upstream
 # PyPI release), so the fork's short spelling is ``up``.
 cli.add_command(host_update_custom, name="up")
+
+
+def _register_usage_export_commands() -> None:
+    """Owner-scoped usage feed controls (cutover holds, bindings, route)."""
+    from omnigent.usage_export.cli import usage_export
+
+    cli.add_command(usage_export, name="usage-export")
+
+
+_register_usage_export_commands()
 
 
 def _host_update_custom_impl(

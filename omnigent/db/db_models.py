@@ -13,6 +13,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Double,
     Float,
     Index,
     Integer,
@@ -558,7 +559,7 @@ class SqlDeviceGrant(OmnigentBase):
         and recorded in the issued token's ``act`` claim for audit.
         Display/audit only — not a security-decision key.
     :param scope: Persisted authority; ``NULL`` only for first-party login
-        grants, ``sessions`` or ``usage:read`` for device grants.
+        grants, with device scopes including ``annotations:write``.
     :param user_id: The Omnigent identity that approved the grant, set at
         consent time. ``NULL`` while pending. The delegated token's ``sub``.
     :param refresh_token_hash: HMAC-SHA256 hex digest of the current
@@ -596,6 +597,7 @@ class SqlDeviceGrant(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     client_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     scope: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    label: Mapped[str | None] = mapped_column(String(80), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Digest of the just-superseded refresh token, kept only so a replay
@@ -606,6 +608,7 @@ class SqlDeviceGrant(OmnigentBase):
     expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_used_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
@@ -673,6 +676,90 @@ class SqlSessionPermission(OmnigentBase):
             "user_id",
         ),
     )
+
+
+class SqlAnnotationReceiver(OmnigentBase):
+    """One browser-annotation receiving session per user and workspace."""
+
+    __tablename__ = "annotation_receivers"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    session_archive_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    set_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (Index("ix_annotation_receivers_session", "workspace_id", "session_id"),)
+
+
+class SqlAnnotationReceipt(OmnigentBase):
+    """One durable Chrome batch identity, independent of grant-row retention."""
+
+    __tablename__ = "annotation_receipts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    grant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    item_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    accepted_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    dispatch_phase: Mapped[str] = mapped_column(String(16), nullable=False)
+    retry_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+
+    __table_args__ = (
+        Index("ix_annotation_receipts_item", "workspace_id", "session_id", "item_id"),
+    )
+
+
+class SqlAnnotationGrantOwner(OmnigentBase):
+    """Retain original owner after the credential grant row is purged."""
+
+    __tablename__ = "annotation_grant_owners"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    grant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_generation: Mapped[str] = mapped_column(String(32), nullable=False)
+    approved_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlAnnotationCapture(OmnigentBase):
+    """Owner-bound staging and committed capture identity."""
+
+    __tablename__ = "annotation_captures"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    grant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    capture_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    evidence_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    file_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ready", server_default="ready"
+    )
+    committed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+
+    __table_args__ = (Index("ix_annotation_captures_expiry", "workspace_id", "expires_at"),)
 
 
 class SqlConversationMetadata(OmnigentBase):
@@ -2732,6 +2819,8 @@ class SqlUsageFeed(OmnigentBase):
     next_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     read_timestamps: Mapped[str] = mapped_column(Text, nullable=False)
     progress: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    # JSON map of usage:read grant id to the highest cursor position presented.
+    grant_positions: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
 
 class SqlUsageUnit(OmnigentBase):
@@ -2749,6 +2838,10 @@ class SqlUsageUnit(OmnigentBase):
     latest_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     request_count: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Association result of the unit's turn: the linked admission, or the
+    # reason it stays unadmitted (see usage_export/cutover.py).
+    admission_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    association: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class SqlUsageCallAllocation(OmnigentBase):
@@ -2774,6 +2867,135 @@ class SqlUsageEvent(OmnigentBase):
     sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     payload: Mapped[str] = mapped_column(Text, nullable=False)
     snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    # Domain the event belongs to, so a cutover can read the domain's highest
+    # committed sequence under the hold and feed locks.
+    host_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    harness: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    __table_args__ = (
+        Index(
+            "ix_usage_events_domain_sequence",
+            "workspace_id",
+            "owner_digest",
+            "host_id",
+            "harness",
+            "sequence",
+        ),
+    )
+
+
+class SqlUsageCutoverHold(OmnigentBase):
+    """Durable per-domain cutover hold: generation and lifecycle state.
+
+    One row per ``(workspace_id, host_id, harness)``. ``generation`` is null
+    before the domain's first hold; once set it never decreases and a released
+    generation is never reused. ``created_at`` is the hold time H every gate
+    and every detection rule compares against.
+    """
+
+    __tablename__ = "usage_cutover_holds"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    host_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    harness: Mapped[str] = mapped_column(String(16), primary_key=True)
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # none | held | drained | released | invalidated | abandoned
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="none")
+    created_at: Mapped[float | None] = mapped_column(Double, nullable=True)
+    released_at: Mapped[float | None] = mapped_column(Double, nullable=True)
+    state_changed_at: Mapped[float | None] = mapped_column(Double, nullable=True)
+    refused_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class SqlUsageTurnAdmission(OmnigentBase):
+    """Durable record of one server admission, written before the turn starts.
+
+    ``admitted_at`` is server clock and is the ``call_started_not_before`` bound
+    of every call the turn produces. ``terminal_evidence`` is the JSON map of
+    physical thread key to the evidence kind that closed it.
+    """
+
+    __tablename__ = "usage_turn_admissions"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    admission_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    session_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    host_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    harness: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    admitted_at: Mapped[float] = mapped_column(Double, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    binding_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    binding_digest: Mapped[bytes | None] = mapped_column(_CKSUM32, nullable=True)
+    account_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_check: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    main_turn_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    terminal_state: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    terminal_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class SqlUsageCutoverReceipt(OmnigentBase):
+    """Append-only cutover receipt, chained by digest inside one domain."""
+
+    __tablename__ = "usage_cutover_receipts"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    host_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    harness: Mapped[str] = mapped_column(String(16), primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_seq: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receipt_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
+
+
+class SqlUsageAccountBindingRevision(OmnigentBase):
+    """Immutable pinned copy of an owner's account-binding document."""
+
+    __tablename__ = "usage_account_binding_revisions"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    config_revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
+
+
+class SqlUsageAccountBindingActivation(OmnigentBase):
+    """The one pinned binding revision an owner's admissions resolve against."""
+
+    __tablename__ = "usage_account_binding_activation"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    config_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    activated_at: Mapped[float] = mapped_column(Double, nullable=False)
+
+
+class SqlUsageRouteAttestation(OmnigentBase):
+    """Latest runner-attested billing route and opaque route reference per domain."""
+
+    __tablename__ = "usage_route_attestations"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    host_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    harness: Mapped[str] = mapped_column(String(16), primary_key=True)
+    owner_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    billing_route: Mapped[str] = mapped_column(String(16), nullable=False)
+    route_ref: Mapped[str] = mapped_column(String(256), nullable=False)
+    updated_at: Mapped[float] = mapped_column(Double, nullable=False)
 
 
 class SqlUsageProducer(OmnigentBase):

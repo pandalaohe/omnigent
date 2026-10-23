@@ -11,6 +11,8 @@ harness added is filtered by construction rather than by remembering.
 The model is not "no credentials ever". It is:
 
     shared safe base  +  this harness's own config/provider families
+                      +  names the host owner listed in
+                         ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
                       +  whatever the spec declared in
                          ``os_env.sandbox.env_passthrough``
 
@@ -92,7 +94,10 @@ def clean_agent_env(
     extra_allowed: Iterable[str] = (),
     source: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Filter an environment down to the base plus this harness's own families.
+    """Filter to the base, harness families and explicit host/spec names.
+
+    Host names come from ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` in the source
+    environment. They do not override denies or grant desktop-session access.
 
     :param allow_prefixes: Prefix families this harness owns, e.g. ``("QWEN_",)``.
         Added to :data:`BASE_ALLOW_PREFIXES`.
@@ -111,7 +116,12 @@ def clean_agent_env(
     env_source = os.environ if source is None else source
     prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
     extra = set(extra_allowed)
-    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra
+    host_allowed = {
+        name.strip()
+        for name in env_source.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",")
+        if name.strip()
+    }
+    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra | host_allowed
     denied = set(deny_exact) | (DESKTOP_SESSION_ENV_VARS - extra)
     return {
         key: value

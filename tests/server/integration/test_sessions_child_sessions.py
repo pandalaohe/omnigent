@@ -2216,6 +2216,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "pending_id": message_body["pending_id"],
                 "delivery_attempt_id": forwarded_event["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded_event["input_enqueued_at_ms"],
+                "usage_admission": None,
             },
         },
     ]

@@ -840,6 +840,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "pending_id": body["pending_id"],
                 "delivery_attempt_id": forwarded["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
+                "usage_admission": None,
             },
         ),
     ]

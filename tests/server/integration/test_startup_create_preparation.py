@@ -260,9 +260,60 @@ async def test_agent_child_inherits_effective_host_without_host_io(
 
 
 @pytest.mark.asyncio
-async def test_nested_child_inherits_host_through_hostless_parent(
-    client, conv_store, register_host
+@pytest.mark.parametrize(
+    ("child_workspace", "expected_workspace"),
+    [
+        pytest.param(None, "/opt/work/parent", id="inherits-parent"),
+        pytest.param("/opt/work/child", "/opt/work/child", id="explicit-child-wins"),
+    ],
+)
+async def test_direct_runner_named_child_workspace(
+    client, conv_store, child_workspace, expected_workspace
 ):
+    agent = await create_test_agent(
+        client, name="direct-runner-parent", sub_agents=[{"name": "worker"}]
+    )
+    binding = "direct-runner-workspace-binding"
+    runner_id = token_bound_runner_id(binding)
+    parent = conv_store.create_conversation(
+        agent_id=agent["id"], workspace="/opt/work/parent", runner_id=runner_id
+    )
+    body = {
+        "agent_id": agent["id"],
+        "parent_session_id": parent.id,
+        "sub_agent_name": "worker",
+        "title": "worker:workspace",
+    }
+    if child_workspace is not None:
+        body["workspace"] = child_workspace
+    response = await client.post(
+        "/v1/sessions",
+        json=body,
+        headers={
+            CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT,
+            RUNNER_TUNNEL_TOKEN_HEADER: binding,
+        },
+    )
+    assert response.status_code == 201, response.text
+    created = conv_store.get_conversation(response.json()["id"])
+    assert created.workspace == expected_workspace
+    assert created.host_id is None
+    assert created.parent_conversation_id == parent.id
+    assert created.sub_agent_name == "worker"
+
+
+@pytest.mark.asyncio
+async def test_nested_child_inherits_host_through_hostless_parent(
+    app, client, conv_store, register_host, db_uri
+):
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL, "session_collab", {"sessionRestrictions": "off"}
+    )
     capture = register_host()
     root = await _multipart_create(
         client, {"host_id": _HOST_ID, "workspace": "/Users/sample/project"}

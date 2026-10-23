@@ -22,9 +22,9 @@ from omnigent.server.permission_tiers import (
 
 
 @pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
-def test_full_requires_this_creation_selection(harness: str) -> None:
+def test_full_can_be_selected_explicitly_or_as_a_default(harness: str) -> None:
     assert creation_permission_tier(harness=harness) == "auto"
-    assert creation_permission_tier(harness=harness, default="full") == "auto"
+    assert creation_permission_tier(harness=harness, default="full") == "full"
     assert creation_permission_tier(harness=harness, inherited="full") == "auto"
     assert creation_permission_tier(harness=harness, inherited="plan") == "plan"
     assert creation_permission_tier(harness=harness, explicit="full", inherited="plan") == "full"

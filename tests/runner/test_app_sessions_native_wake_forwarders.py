@@ -1240,6 +1240,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
     class _FakeCodexAppServer:
         """Minimal app-server object used by ``codex_terminal_env``."""
 
+        workspace_profile = None
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
@@ -1300,6 +1301,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        permission_profile: str | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
@@ -1589,6 +1591,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
     class _FakeCodexAppServer:
         """Minimal app-server recording whether it was closed."""
 
+        workspace_profile = None
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
@@ -1661,6 +1664,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        permission_profile: str | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
@@ -1832,6 +1836,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     class _FakeCodexAppServer:
         """Minimal app-server recording whether it was closed."""
 
+        workspace_profile = None
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
@@ -1890,6 +1895,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        permission_profile: str | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,

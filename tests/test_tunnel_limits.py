@@ -82,9 +82,6 @@ def test_runner_server_silence_allows_pings_and_reconnect_within_grace() -> None
 
     assert RUNNER_TUNNEL_SILENCE_TIMEOUT_S == 2 * runner_tunnel.PING_INTERVAL_S
     assert RUNNER_TUNNEL_SILENCE_TIMEOUT_S >= serve._STABLE_CONNECTION_DURATION_S
-    assert serve._RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S == (
-        TUNNEL_KEEPALIVE_PING_INTERVAL_S + TUNNEL_KEEPALIVE_PING_TIMEOUT_S
-    )
     assert (
         RUNNER_TUNNEL_SILENCE_TIMEOUT_S
         + serve._GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S

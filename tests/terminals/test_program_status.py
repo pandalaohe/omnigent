@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import itertools
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.terminals import program_status
 from omnigent.terminals.program_status import ProgramStatus, ProgramStatusParser, parse_report
 
 
@@ -110,6 +112,189 @@ def test_output_is_preserved_except_capability_query(chunk_size: int) -> None:
     )
     assert output == stream.replace(b"\x1b]7501;?\x07\x1b[c", b"\x1b[c")
     assert queries == [True]
+
+
+def _mock_relay(monkeypatch: pytest.MonkeyPatch, events: list[object]) -> None:
+    """Keep relay on its real control path without forking or signaling a process."""
+    import fcntl
+    import pty
+    import select
+    import signal
+    import termios
+    import tty
+
+    clock = itertools.count(step=0.5)
+    monkeypatch.setattr(pty, "fork", lambda: (32123, 91))
+    monkeypatch.setattr(fcntl, "ioctl", lambda *_: b"\0" * 8)
+    monkeypatch.setattr(termios, "tcgetattr", lambda _: ["original"])
+    monkeypatch.setattr(termios, "tcsetattr", lambda *_: events.append("termios"))
+    monkeypatch.setattr(tty, "setraw", lambda _: None)
+    monkeypatch.setattr(signal, "signal", lambda *_: None)
+    monkeypatch.setattr(select, "select", lambda *_: ([91], [], []))
+    monkeypatch.setattr(program_status.os, "read", lambda *_: b"")
+    monkeypatch.setattr(program_status.os, "close", lambda fd: events.append(("close", fd)))
+    monkeypatch.setattr(program_status.os, "killpg", lambda *_: events.append("killpg"))
+    monkeypatch.setattr(program_status.os, "kill", lambda *_: events.append("kill"))
+    monkeypatch.setattr(program_status.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(program_status.time, "sleep", lambda _: None)
+
+
+def test_relay_closes_master_before_waiting_for_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[object] = []
+    _mock_relay(monkeypatch, events)
+    state_file = tmp_path / "status.json"
+
+    def waitpid(pid: int, options: int) -> tuple[int, int]:
+        assert (pid, options) == (32123, os.WNOHANG)
+        events.append("wait")
+        return (pid, 7 << 8) if ("close", 91) in events else (0, 0)
+
+    monkeypatch.setattr(program_status.os, "waitpid", waitpid)
+    assert program_status.relay(state_file, "claude-code", ["unused"]) == 7
+    assert events.index(("close", 91)) < events.index("wait")
+    assert "killpg" not in events
+    assert "kill" not in events
+    assert events[-1] == "termios"
+    assert not state_file.exists()
+
+
+def test_relay_unreapable_child_has_bounded_failure_and_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[object] = []
+    _mock_relay(monkeypatch, events)
+    state_file = tmp_path / "status.json"
+
+    def waitpid(pid: int, options: int) -> tuple[int, int]:
+        assert (pid, options) == (32123, os.WNOHANG)
+        events.append("wait")
+        return 0, 0
+
+    monkeypatch.setattr(program_status.os, "waitpid", waitpid)
+    with pytest.raises(RuntimeError, match=r"relay \d+: child 32123 did not reap"):
+        program_status.relay(state_file, "claude-code", ["unused"])
+    assert events.index(("close", 91)) < events.index("killpg")
+    assert events.index("killpg") < events.index("kill") < events.index("termios")
+    assert events.count("wait") < 20
+    assert not state_file.exists()
+
+
+def test_relay_preserves_normal_child_exit_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import select
+
+    events: list[object] = []
+    _mock_relay(monkeypatch, events)
+    state_file = tmp_path / "status.json"
+    polls = iter([([], [], []), ([91], [], [])])
+    monkeypatch.setattr(select, "select", lambda *_: next(polls))
+
+    def waitpid(pid: int, options: int) -> tuple[int, int]:
+        assert (pid, options) == (32123, os.WNOHANG)
+        return pid, 23 << 8
+
+    monkeypatch.setattr(program_status.os, "waitpid", waitpid)
+    assert program_status.relay(state_file, "claude-code", ["unused"]) == 23
+    assert events == [("close", 91), "termios"]
+    assert not state_file.exists()
+
+
+def test_relay_reaps_exiting_child_after_outer_output_disconnect(tmp_path: Path) -> None:
+    """A real controlling PTY exit completes when relay releases its master."""
+    state_file = tmp_path / "status.json"
+    go_file = tmp_path / "go"
+    wrote_file = tmp_path / "wrote"
+    wrapper = """import errno, os, sys, threading, time
+from pathlib import Path
+from omnigent.terminals import program_status
+
+real_waitpid = os.waitpid
+real_write_all = program_status._write_all
+def guarded_signal(*args):
+    raise AssertionError('unexpected real signal attempt')
+def observed_waitpid(pid, options):
+    child, status = real_waitpid(pid, options)
+    if child:
+        print(f'reaped:{os.waitstatus_to_exitcode(status)}', flush=True)
+    return child, status
+def disconnected_write(fd, data):
+    if fd == 1 and data:
+        watchdog = threading.Timer(8, lambda: os._exit(90))
+        watchdog.daemon = True
+        watchdog.start()
+        Path(sys.argv[2]).touch()
+        deadline = time.monotonic() + 5
+        while not Path(sys.argv[3]).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not Path(sys.argv[3]).exists():
+            raise AssertionError('child did not write to controlling tty')
+        time.sleep(0.5)
+        raise OSError(errno.EIO, 'outer output disconnected')
+    return real_write_all(fd, data)
+os.kill = os.killpg = guarded_signal
+os.waitpid = observed_waitpid
+program_status._write_all = disconnected_write
+try:
+    program_status.relay(Path(sys.argv[1]), 'claude-code', sys.argv[4:])
+except OSError as exc:
+    if exc.errno != errno.EIO:
+        raise
+    print('outer-output-eio', flush=True)
+except AssertionError as exc:
+    print(str(exc), flush=True)
+    raise SystemExit(42)
+else:
+    raise AssertionError('expected outer output disconnect')
+"""
+    child = """import os, sys, time
+from pathlib import Path
+os.write(1, b'r')
+deadline = time.monotonic() + 5
+while not Path(sys.argv[1]).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if not Path(sys.argv[1]).exists():
+    os._exit(91)
+tty_fd = os.open('/dev/tty', os.O_WRONLY)
+os.write(tty_fd, b'x' * 63)
+Path(sys.argv[2]).touch()
+os._exit(23)
+"""
+    master, slave = os.openpty()
+    try:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                wrapper,
+                str(state_file),
+                str(go_file),
+                str(wrote_file),
+                sys.executable,
+                "-c",
+                child,
+                str(go_file),
+                str(wrote_file),
+            ],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        ) as process:
+            os.close(slave)
+            slave = -1
+            output, _ = process.communicate(timeout=12)
+        assert process.returncode == 0, output
+        assert b"reaped:23\n" in output
+        assert b"outer-output-eio\n" in output
+        assert b"Traceback" not in output
+        assert b"unexpected real signal attempt" not in output
+        assert not state_file.exists()
+    finally:
+        os.close(master)
+        if slave != -1:
+            os.close(slave)
 
 
 @pytest.mark.parametrize("failure", ["missing", "not-executable", "stdin-eof", "stdin-eio"])

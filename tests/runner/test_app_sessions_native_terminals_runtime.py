@@ -644,6 +644,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version = version
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -803,6 +804,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         agent_pid: int | None = None,
         session_id: str | None = None,
         model_provider: str | None = None,
+        permission_profile: str | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -1250,6 +1252,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1348,6 +1351,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         agent_pid: int | None = None,
         session_id: str | None = None,
         model_provider: str | None = None,
+        permission_profile: str | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1570,6 +1574,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1659,6 +1664,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         agent_pid: int | None = None,
         session_id: str | None = None,
         model_provider: str | None = None,
+        permission_profile: str | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -1825,6 +1831,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -2102,6 +2109,7 @@ async def test_auto_create_codex_terminal_fresh_launch_loads_relaunch_graph(
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -2363,6 +2371,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -4061,6 +4070,8 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
             closed.append("client")
 
     class _AppServer:
+        workspace_profile = None
+
         def __init__(self) -> None:
             self.resident_incarnation_id = uuid.uuid4().hex
             self.exit_confirmed = False
@@ -4240,6 +4251,8 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
             return None
 
     class _AppServer:
+        workspace_profile = None
+
         def __init__(self) -> None:
             self.resident_incarnation_id = uuid.uuid4().hex
             self.exit_confirmed = False
@@ -4407,6 +4420,8 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
             closed["client"] = True
 
     class _AppServer:
+        workspace_profile = None
+
         def __init__(self) -> None:
             self.resident_incarnation_id = uuid.uuid4().hex
             self.exit_confirmed = False
@@ -4484,6 +4499,8 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             return None
 
     class _AppServer:
+        workspace_profile = None
+
         def __init__(self) -> None:
             self.resident_incarnation_id = uuid.uuid4().hex
             self.exit_confirmed = False
@@ -4593,6 +4610,8 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
             return None
 
     class _AppServer:
+        workspace_profile = None
+
         def __init__(self) -> None:
             self.resident_incarnation_id = uuid.uuid4().hex
             self.exit_confirmed = False
@@ -4732,6 +4751,8 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before
             return None
 
     class _AppServer:
+        workspace_profile = None
+
         def __init__(self) -> None:
             self.resident_incarnation_id = uuid.uuid4().hex
             self.exit_confirmed = False
@@ -4889,10 +4910,16 @@ async def test_codex_app_server_teardown_forgets_the_launch_bridge_dir(tmp_path:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("binding_token", [None, "native-forwarder-binding-test"])
+@pytest.mark.parametrize(
+    "profile_enabled,update_fails", [(False, False), (True, False), (True, True)]
+)
 async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     binding_token: str | None,
+    profile_enabled: bool,
+    update_fails: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     The fresh-session bridge state must carry the session workspace as ``cwd``.
@@ -4945,7 +4972,19 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         async def close(self) -> None:
             return None
 
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native import app_server as codex_app_server
+    from omnigent.harnesses.codex_native.launch_args import CodexWorkspaceProfile
+
+    update = AsyncMock(side_effect=RuntimeError("rejected") if update_fails else None)
+    monkeypatch.setattr(codex_app_server, "apply_codex_thread_permissions", update)
+
     class _AppServer:
+        workspace_profile = (
+            CodexWorkspaceProfile("omnigent-workspace", ()) if profile_enabled else None
+        )
+
         async def close(self) -> None:
             return None
 
@@ -4969,6 +5008,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
             workspace=str(workspace),
+            app_server=_AUTO_CODEX_APP_SERVERS[session_id],
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
             thread_start_timeout_seconds=120.0,
@@ -4993,6 +5033,13 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     assert forwarder_kwargs["headers"].get(RUNNER_TUNNEL_TOKEN_HEADER) == binding_token
     assert wait_calls == [{"timeout": 120.0}]
     assert codex_native_bridge.read_bridge_startup_timeout(tmp_path) == 120.0
+
+    assert state.permission_profile == ("omnigent-workspace" if profile_enabled else None)
+    assert update.await_count == int(profile_enabled)
+    if profile_enabled:
+        update.assert_awaited_once_with("ws://127.0.0.1:1", thread_id, "omnigent-workspace")
+    if update_fails:
+        assert "Failed to apply Codex thread permissions" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -5207,6 +5254,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
@@ -5269,6 +5317,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         agent_pid: int | None = None,
         session_id: str | None = None,
         model_provider: str | None = None,
+        permission_profile: str | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -5454,6 +5503,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
         agent_pid: int | None = None
+        workspace_profile = None
 
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
@@ -5516,6 +5566,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         agent_pid: int | None = None,
         session_id: str | None = None,
         model_provider: str | None = None,
+        permission_profile: str | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

@@ -77,6 +77,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "host_id",
         "timezone",
         "state",
+        "paused_by_archive_batch",
         "last_run_at",
         "last_run_conversation_id",
         "created_at",

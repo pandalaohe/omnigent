@@ -2942,15 +2942,10 @@ export function NewChatLandingScreen() {
   const [cursorExecMode, setCursorExecMode] = useState<string>(
     () => restoredDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
-  const [agySkipMode, setAgySkipMode] = useState<string>(() =>
-    normalizeAgyPermissionTier(restoredDraft?.agySkipMode) === "full"
-      ? AGY_NATIVE_DEFAULT_PERMISSION_TIER
-      : (normalizeAgyPermissionTier(restoredDraft?.agySkipMode) ??
-        AGY_NATIVE_DEFAULT_PERMISSION_TIER),
+  const [agySkipMode, setAgySkipMode] = useState<string>(
+    () =>
+      normalizeAgyPermissionTier(restoredDraft?.agySkipMode) ?? AGY_NATIVE_DEFAULT_PERMISSION_TIER,
   );
-  const [tierFullChosen, setTierFullChosen] = useState(false);
-  const tierFullChoiceHarness = useRef<string | null>(null);
-  const [migratedFullProjectDefault, setMigratedFullProjectDefault] = useState(false);
   // Devin's `--permission-mode`. Only meaningful for the devin-native wrapper.
   const [devinPermissionMode, setDevinPermissionMode] = useState<string>(
     () => restoredDraft?.devinPermissionMode ?? DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
@@ -4806,8 +4801,6 @@ export function NewChatLandingScreen() {
     } else if (supportsCursorMode) setCursorExecMode(mode);
     else if (supportsAgyPermissionTier) {
       setAgySkipMode(mode);
-      setTierFullChosen(mode === "full");
-      tierFullChoiceHarness.current = mode === "full" ? selectionHarness : null;
     } else if (supportsDevinPermission) setDevinPermissionMode(mode);
     else if (hasGenericPermissionMode) setPermissionMode(mode);
     rememberPickerOptions(selectionHarness!, { mode });
@@ -4988,16 +4981,11 @@ export function NewChatLandingScreen() {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     } else if (supportsAgyPermissionTier) {
       const savedTier = normalizeAgyPermissionTier(seededPermission ?? stored.mode);
-      if (!(tierFullChosen && tierFullChoiceHarness.current === selectionHarness)) {
-        setAgySkipMode(
-          savedTier !== "full" &&
-            AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === savedTier)
-            ? savedTier!
-            : AGY_NATIVE_DEFAULT_PERMISSION_TIER,
-        );
-        setTierFullChosen(false);
-        tierFullChoiceHarness.current = null;
-      }
+      setAgySkipMode(
+        AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === savedTier)
+          ? savedTier!
+          : AGY_NATIVE_DEFAULT_PERMISSION_TIER,
+      );
       if (!projectVisit && selectedNativeHarness === "antigravity-native") {
         const model =
           stored.model && agyModelOptions.some((row) => row.id === stored.model)
@@ -5566,12 +5554,9 @@ export function NewChatLandingScreen() {
               current === seedFromApprovalMode ? seed.permission! : current,
             );
           } else if (["antigravity-native", "pi", "pi-native"].includes(seedHarness)) {
-            setMigratedFullProjectDefault(normalizeAgyPermissionTier(seed.permission) === "full");
             setAgySkipMode((current) =>
               current === seedFromAgySkipMode
-                ? normalizeAgyPermissionTier(seed.permission) === "full"
-                  ? AGY_NATIVE_DEFAULT_PERMISSION_TIER
-                  : (normalizeAgyPermissionTier(seed.permission) ?? current)
+                ? (normalizeAgyPermissionTier(seed.permission) ?? current)
                 : current,
             );
           } else if (seedHarness === "claude-sdk" || seedHarness === "claude-native") {
@@ -5695,6 +5680,7 @@ export function NewChatLandingScreen() {
           }
         : null,
     enabled: canDiscoverHostSkills,
+    allowPending: true,
     starting: !sandboxSelected && (hostsLoading || agentsLoading),
   });
   const availableSkills = useMemo(
@@ -6826,7 +6812,7 @@ export function NewChatLandingScreen() {
             : {}),
           ...(sdkHarness === "codex" ? { approval_mode: approvalMode } : {}),
           ...(agentSupportsAgyPermissionTier && !smartRoutingHarnessSelected
-            ? { permission_tier: agySkipMode === "full" && !tierFullChosen ? "auto" : agySkipMode }
+            ? { permission_tier: agySkipMode }
             : {}),
           cost_control_mode_override: costControlOverride,
           // Top-level Smart Routing sends the same "auto" sentinel the bundle
@@ -8456,11 +8442,6 @@ export function NewChatLandingScreen() {
               {AGY_RESTRICTED_HOOK_RULE}
             </p>
           )}
-          {supportsAgyPermissionTier && migratedFullProjectDefault && (
-            <div role="status" className="rounded-md border border-border px-2 py-1.5 text-xs">
-              项目原有的全放开默认值已迁为自动。若本次确需全放开，请在权限菜单中明确选择。
-            </div>
-          )}
           {supportsAgyPermissionTier &&
             !autoRoutingSelected &&
             agySkipMode === AGY_NATIVE_FULL_PERMISSION_TIER && (
@@ -8470,7 +8451,7 @@ export function NewChatLandingScreen() {
                 className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
               >
                 <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-                <span>全放开会跳过本套审批与规则；仅本次创建时可选。</span>
+                <span>Full access bypasses tier approvals and risk rules for this session.</span>
               </div>
             )}
           {/* Warn (don't block) when the selected agent's harness isn't

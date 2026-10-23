@@ -40,13 +40,14 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_ru
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import (
     configure_mock_llm,
-    create_runner_bound_session,
     find_free_port,
     get_mock_requests,
+    lookup_agent_id,
     register_inline_agent,
     send_user_message_to_session,
     set_fallback_mock_llm,
 )
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CHILD_MODEL = "pi-startup-child"
@@ -205,7 +206,9 @@ def pi_startup_rig(tmp_path: Path) -> Iterator[PiRig]:
     with (
         (evidence / "server.log").open("w") as server_log,
         (evidence / "runner.log").open("w") as runner_log,
-        httpx.Client(base_url=base_url, trust_env=False, timeout=15) as client,
+        httpx.Client(
+            base_url=base_url, trust_env=False, timeout=15, headers=PERMISSION_TIERS_HEADERS
+        ) as client,
     ):
         try:
             processes.append(
@@ -346,7 +349,14 @@ def test_real_pi_child_startup_cannot_complete_or_timeout_running_work(
             },
         },
     )
-    parent = create_runner_bound_session(client, agent_name=parent_name, runner_id=rig.runner_id)
+    created = client.post(
+        "/v1/sessions",
+        json={"agent_id": lookup_agent_id(client, parent_name), "workspace": str(workspace)},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    created.raise_for_status()
+    parent = created.json()["id"]
+    client.patch(f"/v1/sessions/{parent}", json={"runner_id": rig.runner_id}).raise_for_status()
     send_user_message_to_session(client, session_id=parent, content="Initialize, then wait.")
     _wait(
         lambda: (

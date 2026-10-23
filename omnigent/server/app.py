@@ -213,6 +213,8 @@ class BrandingInfo(BaseModel):
 
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
+    browser_annotations_available: bool = False
+    connected_apps_available: bool = False
     single_user: bool
     login_url: str | None
     needs_setup: bool
@@ -1634,6 +1636,9 @@ def create_app(
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+    annotation_enabled = False
+    annotation_storage_supported = False
+    connected_apps_enabled = False
 
     # Public base path for serving behind a subpath reverse proxy (issue
     # #1031). Falls back to OMNIGENT_WEB_BASE_PATH so Docker/PaaS entrypoints
@@ -2124,6 +2129,7 @@ def create_app(
             conversation_store=conversation_store,
             file_store=file_store,
             artifact_store=artifact_store,
+            annotation_staging_cleanup=annotation_storage_supported,
         )
         app_inst.state.attachment_archive_cleanup = attachment_archive_cleanup
         await attachment_archive_cleanup.start()
@@ -2245,6 +2251,12 @@ def create_app(
         ManagedStartupInputs(conversation_store, host_registry)
         if startup_policy is not None
         or (sandbox_config is not None and sandbox_config.managed_launch_supported)
+        or (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "accounts"
+            and os.environ.get("OMNIGENT_CHROME_ANNOTATIONS_ENABLED", "").lower()
+            in ("1", "true", "yes", "on")
+        )
         else None
     )
     app.state.startup_inputs = startup_inputs
@@ -3554,6 +3566,9 @@ def create_app(
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
+                "browser_annotations_available": annotation_enabled
+                and annotation_storage_supported,
+                "connected_apps_available": connected_apps_enabled,
                 "single_user": single_user,
                 "login_url": login_url,
                 "needs_setup": needs_setup,
@@ -4000,6 +4015,7 @@ def create_app(
             conversation_store,
             auth_provider=auth_provider,
             feature_flags=resolved_feature_flags,
+            host_registry=host_registry,
         ),
         prefix="/v1",
         tags=["usage"],
@@ -5227,6 +5243,78 @@ def create_app(
 
             device_grant_store = DeviceGrantStore(permission_store.storage_location)
             auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            from omnigent.server.auth import env_var_is_truthy
+
+            annotation_enabled = (
+                auth_provider._source == "accounts"
+                and env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+                and env_var_is_truthy("OMNIGENT_CHROME_ANNOTATIONS_ENABLED", default=False)
+            )
+            annotation_storage_supported = (
+                annotation_enabled
+                and account_store is not None
+                and all(
+                    engine is device_grant_store._engine
+                    for engine in (
+                        getattr(account_store, "_engine", None),
+                        getattr(permission_store, "_engine", None),
+                        getattr(conversation_store, "_engine", None),
+                        getattr(conversation_store, "_conv_engine", None),
+                        getattr(file_store, "_engine", None),
+                    )
+                )
+            )
+            auth_provider.set_annotation_origin(
+                os.environ.get("OMNIGENT_CHROME_EXTENSION_ORIGIN") if annotation_enabled else None
+            )
+            auth_provider.set_annotation_grant_check(
+                lambda grant_id, user_id, generation: (
+                    annotation_enabled
+                    and device_grant_store.authorize_annotation_request(
+                        grant_id, user_id, generation
+                    )
+                )
+            )
+            if annotation_enabled:
+                from omnigent.server.annotation_receiver_store import AnnotationReceiverStore
+                from omnigent.server.routes.browser_annotations import (
+                    create_browser_annotations_router,
+                )
+                from omnigent.stores.conversation_store.sqlalchemy_store import (
+                    SqlAlchemyConversationStore,
+                )
+
+                chrome_origin = os.environ.get("OMNIGENT_CHROME_EXTENSION_ORIGIN", "")
+                app.state.chrome_annotation_origin = chrome_origin
+
+                def annotation_target_live(session_id: str) -> bool:
+                    conversation = conversation_store.get_conversation(session_id)
+                    if conversation is None:
+                        return False
+                    liveness = _session_liveness(session_id)
+                    return bool(
+                        (conversation.host_id is not None and liveness.host_online is True)
+                        or (conversation.runner_id is not None and liveness.runner_online)
+                    )
+
+                app.state.annotation_target_live = annotation_target_live
+
+                app.include_router(
+                    create_browser_annotations_router(
+                        auth_provider,
+                        AnnotationReceiverStore(permission_store.storage_location),
+                        device_grant_store,
+                        chrome_origin=chrome_origin,
+                        storage_supported=annotation_storage_supported,
+                        conversations=conversation_store
+                        if isinstance(conversation_store, SqlAlchemyConversationStore)
+                        else None,
+                        artifacts=artifact_store,
+                        startup_inputs=startup_inputs,
+                        target_live=annotation_target_live,
+                    ),
+                    tags=["browser-annotations"],
+                )
 
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
@@ -5356,9 +5444,11 @@ def create_app(
                     auth_provider,
                     device_grant_store,
                     handle_client_credentials=handle_client_credentials,
+                    annotation_storage_supported=annotation_storage_supported,
                 ),
                 tags=["oauth"],
             )
+            connected_apps_enabled = True
             _logger.info("device-grant: /oauth/* routes enabled")
             # Multi-user server with a PUBLIC device-authorize endpoint: without
             # the shared client secret, anyone who can reach the server can

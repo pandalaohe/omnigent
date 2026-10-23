@@ -153,7 +153,7 @@ def creation_permission_tier(
     default: object = None,
     inherited: PermissionTier | None = None,
 ) -> PermissionTier:
-    """Only this create request's explicit selection can mint a new full session."""
+    """Honor explicit selections and saved defaults without copying full authority."""
     tier_label_key(harness)
     if explicit is not None:
         try:
@@ -166,8 +166,7 @@ def creation_permission_tier(
         return DEFAULT_PERMISSION_TIER if inherited == "full" else inherited
     if default is None:
         return DEFAULT_PERMISSION_TIER
-    tier = normalize_permission_tier(default, harness=harness, legacy=True)
-    return DEFAULT_PERMISSION_TIER if tier == "full" else tier
+    return normalize_permission_tier(default, harness=harness, legacy=True)
 
 
 def legacy_permission_tier(

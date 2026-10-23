@@ -602,11 +602,12 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
     assert state.posted_approval_preset == "full-access"
 
 
-def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
+@pytest.mark.parametrize("approval_policy", ["on-failure", "on-request"])
+def test_codex_permission_settings_fall_back_to_legacy_policy_args(approval_policy: str) -> None:
     """Legacy settings without an active profile keep approval and sandbox."""
     assert fwd._codex_terminal_launch_args_from_settings(
         {
-            "approvalPolicy": "on-failure",
+            "approvalPolicy": approval_policy,
             "approvalsReviewer": "user",
             "sandboxPolicy": {"type": "workspace-write"},
         }
@@ -614,7 +615,24 @@ def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
         "--sandbox",
         "workspace-write",
         "--ask-for-approval",
-        "on-failure",
+        approval_policy,
         "-c",
         'approvals_reviewer="user"',
+    ]
+
+
+def test_generated_permission_readback_is_explicit_legacy_stance() -> None:
+    assert fwd._codex_terminal_launch_args_from_settings(
+        {
+            "activePermissionProfile": {"id": "omnigent-workspace"},
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+        }
+    ) == [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="auto_review"',
     ]

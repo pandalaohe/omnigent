@@ -238,6 +238,12 @@ def main(argv: list[str] | None = None) -> int:
             payload["omnigent_fork_rotated_to"] = rotated_session_id
     try:
         record_hook_event(bridge_dir, payload)
+        if payload.get("hook_event_name") in {"Stop", "SubagentStop"}:
+            from omnigent.usage_export.runtime import capture_claude_hook_path
+
+            active = read_active_session_id(bridge_dir)
+            if active:
+                capture_claude_hook_path(active, payload, harness="claude-native")
     except Exception as exc:  # noqa: BLE001 - hook must not break Claude Code.
         print(f"omnigent claude hook: failed to record hook: {exc}", file=sys.stderr)
     conversation_url = _conversation_url_for_active_session(bridge_dir, args.conversation_url)
@@ -989,6 +995,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
         return _fail_closed()
 
+    if hook_event == "UserPromptSubmit" and isinstance(eval_response.get("usage_admission"), dict):
+        from omnigent.usage_export.runtime import begin_admitted_turn, check_live_route
+
+        begin_admitted_turn(session_id, "claude-native", eval_response["usage_admission"])
+        check_live_route(session_id, "claude-native", os.environ)
+        record_hook_event(bridge_dir, {**payload, "admission_id": eval_response["admission_id"]})
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))

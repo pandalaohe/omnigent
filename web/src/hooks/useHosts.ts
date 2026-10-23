@@ -8,6 +8,7 @@ import {
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { isSandboxHostChoice, readLastHostChoice } from "@/lib/hostPreferences";
+import { withHostRequestTimeout } from "@/lib/hostRequestTimeout";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -453,24 +454,27 @@ async function fetchHostModelOptions(
   refresh?: "auto" | "force",
 ): Promise<NativeModelOption[]> {
   const suffix = refresh ? `?refresh=${refresh}` : "";
-  const res = await authenticatedFetch(
-    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options${suffix}`,
-  );
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      const body = (await res.json()) as { detail?: unknown };
-      if (typeof body.detail === "string" && body.detail) detail = body.detail;
-    } catch {
-      // Non-JSON error body — keep the status-line detail.
+  return withHostRequestTimeout(async (signal) => {
+    const res = await authenticatedFetch(
+      `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options${suffix}`,
+      { signal },
+    );
+    if (!res.ok) {
+      let detail = `${res.status} ${res.statusText}`;
+      try {
+        const body = (await res.json()) as { detail?: unknown };
+        if (typeof body.detail === "string" && body.detail) detail = body.detail;
+      } catch {
+        // Non-JSON error body — keep the status-line detail.
+      }
+      throw new ApiError(detail, res.status, null);
     }
-    throw new Error(detail);
-  }
-  const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
-  const models = body.models ?? [];
-  // Backward compatibility with servers that encoded probe failure in a 200.
-  if (body.error) throw new Error(body.error);
-  return models;
+    const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
+    const models = body.models ?? [];
+    // Backward compatibility with servers that encoded probe failure in a 200.
+    if (body.error) throw new Error(body.error);
+    return models;
+  });
 }
 
 /** Refresh a catalog while retaining the last usable rows if the probe fails. */
@@ -525,8 +529,11 @@ export function useHostModelOptions(
     ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
     // Retry boot-probe races while any picker uses this catalog. Persistent
     // failures surface after bounded backoff (~22 s).
-    retry: (failureCount) =>
-      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
+    retry: (failureCount, error) =>
+      error.name !== "TimeoutError" &&
+      !(error instanceof ApiError && error.status === 504) &&
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 &&
+      failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
   const previouslyRefreshing = useRef(canRefresh);

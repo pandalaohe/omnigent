@@ -286,6 +286,7 @@ def _build_accounts_app(
     *,
     device_grant_enabled: bool = True,
     base_path: str | None = None,
+    conversation_db_url: str | None = None,
 ) -> Iterator[TestClient]:
     monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -322,7 +323,7 @@ def _build_accounts_app(
     telemetry.init()
     permission_store = SqlAlchemyPermissionStore(db_url)
     agent_store = SqlAlchemyAgentStore(db_url)
-    conversation_store = SqlAlchemyConversationStore(db_url)
+    conversation_store = SqlAlchemyConversationStore(conversation_db_url or db_url)
     file_store = SqlAlchemyFileStore(db_url)
     comment_store = SqlAlchemyCommentStore(db_url)
     host_store = HostStore(db_url)
@@ -1123,3 +1124,328 @@ def test_app_skips_device_grant_for_github_oidc_without_crashing(
     # why the skip matters — then confirm the gate keeps it unreached.
     with pytest.raises(RuntimeError, match="GitHub OAuth"):
         create_device_auth_router(provider, None)  # type: ignore[arg-type]
+
+
+_CHROME_ORIGIN = "chrome-extension://" + "a" * 32
+_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+
+
+@pytest.mark.parametrize("shared_secret_enabled", [False, True])
+def test_chrome_public_pairing_preserves_shared_secret_and_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared_secret_enabled: bool
+) -> None:
+    from omnigent.server.routes import device_auth
+
+    monkeypatch.setenv("OMNIGENT_CHROME_ANNOTATIONS_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_CHROME_EXTENSION_ORIGIN", _CHROME_ORIGIN)
+    monkeypatch.setattr(device_auth, "_POLL_INTERVAL_SECONDS", 0)
+    if shared_secret_enabled:
+        monkeypatch.setenv("OMNIGENT_DEVICE_CLIENT_SECRET", _SECRET)
+    else:
+        monkeypatch.delenv("OMNIGENT_DEVICE_CLIENT_SECRET", raising=False)
+    generator = _build_accounts_app(tmp_path, monkeypatch)
+    client = next(generator)
+    try:
+        origin = {"Origin": _CHROME_ORIGIN}
+        assert (
+            client.post("/oauth/annotations/authorize", json={"label": "Desk"}).status_code == 403
+        )
+        assert (
+            client.post(
+                "/oauth/annotations/authorize",
+                json={"label": "Desk"},
+                headers={"Origin": "chrome-extension://" + "b" * 32},
+            ).status_code
+            == 403
+        )
+        preflight = client.options("/oauth/annotations/authorize", headers=origin)
+        assert preflight.status_code == 204
+        assert preflight.headers["access-control-allow-origin"] == _CHROME_ORIGIN
+        assert "access-control-allow-credentials" not in preflight.headers
+        assert (
+            client.post("/oauth/annotations/authorize", json={}, headers=origin).status_code == 400
+        )
+        assert (
+            client.post(
+                "/oauth/annotations/authorize",
+                json={"label": "Desk", "scope": "sessions"},
+                headers=origin,
+            ).status_code
+            == 400
+        )
+        requested = client.post(
+            "/oauth/annotations/authorize", json={"label": "Desk"}, headers=origin
+        )
+        assert requested.status_code == 200
+        assert requested.headers["cache-control"] == "no-store"
+        data = requested.json()
+        assert data["expires_in"] == 600
+
+        generic = client.post(
+            "/oauth/token",
+            data={"grant_type": _DEVICE_GRANT_TYPE, "device_code": data["device_code"]},
+        )
+        assert generic.status_code == (401 if shared_secret_enabled else 400)
+        assert generic.json()["error"] == (
+            "invalid_client" if shared_secret_enabled else "invalid_grant"
+        )
+        assert client.post(
+            "/oauth/device/authorize",
+            json={"client_id": "omnigent-chrome", "scope": "annotations:write"},
+        ).status_code in (400, 401)
+
+        _login_admin(client)
+        consent = client.get("/oauth/device", params={"user_code": data["user_code"]})
+        assert consent.status_code == 200
+        assert "Desk" in consent.text
+        assert (
+            "list editable sessions, stage screenshots, and send annotation batches"
+            in consent.text
+        )
+        assert (
+            client.post("/oauth/device/approve", data={"user_code": data["user_code"]}).status_code
+            == 403
+        )
+        approval = client.post(
+            "/oauth/device/approve",
+            data={"user_code": data["user_code"]},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert approval.status_code == 200
+        assert "Connected" in approval.text
+
+        issued = client.post(
+            "/oauth/annotations/token",
+            data={"grant_type": _DEVICE_GRANT_TYPE, "device_code": data["device_code"]},
+            headers=origin,
+        )
+        assert issued.status_code == 200
+        body = issued.json()
+        claims = jwt.decode(body["access_token"], options={"verify_signature": False})
+        assert claims["scope"] == "annotations:write"
+        assert claims["act"] == {"client_id": "omnigent-chrome"}
+        assert body["grant_id"] == claims["grant_id"]
+        assert body["user_id"] == "admin"
+        assert body["protocol_version"] == 1
+        assert body["refresh_token"]
+        connected = client.get("/v1/me/connected-apps")
+        assert connected.status_code == 200
+        assert connected.json()["apps"][0]["label"] == "Desk"
+        repeated = client.post(
+            "/oauth/annotations/token",
+            data={"grant_type": _DEVICE_GRANT_TYPE, "device_code": data["device_code"]},
+            headers=origin,
+        )
+        assert repeated.status_code == 400
+        assert repeated.json()["error"] == "invalid_grant"
+
+        refreshed = client.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
+        )
+        assert refreshed.status_code == 200
+        assert refreshed.json()["refresh_token"] != body["refresh_token"]
+        from starlette.requests import Request
+
+        from omnigent.server.accounts_store import SqlAlchemyAccountStore
+        from omnigent.server.auth import create_auth_provider
+
+        store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
+        provider = create_auth_provider()
+        provider.set_account_check(
+            SqlAlchemyAccountStore(f"sqlite:///{tmp_path}/test.db").accepts_generation
+        )
+        provider.set_grant_revocation_check(store.is_revoked)
+        provider.set_annotation_grant_check(store.authorize_annotation_request)
+        provider.set_annotation_origin(_CHROME_ORIGIN)
+
+        def identity(
+            method: str,
+            path: str,
+            request_origin: str | None,
+            *,
+            raw_path: bytes | None = None,
+        ) -> str | None:
+            from omnigent.db.account_authority import account_authority_scope
+
+            headers = [(b"authorization", f"Bearer {body['access_token']}".encode())]
+            if request_origin is not None:
+                headers.append((b"origin", request_origin.encode()))
+            request = Request(
+                {
+                    "type": "http",
+                    "method": method,
+                    "scheme": "https",
+                    "server": ("omni.example.test", 443),
+                    "path": path,
+                    "raw_path": raw_path if raw_path is not None else path.encode(),
+                    "query_string": b"",
+                    "headers": headers,
+                }
+            )
+            with account_authority_scope(None, None):
+                return provider.get_user_id(request)
+
+        for method in ("GET", "POST"):
+            for path in (
+                "/v1/browser-annotations/sessions",
+                "/v1/browser-annotations/batches/" + "a" * 32,
+            ):
+                assert identity(method, path, _CHROME_ORIGIN) == "admin"
+                assert identity(method, path, None) is None
+                assert identity(method, path, "http://localhost") is None
+            assert (
+                identity(
+                    method,
+                    "/v1/browser-annotations/sessions",
+                    _CHROME_ORIGIN,
+                    raw_path=b"/v1/browser-annotations/%73essions",
+                )
+                is None
+            )
+        assert store.authorize_annotation_request(
+            body["grant_id"], "admin", claims["account_generation"]
+        )
+        assert not store.authorize_annotation_request(
+            body["grant_id"], "other", claims["account_generation"]
+        )
+        client.cookies.clear()
+        bearer = {"Authorization": f"Bearer {body['access_token']}"}
+        for path in (
+            "/v1/hosts",
+            "/v1/agents",
+            "/v1/usage-events",
+            "/v1/me/connected-apps",
+            "/v1/sessions",
+        ):
+            assert client.get(path, headers=bearer).status_code == 401, path
+        assert (
+            client.post(
+                "/oauth/device/approve",
+                data={"user_code": data["user_code"]},
+                headers={**bearer, "Origin": "http://localhost:8000"},
+            ).status_code
+            == 401
+        )
+        revoked = client.post(
+            "/oauth/revoke", data={"refresh_token": refreshed.json()["refresh_token"]}
+        )
+        assert revoked.status_code == 200
+        assert not store.authorize_annotation_request(
+            body["grant_id"], "admin", claims["account_generation"]
+        )
+        for method in ("GET", "POST"):
+            assert identity(method, "/v1/browser-annotations/sessions", _CHROME_ORIGIN) is None
+            assert (
+                identity(method, "/v1/browser-annotations/batches/" + "a" * 32, _CHROME_ORIGIN)
+                is None
+            )
+    finally:
+        generator.close()
+
+
+def test_connected_apps_lists_and_revokes_only_owned_delegations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    monkeypatch.delenv("OMNIGENT_CHROME_ANNOTATIONS_ENABLED", raising=False)
+    generator = _build_accounts_app(tmp_path, monkeypatch)
+    client = next(generator)
+    try:
+        _login_admin(client)
+        store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
+        accounts = SqlAlchemyAccountStore(f"sqlite:///{tmp_path}/test.db")
+        accounts.create_user_with_password("other", "unused-test-hash")
+        now = int(time.time())
+        with account_authority_scope(None, None):
+            for grant_id, owner in (("slack-owned", "admin"), ("other-owned", "other")):
+                store.create_grant(
+                    grant_id,
+                    device_code_hash=hash_secret(grant_id, _KEY),
+                    user_code=grant_id.upper(),
+                    client_id="slack",
+                    scope="sessions",
+                    created_at=now,
+                    expires_at=now + 600,
+                )
+                store.approve(grant_id, user_id=owner, now_epoch_seconds=now)
+                store.redeem_approved(
+                    grant_id,
+                    refresh_token_hash=hash_secret(grant_id + "-refresh", _KEY),
+                    now_epoch_seconds=now,
+                )
+            login = store.create_redeemed_grant(
+                "login-owned",
+                user_id="admin",
+                client_id="omnigent-cli",
+                refresh_token_hash=hash_secret("login-refresh", _KEY),
+                created_at=now,
+            )
+        assert login.scope is None
+        listed = client.get("/v1/me/connected-apps")
+        assert listed.status_code == 200
+        assert [entry["grant_id"] for entry in listed.json()["apps"]] == ["slack-owned"]
+        assert listed.json()["apps"][0]["label"] == "slack"
+        assert listed.json()["apps"][0]["last_used_at"] == now
+        origin = {"Origin": "http://localhost:8000"}
+        assert (
+            client.delete("/v1/me/connected-apps/login-owned", headers=origin).status_code == 404
+        )
+        assert (
+            client.delete("/v1/me/connected-apps/other-owned", headers=origin).status_code == 404
+        )
+        assert client.delete("/v1/me/connected-apps/slack-owned").status_code == 403
+        assert (
+            client.delete("/v1/me/connected-apps/slack-owned", headers=origin).status_code == 200
+        )
+        assert client.get("/v1/me/connected-apps").json()["apps"] == []
+        assert store.is_revoked("slack-owned")
+        assert not store.is_revoked("other-owned")
+    finally:
+        generator.close()
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "allowed"),
+    [
+        ("GET", "/v1/browser-annotations/sessions", True),
+        ("POST", "/v1/browser-annotations/sessions", True),
+        ("POST", "/v1/browser-annotations/sessions/sid_1/screenshots", True),
+        ("POST", "/v1/browser-annotations/sessions/sid_1/batches", True),
+        ("GET", "/v1/browser-annotations/batches/" + "a" * 32, True),
+        ("POST", "/v1/browser-annotations/batches/" + "a" * 32, True),
+        ("POST", "/oauth/token", True),
+        ("POST", "/oauth/revoke", True),
+        ("GET", "/v1/browser-annotations/sessions/sid_1", False),
+        ("POST", "/v1/browser-annotations/sessions/", False),
+        ("POST", "/v1/browser-annotations/sessions-extra", False),
+        ("POST", "/v1/browser-annotations/batches/" + "a" * 32 + "/", False),
+        ("POST", "/v1/browser-annotations/batches/" + "a" * 33, False),
+        ("HEAD", "/v1/browser-annotations/sessions", False),
+        ("PUT", "/v1/browser-annotations/sessions", False),
+        ("PATCH", "/v1/browser-annotations/sessions", False),
+        ("DELETE", "/v1/browser-annotations/sessions", False),
+        ("OPTIONS", "/v1/browser-annotations/sessions", False),
+        ("HEAD", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("PUT", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("PATCH", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("DELETE", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("OPTIONS", "/v1/browser-annotations/batches/" + "a" * 32, False),
+        ("POST", "/v1/browser-annotations/sessions/sid_1/stop", False),
+        ("GET", "/v1/browser-annotations/batches/short", False),
+        ("POST", "/v1/browser-annotations/batches/short", False),
+        ("GET", "/v1/sessions", False),
+        ("PUT", "/v1/me/annotation-receiver", False),
+        ("GET", "/v1/me/connected-apps", False),
+        ("GET", "/v1/hosts", False),
+        ("POST", "/v1/browser-annotations/sessions/sid_1/../batches", False),
+    ],
+)
+def test_annotation_scope_exact_method_path_matrix(method: str, path: str, allowed: bool) -> None:
+    from omnigent.server.auth import annotation_path_allowed
+
+    assert annotation_path_allowed(method, path) is allowed

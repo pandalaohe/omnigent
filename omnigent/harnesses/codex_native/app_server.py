@@ -54,15 +54,19 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
 from omnigent.harnesses.codex_native.launch_args import (
+    MIN_NATIVE_PROFILE_CODEX_VERSION,
+    CodexWorkspaceProfile,
+    _codex_resume_permission_params,
     _merge_tables,
+    _set_codex_resume_config_param,
     _write_private_config,
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
-    codex_config_string,
-    codex_permission_stance,
+    codex_workspace_profile,
     codex_workspace_roots,
     materialize_codex_config_profile,
+    normalize_codex_permission_launch_args,
     read_codex_mcp_servers,
     reject_reserved_codex_transport_args,
     validate_codex_config_profile_state,
@@ -152,6 +156,7 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 _APP_SERVER_READY_TIMEOUT_SECONDS = 60.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
+_PICKER_CATALOG_WAIT_SECONDS = 2.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _CONTEXT_CATALOG_TIMEOUT_SECONDS = 2.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
@@ -1987,7 +1992,11 @@ def fresh_codex_launch_catalog(
 
 
 async def _codex_launch_catalog(
-    *, codex_path: str | None, launch: NativeCodexLaunch | None, reprobe: bool
+    *,
+    codex_path: str | None,
+    launch: NativeCodexLaunch | None,
+    reprobe: bool,
+    preview: bool = False,
 ) -> list[_JsonObject] | None:
     """Read or refresh one launch shape without resolving a different probe shape."""
     from omnigent.models import model_catalog_store
@@ -2027,7 +2036,14 @@ async def _codex_launch_catalog(
     # failed re-probe, leaving the stored rows serving.
     allow_empty = not model_catalog_store.read_catalog("codex-native", fingerprint)
     read = model_catalog_store.reprobe_catalog if reprobe else model_catalog_store.ensure_catalog
-    return await read("codex-native", fingerprint, lambda: _probe(allow_empty=allow_empty))
+    pending = read("codex-native", fingerprint, lambda: _probe(allow_empty=allow_empty))
+    if not preview:
+        return await pending
+    try:
+        return await asyncio.wait_for(pending, timeout=_PICKER_CATALOG_WAIT_SECONDS)
+    except TimeoutError:
+        # Store probes are shielded and keep refreshing the exact launch shape.
+        return model_catalog_store.read_catalog("codex-native", fingerprint)
 
 
 async def codex_launch_catalog(
@@ -2035,6 +2051,7 @@ async def codex_launch_catalog(
     codex_path: str | None = None,
     launch: NativeCodexLaunch | None = None,
     refresh: str | None = None,
+    preview: bool = False,
 ) -> list[_JsonObject] | None:
     """
     The shared codex catalog for a launch shape: store, then probe.
@@ -2047,6 +2064,8 @@ async def codex_launch_catalog(
     :param codex_path: Optional Codex executable override.
     :param launch: An already-resolved ``model=None`` launch shape. When
         omitted, resolve the host's default shape.
+    :param preview: Bound the picker wait and serve matching stored rows when
+        a probe is slow; the shared probe continues in the background.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
     if refresh not in {None, "auto", "force"}:
@@ -2061,7 +2080,7 @@ async def codex_launch_catalog(
         launch = shape
         refresh = "force" if age is None or age > 300 else None
     return await _codex_launch_catalog(
-        codex_path=codex_path, launch=launch, reprobe=refresh == "force"
+        codex_path=codex_path, launch=launch, reprobe=refresh == "force", preview=preview
     )
 
 
@@ -2308,6 +2327,9 @@ class CodexNativeAppServer:
     config_profile: str | None = None
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
+    permission_launch_args: tuple[str, ...] = ()
+    bypass_sandbox: bool = False
+    workspace_profile: CodexWorkspaceProfile | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2515,7 +2537,37 @@ class CodexNativeAppServer:
             self.env[PRIMARY_SESSION_ID_ENV_VAR] = self.session_id
         else:
             self.env.pop(PRIMARY_SESSION_ID_ENV_VAR, None)
+
+        def build_workspace_profile() -> CodexWorkspaceProfile | None:
+            import tomllib
+
+            if (
+                self.bypass_sandbox
+                or codex_version is None
+                or codex_version < MIN_NATIVE_PROFILE_CODEX_VERSION
+            ):
+                return None
+            try:
+                config_path = self.codex_home / "config.toml"
+                private_config = (
+                    tomllib.loads(config_path.read_text(encoding="utf-8"))
+                    if config_path.exists()
+                    else {}
+                )
+            except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+                return None
+            return codex_workspace_profile(
+                self.cwd,
+                launch_args=self.permission_launch_args,
+                server_overrides=self.config_overrides,
+                private_config=private_config,
+                codex_version=codex_version,
+            )
+
+        self.workspace_profile = await asyncio.to_thread(build_workspace_profile)
         config_overrides = [*self.config_overrides]
+        if self.workspace_profile is not None:
+            config_overrides.extend(self.workspace_profile.config_overrides)
         if self.session_id:
             config_overrides.append(
                 f"{CODEX_PRIMARY_SESSION_ID_CONFIG_KEY}={json.dumps(self.session_id)}"
@@ -3895,6 +3947,7 @@ def build_codex_native_server(
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
+    permission_launch_args: Sequence[str] = (),
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -3952,6 +4005,7 @@ def build_codex_native_server(
         crash registry sweep. Runner-owned launches disable this because the
         host janitor owns it; standalone callers keep the
         synchronous safety default.
+    :param permission_launch_args: Persisted permission options used to gate the workspace profile.
     :param terminal_launch_args: Original CLI options used to select the Codex
         config-file profile (distinct from the Databricks routing profile)
         and the ``--add-dir`` roots the app-server owns.
@@ -4017,6 +4071,10 @@ def build_codex_native_server(
         env=env,
         config_overrides=config_overrides,
         config_profile=codex_config_profile(terminal_launch_args),
+        permission_launch_args=tuple(
+            normalize_codex_permission_launch_args(permission_launch_args)
+        ),
+        bypass_sandbox=bypass_sandbox,
         cwd=cwd,
         bridge_dir=bridge_dir,
         session_id=session_id,
@@ -4847,136 +4905,13 @@ def client_for_transport(
     return CodexAppServerClient(Path(transport), client_name=client_name)
 
 
-def normalize_codex_permission_launch_args(
-    terminal_launch_args: Sequence[str] | None,
-) -> list[str]:
-    """Complete permission launch args into their effective stance.
-
-    Two normalizations:
-
-    - Legacy Full Access args (a ``default_permissions=":danger-full-access"``
-      profile with no approval policy) gain ``approval_policy="never"``.
-    - The bare default stance — no approval policy, sandbox, permission
-      profile, reviewer, or bypass flag — gains
-      ``approvals_reviewer="auto_review"``. Codex's built-in default routes
-      escalated approvals (e.g. an out-of-workspace write) to the human,
-      which parks web turns on an approval card even though the default
-      permission mode is presented as automatic. ``auto_review`` keeps the
-      workspace-write sandbox and approval boundaries but lets Codex's
-      automatic reviewer settle eligible requests instead of prompting.
-      Any explicit approval/sandbox/reviewer/profile choice wins untouched.
-    """
-    args = canonical_codex_launch_args(terminal_launch_args or ())
-    stance = codex_permission_stance(args)
-    if stance.full_access_profile and not stance.approval_policy:
-        args.extend(["-c", 'approval_policy="never"'])
-    elif not stance.explicit:
-        args.extend(["-c", 'approvals_reviewer="auto_review"'])
-    return args
-
-
-def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
-    """Convert persisted Codex permission args into thread-resume overrides."""
-    params: CodexParams = {}
-    typed_params: CodexParams = {}
-    args = normalize_codex_permission_launch_args(terminal_launch_args)
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            break
-        value: str | None = None
-        if arg == "--dangerously-bypass-approvals-and-sandbox":
-            typed_params.update(approvalPolicy="never", sandbox="danger-full-access")
-        elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
-            if index + 1 < len(args):
-                value = args[index + 1]
-                index += 1
-            if value is not None:
-                field = "approvalPolicy" if arg in {"--ask-for-approval", "-a"} else "sandbox"
-                typed_params[field] = value
-        elif arg.startswith(("--ask-for-approval=", "-a=")):
-            typed_params["approvalPolicy"] = arg.split("=", 1)[1]
-        elif arg.startswith(("--sandbox=", "-s=")):
-            typed_params["sandbox"] = arg.split("=", 1)[1]
-        elif arg in {"--config", "-c"} and index + 1 < len(args):
-            index += 1
-            key, _, value = args[index].partition("=")
-            _set_codex_resume_config_param(params, key, value)
-        elif arg.startswith(("--config=", "-c=")):
-            key, _, value = arg.split("=", 1)[1].partition("=")
-            _set_codex_resume_config_param(params, key, value)
-        index += 1
-    if "--approve-for-me" in args:
-        if "sandbox" in typed_params:
-            raise ValueError("--approve-for-me conflicts with sandbox and bypass flags")
-        params.update(
-            approvalsReviewer="auto_review", approvalPolicy="on-request", sandbox="workspace-write"
-        )
-    params.update(typed_params)
-    if "permissions" in params:
-        params.pop("sandbox", None)
-    return params
-
-
-_CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {
-    "approval_policy": "approvalPolicy",
-    "approvals_reviewer": "approvalsReviewer",
-    "default_permissions": "permissions",
-    "sandbox_mode": "sandbox",
-}
-
-
-def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> bool:
-    key = key.strip()
-    field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key)
-    if field is not None:
-        value = codex_config_string(raw_value)
-        if not value:
-            return False
-        params[field] = value
-        return True
-    if key.split(".", 1)[0] not in {"sandbox_workspace_write", "network", "permissions"}:
-        return False
-    try:
-        config_value = tomlkit.parse(f"value = {raw_value}").unwrap()["value"]
-    except tomlkit.exceptions.TOMLKitError:
-        config_value = raw_value.strip().strip("\"'")
-    try:
-        json.dumps(config_value, allow_nan=False)
-    except (TypeError, ValueError):
-        return False
-    config = cast(CodexParams, params.setdefault("config", {}))
-    _set_codex_resume_config_value(config, key, config_value)
-    return True
-
-
-def _set_codex_resume_config_value(config: CodexParams, key: str, value: object) -> None:
-    """Preserve CLI order without overlapping keys in the app-server's unordered config map."""
-    for existing_key in list(config):
-        if existing_key.startswith(f"{key}."):
-            del config[existing_key]
-    segments = key.split(".")
-    for prefix_length in range(1, len(segments)):
-        ancestor = ".".join(segments[:prefix_length])
-        if ancestor not in config:
-            continue
-        target = config
-        for segment in (ancestor, *segments[prefix_length:-1]):
-            if not isinstance(target.get(segment), dict):
-                target[segment] = {}
-            target = cast(CodexParams, target[segment])
-        target[segments[-1]] = value
-        return
-    config[key] = value
-
-
 async def preload_codex_thread_for_resume(
     transport: str,
     thread_id: str,
     *,
     terminal_launch_args: Sequence[str] | None = None,
     retain_client: bool = False,
+    permission_profile: str | None = None,
     cwd: Path | None = None,
     agent_pid: int | None = None,
     session_id: str | None = None,
@@ -5015,7 +4950,7 @@ async def preload_codex_thread_for_resume(
     retained = False
     try:
         await client.connect()
-        params = _codex_resume_permission_params(terminal_launch_args)
+        params = _codex_resume_permission_params(terminal_launch_args, permission_profile)
         if agent_pid is not None:
             config = cast(CodexParams, params.setdefault("config", {}))
             config[CODEX_AGENT_PID_CONFIG_KEY] = str(agent_pid)
@@ -5077,6 +5012,23 @@ async def preload_codex_thread_for_resume(
         if not retained:
             await client.close()
     return None
+
+
+async def apply_codex_thread_permissions(transport: str, thread_id: str, permissions: str) -> None:
+    """Select a loaded thread's permission profile; propagate rejection to the caller."""
+    client = client_for_transport(transport, client_name="omnigent-codex-native-permissions")
+    try:
+        await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
+        response = await asyncio.wait_for(
+            client.request(
+                "thread/settings/update", {"threadId": thread_id, "permissions": permissions}
+            ),
+            timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
+        )
+        if response.get("error"):
+            raise RuntimeError("Codex rejected the thread permission update")
+    finally:
+        await client.close()
 
 
 async def apply_codex_thread_effort(
@@ -5376,10 +5328,16 @@ def build_codex_remote_args(
     # below; reject caller pass-through args that would re-select or re-attach
     # that transport (e.g. ``codex app-server … --remote``, which clap rejects).
     reject_reserved_codex_transport_args(codex_args)
+    prompt_tail: tuple[str, ...] = ()
     if thread_id is not None:
         # Codex submits a positional ahead of ``resume`` as a new prompt to the
         # resumed thread; the persisted launch prompt was meant for the first start.
         codex_args = tuple(without_codex_positional_prompt(codex_args))
+    elif "--" in codex_args:
+        # Keep generated options out of the literal prompt tail.
+        separator = codex_args.index("--")
+        prompt_tail = codex_args[separator:]
+        codex_args = codex_args[:separator]
     override_args: list[str] = []
     for override in config_overrides:
         if override.lstrip().startswith("model_providers."):
@@ -5447,6 +5405,7 @@ def build_codex_remote_args(
             *agent_pid_args,
             "--remote",
             remote_url,
+            *prompt_tail,
         ]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
         return [

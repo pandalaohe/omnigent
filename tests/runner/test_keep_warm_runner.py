@@ -418,11 +418,23 @@ async def test_keep_warm_ping_without_live_harness_skips_no_live_client(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        None,
+        "tmux_metadata",
+        "native_status",
+        "composer_unreadable",
+        "query_budget",
+        "client_activity",
+    ],
+)
 async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, reason: str | None
 ) -> None:
     """Happy path: the harness gets the ``keep_warm`` event; its receipt is relayed verbatim."""
-    harness = _ReceiptHarnessClient(_OK_RECEIPT)
+    receipt = _OK_RECEIPT if reason is None else {**_UNKNOWN_RECEIPT, "reason": reason}
+    harness = _ReceiptHarnessClient(receipt)
     mgr = _KeepWarmProcessManager(harness_client=harness)
     server = _RecordingServerClient()
     app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
@@ -442,10 +454,10 @@ async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(
             "timeout": 120.0,
         }
     ]
-    assert server.posts == [{"type": "external_keep_warm_receipt", "data": _OK_RECEIPT}]
+    assert server.posts == [{"type": "external_keep_warm_receipt", "data": receipt}]
     assert (
-        "keep-warm attempt session=conv_x attempt=att-1 family=claude outcome=ok reason=none"
-        in caplog.text
+        f"keep-warm attempt session=conv_x attempt=att-1 family=claude "
+        f"outcome={receipt['outcome']} reason={reason or 'none'}" in caplog.text
     )
     # The ping re-arms both idle clocks even though the work is delegated.
     assert mgr.noted == [_CONV]

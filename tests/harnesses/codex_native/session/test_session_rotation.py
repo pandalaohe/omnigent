@@ -81,8 +81,25 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     assert state.thread_id == "thread_old"
 
 
+@pytest.mark.parametrize(
+    "live_args,enabled,expected_update,update_fails",
+    [
+        (["--approve-for-me"], True, True, False),
+        (["--approve-for-me"], True, True, True),
+        (["--sandbox", "read-only"], True, False, False),
+        (["-c", 'default_permissions="custom"', "-a", "on-request"], True, False, False),
+        (["--approve-for-me"], False, False, False),
+        (None, True, True, False),
+    ],
+)
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_args: list[str] | None,
+    enabled: bool,
+    expected_update: bool,
+    update_fails: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -96,6 +113,17 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     _write_forwarder_bridge(
         tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import write_bridge_state
+
+    state = read_bridge_state(tmp_path)
+    write_bridge_state(
+        tmp_path, replace(state, permission_profile="omnigent-workspace" if enabled else None)
+    )
+    update = AsyncMock(side_effect=RuntimeError("rejected") if update_fails else None)
+    monkeypatch.setattr(codex_native_forwarder, "apply_codex_thread_permissions", update)
     fake_client = _FakeCodexAppServerClient()
     requests: list[tuple[str, str, dict[str, Any] | None]] = []
     posted_events: list[tuple[str, dict[str, Any]]] = []
@@ -115,6 +143,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                 json={
                     "id": "conv_old",
                     "agent_id": "ag_codex",
+                    "terminal_launch_args": ["--approve-for-me"],
                     "runner_id": "runner_123",
                     "labels": {
                         "omnigent.wrapper": "codex-native-ui",
@@ -182,6 +211,9 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                 bridge_dir=tmp_path,
                 app_server_url="ws://127.0.0.1:9876",
                 event=_thread_started_event("thread_new"),
+                forwarder_state=codex_native_forwarder._CodexForwarderState(
+                    terminal_launch_args=live_args
+                ),
             )
             assert rotated
             await codex_native_forwarder._subscribe_until_ready(
@@ -266,6 +298,16 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         for _, payload in posted_events
         if payload["type"] == "external_conversation_item"
     ] == ["after clear"]
+
+    assert update.await_count == int(expected_update)
+    if expected_update:
+        update.assert_awaited_once_with("ws://127.0.0.1:9876", "thread_new", "omnigent-workspace")
+    assert read_bridge_state(tmp_path).permission_profile == (
+        "omnigent-workspace" if enabled else None
+    )
+
+    if update_fails:
+        assert "Failed to apply Codex rotated thread permissions" in caplog.text
 
 
 def test_forwarder_rotation_failure_preserves_old_target(
@@ -501,7 +543,12 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    assert [event for event in session_events if event.session_id == "conv_old"] == []
+    old_events = [event for event in session_events if event.session_id == "conv_old"]
+    assert len(old_events) == 1
+    assert old_events[0].body["type"] == "external_native_subagent_snapshot"
+    assert old_events[0].body["data"]["children"] == []
+    assert old_events[0].body["data"]["complete"] is True
+    assert old_events[0].body["data"]["retired"] is True
     assert hook_posts == []
     assert fake_client.responses == []
 
@@ -543,3 +590,35 @@ async def test_thread_replacement_preserves_project_or_retries_unfiled(
         assert set(creates[1]) == {"agent_id", "labels"}
     else:
         assert len(creates) == 1
+
+
+@pytest.mark.parametrize(
+    "thread_fields",
+    [
+        {"ephemeral": True, "path": None},
+        {"source": {"subAgent": {"thread_spawn": {"parent_thread_id": "old"}}}},
+    ],
+)
+async def test_profile_rotation_ignores_non_main_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, thread_fields: dict[str, Any]
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import write_bridge_state
+
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    write_bridge_state(
+        tmp_path, replace(read_bridge_state(tmp_path), permission_profile="omnigent-workspace")
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(codex_native_forwarder, "apply_codex_thread_permissions", update)
+    assert not await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+        ap_client=AsyncMock(),
+        target=SimpleNamespace(thread_id="old"),
+        bridge_dir=tmp_path,
+        app_server_url="ws://127.0.0.1:1234",
+        event={"method": "thread/started", "params": {"thread": {"id": "new", **thread_fields}}},
+    )
+    update.assert_not_called()

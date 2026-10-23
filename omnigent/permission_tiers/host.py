@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -136,6 +136,7 @@ def evaluate_host_tool(
     arguments: Mapping[str, object],
     *,
     control_paths: tuple[str, ...],
+    extension_tools: Mapping[str, str] | None = None,
 ) -> TierDecision:
     """Adapt with local filesystem facts immediately before requesting approval."""
     try:
@@ -144,6 +145,8 @@ def evaluate_host_tool(
         if state.tier == "full":
             return TierDecision(Verdict.ALLOW)
         context = local_host_context(state, control_paths=control_paths)
+        if extension_tools is not None:
+            context = replace(context, extension_tools=extension_tools)
         intent = adapt_tool_call(name, arguments, context)
         return decide_tier(state.tier, intent, load_rules())
     except Exception as exc:  # noqa: BLE001 - failures never become execution permission

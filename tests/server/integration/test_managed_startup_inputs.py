@@ -121,6 +121,51 @@ def _bind(env: _Env, session_id: str):
     return env.conv_store.list_pending_inputs(session_id)[0]
 
 
+def _seed_annotation_target(db_uri: str, session_id: str) -> str:
+    import time
+
+    from sqlalchemy import update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlAnnotationGrantOwner, SqlDeviceGrant, SqlUser
+    from omnigent.db.enum_codecs import encode_device_grant_status
+    from omnigent.db.utils import get_or_create_engine
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("alice")
+    permissions.grant("alice", session_id, 4)
+    now = int(time.time())
+    grant_id = "annotation-test-grant"
+    with Session(get_or_create_engine(db_uri)) as session, session.begin():
+        session.execute(
+            update(SqlUser).where(SqlUser.id == "alice").values(account_generation="G1")
+        )
+        session.add(
+            SqlDeviceGrant(
+                id=grant_id,
+                device_code_hash="0" * 64,
+                user_code="TEST",
+                status=encode_device_grant_status("redeemed"),
+                client_id="omnigent-chrome",
+                scope="annotations:write",
+                user_id="alice",
+                account_generation="G1",
+                created_at=now,
+                expires_at=now,
+                approved_at=now,
+            )
+        )
+        session.add(
+            SqlAnnotationGrantOwner(
+                grant_id=grant_id,
+                user_id="alice",
+                account_generation="G1",
+                approved_at=now,
+            )
+        )
+    return grant_id
+
+
 @pytest.mark.parametrize(
     "name,native",
     [
@@ -167,6 +212,397 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         assert len([item for item in snapshot["items"] if item["type"] == "message"]) == 1
         assert snapshot["pending_inputs"] == []
+    finally:
+        await runner.aclose()
+
+
+async def test_annotation_uses_native_saved_input_dispatch_and_transcript_receipt(
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The annotation CAS feeds the production native runner callback once."""
+    from omnigent.server.annotation_batch import INTRO
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+    from tests.server.test_annotation_batches import _batch
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+        initial = env.conv_store.list_pending_inputs(session_id)[0]
+        assert env.conv_store.transition_pending_input(
+            session_id, initial.id, expected="in_progress", status=None
+        )
+        assert env.conv_store.set_host_id(session_id, uuid4().hex, "/opt/work/omnigent/fork/test")
+        grant_id = _seed_annotation_target(db_uri, session_id)
+        batch = _batch()
+        receipt, created = env.conv_store.admit_annotation_batch(
+            "alice", grant_id, "G1", session_id, batch, target_live=True
+        )
+        assert created
+        service = env.app.state.startup_inputs
+        await service.dispatch_annotation(
+            env.app,
+            session_id,
+            str(receipt["item_id"]),
+            "alice",
+            grant_id,
+            "G1",
+            batch.batch_id,
+            target_live=lambda _: True,
+        )
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1 and INTRO in json.dumps(turns[0])
+        pending = env.conv_store.list_pending_inputs(session_id)
+        assert len(pending) == 1 and pending[0].id == receipt["item_id"]
+        assert (
+            env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)[
+                "dispatch_phase"
+            ]
+            == "dispatching"
+        )
+        env.conv_store.delete_label(session_id, STARTUP_LABEL)
+        pending_inputs.reset_for_tests()
+        unrelated = await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "typed in terminal"}],
+                    },
+                    "response_id": "resp_terminal_only",
+                },
+            },
+        )
+        assert unrelated.status_code in (200, 201, 202), unrelated.text
+        still_pending = env.conv_store.get_item(session_id, str(receipt["item_id"]))
+        assert still_pending is not None
+        assert still_pending.response_id == PENDING_INPUT_RESPONSE_ID
+        assert (
+            env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)[
+                "dispatch_phase"
+            ]
+            == "uncertain"
+        )
+        assert pending_inputs.pending_id_for_stable_id(session_id, str(receipt["item_id"]))
+        echoed = await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": pending[0].data.content},
+                    "response_id": "resp_annotation_echo",
+                },
+            },
+        )
+        assert echoed.status_code in (200, 201, 202), echoed.text
+        assert (
+            env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)[
+                "dispatch_phase"
+            ]
+            == "confirmed"
+        )
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        await service.dispatch_annotation(
+            env.app,
+            session_id,
+            str(receipt["item_id"]),
+            "alice",
+            grant_id,
+            "G1",
+            batch.batch_id,
+            target_live=lambda _: True,
+            explicit_retry=True,
+        )
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+    finally:
+        await runner.aclose()
+
+
+async def test_annotation_native_async_not_received_keeps_explicit_retry(
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _settle_undelivered_native_input
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+    from tests.server.test_annotation_batches import _batch
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+        initial = env.conv_store.list_pending_inputs(session_id)[0]
+        assert env.conv_store.transition_pending_input(
+            session_id, initial.id, expected="in_progress", status=None
+        )
+        assert env.conv_store.set_host_id(session_id, uuid4().hex, "/opt/work/omnigent/fork/test")
+        grant_id = _seed_annotation_target(db_uri, session_id)
+        batch = _batch()
+        receipt, _ = env.conv_store.admit_annotation_batch(
+            "alice", grant_id, "G1", session_id, batch, target_live=True
+        )
+        service = env.app.state.startup_inputs
+        await service.dispatch_annotation(
+            env.app,
+            session_id,
+            str(receipt["item_id"]),
+            "alice",
+            grant_id,
+            "G1",
+            batch.batch_id,
+            target_live=lambda _: True,
+        )
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        assert (
+            env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)[
+                "dispatch_phase"
+            ]
+            == "dispatching"
+        )
+
+        # The runner accepted the POST, then reported that the harness never
+        # received this stable input. The native relay uses this settlement.
+        pending_inputs.mark_lifecycle(
+            session_id,
+            str(receipt["item_id"]),
+            stage="rejected_before_handoff",
+            cause_class="rejected_before_handoff",
+        )
+        await _settle_undelivered_native_input(
+            env.conv_store, session_id, "resp_not_received", str(receipt["item_id"])
+        )
+        after = env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)
+        assert after is not None
+        assert after["dispatch_phase"] == "ready" and after["retry_required"] is True
+        pending = env.conv_store.get_item(session_id, str(receipt["item_id"]))
+        assert pending is not None
+        assert pending.response_id == PENDING_INPUT_RESPONSE_ID
+        assert pending.status == "in_progress"
+        await service.dispatch_annotation(
+            env.app,
+            session_id,
+            str(receipt["item_id"]),
+            "alice",
+            grant_id,
+            "G1",
+            batch.batch_id,
+            target_live=lambda _: True,
+            explicit_retry=True,
+        )
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 2
+        retry_pending_id = pending_inputs.make_pending_id(session_id, str(receipt["item_id"]))
+        retry_attrs = pending_inputs.delivery_attributes_for(session_id, retry_pending_id)
+        assert retry_attrs["last_delivery_stage"] == "forward_accepted"
+        assert "cause_class" not in retry_attrs
+    finally:
+        await runner.aclose()
+
+
+async def test_annotation_lookup_fault_restores_every_held_native_input(
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+    from tests.server.test_annotation_batches import _batch
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+        initial = env.conv_store.list_pending_inputs(session_id)[0]
+        assert env.conv_store.transition_pending_input(
+            session_id, initial.id, expected="in_progress", status=None
+        )
+        assert env.conv_store.set_host_id(session_id, uuid4().hex, "/opt/work/omnigent/fork/test")
+        grant_id = _seed_annotation_target(db_uri, session_id)
+        batch = _batch()
+        receipt, _ = env.conv_store.admit_annotation_batch(
+            "alice", grant_id, "G1", session_id, batch, target_live=True
+        )
+        await env.app.state.startup_inputs.dispatch_annotation(
+            env.app,
+            session_id,
+            str(receipt["item_id"]),
+            "alice",
+            grant_id,
+            "G1",
+            batch.batch_id,
+            target_live=lambda _: True,
+        )
+        annotation_id = str(receipt["item_id"])
+        saved_annotation = env.conv_store.get_item(session_id, annotation_id)
+        assert saved_annotation is not None
+        annotation_content = saved_annotation.data.content
+        annotation_pending_id = pending_inputs.pending_id_for_stable_id(session_id, annotation_id)
+        assert annotation_pending_id is not None
+        second_id, third_id = uuid4().hex, uuid4().hex
+        second_pending_id = pending_inputs.record(
+            session_id, [{"type": "input_text", "text": "second web input"}], stable_id=second_id
+        )
+        third_pending_id = pending_inputs.record(
+            session_id, [{"type": "input_text", "text": "third web input"}], stable_id=third_id
+        )
+        assert pending_inputs.pending_ids(session_id) == [
+            annotation_pending_id,
+            second_pending_id,
+            third_pending_id,
+        ]
+
+        async def echo(content: list[dict[str, Any]], source_id: str) -> httpx.Response:
+            return await env.client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "source_id": source_id,
+                        "item_data": {"role": "user", "content": content},
+                        "response_id": f"resp_{source_id}",
+                    },
+                },
+            )
+
+        original_lookup = env.conv_store.annotation_receipt_for_item
+        lookups = 0
+
+        def fail_lookup(*_: Any) -> None:
+            nonlocal lookups
+            lookups += 1
+            assert pending_inputs.pending_ids(session_id) == []
+            raise RuntimeError("annotation receipt lookup failed")
+
+        monkeypatch.setattr(env.conv_store, "annotation_receipt_for_item", fail_lookup)
+        try:
+            with pytest.raises(RuntimeError, match="annotation receipt lookup failed"):
+                await echo([{"type": "input_text", "text": "third web input"}], "faulted-third")
+        finally:
+            monkeypatch.setattr(env.conv_store, "annotation_receipt_for_item", original_lookup)
+        assert lookups == 1
+        assert pending_inputs.pending_ids(session_id) == [
+            annotation_pending_id,
+            second_pending_id,
+            third_pending_id,
+        ]
+
+        second = await echo([{"type": "input_text", "text": "second web input"}], "second")
+        assert second.status_code in (200, 201, 202), second.text
+        assert pending_inputs.pending_ids(session_id) == [annotation_pending_id, third_pending_id]
+        annotation = env.conv_store.get_item(session_id, annotation_id)
+        assert annotation is not None and annotation.response_id == PENDING_INPUT_RESPONSE_ID
+        assert (
+            env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)[
+                "dispatch_phase"
+            ]
+            == "uncertain"
+        )
+
+        accepted = await echo(annotation_content, "annotation")
+        assert accepted.status_code in (200, 201, 202), accepted.text
+        assert pending_inputs.pending_ids(session_id) == [third_pending_id]
+        assert (
+            env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)[
+                "dispatch_phase"
+            ]
+            == "confirmed"
+        )
+        third = await echo([{"type": "input_text", "text": "third web input"}], "third")
+        assert third.status_code in (200, 201, 202), third.text
+        assert pending_inputs.pending_ids(session_id) == []
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    "runner_outcome, expected_phase",
+    [
+        ("accepted", "confirmed"),
+        ("rejected", "ready"),
+        ("disconnect", "uncertain"),
+        ("policy_denied", "ready"),
+        ("ack_crash", "uncertain"),
+    ],
+)
+async def test_annotation_ordinary_runner_handoff_decides_receipt_phase(
+    startup_env: _Env,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_outcome: str,
+    expected_phase: str,
+) -> None:
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+    from tests.server.test_annotation_batches import _batch
+
+    forwarded: list[dict[str, Any]] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload.get("type") == "message":
+            forwarded.append(payload)
+            if runner_outcome == "disconnect":
+                raise httpx.ConnectError("runner connection dropped", request=request)
+            if runner_outcome == "rejected":
+                return httpx.Response(501, json={"error": "refused"})
+        return httpx.Response(202, json={"queued": True})
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(answer), base_url="http://runner")
+
+    async def get_runner_client(*_: Any, **__: Any) -> httpx.AsyncClient:
+        return runner
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", get_runner_client)
+    if runner_outcome == "policy_denied":
+        from omnigent.server.routes.sessions import routes_events
+
+        async def deny_input(*_: Any, **__: Any) -> dict[str, str]:
+            return {"verdict": "deny", "reason": "policy blocked annotation"}
+
+        monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_input)
+    try:
+        env = startup_env
+        session_id = await _create(env, name="startup-probe")
+        initial = env.conv_store.list_pending_inputs(session_id)[0]
+        assert env.conv_store.transition_pending_input(
+            session_id, initial.id, expected="in_progress", status=None
+        )
+        assert env.conv_store.set_host_id(session_id, uuid4().hex, "/opt/work/omnigent/fork/test")
+        grant_id = _seed_annotation_target(db_uri, session_id)
+        batch = _batch()
+        receipt, _ = env.conv_store.admit_annotation_batch(
+            "alice", grant_id, "G1", session_id, batch, target_live=True
+        )
+        if runner_outcome == "ack_crash":
+
+            def crash_after_ack(*_: Any, **__: Any) -> None:
+                raise RuntimeError("crash after runner acknowledgement")
+
+            monkeypatch.setattr(env.conv_store, "append", crash_after_ack)
+        await env.app.state.startup_inputs.dispatch_annotation(
+            env.app,
+            session_id,
+            str(receipt["item_id"]),
+            "alice",
+            grant_id,
+            "G1",
+            batch.batch_id,
+            target_live=lambda _: True,
+        )
+        after = env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)
+        assert after is not None and after["dispatch_phase"] == expected_phase
+        assert len(forwarded) == (0 if runner_outcome == "policy_denied" else 1)
+        item = env.conv_store.get_item(session_id, str(receipt["item_id"]))
+        assert item is not None
+        if runner_outcome == "accepted":
+            assert item.response_id != PENDING_INPUT_RESPONSE_ID
+        else:
+            assert item.response_id == PENDING_INPUT_RESPONSE_ID
+            assert after["retry_required"] is (runner_outcome in ("rejected", "policy_denied"))
+            assert item.status == (
+                "incomplete" if runner_outcome in ("disconnect", "ack_crash") else "in_progress"
+            )
     finally:
         await runner.aclose()
 

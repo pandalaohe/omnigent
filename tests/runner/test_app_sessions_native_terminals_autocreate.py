@@ -335,10 +335,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["terminal_name"] == "pi"
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
-    assert captured["spec"].command == (
-        "pi" if permission_tier == "full" else "/opt/launchers/controlled-pi"
-    )
-    assert bool(ordered_calls) is (permission_tier != "full")
+    expected_command = "pi" if permission_tier == "full" else "/opt/launchers/controlled-pi"
+    assert captured["spec"].command == expected_command
+    assert len(ordered_calls) == (0 if permission_tier == "full" else 1)
     # Preserve the exited pane so the idle watcher can report its output.
     assert captured["spec"].keep_alive_after_exit is True
     assert captured["spec"].env_unset == expected_env_unset
@@ -561,17 +560,30 @@ async def test_auto_create_pi_terminal_informational_notice_posts_info_level(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
+@pytest.mark.parametrize(
+    ("model", "effort", "terminal_args", "expected_thinking"),
+    [
+        ("anthropic/claude-sonnet-4-5", "max", None, "max"),
+        (None, "max", None, "max"),
+        (None, "medium", None, "medium"),
+        (None, "none", None, "off"),
+        (None, "ultra", None, "max"),
+        (None, None, None, None),
+        (None, "default", None, None),
+        (None, "max", ["--thinking", "low"], "low"),
+        (None, "max", ["--thinking=low"], "low"),
+        (None, "max", ["--model", "anthropic/claude-sonnet-4-5"], "max"),
+    ],
+)
+async def test_auto_create_pi_terminal_unmanaged_keeps_launch_choices(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+    effort: str | None,
+    terminal_args: list[str] | None,
+    expected_thinking: str | None,
 ) -> None:
-    """With no managed provider, a pinned model still reaches the pi argv.
-
-    Pi falls back to its own login when ``resolve_pi_native_provider()`` is
-    ``None``, but the session's pinned model must not be silently dropped:
-    it passes through as ``--model`` so Pi resolves it against its own
-    catalog instead of opening its default model.
-    """
+    """Own-login launches retain model and effort, with explicit args winning."""
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
@@ -587,9 +599,10 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
         return _PiNativeLaunchConfig(
             workspace=tmp_path,
             server_url="http://127.0.0.1:8000",
-            terminal_launch_args=None,
+            terminal_launch_args=terminal_args,
             external_session_id=None,
-            model_override="anthropic/claude-sonnet-4-5",
+            model_override=model,
+            reasoning_effort=effort,
         )
 
     monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
@@ -620,8 +633,17 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
     )
 
     args = captured["spec"].args
-    assert "--model" in args
-    assert args[args.index("--model") + 1] == "anthropic/claude-sonnet-4-5"
+    if model or (terminal_args and "--model" in terminal_args):
+        assert args[args.index("--model") + 1] == "anthropic/claude-sonnet-4-5"
+    else:
+        assert "--model" not in args
+    thinking_args = [arg for arg in args if arg == "--thinking" or arg.startswith("--thinking=")]
+    assert len(thinking_args) == (0 if expected_thinking is None else 1)
+    if expected_thinking is not None:
+        if "--thinking" in args:
+            assert args[args.index("--thinking") + 1] == expected_thinking
+        else:
+            assert f"--thinking={expected_thinking}" in args
     # No managed provider was injected — Pi runs on its own login.
     assert "--provider" not in args
 
@@ -743,6 +765,37 @@ def _pi_launch_test_stubs(
 
     captured["registry"] = _FakeResourceRegistry()
     return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission_tier", ["full", "ask"])
+async def test_pi_launcher_requires_sdk_only_for_restricted_tiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, permission_tier: str
+) -> None:
+    captured = _pi_launch_test_stubs(tmp_path, monkeypatch, None)
+    executable = tmp_path / "pi"
+    executable.touch()
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: str(executable)
+    )
+    session_id = "47f049b9d13df4db397c7f46859b825f"
+    seed_pi_permission_state(tmp_path, session_id, permission_tier)
+
+    async def launch() -> None:
+        await _auto_create_pi_terminal(
+            session_id,
+            captured["registry"],
+            lambda _sid, _event: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+
+    if permission_tier == "full":
+        await launch()
+        assert captured["spec"].command == str(executable)
+    else:
+        with pytest.raises(ValueError, match="does not expose the supported Pi SDK loader"):
+            await launch()
+        assert "spec" not in captured
 
 
 @pytest.mark.asyncio

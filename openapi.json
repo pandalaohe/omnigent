@@ -4932,6 +4932,18 @@
       "KeepWarmStatus": {
         "description": "Keep-warm status object for a session row.\n\nBuilt from the `omnigent.keep_warm` / `omnigent.keep_warm_stats`\nlabels with no settings read. `None` is used at the field level when a\nsession has no keep-warm label or is archived.",
         "properties": {
+          "blocked_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "First eligibility blocker observed in a due ping window, retained after the episode closes. `None` if unobserved.",
+            "title": "Blocked By"
+          },
           "episode": {
             "$ref": "#/components/schemas/KeepWarmEpisode",
             "description": "Pings / cost since the last real turn."
@@ -4945,7 +4957,7 @@
                 "type": "null"
               }
             ],
-            "description": "The label's raw `k` code \u2014 the last ping's skip / fail reason, e.g. `\"btw_unavailable\"` \u2014 so a `failures` pause names its cause. `None` when no code is stored.",
+            "description": "The last ping's skip / fail reason without internal label prefixes, e.g. `\"btw_unavailable\"` \u2014 so a pause names its cause. `None` when no code is stored.",
             "title": "Last Reason"
           },
           "last_return": {
@@ -4960,7 +4972,7 @@
             "description": "The measured first turn after an absence, or `None` when none was recorded."
           },
           "state": {
-            "description": "Episode state \u2014 `\"on\"` while warming is active, `\"off\"` with no episode, `\"paused\"` after repeated failures or measured cache misses, `\"stopped\"` when the cap / window ended.",
+            "description": "Episode state \u2014 `\"on\"` while warming is active, `\"off\"` with no episode, `\"paused\"` after skipped pings, repeated failures or measured cache misses, `\"stopped\"` when the cap / window ended.",
             "enum": [
               "on",
               "off",
@@ -4980,7 +4992,12 @@
                   "card",
                   "host",
                   "switch_off",
-                  "runner_version"
+                  "runner_version",
+                  "expired",
+                  "archive_revision",
+                  "policy",
+                  "parent_inactive",
+                  "skipped"
                 ],
                 "type": "string"
               },
@@ -7544,6 +7561,16 @@
           },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
+          },
+          "browser_annotations_available": {
+            "default": false,
+            "title": "Browser Annotations Available",
+            "type": "boolean"
+          },
+          "connected_apps_available": {
+            "default": false,
+            "title": "Connected Apps Available",
+            "type": "boolean"
           },
           "databricks_features": {
             "title": "Databricks Features",
@@ -12866,6 +12893,7 @@
                 "calling_last",
                 "session_collab",
                 "host_colors",
+                "instruction_grid",
                 "keep_warm",
                 "child_idle",
                 "worktree_location",
@@ -16479,6 +16507,7 @@
                         "child_idle",
                         "context_indicator",
                         "host_colors",
+                        "instruction_grid",
                         "keep_warm",
                         "keyboard_shortcuts",
                         "mobile_assistant",
@@ -16612,6 +16641,7 @@
                 "calling_last",
                 "session_collab",
                 "host_colors",
+                "instruction_grid",
                 "keep_warm",
                 "child_idle",
                 "worktree_location",
@@ -21459,11 +21489,9 @@
     },
     "/v1/sessions/{session_id}/policies/evaluate": {
       "post": {
-        "description": "Generic policy evaluation endpoint (proto-compatible).\n\nAccepts an `EvaluationRequest` JSON body whose `event`\nfield carries the phase (`PHASE_TOOL_CALL`,\n`PHASE_TOOL_RESULT`, `PHASE_LLM_REQUEST`,\n`PHASE_LLM_RESPONSE`), the event data, and optional\ncontext. Returns an `EvaluationResponse` with the policy\nverdict (`result`), an optional `reason`, and optional\n`data` for content-rewriting policies.\n\nUsed by Claude Code's `PreToolUse` and `PostToolUse`\ncommand hooks (via `omnigent.harnesses.claude_native.hook`) to\nevaluate admin policies on native tool calls. Also usable\nby any client that speaks the proto-compatible JSON schema.\n\n**Returns:** `EvaluationResponse` JSON with `result`, `reason`, and optional `data`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session doesn't exist, 400 if the body is malformed.",
         "operationId": "evaluate_policy_v1_sessions__session_id__policies_evaluate_post",
         "parameters": [
           {
-            "description": "Omnigent conversation id from the URL path.",
             "in": "path",
             "name": "session_id",
             "required": true,
@@ -23999,7 +24027,7 @@
     },
     "/v1/skills": {
       "get": {
-        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.",
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.\n`allow_pending` opts into a short host wait and retryable pending errors.",
         "operationId": "get_skills_v1_skills_get",
         "parameters": [
           {
@@ -24085,6 +24113,16 @@
                 }
               ],
               "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "allow_pending",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Allow Pending",
+              "type": "boolean"
             }
           }
         ],
@@ -24326,6 +24364,302 @@
           }
         },
         "summary": "Get Usage",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/admissions": {
+      "post": {
+        "operationId": "admit_runner_turn_v1_usage_cutover_admissions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Admit Runner Turn",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/bindings": {
+      "post": {
+        "operationId": "load_bindings_v1_usage_cutover_bindings_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Load Bindings",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/bindings/activate": {
+      "post": {
+        "operationId": "activate_bindings_v1_usage_cutover_bindings_activate_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Activate Bindings",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds": {
+      "post": {
+        "operationId": "create_hold_v1_usage_cutover_holds_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Hold",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds/{host_id}/{harness}": {
+      "get": {
+        "operationId": "read_hold_v1_usage_cutover_holds__host_id___harness__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Hold",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds/{host_id}/{harness}/{generation}/receipts": {
+      "post": {
+        "operationId": "submit_receipt_v1_usage_cutover_holds__host_id___harness___generation__receipts_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "generation",
+            "required": true,
+            "schema": {
+              "title": "Generation",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Receipt",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/holds/{host_id}/{harness}/{generation}/release": {
+      "post": {
+        "operationId": "release_hold_v1_usage_cutover_holds__host_id___harness___generation__release_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "generation",
+            "required": true,
+            "schema": {
+              "title": "Generation",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Hold",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/receipts": {
+      "get": {
+        "operationId": "read_receipts_v1_usage_cutover_receipts_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Receipts",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage-cutover/route": {
+      "get": {
+        "operationId": "read_route_v1_usage_cutover_route_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Route",
+        "tags": [
+          "usage"
+        ]
+      },
+      "post": {
+        "operationId": "record_route_v1_usage_cutover_route_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Record Route",
         "tags": [
           "usage"
         ]

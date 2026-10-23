@@ -6,11 +6,13 @@ import hashlib
 import inspect
 import json
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from functools import wraps
 from pathlib import PureWindowsPath
 from typing import Any, Literal, Protocol, TypeVar, cast
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -43,6 +45,9 @@ from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
+    SqlAnnotationCapture,
+    SqlAnnotationGrantOwner,
+    SqlAnnotationReceipt,
     SqlCliReleaseIntent,
     SqlComment,
     SqlConversation,
@@ -50,6 +55,8 @@ from omnigent.db.db_models import (
     SqlConversationLabel,
     SqlConversationMetadata,
     SqlDetachedCard,
+    SqlDeviceGrant,
+    SqlFile,
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
@@ -65,6 +72,7 @@ from omnigent.db.enum_codecs import (
     decode_session_live_status,
     encode_agent_kind,
     encode_conversation_kind,
+    encode_device_grant_status,
     encode_item_status,
     encode_item_type,
     encode_session_live_status,
@@ -93,6 +101,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -100,6 +109,13 @@ from omnigent.entities import (
 from omnigent.errors import ErrorCode, OmnigentError, ProjectArchivedError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
+from omnigent.server.annotation_batch import (
+    AnnotationBatch,
+    AnnotationFailure,
+    canonical_digest,
+    capture_digest,
+    render_annotation_batch,
+)
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
@@ -1849,12 +1865,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             #   MySQL    → duplicate entry ... for key '...PRIMARY'
             #   SQLite   → "conversations.id" (dotted) in the failed-UNIQUE clause.
             msg = str(exc).lower()
+            driver_args = getattr(exc.orig, "args", ())
+            driver_code = driver_args[0] if driver_args else None
             is_id_unique_violation = conversation_id is not None and (
                 "pk_conversations" in msg
                 or "conversations_pkey" in msg
                 or (
+                    getattr(exc.orig, "sqlstate", None) == "23505"
+                    and getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+                    == "omnigent_conversation_metadata_pkey"
+                )
+                or (
                     "duplicate entry" in msg
-                    and ("for key 'primary'" in msg or "for key 'conversations.primary'" in msg)
+                    and (
+                        "for key 'primary'" in msg
+                        or "for key 'conversations.primary'" in msg
+                        or (
+                            driver_code == 1062
+                            and "for key 'omnigent_conversation_metadata.primary'" in msg
+                        )
+                    )
                 )
                 or ("unique" in msg and "conversations.id" in msg)
                 or ("unique" in msg and "omnigent_conversation_metadata.id" in msg)
@@ -3512,6 +3542,721 @@ class SqlAlchemyConversationStore(ConversationStore):
         items = [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
         return items, rows[-1].position if more else None
 
+    def _annotation_authority(
+        self, session: Session, user_id: str, grant_id: str, generation: str, now: int
+    ) -> None:
+        """Lock the actor before the grant, matching account mutation ordering."""
+        actual = require_active_account(session, user_id, generation=generation)
+        if actual != generation:
+            raise AnnotationFailure(401, "reconnect_required")
+        grant = session.get(
+            SqlDeviceGrant, (current_workspace_id(), grant_id), with_for_update=True
+        )
+        if (
+            grant is None
+            or grant.user_id != user_id
+            or grant.account_generation != generation
+            or grant.status != encode_device_grant_status("redeemed")
+            or grant.client_id != "omnigent-chrome"
+            or grant.scope != "annotations:write"
+            or grant.approved_at is None
+            or grant.approved_at <= now - 30 * 24 * 3600
+        ):
+            raise AnnotationFailure(401, "reconnect_required")
+
+    def _annotation_target(
+        self, session: Session, user_id: str, session_id: str
+    ) -> SqlConversation:
+        """Lock the conversation and the explicit edit grant; admins get no override."""
+        workspace_id = current_workspace_id()
+        conversation = session.get(
+            SqlConversation, (workspace_id, session_id), with_for_update=True
+        )
+        if conversation is None or conversation.deletion_claim_token is not None:
+            raise AnnotationFailure(404, "target_unavailable")
+        if conversation.archived:
+            raise AnnotationFailure(409, "target_archived")
+        metadata = session.get(
+            SqlConversationMetadata, (workspace_id, session_id), with_for_update=True
+        )
+        if metadata is None or metadata.kind != 1:
+            raise AnnotationFailure(404, "target_unavailable")
+        permission = session.get(
+            SqlSessionPermission, (workspace_id, user_id, session_id), with_for_update=True
+        )
+        if permission is None or permission.level < 2:
+            raise AnnotationFailure(403, "target_forbidden")
+        return conversation
+
+    @staticmethod
+    def _annotation_receipt(row: SqlAnnotationReceipt) -> dict[str, object]:
+        from omnigent.runtime.pending_inputs import make_pending_id
+
+        return {
+            "batch_id": row.batch_id,
+            "session_id": row.session_id,
+            "state": "delivery_unknown"
+            if row.dispatch_phase in ("dispatching", "uncertain")
+            else "accepted",
+            "dispatch_phase": row.dispatch_phase,
+            "retry_required": row.retry_required,
+            "item_id": row.item_id,
+            "pending_id": make_pending_id(row.session_id, row.item_id),
+            "accepted_at": row.accepted_at,
+            "session_path": f"/sessions/{row.session_id}",
+        }
+
+    def _insert_annotation_pending(
+        self, session: Session, conversation: SqlConversation, item: NewConversationItem
+    ) -> None:
+        """Use the existing item encoding and position allocator in the caller's transaction."""
+        workspace_id = current_workspace_id()
+        next_position = conversation.next_position
+        if next_position is None:
+            next_position = session.scalar(
+                select(func.coalesce(func.max(SqlConversationItem.position), -1) + 1).where(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == conversation.id,
+                )
+            )
+        assert next_position is not None
+        pending_count = session.scalar(
+            select(func.count(SqlConversationItem.id)).where(
+                SqlConversationItem.workspace_id == workspace_id,
+                SqlConversationItem.conversation_id == conversation.id,
+                SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+            )
+        )
+        if pending_count is None or pending_count >= MAX_PENDING_INPUTS:
+            raise AnnotationFailure(409, "pending_input_limit")
+        encoded = self._encode_item_data_batch(
+            [strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True)))]
+        )[0]
+        now = now_epoch()
+        session.add(
+            SqlConversationItem(
+                workspace_id=workspace_id,
+                conversation_id=conversation.id,
+                id=item.stable_id,
+                response_id=PENDING_INPUT_RESPONSE_ID,
+                created_at=now,
+                status=encode_item_status("in_progress"),
+                position=next_position,
+                type=encode_item_type("message"),
+                data=encoded,
+                search_text="",
+                created_by=item.created_by,
+            )
+        )
+        conversation.next_position = next_position + 1
+        conversation.updated_at = now
+
+    def admit_annotation_batch(
+        self,
+        user_id: str,
+        grant_id: str,
+        generation: str,
+        session_id: str,
+        batch: AnnotationBatch,
+        *,
+        target_live: bool,
+    ) -> tuple[dict[str, object], bool]:
+        """Commit receipt, captures and one pending user input in one SQL transaction."""
+        if self._engine is not self._conv_engine:
+            raise AnnotationFailure(503, "annotation_storage_unsupported")
+        digest = canonical_digest(session_id, batch)
+        input_id = uuid4().hex
+        pending = NewConversationItem(
+            type="message",
+            response_id=PENDING_INPUT_RESPONSE_ID,
+            stable_id=input_id,
+            status="in_progress",
+            data=MessageData(
+                role="user", content=render_annotation_batch(batch), user_authored=True
+            ),
+            created_by=user_id,
+        )
+        now = int(time.time())
+
+        def write(session: Session) -> tuple[dict[str, object], bool]:
+            self._annotation_authority(session, user_id, grant_id, generation, now)
+            workspace_id = current_workspace_id()
+            key = (workspace_id, user_id, grant_id, batch.batch_id)
+            prior = session.get(SqlAnnotationReceipt, key, with_for_update=True)
+            if prior is not None:
+                if prior.digest != digest or prior.session_id != session_id:
+                    raise AnnotationFailure(409, "idempotency_conflict")
+                return self._annotation_receipt(prior), False
+            conversation = self._annotation_target(session, user_id, session_id)
+            if not target_live:
+                raise AnnotationFailure(503, "target_unavailable")
+            expired: list[str] = []
+            total_bytes = 0
+            captures: list[SqlAnnotationCapture] = []
+            for item in batch.items:
+                capture_key = (workspace_id, user_id, grant_id, item.capture_id)
+                capture = session.get(SqlAnnotationCapture, capture_key, with_for_update=True)
+                item_digest = capture_digest(item)
+                if capture is not None and (
+                    capture.batch_id != batch.batch_id
+                    or capture.session_id != session_id
+                    or (
+                        capture.evidence_digest is not None
+                        and capture.evidence_digest != item_digest
+                    )
+                ):
+                    raise AnnotationFailure(409, "capture_conflict")
+                if item.screenshot is not None:
+                    if (
+                        capture is None
+                        or capture.file_id != item.screenshot.file_id
+                        or capture.sha256 != item.screenshot.sha256
+                        or capture.expires_at is None
+                        or capture.expires_at <= now
+                        or capture.upload_state != "ready"
+                    ):
+                        expired.append(item.capture_id)
+                        continue
+                    file_row = session.get(SqlFile, (workspace_id, capture.file_id))
+                    if file_row is None or file_row.session_id != session_id:
+                        expired.append(item.capture_id)
+                        continue
+                    total_bytes += file_row.bytes
+                elif capture is not None and capture.file_id is not None:
+                    raise AnnotationFailure(409, "capture_conflict")
+                if capture is None:
+                    capture = SqlAnnotationCapture(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        grant_id=grant_id,
+                        capture_id=item.capture_id,
+                        batch_id=batch.batch_id,
+                        session_id=session_id,
+                    )
+                    session.add(capture)
+                capture.evidence_digest = item_digest
+                captures.append(capture)
+            if expired:
+                raise AnnotationFailure(410, "screenshot_staging_expired", tuple(expired))
+            if total_bytes > 20 * 1024 * 1024:
+                raise AnnotationFailure(413, "batch_images_too_large")
+            self._insert_annotation_pending(session, conversation, pending)
+            for capture in captures:
+                capture.committed = True
+            receipt = SqlAnnotationReceipt(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                grant_id=grant_id,
+                batch_id=batch.batch_id,
+                session_id=session_id,
+                item_id=input_id,
+                digest=digest,
+                accepted_at=now,
+                dispatch_phase="ready",
+                retry_required=False,
+            )
+            session.add(receipt)
+            return self._annotation_receipt(receipt), True
+
+        return run_write_transaction(self._session_immediate, "admit_annotation_batch", write)
+
+    def reserve_annotation_screenshot(
+        self,
+        user_id: str,
+        grant_id: str,
+        generation: str,
+        session_id: str,
+        batch_id: str,
+        capture_id: str,
+        sha256: str,
+        delete_blob: Callable[[str], None],
+    ) -> tuple[dict[str, object], bool]:
+        """Commit an owner-bound blob key before any screenshot bytes are written."""
+        if self._engine is not self._conv_engine:
+            raise AnnotationFailure(503, "annotation_storage_unsupported")
+        now = int(time.time())
+
+        def write(session: Session) -> tuple[dict[str, object], bool]:
+            self._annotation_authority(session, user_id, grant_id, generation, now)
+            self._annotation_target(session, user_id, session_id)
+            workspace_id = current_workspace_id()
+            capture = session.get(
+                SqlAnnotationCapture,
+                (workspace_id, user_id, grant_id, capture_id),
+                with_for_update=True,
+            )
+            if capture is not None and (
+                capture.batch_id != batch_id
+                or capture.session_id != session_id
+                or capture.sha256 != sha256
+            ):
+                raise AnnotationFailure(409, "capture_conflict")
+            if capture is not None and capture.file_id is not None:
+                if capture.committed or (
+                    capture.expires_at is not None and capture.expires_at > now
+                ):
+                    return (
+                        {
+                            "file_id": capture.file_id,
+                            "sha256": sha256,
+                            "expires_at": capture.expires_at,
+                        },
+                        capture.upload_state != "ready",
+                    )
+                delete_blob(capture.file_id)
+                old_file = session.get(SqlFile, (workspace_id, capture.file_id))
+                if old_file is not None:
+                    session.delete(old_file)
+            if capture is None:
+                capture = SqlAnnotationCapture(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    grant_id=grant_id,
+                    capture_id=capture_id,
+                    batch_id=batch_id,
+                    session_id=session_id,
+                )
+                session.add(capture)
+            blob_identity = f"{workspace_id}:{user_id}:{grant_id}:{capture_id}:{sha256}"
+            capture.file_id = hashlib.sha256(blob_identity.encode()).hexdigest()[:32]
+            capture.sha256 = sha256
+            capture.expires_at = now + 24 * 3600
+            capture.upload_state = "reserved"
+            return (
+                {
+                    "file_id": capture.file_id,
+                    "sha256": sha256,
+                    "expires_at": capture.expires_at,
+                },
+                True,
+            )
+
+        return run_write_transaction(
+            self._session_immediate, "reserve_annotation_screenshot", write
+        )
+
+    def complete_annotation_screenshot(
+        self,
+        user_id: str,
+        grant_id: str,
+        generation: str,
+        session_id: str,
+        batch_id: str,
+        capture_id: str,
+        sha256: str,
+        file_id: str,
+        content: bytes,
+        content_type: str,
+        put_blob: Callable[[str, bytes], None],
+    ) -> dict[str, object]:
+        """Serialize a blob write and its metadata completion under the capture lock."""
+        if hashlib.sha256(content).hexdigest() != sha256:
+            raise AnnotationFailure(422, "screenshot_hash_mismatch")
+        if self._engine is not self._conv_engine:
+            raise AnnotationFailure(503, "annotation_storage_unsupported")
+        now = int(time.time())
+
+        def write(session: Session) -> dict[str, object]:
+            self._annotation_authority(session, user_id, grant_id, generation, now)
+            self._annotation_target(session, user_id, session_id)
+            workspace_id = current_workspace_id()
+            capture = session.get(
+                SqlAnnotationCapture,
+                (workspace_id, user_id, grant_id, capture_id),
+                with_for_update=True,
+            )
+            if (
+                capture is None
+                or capture.batch_id != batch_id
+                or capture.session_id != session_id
+                or capture.sha256 != sha256
+                or capture.file_id != file_id
+                or capture.expires_at is None
+                or capture.expires_at <= now
+            ):
+                raise AnnotationFailure(409, "screenshot_reservation_changed")
+            if capture.upload_state == "ready":
+                return {"file_id": file_id, "sha256": sha256, "expires_at": capture.expires_at}
+            if capture.upload_state != "reserved" or capture.committed:
+                raise AnnotationFailure(409, "screenshot_reservation_changed")
+            put_blob(file_id, content)
+            extension = "png" if content_type == "image/png" else "jpg"
+            session.add(
+                SqlFile(
+                    workspace_id=workspace_id,
+                    id=file_id,
+                    created_at=now,
+                    filename=f"annotation-{capture_id}.{extension}",
+                    bytes=len(content),
+                    content_type=content_type,
+                    session_id=session_id,
+                    blob_key=file_id,
+                )
+            )
+            capture.upload_state = "ready"
+            capture.expires_at = now + 24 * 3600
+            return {"file_id": file_id, "sha256": sha256, "expires_at": capture.expires_at}
+
+        return run_write_transaction(
+            self._session_immediate, "complete_annotation_screenshot", write
+        )
+
+    def stage_annotation_screenshot(
+        self,
+        user_id: str,
+        grant_id: str,
+        generation: str,
+        session_id: str,
+        batch_id: str,
+        capture_id: str,
+        sha256: str,
+        file_id: str,
+        size: int,
+        content_type: str,
+    ) -> tuple[dict[str, object], str | None]:
+        """Bind validated bytes to one owner and capture; return an old blob to retire."""
+        if self._engine is not self._conv_engine:
+            raise AnnotationFailure(503, "annotation_storage_unsupported")
+        now = int(time.time())
+
+        def write(session: Session) -> tuple[dict[str, object], str | None]:
+            self._annotation_authority(session, user_id, grant_id, generation, now)
+            self._annotation_target(session, user_id, session_id)
+            workspace_id = current_workspace_id()
+            key = (workspace_id, user_id, grant_id, capture_id)
+            capture = session.get(SqlAnnotationCapture, key, with_for_update=True)
+            if capture is not None and (
+                capture.batch_id != batch_id
+                or capture.session_id != session_id
+                or capture.sha256 != sha256
+            ):
+                raise AnnotationFailure(409, "capture_conflict")
+            if capture is not None and capture.committed:
+                return (
+                    {
+                        "file_id": capture.file_id,
+                        "sha256": sha256,
+                        "expires_at": capture.expires_at,
+                    },
+                    file_id,
+                )
+            if capture is not None and capture.file_id is not None and capture.expires_at:
+                if capture.expires_at > now:
+                    return (
+                        {
+                            "file_id": capture.file_id,
+                            "sha256": sha256,
+                            "expires_at": capture.expires_at,
+                        },
+                        file_id,
+                    )
+                old_file = capture.file_id
+                old_row = session.get(SqlFile, (workspace_id, old_file))
+                if old_row is not None:
+                    session.delete(old_row)
+            else:
+                old_file = None
+            extension = "png" if content_type == "image/png" else "jpg"
+            session.add(
+                SqlFile(
+                    workspace_id=workspace_id,
+                    id=file_id,
+                    created_at=now,
+                    filename=f"annotation-{capture_id}.{extension}",
+                    bytes=size,
+                    content_type=content_type,
+                    session_id=session_id,
+                    blob_key=file_id,
+                )
+            )
+            if capture is None:
+                capture = SqlAnnotationCapture(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    grant_id=grant_id,
+                    capture_id=capture_id,
+                    batch_id=batch_id,
+                    session_id=session_id,
+                )
+                session.add(capture)
+            capture.sha256 = sha256
+            capture.file_id = file_id
+            capture.expires_at = now + 24 * 3600
+            return (
+                {"file_id": file_id, "sha256": sha256, "expires_at": capture.expires_at},
+                old_file,
+            )
+
+        return run_write_transaction(self._session_immediate, "stage_annotation_screenshot", write)
+
+    def cleanup_expired_annotation_staging(
+        self,
+        user_id: str,
+        grant_id: str,
+        delete_blob: Callable[[str], None],
+        *,
+        limit: int = 20,
+    ) -> int:
+        """Remove only this owner's expired, uncommitted file rows in bounded pages."""
+        now = int(time.time())
+
+        def write(session: Session) -> int:
+            rows = list(
+                session.scalars(
+                    select(SqlAnnotationCapture)
+                    .where(
+                        SqlAnnotationCapture.workspace_id == current_workspace_id(),
+                        SqlAnnotationCapture.user_id == user_id,
+                        SqlAnnotationCapture.grant_id == grant_id,
+                        SqlAnnotationCapture.committed.is_(False),
+                        SqlAnnotationCapture.expires_at <= now,
+                        SqlAnnotationCapture.file_id.is_not(None),
+                    )
+                    .order_by(SqlAnnotationCapture.expires_at, SqlAnnotationCapture.capture_id)
+                    .limit(limit)
+                    .with_for_update()
+                )
+            )
+            retired = 0
+            for capture in rows:
+                if capture.file_id is None:
+                    continue
+                delete_blob(capture.file_id)
+                retired += 1
+                file_row = session.get(SqlFile, (current_workspace_id(), capture.file_id))
+                if file_row is not None:
+                    session.delete(file_row)
+                capture.file_id = None
+                capture.expires_at = None
+            return retired
+
+        return run_write_transaction(
+            self._session_immediate, "cleanup_expired_annotation_staging", write
+        )
+
+    def list_expired_annotation_staging(
+        self, *, limit: int = 200
+    ) -> list[tuple[int, str, str, str, str]]:
+        """Find expired staging across workspaces for the periodic cleanup job."""
+        with self._session("list_expired_annotation_staging") as session:
+            rows = session.scalars(
+                select(SqlAnnotationCapture)
+                .where(
+                    SqlAnnotationCapture.committed.is_(False),
+                    SqlAnnotationCapture.expires_at <= int(time.time()),
+                    SqlAnnotationCapture.file_id.is_not(None),
+                )
+                .order_by(
+                    SqlAnnotationCapture.expires_at,
+                    SqlAnnotationCapture.workspace_id,
+                    SqlAnnotationCapture.capture_id,
+                )
+                .limit(limit)
+            )
+            return [
+                (row.workspace_id, row.user_id, row.grant_id, row.capture_id, row.file_id)
+                for row in rows
+                if row.file_id is not None
+            ]
+
+    def retire_expired_annotation_staging(
+        self,
+        candidate: tuple[int, str, str, str, str],
+        delete_blob: Callable[[str], None],
+    ) -> bool:
+        """Recheck expiry under lock and delete bytes before releasing the SQL claim."""
+        workspace_id, user_id, grant_id, capture_id, file_id = candidate
+
+        def write(session: Session) -> bool:
+            capture = session.get(
+                SqlAnnotationCapture,
+                (workspace_id, user_id, grant_id, capture_id),
+                with_for_update=True,
+            )
+            if (
+                capture is None
+                or capture.committed
+                or capture.file_id != file_id
+                or capture.expires_at is None
+                or capture.expires_at > int(time.time())
+            ):
+                return False
+            delete_blob(file_id)
+            file_row = session.get(SqlFile, (workspace_id, file_id))
+            if file_row is not None:
+                session.delete(file_row)
+            capture.file_id = None
+            capture.expires_at = None
+            return True
+
+        return run_write_transaction(
+            self._session_immediate, "retire_expired_annotation_staging", write
+        )
+
+    def annotation_receipt_for_item(
+        self, session_id: str, item_id: str
+    ) -> dict[str, object] | None:
+        """Let the existing startup worker distinguish annotation pending rows."""
+        with self._session("lookup_annotation_pending") as session:
+            row = session.scalar(
+                select(SqlAnnotationReceipt).where(
+                    SqlAnnotationReceipt.workspace_id == current_workspace_id(),
+                    SqlAnnotationReceipt.session_id == session_id,
+                    SqlAnnotationReceipt.item_id == item_id,
+                )
+            )
+            if row is None:
+                return None
+            receipt = self._annotation_receipt(row)
+            grant = session.get(SqlDeviceGrant, (current_workspace_id(), row.grant_id))
+            receipt.update(
+                user_id=row.user_id,
+                grant_id=row.grant_id,
+                generation=grant.account_generation if grant is not None else None,
+            )
+            return receipt
+
+    def get_annotation_receipt(
+        self, user_id: str, grant_id: str, batch_id: str
+    ) -> dict[str, object] | None:
+        """Read only a receipt owned by this user and grant."""
+        with self._session("read_annotation_receipt") as session:
+            row = session.get(
+                SqlAnnotationReceipt,
+                (current_workspace_id(), user_id, grant_id, batch_id),
+            )
+            return self._annotation_receipt(row) if row is not None else None
+
+    def get_old_annotation_receipt(
+        self, user_id: str, generation: str, grant_id: str, batch_id: str
+    ) -> dict[str, object]:
+        """First-party check of one original owner's old batch after credential loss."""
+        with self._session("read_old_annotation_receipt_owner") as session:
+            owner = session.get(SqlAnnotationGrantOwner, (current_workspace_id(), grant_id))
+            if owner is None or owner.user_id != user_id or owner.account_generation != generation:
+                raise AnnotationFailure(404, "not_found")
+            grant = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            closed = (
+                grant is None
+                or grant.status != encode_device_grant_status("redeemed")
+                or grant.approved_at is None
+                or grant.approved_at <= int(time.time()) - 30 * 24 * 3600
+            )
+        receipt = self.get_annotation_receipt(user_id, grant_id, batch_id)
+        if receipt is not None:
+            return receipt
+        return {"batch_id": batch_id, "state": "not_admitted" if closed else "unknown_record"}
+
+    def begin_annotation_dispatch(
+        self,
+        user_id: str,
+        grant_id: str,
+        generation: str,
+        batch_id: str,
+        *,
+        target_live: bool,
+        explicit_retry: bool = False,
+    ) -> dict[str, object] | None:
+        """Commit ready→dispatching before the first runner call."""
+        now = int(time.time())
+
+        def write(session: Session) -> dict[str, object] | None:
+            self._annotation_authority(session, user_id, grant_id, generation, now)
+            key = (current_workspace_id(), user_id, grant_id, batch_id)
+            row = session.get(SqlAnnotationReceipt, key)
+            if row is None or row.dispatch_phase != "ready":
+                return None
+            self._annotation_target(session, user_id, row.session_id)
+            row = session.get(
+                SqlAnnotationReceipt, key, with_for_update=True, populate_existing=True
+            )
+            if row is None or row.dispatch_phase != "ready":
+                return None
+            if not target_live:
+                row.retry_required = True
+                return None
+            if row.retry_required and not explicit_retry:
+                return None
+            row.retry_required = False
+            row.dispatch_phase = "dispatching"
+            return self._annotation_receipt(row)
+
+        return run_write_transaction(self._session_immediate, "begin_annotation_dispatch", write)
+
+    def mark_annotation_uncertain(self, session_id: str, item_id: str) -> None:
+        """A recovered post-CAS pending item may have reached its runner."""
+
+        def write(session: Session) -> None:
+            row = session.scalar(
+                select(SqlAnnotationReceipt)
+                .where(
+                    SqlAnnotationReceipt.workspace_id == current_workspace_id(),
+                    SqlAnnotationReceipt.session_id == session_id,
+                    SqlAnnotationReceipt.item_id == item_id,
+                    SqlAnnotationReceipt.dispatch_phase == "dispatching",
+                )
+                .with_for_update()
+            )
+            if row is not None:
+                row.dispatch_phase = "uncertain"
+
+        run_write_transaction(self._session_immediate, "mark_annotation_uncertain", write)
+
+    def defer_unsubmitted_annotation(
+        self, session_id: str, item_id: str, *, runner_reported: bool = False
+    ) -> None:
+        """Keep a known-unsent input pending for an explicit retry."""
+
+        def write(session: Session) -> None:
+            row = session.scalar(
+                select(SqlAnnotationReceipt)
+                .where(
+                    SqlAnnotationReceipt.workspace_id == current_workspace_id(),
+                    SqlAnnotationReceipt.session_id == session_id,
+                    SqlAnnotationReceipt.item_id == item_id,
+                    SqlAnnotationReceipt.dispatch_phase.in_(
+                        ("dispatching", "uncertain") if runner_reported else ("dispatching",)
+                    ),
+                )
+                .with_for_update()
+            )
+            if row is not None:
+                row.dispatch_phase = "ready"
+                row.retry_required = True
+                pending = session.scalar(
+                    select(SqlConversationItem)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == session_id,
+                        SqlConversationItem.id == item_id,
+                        SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+                    )
+                    .with_for_update()
+                )
+                if pending is not None and pending.status == encode_item_status("incomplete"):
+                    pending.status = encode_item_status("in_progress")
+
+        run_write_transaction(self._session_immediate, "defer_unsubmitted_annotation", write)
+
+    def defer_annotation_input(self, session_id: str, item_id: str) -> None:
+        """A stopped or failed launch cannot auto-deliver a ready annotation."""
+
+        def write(session: Session) -> None:
+            row = session.scalar(
+                select(SqlAnnotationReceipt)
+                .where(
+                    SqlAnnotationReceipt.workspace_id == current_workspace_id(),
+                    SqlAnnotationReceipt.session_id == session_id,
+                    SqlAnnotationReceipt.item_id == item_id,
+                    SqlAnnotationReceipt.dispatch_phase == "ready",
+                )
+                .with_for_update()
+            )
+            if row is not None:
+                row.retry_required = True
+
+        run_write_transaction(self._session_immediate, "defer_annotation_input", write)
+
     def transition_pending_input(
         self,
         conversation_id: str,
@@ -3948,6 +4693,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 if row is not None:
                     replacements[cast(str, prepared["id"])] = (row.position, row.created_at)
+                    if item.annotation_delivery_confirmed:
+                        receipt = session.scalar(
+                            select(SqlAnnotationReceipt)
+                            .where(
+                                SqlAnnotationReceipt.workspace_id == workspace_id,
+                                SqlAnnotationReceipt.session_id == conversation_id,
+                                SqlAnnotationReceipt.item_id == row.id,
+                                SqlAnnotationReceipt.dispatch_phase.in_(
+                                    ("dispatching", "uncertain")
+                                ),
+                            )
+                            .with_for_update()
+                        )
+                        if receipt is not None:
+                            receipt.dispatch_phase = "confirmed"
                     session.execute(
                         delete(SqlConversationItem).where(
                             SqlConversationItem.workspace_id == workspace_id,

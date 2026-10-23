@@ -116,6 +116,7 @@ def build_runner_session_init_payload(
     project_code: list[ProjectCodeLocation] | None = None,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    usage_storage_location: str | None = None,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body.
 
@@ -124,6 +125,14 @@ def build_runner_session_init_payload(
     field existed.
     """
     from omnigent.inference_config import snapshot_runtime_config
+
+    if usage_storage_location is not None:
+        from omnigent.server.routes.usage import _resolve_session_harness
+        from omnigent.server.usage_cutover import active_hold
+
+        if active_hold(usage_storage_location, conversation, _resolve_session_harness) is not None:
+            suppress_recovery_turn = True
+            resume_interrupted_turn = False
 
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")

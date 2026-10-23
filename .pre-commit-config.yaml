@@ -89,7 +89,14 @@ repos:
         name: web TypeScript type check
         language: system
         entry: bash -c 'test -x web/node_modules/.bin/tsc && cd web && node_modules/.bin/tsc -b'
-        files: ^(web/.*\.[cm]?[jt]sx?|web/tsconfig(?:\.[^.]+)?\.json|web/package\.json|pnpm-(?:lock|workspace)\.yaml)$
+        files: ^(web/.*\.[cm]?[jt]sx?|browsers/shared/.*\.ts|web/tsconfig(?:\.[^.]+)?\.json|web/package\.json|pnpm-(?:lock|workspace)\.yaml)$
+        pass_filenames: false
+
+      - id: chrome-annotation-check
+        name: Chrome companion format, lint, types, tests and build
+        language: system
+        entry: pnpm --filter omnigent-chrome run check
+        files: ^(browsers/|pnpm-(?:lock|workspace)\.yaml)
         pass_filenames: false
 
       - id: vscode-tsc

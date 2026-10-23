@@ -139,10 +139,6 @@ _RECYCLE_RECONNECT_MIN_S = 0.5
 _RECYCLE_RECONNECT_MAX_S = 3.0
 _RUNNER_TUNNEL_CLOSE_TIMEOUT_S = 0.25
 _RUNNER_TUNNEL_OPEN_TIMEOUT_S = 10.0
-# In-flight requests can own inference; preserve their existing keepalive tolerance.
-_RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S = (
-    TUNNEL_KEEPALIVE_PING_INTERVAL_S + TUNNEL_KEEPALIVE_PING_TIMEOUT_S
-)
 # Close timeout for a *graceful* (idle-reaper) shutdown. Larger than the
 # snappy reconnect close above because completing the WebSocket close
 # handshake is what confirms the server read our end-of-stream ([DONE])
@@ -1102,7 +1098,6 @@ async def _serve_tunnel_once(
     import websockets
 
     dispatch_tasks: dict[str, asyncio.Task[None]] = {}
-    passive_dispatch_tasks: set[asyncio.Task[None]] = set()
     ws_channels: dict[str, _RunnerWSChannel] = {}
     # Identify as a first-party client so the server's WebSocket origin
     # guard (CSWSH protection) allows the handshake — this runner is not a
@@ -1181,9 +1176,14 @@ async def _serve_tunnel_once(
         async def send_text(data: str) -> None:
             await diagnostics.send(ws.send, data)
 
+        loop = asyncio.get_running_loop()
+
         async def receive_and_handle_frame() -> None:
             raw = await ws.recv()
             if shutdown_event is not None and shutdown_event.is_set():
+                return
+            # Buffered frames after a loop stall cannot renew an expired tunnel.
+            if loop.time() - last_progress >= RUNNER_TUNNEL_SILENCE_TIMEOUT_S:
                 return
             await _handle_tunnel_frame(
                 app,
@@ -1194,59 +1194,43 @@ async def _serve_tunnel_once(
                 on_activity=on_activity,
                 event_dispatcher=event_dispatcher,
                 diagnostics=diagnostics,
-                passive_dispatch_tasks=passive_dispatch_tasks,
             )
 
         async def receive_frame() -> None:
-            """Bound the read and inline pong with one elapsed ownership deadline."""
-            started = asyncio.get_running_loop().time()
-            silence_timeout = RUNNER_TUNNEL_SILENCE_TIMEOUT_S
+            """Bound reads, inline pongs and scheduling gaps by one progress deadline."""
+            nonlocal last_progress
             operation = asyncio.create_task(receive_and_handle_frame())
             try:
-                while True:
-                    diagnostics.settings["app_silence_timeout_s"] = silence_timeout
-                    done, _pending = await asyncio.wait(
-                        {operation},
-                        timeout=max(
-                            0.0, started + silence_timeout - asyncio.get_running_loop().time()
+                done, _pending = await asyncio.wait(
+                    {operation},
+                    timeout=max(
+                        0.0, last_progress + RUNNER_TUNNEL_SILENCE_TIMEOUT_S - loop.time()
+                    ),
+                )
+                now = loop.time()
+                if done and now - last_progress < RUNNER_TUNNEL_SILENCE_TIMEOUT_S:
+                    operation.result()
+                    last_progress = now
+                    return
+                if shutdown_event is None or not shutdown_event.is_set():
+                    _logger.warning(
+                        "Runner %s made no server-frame progress for %.0fs; reconnecting",
+                        runner_id,
+                        now - last_progress,
+                        extra=debug_event(
+                            "runner_server_silence_timeout",
+                            session_id=runner_primary_session_id(),
+                            runner_id=runner_id,
+                            connection_id=connection_id,
+                            silence_timeout_s=RUNNER_TUNNEL_SILENCE_TIMEOUT_S,
+                            **diagnostics.snapshot(),
                         ),
                     )
-                    if done:
-                        operation.result()
-                        return
-                    # Only event subscriptions are known to detach safely;
-                    # extend the same operation without cancelling a pending pong.
-                    if silence_timeout < _RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S and (
-                        any(
-                            not task.done() and task not in passive_dispatch_tasks
-                            for task in dispatch_tasks.values()
-                        )
-                        or any(
-                            channel.task is None or not channel.task.done()
-                            for channel in ws_channels.values()
-                        )
-                    ):
-                        silence_timeout = _RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S
-                        continue
-                    if shutdown_event is None or not shutdown_event.is_set():
-                        _logger.warning(
-                            "Runner %s made no server-frame progress for %.0fs; reconnecting",
-                            runner_id,
-                            silence_timeout,
-                            extra=debug_event(
-                                "runner_server_silence_timeout",
-                                session_id=runner_primary_session_id(),
-                                runner_id=runner_id,
-                                connection_id=connection_id,
-                                silence_timeout_s=silence_timeout,
-                                **diagnostics.snapshot(),
-                            ),
-                        )
-                        transport = getattr(ws, "transport", None)
-                        if transport is not None:
-                            with contextlib.suppress(Exception):
-                                transport.abort()
-                    raise ConnectionError("server application ping timeout; reconnecting")
+                    transport = getattr(ws, "transport", None)
+                    if transport is not None:
+                        with contextlib.suppress(Exception):
+                            transport.abort()
+                raise ConnectionError("server application ping timeout; reconnecting")
             finally:
                 operation.cancel()
                 await asyncio.gather(operation, return_exceptions=True)
@@ -1264,6 +1248,7 @@ async def _serve_tunnel_once(
             connection_id=connection_id,
             event_dispatcher=event_dispatcher,
         )
+        last_progress = loop.time()
         if event_dispatcher is not None:
             event_dispatcher.connected(send_text)
         # Recovery can await work sent through this tunnel, including when
@@ -1548,7 +1533,6 @@ async def _handle_tunnel_frame(
     on_activity: Callable[[], None] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
-    passive_dispatch_tasks: set[asyncio.Task[None]] | None = None,
 ) -> None:
     """Handle one server-to-runner tunnel frame.
 
@@ -1564,7 +1548,6 @@ async def _handle_tunnel_frame(
     :param on_activity: Optional sync callback fired for non-ping
         frames that represent real runner work.
     :param diagnostics: Connection-local application frame and heartbeat observations.
-    :param passive_dispatch_tasks: Connection-owned subscriptions that can safely reconnect.
     :returns: None.
     """
     if diagnostics is not None:
@@ -1599,17 +1582,6 @@ async def _handle_tunnel_frame(
             name=f"ws-tunnel-dispatch:{frame.id}",
         )
         dispatch_tasks[frame.id] = task
-        path = frame.path.split("?", 1)[0].split("/")
-        if (
-            passive_dispatch_tasks is not None
-            and frame.method == "GET"
-            and len(path) == 5
-            and path[:3] == ["", "v1", "sessions"]
-            and path[3]
-            and path[4] == "stream"
-        ):
-            passive_dispatch_tasks.add(task)
-            task.add_done_callback(passive_dispatch_tasks.discard)
         task.add_done_callback(_forget_dispatch_task(dispatch_tasks, frame.id))
     elif isinstance(frame, RequestCancelFrame):
         if on_activity is not None:

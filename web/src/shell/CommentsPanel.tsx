@@ -566,7 +566,7 @@ function CommentCard({
       {screenshotExpiry && (
         <p className="text-xs text-muted-foreground">
           {now.getTime() >= screenshotExpiry * 1000
-            ? "截图已过期"
+            ? "Screenshot expired"
             : `Screenshot expires ${new Date(screenshotExpiry * 1000).toLocaleDateString()}`}
         </p>
       )}

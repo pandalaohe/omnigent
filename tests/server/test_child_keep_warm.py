@@ -956,7 +956,7 @@ async def test_skipped_receipt_clears_the_attempt_only(harness: _Harness) -> Non
     settled = _read_label(harness, main.id)
     assert settled is not None
     assert settled.a is None and settled.u == u and settled.f == 0
-    assert settled.k == "card"
+    assert settled.k == "skip:card"
     assert _read_stats(harness, main.id) == child_keep_warm._WarmStats()
 
 
@@ -982,6 +982,74 @@ async def test_failed_receipts_pause_at_three(harness: _Harness) -> None:
     paused = _read_label(harness, child.id)
     assert paused is not None and paused.s == "p" and paused.why == "fail"
     assert len(harness.notices.lines) == 1
+
+
+@pytest.mark.parametrize("first_outcome", ["skipped", "failed"])
+async def test_repeated_skips_notify_parent_once_per_episode(
+    harness: _Harness, first_outcome: str
+) -> None:
+    parent = _parent(harness)
+    u = harness.now - _CLAUDE_INTERVAL_S
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+    for index in range(4):
+        await _tick(harness)
+        state = _read_label(harness, child.id)
+        assert state is not None
+        assert await harness.sweeper.settle_receipt(
+            child.id,
+            {
+                "attempt_id": state.a,
+                "outcome": first_outcome if index == 0 else "skipped",
+                "reason": "native_status",
+            },
+        )
+        assert len(harness.notices.lines) == (1 if index >= 2 else 0)
+        harness.clock.now += 60
+    parent_id, text = harness.notices.lines[0]
+    assert parent_id == parent.id and child.title in text and "native_status" in text
+    await _tick(harness)
+    state = _read_label(harness, child.id)
+    assert state is not None
+    await harness.sweeper.settle_receipt(
+        child.id, {"attempt_id": state.a, "outcome": "failed", "reason": "dismiss_failed"}
+    )
+    assert len(harness.notices.lines) == 1
+    _set_running_since(harness, child.id, harness.clock.now)
+    await _tick(harness)
+    harness.clock.now += _CLAUDE_INTERVAL_S
+    for _ in range(3):
+        await _tick(harness)
+        state = _read_label(harness, child.id)
+        assert state is not None
+        await harness.sweeper.settle_receipt(
+            child.id,
+            {"attempt_id": state.a, "outcome": "skipped", "reason": "composer_unreadable"},
+        )
+        harness.clock.now += 60
+    assert len(harness.notices.lines) == 2
+    assert "composer_unreadable" in harness.notices.lines[1][1]
+
+
+async def test_main_skipped_pings_stay_visible_without_a_parent_notice(harness: _Harness) -> None:
+    u = harness.now - _CLAUDE_INTERVAL_S
+    main = _main(harness, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+    for _ in range(3):
+        await _tick(harness)
+        state = _read_label(harness, main.id)
+        assert state is not None
+        await harness.sweeper.settle_receipt(
+            main.id, {"attempt_id": state.a, "outcome": "skipped", "reason": "native_status"}
+        )
+        harness.clock.now += 60
+    conv = harness.store.get_conversation(main.id)
+    status = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+    assert status is not None
+    assert (status["state"], status["stop_reason"], status["last_reason"]) == (
+        "paused",
+        "skipped",
+        "native_status",
+    )
+    assert harness.notices.lines == []
 
 
 async def test_unverified_overlay_close_pauses_after_one_receipt(harness: _Harness) -> None:
@@ -1213,7 +1281,7 @@ async def test_unmapped_receipt_reason_stores_other(harness: _Harness) -> None:
     )
 
     settled = _read_label(harness, main.id)
-    assert settled is not None and settled.k == "other"
+    assert settled is not None and settled.k == "skip:other"
 
 
 async def test_ok_receipt_clears_a_recorded_stop_reason(harness: _Harness) -> None:
@@ -2405,7 +2473,7 @@ async def test_unlabelled_idle_warm_state_uses_last_real_turn(
         )
         is None
     )
-    # A keep-warm label remains authoritative even when a later turn is fresh.
+    # A turn-start stamp alone does not supersede a keep-warm observation.
     assert (
         warm_state_for_labels(
             {
@@ -2429,7 +2497,7 @@ async def test_unlabelled_idle_warm_state_uses_last_real_turn(
                 busy=False,
                 now=now,
             )
-            == "cold"
+            == "warm"
         )
     assert (
         warm_state_for_labels(
@@ -2441,6 +2509,80 @@ async def test_unlabelled_idle_warm_state_uses_last_real_turn(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("family", ["claude", "codex"])
+@pytest.mark.parametrize(
+    "age,cold_after,expected",
+    [
+        (33, None, "warm"),
+        (33, 60, "warm"),
+        (60, 60, "cold"),
+        (-1, None, "cold"),
+        (3600, None, "cold"),
+    ],
+)
+async def test_new_settled_turn_overrides_expired_keep_warm_label(
+    family: str, age: int, cold_after: int | None, expected: str
+) -> None:
+    now = 1792671498
+    labels = {
+        KEEP_WARM_LABEL: _label(
+            s="c", why="exp", y=family, c=1792666657, u=1792666657, w=1792670257
+        ),
+        "omnigent.last_real_turn_settled": str(now - age),
+    }
+    assert (
+        warm_state_for_labels(
+            labels, archived=False, busy=False, now=now, family=family, cold_after_s=cold_after
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("reason", ["native_status", "card", "unknown"])
+async def test_skipped_receipt_stays_visible_until_recovery_or_expiry(
+    harness: _Harness, reason: str
+) -> None:
+    u = harness.now - _CLAUDE_INTERVAL_S
+    main = _main(harness, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+    await _tick(harness)
+    state = _read_label(harness, main.id)
+    assert state is not None
+    assert await harness.sweeper.settle_receipt(
+        main.id, {"attempt_id": state.a, "outcome": "skipped", "reason": reason}
+    )
+    for _ in range(2):
+        conv = harness.store.get_conversation(main.id)
+        status = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+        assert status is not None
+        assert (status["state"], status["stop_reason"], status["last_reason"]) == (
+            "paused",
+            "skipped",
+            reason,
+        )
+        assert status["total"]["pings"] == 0
+        await _tick(harness)
+    state = _read_label(harness, main.id)
+    assert state is not None and state.f == 0 and state.u == u
+    assert await harness.sweeper.settle_receipt(main.id, {"attempt_id": state.a, "outcome": "ok"})
+    conv = harness.store.get_conversation(main.id)
+    status = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+    assert status is not None and status["state"] == "on" and status["last_reason"] is None
+    harness.clock.now += _CLAUDE_INTERVAL_S
+    await _tick(harness)
+    state = _read_label(harness, main.id)
+    assert state is not None
+    await harness.sweeper.settle_receipt(
+        main.id, {"attempt_id": state.a, "outcome": "skipped", "reason": reason}
+    )
+    harness.clock.now += _SLACK_S + 1
+    await _tick(harness)
+    conv = harness.store.get_conversation(main.id)
+    status = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+    assert status is not None
+    assert (status["stop_reason"], status["last_reason"]) == ("expired", reason)
+    assert harness.notices.lines == []
 
 
 async def test_warm_state_from_label_cold_after_zero_never_reads_cold() -> None:
@@ -3539,14 +3681,172 @@ async def test_keep_warm_status_maps_state_reasons_and_costs() -> None:
     assert off["state"] == "off"
     assert off["stop_reason"] is None
 
-    # An unrecognized stored code never errors; it reads a null stop reason.
+    # Expiry is a recorded close reason, even if no ping was sent.
     unknown = _status(_label(s="c", why="exp", y="claude", t=1))
     assert unknown is not None
     assert unknown["state"] == "stopped"
-    assert unknown["stop_reason"] is None
+    assert unknown["stop_reason"] == "expired"
 
     assert _status(None) is None
     assert _status(_label(s="w", y="claude", t=1), archived=True) is None
+
+
+@pytest.mark.parametrize(
+    ("why", "reason"),
+    [
+        ("cap", "cap"),
+        ("exp", "expired"),
+        ("rev", "archive_revision"),
+        ("miss", "misses"),
+        ("fail", "failures"),
+        ("pol", "policy"),
+        ("mom", "parent_inactive"),
+    ],
+)
+async def test_every_recorded_close_reason_has_status(why: str, reason: str) -> None:
+    from omnigent.server.schemas import KeepWarmStatus
+
+    result = keep_warm_status_from_labels(
+        {KEEP_WARM_LABEL: _label(s="c", why=why)}, archived=False, now=1_000_000
+    )
+    assert result is not None and result["stop_reason"] == reason
+    assert KeepWarmStatus.model_validate(result).stop_reason == reason
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "not_inspectable",
+        "switch_off",
+        "missing_running_since",
+        "session_closed",
+        "ancestor_archived",
+        "runner_offline",
+        "host_unavailable",
+        "status_not_idle",
+        "running",
+        "pending_card",
+    ],
+)
+async def test_first_window_blocker_survives_expiry(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, blocker: str
+) -> None:
+    u = harness.now - _CLAUDE_INTERVAL_S
+    parent = _parent(harness)
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+    harness.sweeper._tracked[child.id] = harness.now + _SLACK_S
+    if blocker == "not_inspectable":
+        harness.store.set_labels(child.id, {_WRAPPER_LABEL_KEY: _MIRRORED_CLAUDE_WRAPPER})
+    elif blocker == "switch_off":
+        harness.prefs.keep_warm = {"agents": {_CLAUDE_AGENT: {"child": False}}}
+    elif blocker == "missing_running_since":
+        monkeypatch.setattr(child_keep_warm, "_running_since", lambda _conv: None)
+    elif blocker == "session_closed":
+        harness.store.set_labels(child.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    elif blocker == "ancestor_archived":
+        monkeypatch.setattr(harness.sweeper, "_ancestor_archived", lambda _conv: True)
+    elif blocker == "runner_offline":
+        harness.liveness.runner_online = False
+    elif blocker == "host_unavailable":
+        harness.host_ok.ok = False
+    elif blocker in ("status_not_idle", "running"):
+        harness.store.set_session_live_status(
+            child.id, "running" if blocker == "running" else "failed"
+        )
+    else:
+        pending_elicitations.record_publish(
+            child.id,
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": "sync",
+                "params": {"message": "Allow build?"},
+            },
+        )
+    await _tick(harness)
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    result = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.now)
+    expected = "status_not_idle" if blocker == "running" else blocker
+    assert result is not None and result["blocked_by"] == expected
+    first_label = conv.labels[KEEP_WARM_LABEL]
+    await _tick(harness)
+    assert harness.store.get_conversation(child.id).labels[KEEP_WARM_LABEL] == first_label
+    # A later blocker must not replace the first observation.
+    harness.host_ok.ok = False
+    if blocker == "running":
+        harness.store.set_session_live_status(child.id, "failed")
+    harness.clock.now += _SLACK_S + 1
+    await _tick(harness)
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    result = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+    assert result is not None and result["state"] == "stopped"
+    assert result["stop_reason"] == "expired"
+    assert result["blocked_by"] == expected
+    assert harness.forward.pings() == []
+
+
+@pytest.mark.parametrize(
+    "blocker", ["missing_running_since", "ancestor_archived", "status_not_idle"]
+)
+async def test_historical_blocker_preserves_current_gate(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, blocker: str
+) -> None:
+    u = harness.now - _CLAUDE_INTERVAL_S
+    child = _child(
+        harness, _parent(harness).id, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u
+    )
+    if blocker == "missing_running_since":
+        monkeypatch.setattr(child_keep_warm, "_running_since", lambda _conv: None)
+    elif blocker == "ancestor_archived":
+        monkeypatch.setattr(harness.sweeper, "_ancestor_archived", lambda _conv: True)
+    else:
+        harness.store.set_session_live_status(child.id, "failed")
+        pending_elicitations.record_publish(
+            child.id,
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": "sync",
+                "params": {"message": "Allow build?"},
+            },
+        )
+    harness.liveness.runner_online = blocker == "status_not_idle"
+    await _tick(harness)
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    result = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.now)
+    assert result is not None and result["state"] == "paused"
+    assert result["last_reason"] == ("card" if blocker == "status_not_idle" else "runner")
+    assert result["blocked_by"] == blocker
+
+
+async def test_blocker_only_records_in_ping_window_and_resets_on_real_turn(
+    harness: _Harness,
+) -> None:
+    u = harness.now - _CLAUDE_INTERVAL_S + 60
+    main = _main(harness, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+    harness.host_ok.ok = False
+    await _tick(harness)
+    conv = harness.store.get_conversation(main.id)
+    assert conv is not None
+    result = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.now)
+    assert result is not None and result["blocked_by"] is None
+    harness.clock.now += 60
+    await _tick(harness)
+    # Recovering eligibility clears k but preserves the historical blocker.
+    harness.host_ok.ok = True
+    await _tick(harness)
+    await _settle(harness, main.id)
+    conv = harness.store.get_conversation(main.id)
+    assert conv is not None
+    result = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+    assert result is not None and result["blocked_by"] == "host_unavailable"
+    _set_running_since(harness, main.id, harness.clock.now)
+    await _tick(harness)
+    conv = harness.store.get_conversation(main.id)
+    assert conv is not None
+    result = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+    assert result is not None and result["blocked_by"] is None
 
 
 async def test_keep_warm_status_reports_a_blocking_gate() -> None:
@@ -3666,6 +3966,8 @@ async def test_label_round_trips_through_the_store_at_its_largest(
         r=True,
         e=True,
         k="x" * 24,
+        y="claude",
+        g="t",
     )
     value = state.to_label()
     assert len(value) <= 256

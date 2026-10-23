@@ -62,6 +62,7 @@ from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.bridge import (
     bridge_dir_for_session_id,
     clear_inbox,
+    permission_tool_registry_source,
     prepare_bridge_dir,
     prepare_permission_installation,
     verify_pi_permission_installation,
@@ -756,6 +757,8 @@ const PERMISSION_BRIDGE_DIR = __BRIDGE_DIR__;
 const PERMISSION_SESSION_ID = __SESSION_ID__;
 const PLAN_VISIBLE_TOOLS = new Set(__PLAN_TOOLS__);
 const PERMISSION_LEASES = new Map();
+const permissionToolSources = __TOOL_REGISTRY_SOURCE__;
+let permissionToolRegistry = null;
 let baselineActiveTools = null;
 
 function permissionPath(name) { return path.join(PERMISSION_BRIDGE_DIR, name); }
@@ -804,19 +807,30 @@ function applyPermissionTools(pi, tier) {
       actual.every((name, index) => name === desired[index]) ? actual : null;
   } catch (_err) { return null; }
 }
-function writePermissionInstallation(pi) {
-  const state = permissionState();
+function writePermissionInstallation(pi, confirmedState, confirmedTools) {
+  const state = confirmedState || permissionState();
   const expected = readPermissionJson("permission_expected.json");
   if (!state || !expected || expected.session_id !== PERMISSION_SESSION_ID ||
       expected.harness !== "pi" || typeof expected.installation_id !== "string" ||
       !expected.installation_id ||
       (state.tier !== "full" && !permissionExtensionOrderProven())) return;
-  const tools = pi.getActiveTools();
-  if (!Array.isArray(tools) || !tools.every((name) => typeof name === "string")) return;
-  baselineActiveTools = tools;
-  const active = applyPermissionTools(pi, state.tier);
-  if (!active) return;
+  let active = confirmedTools;
+  if (!active) {
+    const tools = pi.getActiveTools();
+    if (!Array.isArray(tools) || !tools.every((name) => typeof name === "string")) return false;
+    baselineActiveTools = tools;
+    active = applyPermissionTools(pi, state.tier);
+  }
+  if (!active) return false;
   try {
+    if (state.tier !== "full") {
+      permissionToolRegistry = permissionToolSources.capture(pi, {
+        version: 1, installation_id: expected.installation_id,
+        session_id: PERMISSION_SESSION_ID, harness: "pi",
+        extension_sha256: expected.extension_sha256,
+      });
+      writePermissionJson("permission_tools.json", permissionToolRegistry);
+    }
     writePermissionJson("permission_installation.json", {
       version: 1, installation_id: expected.installation_id,
       session_id: PERMISSION_SESSION_ID, harness: "pi",
@@ -825,7 +839,8 @@ function writePermissionInstallation(pi) {
       tier: state.tier, revision: state.revision,
       tools_verified: true, active_tools: active,
     });
-  } catch (_err) {}
+    return true;
+  } catch (_err) { return false; }
 }
 function permissionExtensionOrderProven() {
   if (process.env.OMNIGENT_PI_PERMISSION_INLINE) {
@@ -863,14 +878,20 @@ function pollPermissionInbox(pi, ctx) {
       const idle = ctx && typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
       const valid = state && state.status === "switching" &&
         state.revision === payload.expected_revision && idle &&
-        ["ask", "plan", "accept-edits", "auto"].includes(payload.target_tier) &&
-        state.tier !== "full";
+        ["ask", "plan", "accept-edits", "auto", "full"].includes(payload.target_tier) &&
+        (payload.target_tier === "full" || permissionExtensionOrderProven());
       const active = valid ? applyPermissionTools(pi, payload.target_tier) : null;
+      const attested = active && writePermissionInstallation(
+        pi,
+        { ...state, tier: payload.target_tier,
+          revision: state.revision + (payload.target_tier === state.tier ? 0 : 1) },
+        active,
+      );
       try { writePermissionJson("permission_ack.json", {
         id: payload.id, session_id: PERMISSION_SESSION_ID,
         target_tier: payload.target_tier,
         expected_revision: payload.expected_revision,
-        ok: !!active, active_tools: active || [],
+        ok: !!attested, active_tools: active || [],
       }); } catch (_err) {}
       try { fs.unlinkSync(file); } catch (_err) {}
     }
@@ -910,6 +931,7 @@ function installPermissionHooks(pi) {
         setup.replace("__BRIDGE_DIR__", json.dumps(str(bridge_dir)))
         .replace("__SESSION_ID__", json.dumps(session_id))
         .replace("__PLAN_TOOLS__", json.dumps(plan_tools))
+        .replace("__TOOL_REGISTRY_SOURCE__", permission_tool_registry_source())
     )
 
 
@@ -1168,6 +1190,20 @@ def _generate_extension_js(
     permission_revision_capture = (
         "const permissionRevisionAtCall = permissionRevision();" if permission_setup else ""
     )
+    permission_source_guard = (
+        'if (permissionState().tier !== "full" && permissionToolRegistry && '
+        "!permissionToolSources.matches(pi, permissionToolRegistry, event.toolName)) "
+        'return { block: true, reason: "Pi extension registration changed; '
+        'restart to verify its source" };'
+        if permission_setup
+        else ""
+    )
+    permission_bridge_origin = (
+        "(!permissionToolRegistry || "
+        "permissionToolSources.isBridge(permissionToolRegistry, event.toolName, __filename))"
+        if permission_setup
+        else "true"
+    )
     permission_post_guard = (
         "if (permissionRevision() !== permissionRevisionAtCall) return "
         '{ block: true, reason: "permission revision changed" };'
@@ -1326,7 +1362,9 @@ module.exports = function(pi) {{
       return {{ block: true, reason: "invalid tool call" }};
     }}
     {permission_guard}
-    if (BRIDGED.has(event.toolName) && !PI_NATIVE_TOOLS.has(event.toolName)) return;
+    {permission_source_guard}
+    if (BRIDGED.has(event.toolName) && !PI_NATIVE_TOOLS.has(event.toolName) &&
+        {permission_bridge_origin}) return;
     {permission_revision_capture}
     const verdict = await evalNativePolicy(event.toolName, event.input, event.toolCallId);
     if (verdict.block) {{

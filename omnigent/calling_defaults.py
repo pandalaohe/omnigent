@@ -376,7 +376,7 @@ def _resolve_harness_setting(
                 tier = normalize_permission_tier(value, harness=harness, legacy=True)
             except ValueError:
                 continue
-            return ("auto" if tier == "full" else tier), source
+            return tier, source
         if value is not None and (
             (field == "speed" and valid_speed_tier(value, harness))
             or (field != "speed" and (values is None or value in values))

@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "batch_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "intent": "send",
+  "items": [
+    {
+      "capture_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "captured_at": "2026-10-22T01:02:03Z",
+      "kind": "text",
+      "note": "Keep this user instruction\nverbatim.",
+      "page": {
+        "url": "https://example.test/checkout",
+        "title": "Checkout · Demo",
+        "include_query_fragment": false
+      },
+      "target": {
+        "tag": "p",
+        "selector": "",
+        "quote": "Total: \"€25\" ```",
+        "prefix": "Cart",
+        "suffix": "Continue",
+        "aria_label": "Order total",
+        "role": "status"
+      },
+      "geometry": {
+        "rect": { "x": 10.2, "y": 20.1, "width": 20.2, "height": 10.2 },
+        "viewport": { "width": 1000, "height": 800 },
+        "bitmap_scale": { "x": 1.5, "y": 1.49875 }
+      },
+      "screenshot": {
+        "file_id": "cccccccccccccccccccccccccccccccc",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    }
+  ]
+}

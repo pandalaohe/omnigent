@@ -2,6 +2,8 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const permissionToolSources = require("./permission_tool_registry.cjs");
+let permissionToolRegistry = null;
 
 // Tuning for the TOOL_CALL policy long-poll (see evalNativePolicyHttp).
 //
@@ -223,7 +225,7 @@ function activeToolsForTier(pi, config, baselineTools, tier) {
   }
 }
 
-function markPermissionInstallation(config, state, activeTools) {
+function markPermissionInstallation(pi, config, state, activeTools) {
   if (!config || !state || !activeTools ||
       (state.tier !== "full" && !permissionExtensionOrderProven()) ||
       typeof config.permissionInstallationId !== "string" ||
@@ -231,6 +233,13 @@ function markPermissionInstallation(config, state, activeTools) {
   try {
     const extensionSha256 = crypto.createHash("sha256")
       .update(fs.readFileSync(__filename)).digest("hex");
+    if (state.tier !== "full") {
+      permissionToolRegistry = permissionToolSources.capture(pi, {
+        version: 1, installation_id: config.permissionInstallationId,
+        session_id: state.session_id, harness: "pi-native", extension_sha256: extensionSha256,
+      });
+      writePermissionControlFile(config, "permission_tools.json", permissionToolRegistry);
+    }
     writePermissionControlFile(config, "permission_installation.json", {
       version: 1,
       installation_id: config.permissionInstallationId,
@@ -890,7 +899,7 @@ async function callOmnigentTool(config, toolName, args, callId) {
 
   const permissionState = readPermissionState(config);
   if (!permissionState || permissionState.status !== "ready") {
-    return { content: [{ type: "text", text: "权限状态待恢复，工具已暂停" }], isError: true };
+    return { content: [{ type: "text", text: "Permission state needs recovery; tools are paused" }], isError: true };
   }
 
   const first = await postMcpToolsCall(config, toolName, args, 1, callId);
@@ -926,7 +935,7 @@ async function callOmnigentTool(config, toolName, args, callId) {
   const current = readPermissionState(config);
   if (!current || current.status !== "ready" ||
       current.revision !== permissionState.revision || current.tier !== permissionState.tier) {
-    return { content: [{ type: "text", text: "权限状态已变化，工具未执行" }], isError: true };
+    return { content: [{ type: "text", text: "Permission state changed; the tool was not executed" }], isError: true };
   }
   const retry = await postMcpToolsCall(config, toolName, args, 2, callId, {
     requestState: initial.requestState,
@@ -1080,6 +1089,11 @@ const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
 const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
 const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+const _PREVIEW_POST_TIMEOUT_MS = 1_000;
+const _PREVIEW_FLUSH_TIMEOUT_MS = 300;
+const _PREVIEW_MAX_QUEUED_EVENTS = 32;
+const _PREVIEW_MAX_QUEUED_CHARS = 32_768;
+const _PREVIEW_MAX_DELTA_CHARS = 8_192;
 
 function boundedSourceId(sourceId) {
   const value = typeof sourceId === "string" ? sourceId.trim() : "";
@@ -1656,8 +1670,7 @@ function startInboxPoller(
       }
       if (payload.type === "thinking_level_change") {
         // Point-in-time: one delivery attempt, then always consume the file.
-        // Pi's setThinkingLevel is async but fire-and-forget here — success is
-        // visible in Pi's TUI menu and the returned promise is discarded.
+        // The callback reads back Pi's effective level after its synchronous setter.
         if (
           typeof handleThinkingLevelChange === "function" &&
           typeof payload.thinkingLevel === "string"
@@ -1697,6 +1710,30 @@ module.exports = function (pi) {
   let latestContext = null;
   let rotationInFlight = false;
   let rotationPending = false;
+  let settingThinkingLevel = false;
+  let lastReportedThinkingLevel;
+  let thinkingLevelReport = Promise.resolve();
+  function reportThinkingLevel(force = false) {
+    // Serialize posts and read state when sending, so concurrent native events
+    // cannot deliver an older snapshot after a newer selection.
+    thinkingLevelReport = thinkingLevelReport.then(async () => {
+      try {
+        if (typeof pi.getThinkingLevel !== "function") return;
+        const level = pi.getThinkingLevel();
+        if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)) return;
+        if (!force && level === lastReportedThinkingLevel) return;
+        await postEventChecked(config, {
+          type: "external_reasoning_effort_change",
+          data: { reasoning_effort: level === "off" ? "none" : level },
+        });
+        lastReportedThinkingLevel = level;
+      } catch (_err) {
+        lastReportedThinkingLevel = undefined;
+        // Legacy APIs and a temporarily unavailable server must not break Pi.
+      }
+    });
+    return thinkingLevelReport;
+  }
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -1709,13 +1746,12 @@ module.exports = function (pi) {
   // message_update events carrying an assistantMessageEvent of type
   // "text_delta" (token chunk) / "text_end" (block complete) during a
   // turn — see @earendil-works/pi-ai AssistantMessageEvent. We forward
-  // each token as a transient external_output_text_delta so the web UI
-  // paints a live preview before the final message lands.
+  // adjacent tokens as transient external_output_text_delta events so the
+  // web UI paints a live preview before the final message lands.
   //
-  // The preview is keyed by ASSISTANT MESSAGE, not per text block: the
-  // web UI (chatStore.pumpStreamEvents) finalizes the OLDEST in-flight
-  // "live:<message_id>" preview when the authoritative text_done arrives,
-  // FIFO, and message_end posts ONE combined external_conversation_item
+  // The preview is keyed by ASSISTANT MESSAGE, not per text block.
+  // message_end carries the same id on its authoritative item, retiring late
+  // previews, and posts ONE combined external_conversation_item
   // per assistant message (textFromMessage joins all text blocks). So a
   // 1:1 message-scoped id keeps exactly one preview per item; a per-block
   // id would orphan extra previews when a message has multiple text
@@ -1731,6 +1767,104 @@ module.exports = function (pi) {
   // ones — see the message_end handler for why it advances there (not on
   // message_start) so deltas and the finalize agree on the id.
   let streamingMessageOrdinal = 0;
+  // The sender serializes text and reasoning previews. Slow preview HTTP
+  // cannot hold Pi's token producer or the authoritative message indefinitely.
+  const previewQueue = [];
+  let previewQueuedChars = 0;
+  let previewTask = null;
+  let previewController = null;
+  let previewDisabled = false;
+  function disablePreviews() {
+    previewDisabled = true;
+    previewQueue.length = 0;
+    previewQueuedChars = 0;
+    if (previewController) previewController.abort();
+  }
+  function queuePreview(type, data, key) {
+    if (previewDisabled) return;
+    const delta = data.delta;
+    const last = previewQueue[previewQueue.length - 1];
+    if (last && key && last.key === key &&
+        last.data.delta.length + delta.length <= _PREVIEW_MAX_DELTA_CHARS) {
+      last.data.delta += delta;
+      previewQueuedChars += delta.length;
+    } else if (previewQueue.length < _PREVIEW_MAX_QUEUED_EVENTS &&
+               delta.length <= _PREVIEW_MAX_DELTA_CHARS) {
+      previewQueue.push({ type, data, key });
+      previewQueuedChars += delta.length;
+    } else {
+      previewDisabled = true;
+    }
+    if (previewQueuedChars > _PREVIEW_MAX_QUEUED_CHARS || previewDisabled) {
+      previewQueue.length = 0;
+      previewQueuedChars = 0;
+      return;
+    }
+    queuePreviewPump();
+  }
+
+  function queuePreviewPump() {
+    if (previewTask || !previewQueue.length) return;
+    previewTask = drainPreviews().finally(() => {
+      previewTask = null;
+      if (previewQueue.length) queuePreviewPump();
+    });
+  }
+
+  async function drainPreviews() {
+    while (previewQueue.length) {
+      const next = previewQueue.shift();
+      previewQueuedChars -= next.data.delta.length;
+      if (next.type === "external_output_text_delta") {
+        const messageId = next.data.message_id;
+        const index = streamedTextIndex.get(messageId) || 0;
+        next.data.index = index;
+        streamedTextIndex.set(messageId, index + 1);
+      }
+      const controller = new AbortController();
+      previewController = controller;
+      let timeout;
+      try {
+        const deadline = new Promise((_, reject) => {
+          controller.signal.addEventListener("abort", () => {
+            reject(new Error("preview POST aborted"));
+          }, { once: true });
+          timeout = setTimeout(() => {
+            controller.abort();
+          }, _PREVIEW_POST_TIMEOUT_MS);
+        });
+        await Promise.race([
+          postEventChecked(config, { type: next.type, data: next.data }, controller.signal),
+          deadline,
+        ]);
+      } catch (_err) {
+        // A partial preview is repaired by the authoritative item.
+        disablePreviews();
+      } finally {
+        clearTimeout(timeout);
+        if (previewController === controller) previewController = null;
+      }
+    }
+  }
+
+  async function flushPreviews() {
+    const deadline = Date.now() + _PREVIEW_FLUSH_TIMEOUT_MS;
+    while (previewTask) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        disablePreviews();
+        await previewTask;
+        return;
+      }
+      let timeout;
+      await Promise.race([
+        previewTask,
+        new Promise((resolve) => { timeout = setTimeout(resolve, remaining); }),
+      ]);
+      clearTimeout(timeout);
+    }
+  }
+
   // streamedTextIndex: message_id -> next 0-based chunk index.
   const streamedTextIndex = new Map();
   // finalizedTextBlocks: message_ids whose final delta was already posted,
@@ -2207,11 +2341,10 @@ module.exports = function (pi) {
     postedReasoning.add(key);
     postedReasoning.add(textKey);
     if (!streamed) {
-      await postEvent(config, {
-        type: "external_output_reasoning_delta",
-        data: { delta: text, started: true },
-      });
+      queuePreview("external_output_reasoning_delta",
+        { delta: text, started: true }, null);
     }
+    await flushPreviews();
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -2230,15 +2363,13 @@ module.exports = function (pi) {
     return `${responseId}:msg:${streamingMessageOrdinal}:thinking:${contentIndex}`;
   }
 
-  async function postReasoningDelta(update, responseId) {
+  function postReasoningDelta(update, responseId) {
     if (typeof update.delta !== "string" || !update.delta) return;
     const blockKey = reasoningBlockKey(responseId, update.contentIndex);
     const started = !streamedReasoningBlocks.has(blockKey);
     streamedReasoningBlocks.add(blockKey);
-    await postEvent(config, {
-      type: "external_output_reasoning_delta",
-      data: { delta: update.delta, started },
-    });
+    queuePreview("external_output_reasoning_delta",
+      { delta: update.delta, started }, blockKey);
   }
 
   function streamingMessageId(responseId) {
@@ -2252,7 +2383,7 @@ module.exports = function (pi) {
     return `${responseId}:msg:${streamingMessageOrdinal}`;
   }
 
-  async function postOutputTextDelta(messageId, delta, options) {
+  function postOutputTextDelta(messageId, delta, options) {
     // Transient assistant-text chunk for live preview (Responses-style
     // response.output_text.delta on the wire). Not persisted; the
     // authoritative final text arrives separately via
@@ -2261,27 +2392,19 @@ module.exports = function (pi) {
     const final = !!(options && options.final);
     if (typeof delta !== "string") return;
     if (!delta && !final) return;
-    const index = streamedTextIndex.get(messageId) || 0;
-    streamedTextIndex.set(messageId, index + 1);
-    await postEvent(config, {
-      type: "external_output_text_delta",
-      data: {
-        delta,
-        message_id: messageId,
-        index,
-        final,
-      },
-    });
+    queuePreview("external_output_text_delta",
+      { delta, message_id: messageId, final },
+      final ? null : `${messageId}:block:${options && options.contentIndex}`);
   }
 
-  async function postTextDelta(update, responseId) {
+  function postTextDelta(update, responseId) {
     // assistantMessageEvent of type "text_delta": one streamed token of
     // the current assistant message. All text blocks of the message share
     // its id, so the preview reads as one growing message.
     if (!update || typeof update.delta !== "string" || !update.delta) return;
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
-    await postOutputTextDelta(messageId, update.delta);
+    postOutputTextDelta(messageId, update.delta, { contentIndex: update.contentIndex });
   }
 
   async function finalizeStreamingMessage(responseId) {
@@ -2293,9 +2416,11 @@ module.exports = function (pi) {
     // message with no text_delta has no live preview to close).
     const messageId = streamingMessageId(responseId);
     if (finalizedTextBlocks.has(messageId)) return;
-    if (!streamedTextIndex.has(messageId)) return;
+    if (!streamedTextIndex.has(messageId) &&
+        !previewQueue.some((entry) => entry.data.message_id === messageId)) return;
     finalizedTextBlocks.add(messageId);
-    await postOutputTextDelta(messageId, "", { final: true });
+    postOutputTextDelta(messageId, "", { final: true });
+    await flushPreviews();
   }
 
   async function mirrorAssistantMessage(message, responseId) {
@@ -2404,7 +2529,7 @@ module.exports = function (pi) {
       if (Array.isArray(currentTools) && currentTools.every((name) => typeof name === "string")) {
         baselineActiveTools = currentTools;
         const active = activeToolsForTier(pi, config, baselineActiveTools, permissionState.tier);
-        markPermissionInstallation(config, permissionState, active);
+        markPermissionInstallation(pi, config, permissionState, active);
       }
     }
     restoreTaskList(ctx);
@@ -2434,7 +2559,18 @@ module.exports = function (pi) {
         }
       },
       (model) => applyModelChange(pi, config, latestContext, model),
-      (level) => pi.setThinkingLevel(level),
+      (level) => {
+        settingThinkingLevel = true;
+        try {
+          pi.setThinkingLevel(level);
+        } catch (_err) {
+          // Report the unchanged effective value if Pi rejects the request.
+        } finally {
+          settingThinkingLevel = false;
+        }
+        // A clamped request can leave Pi unchanged and emit no native event.
+        return reportThinkingLevel(true);
+      },
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
         // state on SDK versions that don't expose isIdle() (same fallback
@@ -2450,19 +2586,26 @@ module.exports = function (pi) {
         const turnActive = idle === null ? agentRunning : !idle;
         const valid = state && state.status === "switching" &&
           state.revision === payload.expected_revision &&
-          PERMISSION_TIERS.has(target) && target !== "full" &&
-          state.tier !== "full" && baselineActiveTools &&
+          PERMISSION_TIERS.has(target) && baselineActiveTools &&
+          (target === "full" || permissionExtensionOrderProven()) &&
           !turnActive;
         const active = valid
           ? activeToolsForTier(pi, config, baselineActiveTools, target)
           : null;
+        const attested = active && markPermissionInstallation(
+          pi,
+          config,
+          { ...state, tier: target,
+            revision: state.revision + (target === state.tier ? 0 : 1) },
+          active,
+        );
         try {
           writePermissionControlFile(config, "permission_ack.json", {
             id: payload.id,
             session_id: config.sessionId,
             target_tier: target,
             expected_revision: payload.expected_revision,
-            ok: !!active,
+            ok: !!attested,
             active_tools: active || [],
           });
         } catch (_err) {}
@@ -2489,6 +2632,7 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
+    await reportThinkingLevel();
     // Readiness is not turn completion: a queued prompt may already be running.
     // Only agent_end publishes idle so startup cannot complete a child task.
   });
@@ -2498,8 +2642,13 @@ module.exports = function (pi) {
     await publishTaskList();
   });
 
+  pi.on("thinking_level_select", async () => {
+    if (!settingThinkingLevel) await reportThinkingLevel();
+  });
+
   pi.on("model_select", async (event, ctx) => {
     rememberContext(ctx);
+    await reportThinkingLevel();
     // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
     // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
     // ``restore`` — that is Pi re-applying the session's saved model at
@@ -2580,6 +2729,8 @@ module.exports = function (pi) {
     // this loop and can still arm/replay; agent_end clears once the loop
     // completes. See F18.
     clearPendingInterrupt();
+    await flushPreviews();
+    previewDisabled = false;
     agentRunning = true;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
@@ -2621,6 +2772,7 @@ module.exports = function (pi) {
       accumulateUsage(message);
     }
     await postSessionUsage(ctx);
+    await flushPreviews();
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
     const endResponseId =
@@ -2652,14 +2804,15 @@ module.exports = function (pi) {
     const update = event ? event.assistantMessageEvent : undefined;
     if (!update || typeof update !== "object") return;
     if (update.type === "text_delta") {
-      await postTextDelta(update, responseId);
+      postTextDelta(update, responseId);
       return;
     }
     if (update.type === "thinking_delta") {
-      await postReasoningDelta(update, responseId);
+      postReasoningDelta(update, responseId);
       return;
     }
     if (update.type === "toolcall_end") {
+      await flushPreviews();
       await postToolCall(update.toolCall, responseId);
       return;
     }
@@ -2699,11 +2852,15 @@ module.exports = function (pi) {
     }
     const permissionState = readPermissionState(config);
     if (!permissionState || permissionState.status !== "ready") {
-      return { block: true, reason: "权限状态待恢复，工具已暂停" };
+      return { block: true, reason: "Permission state needs recovery; tools are paused" };
     }
     if (!event || typeof event.toolCallId !== "string" || !event.toolCallId ||
         !event.input || typeof event.input !== "object" || Array.isArray(event.input)) {
       return { block: true, reason: "invalid tool call" };
+    }
+    if (permissionState.tier !== "full" && permissionToolRegistry &&
+        !permissionToolSources.matches(pi, permissionToolRegistry, event.toolName)) {
+      return { block: true, reason: "Pi extension registration changed; restart the session to verify its source" };
     }
     // Bridged Omnigent tools (registered via pi.registerTool above) are
     // policy-evaluated server-side inside the /mcp proxy when execute() runs,
@@ -2712,7 +2869,9 @@ module.exports = function (pi) {
     // are NOT bridged and stay gated here.
     if (
       bridgedTools.has((event && event.toolName) || "") &&
-      !piNativeTools.has(event.toolName)
+      !piNativeTools.has(event.toolName) &&
+      (!permissionToolRegistry || permissionToolSources.isBridge(
+        permissionToolRegistry, event.toolName, __filename))
     ) {
       return;
     }
@@ -2794,6 +2953,7 @@ module.exports = function (pi) {
         ctx.ui.notify(authFailure.message, "error");
     }
     const responseId = currentResponseId();
+    const messageId = streamingMessageId(responseId);
     // Close the live preview for this message (no-op if nothing streamed),
     // then bump the ordinal so the NEXT assistant message of this turn
     // streams under a fresh, distinct id and never reuses this one's. The
@@ -2802,6 +2962,7 @@ module.exports = function (pi) {
     // fires message_start.
     await finalizeStreamingMessage(responseId);
     await mirrorAssistantMessage(message, responseId);
+    previewDisabled = false;
     streamingMessageOrdinal += 1;
     // ``message_end`` is the primary usage-capture site (one completed
     // assistant message per LLM call); fold its token counts into the
@@ -2839,13 +3000,12 @@ module.exports = function (pi) {
     if (!text) return;
     const sourceId = assistantMessageSourceId(message, responseId, text);
     if (postedAssistantMessages.has(sourceId)) return;
-    // The authoritative assistant item. The web UI retires + replaces the
-    // oldest in-flight live preview in place with this (FIFO; one preview
-    // per message), so the streamed partials never duplicate the final.
+    // The durable identity also suppresses a timed-out preview applied late.
     await postConversationItem(
       config,
       {
         response_id: responseId,
+        message_id: messageId,
         item_type: "message",
         item_data: {
           role: "assistant",

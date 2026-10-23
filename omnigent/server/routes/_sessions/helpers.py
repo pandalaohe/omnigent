@@ -3265,13 +3265,18 @@ def _merge_codex_permission_launch_args(
     index = 0
     while index < len(args):
         arg = args[index]
-        if arg == "--dangerously-bypass-approvals-and-sandbox":
+        if arg in {
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--approve-for-me",
+            "--not-so-yolo",
+            "--yolo",
+        }:
             index += 1
             continue
         if arg in value_options:
             index += 2
             continue
-        if arg.startswith(("--ask-for-approval=", "-a=", "--sandbox=", "-s=")):
+        if arg.startswith(("--ask-for-approval=", "--sandbox=", "-a", "-s")):
             index += 1
             continue
         if arg in {"--config", "-c"} and index + 1 < len(args):
@@ -3282,8 +3287,13 @@ def _merge_codex_permission_launch_args(
             merged.extend(args[index : index + 2])
             index += 2
             continue
-        if arg.startswith(("--config=", "-c=")):
-            key = arg.split("=", 1)[1].partition("=")[0].strip()
+        if arg.startswith("--config=") or (arg.startswith("-c") and not arg.startswith("--")):
+            assignment = (
+                arg.removeprefix("--config=")
+                if arg.startswith("--config=")
+                else arg[2:].removeprefix("=")
+            )
+            key = assignment.partition("=")[0].strip()
             if key in config_keys:
                 index += 1
                 continue
@@ -3436,6 +3446,19 @@ async def _persist_external_goal_state(
             "external_goal_state requires data.state to be active, paused, or null",
             code=ErrorCode.INVALID_INPUT,
         )
+    if raw_state is None:
+        from omnigent.usage_export.cutover import UsageCutoverStore
+
+        authority = await asyncio.to_thread(
+            conversation_store.get_session_owner_authority,
+            conv.root_conversation_id or conv.id,
+            owner_only=True,
+        )
+        await asyncio.to_thread(
+            UsageCutoverStore(conversation_store.storage_location).end_goal_admissions,
+            authority.user_id if authority else "local",
+            session_id,
+        )
     current = conv.labels.get(_GOAL_STATE_LABEL_KEY)
     if current == raw_state:
         return
@@ -3445,12 +3468,14 @@ async def _persist_external_goal_state(
             session_id,
             _GOAL_STATE_LABEL_KEY,
         )
+        conv.labels.pop(_GOAL_STATE_LABEL_KEY, None)
         return
     await asyncio.to_thread(
         conversation_store.set_labels,
         session_id,
         {_GOAL_STATE_LABEL_KEY: raw_state},
     )
+    conv.labels[_GOAL_STATE_LABEL_KEY] = raw_state
 
 
 def _publish_external_conversation_item(
@@ -8389,6 +8414,16 @@ async def _dispatch_skill_slash_command_to_runner(
     :raises OmnigentError: If the skill is not exposed for the
         session, or the runner is unreachable while resolving it.
     """
+    from omnigent.server.routes.usage import _resolve_session_harness
+    from omnigent.server.usage_cutover import refuse_if_held
+
+    storage_location = getattr(conversation_store, "storage_location", None)
+    if isinstance(storage_location, str) and conv.host_id:
+        refuse_if_held(
+            storage_location,
+            conv,
+            resolve_harness=_resolve_session_harness,
+        )
     import uuid
 
     skill_name, arguments = _parse_skill_slash_command(body)

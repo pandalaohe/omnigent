@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1337,7 +1338,8 @@ class TestGenerateExtensionJs(unittest.TestCase):
         self.assertIn("block: true", js)
 
 
-def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tier", ["plan", "full"])
+def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path, tier) -> None:
     """The real generated JS must install itself and hide executable tools in plan."""
     node = shutil.which("node")
     if node is None:
@@ -1350,7 +1352,7 @@ def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path
             session_id="test-session",
             host_id="test-host",
             workspace=str(tmp_path),
-            tier="plan",
+            tier=tier,
             revision=1,
             status="blocked",
         ),
@@ -1377,29 +1379,38 @@ if (process.argv[2] === "safe") {
   process.argv.push("--no-extensions", "--extension", process.argv[1]);
 }
 const handlers = {};
+const tier = process.argv[3];
 let active = ["read", "sys_os_read", "sys_os_shell"];
 global.setInterval = () => 0;
 const pi = {
   on(name, handler) { handlers[name] = handler; },
   registerTool() {},
+  getAllTools() { throw new Error('metadata unavailable'); },
   getActiveTools() { return active; },
   setActiveTools(names) { active = names; },
 };
 require(process.argv[1])(pi);
 handlers.session_start({}, { isIdle: () => true });
-assert.deepEqual(active, process.argv[2] === "safe"
+assert.deepEqual(active, process.argv[2] === "safe" && tier === "plan"
   ? ["read", "sys_os_read"] : ["read", "sys_os_read", "sys_os_shell"]);
 """
-    result = subprocess.run([node, "-e", script, str(extension)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    assert not verify_pi_permission_installation(bridge_dir, "plan")
+    # Plan needs a usable registry API; full must retain its metadata-independent path.
+    if tier == "plan":
+        script = script.replace("throw new Error('metadata unavailable');", "return [];")
     result = subprocess.run(
-        [node, "-e", script, str(extension), "safe"], capture_output=True, text=True
+        [node, "-e", script, str(extension), "unsafe", tier], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
-    assert verify_pi_permission_installation(bridge_dir, "plan")
+    assert verify_pi_permission_installation(bridge_dir, tier) == (tier == "full")
+    result = subprocess.run(
+        [node, "-e", script, str(extension), "safe", tier], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert verify_pi_permission_installation(bridge_dir, tier)
     installed = json.loads((bridge_dir / "permission_installation.json").read_text())
-    assert installed["active_tools"] == ["read", "sys_os_read"]
+    assert installed["active_tools"] == (
+        ["read", "sys_os_read"] if tier == "plan" else ["read", "sys_os_read", "sys_os_shell"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2526,6 +2537,98 @@ async def test_generated_pi_full_tier_gates_without_finish_lease(tmp_path: Path)
         await server.wait_closed()
 
 
+def test_generated_pi_rpc_extension_switches_into_and_out_of_full(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for generated Pi extension test")
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "inbox").mkdir()
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState("test-session", "test-host", str(tmp_path), "ask", 1, "ready"),
+    )
+    (bridge / "permission_expected.json").write_text(
+        json.dumps({"session_id": "test-session", "harness": "pi", "installation_id": "test-id"})
+    )
+    extension = tmp_path / "bridge.js"
+    extension.write_text(
+        _generate_extension_js(
+            12345,
+            [],
+            "test-token",
+            permission_bridge_dir=bridge,
+            session_id="test-session",
+        )
+    )
+    from omnigent.harnesses.pi_native.bridge import verify_pi_permission_installation
+
+    expected = json.loads((bridge / "permission_expected.json").read_text())
+    expected.update(
+        {
+            "version": 1,
+            "extension_path": str(extension),
+            "extension_sha256": hashlib.sha256(extension.read_bytes()).hexdigest(),
+        }
+    )
+    (bridge / "permission_expected.json").write_text(json.dumps(expected))
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+const extensionPath = process.argv[1];
+const bridgeDir = process.argv[2];
+const statePath = path.join(bridgeDir, "permission_state.json");
+process.env.OMNIGENT_PI_PERMISSION_INLINE = extensionPath;
+const handlers = {};
+let pollInbox;
+let activeTools = ["read", "bash"];
+global.setInterval = (fn) => { pollInbox = fn; return 1; };
+const pi = {
+  on(name, handler) { handlers[name] = handler; },
+  getActiveTools() { return activeTools; },
+  setActiveTools(names) { activeTools = names; },
+};
+require(extensionPath)(pi);
+function switchTier(target, revision) {
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.status = "switching";
+  state.transaction_id = `switch-${revision}`;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  fs.writeFileSync(path.join(bridgeDir, "inbox", `switch-${revision}.json`), JSON.stringify({
+    id: `switch-${revision}`, type: "permission_tier_change",
+    target_tier: target, expected_revision: revision,
+  }));
+  pollInbox();
+  const ack = JSON.parse(fs.readFileSync(path.join(bridgeDir, "permission_ack.json"), "utf8"));
+  assert.equal(ack.id, `switch-${revision}`);
+  assert.equal(ack.ok, true, JSON.stringify(ack));
+  assert.deepEqual(ack.active_tools, ["read", "bash"]);
+  const installed = JSON.parse(fs.readFileSync(
+    path.join(bridgeDir, "permission_installation.json"), "utf8"));
+  assert.equal(installed.tier, target);
+  assert.equal(installed.revision, revision + 1);
+  state.tier = target;
+  state.revision = revision + 1;
+  state.status = "ready";
+  state.transaction_id = null;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+}
+handlers.session_start({}, { isIdle: () => true });
+switchTier("full", 1);
+switchTier("ask", 2);
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(extension), str(bridge)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert verify_pi_permission_installation(bridge, "ask")
+
+
 @pytest.mark.asyncio
 async def test_tool_server_rejects_malformed_policy_and_unknown_action() -> None:
     server = _ToolServer()
@@ -3039,7 +3142,10 @@ class TestResolveModel(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def test_controlled_rpc_launch_orders_user_extensions_before_guard(tmp_path, monkeypatch):
+@pytest.mark.parametrize("permission_tier", ["ask", "full"])
+def test_controlled_rpc_launch_orders_user_extensions_before_guard(
+    tmp_path, monkeypatch, permission_tier
+):
     from omnigent.inner import pi_settings
 
     monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/opt/bin/pi")
@@ -3048,7 +3154,7 @@ def test_controlled_rpc_launch_orders_user_extensions_before_guard(tmp_path, mon
     bridge.mkdir()
     write_host_permission_state(
         bridge / "permission_state.json",
-        HostPermissionState("session", "host", str(tmp_path), "ask", 1, "blocked"),
+        HostPermissionState("session", "host", str(tmp_path), permission_tier, 1, "blocked"),
     )
     monkeypatch.setattr("omnigent.inner.pi_executor.prepare_bridge_dir", lambda _: bridge)
     observed = []
@@ -3063,9 +3169,15 @@ def test_controlled_rpc_launch_orders_user_extensions_before_guard(tmp_path, mon
         [], 12345, "test-token", None, permission_session_id="session"
     )
     try:
-        assert config.executable == "/opt/launchers/permission-pi"
-        assert observed == ["/opt/bin/pi"]
-        assert config.extra_args == ["--approve", "--model", "demo", "--tools", "read"]
+        if permission_tier == "full":
+            assert config.executable is None
+            assert observed == []
+            assert "--extension" in config.extra_args
+            assert config.extra_args[-2:] == ["--tools", "read"]
+        else:
+            assert config.executable == "/opt/launchers/permission-pi"
+            assert observed == ["/opt/bin/pi"]
+            assert config.extra_args == ["--approve", "--model", "demo", "--tools", "read"]
     finally:
         shutil.rmtree(config.tmp_dir)
 

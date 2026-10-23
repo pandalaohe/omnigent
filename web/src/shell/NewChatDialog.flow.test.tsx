@@ -2312,8 +2312,9 @@ describe("NewChatLandingScreen create flow", () => {
 
   it.each([
     ["default", "ask"],
-    ["skip", "auto"],
-  ])("restores legacy Antigravity mode %s", async (legacy, tier) => {
+    ["skip", "full"],
+    ["full", "full"],
+  ])("restores remembered Antigravity mode %s", async (legacy, tier) => {
     localStorage.setItem(
       "omnigent:last-mode-by-harness",
       JSON.stringify({ "antigravity-native": { mode: legacy } }),
@@ -2332,6 +2333,41 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string).permission_tier).toBe(tier);
+  });
+
+  it("sends a saved Full access project default without a new menu selection", async () => {
+    searchParams = new URLSearchParams("project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    projectConfig = { host_id: "host_1", workspace: "/opt/work/omnigent/fork/project" };
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(resolveCallingDefaults).mockResolvedValue({
+      agent_id: "ag_agy",
+      harness: "antigravity-native",
+      model: null,
+      effort: null,
+      permission: "full",
+      sources: {},
+      problems: [],
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_full_default" }),
+    } as Response);
+
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent(
+        "Full access",
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toBeVisible();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).permission_tier).toBe("full");
   });
 
   it("creates Antigravity with a base model id and a supported effort", async () => {
@@ -2427,7 +2463,7 @@ describe("NewChatLandingScreen create flow", () => {
     pickPermissionOption("full");
     expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveAttribute("role", "alert");
     expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveTextContent(
-      "跳过本套审批与规则",
+      "bypasses tier approvals and risk rules",
     );
     pickPermissionOption("ask");
     expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();

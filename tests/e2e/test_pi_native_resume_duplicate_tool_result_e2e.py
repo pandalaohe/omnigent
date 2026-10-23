@@ -15,9 +15,10 @@ import httpx
 import pytest
 
 from tests._helpers.server_runner import server_runner
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 # Every HTTP call targets 127.0.0.1; bypass any CI egress proxy autodetection.
-_http = httpx.Client(trust_env=False)
+_http = httpx.Client(trust_env=False, headers=PERMISSION_TIERS_HEADERS)
 
 
 # Valid Pi UUID-shaped session id (is_safe_pi_session_id) bound as the prior
@@ -37,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _create_pi_native_session(base_url: str) -> str:
+def _create_pi_native_session(base_url: str, workspace: Path) -> str:
     """Create a pi-native wrapper session (production spec + labels) like ``omnigent pi``."""
     import io
     import tarfile
@@ -67,7 +68,11 @@ def _create_pi_native_session(base_url: str) -> str:
     }
     create = _http.post(
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
+        data={
+            "metadata": json.dumps(
+                {"labels": labels, "permission_tier": "full", "workspace": str(workspace)}
+            )
+        },
         files={"bundle": ("pi-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
         timeout=30.0,
     )
@@ -183,7 +188,7 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
         # A prior pi-native conversation with the Pi session id captured and
         # committed history holding a doubly-mirrored tool result -- the state
         # a user resumes into.
-        session_id = _create_pi_native_session(base_url)
+        session_id = _create_pi_native_session(base_url, stack.workspace)
         _http.patch(
             f"{base_url}/v1/sessions/{session_id}",
             json={"external_session_id": _EXTERNAL_SID},
@@ -222,8 +227,7 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
                 break
             time.sleep(_POLL_S)
         assert session_file is not None, (
-            "runner never synthesized a Pi resume session file; runner log:\n"
-            f"{(tmp_path / 'runner.log').read_text()[-3000:]}"
+            f"runner never synthesized a Pi resume session file; runner log:\n{stack.log_tail()}"
         )
 
         call_ids = _tool_result_call_ids(session_file)

@@ -395,6 +395,15 @@ async def _start_codex_turn(
         failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
         for key, value in failed.items():
             _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
+    from omnigent.usage_export.runtime import check_live_route
+
+    await asyncio.to_thread(
+        check_live_route,
+        state.session_id,
+        "codex-native",
+        os.environ,
+        codex_home=Path(state.codex_home),
+    )
     response = await _native_delivery_request(
         client,
         "turn/start",
@@ -415,6 +424,11 @@ async def _start_codex_turn(
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
+        from omnigent.usage_export.runtime import link_codex_turn
+
+        await asyncio.to_thread(
+            link_codex_turn, state.session_id, "codex-native", state.thread_id, turn_id
+        )
         update_active_turn_id(bridge_dir, turn_id)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
         return replace(state, active_turn_id=turn_id)

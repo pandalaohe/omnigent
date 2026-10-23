@@ -727,8 +727,8 @@ function assistantText(item) {
 """
 
 
-def test_text_deltas_post_incrementally_with_stable_id() -> None:
-    """Each token posts as an external_output_text_delta with a stable id.
+def test_text_deltas_post_incrementally_with_stable_id(tmp_path: Path) -> None:
+    """Coalesced preview chunks have a stable id and authoritative replacement.
 
     Drives the real extension with a sequence of Pi ``text_delta`` events for
     one assistant message, then ``message_end``. Asserts: every chunk shares one
@@ -749,10 +749,10 @@ def test_text_deltas_post_incrementally_with_stable_id() -> None:
   await endMessage(chunks.join(""));
 
   const ds = deltas();
-  // One text chunk per delta plus a single final marker.
+  // Adjacent tokens may share a preview request; one final marker closes it.
   const textChunks = ds.filter((d) => d.data.delta !== "");
   const finals = ds.filter((d) => d.data.final === true);
-  assert.equal(textChunks.length, chunks.length, JSON.stringify(ds));
+  assert.ok(textChunks.length >= 1 && textChunks.length <= chunks.length, JSON.stringify(ds));
   assert.equal(finals.length, 1, JSON.stringify(ds));
 
   // Stable message_id across every chunk and the final marker.
@@ -781,7 +781,7 @@ def test_text_deltas_post_incrementally_with_stable_id() -> None:
 })().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
 """
     )
-    result = _run_node(script, str(_extension_path()), "/tmp")
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -810,13 +810,9 @@ def test_thinking_deltas_post_live_reasoning(tmp_path: Path) -> None:
   await handlers.turn_end({ message, toolResults: [] }, ctx);
 
   const reasoning = posted.filter((e) => e.type === "external_output_reasoning_delta");
-  assert.deepEqual(
-    reasoning.map((e) => e.data),
-    [
-      { delta: "plan ", started: true },
-      { delta: "step", started: false },
-    ],
-  );
+  assert.equal(reasoning.map((e) => e.data.delta).join(""), "plan step");
+  assert.equal(reasoning.filter((e) => e.data.started).length, 1);
+  assert.equal(reasoning[0].data.started, true);
   const completed = items().filter((e) => e.data.item_type === "reasoning");
   assert.equal(completed.length, 1, JSON.stringify(completed));
   assert.deepEqual(completed[0].data.item_data.content, [
@@ -859,7 +855,7 @@ def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
   assert.equal(ids.size, 1, "both blocks must share one id: " + JSON.stringify([...ids]));
 
   const textChunks = ds.filter((d) => d.data.delta !== "");
-  assert.equal(textChunks.length, 4, JSON.stringify(ds));
+  assert.ok(textChunks.length >= 1 && textChunks.length <= 4, JSON.stringify(ds));
   // Single monotonic index spanning both blocks.
   const indices = ds.map((d) => d.data.index);
   assert.deepEqual(indices, indices.map((_, i) => i), JSON.stringify(indices));
@@ -945,6 +941,111 @@ def test_message_without_streamed_text_posts_no_delta(tmp_path: Path) -> None:
 
   assert.equal(deltas().length, 0, JSON.stringify(deltas()));
 })().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_slow_preview_transport_coalesces_without_stalling_tokens(tmp_path: Path) -> None:
+    """Slow event POSTs do not impose one round trip per Pi token."""
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return { ok: true, status: 204 };
+  };
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "plan " });
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "step" });
+  await feed({ type: "thinking_end", contentIndex: 0, content: "plan step" });
+  const first = "片".repeat(100);
+  const start = Date.now();
+  for (let n = 0; n < 100; n += 1) await feed(textDelta(1, "片"));
+  assert.ok(Date.now() - start < 100, "producer stalled on HTTP");
+  await endMessage(first);
+  await feed(textDelta(0, "next"));
+  await endMessage("next");
+
+  const preview = deltas();
+  const ids = [...new Set(preview.map((event) => event.data.message_id))];
+  assert.equal(ids.length, 2);
+  for (const [ordinal, expected] of [first, "next"].entries()) {
+    const stream = preview.filter((event) => event.data.message_id === ids[ordinal]);
+    assert.equal(stream.filter((event) => event.data.final).length, 1);
+    assert.deepEqual(stream.map((event) => event.data.index),
+      stream.map((_, index) => index));
+    assert.equal(stream.filter((event) => !event.data.final)
+      .map((event) => event.data.delta).join(""), expected);
+    const item = items().filter((event) => event.data.item_type === "message")[ordinal];
+    assert.equal(assistantText(item), expected);
+    assert.equal(item.data.message_id, ids[ordinal]);
+    assert.ok(posted.indexOf(stream[stream.length - 1]) < posted.indexOf(item));
+  }
+  const reasoning = posted.filter((event) =>
+    event.type === "external_output_reasoning_delta");
+  assert.equal(reasoning.map((event) => event.data.delta).join(""), "plan step");
+  assert.equal(reasoning.filter((event) => event.data.started).length, 1);
+  const reasonItemIndex = posted.findIndex((event) =>
+    event.type === "external_conversation_item" && event.data.item_type === "reasoning");
+  assert.ok(reasonItemIndex >= 0 && reasonItemIndex < posted.indexOf(preview[0]));
+  assert.ok(posted.length < 15, "too many preview requests: " + posted.length);
+})().catch((error) => { console.error(error.stack || error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_failed_preview_does_not_block_final_item_or_idle(tmp_path: Path) -> None:
+    """Hung and rejected preview requests leave final delivery available."""
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  let failure = "hung";
+  let delayedApply;
+  global.fetch = async (_url, request) => {
+    const event = JSON.parse(request.body);
+    if (event.type === "external_output_text_delta") {
+      if (failure === "rejected") throw new Error("preview offline");
+      // A server can apply a request after the client has aborted it.
+      delayedApply = new Promise((resolve) => {
+        setTimeout(() => { posted.push(event); resolve({ ok: true, status: 204 }); }, 600);
+      });
+      return delayedApply;
+    }
+    posted.push(event);
+    return { ok: true, status: 204 };
+  };
+  const began = Date.now();
+  await feed(textDelta(0, "first"));
+  for (let index = 1; index <= 20; index += 1) {
+    await feed(textDelta(index, "x"));
+  }
+  await endMessage("first");
+  failure = "rejected";
+  await feed(textDelta(0, "second"));
+  await endMessage("second");
+  await handlers.agent_end({ messages: [] }, ctx);
+  await delayedApply;
+  assert.ok(Date.now() - began < 1500, "final delivery waited on preview");
+  const messages = items().filter((event) => event.data.item_type === "message");
+  assert.deepEqual(messages.map(assistantText), ["first", "second"]);
+  const late = deltas()[0];
+  assert.ok(posted.indexOf(messages[0]) < posted.indexOf(late));
+  assert.equal(messages[0].data.message_id, late.data.message_id,
+    "final item must retire its unseen late preview");
+  assert.notEqual(messages[0].data.message_id, messages[1].data.message_id);
+  assert.ok(posted.some((event) => event.type === "external_session_status" &&
+    event.data.status === "idle"));
+})().catch((error) => { console.error(error.stack || error); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
@@ -2856,6 +2957,112 @@ def test_full_tier_keeps_policy_gate_without_finish_lease(tmp_path: Path) -> Non
     _run_policy_node_script(_extension_path(), tmp_path, body)
 
 
+def test_live_pi_tier_changes_resume_tools_after_commit(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension policy test")
+    from omnigent.harnesses.pi_native.bridge import (
+        prepare_permission_installation,
+        verify_pi_permission_installation,
+    )
+    from omnigent.permission_tiers.host import (
+        HostPermissionState,
+        write_host_permission_state,
+    )
+
+    installation_id = prepare_permission_installation(
+        tmp_path, session_id="session-1", harness="pi-native", extension=_extension_path()
+    )
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState("session-1", "test-host", str(tmp_path), "auto", 1, "ready"),
+    )
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+const extensionPath = process.argv[1];
+const bridgeDir = process.argv[2];
+const installationId = process.argv[3];
+const inboxDir = path.join(bridgeDir, "inbox");
+const statePath = path.join(bridgeDir, "permission_state.json");
+fs.mkdirSync(inboxDir);
+fs.writeFileSync(path.join(bridgeDir, "config.json"), JSON.stringify({
+  serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir,
+  planVisibleTools: [], permissionInstallationId: installationId,
+}));
+process.env.OMNIGENT_PI_NATIVE_CONFIG = path.join(bridgeDir, "config.json");
+process.env.OMNIGENT_PI_PERMISSION_INLINE = extensionPath;
+const handlers = {};
+let pollInbox;
+let activeTools = ["read", "bash"];
+global.setInterval = (fn) => { pollInbox = fn; return { unref() {} }; };
+global.fetch = async () => ({ ok: true, status: 200,
+  json: async () => ({ result: "POLICY_ACTION_ALLOW" }) });
+const pi = {
+  registerCommand() {}, registerTool() {},
+  on(name, fn) { handlers[name] = fn; },
+  getAllTools() { return activeTools.map((name) => ({ name })); },
+  getActiveTools() { return activeTools; },
+  setActiveTools(names) { activeTools = names; },
+};
+require(extensionPath)(pi);
+const ctx = {
+  isIdle() { return true; },
+  sessionManager: { getSessionId: () => "pi-session" },
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
+};
+async function switchTier(target, revision) {
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.status = "switching";
+  state.transaction_id = `switch-${revision}`;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  fs.writeFileSync(path.join(inboxDir, `00${revision}-tier.json`), JSON.stringify({
+    id: `switch-${revision}`, type: "permission_tier_change",
+    target_tier: target, expected_revision: revision,
+  }));
+  pollInbox();
+  await new Promise((resolve) => setImmediate(resolve));
+  const ack = JSON.parse(fs.readFileSync(path.join(bridgeDir, "permission_ack.json"), "utf8"));
+  assert.equal(ack.id, `switch-${revision}`);
+  assert.equal(ack.ok, true, JSON.stringify(ack));
+  const installed = JSON.parse(fs.readFileSync(
+    path.join(bridgeDir, "permission_installation.json"), "utf8"));
+  assert.equal(installed.installation_id, installationId);
+  assert.equal(installed.tier, target);
+  assert.equal(installed.revision, revision + 1);
+  state.tier = target;
+  state.revision = revision + 1;
+  state.status = "ready";
+  state.transaction_id = null;
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  const verdict = await handlers.tool_call(
+    { toolCallId: `call-${revision}`, toolName: "bash", input: { command: "pwd" } }, ctx);
+  assert.ok(!verdict || verdict.block !== true, JSON.stringify(verdict));
+}
+(async () => {
+  await handlers.session_start({}, ctx);
+  await switchTier("ask", 1);
+  await switchTier("full", 2);
+  await switchTier("ask", 3);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(_extension_path()), str(tmp_path), installation_id],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert verify_pi_permission_installation(tmp_path, "ask")
+    proof_path = tmp_path / "permission_installation.json"
+    stale_proof = json.loads(proof_path.read_text())
+    stale_proof["revision"] = 3
+    proof_path.write_text(json.dumps(stale_proof))
+    assert not verify_pi_permission_installation(tmp_path, "ask")
+
+
 def test_policy_deny_blocks(tmp_path: Path) -> None:
     """A DENY verdict blocks the Pi tool call and surfaces the policy reason."""
     body = r"""
@@ -3594,6 +3801,176 @@ def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
 });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+@pytest.mark.parametrize(
+    ("getter", "expected"),
+    [
+        ('() => "max"', "max"),
+        ('() => "high"', "high"),
+        ('() => "off"', "none"),
+        ("undefined", None),
+        ('() => { throw new Error("unavailable"); }', None),
+        ('() => "unknown"', None),
+    ],
+)
+def test_session_start_reports_effective_thinking_level(
+    getter: str,
+    expected: str | None,
+) -> None:
+    """Read Pi's effective level, including clamping, without requiring a getter."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _usage_test_preamble()
+        + f"\npi.getThinkingLevel = {getter};\nconst expected = {json.dumps(expected)};\n"
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  const changes = postedEvents.filter((e) => e.type === "external_reasoning_effort_change");
+  assert.deepEqual(changes.map((e) => e.data),
+    expected === null ? [] : [{ reasoning_effort: expected }]);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_thinking_changes_report_effective_level_without_duplicate_native_events() -> None:
+    """Inbox acknowledgements read back clamping even when Pi emits no change event."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+let level = "high";
+const requested = [];
+pi.getThinkingLevel = () => level;
+pi.setThinkingLevel = (value) => {
+  requested.push(value);
+  const previous = level;
+  level = value === "medium" ? "high" : value;
+  if (previous !== level && handlers.thinking_level_select)
+    void handlers.thinking_level_select({ source: "set", level }, ctx);
+};
+function efforts() {
+  return posted.filter((e) => e.type === "external_reasoning_effort_change")
+    .map((e) => e.data.reasoning_effort);
+}
+async function deliverThinking(value, id) {
+  const file = path.join(inboxDir, `000-thinking-${id}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    id, type: "thinking_level_change", thinkingLevel: value,
+  }));
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("thinking change was not consumed");
+    await sleep(20);
+  }
+  await sleep(20);
+}
+(async () => {
+  await handlers.session_start({}, ctx);
+  assert.deepEqual(efforts(), ["high"]);
+  // Medium clamps back to high and emits no native event, but must correct the web choice.
+  await deliverThinking("medium", "clamped");
+  await deliverThinking("max", "maximum");
+  await deliverThinking("off", "disabled");
+  assert.deepEqual(requested, ["medium", "max", "off"]);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none"]);
+  assert.equal(typeof handlers.thinking_level_select, "function");
+  // A delayed native event from the setter also must not duplicate the acknowledgement.
+  await handlers.thinking_level_select({ source: "set", level: "off" }, ctx);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none"]);
+  level = "low";
+  await handlers.thinking_level_select({ source: "cycle", level: "max" }, ctx);
+  await handlers.thinking_level_select({ source: "cycle", level: "low" }, ctx);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low"]);
+  // Model changes may clamp the level without emitting thinking_level_select.
+  level = "off";
+  await handlers.model_select({ source: "set", model: ctx.model }, ctx);
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low", "none"]);
+  pi.setThinkingLevel = () => { throw new Error("request rejected"); };
+  await deliverThinking("max", "rejected");
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low", "none", "none"]);
+  // A legacy API still consumes a request safely without inventing an effective value.
+  delete pi.getThinkingLevel;
+  await deliverThinking("max", "legacy");
+  assert.deepEqual(efforts(), ["high", "high", "max", "none", "low", "none", "none"]);
+  finish();
+})().catch((error) => {
+  finish(); console.error(error); process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_thinking_reports_retry_failures_and_serialize_live_state() -> None:
+    """A failed POST stays retryable and queued reports never restore stale state."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+let level = "high";
+pi.getThinkingLevel = () => level;
+pi.setThinkingLevel = (value) => {
+  assert.equal(value, "medium");
+  level = "high";
+};
+(async () => {
+  await handlers.session_start({}, ctx);
+  assert.deepEqual(posted.filter((e) => e.type === "external_reasoning_effort_change")
+    .map((e) => e.data.reasoning_effort), ["high"]);
+  let failedAcknowledgements = 0;
+  global.fetch = async (_url, request) => {
+    const event = JSON.parse(request.body);
+    if (event.type !== "external_reasoning_effort_change") return { ok: true };
+    assert.equal(event.data.reasoning_effort, "high");
+    failedAcknowledgements += 1;
+    return { ok: false, status: 503 };
+  };
+  const file = path.join(inboxDir, "000-thinking-clamped.json");
+  fs.writeFileSync(file, JSON.stringify({
+    id: "clamped", type: "thinking_level_change", thinkingLevel: "medium",
+  }));
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("thinking change was not consumed");
+    await sleep(20);
+  }
+  await sleep(20);
+  assert.equal(failedAcknowledgements, 1);
+  const completed = [];
+  let release;
+  global.fetch = async (_url, request) => {
+    const event = JSON.parse(request.body);
+    if (event.type !== "external_reasoning_effort_change") return { ok: true };
+    if (event.data.reasoning_effort === "high")
+      await new Promise((resolve) => { release = resolve; });
+    completed.push(event.data.reasoning_effort);
+    return { ok: true };
+  };
+  const retry = handlers.thinking_level_select({}, ctx);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof release, "function");
+  level = "max";
+  const queued = handlers.thinking_level_select({}, ctx);
+  level = "off";
+  const latest = handlers.thinking_level_select({}, ctx);
+  assert.deepEqual(completed, []);
+  release();
+  await Promise.all([retry, queued, latest]);
+  assert.deepEqual(completed, ["high", "none"]);
+  finish();
+})().catch((error) => { finish(); console.error(error); process.exit(1); });
 """
     )
     _run_extension_script(node, _extension_path(), script)

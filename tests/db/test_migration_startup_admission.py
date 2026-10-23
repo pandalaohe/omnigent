@@ -80,7 +80,7 @@ def test_inventory_veto_migration_backfills_and_downgrades(db_uri):
     budgets = sa.Table("session_startup_budgets", sa.MetaData(), autoload_with=engine)
     with engine.begin() as connection:
         row = connection.execute(sa.select(budgets).where(budgets.c.scope == "legacy-host")).one()
-        assert row.resident_inventory_unknown is False
+        assert row.resident_inventory_unknown in (False, 0)
         assert row.resident_limit == 7 and row.next_sequence == 5
         connection.execute(
             budgets.update()

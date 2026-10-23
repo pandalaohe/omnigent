@@ -341,6 +341,7 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { ConnectedAppsSettings } from "@/components/ConnectedAppsSettings";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies / Global
@@ -3592,6 +3593,9 @@ function UpdatesSection() {
 function AccountSection() {
   const info = useServerInfo();
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  const browserAnnotationsAvailable =
+    info !== "loading" && info.browser_annotations_available === true;
+  const connectedAppsAvailable = info !== "loading" && info.connected_apps_available === true;
   // Identity for display. Sourced from the mode-agnostic `/v1/me` probe so it
   // works under OIDC too (the accounts-only `/auth/me` doesn't exist there).
   const [me, setMe] = useState<{ id: string; is_admin: boolean } | null | "unknown">("unknown");
@@ -3708,6 +3712,9 @@ function AccountSection() {
             <LogOutIcon className="size-4" /> Sign out
           </Button>
         </div>
+        {connectedAppsAvailable && (
+          <ConnectedAppsSettings pairingAvailable={browserAnnotationsAvailable} />
+        )}
       </div>
 
       <Dialog

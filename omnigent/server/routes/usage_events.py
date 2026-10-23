@@ -56,10 +56,10 @@ def _error(
     return JSONResponse({"error": error}, status_code=status, headers=headers)
 
 
-async def _json_body(request: Request) -> dict[str, Any] | None:
+async def _json_body(request: Request, *, max_bytes: int = 32768) -> dict[str, Any] | None:
     data = bytearray()
     async for chunk in request.stream():
-        if len(data) + len(chunk) > 32768:
+        if len(data) + len(chunk) > max_bytes:
             return None
         data.extend(chunk)
     try:
@@ -88,7 +88,13 @@ def create_usage_events_router(
         if cursor is not None and len(cursor) > 4096:
             return _error("invalid_cursor", 400)
         try:
-            page = await asyncio.to_thread(store.page, owner, cursor=cursor, limit=int(raw_limit))
+            page = await asyncio.to_thread(
+                store.page,
+                owner,
+                cursor=cursor,
+                limit=int(raw_limit),
+                grant_id=getattr(request.state, "usage_read_grant_id", None),
+            )
         except UsageExportError as exc:
             return _error(
                 exc.code, exc.status_code, retry_after=exc.retry_after, detail=exc.detail
@@ -198,6 +204,6 @@ def create_usage_events_router(
             return _error(exc.code, exc.status_code, retry_after=exc.retry_after)
         except SQLAlchemyError:
             return _error("usage_feed_unavailable", 503, retry_after=5)
-        return JSONResponse({"event_id": event["event_id"]}, headers={"Cache-Control": "no-store"})
+        return JSONResponse(event, headers={"Cache-Control": "no-store"})
 
     return router

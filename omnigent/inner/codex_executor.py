@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 from uuid import uuid4
 
 import psutil
+import tomllib
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import IS_LINUX, resolve_cli_binary
@@ -61,7 +62,11 @@ from omnigent.harnesses.codex_native.keep_warm import (
     keep_warm_receipt,
     keep_warm_result_receipt,
 )
-from omnigent.harnesses.codex_native.launch_args import absolute_codex_path
+from omnigent.harnesses.codex_native.launch_args import (
+    CodexWorkspaceProfile,
+    absolute_codex_path,
+    codex_workspace_profile,
+)
 from omnigent.harnesses.codex_native.side_chat import (
     is_keep_warm_fork as _is_keep_warm_fork,
 )
@@ -75,7 +80,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
-from omnigent.runtime.filesystem_registry import linked_worktree_git_dir
+from omnigent.runtime.filesystem_registry import detect_git_root, linked_worktree_git_dir
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_peer_delivery import PeerOutcome, ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
@@ -3122,6 +3127,8 @@ class _CodexAppServerSession:
         self._tool_executor = tool_executor
         self._raw_elicitation_handler = raw_elicitation_handler
         self._codex_config_overrides = list(codex_config_overrides or [])
+        self._workspace_profile: CodexWorkspaceProfile | None = None
+        self._workspace_profile_cwd: Path | None = None
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
@@ -3341,13 +3348,20 @@ class _CodexAppServerSession:
         # Smart Routing session gets that endpoint, so a plain or pinned session
         # keeps the symlink — and with it mid-session edits to the user's file.
         router_bridge_dir = codex_router_bridge_dir(self._env)
+        codex_version = None
+        try:
+            if router_bridge_dir is not None or (
+                os.name == "posix"
+                and await asyncio.to_thread(
+                    lambda: detect_git_root(Path(self._cwd or os.getcwd()).resolve()) is not None
+                )
+            ):
+                codex_version = await _codex_cli_version(self._codex_path)
+        except Exception:  # noqa: BLE001 - profile discovery keeps the legacy launch.
+            logger.warning("Failed to probe Codex permission profile support", exc_info=True)
         if router_bridge_dir is not None:
-            # Probed only on the routing path so a plain session never pays the
-            # subprocess. A CLI too old for the spawn gate drops the hooks and
-            # keeps the symlinked home, so routing no-ops instead of blocking.
-            skip_reason = codex_routing_hook_skip_reason(
-                await _codex_cli_version(self._codex_path)
-            )
+            # Older CLIs keep the symlinked home without routing hooks.
+            skip_reason = codex_routing_hook_skip_reason(codex_version)
             if skip_reason is not None:
                 logger.warning("%s", skip_reason)
                 router_bridge_dir = None
@@ -3391,6 +3405,37 @@ class _CodexAppServerSession:
                 session_id=codex_router_session_id(self._env),
                 user_hooks_source=config_source / _CODEX_HOOKS_FILENAME,
             )
+        self._workspace_profile = None
+        self._workspace_profile_cwd = None
+        if os.name == "posix" and codex_version is not None:
+            config_path = self._codex_home_dir / "config.toml"
+
+            def build_profile() -> tuple[Path, CodexWorkspaceProfile | None]:
+                workspace = Path(self._cwd or os.getcwd()).resolve()
+                private_config = (
+                    tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+                )
+                return workspace, codex_workspace_profile(
+                    workspace,
+                    private_config=private_config,
+                    server_overrides=self._codex_config_overrides,
+                    launch_args=(),
+                    codex_version=codex_version,
+                    workspace_write_stance=(
+                        _sandbox_mode(self._os_env_spec) == "workspace-write"
+                        or any(
+                            policy[2] == "workspaceWrite"
+                            for policy in CODEX_SDK_TURN_POLICIES.values()
+                        )
+                    ),
+                )
+
+            try:
+                self._workspace_profile_cwd, self._workspace_profile = await asyncio.to_thread(
+                    build_profile
+                )
+            except Exception:  # noqa: BLE001 - discovery/config errors preserve legacy permissions.
+                logger.warning("Failed to build Codex workspace permission profile", exc_info=True)
         # Override CODEX_HOME so Codex stores its data (including conversation
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
@@ -3433,6 +3478,9 @@ class _CodexAppServerSession:
             argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
+            if self._workspace_profile is not None:
+                for override in self._workspace_profile.config_overrides:
+                    argv.extend(["-c", override])
             spawn_argv = argv
             pass_fds: tuple[int, ...] = ()
             liveness_read_fd: int | None = None
@@ -4204,6 +4252,13 @@ class _CodexAppServerSession:
         self._saw_connection_retry = False
         native_forwarder_health.note_post_success()
 
+        workspace_profile = self._workspace_profile
+        if workspace_profile is not None:
+            workspace = await asyncio.to_thread(
+                lambda: Path(absolute_codex_path(cwd, Path(self._cwd or os.getcwd()))).resolve()
+            )
+            if workspace != self._workspace_profile_cwd:
+                workspace_profile = None
         is_new_thread = self.thread_id is None
         if is_new_thread:
             params: CodexParams = {
@@ -4212,6 +4267,9 @@ class _CodexAppServerSession:
                 "model": model,
                 "sandbox": sandbox,
             }
+            if workspace_profile is not None and sandbox == "workspace-write":
+                params.pop("sandbox")
+                params["permissions"] = workspace_profile.profile_id
             if self._thread_model_provider is not None:
                 params["modelProvider"] = self._thread_model_provider
             if system_prompt:
@@ -4368,6 +4426,33 @@ class _CodexAppServerSession:
                                 "sandbox_workspace_write.network_access must be a boolean"
                             )
                         sandbox_policy["networkAccess"] = network_access
+                    if workspace_profile is not None:
+                        covered_roots = {workspace.resolve()}
+                        if git_dir is not None:
+                            covered_roots.add(git_dir.resolve())
+                        effective_roots = {
+                            Path(root).resolve() for root in writable_roots
+                        } - covered_roots
+                        profile_roots = {
+                            Path(root).resolve() for root in workspace_profile.writable_roots
+                        } - covered_roots
+                        if effective_roots == profile_roots and (
+                            sandbox_policy.get("networkAccess", False)
+                            == workspace_profile.network_access
+                        ):
+                            del turn_params["sandboxPolicy"]
+                            turn_params["permissions"] = workspace_profile.profile_id
+        if self._usage_session_id is not None:
+            from omnigent.usage_export.runtime import check_live_route
+
+            await asyncio.to_thread(
+                check_live_route,
+                self._usage_session_id,
+                "codex-sdk",
+                self._env,
+                codex_home=self._codex_home_dir,
+                provider=self._thread_model_provider,
+            )
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -4380,6 +4465,16 @@ class _CodexAppServerSession:
             return
         active_turn_id: str = raw_active_turn_id
         self.active_turn_id = active_turn_id
+        if self._usage_session_id is not None and self.thread_id is not None:
+            from omnigent.usage_export.runtime import link_codex_turn
+
+            await asyncio.to_thread(
+                link_codex_turn,
+                self._usage_session_id,
+                "codex-sdk",
+                self.thread_id,
+                active_turn_id,
+            )
         startup_evidence = CodexTurnEvidence(self.thread_id, active_turn_id, source="codex")
         # thread/start established the owned runtime. A configured dynamic-tool
         # bridge is ready only after the thread and turn RPCs have both returned.

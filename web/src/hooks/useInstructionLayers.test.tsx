@@ -7,7 +7,8 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   instructionRegistryItems,
-  visibleInstructionAgents,
+  instructionGridAxes,
+  hasInstructionText,
   useInstructionPreview,
   useInstructionRevisions,
   useSaveInstructionLayer,
@@ -29,41 +30,45 @@ function setup() {
 beforeEach(() => fetch.mockReset());
 afterEach(cleanup);
 
-it("sends the exact scoped text and invalidates totals and history after a save", async () => {
-  const { client, wrapper } = setup();
-  client.setQueryData(["instruction-layers"], { data: [] });
-  client.setQueryData(["instruction-layers", "preview", "host-a"], { text: "old" });
-  client.setQueryData(["instruction-layers", "revisions", { scope: "host", host_id: "host-a" }], {
-    data: [],
-  });
-  fetch.mockResolvedValue(
-    new Response(
-      JSON.stringify({
-        over_budget_routes: [{ host_id: "host-a", agent_key: "codex", total_chars: 10001 }],
-      }),
-      { status: 200 },
-    ),
-  );
-  const { result } = renderHook(useSaveInstructionLayer, { wrapper });
-  const body = {
-    scope: "host" as const,
-    agent_key: "",
-    host_id: "host-a",
-    text: "😀".repeat(10001),
-  };
-  await act(async () => {
-    await result.current.mutateAsync(body);
-  });
-  const [path, request] = fetch.mock.calls[0]!;
-  expect(path).toBe("/v1/instruction-layers");
-  expect(request?.method).toBe("PUT");
-  expect(JSON.parse(request?.body as string)).toEqual(body);
-  expect(client.getQueryState(["instruction-layers", "preview", "host-a"])?.isInvalidated).toBe(
-    true,
-  );
-  await waitFor(() => expect(result.current.data?.over_budget_routes).toHaveLength(1));
-  client.clear();
-});
+it.each([undefined, "revision-a", null])(
+  "sends the exact scoped text with expected revision %j and invalidates totals and history",
+  async (expected_revision_id) => {
+    const { client, wrapper } = setup();
+    client.setQueryData(["instruction-layers"], { data: [] });
+    client.setQueryData(["instruction-layers", "preview", "host-a"], { text: "old" });
+    client.setQueryData(["instruction-layers", "revisions", { scope: "host", host_id: "host-a" }], {
+      data: [],
+    });
+    fetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          over_budget_routes: [{ host_id: "host-a", agent_key: "codex", total_chars: 10001 }],
+        }),
+        { status: 200 },
+      ),
+    );
+    const { result } = renderHook(useSaveInstructionLayer, { wrapper });
+    const body = {
+      scope: "host" as const,
+      agent_key: "",
+      host_id: "host-a",
+      text: "😀".repeat(10001),
+      ...(expected_revision_id !== undefined ? { expected_revision_id } : {}),
+    };
+    await act(async () => {
+      await result.current.mutateAsync(body);
+    });
+    const [path, request] = fetch.mock.calls[0]!;
+    expect(path).toBe("/v1/instruction-layers");
+    expect(request?.method).toBe("PUT");
+    expect(JSON.parse(request?.body as string)).toEqual(body);
+    expect(client.getQueryState(["instruction-layers", "preview", "host-a"])?.isInvalidated).toBe(
+      true,
+    );
+    await waitFor(() => expect(result.current.data?.over_budget_routes).toHaveLength(1));
+    client.clear();
+  },
+);
 it("keeps the route identity in the query and exposes safe API errors", async () => {
   const { client, wrapper } = setup();
   fetch.mockResolvedValue(
@@ -97,22 +102,70 @@ it("loads revision history for just the selected layer", async () => {
   client.clear();
 });
 
-it("shows only nonblank agent/independent layers and this-visit additions", () => {
+it("orders explicit axes first, then held axes, skipping unknown and removed hosts", () => {
+  const hosts = ["host-a", "host-b", "host-c"].map((host_id) => ({ host_id })) as Host[];
   const data = {
     data: [
       { scope: "agent", agent_key: "codex", text: "C" },
-      { scope: "independent", agent_key: "claude", text: "I" },
-      { scope: "agent", agent_key: "empty", text: "  " },
-      { scope: "host", agent_key: "", text: "Host" },
+      { scope: "independent", agent_key: "claude", host_id: "host-a", text: "I" },
+      {
+        scope: "independent",
+        agent_key: "removed",
+        host_id: "host-b",
+        text: "R",
+        host_removed: true,
+      },
+      { scope: "independent", agent_key: "missing", host_id: "unknown", text: "M" },
+      { scope: "independent", agent_key: "unknown", host_id: "host-c", text: "U" },
+      { scope: "agent", agent_key: "empty", text: "\u0085\u001c" },
+      { scope: "host", host_id: "host-b", text: "Host" },
+      { scope: "host", host_id: "unknown", text: "Missing host" },
     ],
-    agents: ["codex", "claude", "empty", "new"].map((key) => ({ key, display_name: key })),
+    agents: ["codex", "claude", "removed", "missing", "empty", "new"].map((key) => ({
+      key,
+      display_name: key,
+    })),
   } as InstructionLayers;
-  expect(visibleInstructionAgents(data, new Set()).map((a) => a.key)).toEqual(["codex", "claude"]);
-  expect(visibleInstructionAgents(data, new Set(["new"])).map((a) => a.key)).toEqual([
-    "codex",
-    "claude",
-    "new",
-  ]);
+  const axes = instructionGridAxes(data, hosts, {
+    hosts: ["unknown", "host-b"],
+    agents: ["unknown", "new"],
+  });
+  expect(axes.agents.map((agent) => agent.key)).toEqual(["new", "codex", "claude"]);
+  expect(axes.hosts.map((host) => host.host_id)).toEqual(["host-b", "host-a"]);
+  expect(axes.agentLayers.get("claude")).toEqual([data.data[1]]);
+  expect(axes.hostLayers.get("host-b")).toEqual([data.data[6]]);
+  expect(axes.hostLayers.get("host-a")).toEqual([data.data[1]]);
+});
+it("excludes unknown-agent layers from a held host row's clear set", () => {
+  const hostLayer = { scope: "host", host_id: "host-a", text: "Host text" };
+  const unknownLayer = {
+    scope: "independent",
+    host_id: "host-a",
+    agent_key: "unknown",
+    text: "Independent text",
+  };
+  const data = {
+    data: [hostLayer, unknownLayer, { scope: "agent", agent_key: "unknown", text: "Agent text" }],
+    agents: [{ key: "agent-a", display_name: "Agent A" }],
+  } as InstructionLayers;
+  const axes = instructionGridAxes(data, [{ host_id: "host-a" }] as Host[], {
+    hosts: [],
+    agents: [],
+  });
+  expect(axes.hosts.map((host) => host.host_id)).toEqual(["host-a"]);
+  expect(axes.hostLayers.get("host-a")).toEqual([hostLayer]);
+  expect(axes.agentLayers.size).toBe(0);
+  expect(axes.agents).toEqual([]);
+  expect(unknownLayer.text).toBe("Independent text");
+});
+it.each([
+  [null, false],
+  ["", false],
+  [" \n\u0085\u001c\u001f", false],
+  ["\ufeff", true],
+  ["Text", true],
+])("uses the server blank rule for %j", (text, held) => {
+  expect(hasInstructionText(text)).toBe(held);
 });
 it("uses descriptor harnesses for section and owner-host deployment", () => {
   const agents = [{ key: "plugin", display_name: "Plugin", harnesses: ["acp:plugin"] }];

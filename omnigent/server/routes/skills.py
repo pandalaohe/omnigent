@@ -52,6 +52,7 @@ def create_skills_router(
         harness: str | None = Query(None, min_length=1),
         path: str | None = Query(None, min_length=1),
         agent_id: str | None = Query(None, min_length=1),
+        allow_pending: bool = Query(False),
     ) -> SkillsResponse:
         """Discover skills using a session or an explicit host, harness, and directory.
 
@@ -61,6 +62,7 @@ def create_skills_router(
         is required. Optional ``agent_id`` applies the selected agent's filter
         and bundled skills, with the same access check as session creation.
         The two forms cannot be combined.
+        ``allow_pending`` opts into a short host wait and retryable pending errors.
         """
         user_id = require_user(request, auth_provider)
         agent_version = sub_agent_name = None
@@ -141,6 +143,7 @@ def create_skills_router(
             agent_version=agent_version,
             sub_agent_name=sub_agent_name,
             skills_filter=spec.skills_filter if spec is not None else "all",
+            allow_pending=allow_pending,
         )
         if result.status != "ok":
             raise HTTPException(
@@ -182,6 +185,7 @@ async def request_host_skills(
     agent_version: str | None = None,
     sub_agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    allow_pending: bool = False,
 ) -> HostSkillsResultFrame:
     """Request skill metadata over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -200,6 +204,7 @@ async def request_host_skills(
                     agent_version=agent_version,
                     sub_agent_name=sub_agent_name,
                     skills_filter=skills_filter,
+                    allow_pending=allow_pending,
                 )
             ),
         )

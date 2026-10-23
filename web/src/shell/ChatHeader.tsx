@@ -50,6 +50,8 @@ import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
+import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -219,6 +221,8 @@ interface ChatHeaderProps {
   onToggleRightPanel: () => void;
   /** Show dependency-free disabled chrome while the server session is pending. */
   pending?: boolean;
+  /** Current session archive state, including directly opened sessions. */
+  archived?: boolean;
   /** Gating + handlers for the mobile session-menu FAB. */
   mobileMenu: MobileSessionMenuProps;
 }
@@ -368,11 +372,13 @@ export function ChatHeader({
   rightPanelOpen,
   onToggleRightPanel,
   pending = false,
+  archived = false,
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
   const rightPanelShortcut = useShortcutHint("toggleWorkspaceSidebar");
   const canvas = useCanvasWorkspace();
+  const serverInfo = useServerInfo();
   const { trackClick } = useOmnigentAnalytics();
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
@@ -646,6 +652,12 @@ export function ChatHeader({
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
+        {!pending &&
+          conversationId &&
+          serverInfo !== "loading" &&
+          serverInfo.browser_annotations_available && (
+            <ReceiveAnnotationsButton sessionId={conversationId} archived={archived} />
+          )}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (

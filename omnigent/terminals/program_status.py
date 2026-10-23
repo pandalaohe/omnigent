@@ -365,25 +365,36 @@ def relay(path: Path, app: str, command: list[str]) -> int:
                     stopping_at = time.monotonic()
         _write_all(1, parser.finish())
     finally:
-        # PTY EOF can precede waitpid readiness; allow the child's real exit to arrive.
-        deadline = (stopping_at if stopping_at is not None else time.monotonic()) + 2
-        while exit_status is None and time.monotonic() < deadline:
-            child, result = os.waitpid(pid, os.WNOHANG)
-            if child:
-                exit_status = result
-            else:
-                time.sleep(0.01)
-        if exit_status is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pid, signal.SIGKILL)
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
-            _, exit_status = os.waitpid(pid, 0)
-        os.close(master)
-        with contextlib.suppress(OSError, termios.error):
-            termios.tcsetattr(0, termios.TCSANOW, original)
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        try:
+            # A child exiting its controlling PTY may wait for the master to close.
+            os.close(master)
+            # PTY EOF can precede waitpid readiness; allow the child's real exit to arrive.
+            deadline = (stopping_at if stopping_at is not None else time.monotonic()) + 2
+            while exit_status is None and time.monotonic() < deadline:
+                child, result = os.waitpid(pid, os.WNOHANG)
+                if child:
+                    exit_status = result
+                else:
+                    time.sleep(0.01)
+            if exit_status is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+                deadline = time.monotonic() + 2
+                while exit_status is None and time.monotonic() < deadline:
+                    child, result = os.waitpid(pid, os.WNOHANG)
+                    if child:
+                        exit_status = result
+                    else:
+                        time.sleep(0.01)
+                if exit_status is None:
+                    raise RuntimeError(f"relay {os.getpid()}: child {pid} did not reap")
+        finally:
+            with contextlib.suppress(OSError, termios.error):
+                termios.tcsetattr(0, termios.TCSANOW, original)
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
     return os.waitstatus_to_exitcode(exit_status)
 
 

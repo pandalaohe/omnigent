@@ -62,6 +62,22 @@ class StartupAdmission:
             startups, conversations, eligible=self._eligible, launch=self._launch
         )
 
+    async def _generic_pending(self, session_id: str) -> list[Any]:
+        """Annotation receipts own their own dispatch phase and cannot be retried here."""
+        items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        lookup = getattr(self.conversations, "annotation_receipt_for_item", None)
+        if lookup is None:
+            return items
+        return [
+            item for item in items if await asyncio.to_thread(lookup, session_id, item.id) is None
+        ]
+
+    async def _is_annotation_input(self, session_id: str, item_id: str) -> bool:
+        lookup = getattr(self.conversations, "annotation_receipt_for_item", None)
+        return (
+            lookup is not None and await asyncio.to_thread(lookup, session_id, item_id) is not None
+        )
+
     def bind(self, app: Any) -> None:
         self._app = app
         app.state.startup_store = self.startups
@@ -75,7 +91,7 @@ class StartupAdmission:
     async def input_saved(self, session_id: str, _input_id: str) -> None:
         current = await asyncio.to_thread(self.startups.for_session, session_id)
         if current is not None and current.state == "queued" and current.input_id is None:
-            pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+            pending = await self._generic_pending(session_id)
             head = next((item for item in pending if item.status != "failed"), None)
             if head is not None and head.status == "in_progress":
                 await asyncio.to_thread(self.startups.attach_queued_input, current.id, head.id)
@@ -155,7 +171,7 @@ class StartupAdmission:
         ):
             raise StartupQueued(None)
         current = await asyncio.to_thread(self.startups.for_session, session_id)
-        pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        pending = await self._generic_pending(session_id)
         head = next((item for item in pending if item.status != "failed"), None)
         if current is not None:
             if (
@@ -225,7 +241,7 @@ class StartupAdmission:
             ):
                 return current
             raise OmnigentError("Startup preparation changed", code=ErrorCode.CONFLICT)
-        pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        pending = await self._generic_pending(session_id)
         head = next((item for item in pending if item.status != "failed"), None)
         if head is not None and head.status != "in_progress":
             raise OmnigentError("Previous input requires reconciliation", code=ErrorCode.CONFLICT)
@@ -294,7 +310,11 @@ class StartupAdmission:
         item = await asyncio.to_thread(
             self.conversations.get_item, current.session_id, current.input_id
         )
-        if item is None or item.status != "in_progress":
+        if (
+            item is None
+            or item.status != "in_progress"
+            or await self._is_annotation_input(current.session_id, item.id)
+        ):
             return False
         ref = StartupAttemptRef(
             startup_id=current.id,
@@ -379,6 +399,8 @@ class StartupAdmission:
                     self.conversations.get_item, startup.session_id, startup.input_id
                 )
                 if item is None:
+                    raise StartupQueued(startup.id)
+                if await self._is_annotation_input(startup.session_id, item.id):
                     raise StartupQueued(startup.id)
                 outcome = await self._app.state.startup_inputs._deliver(
                     self._app, startup.session_id, item, startup=ref

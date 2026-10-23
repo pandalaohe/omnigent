@@ -13,3 +13,7 @@ omnigent/api/**/*_pb2.pyi linguist-generated=true
 
 # This script is executed directly by Bash from Windows checkouts.
 scripts/fetch-dictation-models.sh text eol=lf
+
+# Extension source/build inputs must load identically from Windows checkouts.
+browsers/chrome/** text eol=lf
+browsers/shared/** text eol=lf

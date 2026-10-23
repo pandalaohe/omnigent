@@ -733,6 +733,7 @@ class RunnerSessionInitializer:
                 project_code = await self.resolve_project_code(conversation)
             payload = build_runner_session_init_payload(
                 conversation,
+                usage_storage_location=getattr(self._conversation_store, "storage_location", None),
                 server_version=self._server_version,
                 suppress_recovery_turn=suppress_recovery_turn,
                 archive_states=archive_states,
@@ -781,6 +782,9 @@ class RunnerSessionInitializer:
                 self.require_generation(runner_id, runner_client, generation)
                 refreshed_payload = build_runner_session_init_payload(
                     refreshed,
+                    usage_storage_location=getattr(
+                        self._conversation_store, "storage_location", None
+                    ),
                     server_version=self._server_version,
                     suppress_recovery_turn=suppress_recovery_turn,
                     archive_states=archive_states,

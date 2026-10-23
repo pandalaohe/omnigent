@@ -153,6 +153,7 @@ async def codex_launch_harness(
         return httpx.Response(200, json={"reset": applied})
 
     app_server = SimpleNamespace(
+        workspace_profile=None,
         resident_incarnation_id="test-backend-incarnation",
         exit_confirmed=False,
         process_exit_confirmed=False,

@@ -7,7 +7,9 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
+import sqlite3
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable
@@ -32,6 +34,8 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
     CodexMessage,
+    _codex_resume_permission_params,
+    apply_codex_thread_permissions,
     client_for_transport,
 )
 from omnigent.harnesses.codex_native.bridge import (
@@ -65,6 +69,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.harnesses.codex_native.launch_args import PROFILE_ID, codex_stance_is_workspace_write
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -1514,7 +1519,9 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
         return None
 
     args: list[str] = []
-    if isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
+    if isinstance(active_profile, dict) and active_profile.get("id") == PROFILE_ID:
+        args.extend(["--sandbox", "workspace-write", "--ask-for-approval", approval_policy])
+    elif isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
         args.extend(
             [
                 "-c",
@@ -1532,8 +1539,7 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
         sandbox_mode = sandbox_policy.get("type")
         if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
             return None
-        if approval_policy != "on-request" or sandbox_mode != "workspace-write":
-            args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
+        args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
 
     if reviewer in {"user", "auto_review", "guardian_subagent"}:
         args.extend(["-c", f"approvals_reviewer={json.dumps(reviewer)}"])
@@ -2642,6 +2648,17 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
         )
+        bridge_state = read_bridge_state(bridge_dir)
+        if bridge_state is not None and bridge_state.permission_profile:
+            try:
+                snapshot = await _fetch_session_snapshot(ap_client, session_id)
+                launch_args = snapshot.get("terminal_launch_args") or []
+                if isinstance(launch_args, list) and all(
+                    isinstance(arg, str) for arg in launch_args
+                ):
+                    forwarder_state.terminal_launch_args = launch_args
+            except Exception:  # noqa: BLE001 - live thread settings can still supply the stance.
+                _logger.warning("Failed to read Codex launch stance", exc_info=True)
         snapshots = NativeSubagentSnapshotPublisher(ap_client)
         forwarder_state.snapshot_publisher = snapshots
         try:
@@ -2681,6 +2698,11 @@ async def supervise_forwarder(
         )
         await _sleep(0)
         await snapshots.__aenter__()
+        usage_completion_wake = asyncio.Event()
+        usage_completion_task = asyncio.create_task(
+            _retry_usage_completions(ap_client, bridge_dir, usage_completion_wake),
+            name="codex-usage-completions",
+        )
         try:
             async for event in client.iter_events():
                 try:
@@ -2693,17 +2715,11 @@ async def supervise_forwarder(
                         event=event,
                         forwarder_state=forwarder_state,
                     )
-                    if capture_enabled() and (rotated or codex_usage_boundary(event)):
-                        await prepare_capture(ap_client, target.session_id, "codex-native")
-                        usage_state = read_bridge_state(bridge_dir)
-                        if usage_state is not None:
-                            await asyncio.to_thread(
-                                capture_codex_home,
-                                Path(usage_state.codex_home),
-                                target.session_id,
-                                "codex-native",
-                                target.thread_id,
-                            )
+                    try:
+                        if await _queue_usage_terminal(bridge_dir, event):
+                            usage_completion_wake.set()
+                    except (OSError, sqlite3.Error):
+                        _logger.warning("Usage completion persistence failed", exc_info=True)
                     if rotated:
                         if (
                             forwarder_state.posted_goal_state_known
@@ -2750,6 +2766,7 @@ async def supervise_forwarder(
                                 "Codex Goal rotation reconciliation failed",
                                 exc_info=True,
                             )
+                        await _capture_usage_boundary(ap_client, bridge_dir, target, event)
                         continue
                     # A keep-warm ping fork's whole stream stays invisible
                     # here — the ping driver owns it on its own connection.
@@ -2782,9 +2799,14 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
+                    if codex_usage_boundary(event):
+                        await _capture_usage_boundary(ap_client, bridge_dir, target, event)
                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
+            usage_completion_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await usage_completion_task
             await snapshots.__aexit__()
             if mcp_settle_timer is not None:
                 mcp_settle_timer.cancel()
@@ -2980,19 +3002,46 @@ async def _maybe_rotate_session_on_thread_started(
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
         return False
+    bridge_state = read_bridge_state(bridge_dir)
+    if bridge_state is not None and bridge_state.permission_profile:
+        live_args = forwarder_state.terminal_launch_args if forwarder_state is not None else None
+        try:
+            if live_args is None:
+                snapshot = await _fetch_session_snapshot(ap_client, target.session_id)
+                launch_args = snapshot.get("terminal_launch_args") or []
+                if isinstance(launch_args, list) and all(
+                    isinstance(arg, str) for arg in launch_args
+                ):
+                    live_args = launch_args
+            if live_args is not None and codex_stance_is_workspace_write(
+                live_args, configured_sandbox_mode=None, bypass_sandbox=False
+            ):
+                await apply_codex_thread_permissions(
+                    app_server_url, new_thread_id, bridge_state.permission_profile
+                )
+        except Exception:  # noqa: BLE001 - rotation continues with the thread's legacy permissions.
+            _logger.warning("Failed to apply Codex rotated thread permissions", exc_info=True)
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
     await old_usage_coalescer.flush()
     old_elicitation_tracker = target.elicitation_tracker
     old_session_id = target.session_id
-    new_session_id = await _create_thread_replacement_session(
-        client=ap_client,
-        old_session_id=old_session_id,
-        bridge_dir=bridge_dir,
-        app_server_url=app_server_url,
-        new_thread_id=new_thread_id,
-    )
+    prepared = read_bridge_state(bridge_dir)
+    if (
+        prepared is not None
+        and prepared.thread_id == new_thread_id
+        and prepared.session_id != old_session_id
+    ):
+        new_session_id = prepared.session_id
+    else:
+        new_session_id = await _create_thread_replacement_session(
+            client=ap_client,
+            old_session_id=old_session_id,
+            bridge_dir=bridge_dir,
+            app_server_url=app_server_url,
+            new_thread_id=new_thread_id,
+        )
     target.session_id = new_session_id
     target.thread_id = new_thread_id
     target.delta_coalescer = _OutputTextDeltaCoalescer(ap_client, new_session_id)
@@ -3122,6 +3171,7 @@ async def _create_thread_replacement_session(
             # Carry the workspace across the rotation, or the executor
             # falls back to the harness process's own cwd for new turns.
             cwd=state.cwd if state is not None else None,
+            permission_profile=state.permission_profile if state is not None else None,
         ),
     )
 
@@ -5424,6 +5474,8 @@ async def _handle_codex_elicitation_request(
     )
     if result is None:
         return
+    result.pop("usage_admission", None)
+    result.pop("admission_id", None)
     await codex_client.respond(request_id, result)
 
 
@@ -5490,6 +5542,11 @@ async def _codex_elicitation_hook_result(
             result,
         )
         return None
+    admission = result.get("usage_admission")
+    if isinstance(admission, dict):
+        from omnigent.usage_export.runtime import begin_admitted_turn
+
+        begin_admitted_turn(session_id, "codex-native", admission)
     return result
 
 
@@ -5672,6 +5729,11 @@ async def _maybe_handle_plan_implementation_prompt(
     selected = _selected_plan_implementation_answer(result)
     if selected == _PLAN_IMPLEMENTATION_NO or selected is None:
         return
+    admission = result.get("usage_admission") if isinstance(result, dict) else None
+    if isinstance(admission, dict):
+        from omnigent.harnesses.codex_native.bridge import record_usage_admission
+
+        record_usage_admission(bridge_dir, admission["admission_id"])
     if selected == _PLAN_IMPLEMENTATION_YES:
         await _start_plan_implementation_turn(
             codex_client,
@@ -5687,6 +5749,8 @@ async def _maybe_handle_plan_implementation_prompt(
             bridge_dir=bridge_dir,
             plan_text=plan_text,
             forwarder_state=forwarder_state,
+            usage_client=client,
+            usage_admission=result.get("usage_admission") if isinstance(result, dict) else None,
         )
 
 
@@ -5966,6 +6030,117 @@ def _first_async_question_answer(
     return None
 
 
+async def _capture_usage_boundary(
+    client: httpx.AsyncClient, bridge_dir: Path, target: _ForwarderTarget, event: CodexMessage
+) -> None:
+    """Refresh capture ownership on rotation as well as ordinary usage events."""
+    from omnigent.usage_export.runtime import (
+        capture_codex_home,
+        capture_enabled,
+        check_live_route,
+        link_codex_turn,
+        outbox,
+        prepare_capture,
+    )
+
+    if not capture_enabled():
+        return
+    state = read_bridge_state(bridge_dir)
+    if state is not None:
+        # Rebind discovery before registration HTTP can yield to the scanner.
+        await asyncio.to_thread(
+            outbox().register_root,
+            Path(state.codex_home),
+            target.session_id,
+            "codex-native",
+            target.thread_id,
+        )
+    await prepare_capture(client, target.session_id, "codex-native")
+    if state is None:
+        return
+    await asyncio.to_thread(
+        check_live_route,
+        target.session_id,
+        "codex-native",
+        os.environ,
+        codex_home=Path(state.codex_home),
+    )
+    params = event.get("params")
+    if event.get("method") == "turn/started" and isinstance(params, dict):
+        turn_id = _turn_id_from_payload(params.get("turn"))
+        if turn_id is not None and params.get("threadId") == target.thread_id:
+            await asyncio.to_thread(
+                link_codex_turn, target.session_id, "codex-native", target.thread_id, turn_id
+            )
+    await asyncio.to_thread(
+        capture_codex_home,
+        Path(state.codex_home),
+        target.session_id,
+        "codex-native",
+        target.thread_id,
+    )
+
+
+async def _queue_usage_terminal(bridge_dir: Path, event: CodexMessage) -> bool:
+    """Persist the exact turn's completion without awaiting network delivery."""
+    from omnigent.harnesses.codex_native.bridge import bind_usage_turn, queue_usage_completion
+
+    params = event.get("params")
+    state = read_bridge_state(bridge_dir)
+    if not isinstance(params, dict) or state is None or params.get("threadId") != state.thread_id:
+        return False
+    turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
+    if turn_id is None:
+        return False
+    if event.get("method") == "turn/started":
+        bind_usage_turn(bridge_dir, turn_id)
+    elif (
+        event.get("method") in {"turn/completed", "turn/failed"}
+        and state.usage_admission_id
+        and state.usage_turn_id == turn_id
+    ):
+        await asyncio.to_thread(
+            queue_usage_completion, bridge_dir, state.session_id, state.usage_admission_id
+        )
+        return True
+    return False
+
+
+async def _retry_usage_completions(
+    client: httpx.AsyncClient, bridge_dir: Path, wake: asyncio.Event
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import (
+        ack_usage_completion,
+        pending_usage_completions,
+    )
+
+    while True:
+        wake.clear()
+        try:
+            pending = await asyncio.to_thread(pending_usage_completions, bridge_dir)
+            for session_id, admission_id in pending:
+                try:
+                    response = await client.post(
+                        "/v1/usage-cutover/admissions",
+                        json={
+                            "session_id": session_id,
+                            "admission_id": admission_id,
+                            "ended": True,
+                        },
+                        timeout=5,
+                    )
+                    response.raise_for_status()
+                    await asyncio.to_thread(
+                        ack_usage_completion, bridge_dir, session_id, admission_id
+                    )
+                except (httpx.HTTPError, OSError, sqlite3.Error):
+                    _logger.warning("Usage completion delivery remains pending", exc_info=True)
+        except (OSError, sqlite3.Error):
+            _logger.warning("Usage completion queue read failed", exc_info=True)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(wake.wait(), timeout=5)
+
+
 async def _start_plan_implementation_turn(
     codex_client: CodexAppServerClient,
     *,
@@ -5991,6 +6166,17 @@ async def _start_plan_implementation_turn(
             "developer_instructions state is unknown"
         )
         return
+    from omnigent.usage_export.runtime import check_live_route, link_codex_turn
+
+    state = read_bridge_state(bridge_dir)
+    if state is not None:
+        await asyncio.to_thread(
+            check_live_route,
+            state.session_id,
+            "codex-native",
+            os.environ,
+            codex_home=Path(state.codex_home),
+        )
     response = await codex_client.request(
         "turn/start",
         {
@@ -6003,6 +6189,13 @@ async def _start_plan_implementation_turn(
     turn = result.get("turn") if isinstance(result, dict) else None
     turn_id = turn.get("id") if isinstance(turn, dict) else None
     if isinstance(turn_id, str) and turn_id:
+        if state is not None:
+            from omnigent.harnesses.codex_native.bridge import bind_usage_turn
+
+            bind_usage_turn(bridge_dir, turn_id)
+            await asyncio.to_thread(
+                link_codex_turn, state.session_id, "codex-native", thread_id, turn_id
+            )
         update_active_turn_id(bridge_dir, turn_id)
 
 
@@ -6012,6 +6205,8 @@ async def _start_clear_context_plan_implementation_turn(
     bridge_dir: Path,
     plan_text: str,
     forwarder_state: _CodexForwarderState,
+    usage_client: httpx.AsyncClient | None = None,
+    usage_admission: object = None,
 ) -> None:
     """
     Start a fresh Codex thread and implement the completed plan there.
@@ -6029,16 +6224,65 @@ async def _start_clear_context_plan_implementation_turn(
             "developer_instructions state is unknown"
         )
         return
-    thread_response = await codex_client.request(
-        "thread/start",
-        {"model": forwarder_state.model, "sessionStartSource": "clear"},
-    )
+    params: _JsonObject = {"model": forwarder_state.model, "sessionStartSource": "clear"}
+    bridge_state = read_bridge_state(bridge_dir)
+    if (
+        bridge_state is not None
+        and bridge_state.permission_profile
+        and forwarder_state.terminal_launch_args is not None
+    ):
+        params.update(
+            _codex_resume_permission_params(
+                forwarder_state.terminal_launch_args, bridge_state.permission_profile
+            )
+        )
+    thread_response = await codex_client.request("thread/start", params)
     result = thread_response.get("result")
     thread = result.get("thread") if isinstance(result, dict) else None
     thread_id = thread.get("id") if isinstance(thread, dict) else None
     if not isinstance(thread_id, str) or not thread_id:
         _logger.warning("Codex clear-context plan implementation skipped: new thread id missing")
         return
+    if usage_client is not None and isinstance(usage_admission, dict):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            raise RuntimeError("Plan continuation requires the live bridge identity")
+        successor_id = await _create_thread_replacement_session(
+            client=usage_client,
+            old_session_id=state.session_id,
+            bridge_dir=bridge_dir,
+            app_server_url=state.socket_path,
+            new_thread_id=thread_id,
+        )
+        ended = await usage_client.post(
+            "/v1/usage-cutover/admissions",
+            json={
+                "session_id": state.session_id,
+                "admission_id": usage_admission["admission_id"],
+                "ended": True,
+            },
+        )
+        ended.raise_for_status()
+        from omnigent.usage_export.runtime import (
+            begin_admitted_turn,
+            capture_enabled,
+            outbox,
+            prepare_capture,
+        )
+
+        if capture_enabled():
+            outbox().finish_admission(state.session_id, "codex-native")
+        admitted = await usage_client.post(
+            "/v1/usage-cutover/admissions", json={"session_id": successor_id, "source": "plan"}
+        )
+        if admitted.status_code == 409:
+            return
+        admitted.raise_for_status()
+        from omnigent.harnesses.codex_native.bridge import record_usage_admission
+
+        record_usage_admission(bridge_dir, admitted.json()["admission_id"])
+        await prepare_capture(usage_client, successor_id, "codex-native")
+        begin_admitted_turn(successor_id, "codex-native", admitted.json())
     update_thread_id(bridge_dir, thread_id)
     text = f"{_PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n{plan_text}"
     await _start_plan_implementation_turn(

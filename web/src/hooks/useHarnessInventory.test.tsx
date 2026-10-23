@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -67,6 +67,60 @@ describe("installedHarnesses", () => {
 });
 
 describe("useHarnessInventory", () => {
+  it.each([
+    { surface: "Settings", options: { includePluginMetadata: true } },
+    { surface: "onboarding", options: { awaitConnection: true } },
+  ])(
+    "keeps $surface waiting for a cold catalog beyond the composer deadline",
+    async ({ options }) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new DOMException("timeout", "TimeoutError")), ms);
+        return controller.signal;
+      });
+      let finish!: (response: Response) => void;
+      authenticatedFetchMock.mockImplementation((url: string, init: RequestInit) => {
+        if (url.startsWith("/v1/skills?")) {
+          expect(new URL(url, "http://test").searchParams.has("allow_pending")).toBe(false);
+          return new Promise<Response>((resolve, reject) => {
+            finish = resolve;
+            init.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+              once: true,
+            });
+          });
+        }
+        return Promise.resolve(Response.json({ plugins: [], mcp_servers: [] }));
+      });
+      const view = renderHook(
+        () =>
+          useHarnessInventory(
+            { ...HOST, configured_harnesses: { "claude-native": true } },
+            options,
+          ),
+        { wrapper },
+      );
+      try {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(9_000);
+        });
+        expect(view.result.current.status).toBe("loading");
+        expect(view.result.current.unavailable).not.toContain("skills");
+        await act(async () => {
+          finish(Response.json({ skills: [{ name: "late-review", description: "Review" }] }));
+        });
+        await waitFor(() => expect(view.result.current.status).toBe("ready"));
+        expect(view.result.current.context.skills.map((s) => s.name)).toEqual(["late-review"]);
+        expect(view.result.current.unavailable).not.toContain("skills");
+        expect(timeout).not.toHaveBeenCalled();
+      } finally {
+        view.unmount();
+        timeout.mockRestore();
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("maps login state, skills, plugins, and MCPs per harness", async () => {
     serve({
       "/v1/hosts/host_1/plugins": 501,

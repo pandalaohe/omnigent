@@ -75,18 +75,18 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("native-agy")).toBe(canonical);
   });
 
-  it("gives antigravity-native its own tier and model capabilities", () => {
+  it("keeps catalog-owned Antigravity modes out of legacy capability flags", () => {
     const agy = nativeCodingAgentForHarness("antigravity-native");
-    expect(agy?.capabilities).toEqual(["agyPermissionTier", "agyMode"]);
+    expect(agy?.capabilities).toBeUndefined();
     expect(
       nativeAgentHasCapability(
         { name: "antigravity-native-ui", harness: null },
         "agyPermissionTier",
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "agyMode"),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "permissionMode"),
     ).toBe(false);

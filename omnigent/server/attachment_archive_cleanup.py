@@ -33,6 +33,7 @@ from omnigent.server.server_config import (
 )
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store import FileStore
 
 _logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ class AttachmentArchiveCleanup:
         clock: Callable[[], int] = now_epoch,
         first_sweep_delay_s: float = FIRST_SWEEP_DELAY_S,
         sweep_interval_s: float = SWEEP_INTERVAL_S,
+        annotation_staging_cleanup: bool = False,
     ) -> None:
         """
         :param conversation_store: Source of archived sessions and revisions.
@@ -121,6 +123,7 @@ class AttachmentArchiveCleanup:
         self._clock = clock
         self._first_sweep_delay_s = first_sweep_delay_s
         self._sweep_interval_s = sweep_interval_s
+        self._annotation_staging_cleanup = annotation_staging_cleanup
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -158,6 +161,11 @@ class AttachmentArchiveCleanup:
             omitted. Tests pass a fixed value to age sessions.
         :returns: The sweep's :class:`CleanupSummary`.
         """
+        if self._annotation_staging_cleanup:
+            try:
+                await asyncio.to_thread(self._sweep_expired_annotation_staging)
+            except Exception:
+                _logger.exception("Expired annotation screenshot scan failed")
         reference_time = self._clock() if now is None else now
         days = attachment_archive_cleanup_days()
         if days == 0:
@@ -186,6 +194,22 @@ class AttachmentArchiveCleanup:
             summary.capped,
         )
         return summary
+
+    def _sweep_expired_annotation_staging(self) -> None:
+        """Retire bounded, uncommitted screenshot bytes on the existing daily tick."""
+        store = self._conversation_store
+        if not isinstance(store, SqlAlchemyConversationStore):
+            return
+        retired = 0
+        for candidate in store.list_expired_annotation_staging():
+            try:
+                retired += store.retire_expired_annotation_staging(
+                    candidate, self._artifact_store.delete
+                )
+            except Exception:
+                _logger.exception("Expired annotation screenshot cleanup failed")
+        if retired:
+            _logger.info("Retired %d expired annotation screenshots", retired)
 
     def _sweep(
         self,

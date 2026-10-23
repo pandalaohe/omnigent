@@ -91,7 +91,7 @@ def _resolve_session_harness(conv: Conversation) -> str | None:
     (3) agent-spec resolution via the runtime (works when the server has
     a live agent cache). Returns a display-friendly name or ``None``.
     """
-    if conv.harness_override:
+    if conv.harness_override and conv.harness_override != "auto":
         return conv.harness_override
     wrapper = conv.labels.get(WRAPPER_LABEL_KEY)
     if wrapper:
@@ -233,6 +233,7 @@ def create_usage_router(
     *,
     auth_provider: AuthProvider | None = None,
     feature_flags: FeatureFlags | None = None,
+    host_registry: Any = None,
 ) -> APIRouter:
     """
     Create the per-user usage-report router.
@@ -254,6 +255,23 @@ def create_usage_router(
     router.include_router(
         create_usage_events_router(
             conversation_store, _resolve_session_harness, auth_provider=auth_provider
+        )
+    )
+
+    def _host_owner(host_id: str, _workspace_id: str | None = None) -> str | None:
+        if host_registry is None:
+            return None
+        connection = host_registry.get(host_id)
+        return None if connection is None else connection.owner
+
+    from omnigent.server.routes.usage_cutover import create_usage_cutover_router
+
+    router.include_router(
+        create_usage_cutover_router(
+            conversation_store.storage_location,
+            auth_provider=auth_provider,
+            host_owner=_host_owner,
+            conversation_store=conversation_store,
         )
     )
 

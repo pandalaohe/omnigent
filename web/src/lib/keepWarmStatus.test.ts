@@ -48,6 +48,19 @@ describe("keepWarmStopReason", () => {
     expect(keepWarmStopReason(status())).toBeNull();
   });
 
+  it("names skipped attempts and keeps their cause after expiry", () => {
+    expect(
+      keepWarmStopReason(
+        status({ state: "paused", stop_reason: "skipped", last_reason: "native_status" }),
+      ),
+    ).toBe("ping skipped (native_status)");
+    expect(
+      keepWarmStopReason(
+        status({ state: "stopped", stop_reason: "expired", last_reason: "native_status" }),
+      ),
+    ).toBe("window expired (last ping: native_status)");
+  });
+
   it("reports a cap stop as 'cap reached' regardless of episode age", () => {
     // `started_at` predates any cold time after the stop, so it must not feed
     // an elapsed-hours label.
@@ -79,6 +92,20 @@ describe("keepWarmStopReason", () => {
     expect(keepWarmStopReason(status({ stop_reason: "host" }))).toBe("host offline");
     expect(keepWarmStopReason(status({ stop_reason: "switch_off" }))).toBe("switched off");
     expect(keepWarmStopReason(status({ stop_reason: "runner_version" }))).toBe("runner too old");
+  });
+
+  it("names closed episodes and preserves their first blocker", () => {
+    expect(keepWarmStopReason(status({ stop_reason: "expired" }))).toBe("window expired");
+    expect(keepWarmStopReason(status({ stop_reason: "archive_revision" }))).toBe(
+      "archive state changed",
+    );
+    expect(keepWarmStopReason(status({ stop_reason: "policy" }))).toBe("policy stopped warming");
+    expect(keepWarmStopReason(status({ stop_reason: "parent_inactive" }))).toBe("parent inactive");
+    expect(
+      keepWarmTooltipLine(
+        status({ state: "stopped", stop_reason: "expired", blocked_by: "status_not_idle" }),
+      ),
+    ).toBe("Keep-warm stopped: window expired (blocked by session not idle) · 0 pings $0.00");
   });
 });
 

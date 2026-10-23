@@ -151,7 +151,6 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import {
   AGY_NATIVE_PERMISSION_TIERS,
   AGY_RESTRICTED_HOOK_RULE,
-  NON_FULL_PERMISSION_TIERS,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -2875,8 +2874,8 @@ function ComposerImpl(
     sessionStorage.setItem(noticeKey, "1");
     toast.info(
       source === "auto-strict" || source === "auto-standard"
-        ? "旧自动档已迁为自动；现在使用固定的宽松危险规则。"
-        : `旧权限档 ${source} 已迁为 ${composerSession.permissionTier ?? "自动"}。`,
+        ? "Legacy Auto mode was migrated to Auto with fixed, relaxed risk rules."
+        : `Legacy permission mode ${source} was migrated to ${composerSession.permissionTier ?? "Auto"}.`,
     );
   }, [composerSession?.labels, composerSession?.permissionTier, composerSessionId]);
   // Archived sessions keep their unhandled comments; fetch them (visitor
@@ -2907,7 +2906,6 @@ function ComposerImpl(
   const claudePermissionMode = tierPermissionControl
     ? (composerSession?.permissionTier ?? "")
     : storedPermissionMode;
-  const permissionLocked = tierPermissionControl && claudePermissionMode === "full";
   const tierDisabledReason = tierPermissionControl
     ? permissionTierSwitchDisabledReason(composerSession)
     : undefined;
@@ -2987,7 +2985,7 @@ function ComposerImpl(
   const tierPickerDisabledReason =
     tierDisabledReason ??
     (tierPermissionControl && hasQueuedComposerMessages
-      ? "消息仍在排队，排空后才能切换权限"
+      ? "Wait for queued messages to finish before changing permissions"
       : undefined);
   const openComposerGithubTab = useOpenGithubTab();
   // Devin shares this control but not Claude's vocabulary: its rungs are
@@ -2998,9 +2996,7 @@ function ComposerImpl(
     (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
     (showClaudePermissionMode
       ? tierPermissionControl
-        ? permissionLocked
-          ? AGY_NATIVE_PERMISSION_TIERS.filter((tier) => tier.value === "full")
-          : NON_FULL_PERMISSION_TIERS
+        ? AGY_NATIVE_PERMISSION_TIERS
         : devinPermissionControl
           ? DEVIN_NATIVE_PERMISSION_MODES
           : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
@@ -3010,7 +3006,7 @@ function ComposerImpl(
       ? composerSession?.permissionTierState === "blocked"
         ? PERMISSION_TIER_BLOCKED
         : (AGY_NATIVE_PERMISSION_TIERS.find((tier) => tier.value === claudePermissionMode)?.label ??
-          "权限状态待确认")
+          "Permission state unconfirmed")
       : devinPermissionControl
         ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
           claudePermissionMode)
@@ -3020,14 +3016,7 @@ function ComposerImpl(
         codexApprovalMode)
       : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
-    if (
-      isReadOnly ||
-      unreachable ||
-      permissionLocked ||
-      tierPickerDisabledReason ||
-      configBusyRef.current
-    )
-      return;
+    if (isReadOnly || unreachable || tierPickerDisabledReason || configBusyRef.current) return;
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
@@ -4618,18 +4607,31 @@ function ComposerImpl(
                     sessionHarness === "antigravity-native"
                       ? permissionOptions.map((option) => ({
                           ...option,
-                          description: `${option.description}。${AGY_RESTRICTED_HOOK_RULE}`,
+                          description: `${option.description}. ${
+                            option.value === "full" || claudePermissionMode === "full"
+                              ? "Changing to or from Full access requires a new Antigravity session. "
+                              : ""
+                          }${AGY_RESTRICTED_HOOK_RULE}`,
                         }))
                       : permissionOptions
                   }
                   disabledOptions={
-                    showCodexApprovalMode && sessionHarness === "codex-native" ? ["read-only"] : []
+                    sessionHarness === "antigravity-native"
+                      ? permissionOptions
+                          .filter((option) =>
+                            claudePermissionMode === "full"
+                              ? option.value !== "full"
+                              : option.value === "full",
+                          )
+                          .map((option) => option.value)
+                      : showCodexApprovalMode && sessionHarness === "codex-native"
+                        ? ["read-only"]
+                        : []
                   }
                   disabled={
                     isReadOnly ||
                     unreachable ||
                     configBusy ||
-                    permissionLocked ||
                     Boolean(tierPickerDisabledReason) ||
                     !isOwnerLevel(permissionLevel)
                   }
