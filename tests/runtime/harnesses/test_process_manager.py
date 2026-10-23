@@ -3074,7 +3074,18 @@ async def _read_selected_inventory(manager, selected, threads, *, timeout_s=5.0)
 
 @pytest.mark.parametrize(
     "case",
-    ["loaded", "owner-empty", "empty", "unknown", "unsupported", "literal", "overlap", "max"],
+    [
+        "loaded",
+        "owner-empty",
+        "empty",
+        "unknown",
+        "unsupported",
+        "literal",
+        "overlap",
+        "max",
+        "generation-zero",
+        "generation-later",
+    ],
 )
 async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_reader, case):
     from dataclasses import replace
@@ -3109,6 +3120,17 @@ async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_
         ids = (("shared",), ("shared",))
     elif case == "max":
         ids = (tuple(f"thread-{i}" for i in range(1000)),)
+    elif case.startswith("generation-"):
+        owner.inventory = replace(
+            owner.inventory,
+            owners=(
+                replace(
+                    owner.inventory.owners[0],
+                    closing=False,
+                    transport_generation=0 if case == "generation-zero" else 7,
+                ),
+            ),
+        )
     snapshot = ExecutorThreadInventorySnapshot(owner.inventory, ids)
     owner.prepare_resident_thread_inventory = AsyncMock(return_value=lambda: snapshot)
     selected = (await manager.resident_inventory()).owners[0]
@@ -3247,6 +3269,7 @@ async def test_read_resident_inventory_uses_existing_authenticated_owner(residen
                     "started": True,
                     "closing": True,
                     "cleanup_complete": False,
+                    "transport_generation": None,
                 },
             ),
             "ambiguous_context_ids": (),
@@ -3383,6 +3406,14 @@ async def test_read_resident_inventory_discards_late_response(
         "duplicate-session-keys",
         "empty-ambiguity",
         "duplicate-ambiguity",
+        "generation-missing",
+        "generation-negative",
+        "generation-bool",
+        "generation-string",
+        "generation-float",
+        "generation-not-started",
+        "generation-closing",
+        "generation-cleaned",
         "http-error",
         "timeout",
     ],
@@ -3428,6 +3459,31 @@ async def test_read_resident_inventory_invalid_response_is_unknown(
             payload["inventory"]["ambiguous_context_ids"] = [""]
         elif failure == "duplicate-ambiguity":
             payload["inventory"]["ambiguous_context_ids"] = ["thread-a", "thread-a"]
+        elif failure.startswith("generation-"):
+            item = payload["inventory"]["owners"][0]
+            item.update(closing=False, transport_generation=0)
+            if failure == "generation-missing":
+                item.pop("transport_generation")
+            elif failure in {
+                "generation-negative",
+                "generation-bool",
+                "generation-string",
+                "generation-float",
+            }:
+                item["transport_generation"] = {
+                    "generation-negative": -1,
+                    "generation-bool": True,
+                    "generation-string": "0",
+                    "generation-float": 0.0,
+                }[failure]
+            else:
+                item[
+                    {
+                        "generation-not-started": "started",
+                        "generation-closing": "closing",
+                        "generation-cleaned": "cleanup_complete",
+                    }[failure]
+                ] = failure != "generation-not-started"
         return httpx.Response(
             500 if failure == "http500" else 200,
             content=b"not-json" if failure == "bad-json" else json.dumps(payload).encode(),

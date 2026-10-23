@@ -3236,6 +3236,7 @@ async def test_thread_inventory_http_contract_and_late_guards(monkeypatch, case)
                             "started": True,
                             "closing": False,
                             "cleanup_complete": False,
+                            "transport_generation": None,
                         }
                     ],
                     "ambiguous_context_ids": [],
@@ -3321,6 +3322,7 @@ async def test_resident_inventory_http_reads_owner_and_preserves_detached_unknow
                         "started": family == "claude-sdk",
                         "closing": False,
                         "cleanup_complete": family == "codex",
+                        "transport_generation": None,
                     }
                 ],
                 "ambiguous_context_ids": [],

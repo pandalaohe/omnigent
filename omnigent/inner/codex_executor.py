@@ -5891,6 +5891,9 @@ class CodexExecutor(Executor):
                     started=app._started,
                     closing=closing or app._closing,
                     cleanup_complete=app.cleaned,
+                    transport_generation=app.resident_connection_generation
+                    if not closing
+                    else None,
                 )
             )
             for attempt, thread_id in app._resident_maintenance.items():

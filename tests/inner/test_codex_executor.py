@@ -775,6 +775,9 @@ async def test_sdk_executor_thread_inventory_collects_registered_owners(
     )
     if apps:
         assert result.inventory.owners[0].session_keys == ("alias", "main")
+        assert tuple(o.transport_generation for o in result.inventory.owners) == (
+            (0, 0, None) if case == "maintenance" else (0, 0)
+        )
         assert all(len(app._proc.stdin.writes) == 1 for app in apps)
 
 
@@ -956,12 +959,40 @@ async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owner
         assert owner._proc.stdin.writes == []
         response = await client.get("/v1/sessions/conversation/resident-thread-inventory")
     assert response.status_code == 200
+    assert response.json()["inventory"]["owners"][0]["transport_generation"] == 0
     assert response.json() == {
         "inventory": legacy.json()["inventory"],
         "thread_ids": [[] if empty else ["main", "sub"]],
     }
     assert len(owner._proc.stdin.writes) == 1
     factory.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["none", "closing", "unbound", "restart", "maintenance"])
+async def test_sdk_resident_inventory_copies_only_established_generation(
+    sdk_inventory_owners, change
+):
+    executor, add = sdk_inventory_owners
+    app = add("main", ["main"])
+    executor._session_states["alias"] = _CodexSessionState(app_session=app)
+    if change == "closing":
+        executor._session_states["alias"].closing = True
+    elif change == "unbound":
+        app._resident_established_connection = None
+    elif change == "restart":
+        app._resident_connection_generation = 7
+        _, proc, stdin, reader, loop = app._resident_established_connection
+        app._resident_established_connection = (7, proc, stdin, reader, loop)
+    elif change == "maintenance":
+        app._resident_maintenance["maintenance"] = "side"
+    snapshot = executor.resident_inventory()
+    assert snapshot.owners[0].session_keys == ("alias", "main")
+    expected = None if change in {"closing", "unbound"} else 7 if change == "restart" else 0
+    assert snapshot.owners[0].transport_generation == expected
+    if change == "maintenance":
+        assert snapshot.owners[1].transport_generation is None
+    assert not snapshot.aliases_complete and not snapshot.context_coverage_complete
+    assert app._proc.stdin.writes == [] and app._resident_inventory_frame_limit is None
 
 
 class TestCodexExecutor(unittest.TestCase):
@@ -9309,6 +9340,7 @@ def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monke
                 "started": True,
                 "closing": False,
                 "cleanup_complete": False,
+                "transport_generation": None,
             },
             {
                 "incarnation_id": "2" * 32,
@@ -9317,6 +9349,7 @@ def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monke
                 "started": True,
                 "closing": True,
                 "cleanup_complete": False,
+                "transport_generation": None,
             },
             {
                 "incarnation_id": "3" * 32,
@@ -9325,6 +9358,7 @@ def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monke
                 "started": True,
                 "closing": False,
                 "cleanup_complete": False,
+                "transport_generation": None,
             },
         ),
         "ambiguous_context_ids": ("thread-main",),

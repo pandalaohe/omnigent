@@ -594,8 +594,10 @@ async def harness_inventory_reader(monkeypatch, tmp_path):
         yield manager, add, client, requests
 
 
+@pytest.mark.parametrize("generation", [None, 0, 7])
 async def test_runner_owner_inventory_composes_registered_harness_contexts(
     harness_inventory_reader,
+    generation,
 ):
     manager, add, client, requests = harness_inventory_reader
     entry, _owner = await add(
@@ -603,7 +605,13 @@ async def test_runner_owner_inventory_composes_registered_harness_contexts(
         ExecutorResidentInventory(
             owners=(
                 ExecutorResidentOwner(
-                    "context-one", ("main", "ui"), "thread-one", True, True, False
+                    "context-one",
+                    ("main", "ui"),
+                    "thread-one",
+                    True,
+                    generation is None,
+                    False,
+                    transport_generation=generation,
                 ),
             )
         ),
@@ -632,8 +640,9 @@ async def test_runner_owner_inventory_composes_registered_harness_contexts(
                             "session_keys": ["main", "ui"],
                             "vendor_context_id": "thread-one",
                             "started": True,
-                            "closing": True,
+                            "closing": generation is None,
                             "cleanup_complete": False,
+                            "transport_generation": generation,
                         }
                     ],
                     "ambiguous_context_ids": [],

@@ -647,7 +647,7 @@ def classify_tool_result(
 
 @dataclass(frozen=True)
 class ExecutorResidentOwner:
-    """Registered execution owner evidence, not a normalized resident count."""
+    """Registered owner evidence; sampled transport epochs are not vendor work revisions."""
 
     incarnation_id: str
     session_keys: tuple[str, ...]
@@ -655,6 +655,7 @@ class ExecutorResidentOwner:
     started: bool
     closing: bool
     cleanup_complete: bool
+    transport_generation: int | None = None
 
 
 @dataclass(frozen=True)

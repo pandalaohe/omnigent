@@ -1421,6 +1421,16 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "empty-ambiguity",
         "duplicate-ambiguity",
         "duplicate-session-keys",
+        "generation-zero",
+        "generation-later",
+        "generation-missing",
+        "generation-negative",
+        "generation-bool",
+        "generation-string",
+        "generation-float",
+        "generation-not-started",
+        "generation-closing",
+        "generation-cleaned",
         "native-valid",
         "native-overlapping-aliases",
         "native-duplicate-sessions",
@@ -1493,6 +1503,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 "started": True,
                 "closing": False,
                 "cleanup_complete": False,
+                "transport_generation": None,
             }
         ],
         "ambiguous_context_ids": [],
@@ -1516,6 +1527,33 @@ def test_runner_context_inventory_strict_wire_decode(case):
     }
     payload["native_thread_ids"] = None
     payload["harness_thread_ids"] = None
+    if case.startswith("generation-"):
+        item = contexts["owners"][0]
+        item["transport_generation"] = 0
+        if case == "generation-later":
+            item["transport_generation"] = 7
+        elif case == "generation-missing":
+            item.pop("transport_generation")
+        elif case in {
+            "generation-negative",
+            "generation-bool",
+            "generation-string",
+            "generation-float",
+        }:
+            item["transport_generation"] = {
+                "generation-negative": -1,
+                "generation-bool": True,
+                "generation-string": "0",
+                "generation-float": 0.0,
+            }[case]
+        elif case in {"generation-not-started", "generation-closing", "generation-cleaned"}:
+            item[
+                {
+                    "generation-not-started": "started",
+                    "generation-closing": "closing",
+                    "generation-cleaned": "cleanup_complete",
+                }[case]
+            ] = case != "generation-not-started"
     if case.startswith("sdk-"):
         payload["harness_thread_ids"] = [[["main", "side"]]]
         if case == "sdk-empty":
@@ -1652,6 +1690,8 @@ def test_runner_context_inventory_strict_wire_decode(case):
     result = _decode_runner_context_inventory(payload)
     if case not in {
         "valid",
+        "generation-zero",
+        "generation-later",
         "empty",
         "unknown",
         "ambiguous",
@@ -1689,6 +1729,10 @@ def test_runner_context_inventory_strict_wire_decode(case):
             assert read.inventory.aliases_complete is False
         else:
             assert read.inventory.owners[0].session_keys == ("main", "ui")
+        if case in {"generation-zero", "generation-later"}:
+            assert read.inventory.owners[0].transport_generation == (
+                0 if case == "generation-zero" else 7
+            )
         if case == "native-valid":
             assert result.native_backends.owners[0].session_ids == ("native-main", "native-ui")
         elif case == "native-overlapping-aliases":

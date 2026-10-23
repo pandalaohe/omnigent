@@ -153,6 +153,15 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                             not o.session_keys
                             or not all(o.session_keys)
                             or len(set(o.session_keys)) != len(o.session_keys)
+                            or (
+                                o.transport_generation is not None
+                                and (
+                                    o.transport_generation < 0
+                                    or not o.started
+                                    or o.closing
+                                    or o.cleanup_complete
+                                )
+                            )
                             for o in inventory.owners
                         )
                     ):

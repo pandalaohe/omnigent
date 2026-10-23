@@ -886,6 +886,15 @@ class HarnessProcessManager:
                     or not item.session_keys
                     or not all(item.session_keys)
                     or len(set(item.session_keys)) != len(item.session_keys)
+                    or (
+                        item.transport_generation is not None
+                        and (
+                            item.transport_generation < 0
+                            or not item.started
+                            or item.closing
+                            or item.cleanup_complete
+                        )
+                    )
                     for item in inventory.owners
                 )
             ):
