@@ -847,7 +847,22 @@ async def sdk_inventory_owners():
         await asyncio.gather(*readers, return_exceptions=True)
 
 
-@pytest.mark.parametrize("case", ["union", "empty", "collision", "maintenance", "unsupported"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "union",
+        "empty",
+        "collision",
+        "maintenance",
+        "unsupported",
+        "revision-none",
+        "revision-bool",
+        "revision-string",
+        "revision-float",
+        "revision-negative",
+        "revision-later",
+    ],
+)
 async def test_sdk_executor_thread_inventory_collects_registered_owners(
     sdk_inventory_owners, case
 ):
@@ -863,6 +878,16 @@ async def test_sdk_executor_thread_inventory_collects_registered_owners(
             main._resident_maintenance["maintenance"] = "sub"
         elif case == "unsupported":
             executor._session_states["foreign"] = _CodexSessionState(app_session=object())
+        elif case.startswith("revision-"):
+            main._resident_thread_started_revision = {
+                "revision-none": None,
+                "revision-bool": False,
+                "revision-string": "0",
+                "revision-float": 0.0,
+                "revision-negative": -1,
+                "revision-later": 7,
+            }[case]
+            main.read_loaded_thread_ids = AsyncMock(return_value=("main", "sub"))
     reconcile = await executor.prepare_resident_thread_inventory(timeout_s=0.1)
     result = reconcile()
     if case in {"collision", "unsupported"}:
@@ -871,20 +896,21 @@ async def test_sdk_executor_thread_inventory_collects_registered_owners(
         return
     assert result.inventory == executor.resident_inventory()
     assert not result.inventory.aliases_complete and not result.inventory.context_coverage_complete
-    assert (
-        result.thread_ids
-        == {
-            "union": (("main", "sub"), ()),
-            "empty": (),
-            "maintenance": (("main", "sub"), (), None),
-        }[case]
-    )
+    assert result.thread_ids == {
+        "union": (("main", "sub"), ()),
+        "empty": (),
+        "maintenance": (("main", "sub"), (), None),
+    }.get(case, (("main", "sub") if case == "revision-later" else None, ()))
     if apps:
         assert result.inventory.owners[0].session_keys == ("alias", "main")
         assert tuple(o.transport_generation for o in result.inventory.owners) == (
             (0, 0, None) if case == "maintenance" else (0, 0)
         )
-        assert all(len(app._proc.stdin.writes) == 1 for app in apps)
+        if case.startswith("revision-"):
+            main.read_loaded_thread_ids.assert_awaited_once_with(timeout_s=0.1)
+            assert not main._proc.stdin.writes and len(side._proc.stdin.writes) == 1
+        else:
+            assert all(len(app._proc.stdin.writes) == 1 for app in apps)
 
 
 @pytest.mark.parametrize(
@@ -904,6 +930,12 @@ async def test_sdk_executor_thread_inventory_collects_registered_owners(
         "alias",
         "thread",
         "collision",
+        "observation",
+        "observation-none",
+        "observation-bool",
+        "observation-string",
+        "observation-float",
+        "observation-negative",
     ],
 )
 async def test_sdk_executor_thread_inventory_reconciles_after_later_awaits(
@@ -943,6 +975,18 @@ async def test_sdk_executor_thread_inventory_reconciles_after_later_awaits(
         first.thread_id = "new-thread"
     elif change == "collision":
         second._resident_incarnation_id = first.resident_incarnation_id
+    elif change == "observation":
+        event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+        first._proc.stdout.feed(event)
+        assert await asyncio.wait_for(first._events.get(), 1) == event
+    elif change.startswith("observation-"):
+        first._resident_thread_started_revision = {
+            "observation-none": None,
+            "observation-bool": False,
+            "observation-string": "0",
+            "observation-float": 0.0,
+            "observation-negative": -1,
+        }[change]
     await asyncio.sleep(0)
     after = reconcile()
     assert before.thread_ids == (("first",), ("second",))
@@ -1010,10 +1054,8 @@ async def test_sdk_executor_thread_inventory_bounds_reads_and_preserves_unknowns
         await asyncio.gather(read, return_exceptions=True)
 
 
-@pytest.mark.parametrize("replace_transport", [False, True])
-async def test_sdk_thread_inventory_through_existing_adapter(
-    sdk_inventory_owners, replace_transport
-):
+@pytest.mark.parametrize("change", ["none", "transport", "observation"])
+async def test_sdk_thread_inventory_through_existing_adapter(sdk_inventory_owners, change):
     from unittest.mock import Mock
 
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -1029,8 +1071,13 @@ async def test_sdk_thread_inventory_through_existing_adapter(
     assert initial.thread_ids == (("main", "sub"),)
     assert not initial.inventory.aliases_complete
     assert not initial.inventory.context_coverage_complete
-    if replace_transport:
-        app._proc.stdin = _FakePipe()
+    if change != "none":
+        if change == "transport":
+            app._proc.stdin = _FakePipe()
+        else:
+            event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+            app._proc.stdout.feed(event)
+            assert await asyncio.wait_for(app._events.get(), 1) == event
         await asyncio.sleep(0)
         assert reconcile().thread_ids == (None,)
     else:
@@ -1039,8 +1086,8 @@ async def test_sdk_thread_inventory_through_existing_adapter(
     factory.assert_not_called()
 
 
-@pytest.mark.parametrize("empty", [False, True])
-async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owners, empty):
+@pytest.mark.parametrize("case", ["loaded", "empty", "observation"])
+async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owners, case):
     from unittest.mock import Mock
 
     import httpx
@@ -1048,10 +1095,21 @@ async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owner
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
     executor, add = sdk_inventory_owners
-    owner = add("main", [] if empty else ["main", "sub"])
+    owner = add("main", [] if case == "empty" else ["main", "sub"])
     factory = Mock(side_effect=AssertionError("must not construct executor"))
     adapter = ExecutorAdapter(factory)
     adapter._executor = executor
+    if case == "observation":
+        prepare = adapter.prepare_resident_thread_inventory
+
+        async def after_read(*, timeout_s):
+            reconcile = await prepare(timeout_s=timeout_s)
+            event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+            owner._proc.stdout.feed(event)
+            assert await asyncio.wait_for(owner._events.get(), 1) == event
+            return reconcile
+
+        adapter.prepare_resident_thread_inventory = after_read
     app = adapter.build()
     app.state.conversation_id = "conversation"
     app.state.harness_auth_token = "test-auth"
@@ -1068,7 +1126,9 @@ async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owner
     assert response.json()["inventory"]["owners"][0]["transport_generation"] == 0
     assert response.json() == {
         "inventory": legacy.json()["inventory"],
-        "thread_ids": [[] if empty else ["main", "sub"]],
+        "thread_ids": [
+            None if case == "observation" else [] if case == "empty" else ["main", "sub"]
+        ],
     }
     assert len(owner._proc.stdin.writes) == 1
     factory.assert_not_called()

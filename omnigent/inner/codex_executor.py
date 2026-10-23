@@ -5994,7 +5994,7 @@ class CodexExecutor(Executor):
                 for key in owner.session_keys
             )
 
-        reads: dict[str, tuple[str, ...]] = {}
+        reads: dict[str, tuple[tuple[str, ...], int]] = {}
         pending = iter(candidates.values())
 
         async def read_owners() -> None:
@@ -6005,7 +6005,9 @@ class CodexExecutor(Executor):
                     continue
                 ids = await app.read_loaded_thread_ids(timeout_s=timeout_s)
                 if ids is not None:
-                    reads[owner.incarnation_id] = ids
+                    revision = app.resident_thread_observation_revision
+                    if type(revision) is int and revision >= 0:
+                        reads[owner.incarnation_id] = (ids, revision)
 
         if 0 < timeout_s <= 5.0:
             try:
@@ -6019,11 +6021,15 @@ class CodexExecutor(Executor):
             inventory = self.resident_inventory()
             ids = (
                 tuple(
-                    reads.get(owner.incarnation_id)
+                    read[0]
                     if (
                         (candidate := candidates.get(owner.incarnation_id)) is not None
                         and candidate[0] == owner
                         and current(candidate)
+                        and (read := reads.get(owner.incarnation_id)) is not None
+                        and type(revision := candidate[1].resident_thread_observation_revision)
+                        is int
+                        and revision == read[1]
                     )
                     else None
                     for owner in inventory.owners
