@@ -253,6 +253,7 @@ def native_thread_inventory(monkeypatch):
         )
         client = SimpleNamespace(
             resident_connection_generation=3,
+            resident_thread_observation_revision=0,
             read_loaded_thread_ids=AsyncMock(return_value=ids),
             connect=Mock(side_effect=AssertionError("read must not connect")),
             close=Mock(side_effect=AssertionError("read must not close")),
@@ -268,7 +269,23 @@ def native_thread_inventory(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "state", ["loaded", "empty", "unknown", "unretained", "closing", "exited", "unsupported"]
+    "state",
+    [
+        "loaded",
+        "empty",
+        "unknown",
+        "unretained",
+        "closing",
+        "exited",
+        "unsupported",
+        "revision-none",
+        "revision-bool",
+        "revision-string",
+        "revision-float",
+        "revision-negative",
+        "revision-missing",
+        "revision-later",
+    ],
 )
 async def test_native_thread_inventory_preserves_owner_evidence(native_thread_inventory, state):
     backend, client = native_thread_inventory(
@@ -277,6 +294,17 @@ async def test_native_thread_inventory_preserves_owner_evidence(native_thread_in
         bind=state != "unretained",
     )
     orchestration._AUTO_CODEX_APP_SERVERS["ui"] = backend
+    if state == "revision-missing":
+        del client.resident_thread_observation_revision
+    elif state.startswith("revision-"):
+        client.resident_thread_observation_revision = {
+            "revision-none": None,
+            "revision-bool": False,
+            "revision-string": "0",
+            "revision-float": 0.0,
+            "revision-negative": -1,
+            "revision-later": 7,
+        }[state]
     if state == "closing":
         orchestration._CLOSING_NATIVE_BACKENDS[object()] = orchestration._ClosingNativeBackend(
             "backend-main", "main", "codex-native", backend
@@ -288,11 +316,15 @@ async def test_native_thread_inventory_preserves_owner_evidence(native_thread_in
         orchestration._AUTO_OPENCODE_SERVERS["main"] = backend
     result = await orchestration.read_native_backend_thread_inventory()
     assert result.thread_ids == (
-        ("thread-one",) if state == "loaded" else () if state == "empty" else None,
+        ("thread-one",)
+        if state in {"loaded", "revision-later"}
+        else ()
+        if state == "empty"
+        else None,
     )
     assert result.inventory == orchestration.native_backend_resident_inventory()
     assert not result.context_coverage_complete and not result.inventory.aliases_complete
-    if state in {"loaded", "empty", "unknown"}:
+    if state in {"loaded", "empty", "unknown"} or state.startswith("revision-"):
         client.read_loaded_thread_ids.assert_awaited_once_with(timeout_s=5.0)
         assert result.inventory.owners[0].session_ids == ("main", "ui")
     else:
@@ -311,6 +343,13 @@ async def test_native_thread_inventory_preserves_owner_evidence(native_thread_in
         "client",
         "backend",
         "generation",
+        "observation",
+        "observation-bool",
+        "observation-none",
+        "observation-string",
+        "observation-float",
+        "observation-negative",
+        "observation-missing",
         "incarnation",
         "alias",
         "closing",
@@ -344,6 +383,17 @@ async def test_native_thread_inventory_reconciles_after_later_owner_waits(
             )
         elif change == "generation":
             client.resident_connection_generation = 4
+        elif change == "observation-missing":
+            del client.resident_thread_observation_revision
+        elif change.startswith("observation"):
+            client.resident_thread_observation_revision = {
+                "observation": 1,
+                "observation-bool": False,
+                "observation-none": None,
+                "observation-string": "0",
+                "observation-float": 0.0,
+                "observation-negative": -1,
+            }[change]
         elif change == "incarnation":
             first.resident_incarnation_id = "restarted-first"
         elif change == "alias":
@@ -977,7 +1027,7 @@ async def test_runner_inventory_transports_native_threads_after_auth(
 
 
 @pytest.mark.parametrize(
-    "change", ["none", "rebind", "backend", "generation", "incarnation", "closing"]
+    "change", ["none", "rebind", "backend", "generation", "incarnation", "closing", "observation"]
 )
 async def test_runner_inventory_rechecks_native_after_harness_reconciliation_wait(
     harness_inventory_reader, native_thread_inventory, monkeypatch, change
@@ -1008,6 +1058,8 @@ async def test_runner_inventory_rechecks_native_after_harness_reconciliation_wai
             )
         elif change == "generation":
             native.resident_connection_generation = 4
+        elif change == "observation":
+            native.resident_thread_observation_revision = 1
         elif change == "incarnation":
             backend.resident_incarnation_id = "restarted-native"
         elif change == "closing":

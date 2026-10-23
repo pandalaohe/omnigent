@@ -591,7 +591,7 @@ async def prepare_native_backend_thread_inventory(
         for owner in selected.owners
         if (binding := binding_for(owner)) is not None
     }
-    reads: dict[str, tuple[str, ...]] = {}
+    reads: dict[str, tuple[tuple[str, ...], int]] = {}
     pending = iter(candidates.values())
 
     async def read_owners() -> None:
@@ -606,7 +606,9 @@ async def prepare_native_backend_thread_inventory(
             except (ConnectionError, RuntimeError, TimeoutError):
                 continue
             if ids is not None:
-                reads[owner.incarnation_id] = ids
+                revision = getattr(binding.client, "resident_thread_observation_revision", None)
+                if type(revision) is int and revision >= 0:
+                    reads[owner.incarnation_id] = (ids, revision)
 
     if 0 < timeout_s <= 5.0:
         try:
@@ -619,11 +621,19 @@ async def prepare_native_backend_thread_inventory(
     def reconcile() -> NativeBackendThreadInventorySnapshot:
         current = native_backend_resident_inventory()
         thread_ids = tuple(
-            reads.get(owner.incarnation_id)
+            read[0]
             if (
                 (candidate := candidates.get(owner.incarnation_id)) is not None
                 and candidate[0] == owner
                 and binding_for(owner) is candidate[1]
+                and (read := reads.get(owner.incarnation_id)) is not None
+                and type(
+                    revision := getattr(
+                        candidate[1].client, "resident_thread_observation_revision", None
+                    )
+                )
+                is int
+                and revision == read[1]
             )
             else None
             for owner in current.owners
