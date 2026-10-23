@@ -3144,6 +3144,7 @@ class _CodexAppServerSession:
         self._reader_task: asyncio.Task[None] | None = None
         self._resident_connection_generation = 0
         self._resident_established_connection: _ResidentStdioConnection | None = None
+        self._resident_thread_started_revision: int | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._worker_census_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
@@ -3241,6 +3242,7 @@ class _CodexAppServerSession:
         self._resident_connection_generation += 1
         generation = self._resident_connection_generation
         self._resident_established_connection = None
+        self._resident_thread_started_revision = None
         cleanup_task = self._cleanup_task
         if cleanup_task is not None and not cleanup_task.done():
             await asyncio.shield(cleanup_task)
@@ -3547,6 +3549,7 @@ class _CodexAppServerSession:
     async def close(self) -> None:
         self._resident_connection_generation += 1
         self._resident_established_connection = None
+        self._resident_thread_started_revision = None
         self._closing = True
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
@@ -3582,6 +3585,7 @@ class _CodexAppServerSession:
 
     async def _close_same_loop(self) -> None:
         self._resident_established_connection = None
+        self._resident_thread_started_revision = None
         self._closing = True
         self._cleaned = False
         cleanup_complete = True
@@ -3748,6 +3752,7 @@ class _CodexAppServerSession:
     def _close_cross_loop(self) -> None:
         """Synchronous safety path used after the owning loop changed/died."""
         self._resident_established_connection = None
+        self._resident_thread_started_revision = None
         self._closing = True
         self._close_worker_liveness()
         proc = self._proc
@@ -4961,6 +4966,15 @@ class _CodexAppServerSession:
         connection = self._current_resident_connection()
         return connection[0] if connection is not None else None
 
+    @property
+    def resident_thread_observation_revision(self) -> int | None:
+        """Locally observed thread additions after inventory starts, not vendor freshness."""
+        return (
+            self._resident_thread_started_revision
+            if self._current_resident_connection() is not None
+            else None
+        )
+
     def _resident_transport_guard(self) -> Callable[[], bool]:
         """Capture this initialized stdio pair for reads and later reconciliation."""
         generation = self.resident_connection_generation
@@ -4982,14 +4996,21 @@ class _CodexAppServerSession:
 
     async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
         """Read only an existing initialized stdio owner; never start or repair it."""
-        current = self._resident_transport_guard()
+        transport_current = self._resident_transport_guard()
         reader = self._reader_task
 
         async def request(method: str, params: CodexParams) -> CodexMessage:
             return await self._request(method, params, transport_guard=current)
 
-        if reader is None or not 0 < timeout_s <= 5.0 or not current():
+        if reader is None or not 0 < timeout_s <= 5.0 or not transport_current():
             return None
+        if self._resident_thread_started_revision is None:
+            self._resident_thread_started_revision = 0
+        revision = self.resident_thread_observation_revision
+
+        def current() -> bool:
+            return transport_current() and self.resident_thread_observation_revision == revision
+
         # Keep the bound after timeout: the shared stdout reader may still hold
         # an unfinished reply. This owner now shares native's frame budget.
         self._resident_inventory_frame_limit = _SDK_INVENTORY_FRAME_LIMIT_BYTES
@@ -5273,10 +5294,11 @@ class _CodexAppServerSession:
                     self._keep_warm_retired.pop(next(iter(self._keep_warm_retired)))
 
     async def _reader_loop(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
+        proc = self._proc
+        assert proc is not None and proc.stdout is not None
         try:
             async for line in self._iter_stream_lines(
-                self._proc.stdout,
+                proc.stdout,
                 frame_limit=lambda: self._resident_inventory_frame_limit,
                 buffer=self._stdout_frame_buffer,
             ):
@@ -5286,6 +5308,15 @@ class _CodexAppServerSession:
                 message = json.loads(raw)
                 if not isinstance(message, dict):
                     raise ValueError("Codex app-server frame is not an object")
+                if (
+                    self._resident_thread_started_revision is not None
+                    and message.get("method") == "thread/started"
+                    and "id" not in message
+                    and (connection := self._current_resident_connection()) is not None
+                    and connection[1] is proc
+                    and connection[3] is asyncio.current_task()
+                ):
+                    self._resident_thread_started_revision += 1
                 from omnigent.usage_export.runtime import (
                     capture_codex_home,
                     capture_enabled,

@@ -374,6 +374,8 @@ async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
             assert len(requests) == 10
         session.start.assert_not_called()
         session.close.assert_not_called()
+        if case in no_rpc:
+            assert session._resident_thread_started_revision is None
     finally:
         session._closing = True
         for task in [reader, *extra_readers, *([read] if read is not None else [])]:
@@ -383,7 +385,7 @@ async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
         )
 
 
-@pytest.mark.parametrize("change", ["process", "stdin", "closing", "timeout"])
+@pytest.mark.parametrize("change", ["process", "stdin", "closing", "timeout", "observation"])
 async def test_sdk_loaded_thread_inventory_rechecks_after_stdin_lock_wait(change):
     session = _CodexAppServerSession(
         codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
@@ -409,6 +411,8 @@ async def test_sdk_loaded_thread_inventory_rechecks_after_stdin_lock_wait(change
             target = proc.stdin
         elif change == "closing":
             session._closing = True
+        elif change == "observation":
+            session._resident_thread_started_revision += 1
         if change != "timeout":
             session._stdin_lock.release()
         assert await asyncio.wait_for(read, 2) is None
@@ -445,6 +449,95 @@ async def sdk_inventory_stream(monkeypatch):
         session._closing = True
         reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "started-loaded",
+        "started-empty",
+        "started-page-two",
+        "earlier-started",
+        "unrelated",
+        "server-request",
+        "stale-reader",
+        "maintenance-started",
+    ],
+)
+async def test_sdk_loaded_thread_inventory_observes_new_threads(sdk_inventory_stream, case):
+    session, proc, reader = sdk_inventory_stream
+    previous_proc, previous_reader = proc, reader
+    if case == "stale-reader":
+        proc = _FakeProcess()
+        proc.stdout = _QueuedStdoutPipe()
+        session._proc = proc
+        session._reader_task = reader = asyncio.create_task(session._reader_loop())
+        session._resident_connection_generation = 1
+        session._resident_established_connection = (1, proc, proc.stdin, reader, session._loop)
+        await asyncio.sleep(0)
+    session.start = AsyncMock(side_effect=AssertionError("read must not start"))
+    session.close = AsyncMock(side_effect=AssertionError("read must not close"))
+    requests = []
+    resample = False
+    maintenance = asyncio.Queue()
+    if case == "maintenance-started":
+        session._keep_warm_queues["new"] = maintenance
+
+    async def notify(event, stdout=None):
+        (stdout if stdout is not None else proc.stdout).feed(event)
+        queue = maintenance if case == "maintenance-started" else session._events
+        assert await asyncio.wait_for(queue.get(), 1) == event
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        assert message["method"] == "thread/list/loaded"
+        requests.append(message)
+        index = len(requests)
+        if (
+            not resample
+            and case != "earlier-started"
+            and index == (2 if case == "started-page-two" else 1)
+        ):
+            event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+            if case == "unrelated":
+                event["method"] = "turn/completed"
+            elif case == "server-request":
+                event["id"] = 99
+            elif case == "maintenance-started":
+                event["params"]["thread"].update(
+                    ephemeral=True, threadSource="omnigent-keep-warm", forkedFromId="main"
+                )
+            await notify(event, previous_proc.stdout if case == "stale-reader" else None)
+        data = [] if case == "started-empty" else ["main"] if index == 1 else ["side"]
+        if resample or case == "earlier-started":
+            data = ["main", "new"]
+        cursor = "second" if not resample and case == "started-page-two" and index == 1 else None
+        proc.stdout.feed({"id": message["id"], "result": {"data": data, "nextCursor": cursor}})
+
+    proc.stdin.drain = respond
+    try:
+        assert session.resident_thread_observation_revision is None
+        if case == "earlier-started":
+            await notify({"method": "thread/started", "params": {"thread": {"id": "new"}}})
+            assert session.resident_thread_observation_revision is None
+        result = await session.read_loaded_thread_ids(timeout_s=1)
+        changed = case.startswith("started-") or case == "maintenance-started"
+        if changed:
+            assert result is None
+            resample = True
+            assert await session.read_loaded_thread_ids(timeout_s=1) == ("main", "new")
+        else:
+            assert result == (("main", "new") if case == "earlier-started" else ("main",))
+        assert session.resident_thread_observation_revision == (1 if changed else 0)
+        assert not reader.done() and session._pending_requests == {}
+        assert session._events.empty() and session._transport_error is None
+        session.start.assert_not_called()
+        session.close.assert_not_called()
+    finally:
+        if reader is not previous_reader:
+            session._closing = True
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
 
 
 @pytest.mark.parametrize("when", ["during-read", "after-timeout", "terminated-frame"])
@@ -501,6 +594,8 @@ async def test_sdk_inventory_frame_overflow_stops_reader(sdk_inventory_stream, w
 async def test_sdk_resident_connection_generation_is_read_only(sdk_inventory_stream, change):
     session, proc, reader = sdk_inventory_stream
     assert session.resident_connection_generation == 0
+    assert session.resident_thread_observation_revision is None
+    session._resident_thread_started_revision = 3
     guard = session._resident_transport_guard()
     if change == "unbound":
         session._resident_established_connection = None
@@ -529,6 +624,9 @@ async def test_sdk_resident_connection_generation_is_read_only(sdk_inventory_str
     elif change == "rebind":
         session._resident_established_connection = (*session._resident_established_connection,)
     assert session.resident_connection_generation == (0 if change in {"none", "rebind"} else None)
+    assert session.resident_thread_observation_revision == (
+        3 if change in {"none", "rebind"} else None
+    )
     assert guard() is (change == "none")
     assert session._pending_requests == {} and not proc.stdin.writes
     assert session._resident_inventory_frame_limit is None
@@ -557,6 +655,8 @@ async def test_sdk_resident_generation_follows_initialized_transport(monkeypatch
 
     async def initialize(method, _params):
         assert method == "initialize"
+        assert session._resident_thread_started_revision is None
+        assert session.resident_thread_observation_revision is None
         entered.set()
         await resume.wait()
         if end == "failure":
@@ -565,6 +665,7 @@ async def test_sdk_resident_generation_follows_initialized_transport(monkeypatch
 
     session._request = AsyncMock(side_effect=initialize)
     assert session.resident_connection_generation is None
+    session._resident_thread_started_revision = 7
     start = asyncio.create_task(session.start())
     try:
         await asyncio.wait_for(entered.wait(), 2)
@@ -590,11 +691,15 @@ async def test_sdk_resident_generation_follows_initialized_transport(monkeypatch
             assert isinstance(generation, int)
             guard = session._resident_transport_guard()
             assert guard()
+            assert session.resident_thread_observation_revision is None
+            session._resident_thread_started_revision = 3
             await session.start()
             assert session.resident_connection_generation == generation
+            assert session.resident_thread_observation_revision == 3
             assert len(processes) == 1
             await session.close()
             assert session.resident_connection_generation is None and not guard()
+            assert session._resident_thread_started_revision is None
             entered.clear()
             resume.clear()
             start = asyncio.create_task(session.start())
@@ -614,6 +719,7 @@ async def test_sdk_resident_generation_follows_initialized_transport(monkeypatch
         await asyncio.gather(start, return_exceptions=True)
         await session.close()
         assert session._resident_established_connection is None
+        assert session._resident_thread_started_revision is None
 
 
 @pytest.mark.parametrize("inventory", [False, True])
