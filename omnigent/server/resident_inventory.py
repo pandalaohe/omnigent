@@ -181,8 +181,13 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                     return None
                 if any(
                     ids is not None
-                    and (len(ids) > 1000 or not all(ids) or len(set(ids)) != len(ids))
-                    for ids in thread_ids
+                    and (
+                        owner.transport_generation is None
+                        or len(ids) > 1000
+                        or not all(ids)
+                        or len(set(ids)) != len(ids)
+                    )
+                    for owner, ids in zip(read.inventory.owners, thread_ids, strict=True)
                 ):
                     return None
         return snapshot

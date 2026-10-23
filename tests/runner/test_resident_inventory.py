@@ -669,14 +669,27 @@ async def test_runner_owner_inventory_auth_precedes_harness_reads(harness_invent
 
 
 @pytest.mark.parametrize("ids", [("main", "side"), (), None, (" main ", "main")])
-async def test_runner_inventory_transports_sdk_threads_after_auth(harness_inventory_reader, ids):
+@pytest.mark.parametrize("generation", [None, 0, 7])
+async def test_runner_inventory_transports_sdk_threads_after_auth(
+    harness_inventory_reader, ids, generation
+):
     from omnigent.inner.executor import ExecutorThreadInventorySnapshot
 
     manager, add, client, requests = harness_inventory_reader
     entry, owner = await add(
         "one",
         ExecutorResidentInventory(
-            (ExecutorResidentOwner("context-one", ("main", "ui"), "main", True, False, False),)
+            (
+                ExecutorResidentOwner(
+                    "context-one",
+                    ("main", "ui"),
+                    "main",
+                    True,
+                    False,
+                    False,
+                    transport_generation=generation,
+                ),
+            )
         ),
     )
     snapshot = ExecutorThreadInventorySnapshot(owner.inventory, (ids,))
@@ -687,11 +700,13 @@ async def test_runner_inventory_transports_sdk_threads_after_auth(harness_invent
     assert requests == []
     client.headers["Authorization"] = "Bearer runner-auth"
     body = (await client.get("/v1/startup/owner-inventory?read_id=sdk")).json()
-    assert body["harness_thread_ids"] == [[list(ids) if ids is not None else None]]
-    assert body["harnesses"]["contexts"][0]["inventory"]["owners"][0]["session_keys"] == [
-        "main",
-        "ui",
-    ]
+    if generation is None and ids is not None:
+        assert body["harness_thread_ids"] == body["harnesses"]["contexts"] == [None]
+    else:
+        assert body["harness_thread_ids"] == [[list(ids) if ids is not None else None]]
+        observed = body["harnesses"]["contexts"][0]["inventory"]["owners"][0]
+        assert observed["session_keys"] == ["main", "ui"]
+        assert observed["transport_generation"] == generation
     assert body["executor_contexts_complete"] is body["external_owners_complete"] is False
     owner.prepare_resident_thread_inventory.assert_awaited_once_with(timeout_s=5.0)
     assert requests == [("one", "/v1/sessions/one/resident-thread-inventory")]
@@ -1020,7 +1035,11 @@ async def test_runner_inventory_rechecks_harness_after_native_wait(
     entry, owner = await add(
         "harness",
         ExecutorResidentInventory(
-            (ExecutorResidentOwner("sdk-one", ("main",), "sdk", True, False, False),)
+            (
+                ExecutorResidentOwner(
+                    "sdk-one", ("main",), "sdk", True, False, False, transport_generation=0
+                ),
+            )
         ),
     )
     snapshot = ExecutorThreadInventorySnapshot(owner.inventory, (("sdk",),))

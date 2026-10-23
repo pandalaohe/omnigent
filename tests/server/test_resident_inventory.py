@@ -1172,6 +1172,9 @@ async def test_host_context_inventory_preserves_contexts_and_aliases(
             await response.aread()
             payload = response.json()
             payload["harness_thread_ids"] = [harness_threads]
+            contexts = payload["harnesses"]["contexts"][0]["inventory"]["owners"]
+            for owner, generation in zip(contexts, (0, 7), strict=True):
+                owner["transport_generation"] = generation
             response._content = json.dumps(payload).encode()
 
         host_context_reader[-2].event_hooks["response"].append(include_harness)
@@ -1289,7 +1292,16 @@ async def test_host_context_inventory_rechecks_early_runner(
 
 
 @pytest.mark.parametrize(
-    "reason", ["unsupported", "closing", "pending", "host-only", "server-only", "bad-read-id"]
+    "reason",
+    [
+        "unsupported",
+        "closing",
+        "pending",
+        "host-only",
+        "server-only",
+        "bad-read-id",
+        "unbound-sdk-thread",
+    ],
 )
 async def test_host_context_inventory_preserves_unknown_members(host_context_reader, reason):
     control, conversations, _router, _initializer, tunnels, client, requests = host_context_reader
@@ -1312,14 +1324,19 @@ async def test_host_context_inventory_preserves_unknown_members(host_context_rea
 
             await response.aread()
             payload = response.json()
-            payload["read_id"] = "old-read"
+            if reason == "unbound-sdk-thread":
+                payload["harness_thread_ids"] = [[["thread-one"], None]]
+            else:
+                payload["read_id"] = "old-read"
             response._content = json.dumps(payload).encode()
 
         client.event_hooks["response"].append(corrupt)
     result = await _exchange_host_context_inventory(host_context_reader)
     assert result is not None
     assert len(result.runners) == 1 and result.runners[0].inventory is None
-    assert requests == (["/v1/startup/owner-inventory"] if reason == "bad-read-id" else [])
+    assert requests == (
+        ["/v1/startup/owner-inventory"] if reason in {"bad-read-id", "unbound-sdk-thread"} else []
+    )
 
 
 @pytest.mark.parametrize("change", ["host-owner", "binding", "account"])
@@ -1481,6 +1498,11 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "sdk-flat",
         "sdk-too-many",
         "sdk-missing-field",
+        "sdk-unbound-loaded",
+        "sdk-unbound-empty",
+        "sdk-unbound-mixed",
+        "sdk-unknown-unbound",
+        "sdk-mixed-generations",
     ],
 )
 def test_runner_context_inventory_strict_wire_decode(case):
@@ -1555,8 +1577,31 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 }[case]
             ] = case != "generation-not-started"
     if case.startswith("sdk-"):
+        contexts["owners"][0]["transport_generation"] = 0
         payload["harness_thread_ids"] = [[["main", "side"]]]
-        if case == "sdk-empty":
+        if case == "sdk-unbound-mixed":
+            contexts["owners"].append(
+                {**contexts["owners"][0], "incarnation_id": "side", "transport_generation": None}
+            )
+            payload["harness_thread_ids"] = [[None, ["side"]]]
+        elif case in {"sdk-unbound-loaded", "sdk-unbound-empty"}:
+            contexts["owners"][0]["transport_generation"] = None
+            if case == "sdk-unbound-empty":
+                payload["harness_thread_ids"] = [[[]]]
+        elif case in {"sdk-unknown-unbound", "sdk-mixed-generations"}:
+            contexts["owners"][0].update(closing=True, transport_generation=None)
+            payload["harness_thread_ids"] = [[None]]
+            if case == "sdk-mixed-generations":
+                contexts["owners"].append(
+                    {
+                        **contexts["owners"][0],
+                        "incarnation_id": "side",
+                        "closing": False,
+                        "transport_generation": 7,
+                    }
+                )
+                payload["harness_thread_ids"] = [[None, ["side"]]]
+        elif case == "sdk-empty":
             payload["harness_thread_ids"] = [[[]]]
         elif case == "sdk-unknown":
             payload["harness_thread_ids"] = [[None]]
@@ -1570,7 +1615,9 @@ def test_runner_context_inventory_strict_wire_decode(case):
         elif case == "sdk-literal":
             payload["harness_thread_ids"] = [[[" main ", "main"]]]
         elif case == "sdk-overlap":
-            contexts["owners"].append({**contexts["owners"][0], "incarnation_id": "second"})
+            contexts["owners"].append(
+                {**contexts["owners"][0], "incarnation_id": "second", "transport_generation": 7}
+            )
             payload["harness_thread_ids"] = [[["shared"], ["shared"]]]
         elif case == "sdk-max":
             payload["harness_thread_ids"] = [[[str(i) for i in range(1000)]]]
@@ -1710,6 +1757,8 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "sdk-literal",
         "sdk-overlap",
         "sdk-max",
+        "sdk-unknown-unbound",
+        "sdk-mixed-generations",
     }:
         assert result is None
     else:
@@ -1761,6 +1810,8 @@ def test_runner_context_inventory_strict_wire_decode(case):
                     "sdk-loaded": ((("main", "side"),),),
                     "sdk-empty": (((),),),
                     "sdk-unknown": ((None,),),
+                    "sdk-unknown-unbound": ((None,),),
+                    "sdk-mixed-generations": ((None, ("side",)),),
                     "sdk-empty-owner": ((),),
                     "sdk-literal": (((" main ", "main"),),),
                     "sdk-overlap": ((("shared",), ("shared",)),),

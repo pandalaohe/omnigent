@@ -908,11 +908,12 @@ class HarnessProcessManager:
                     or any(
                         ids is not None
                         and (
-                            len(ids) > _MAX_RESIDENT_THREAD_IDS
+                            item.transport_generation is None
+                            or len(ids) > _MAX_RESIDENT_THREAD_IDS
                             or not all(ids)
                             or len(set(ids)) != len(ids)
                         )
-                        for ids in thread_ids
+                        for item, ids in zip(inventory.owners, thread_ids, strict=True)
                     )
                 ):
                     return lambda: None

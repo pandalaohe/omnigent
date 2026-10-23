@@ -3085,6 +3085,8 @@ async def _read_selected_inventory(manager, selected, threads, *, timeout_s=5.0)
         "max",
         "generation-zero",
         "generation-later",
+        "unknown-unbound",
+        "mixed-generations",
     ],
 )
 async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_reader, case):
@@ -3094,6 +3096,10 @@ async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_
     from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
 
     manager, entry, owner, _app, requests = resident_reader
+    owner.inventory = replace(
+        owner.inventory,
+        owners=(replace(owner.inventory.owners[0], closing=False, transport_generation=0),),
+    )
     ids = (("thread-a", "side"),)
     if case == "owner-empty":
         ids = ((),)
@@ -3104,6 +3110,16 @@ async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_
         ids = (None,)
     elif case == "unsupported":
         ids = None
+    elif case in {"unknown-unbound", "mixed-generations"}:
+        first = replace(owner.inventory.owners[0], closing=True, transport_generation=None)
+        owners = (first,)
+        ids = (None,)
+        if case == "mixed-generations":
+            owners += (
+                replace(first, incarnation_id="context-b", closing=False, transport_generation=7),
+            )
+            ids += (("side",),)
+        owner.inventory = replace(owner.inventory, owners=owners)
     elif case == "literal":
         ids = ((" thread-a ", "thread-a"),)
         first = owner.inventory.owners[0]
@@ -3195,6 +3211,9 @@ async def test_prepare_resident_thread_inventory_rechecks_after_later_await(
         "redirect",
         "null-root",
         "unknown-owner",
+        "unbound-loaded",
+        "unbound-empty",
+        "unbound-mixed",
     ],
 )
 async def test_prepare_resident_thread_inventory_invalid_ids_are_unknown(resident_reader, failure):
@@ -3204,6 +3223,17 @@ async def test_prepare_resident_thread_inventory_invalid_ids_are_unknown(residen
     manager, entry, owner, _app, _requests = resident_reader
     selected = (await manager.resident_inventory()).owners[0]
     payload = {"inventory": asdict(owner.inventory), "thread_ids": [["thread-a"]]}
+    item = payload["inventory"]["owners"][0]
+    item.update(closing=False, transport_generation=0)
+    if failure == "unbound-mixed":
+        payload["inventory"]["owners"] += (
+            {**item, "incarnation_id": "side", "transport_generation": None},
+        )
+        payload["thread_ids"] = [None, ["side"]]
+    elif failure in {"unbound-loaded", "unbound-empty"}:
+        item["transport_generation"] = None
+        if failure == "unbound-empty":
+            payload["thread_ids"] = [[]]
     if failure == "legacy-shape":
         payload.pop("thread_ids")
     elif failure == "extra-top":
@@ -3212,7 +3242,13 @@ async def test_prepare_resident_thread_inventory_invalid_ids_are_unknown(residen
         payload = None
     elif failure == "unknown-owner":
         payload = {"inventory": None, "thread_ids": None}
-    elif failure not in {"http404", "redirect"}:
+    elif failure not in {
+        "http404",
+        "redirect",
+        "unbound-loaded",
+        "unbound-empty",
+        "unbound-mixed",
+    }:
         payload["thread_ids"] = {
             "alignment": [],
             "flat": ["thread-a"],
