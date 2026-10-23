@@ -3085,6 +3085,15 @@ def _is_rejected_peer_steer(error: _CodexRPCResponseError, expected_turn_id: str
     )
 
 
+_ResidentStdioConnection = tuple[
+    int,
+    asyncio.subprocess.Process,
+    asyncio.StreamWriter,
+    asyncio.Task[None],
+    asyncio.AbstractEventLoop,
+]
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -3133,6 +3142,8 @@ class _CodexAppServerSession:
         self._proc: asyncio.subprocess.Process | None = None
         self._agent_pid: int | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._resident_connection_generation = 0
+        self._resident_established_connection: _ResidentStdioConnection | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._worker_census_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
@@ -3227,6 +3238,9 @@ class _CodexAppServerSession:
     async def _start_unchecked(self) -> None:
         if self._started:
             return
+        self._resident_connection_generation += 1
+        generation = self._resident_connection_generation
+        self._resident_established_connection = None
         cleanup_task = self._cleanup_task
         if cleanup_task is not None and not cleanup_task.done():
             await asyncio.shield(cleanup_task)
@@ -3237,7 +3251,7 @@ class _CodexAppServerSession:
         self._reader_completed_turn = None
         self._events = asyncio.Queue()
         self._cleaned = False
-        self._loop = asyncio.get_running_loop()
+        self._loop = loop = asyncio.get_running_loop()
         if self._signer_factory is not None:
             signer = self._signer_factory()
             self._signer = signer
@@ -3458,7 +3472,8 @@ class _CodexAppServerSession:
             finally:
                 if liveness_read_fd is not None:
                     os.close(liveness_read_fd)
-            self._reader_task = asyncio.create_task(self._reader_loop())
+            self._reader_task = reader = asyncio.create_task(self._reader_loop())
+            stdin = proc.stdin
             self._stderr_task = asyncio.create_task(self._stderr_loop())
             self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
             initialized = await self._request(
@@ -3490,6 +3505,15 @@ class _CodexAppServerSession:
             ) >= (0, 142, 0)
             self._containment_confirmed = self._worker_launch.sandboxed
             self._started = True
+            if (
+                self._resident_connection_generation == generation
+                and self._proc is proc
+                and self._reader_task is reader
+                and proc.stdin is stdin
+                and stdin is not None
+                and self._loop is loop
+            ):
+                self._resident_established_connection = (generation, proc, stdin, reader, loop)
             if self._signer is None and not codex_minimal_config_requested():
                 from omnigent.harnesses.codex_native.app_server import inherit_codex_hook_approvals
 
@@ -3521,6 +3545,8 @@ class _CodexAppServerSession:
             raise
 
     async def close(self) -> None:
+        self._resident_connection_generation += 1
+        self._resident_established_connection = None
         self._closing = True
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
@@ -3555,6 +3581,7 @@ class _CodexAppServerSession:
         return self._cleaned
 
     async def _close_same_loop(self) -> None:
+        self._resident_established_connection = None
         self._closing = True
         self._cleaned = False
         cleanup_complete = True
@@ -3720,6 +3747,7 @@ class _CodexAppServerSession:
 
     def _close_cross_loop(self) -> None:
         """Synchronous safety path used after the owning loop changed/died."""
+        self._resident_established_connection = None
         self._closing = True
         self._close_worker_liveness()
         proc = self._proc
@@ -4905,28 +4933,49 @@ class _CodexAppServerSession:
         except Exception as exc:  # noqa: BLE001 — tool errors are surfaced to Codex via the JSON response envelope
             return {"error": str(exc)}
 
+    def _current_resident_connection(self) -> _ResidentStdioConnection | None:
+        connection = self._resident_established_connection
+        if connection is None:
+            return None
+        generation, proc, stdin, reader, loop = connection
+        if (
+            self._resident_connection_generation != generation
+            or self._proc is not proc
+            or self._reader_task is not reader
+            or proc.stdin is not stdin
+            or self._loop is not loop
+            or not self._started
+            or self._closing
+            or self._cleaned
+            or self._transport_error is not None
+            or proc.returncode is not None
+            or reader.done()
+            or reader.cancelling()
+        ):
+            return None
+        return connection
+
+    @property
+    def resident_connection_generation(self) -> int | None:
+        """Current initialized stdio identity; no vendor state is probed."""
+        connection = self._current_resident_connection()
+        return connection[0] if connection is not None else None
+
     def _resident_transport_guard(self) -> Callable[[], bool]:
         """Capture this initialized stdio pair for reads and later reconciliation."""
-        proc, reader, incarnation = self._proc, self._reader_task, self.resident_incarnation_id
-        if proc is None or reader is None or proc.stdin is None:
+        generation = self.resident_connection_generation
+        connection = self._resident_established_connection
+        if generation is None or connection is None:
             return lambda: False
-        stdin = proc.stdin
+        incarnation = self.resident_incarnation_id
         loop = asyncio.get_running_loop()
 
         def current() -> bool:
             return (
-                self._proc is proc
-                and self._reader_task is reader
-                and proc.stdin is stdin
+                self.resident_connection_generation == generation
+                and self._resident_established_connection is connection
                 and self.resident_incarnation_id == incarnation
                 and self._loop is loop
-                and self._started
-                and not self._closing
-                and not self._cleaned
-                and self._transport_error is None
-                and proc.returncode is None
-                and not reader.done()
-                and not reader.cancelling()
             )
 
         return current

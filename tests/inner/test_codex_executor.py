@@ -234,6 +234,9 @@ class _FakeProcess:
         "replace-stdin",
         "replace-reader",
         "incarnation",
+        "unbound-pair",
+        "generation",
+        "rebound-pair",
         "close-during-read",
         "invalid-timeout",
     ],
@@ -251,6 +254,8 @@ async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
     session._cleaned = False
     reader = asyncio.create_task(session._reader_loop())
     session._reader_task = reader
+    session._resident_connection_generation = 0
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
     await asyncio.sleep(0)
     session.start = AsyncMock(side_effect=AssertionError("must not start"))
     session.close = AsyncMock(side_effect=AssertionError("must not close"))
@@ -291,6 +296,10 @@ async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
             session._reader_task = extra
         elif case == "incarnation":
             session._resident_incarnation_id = "restarted-owner"
+        elif case == "generation":
+            session._resident_connection_generation += 1
+        elif case == "rebound-pair":
+            session._resident_established_connection = (*session._resident_established_connection,)
         elif case == "close-during-read":
             session._closing = True
         reply = {"id": message["id"], "result": {"data": data, "nextCursor": cursor}}
@@ -312,6 +321,7 @@ async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
         "transport-error",
         "wrong-loop",
         "invalid-timeout",
+        "unbound-pair",
     }
     if case == "not-started":
         session._started = False
@@ -332,6 +342,8 @@ async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
         session._transport_error = HarnessTransportClosedError("transport lost")
     elif case == "wrong-loop":
         session._loop = None
+    elif case == "unbound-pair":
+        session._resident_established_connection = None
     read = None
     try:
         read = asyncio.create_task(
@@ -382,6 +394,7 @@ async def test_sdk_loaded_thread_inventory_rechecks_after_stdin_lock_wait(change
     session._started, session._cleaned = True, False
     reader = asyncio.create_task(asyncio.Event().wait())
     session._reader_task = reader
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
     await session._stdin_lock.acquire()
     read = asyncio.create_task(session.read_loaded_thread_ids(timeout_s=0.1))
     try:
@@ -424,6 +437,7 @@ async def sdk_inventory_stream(monkeypatch):
     session._started, session._cleaned = True, False
     reader = asyncio.create_task(session._reader_loop())
     session._reader_task = reader
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
     await asyncio.sleep(0)
     try:
         yield session, proc, reader
@@ -465,6 +479,143 @@ async def test_sdk_inventory_frame_overflow_stops_reader(sdk_inventory_stream, w
     assert proc.stdout._frames.qsize() == 1
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        "none",
+        "unbound",
+        "generation",
+        "process",
+        "stdin",
+        "reader",
+        "cancel-reader",
+        "cleaned",
+        "not-started",
+        "closing",
+        "exit",
+        "error",
+        "loop",
+        "rebind",
+    ],
+)
+async def test_sdk_resident_connection_generation_is_read_only(sdk_inventory_stream, change):
+    session, proc, reader = sdk_inventory_stream
+    assert session.resident_connection_generation == 0
+    guard = session._resident_transport_guard()
+    if change == "unbound":
+        session._resident_established_connection = None
+    elif change == "generation":
+        session._resident_connection_generation += 1
+    elif change == "process":
+        session._proc = _FakeProcess()
+    elif change == "stdin":
+        proc.stdin = _FakePipe()
+    elif change == "reader":
+        session._reader_task = None
+    elif change == "cancel-reader":
+        reader.cancel()
+    elif change == "cleaned":
+        session._cleaned = True
+    elif change == "not-started":
+        session._started = False
+    elif change == "closing":
+        session._closing = True
+    elif change == "exit":
+        proc.returncode = 0
+    elif change == "error":
+        session._transport_error = HarnessTransportClosedError("transport lost")
+    elif change == "loop":
+        session._loop = None
+    elif change == "rebind":
+        session._resident_established_connection = (*session._resident_established_connection,)
+    assert session.resident_connection_generation == (0 if change in {"none", "rebind"} else None)
+    assert guard() is (change == "none")
+    assert session._pending_requests == {} and not proc.stdin.writes
+    assert session._resident_inventory_frame_limit is None
+
+
+@pytest.mark.parametrize("end", ["complete", "failure", "cancel", "stale", "stdin"])
+async def test_sdk_resident_generation_follows_initialized_transport(monkeypatch, tmp_path, end):
+    import omnigent.inner.codex_executor as module
+
+    monkeypatch.setattr(module, "_codex_home_config_source_from_env", lambda: tmp_path / "empty")
+    monkeypatch.setattr(module, "codex_minimal_config_requested", lambda: True)
+    monkeypatch.setattr(module._proc, "native_server_pid", lambda *_args: None)
+    entered, resume = asyncio.Event(), asyncio.Event()
+    processes = []
+
+    async def spawn(*_args, **_kwargs):
+        proc = _FakeProcess()
+        proc.stdout = _ScriptedStdoutPipe([])
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(module, "_create_subprocess_exec", AsyncMock(side_effect=spawn))
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd=str(tmp_path), env={}, tool_executor=None
+    )
+
+    async def initialize(method, _params):
+        assert method == "initialize"
+        entered.set()
+        await resume.wait()
+        if end == "failure":
+            raise RuntimeError("initialize failed")
+        return {"result": {}}
+
+    session._request = AsyncMock(side_effect=initialize)
+    assert session.resident_connection_generation is None
+    start = asyncio.create_task(session.start())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert session.resident_connection_generation is None
+        assert not session._resident_transport_guard()()
+        if end == "cancel":
+            start.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await start
+        else:
+            if end == "stale":
+                session._resident_connection_generation += 1
+            elif end == "stdin":
+                processes[0].stdin = _FakePipe()
+            resume.set()
+            if end == "failure":
+                with pytest.raises(RuntimeError, match="initialize failed"):
+                    await start
+            else:
+                await start
+        if end == "complete":
+            generation = session.resident_connection_generation
+            assert isinstance(generation, int)
+            guard = session._resident_transport_guard()
+            assert guard()
+            await session.start()
+            assert session.resident_connection_generation == generation
+            assert len(processes) == 1
+            await session.close()
+            assert session.resident_connection_generation is None and not guard()
+            entered.clear()
+            resume.clear()
+            start = asyncio.create_task(session.start())
+            await asyncio.wait_for(entered.wait(), 2)
+            assert session.resident_connection_generation is None
+            resume.set()
+            await start
+            assert session.resident_connection_generation > generation
+            assert not guard() and len(processes) == 2
+        else:
+            assert session.resident_connection_generation is None
+            assert session._resident_established_connection is None
+        assert all(not proc.stdin.writes for proc in processes)
+    finally:
+        resume.set()
+        start.cancel()
+        await asyncio.gather(start, return_exceptions=True)
+        await session.close()
+        assert session._resident_established_connection is None
+
+
 @pytest.mark.parametrize("inventory", [False, True])
 async def test_sdk_inventory_frame_budget_preserves_other_frames(sdk_inventory_stream, inventory):
     session, proc, reader = sdk_inventory_stream
@@ -499,6 +650,7 @@ async def test_sdk_inventory_frame_cap_checks_stalled_partial_frame(sdk_inventor
     proc.stdout = stream
     reader = asyncio.create_task(session._reader_loop())
     session._reader_task = reader
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
     try:
         stream.feed_data(b"x" * 8237)
         await asyncio.sleep(0)
@@ -520,7 +672,7 @@ async def test_sdk_inventory_frame_cap_checks_stalled_partial_frame(sdk_inventor
 
 
 async def test_sdk_inventory_normalizes_real_subprocess_stdin_eio(sdk_inventory_stream):
-    session, proc, _reader = sdk_inventory_stream
+    session, proc, reader = sdk_inventory_stream
     loop = asyncio.get_running_loop()
     protocol = asyncio.subprocess.SubprocessStreamProtocol(limit=65536, loop=loop)
     original_stdin = proc.stdin
@@ -532,6 +684,7 @@ async def test_sdk_inventory_normalizes_real_subprocess_stdin_eio(sdk_inventory_
     )
     stdin = asyncio.StreamWriter(transport, protocol, None, loop)
     proc.stdin = stdin
+    session._resident_established_connection = (0, proc, stdin, reader, loop)
     protocol.pause_writing()
     read = asyncio.create_task(session.read_loaded_thread_ids())
     try:
@@ -562,6 +715,7 @@ async def sdk_inventory_owners():
         app._loop = asyncio.get_running_loop()
         app._started, app._cleaned = True, False
         app._reader_task = reader = asyncio.create_task(app._reader_loop())
+        app._resident_established_connection = (0, proc, proc.stdin, reader, app._loop)
         apps.append(app)
         readers.append(reader)
         executor._session_states[key] = _CodexSessionState(app_session=app)
