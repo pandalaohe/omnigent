@@ -54,6 +54,7 @@ async def test_owner_reader_preserves_missing_registry_and_incomplete_aliases(
             "executor_contexts_complete": False,
             "external_owners_complete": False,
             "native_thread_ids": [],
+            "harness_thread_ids": None,
         }
 
 
@@ -644,7 +645,7 @@ async def test_runner_owner_inventory_composes_registered_harness_contexts(
     }
     assert response.json()["executor_contexts_complete"] is False
     assert response.json()["external_owners_complete"] is False
-    assert requests == [("one", "/v1/sessions/one/resident-inventory")]
+    assert requests == [("one", "/v1/sessions/one/resident-thread-inventory")]
     assert entry.last_used_at == 0.0
     assert manager._retention_managed == {"one": 0.0}
     assert manager._entries["one"] is entry
@@ -658,8 +659,39 @@ async def test_runner_owner_inventory_auth_precedes_harness_reads(harness_invent
     assert requests == []
 
 
+@pytest.mark.parametrize("ids", [("main", "side"), (), None, (" main ", "main")])
+async def test_runner_inventory_transports_sdk_threads_after_auth(harness_inventory_reader, ids):
+    from omnigent.inner.executor import ExecutorThreadInventorySnapshot
+
+    manager, add, client, requests = harness_inventory_reader
+    entry, owner = await add(
+        "one",
+        ExecutorResidentInventory(
+            (ExecutorResidentOwner("context-one", ("main", "ui"), "main", True, False, False),)
+        ),
+    )
+    snapshot = ExecutorThreadInventorySnapshot(owner.inventory, (ids,))
+    owner.prepare_resident_thread_inventory = AsyncMock(return_value=lambda: snapshot)
+    client.headers.clear()
+    assert (await client.get("/v1/startup/owner-inventory?read_id=sdk")).status_code == 401
+    owner.prepare_resident_thread_inventory.assert_not_called()
+    assert requests == []
+    client.headers["Authorization"] = "Bearer runner-auth"
+    body = (await client.get("/v1/startup/owner-inventory?read_id=sdk")).json()
+    assert body["harness_thread_ids"] == [[list(ids) if ids is not None else None]]
+    assert body["harnesses"]["contexts"][0]["inventory"]["owners"][0]["session_keys"] == [
+        "main",
+        "ui",
+    ]
+    assert body["executor_contexts_complete"] is body["external_owners_complete"] is False
+    owner.prepare_resident_thread_inventory.assert_awaited_once_with(timeout_s=5.0)
+    assert requests == [("one", "/v1/sessions/one/resident-thread-inventory")]
+    assert manager._retention_managed == {"one": 0.0} and entry.last_used_at == 0.0
+
+
 @pytest.mark.parametrize(
-    "state", ["empty-manager", "spawning", "empty-owner", "unsupported", "failed", "closing"]
+    "state",
+    ["empty-manager", "spawning", "empty-owner", "unsupported", "failed", "closing", "legacy"],
 )
 async def test_runner_owner_inventory_keeps_unknown_distinct_from_empty(
     harness_inventory_reader, monkeypatch, state
@@ -677,6 +709,12 @@ async def test_runner_owner_inventory_keeps_unknown_distinct_from_empty(
         if state == "closing":
             manager._entries.pop("one")
             manager._closing_entries[entry.incarnation_id] = ("one", entry)
+        elif state == "legacy":
+
+            async def old_harness(response):
+                response.status_code = 404
+
+            entry.client.event_hooks["response"].append(old_harness)
     response = await client.get("/v1/startup/owner-inventory?read_id=unknown")
     assert response.status_code == 200
     body = response.json()
@@ -700,6 +738,9 @@ async def test_runner_owner_inventory_keeps_unknown_distinct_from_empty(
         assert body["harnesses"]["owners"][0]["closing"] is (state == "closing")
     if state in {"closing", "empty-manager", "spawning"}:
         assert requests == []
+    else:
+        assert requests == [("one", "/v1/sessions/one/resident-thread-inventory")]
+    assert body["harness_thread_ids"] == ([] if state in {"empty-manager", "spawning"} else [None])
 
 
 @pytest.mark.parametrize(
@@ -712,12 +753,12 @@ async def test_runner_owner_inventory_reconciles_earlier_read_after_later_owner_
     first, _ = await add("first", ExecutorResidentInventory(owners=()))
     second, _ = await add("second", ExecutorResidentInventory(owners=()))
     first_read, second_waiting, resume = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    original_read = manager.read_resident_inventory
+    original_read = manager.prepare_resident_thread_inventory
 
     async def observed_read(owner, **kwargs):
         result = await original_read(owner, **kwargs)
         if owner.session_id == "first":
-            assert result is not None
+            assert result() is not None
             first_read.set()
         return result
 
@@ -725,7 +766,7 @@ async def test_runner_owner_inventory_reconciles_earlier_read_after_later_owner_
         second_waiting.set()
         await asyncio.wait_for(resume.wait(), timeout=2)
 
-    monkeypatch.setattr(manager, "read_resident_inventory", observed_read)
+    monkeypatch.setattr(manager, "prepare_resident_thread_inventory", observed_read)
     second.client.event_hooks["response"].append(wait_for_second)
     read = asyncio.create_task(client.get("/v1/startup/owner-inventory?read_id=race"))
     release = None
@@ -864,16 +905,16 @@ async def test_runner_owner_inventory_deadline_includes_registry_waits(
         await manager._registry_lock.acquire()
         locked.set()
     else:
-        original_read = manager.read_resident_inventory
+        original_read = manager.prepare_resident_thread_inventory
 
         async def block_reconciliation(owner, **kwargs):
             result = await original_read(owner, **kwargs)
-            assert result is not None
+            assert result() is not None
             await manager._registry_lock.acquire()
             locked.set()
             return result
 
-        monkeypatch.setattr(manager, "read_resident_inventory", block_reconciliation)
+        monkeypatch.setattr(manager, "prepare_resident_thread_inventory", block_reconciliation)
     read = asyncio.create_task(client.get("/v1/startup/owner-inventory?read_id=registry-wait"))
     try:
         await asyncio.wait_for(locked.wait(), timeout=2)
@@ -881,7 +922,7 @@ async def test_runner_owner_inventory_deadline_includes_registry_waits(
         assert response.status_code == 200
         assert response.json()["harnesses"] is None
         assert requests == (
-            [] if phase == "selection" else [("one", "/v1/sessions/one/resident-inventory")]
+            [] if phase == "selection" else [("one", "/v1/sessions/one/resident-thread-inventory")]
         )
     finally:
         if not read.done():
@@ -959,12 +1000,22 @@ async def test_runner_inventory_rechecks_native_after_harness_reconciliation_wai
         await asyncio.gather(read, return_exceptions=True)
 
 
-@pytest.mark.parametrize("change", ["none", "generation", "teardown"])
+@pytest.mark.parametrize("change", ["none", "generation", "teardown", "client", "process"])
+@pytest.mark.parametrize("phase", ["native", "registry"])
 async def test_runner_inventory_rechecks_harness_after_native_wait(
-    harness_inventory_reader, native_thread_inventory, change
+    harness_inventory_reader, native_thread_inventory, monkeypatch, change, phase
 ):
+    from omnigent.inner.executor import ExecutorThreadInventorySnapshot
+
     manager, add, client, _ = harness_inventory_reader
-    entry, _ = await add("harness", ExecutorResidentInventory(owners=()))
+    entry, owner = await add(
+        "harness",
+        ExecutorResidentInventory(
+            (ExecutorResidentOwner("sdk-one", ("main",), "sdk", True, False, False),)
+        ),
+    )
+    snapshot = ExecutorThreadInventorySnapshot(owner.inventory, (("sdk",),))
+    owner.prepare_resident_thread_inventory = AsyncMock(return_value=lambda: snapshot)
     _, native = native_thread_inventory("native")
     entered, resume = asyncio.Event(), asyncio.Event()
 
@@ -973,7 +1024,18 @@ async def test_runner_inventory_rechecks_harness_after_native_wait(
         await resume.wait()
         return ("thread-one",)
 
-    native.read_loaded_thread_ids.side_effect = paused
+    if phase == "native":
+        native.read_loaded_thread_ids.side_effect = paused
+    else:
+        original = manager.resident_inventory
+
+        async def wait_for_registry(**kwargs):
+            if "context_reads" in kwargs:
+                entered.set()
+                await resume.wait()
+            return await original(**kwargs)
+
+        monkeypatch.setattr(manager, "resident_inventory", wait_for_registry)
     read = asyncio.create_task(client.get("/v1/startup/owner-inventory?read_id=late-harness"))
     try:
         await asyncio.wait_for(entered.wait(), 2)
@@ -981,11 +1043,16 @@ async def test_runner_inventory_rechecks_harness_after_native_wait(
             manager._release_generations["harness"] = 1
         elif change == "teardown":
             entry.teardown_started = True
+        elif change == "client":
+            entry.client = SimpleNamespace(is_closed=False)
+        elif change == "process":
+            entry.process = SimpleNamespace(returncode=None)
         resume.set()
         body = (await asyncio.wait_for(read, 2)).json()
         assert body["native_thread_ids"] == [["thread-one"]]
         context = body["harnesses"]["contexts"][0]
         assert (context is None) is (change != "none")
+        assert body["harness_thread_ids"] == ([[["sdk"]]] if change == "none" else [None])
     finally:
         resume.set()
         read.cancel()

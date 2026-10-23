@@ -149,6 +149,25 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                         )
                     ):
                         return None
+        harness_threads = snapshot.harness_thread_ids
+        if harness_threads is not None:
+            if (
+                harnesses is None
+                or harnesses.contexts is None
+                or len(harness_threads) != len(harnesses.owners)
+            ):
+                return None
+            for read, thread_ids in zip(harnesses.contexts, harness_threads, strict=True):
+                if thread_ids is None:
+                    continue
+                if read is None or len(thread_ids) != len(read.inventory.owners):
+                    return None
+                if any(
+                    ids is not None
+                    and (len(ids) > 1000 or not all(ids) or len(set(ids)) != len(ids))
+                    for ids in thread_ids
+                ):
+                    return None
         return snapshot
     except (ValueError, TypeError):
         return None

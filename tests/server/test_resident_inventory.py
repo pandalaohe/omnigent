@@ -1161,9 +1161,20 @@ async def _exchange_host_context_inventory(setup, **kwargs):
 
 
 @pytest.mark.parametrize("native_threads", [False, True])
+@pytest.mark.parametrize("harness_threads", [None, (("main", "side"), ()), (None, ("side",))])
 async def test_host_context_inventory_preserves_contexts_and_aliases(
-    host_context_reader, native_threads
+    host_context_reader, native_threads, harness_threads
 ):
+    if harness_threads is not None:
+        import json
+
+        async def include_harness(response):
+            await response.aread()
+            payload = response.json()
+            payload["harness_thread_ids"] = [harness_threads]
+            response._content = json.dumps(payload).encode()
+
+        host_context_reader[-2].event_hooks["response"].append(include_harness)
     if native_threads:
         import json
         from dataclasses import asdict
@@ -1199,6 +1210,9 @@ async def test_host_context_inventory_preserves_contexts_and_aliases(
         ("context-side", ("side",), "thread-side"),
     ]
     assert not result.aliases_complete and not result.context_coverage_complete
+    assert read.inventory.harness_thread_ids == (
+        (harness_threads,) if harness_threads is not None else None
+    )
     if native_threads:
         assert read.inventory.native_thread_ids == (("native-main", "native-side"),)
         assert read.inventory.native_backends.owners[0].session_ids == ("native-main", "native-ui")
@@ -1431,6 +1445,26 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "duplicate-context",
         "unaligned",
         "closing-harness",
+        "sdk-loaded",
+        "sdk-empty",
+        "sdk-unknown",
+        "sdk-empty-owner",
+        "sdk-empty-manager",
+        "sdk-literal",
+        "sdk-overlap",
+        "sdk-max",
+        "sdk-unaligned-harness",
+        "sdk-unaligned-owner",
+        "sdk-no-harness",
+        "sdk-no-contexts",
+        "sdk-unknown-context",
+        "sdk-duplicate",
+        "sdk-empty-id",
+        "sdk-int",
+        "sdk-bool",
+        "sdk-flat",
+        "sdk-too-many",
+        "sdk-missing-field",
     ],
 )
 def test_runner_context_inventory_strict_wire_decode(case):
@@ -1475,6 +1509,51 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "external_owners_complete": False,
     }
     payload["native_thread_ids"] = None
+    payload["harness_thread_ids"] = None
+    if case.startswith("sdk-"):
+        payload["harness_thread_ids"] = [[["main", "side"]]]
+        if case == "sdk-empty":
+            payload["harness_thread_ids"] = [[[]]]
+        elif case == "sdk-unknown":
+            payload["harness_thread_ids"] = [[None]]
+        elif case == "sdk-empty-owner":
+            contexts["owners"] = []
+            payload["harness_thread_ids"] = [[]]
+        elif case == "sdk-empty-manager":
+            payload["harnesses"]["owners"] = []
+            payload["harnesses"]["contexts"] = []
+            payload["harness_thread_ids"] = []
+        elif case == "sdk-literal":
+            payload["harness_thread_ids"] = [[[" main ", "main"]]]
+        elif case == "sdk-overlap":
+            contexts["owners"].append({**contexts["owners"][0], "incarnation_id": "second"})
+            payload["harness_thread_ids"] = [[["shared"], ["shared"]]]
+        elif case == "sdk-max":
+            payload["harness_thread_ids"] = [[[str(i) for i in range(1000)]]]
+        elif case == "sdk-unaligned-harness":
+            payload["harness_thread_ids"] = []
+        elif case == "sdk-unaligned-owner":
+            payload["harness_thread_ids"] = [[]]
+        elif case == "sdk-no-harness":
+            payload["harnesses"] = None
+        elif case == "sdk-no-contexts":
+            payload["harnesses"]["contexts"] = None
+        elif case == "sdk-unknown-context":
+            payload["harnesses"]["contexts"] = [None]
+        elif case == "sdk-duplicate":
+            payload["harness_thread_ids"] = [[["main", "main"]]]
+        elif case == "sdk-empty-id":
+            payload["harness_thread_ids"] = [[[""]]]
+        elif case == "sdk-int":
+            payload["harness_thread_ids"] = [[[1]]]
+        elif case == "sdk-bool":
+            payload["harness_thread_ids"] = [[[True]]]
+        elif case == "sdk-flat":
+            payload["harness_thread_ids"] = [["main"]]
+        elif case == "sdk-too-many":
+            payload["harness_thread_ids"] = [[[str(i) for i in range(1001)]]]
+        elif case == "sdk-missing-field":
+            payload.pop("harness_thread_ids")
     if case.startswith("native-"):
         payload["native_backends"]["owners"] = [
             {
@@ -1562,15 +1641,27 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "native-thread-loaded",
         "native-thread-empty",
         "native-thread-unknown",
+        "sdk-loaded",
+        "sdk-empty",
+        "sdk-unknown",
+        "sdk-empty-owner",
+        "sdk-empty-manager",
+        "sdk-literal",
+        "sdk-overlap",
+        "sdk-max",
     }:
         assert result is None
     else:
         assert result is not None
         assert result.external_owners_complete is False
+        if case == "sdk-empty-manager":
+            assert result.harness_thread_ids == ()
+            assert result.harnesses.owners == result.harnesses.contexts == ()
+            return
         read = result.harnesses.contexts[0]
         if case == "unknown":
             assert read is None
-        elif case == "empty":
+        elif case in {"empty", "sdk-empty-owner"}:
             assert read.inventory.owners == ()
         elif case == "ambiguous":
             assert read.inventory.ambiguous_context_ids == ("thread-one",)
@@ -1588,5 +1679,18 @@ def test_runner_context_inventory_strict_wire_decode(case):
                     "native-thread-loaded": (("main", "side"),),
                     "native-thread-empty": ((),),
                     "native-thread-unknown": (None,),
+                }[case]
+            )
+        if case.startswith("sdk-"):
+            assert (
+                result.harness_thread_ids
+                == {
+                    "sdk-loaded": ((("main", "side"),),),
+                    "sdk-empty": (((),),),
+                    "sdk-unknown": ((None,),),
+                    "sdk-empty-owner": ((),),
+                    "sdk-literal": (((" main ", "main"),),),
+                    "sdk-overlap": ((("shared",), ("shared",)),),
+                    "sdk-max": ((tuple(str(i) for i in range(1000)),),),
                 }[case]
             )
