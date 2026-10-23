@@ -876,9 +876,18 @@ class HarnessProcessManager:
             if inventory.aliases_complete or inventory.context_coverage_complete:
                 return lambda: None
             identities = {item.incarnation_id for item in inventory.owners}
-            if len(identities) != len(inventory.owners) or any(
-                not item.incarnation_id or not item.session_keys or not all(item.session_keys)
-                for item in inventory.owners
+            if (
+                len(identities) != len(inventory.owners)
+                or not all(inventory.ambiguous_context_ids)
+                or len(set(inventory.ambiguous_context_ids))
+                != len(inventory.ambiguous_context_ids)
+                or any(
+                    not item.incarnation_id
+                    or not item.session_keys
+                    or not all(item.session_keys)
+                    or len(set(item.session_keys)) != len(item.session_keys)
+                    for item in inventory.owners
+                )
             ):
                 return lambda: None
             if include_threads:

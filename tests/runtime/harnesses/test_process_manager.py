@@ -3095,6 +3095,12 @@ async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_
         ids = None
     elif case == "literal":
         ids = ((" thread-a ", "thread-a"),)
+        first = owner.inventory.owners[0]
+        owner.inventory = replace(
+            owner.inventory,
+            owners=(replace(first, session_keys=(" main ", "main")),),
+            ambiguous_context_ids=(" thread-a ", "thread-a"),
+        )
     elif case == "overlap":
         first = owner.inventory.owners[0]
         owner.inventory = replace(
@@ -3374,6 +3380,9 @@ async def test_read_resident_inventory_discards_late_response(
         "complete-aliases",
         "complete-contexts",
         "duplicate-owner",
+        "duplicate-session-keys",
+        "empty-ambiguity",
+        "duplicate-ambiguity",
         "http-error",
         "timeout",
     ],
@@ -3413,6 +3422,12 @@ async def test_read_resident_inventory_invalid_response_is_unknown(
             payload["inventory"]["context_coverage_complete"] = True
         elif failure == "duplicate-owner":
             payload["inventory"]["owners"] *= 2
+        elif failure == "duplicate-session-keys":
+            payload["inventory"]["owners"][0]["session_keys"] = ["main", "main"]
+        elif failure == "empty-ambiguity":
+            payload["inventory"]["ambiguous_context_ids"] = [""]
+        elif failure == "duplicate-ambiguity":
+            payload["inventory"]["ambiguous_context_ids"] = ["thread-a", "thread-a"]
         return httpx.Response(
             500 if failure == "http500" else 200,
             content=b"not-json" if failure == "bad-json" else json.dumps(payload).encode(),

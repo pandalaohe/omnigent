@@ -1417,7 +1417,13 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "empty",
         "unknown",
         "ambiguous",
+        "ambiguous-literals",
+        "empty-ambiguity",
+        "duplicate-ambiguity",
+        "duplicate-session-keys",
         "native-valid",
+        "native-overlapping-aliases",
+        "native-duplicate-sessions",
         "native-transport",
         "native-thread-loaded",
         "native-thread-empty",
@@ -1568,7 +1574,12 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 "transport_generation": None,
             }
         ]
-        if case == "native-empty-sessions":
+        if case == "native-overlapping-aliases":
+            first = payload["native_backends"]["owners"][0]
+            payload["native_backends"]["owners"].append({**first, "incarnation_id": "second"})
+        elif case == "native-duplicate-sessions":
+            payload["native_backends"]["owners"][0]["session_ids"] = ["native-main", "native-main"]
+        elif case == "native-empty-sessions":
             payload["native_backends"]["owners"][0]["session_ids"] = []
         elif case == "native-empty-session-id":
             payload["native_backends"]["owners"][0]["session_ids"] = ["native-main", ""]
@@ -1603,6 +1614,14 @@ def test_runner_context_inventory_strict_wire_decode(case):
         payload["harnesses"]["contexts"] = [None]
     elif case == "ambiguous":
         contexts["ambiguous_context_ids"] = ["thread-one"]
+    elif case == "ambiguous-literals":
+        contexts["ambiguous_context_ids"] = [" thread-one ", "thread-one"]
+    elif case == "empty-ambiguity":
+        contexts["ambiguous_context_ids"] = [""]
+    elif case == "duplicate-ambiguity":
+        contexts["ambiguous_context_ids"] = ["thread-one", "thread-one"]
+    elif case == "duplicate-session-keys":
+        contexts["owners"][0]["session_keys"] = ["main", "main"]
     elif case.startswith("harness-empty-session-id"):
         owner["session_id"] = ""
         payload["harnesses"]["contexts"][0]["owner"]["session_id"] = ""
@@ -1636,7 +1655,9 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "empty",
         "unknown",
         "ambiguous",
+        "ambiguous-literals",
         "native-valid",
+        "native-overlapping-aliases",
         "native-transport",
         "native-thread-loaded",
         "native-thread-empty",
@@ -1670,6 +1691,12 @@ def test_runner_context_inventory_strict_wire_decode(case):
             assert read.inventory.owners[0].session_keys == ("main", "ui")
         if case == "native-valid":
             assert result.native_backends.owners[0].session_ids == ("native-main", "native-ui")
+        elif case == "native-overlapping-aliases":
+            assert len(result.native_backends.owners) == 2
+            assert all(
+                owner.session_ids == ("native-main", "native-ui")
+                for owner in result.native_backends.owners
+            )
         elif case == "native-transport":
             assert result.native_backends.owners[0].transport_generation == 3
         elif case.startswith("native-thread-"):
@@ -1681,6 +1708,8 @@ def test_runner_context_inventory_strict_wire_decode(case):
                     "native-thread-unknown": (None,),
                 }[case]
             )
+        if case == "ambiguous-literals":
+            assert read.inventory.ambiguous_context_ids == (" thread-one ", "thread-one")
         if case.startswith("sdk-"):
             assert (
                 result.harness_thread_ids

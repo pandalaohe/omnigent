@@ -91,7 +91,9 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
             not all(native_ids)
             or len(set(native_ids)) != len(native_ids)
             or any(
-                not owner.session_ids or not all(owner.session_ids)
+                not owner.session_ids
+                or not all(owner.session_ids)
+                or len(set(owner.session_ids)) != len(owner.session_ids)
                 for owner in snapshot.native_backends.owners
             )
             or any(
@@ -142,10 +144,16 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                         or read.release_generation < 0
                         or inventory.aliases_complete
                         or inventory.context_coverage_complete
+                        or not all(inventory.ambiguous_context_ids)
+                        or len(set(inventory.ambiguous_context_ids))
+                        != len(inventory.ambiguous_context_ids)
                         or not all(ids)
                         or len(set(ids)) != len(ids)
                         or any(
-                            not o.session_keys or not all(o.session_keys) for o in inventory.owners
+                            not o.session_keys
+                            or not all(o.session_keys)
+                            or len(set(o.session_keys)) != len(o.session_keys)
+                            for o in inventory.owners
                         )
                     ):
                         return None
