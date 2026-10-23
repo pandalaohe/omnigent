@@ -31,6 +31,7 @@ import socket
 import sys
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -874,6 +875,17 @@ class HarnessProcessManager:
                 return lambda: None
             inventory = _RESIDENT_INVENTORY_DECODER.validate_json(json.dumps(raw), strict=True)
             if inventory.aliases_complete or inventory.context_coverage_complete:
+                return lambda: None
+            shared_context_ids = {
+                context_id
+                for context_id, count in Counter(
+                    item.vendor_context_id
+                    for item in inventory.owners
+                    if item.vendor_context_id is not None
+                ).items()
+                if count > 1
+            }
+            if not shared_context_ids.issubset(inventory.ambiguous_context_ids):
                 return lambda: None
             identities = {item.incarnation_id for item in inventory.owners}
             if (

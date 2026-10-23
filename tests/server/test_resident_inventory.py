@@ -1437,6 +1437,11 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "ambiguous-literals",
         "empty-ambiguity",
         "duplicate-ambiguity",
+        "missing-context-ambiguity",
+        "partial-context-ambiguity",
+        "literal-context-ambiguity",
+        "unknown-contexts",
+        "distinct-context-literals",
         "duplicate-session-keys",
         "generation-zero",
         "generation-later",
@@ -1584,6 +1589,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 {**contexts["owners"][0], "incarnation_id": "side", "transport_generation": None}
             )
             payload["harness_thread_ids"] = [[None, ["side"]]]
+            contexts["ambiguous_context_ids"] = ["thread-one"]
         elif case in {"sdk-unbound-loaded", "sdk-unbound-empty"}:
             contexts["owners"][0]["transport_generation"] = None
             if case == "sdk-unbound-empty":
@@ -1601,6 +1607,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
                     }
                 )
                 payload["harness_thread_ids"] = [[None, ["side"]]]
+                contexts["ambiguous_context_ids"] = ["thread-one"]
         elif case == "sdk-empty":
             payload["harness_thread_ids"] = [[[]]]
         elif case == "sdk-unknown":
@@ -1619,6 +1626,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 {**contexts["owners"][0], "incarnation_id": "second", "transport_generation": 7}
             )
             payload["harness_thread_ids"] = [[["shared"], ["shared"]]]
+            contexts["ambiguous_context_ids"] = ["thread-one"]
         elif case == "sdk-max":
             payload["harness_thread_ids"] = [[[str(i) for i in range(1000)]]]
         elif case == "sdk-unaligned-harness":
@@ -1705,6 +1713,28 @@ def test_runner_context_inventory_strict_wire_decode(case):
         contexts["ambiguous_context_ids"] = [""]
     elif case == "duplicate-ambiguity":
         contexts["ambiguous_context_ids"] = ["thread-one", "thread-one"]
+    elif case in {"unknown-contexts", "distinct-context-literals"}:
+        first = contexts["owners"][0]
+        first["vendor_context_id"] = None if case == "unknown-contexts" else " thread-one "
+        contexts["owners"].append(
+            {
+                **first,
+                "incarnation_id": "context-two",
+                "vendor_context_id": None if case == "unknown-contexts" else "thread-one",
+            }
+        )
+    elif case.endswith("context-ambiguity"):
+        first = contexts["owners"][0]
+        if case == "literal-context-ambiguity":
+            first["vendor_context_id"] = " thread-one "
+        contexts["owners"].append({**first, "incarnation_id": "context-two"})
+        if case != "missing-context-ambiguity":
+            contexts["ambiguous_context_ids"] = ["thread-one"]
+        if case == "partial-context-ambiguity":
+            contexts["owners"].extend(
+                {**first, "incarnation_id": key, "vendor_context_id": "thread-two"}
+                for key in ("context-three", "context-four")
+            )
     elif case == "duplicate-session-keys":
         contexts["owners"][0]["session_keys"] = ["main", "main"]
     elif case.startswith("harness-empty-session-id"):
@@ -1729,6 +1759,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
         payload["harnesses"]["contexts"] *= 2
     elif case == "duplicate-context":
         contexts["owners"] *= 2
+        contexts["ambiguous_context_ids"] = ["thread-one"]
     elif case == "unaligned":
         payload["harnesses"]["contexts"].append(None)
     elif case == "closing-harness":
@@ -1744,6 +1775,8 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "ambiguous",
         "ambiguous-literals",
         "native-valid",
+        "unknown-contexts",
+        "distinct-context-literals",
         "native-overlapping-aliases",
         "native-transport",
         "native-thread-loaded",

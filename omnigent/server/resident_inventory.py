@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -135,6 +136,17 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                     if read is None:
                         continue
                     inventory = read.inventory
+                    shared_context_ids = {
+                        context_id
+                        for context_id, count in Counter(
+                            item.vendor_context_id
+                            for item in inventory.owners
+                            if item.vendor_context_id is not None
+                        ).items()
+                        if count > 1
+                    }
+                    if not shared_context_ids.issubset(inventory.ambiguous_context_ids):
+                        return None
                     ids = [o.incarnation_id for o in inventory.owners]
                     if (
                         read.owner != owner

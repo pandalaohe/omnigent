@@ -3087,6 +3087,8 @@ async def _read_selected_inventory(manager, selected, threads, *, timeout_s=5.0)
         "generation-later",
         "unknown-unbound",
         "mixed-generations",
+        "unknown-contexts",
+        "distinct-context-literals",
     ],
 )
 async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_reader, case):
@@ -3119,7 +3121,27 @@ async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_
                 replace(first, incarnation_id="context-b", closing=False, transport_generation=7),
             )
             ids += (("side",),)
-        owner.inventory = replace(owner.inventory, owners=owners)
+        owner.inventory = replace(
+            owner.inventory,
+            owners=owners,
+            ambiguous_context_ids=("thread-a",) if len(owners) > 1 else (),
+        )
+    elif case in {"unknown-contexts", "distinct-context-literals"}:
+        first = owner.inventory.owners[0]
+        owner.inventory = replace(
+            owner.inventory,
+            owners=(
+                replace(
+                    first, vendor_context_id=None if case == "unknown-contexts" else " thread-a "
+                ),
+                replace(
+                    first,
+                    incarnation_id="context-b",
+                    vendor_context_id=None if case == "unknown-contexts" else "thread-a",
+                ),
+            ),
+        )
+        ids = (None, None)
     elif case == "literal":
         ids = ((" thread-a ", "thread-a"),)
         first = owner.inventory.owners[0]
@@ -3131,7 +3153,9 @@ async def test_prepare_resident_thread_inventory_uses_existing_channel(resident_
     elif case == "overlap":
         first = owner.inventory.owners[0]
         owner.inventory = replace(
-            owner.inventory, owners=(first, replace(first, incarnation_id="context-b"))
+            owner.inventory,
+            owners=(first, replace(first, incarnation_id="context-b")),
+            ambiguous_context_ids=("thread-a",),
         )
         ids = (("shared",), ("shared",))
     elif case == "max":
@@ -3230,6 +3254,7 @@ async def test_prepare_resident_thread_inventory_invalid_ids_are_unknown(residen
             {**item, "incarnation_id": "side", "transport_generation": None},
         )
         payload["thread_ids"] = [None, ["side"]]
+        payload["inventory"]["ambiguous_context_ids"] = ["thread-a"]
     elif failure in {"unbound-loaded", "unbound-empty"}:
         item["transport_generation"] = None
         if failure == "unbound-empty":
@@ -3442,6 +3467,9 @@ async def test_read_resident_inventory_discards_late_response(
         "duplicate-session-keys",
         "empty-ambiguity",
         "duplicate-ambiguity",
+        "missing-context-ambiguity",
+        "partial-context-ambiguity",
+        "literal-context-ambiguity",
         "generation-missing",
         "generation-negative",
         "generation-bool",
@@ -3489,12 +3517,26 @@ async def test_read_resident_inventory_invalid_response_is_unknown(
             payload["inventory"]["context_coverage_complete"] = True
         elif failure == "duplicate-owner":
             payload["inventory"]["owners"] *= 2
+            payload["inventory"]["ambiguous_context_ids"] = ["thread-a"]
         elif failure == "duplicate-session-keys":
             payload["inventory"]["owners"][0]["session_keys"] = ["main", "main"]
         elif failure == "empty-ambiguity":
             payload["inventory"]["ambiguous_context_ids"] = [""]
         elif failure == "duplicate-ambiguity":
             payload["inventory"]["ambiguous_context_ids"] = ["thread-a", "thread-a"]
+        elif failure.endswith("context-ambiguity"):
+            raw = payload["inventory"]
+            first = raw["owners"][0]
+            if failure == "literal-context-ambiguity":
+                first["vendor_context_id"] = " thread-a "
+            raw["owners"] += ({**first, "incarnation_id": "context-b"},)
+            if failure != "missing-context-ambiguity":
+                raw["ambiguous_context_ids"] = ["thread-a"]
+            if failure == "partial-context-ambiguity":
+                raw["owners"] += tuple(
+                    {**first, "incarnation_id": key, "vendor_context_id": "thread-b"}
+                    for key in ("context-c", "context-d")
+                )
         elif failure.startswith("generation-"):
             item = payload["inventory"]["owners"][0]
             item.update(closing=False, transport_generation=0)
