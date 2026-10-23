@@ -2871,6 +2871,16 @@ class SqlUsageEvent(OmnigentBase):
     # committed sequence under the hold and feed locks.
     host_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     harness: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    __table_args__ = (
+        Index(
+            "ix_usage_events_domain_sequence",
+            "workspace_id",
+            "owner_digest",
+            "host_id",
+            "harness",
+            "sequence",
+        ),
+    )
 
 
 class SqlUsageCutoverHold(OmnigentBase):
