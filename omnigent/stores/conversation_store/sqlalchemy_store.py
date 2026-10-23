@@ -1865,12 +1865,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             #   MySQL    → duplicate entry ... for key '...PRIMARY'
             #   SQLite   → "conversations.id" (dotted) in the failed-UNIQUE clause.
             msg = str(exc).lower()
+            driver_args = getattr(exc.orig, "args", ())
+            driver_code = driver_args[0] if driver_args else None
             is_id_unique_violation = conversation_id is not None and (
                 "pk_conversations" in msg
                 or "conversations_pkey" in msg
                 or (
+                    getattr(exc.orig, "sqlstate", None) == "23505"
+                    and getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+                    == "omnigent_conversation_metadata_pkey"
+                )
+                or (
                     "duplicate entry" in msg
-                    and ("for key 'primary'" in msg or "for key 'conversations.primary'" in msg)
+                    and (
+                        "for key 'primary'" in msg
+                        or "for key 'conversations.primary'" in msg
+                        or (
+                            driver_code == 1062
+                            and "for key 'omnigent_conversation_metadata.primary'" in msg
+                        )
+                    )
                 )
                 or ("unique" in msg and "conversations.id" in msg)
                 or ("unique" in msg and "omnigent_conversation_metadata.id" in msg)

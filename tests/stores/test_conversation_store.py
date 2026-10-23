@@ -4898,8 +4898,17 @@ def test_workspace_persists_for_cli_session_without_host_id(
     assert fetched.workspace == "/Users/corey/projects/cli-launched"
 
 
+@pytest.mark.parametrize(
+    "runner_id",
+    [
+        None,
+        "omnigent_conversation_metadata_pkey",
+        "duplicate entry for key 'omnigent_conversation_metadata.primary'",
+    ],
+)
 def test_create_conversation_with_host_id_no_workspace_raises(
     conversation_store: SqlAlchemyConversationStore,
+    runner_id: str | None,
 ) -> None:
     """
     Creating a conversation with host_id but no workspace raises
@@ -4915,7 +4924,12 @@ def test_create_conversation_with_host_id_no_workspace_raises(
     from sqlalchemy.exc import IntegrityError, OperationalError
 
     with pytest.raises((IntegrityError, OperationalError)):
-        conversation_store.create_conversation(host_id="abb32306b80732bdfa6153b2f5f6eb92")
+        conversation_store.create_conversation(
+            conversation_id="d" * 32,
+            host_id="abb32306b80732bdfa6153b2f5f6eb92",
+            runner_id=runner_id,
+        )
+    assert conversation_store.get_conversation("d" * 32) is None
 
 
 # ── External session id ─────────────────────────────
