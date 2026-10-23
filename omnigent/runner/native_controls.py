@@ -248,6 +248,7 @@ class NativeControls:
     ]
     codex_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
     handle_claude_native_btw_dismiss: Callable[[str], Coroutine[Any, Any, Response]]
+    handle_claude_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_cost_popup: _HandleClaudeNativeCostPopupFn
     handle_claude_native_effort_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
@@ -258,6 +259,7 @@ class NativeControls:
     handle_claude_native_slash_command: Callable[..., Coroutine[Any, Any, Response]]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
+    handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_cost_popup: _HandleCodexNativeCostPopupFn
     handle_codex_native_plan_mode_change: _HandleCodexNativePlanModeChangeFn
@@ -1930,6 +1932,14 @@ def build_native_controls(
             context="claude-native compact",
         )
 
+    async def _handle_claude_native_clear(conv_id: str) -> Response:
+        return await _handle_claude_native_slash_command(
+            conv_id,
+            "/clear",
+            error_code="claude_native_clear_failed",
+            context="claude-native clear",
+        )
+
     async def _handle_codex_native_slash_command(
         conv_id: str,
         command: str,
@@ -1971,6 +1981,14 @@ def build_native_controls(
             "/compact",
             error_code="codex_native_compact_failed",
             context="codex-native compact",
+        )
+
+    async def _handle_codex_native_clear(conv_id: str) -> Response:
+        return await _handle_codex_native_slash_command(
+            conv_id,
+            "/clear",
+            error_code="codex_native_clear_failed",
+            context="codex-native clear",
         )
 
     async def _handle_opencode_native_compact(conv_id: str) -> Response:
@@ -2587,6 +2605,7 @@ def build_native_controls(
         handle_antigravity_native_effort_change=_handle_antigravity_native_effort_change,
         codex_native_model_options=_codex_native_model_options,
         handle_claude_native_btw_dismiss=_handle_claude_native_btw_dismiss,
+        handle_claude_native_clear=_handle_claude_native_clear,
         handle_claude_native_compact=_handle_claude_native_compact,
         handle_claude_native_cost_popup=_handle_claude_native_cost_popup,
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
@@ -2595,6 +2614,7 @@ def build_native_controls(
         handle_claude_native_slash_command=_handle_claude_native_slash_command,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
+        handle_codex_native_clear=_handle_codex_native_clear,
         handle_codex_native_compact=_handle_codex_native_compact,
         handle_codex_native_cost_popup=_handle_codex_native_cost_popup,
         handle_codex_native_plan_mode_change=_handle_codex_native_plan_mode_change,

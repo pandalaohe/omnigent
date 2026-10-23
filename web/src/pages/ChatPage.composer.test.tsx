@@ -1118,6 +1118,44 @@ describe("Composer slash-command menu", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it.each(["claude-native", "codex-native", "pi-native"])(
+    "%s executes the native clear command from the composer",
+    async (sessionHarness) => {
+      useChatStore.setState({ sessionHarness });
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValue(new Response(JSON.stringify({ queued: false }), { status: 202 }));
+      vi.stubGlobal("fetch", fetchMock);
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+      });
+      const props = composerProps({ isNativeWrapper: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "/cle" } });
+      expect(screen.getByTestId("slash-menu-item-clear")).toHaveTextContent("/clear");
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue("/clear ");
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(
+          expect.stringContaining("/v1/sessions/conv_test/events"),
+          expect.objectContaining({ body: JSON.stringify({ type: "clear", data: {} }) }),
+        );
+      });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
+  it("preserves Pi RPC /clear through the message path", () => {
+    useChatStore.setState({ sessionHarness: "pi" });
+    const props = composerProps();
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/clear" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("/clear", undefined);
+  });
+
   it("highlights the first match as soon as the menu opens", () => {
     // /compact is native-wrapper-only (#1139); render a native session so it
     // appears as the first built-in and is the default highlight.

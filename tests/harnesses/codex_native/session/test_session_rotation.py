@@ -552,6 +552,17 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
     old_events = [event for event in session_events if event.session_id == "conv_old"]
+    notice_types = {
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    }
+    assert [event.body["type"] for event in old_events if event.body["type"] in notice_types] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    old_events = [event for event in old_events if event.body["type"] not in notice_types]
     assert len(old_events) == 2
     assert old_events[0].body == {
         "type": "external_codex_approval_mode_change",

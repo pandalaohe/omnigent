@@ -927,8 +927,10 @@ async def test_unarchive_skips_stop(
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
+@pytest.mark.parametrize("event_type", ["message", "compact", "clear"])
 async def test_archived_session_rejects_new_user_work_until_unarchived(
     client: httpx.AsyncClient,
+    event_type: str,
 ) -> None:
     """A new message cannot race an archive close by relaunching its CLI."""
     session = await create_test_session(client, name="archive-read-only")
@@ -940,7 +942,7 @@ async def test_archived_session_rejects_new_user_work_until_unarchived(
     rejected = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
-            "type": "message",
+            "type": event_type,
             "data": {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "wake anyway"}],

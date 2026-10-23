@@ -87,6 +87,7 @@ from omnigent.native._native_post_delivery import (
     post_session_succession,
     replay_dead_letters,
 )
+from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -3104,6 +3105,12 @@ async def _maybe_rotate_session_on_thread_started(
         old_session_id=old_session_id,
         new_session_id=new_session_id,
         allow_empty=allow_empty,
+    )
+    await post_clear_supersession(
+        ap_client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
     )
     return True
 
