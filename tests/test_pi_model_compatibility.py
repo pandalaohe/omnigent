@@ -5,14 +5,67 @@ from __future__ import annotations
 import pytest
 
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import (
+    ModelCapability,
+    ModelMetadata,
+    ModelReasoningMetadata,
+    ModelWireAPI,
+)
 from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_model_json_entry,
+    pi_model_with_thinking_defaults,
 )
 from omnigent.onboarding.providers import ModelInfo
 
 _REASONING = frozenset({ModelCapability.REASONING})
+
+
+@pytest.mark.parametrize("levels", [("low", "high"), ("low", "high", "max")])
+def test_declared_efforts_limit_pi_to_positive_supported_levels(levels) -> None:
+    entry = pi_model_json_entry(
+        ModelEntry(
+            id="custom-model",
+            family="other",
+            metadata=ModelMetadata(reasoning=ModelReasoningMetadata(efforts=frozenset(levels))),
+        )
+    )
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"] == {
+        "off": None,
+        "minimal": None,
+        "low": "low",
+        "medium": None,
+        "high": "high",
+        "xhigh": None,
+        "max": "max" if "max" in levels else None,
+    }
+
+
+@pytest.mark.parametrize("levels", [(), ("off", "none"), ("adaptive",)])
+def test_no_positive_declared_efforts_preserves_pi_defaults(levels) -> None:
+    entry = pi_model_json_entry(
+        ModelEntry(
+            id="custom-model",
+            family="other",
+            metadata=ModelMetadata(reasoning=ModelReasoningMetadata(efforts=frozenset(levels))),
+        )
+    )
+    assert "thinkingLevelMap" not in entry
+    assert "reasoning" not in entry
+
+
+def test_declared_map_survives_anthropic_thinking_defaults() -> None:
+    entry = pi_model_json_entry(
+        ModelEntry(
+            id="claude-sonnet-5-5",
+            family="claude",
+            metadata=ModelMetadata(reasoning=ModelReasoningMetadata(efforts=frozenset({"high"}))),
+        )
+    )
+    result = pi_model_with_thinking_defaults(entry)
+    assert result["compat"] == {"forceAdaptiveThinking": True}
+    assert result["thinkingLevelMap"] == entry["thinkingLevelMap"]
 
 
 def _entry(model_id: str, *, reasoning: bool | None, wire: ModelWireAPI) -> ModelEntry:

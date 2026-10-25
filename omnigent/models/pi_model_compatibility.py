@@ -15,7 +15,7 @@ from omnigent.models.model_fallbacks import (
     PI_ANTHROPIC_BUDGET_THINKING,
     PI_ANTHROPIC_THINKING_REQUIRED,
 )
-from omnigent.models.model_metadata import ModelCapability, ModelMetadata
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelReasoningMetadata
 
 if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
@@ -168,6 +168,23 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if pi_model_entry_is_reasoning(model):
         entry["reasoning"] = True
+    return pi_model_with_reasoning_metadata(entry, model.metadata.reasoning)
+
+
+def pi_model_with_reasoning_metadata(
+    entry: PiModelEntry, reasoning: ModelReasoningMetadata | None
+) -> PiModelEntry:
+    """Restrict declared effort levels without allowing thinking to be disabled."""
+    levels = ("minimal", "low", "medium", "high", "xhigh", "max")
+    if reasoning is not None and reasoning.efforts.intersection(levels):
+        return {
+            **entry,
+            "reasoning": True,
+            "thinkingLevelMap": {
+                "off": None,
+                **{level: level if level in reasoning.efforts else None for level in levels},
+            },
+        }
     return entry
 
 
@@ -282,6 +299,7 @@ def enrich_databricks_model_catalog(
                         live.cost_tier if live.cost_tier is not None else metadata.cost_tier
                     ),
                     wire_apis=live.wire_apis or metadata.wire_apis,
+                    reasoning=live.reasoning or metadata.reasoning,
                 ),
             )
         )

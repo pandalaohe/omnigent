@@ -40,6 +40,69 @@ def _databricks_config() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("declared", [False, True])
+def test_native_launch_carries_gateway_efforts_for_allowlisted_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, declared: bool
+) -> None:
+    from omnigent.models.model_catalog import ResolvedModelProvider
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/proxy/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "custom-model"}]})
+        assert request.url.path == "/proxy/model_group/info"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "model_group": "custom-model",
+                        "supported_reasoning_efforts": ["low", "high", "max"]
+                        if declared
+                        else None,
+                    }
+                ]
+            },
+        )
+
+    client = httpx.Client
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kw: client(**{**kw, "transport": httpx.MockTransport(handler)})
+    )
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://native.example/proxy/v1",
+        api="openai-completions",
+        model="custom-model",
+        api_key="test-key",
+        auth_header=True,
+        extra_models=[{"id": "custom-model", "contextWindow": 123_000}],
+        model_allowlist=("custom-model",),
+        listing_provider=ResolvedModelProvider(
+            kind="gateway",
+            family="openai",
+            base_url="https://native.example/proxy/v1",
+            api_key="test-key",
+        ),
+    )
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider, "medium")
+    models = json.loads((agent_dir / "models.json").read_text())["providers"]["omnigent"]["models"]
+    assert len(models) == 1 and models[0]["contextWindow"] == 123_000
+    if declared:
+        assert models[0]["reasoning"] is True
+        assert models[0]["thinkingLevelMap"] == {
+            "off": None,
+            "minimal": None,
+            "low": "low",
+            "medium": None,
+            "high": "high",
+            "xhigh": None,
+            "max": "max",
+        }
+    else:
+        assert "thinkingLevelMap" not in models[0]
+
+
 def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
     """A Databricks default → Pi anthropic-messages gateway provider.
 
