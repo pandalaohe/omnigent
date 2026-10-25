@@ -1610,6 +1610,9 @@ async def stats() -> dict[str, int]:
 
 
 if __name__ == "__main__":
+    from omnigent.testing.process_reaper import exit_when_parent_dies
+
+    exit_when_parent_dies(int(sys.argv[2]) if len(sys.argv) > 2 else os.getppid())
     port = int(sys.argv[1])
     uvicorn.run(
         app,

@@ -238,7 +238,7 @@ def _write_all(fd: int, data: bytes) -> None:
         data = data[os.write(fd, data) :]
 
 
-def relay(path: Path, app: str, command: list[str]) -> int:
+def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = None) -> int:
     """Run a command in an inner PTY, answering queries before tmux can answer DA.
 
     The relay stays outside the command's existing sandbox wrapper. It owns no
@@ -251,8 +251,18 @@ def relay(path: Path, app: str, command: list[str]) -> int:
     import termios
     import tty
 
+    import psutil
+
+    parent_pid = os.getppid()
+    owner = None
+    if owner_pid is not None:
+        try:
+            owner = psutil.Process(owner_pid)
+        except psutil.NoSuchProcess:
+            return 1
     original = termios.tcgetattr(0)
     size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+    original_flags = {fd: fcntl.fcntl(fd, fcntl.F_GETFL) for fd in (0, 1)}
     pid, master = pty.fork()
     if pid == 0:
         exit_code = 126
@@ -267,8 +277,12 @@ def relay(path: Path, app: str, command: list[str]) -> int:
             os._exit(exit_code)
     status: ProgramStatus | None = None
     stopping_at: float | None = None
+    drain_deadline: float | None = None
     exit_status: int | None = None
     stdin_open = True
+    master_open = True
+    pending_input = bytearray()
+    pending_output = bytearray()
 
     def save() -> None:
         temporary = path.with_suffix(".tmp")
@@ -311,7 +325,7 @@ def relay(path: Path, app: str, command: list[str]) -> int:
             save()
 
     def reply() -> None:
-        _write_all(master, _REPLY)
+        pending_input.extend(_REPLY)
 
     def resize(_signum: int, _frame: object) -> None:
         with contextlib.suppress(OSError):
@@ -327,24 +341,60 @@ def relay(path: Path, app: str, command: list[str]) -> int:
     parser = ProgramStatusParser(on_report=record, on_query=reply, on_reset=reset)
     try:
         tty.setraw(0)
+        for fd in (0, 1, master):
+            os.set_blocking(fd, False)
         signal.signal(signal.SIGWINCH, resize)
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(sig, stop)
         save()
         while True:
+            if stopping_at is None:
+                owner_gone = False
+                if owner is not None:
+                    try:
+                        owner_gone = (
+                            not owner.is_running() or owner.status() == psutil.STATUS_ZOMBIE
+                        )
+                    except psutil.NoSuchProcess:
+                        owner_gone = True
+                    except psutil.AccessDenied:
+                        pass
+                if os.getppid() != parent_pid or owner_gone:
+                    stop(signal.SIGHUP, None)
             if stopping_at is not None and time.monotonic() - stopping_at > 2:
                 break
-            readable, _, _ = select.select([0, master] if stdin_open else [master], [], [], 0.2)
-            if master in readable:
+            readers = []
+            if stdin_open and len(pending_input) < 65536:
+                readers.append(0)
+            if master_open and len(pending_output) < 65536 and len(pending_input) < 65536:
+                readers.append(master)
+            writers = ([master] if pending_input else []) + ([1] if pending_output else [])
+            readable, writable, _ = select.select(readers, writers, [], 0.2)
+            if drain_deadline is not None:
+                if pending_output and 1 not in writable:
+                    # A slow receiver must not consume the normal PTY drain budget.
+                    drain_deadline = time.monotonic() + 2
+                elif time.monotonic() > drain_deadline:
+                    master_open = False
+                    pending_input.clear()
+                    pending_output.extend(parser.finish())
+                    drain_deadline = None
+            for fd, pending in ((master, pending_input), (1, pending_output)):
+                if fd in writable:
+                    with contextlib.suppress(BlockingIOError):
+                        del pending[: os.write(fd, pending)]
+            if master_open and master in readable:
                 try:
                     data = os.read(master, 65536)
                 except OSError as exc:
                     if exc.errno != errno.EIO:
                         raise
-                    break
+                    data = b""
                 if not data:
-                    break
-                _write_all(1, parser.feed(data))
+                    master_open = False
+                    pending_output.extend(parser.finish())
+                else:
+                    pending_output.extend(parser.feed(data))
             if 0 in readable:
                 try:
                     data = os.read(0, 65536)
@@ -355,15 +405,22 @@ def relay(path: Path, app: str, command: list[str]) -> int:
                 if not data:
                     stdin_open = False
                     stop(signal.SIGHUP, None)
-                else:
-                    _write_all(master, data)
+                elif master_open:
+                    pending_input.extend(data)
+            if not master_open and not pending_output:
+                break
             if exit_status is None:
                 child, result = os.waitpid(pid, os.WNOHANG)
                 if child:
                     exit_status = result
-                    # Drain buffered output, bounding descendants holding the slave open.
-                    stopping_at = time.monotonic()
-        _write_all(1, parser.finish())
+                    # Bound a descendant-held PTY, then finish delivering buffered output.
+                    drain_deadline = time.monotonic() + 2
+        pending_output.extend(parser.finish())
+        while pending_output:
+            try:
+                del pending_output[: os.write(1, pending_output)]
+            except BlockingIOError:
+                break
     finally:
         try:
             # A child exiting its controlling PTY may wait for the master to close.
@@ -391,6 +448,9 @@ def relay(path: Path, app: str, command: list[str]) -> int:
                 if exit_status is None:
                     raise RuntimeError(f"relay {os.getpid()}: child {pid} did not reap")
         finally:
+            for fd, flags in original_flags.items():
+                with contextlib.suppress(OSError):
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags)
             with contextlib.suppress(OSError, termios.error):
                 termios.tcsetattr(0, termios.TCSANOW, original)
             with contextlib.suppress(OSError):
@@ -406,12 +466,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-file", type=Path, required=True)
     parser.add_argument("--app", required=True)
+    parser.add_argument("--owner-pid", type=int)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a command is required")
-    code = relay(args.state_file, args.app, command)
+    code = relay(args.state_file, args.app, command, owner_pid=args.owner_pid)
     if code < 0:
         if -code != signal.SIGKILL:
             signal.signal(-code, signal.SIG_DFL)

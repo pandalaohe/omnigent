@@ -1670,6 +1670,8 @@ class TerminalInstance:
                 str(status_path),
                 "--app",
                 self.program_status_app,
+                "--owner-pid",
+                str(os.getpid()),
                 "--",
                 *inner_cmd,
             ]

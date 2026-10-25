@@ -2,10 +2,47 @@
 
 from __future__ import annotations
 
+import os
+import signal
+from pathlib import Path
+from unittest.mock import Mock
+
 import httpx
 import pytest
 
 from tests.e2e import conftest as helpers
+
+
+@pytest.mark.parametrize("entry", ["e2e", "ui", "omnigent"])
+def test_mock_fixture_reaps_process_when_readiness_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: str
+) -> None:
+    from tests.e2e.omnigent import conftest as omnigent_helpers
+    from tests.e2e_ui import conftest as ui_helpers
+
+    module = {"e2e": helpers, "ui": ui_helpers, "omnigent": omnigent_helpers}[entry]
+    monkeypatch.setattr(
+        ui_helpers, "prepared_repro_environment", lambda: {"OMNIGENT_REPRO_MODEL_URL": ""}
+    )
+    process = Mock()
+    spawn = Mock(return_value=process)
+    monkeypatch.setattr(module.subprocess, "Popen", spawn)
+    monkeypatch.setattr(module.httpx, "get", Mock(side_effect=KeyboardInterrupt))
+    if entry == "e2e":
+        journey = module._mock_llm_server_process(tmp_path)
+    else:
+        factory = Mock()
+        factory.mktemp.return_value = tmp_path
+        journey = module.mock_llm_server_url.__wrapped__(factory)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            next(journey)
+    finally:
+        journey.close()
+    assert spawn.call_args.args[0][-1] == str(os.getpid())
+    process.send_signal.assert_called_once_with(signal.SIGTERM)
+    process.wait.assert_called_once_with(timeout=5)
+    assert spawn.call_args.kwargs["stdout"].closed
 
 
 def _item(role: str, text: str, response_id: str, *, nested: bool) -> dict:

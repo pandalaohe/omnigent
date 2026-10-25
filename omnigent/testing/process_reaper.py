@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 from itertools import pairwise
 from pathlib import Path
 
@@ -56,6 +57,38 @@ class ProcessScanUnavailable(RuntimeError):
     about leaks, so callers must report the leak state as *unverified* — never
     as "no leaks" — and must not narrow or bypass the identity checks below.
     """
+
+
+def exit_when_parent_dies(parent_pid: int) -> None:
+    """Bound a standalone test helper to its spawning pytest process.
+
+    Fixture finalizers do not run after SIGKILL or pytest-timeout's hard exit.
+    Keep the parent's creation identity so a reused PID cannot retain a helper.
+    """
+    try:
+        parent = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        os._exit(1)
+
+    def watch() -> None:
+        interval = threading.Event()
+        while True:
+            try:
+                if not parent.is_running() or parent.status() == psutil.STATUS_ZOMBIE:
+                    os._exit(1)
+            except psutil.NoSuchProcess:
+                os._exit(1)
+            except psutil.AccessDenied:
+                pass
+            interval.wait(0.1)
+
+    def start_watch() -> None:
+        threading.Thread(target=watch, name="test-helper-parent-watch", daemon=True).start()
+
+    # Fork drops every thread except the caller; descendants retain this owner.
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=start_watch)
+    start_watch()
 
 
 def _proc_argv(proc: psutil.Process) -> list[str]:
