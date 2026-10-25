@@ -110,6 +110,65 @@ async def test_pi_rpc_relay_is_ready_before_permission_bootstrap(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sdk_missing", [True, False])
+async def test_permission_bootstrap_failure_reaches_turn_without_confirmation_wait(
+    monkeypatch, sdk_missing
+):
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-agent",
+        executor=ExecutorSpec(config={"harness": "pi"}),
+    )
+    app, process_manager = await _build_app_for_spec(spec)
+    harness = process_manager._client
+    original_post = harness.post
+
+    async def bootstrap_failure(url, *, json, timeout=None):
+        assert url == "/v1/permission-tier/bootstrap"
+        return httpx.Response(
+            503,
+            json={
+                "installed": False,
+                "error": "pi_sdk_loader_unavailable" if sdk_missing else "unknown",
+                "detail": "private untrusted exception text",
+            },
+        )
+
+    monkeypatch.setattr(harness, "post", bootstrap_failure)
+    session_id = f"pi-startup-failed-{sdk_missing}"
+    async with _runner_client(app, permission_harness="pi") as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "test-agent"}
+        )
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert "private untrusted" not in detail
+        if sdk_missing:
+            assert "supported Pi SDK loader" in detail
+        assert app.state.permission_tiers.state(session_id).status == "blocked"
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "message", "role": "user", "content": "hello"},
+        )
+        assert response.status_code == 202
+        async with asyncio.timeout(2):
+            queue = app.state.session_event_queues[session_id]
+            while True:
+                event = await queue.get()
+                if event.get("type") == "session.status" and event.get("status") == "failed":
+                    break
+        assert detail in event["error"]["message"]
+        assert "not confirmed" not in event["error"]["message"]
+        assert not harness.posted_bodies
+        monkeypatch.setattr(harness, "post", original_post)
+        response = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "test-agent"}
+        )
+        assert response.status_code == 201, response.text
+        assert app.state.permission_tiers.state(session_id).status == "ready"
+
+
+@pytest.mark.asyncio
 async def test_session_labels_for_runner_spawn_timeout_is_quiet(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

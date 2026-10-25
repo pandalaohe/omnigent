@@ -2347,6 +2347,7 @@ def create_runner_app(
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     permission_tiers = PermissionTierRuntime()
+    permission_startup_errors: dict[str, str] = {}
     app.state.permission_tiers = permission_tiers
     _permission_tier_targets: dict[str, tuple[str, str]] = {}
     _permission_tier_commits: dict[str, tuple[str, str, int]] = {}
@@ -3899,6 +3900,7 @@ def create_runner_app(
 
         try:
             permission_tiers.fence_start(init_context.envelope, harness_name)
+            permission_startup_errors.pop(session_id, None)
         except PermissionTierEpochChanged:
             return JSONResponse(
                 status_code=409,
@@ -4300,6 +4302,8 @@ def create_runner_app(
                         _publish_terminal_pending(_publish_event, session_id, False)
 
         permission_tier_ack: str | None = None
+        from omnigent.inner.pi_settings import PiSdkLoaderUnavailableError
+
         try:
             if harness_name == "pi":
                 from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
@@ -4328,6 +4332,11 @@ def create_runner_app(
                     or not isinstance(bootstrap_body, dict)
                     or bootstrap_body.get("installed") is not True
                 ):
+                    if (
+                        isinstance(bootstrap_body, dict)
+                        and bootstrap_body.get("error") == PiSdkLoaderUnavailableError.code
+                    ):
+                        raise PiSdkLoaderUnavailableError
                     raise ValueError("Pi permission extension did not acknowledge startup")
             elif harness_name == "pi-native" and init_context.envelope is not None:
                 from omnigent.harnesses.pi_native.bridge import (
@@ -4351,11 +4360,17 @@ def create_runner_app(
             if permission_state is not None:
                 permission_tier_ack = PERMISSION_TIERS_CAPABILITY
         except (OSError, ValueError, TypeError, ImportError, httpx.HTTPError, TimeoutError) as exc:
+            detail = (
+                str(PiSdkLoaderUnavailableError())
+                if isinstance(exc, PiSdkLoaderUnavailableError)
+                else _client_safe_error_detail(exc, context="permission tier startup")
+            )
+            permission_startup_errors[session_id] = detail
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "permission_tier_unavailable",
-                    "detail": _client_safe_error_detail(exc, context="permission tier startup"),
+                    "detail": detail,
                 },
             )
 
@@ -7684,6 +7699,11 @@ def create_runner_app(
                     _cli_runtime_lifecycle.mark_live(conv)
                     permission_state = permission_tiers.state(conv)
                     if permission_state is not None:
+                        if permission_state.status != "ready":
+                            raise RuntimeError(
+                                permission_startup_errors.get(conv)
+                                or "Permission tier is unavailable: " + permission_state.status
+                            )
                         deadline = asyncio.get_running_loop().time() + 20.0
                         session_path = f"/v1/sessions/{urllib.parse.quote(conv, safe='')}"
                         while True:

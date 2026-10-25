@@ -87,6 +87,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor, ExecutorConfig
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.inner.pi_executor import PiExecutor, _pi_thinking_from_config
+from omnigent.inner.pi_settings import PiSdkLoaderUnavailableError
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.util.json_types import JsonValue
 
@@ -426,6 +427,11 @@ def create_app() -> FastAPI:
             installed = isinstance(
                 executor, PiExecutor
             ) and await executor.bootstrap_permission_tier(session_id)
+        except PiSdkLoaderUnavailableError:
+            _logger.warning("Pi permission bootstrap failed", exc_info=True)
+            return JSONResponse(
+                {"installed": False, "error": PiSdkLoaderUnavailableError.code}, status_code=503
+            )
         except Exception:  # noqa: BLE001 - no prompt may proceed after bootstrap failure
             _logger.warning("Pi permission bootstrap failed", exc_info=True)
             installed = False

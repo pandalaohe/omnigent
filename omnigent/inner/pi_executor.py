@@ -1920,6 +1920,7 @@ class _PiRpcSession:
         thinking: str | None = None,
         session_id: str | None = None,
         extra_args: list[str] | None = None,
+        launcher_args: tuple[str, ...] = (),
     ) -> None:
         """
         Spawn the Pi subprocess in RPC mode and start the I/O readers.
@@ -1947,7 +1948,7 @@ class _PiRpcSession:
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
         """
-        args = [*pi_cli_argv(pi_path), "--mode", "rpc", "--no-session"]
+        args = [*pi_cli_argv(pi_path), *launcher_args, "--mode", "rpc", "--no-session"]
         if session_id:
             args.extend(["--session-id", session_id])
         if model:
@@ -2282,6 +2283,7 @@ class PiSubprocessConfig:
     tmp_dir: str
     extra_args: list[str]
     executable: str | None = None
+    launcher_args: tuple[str, ...] = ()
 
 
 def _extract_text(msg: Message) -> str:
@@ -2457,6 +2459,7 @@ class SandboxedPiCli:
 
     launch_path: str
     sandboxed: bool
+    launcher_args: tuple[str, ...] = ()
 
 
 def _try_sandbox_pi(
@@ -2512,8 +2515,11 @@ def _try_sandbox_pi(
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
-        launcher = create_exec_launcher(str(executable), sandbox)
-        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
+        command = pi_cli_argv(str(executable))
+        launcher = create_exec_launcher(command[0], sandbox)
+        return SandboxedPiCli(
+            launch_path=launcher, sandboxed=True, launcher_args=tuple(command[1:])
+        )
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
@@ -2946,6 +2952,7 @@ class PiExecutor(Executor):
             spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR", "OMNIGENT_PI_EXTENSION_UI"],
         )
         self._pi_launch_path = sandboxed.launch_path
+        self._pi_launcher_args = sandboxed.launcher_args
         self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
@@ -3359,6 +3366,7 @@ class PiExecutor(Executor):
         tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_", dir=tmp_parent)
         extra_args: list[str] = list(self._extra_args)
         executable: str | None = None
+        launcher_args = self._pi_launcher_args
 
         if self._gateway:
             assert tool_server_port is not None and tool_server_token is not None
@@ -3464,6 +3472,7 @@ class PiExecutor(Executor):
                         resource_executable=self._pi_path,
                     )
                     executable = sandbox_launch.launch_path
+                    launcher_args = sandbox_launch.launcher_args
             # Allowlist the bridged tool names. ``--no-tools`` (set in
             # __init__) disables every tool by default in pi 0.68+;
             # ``--tools`` adds specific names back. Without this pass
@@ -3490,7 +3499,11 @@ class PiExecutor(Executor):
                 extra_args.extend(["--tools", ",".join(tool_names)])
 
         return PiSubprocessConfig(
-            env=env, tmp_dir=tmp_dir, extra_args=extra_args, executable=executable
+            env=env,
+            tmp_dir=tmp_dir,
+            extra_args=extra_args,
+            executable=executable,
+            launcher_args=launcher_args,
         )
 
     async def _handle_extension_ui(self, rpc: _PiRpcSession, event: CodexEvent) -> None:
@@ -3765,6 +3778,7 @@ class PiExecutor(Executor):
                 thinking=thinking,
                 session_id=session_key if session_key != "__default__" else None,
                 extra_args=extra_args or None,
+                launcher_args=subprocess_config.launcher_args,
             )
             if self._permission_controlled:
                 await self._await_permission_installation(session_key)
@@ -3799,11 +3813,7 @@ class PiExecutor(Executor):
         if not self._permission_controlled or not session_id:
             return False
         self._permission_session_id = session_id
-        try:
-            await self._ensure_rpc(session_id, "", None, [], permission_bootstrap=True)
-        except Exception:  # noqa: BLE001 - the harness returns an explicit failed bootstrap
-            logger.warning("Pi permission bootstrap failed", exc_info=True)
-            return False
+        await self._ensure_rpc(session_id, "", None, [], permission_bootstrap=True)
         return True
 
     async def run_turn(
