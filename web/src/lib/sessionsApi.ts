@@ -31,6 +31,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  SessionStartupHold,
   SessionStartupStatus,
 } from "./types";
 
@@ -319,6 +320,8 @@ interface SessionResponseWire {
    */
   sandbox_status?: SandboxStatus | null;
   startup?: unknown;
+  /** Present while the session waits for its host to drop below its new-session line. */
+  startup_hold?: SessionStartupHold | null;
   mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
@@ -448,6 +451,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
     startup: sessionStartupFromWire(wire.startup),
+    startupHold: wire.startup_hold ?? null,
     mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };

@@ -289,6 +289,13 @@ export interface BackgroundTaskInfo {
   command?: string;
 }
 
+/** Why a created session has not started yet (`startup_hold` on the wire). */
+export interface SessionStartupHold {
+  reason: "host_load";
+  host_id: string;
+  since: string;
+}
+
 export interface Session {
   id: string;
   /** Server-confirmed tier state; absent on older servers and unrelated harnesses. */
@@ -581,6 +588,11 @@ export interface Session {
    */
   sandboxStatus?: SandboxStatus | null;
   startup?: SessionStartupStatus | null;
+  /**
+   * Present while the session waits to start because its host is above its
+   * new-session line; absent once it starts or is cancelled.
+   */
+  startupHold?: SessionStartupHold | null;
   /**
    * Per-MCP-server startup state for native harness sessions
    * (codex-native). Present while the harness boots its MCP servers or

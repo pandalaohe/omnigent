@@ -205,6 +205,7 @@ describe("createSession", () => {
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
+      startupHold: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
@@ -213,6 +214,24 @@ describe("createSession", () => {
       effectiveHostId: null,
       effectiveCwd: null,
       effectiveGitBranch: null,
+    });
+  });
+
+  it("maps a startup hold while the session waits for its host", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_held",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        startup_hold: { reason: "host_load", host_id: "host_1", since: "2026-10-25T09:56:07Z" },
+      }),
+    );
+    const session = await createSession("agent_xyz");
+    expect(session.startupHold).toEqual({
+      reason: "host_load",
+      host_id: "host_1",
+      since: "2026-10-25T09:56:07Z",
     });
   });
 
