@@ -31,6 +31,7 @@ import socket
 import sys
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -60,9 +61,20 @@ from omnigent.runtime.harnesses.paths import (
     HARNESS_TMP_PARENT_ENV_VAR,
     harness_tmp_parent,
 )
+from omnigent.startup_protocol import (
+    CONTEXT_INVENTORY_MAX_BYTES,
+    CONTEXT_INVENTORY_V2,
+    ContextEvidenceV2,
+    decode_context_evidence_v2,
+    executor_context_scope_v2,
+    harness_context_authority_v2,
+    unknown_context_evidence_v2,
+)
 
 _logger = logging.getLogger(__name__)
 _RESIDENT_INVENTORY_DECODER = TypeAdapter(ExecutorResidentInventory)
+_RESIDENT_THREAD_IDS_DECODER = TypeAdapter(tuple[tuple[str, ...] | None, ...] | None)
+_MAX_RESIDENT_THREAD_IDS = 1000
 
 # Per-AP-instance directory holding all per-conversation Unix
 # sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
@@ -530,6 +542,24 @@ class HarnessContextInventorySnapshot:
     inventory: ExecutorResidentInventory
 
 
+@dataclass(frozen=True)
+class HarnessThreadInventorySnapshot:
+    """Sampled loaded IDs aligned with a selected harness's context owners."""
+
+    context: HarnessContextInventorySnapshot
+    thread_ids: tuple[tuple[str, ...] | None, ...] | None
+
+
+@dataclass(frozen=True)
+class HarnessContextEvidenceSnapshotV2:
+    """Local binding and age-adjusted observations, without a held admission guard."""
+
+    owner: HarnessResidentSnapshot
+    release_generation: int
+    evidence: ContextEvidenceV2
+    request_elapsed_s: float
+
+
 def _model_env_key(harness: str) -> str:
     """
     Return the per-harness model env-var key for *harness*.
@@ -788,8 +818,206 @@ class HarnessProcessManager:
         self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
     ) -> HarnessContextInventorySnapshot | None:
         """Read an existing selected owner's channel; any stale or invalid evidence is unknown."""
+        reconcile = await self._prepare_resident_inventory(
+            owner, timeout_s=timeout_s, include_threads=False
+        )
+        snapshot = reconcile()
+        return snapshot.context if snapshot is not None else None
+
+    async def prepare_context_inventory_v2(
+        self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
+    ) -> Callable[[], HarnessContextEvidenceSnapshotV2]:
+        """Negotiate v2 on the selected channel; old peers and stale bindings stay unknown."""
+        read_id = uuid.uuid4().hex
+        started = time.monotonic()
+        generation = 0
+
+        def unknown(reason: str, *, unsupported: bool = False) -> HarnessContextEvidenceSnapshotV2:
+            return HarnessContextEvidenceSnapshotV2(
+                owner,
+                generation,
+                unknown_context_evidence_v2(
+                    owner.session_id, read_id, reason, unsupported=unsupported
+                ),
+                time.monotonic() - started,
+            )
+
         if not 0 < timeout_s <= 5.0:
-            return None
+            return lambda: unknown("invalid_read_budget")
+        try:
+            async with asyncio.timeout_at(started + timeout_s):
+                selection = await self._select_resident_inventory_owner(owner)
+                if selection is None:
+                    return lambda: unknown("owner_unbound")
+                client, generation, still_current = selection
+                async with client.stream(
+                    "GET",
+                    f"/v2/sessions/{quote(owner.session_id, safe='')}/resident-context-inventory",
+                    params={"read_id": read_id},
+                    timeout=timeout_s,
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code == 404:
+                        return lambda: unknown("peer_needs_update", unsupported=True)
+                    if (
+                        response.status_code != 200
+                        or response.headers.get("Omnigent-Context-Inventory-Contract")
+                        != CONTEXT_INVENTORY_V2
+                    ):
+                        return lambda: unknown("contract_unavailable")
+                    payload = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(payload) + len(chunk) > CONTEXT_INVENTORY_MAX_BYTES:
+                            return lambda: unknown("read_byte_budget")
+                        payload.extend(chunk)
+            evidence = decode_context_evidence_v2(
+                bytes(payload),
+                read_id=read_id,
+                authority=harness_context_authority_v2(owner.session_id),
+                expected_scopes=(executor_context_scope_v2(owner.session_id),),
+            )
+        except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+            return lambda: unknown("invalid_or_failed_read")
+
+        def reconcile() -> HarnessContextEvidenceSnapshotV2:
+            if not still_current():
+                return unknown("owner_changed")
+            elapsed = time.monotonic() - started
+            aged = evidence.model_copy(
+                update={
+                    "sources": tuple(
+                        source.model_copy(
+                            update={
+                                "age_upper_bound_s": (
+                                    source.age_upper_bound_s + elapsed
+                                    if source.age_upper_bound_s is not None
+                                    else None
+                                ),
+                            }
+                        )
+                        for source in evidence.sources
+                    ),
+                }
+            )
+            return HarnessContextEvidenceSnapshotV2(owner, generation, aged, elapsed)
+
+        return reconcile
+
+    async def prepare_resident_thread_inventory(
+        self, owner: HarnessResidentSnapshot, *, timeout_s: float = 5.0
+    ) -> Callable[[], HarnessThreadInventorySnapshot | None]:
+        """Read the existing channel; recheck its binding after other sources await."""
+        return await self._prepare_resident_inventory(
+            owner, timeout_s=timeout_s, include_threads=True
+        )
+
+    async def _prepare_resident_inventory(
+        self, owner: HarnessResidentSnapshot, *, timeout_s: float, include_threads: bool
+    ) -> Callable[[], HarnessThreadInventorySnapshot | None]:
+        if not 0 < timeout_s <= 5.0:
+            return lambda: None
+        selection = await self._select_resident_inventory_owner(owner)
+        if selection is None:
+            return lambda: None
+        client, generation, still_current = selection
+        endpoint = "resident-thread-inventory" if include_threads else "resident-inventory"
+        thread_ids = None
+        try:
+            response = await asyncio.wait_for(
+                client.get(
+                    f"/v1/sessions/{quote(owner.session_id, safe='')}/{endpoint}",
+                    timeout=timeout_s,
+                    follow_redirects=False,
+                ),
+                timeout=timeout_s,
+            )
+            if response.status_code != 200:
+                return lambda: None
+            payload = response.json()
+            expected = {"inventory", "thread_ids"} if include_threads else {"inventory"}
+            if not isinstance(payload, dict) or set(payload) != expected:
+                return lambda: None
+            raw = payload["inventory"]
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != {field.name for field in fields(ExecutorResidentInventory)}
+                or not isinstance(raw["owners"], list)
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != {field.name for field in fields(ExecutorResidentOwner)}
+                    for item in raw["owners"]
+                )
+            ):
+                return lambda: None
+            inventory = _RESIDENT_INVENTORY_DECODER.validate_json(json.dumps(raw), strict=True)
+            if inventory.aliases_complete or inventory.context_coverage_complete:
+                return lambda: None
+            shared_context_ids = {
+                context_id
+                for context_id, count in Counter(
+                    item.vendor_context_id
+                    for item in inventory.owners
+                    if item.vendor_context_id is not None
+                ).items()
+                if count > 1
+            }
+            if not shared_context_ids.issubset(inventory.ambiguous_context_ids):
+                return lambda: None
+            identities = {item.incarnation_id for item in inventory.owners}
+            if (
+                len(identities) != len(inventory.owners)
+                or not all(inventory.ambiguous_context_ids)
+                or len(set(inventory.ambiguous_context_ids))
+                != len(inventory.ambiguous_context_ids)
+                or any(
+                    not item.incarnation_id
+                    or not item.session_keys
+                    or not all(item.session_keys)
+                    or len(set(item.session_keys)) != len(item.session_keys)
+                    or (
+                        item.transport_generation is not None
+                        and (
+                            item.transport_generation < 0
+                            or not item.started
+                            or item.closing
+                            or item.cleanup_complete
+                        )
+                    )
+                    for item in inventory.owners
+                )
+            ):
+                return lambda: None
+            if include_threads:
+                thread_ids = _RESIDENT_THREAD_IDS_DECODER.validate_json(
+                    json.dumps(payload["thread_ids"]), strict=True
+                )
+                if thread_ids is not None and (
+                    len(thread_ids) != len(inventory.owners)
+                    or any(
+                        ids is not None
+                        and (
+                            item.transport_generation is None
+                            or len(ids) > _MAX_RESIDENT_THREAD_IDS
+                            or not all(ids)
+                            or len(set(ids)) != len(ids)
+                        )
+                        for item, ids in zip(inventory.owners, thread_ids, strict=True)
+                    )
+                ):
+                    return lambda: None
+        except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+            return lambda: None
+        async with self._registry_lock:
+            if not still_current():
+                return lambda: None
+            snapshot = HarnessThreadInventorySnapshot(
+                HarnessContextInventorySnapshot(owner, generation, inventory), thread_ids
+            )
+        return lambda: snapshot if still_current() else None
+
+    async def _select_resident_inventory_owner(
+        self, owner: HarnessResidentSnapshot
+    ) -> tuple[httpx.AsyncClient, int, Callable[[], bool]] | None:
         async with self._registry_lock:
             entry = self._entries.get(owner.session_id)
             if entry is None or owner.closing or owner.wrapper_exited or owner.exit_confirmed:
@@ -814,49 +1042,7 @@ class HarnessProcessManager:
                     and self._release_generations.get(owner.session_id, 0) == generation
                 )
 
-            if not still_current():
-                return None
-        try:
-            response = await asyncio.wait_for(
-                client.get(
-                    f"/v1/sessions/{quote(owner.session_id, safe='')}/resident-inventory",
-                    timeout=timeout_s,
-                    follow_redirects=False,
-                ),
-                timeout=timeout_s,
-            )
-            if response.status_code != 200:
-                return None
-            payload = response.json()
-            if not isinstance(payload, dict) or set(payload) != {"inventory"}:
-                return None
-            raw = payload["inventory"]
-            if (
-                not isinstance(raw, dict)
-                or set(raw) != {field.name for field in fields(ExecutorResidentInventory)}
-                or not isinstance(raw["owners"], list)
-                or any(
-                    not isinstance(item, dict)
-                    or set(item) != {field.name for field in fields(ExecutorResidentOwner)}
-                    for item in raw["owners"]
-                )
-            ):
-                return None
-            inventory = _RESIDENT_INVENTORY_DECODER.validate_json(json.dumps(raw), strict=True)
-            if inventory.aliases_complete or inventory.context_coverage_complete:
-                return None
-            identities = {item.incarnation_id for item in inventory.owners}
-            if len(identities) != len(inventory.owners) or any(
-                not item.incarnation_id or not item.session_keys or not all(item.session_keys)
-                for item in inventory.owners
-            ):
-                return None
-        except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
-            return None
-        async with self._registry_lock:
-            if not still_current():
-                return None
-            return HarnessContextInventorySnapshot(owner, generation, inventory)
+            return (client, generation, still_current) if still_current() else None
 
     async def retention_snapshot(
         self,

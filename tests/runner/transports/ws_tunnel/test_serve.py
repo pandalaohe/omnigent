@@ -51,6 +51,23 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     serve_tunnel,
 )
 from omnigent.sdk_peer_delivery import CLAUDE_SDK_PEER_CAPABILITY, SDK_PEER_CAPABILITY
+from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
+
+
+@pytest.mark.asyncio
+async def test_hello_advertises_the_context_inventory_v2_route() -> None:
+    """The runner advertises exactly the aggregate route this build registers."""
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame
+
+    sent: list[str] = []
+
+    async def send_text(frame: str) -> None:
+        sent.append(frame)
+
+    await _send_hello(send_text, "test")
+    hello = decode_frame(sent[0])
+    assert isinstance(hello, HelloFrame)
+    assert CONTEXT_INVENTORY_V2 in hello.capabilities
 
 
 @pytest.mark.asyncio

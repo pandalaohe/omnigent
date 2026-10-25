@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
+    HostContextInventoryV2ResultFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
@@ -1275,6 +1276,11 @@ async def _receive_loop(
             owner_future = conn.pending_owner_inventory.pop(frame.request_id, None)
             if owner_future is not None and not owner_future.done():
                 owner_future.set_result(frame)
+            continue
+        if isinstance(frame, HostContextInventoryV2ResultFrame):
+            context_future = conn.pending_context_inventory.pop(frame.request_id, None)
+            if context_future is not None and not context_future.done():
+                context_future.set_result(frame)
             continue
         if isinstance(frame, HostPluginsResultFrame):
             plugins_future = conn.pending_plugins.pop(frame.request_id, None)

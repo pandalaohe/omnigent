@@ -223,6 +223,28 @@ def register_resource_routes(
         snapshot = await owner_registration_snapshot(resource_registry, process_manager)
         return JSONResponse({"read_id": read_id, **dataclasses.asdict(snapshot)})
 
+    @app.get("/v2/startup/context-inventory")
+    async def read_context_inventory_v2(
+        request: Request,
+        read_id: str = Query(min_length=1, max_length=128),
+        session_id: str = Query(min_length=1, max_length=256),
+    ) -> JSONResponse:
+        from omnigent.runner.resident_inventory import session_context_evidence_v2
+        from omnigent.startup_protocol import (
+            CONTEXT_INVENTORY_CONTRACT_HEADER,
+            CONTEXT_INVENTORY_V2,
+        )
+
+        if len(request.query_params.getlist("read_id")) != 1:
+            raise HTTPException(status_code=422, detail="exactly one read_id is required")
+        evidence = await session_context_evidence_v2(
+            session_id, read_id, process_manager=process_manager
+        )
+        return JSONResponse(
+            evidence.model_dump(mode="json"),
+            headers={CONTEXT_INVENTORY_CONTRACT_HEADER: CONTEXT_INVENTORY_V2},
+        )
+
     async def _resolve_conversation_id(response_id: str) -> str | None:
         return _resp_to_conv.get(response_id)
 

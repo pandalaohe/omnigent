@@ -33,6 +33,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     ExecutorResidentInventory,
+    ExecutorThreadInventorySnapshot,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -70,6 +71,7 @@ from omnigent.server.schemas import (
     StartupProofEvent,
 )
 from omnigent.startup_evidence import StartupPermissionUnavailable, startup_evidence_scope
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 _logger = logging.getLogger(__name__)
 
@@ -674,8 +676,8 @@ class ExecutorAdapter(HarnessApp):
             await self._executor.interrupt_session(self._session_key)
         return response
 
-    def resident_inventory(self) -> ExecutorResidentInventory | None:
-        """Read only the current owner; detached cleanup leaves coverage unknown."""
+    def _resident_inventory_executor(self) -> Executor | None:
+        """Detached cleanup leaves coverage unknown even after replacement."""
         if (
             self._executor is None
             or self._resident_inventory_detached
@@ -683,7 +685,52 @@ class ExecutorAdapter(HarnessApp):
             or self._bg_tasks
         ):
             return None
-        return self._executor.resident_inventory()
+        return self._executor
+
+    def resident_inventory(self) -> ExecutorResidentInventory | None:
+        """Read only the current owner; detached cleanup leaves coverage unknown."""
+        executor = self._resident_inventory_executor()
+        return executor.resident_inventory() if executor is not None else None
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        executor = self._resident_inventory_executor()
+
+        def current() -> bool:
+            return (
+                executor is not None
+                and self._resident_inventory_executor() is executor
+                and not self._shutting_down.is_set()
+            )
+
+        def unknown() -> ContextEvidenceV2:
+            return unknown_context_evidence_v2(session_id, read_id, "executor_unbound")
+
+        if executor is None or not 0 < timeout_s <= 5.0 or not current():
+            return unknown
+        reconcile = await executor.prepare_context_inventory_v2(
+            session_id, read_id, timeout_s=timeout_s
+        )
+        return lambda: reconcile() if current() else unknown()
+
+    async def prepare_resident_thread_inventory(
+        self, *, timeout_s: float = 5.0
+    ) -> Callable[[], ExecutorThreadInventorySnapshot]:
+        """Read an existing executor and recheck its ownership after other sources await."""
+        executor = self._resident_inventory_executor()
+
+        def current() -> bool:
+            return (
+                executor is not None
+                and self._resident_inventory_executor() is executor
+                and not self._shutting_down.is_set()
+            )
+
+        if executor is None or not 0 < timeout_s <= 5.0 or not current():
+            return lambda: ExecutorThreadInventorySnapshot(None, None)
+        reconcile = await executor.prepare_resident_thread_inventory(timeout_s=timeout_s)
+        return lambda: reconcile() if current() else ExecutorThreadInventorySnapshot(None, None)
 
     async def _keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
         """Answer a keep-warm ping through the inner executor's channel."""

@@ -11,12 +11,13 @@ import contextlib
 import enum
 import json
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
@@ -647,7 +648,7 @@ def classify_tool_result(
 
 @dataclass(frozen=True)
 class ExecutorResidentOwner:
-    """Registered execution owner evidence, not a normalized resident count."""
+    """Registered owner evidence; sampled transport epochs are not vendor work revisions."""
 
     incarnation_id: str
     session_keys: tuple[str, ...]
@@ -655,6 +656,7 @@ class ExecutorResidentOwner:
     started: bool
     closing: bool
     cleanup_complete: bool
+    transport_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -665,6 +667,14 @@ class ExecutorResidentInventory:
     ambiguous_context_ids: tuple[str, ...] = ()
     aliases_complete: bool = False
     context_coverage_complete: bool = False
+
+
+@dataclass(frozen=True)
+class ExecutorThreadInventorySnapshot:
+    """Loaded IDs aligned with registered owners; None is unknown, () is empty."""
+
+    inventory: ExecutorResidentInventory | None
+    thread_ids: tuple[tuple[str, ...] | None, ...] | None
 
 
 class Executor:
@@ -712,6 +722,24 @@ class Executor:
     def resident_inventory(self) -> ExecutorResidentInventory | None:
         """Read owned context evidence without construction or probes; None is unknown."""
         return None
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """Legacy owner IDs do not establish canonical context birth or provenance."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id, read_id, "context_source_unimplemented", unsupported=True
+        )
+
+    async def prepare_resident_thread_inventory(
+        self, *, timeout_s: float = 5.0
+    ) -> Callable[[], ExecutorThreadInventorySnapshot]:
+        """Unsupported thread enumeration retains unknown IDs and fresh owner metadata."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: ExecutorThreadInventorySnapshot(None, None)
+        return lambda: ExecutorThreadInventorySnapshot(self.resident_inventory(), None)
 
     async def close_session(self, session_key: str) -> None:  # noqa: ARG002 — default no-op; subclasses with per-session state override
         """

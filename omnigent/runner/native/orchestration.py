@@ -426,6 +426,7 @@ class NativeBackendResidentSnapshot:
     process_exit_confirmed: bool
     exit_confirmed: bool
     aliases_complete: bool = False
+    transport_generation: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -448,6 +449,40 @@ class _ClosingNativeBackend:
 _CLOSING_NATIVE_BACKENDS: dict[object, _ClosingNativeBackend] = {}
 _STARTING_NATIVE_BACKENDS: dict[object, tuple[str, _NativeBackendHarness, _NativeBackend]] = {}
 _native_backend_exit_coverage_complete = True
+
+
+@dataclasses.dataclass(frozen=True)
+class _CodexInventoryClient:
+    incarnation_id: str
+    backend: CodexNativeAppServer
+    client: CodexAppServerClient
+    generation: int
+
+
+_CODEX_INVENTORY_CLIENTS: dict[int, _CodexInventoryClient] = {}
+
+
+def _bind_codex_inventory_client(
+    session_id: str,
+    backend: CodexNativeAppServer | None,
+    client: CodexAppServerClient | None,
+    *,
+    incarnation_id: str | None,
+) -> None:
+    """Observe the forwarder's existing client without taking over its lifecycle."""
+    if (
+        incarnation_id is None
+        or backend is None
+        or client is None
+        or _AUTO_CODEX_APP_SERVERS.get(session_id) is not backend
+        or backend.resident_incarnation_id != incarnation_id
+    ):
+        return
+    generation = getattr(client, "resident_connection_generation", None)
+    if type(generation) is int:
+        _CODEX_INVENTORY_CLIENTS[id(backend)] = _CodexInventoryClient(
+            incarnation_id, backend, client, generation
+        )
 
 
 def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
@@ -483,21 +518,136 @@ def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
             sessions.add(owner.session_id)
         else:
             owners[key] = (owner.harness, owner.backend, {owner.session_id}, False, True)
-    snapshots = tuple(
-        NativeBackendResidentSnapshot(
-            incarnation_id=key,
-            harness=harness,
-            session_ids=tuple(sorted(sessions)),
-            registered=registered,
-            closing=closing,
-            process_exit_confirmed=(
-                key == backend.resident_incarnation_id and backend.process_exit_confirmed
-            ),
-            exit_confirmed=key == backend.resident_incarnation_id and backend.exit_confirmed,
+    snapshots = []
+    for key, (harness, backend, sessions, registered, closing) in owners.items():
+        binding = _CODEX_INVENTORY_CLIENTS.get(id(backend))
+        transport_generation = None
+        if (
+            harness == "codex-native"
+            and registered
+            and not closing
+            and not backend.process_exit_confirmed
+            and not backend.exit_confirmed
+            and binding is not None
+            and binding.backend is backend
+            and binding.incarnation_id == key == backend.resident_incarnation_id
+            and binding.client.resident_connection_generation == binding.generation
+        ):
+            transport_generation = binding.generation
+        snapshots.append(
+            NativeBackendResidentSnapshot(
+                incarnation_id=key,
+                harness=harness,
+                session_ids=tuple(sorted(sessions)),
+                registered=registered,
+                closing=closing,
+                process_exit_confirmed=(
+                    key == backend.resident_incarnation_id and backend.process_exit_confirmed
+                ),
+                exit_confirmed=key == backend.resident_incarnation_id and backend.exit_confirmed,
+                transport_generation=transport_generation,
+            )
         )
-        for key, (harness, backend, sessions, registered, closing) in owners.items()
-    )
-    return NativeBackendInventorySnapshot(snapshots, _native_backend_exit_coverage_complete)
+    return NativeBackendInventorySnapshot(tuple(snapshots), _native_backend_exit_coverage_complete)
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeBackendThreadInventorySnapshot:
+    """Loaded IDs aligned with current owners; None is unknown, () is observed empty."""
+
+    inventory: NativeBackendInventorySnapshot
+    thread_ids: tuple[tuple[str, ...] | None, ...]
+    context_coverage_complete: bool = False
+
+
+async def prepare_native_backend_thread_inventory(
+    *, timeout_s: float = 5.0
+) -> Callable[[], NativeBackendThreadInventorySnapshot]:
+    """Read retained clients and return a synchronous final reconciliation.
+
+    Sample the returned reader after other sources finish awaiting. Loaded IDs
+    are vendor evidence, not independent-context, fresh-revision or alias proof.
+    """
+    selected = native_backend_resident_inventory()
+
+    def binding_for(owner: NativeBackendResidentSnapshot) -> _CodexInventoryClient | None:
+        if owner.transport_generation is None or not owner.session_ids:
+            return None
+        backend = _AUTO_CODEX_APP_SERVERS.get(owner.session_ids[0])
+        binding = _CODEX_INVENTORY_CLIENTS.get(id(backend))
+        if (
+            binding is not None
+            and binding.backend is backend
+            and binding.incarnation_id == owner.incarnation_id
+            and binding.generation == owner.transport_generation
+            and binding.client.resident_connection_generation == binding.generation
+            and all(_AUTO_CODEX_APP_SERVERS.get(key) is backend for key in owner.session_ids)
+        ):
+            return binding
+        return None
+
+    candidates = {
+        owner.incarnation_id: (owner, binding)
+        for owner in selected.owners
+        if (binding := binding_for(owner)) is not None
+    }
+    reads: dict[str, tuple[tuple[str, ...], int]] = {}
+    pending = iter(candidates.values())
+
+    async def read_owners() -> None:
+        for owner, binding in pending:
+            if (
+                binding_for(owner) is not binding
+                or owner not in native_backend_resident_inventory().owners
+            ):
+                continue
+            try:
+                ids = await binding.client.read_loaded_thread_ids(timeout_s=timeout_s)
+            except (ConnectionError, RuntimeError, TimeoutError):
+                continue
+            if ids is not None:
+                revision = getattr(binding.client, "resident_thread_observation_revision", None)
+                if type(revision) is int and revision >= 0:
+                    reads[owner.incarnation_id] = (ids, revision)
+
+    if 0 < timeout_s <= 5.0:
+        try:
+            async with asyncio.timeout(timeout_s), asyncio.TaskGroup() as workers:
+                for _ in range(min(4, len(candidates))):
+                    workers.create_task(read_owners())
+        except TimeoutError:
+            pass
+
+    def reconcile() -> NativeBackendThreadInventorySnapshot:
+        current = native_backend_resident_inventory()
+        thread_ids = tuple(
+            read[0]
+            if (
+                (candidate := candidates.get(owner.incarnation_id)) is not None
+                and candidate[0] == owner
+                and binding_for(owner) is candidate[1]
+                and (read := reads.get(owner.incarnation_id)) is not None
+                and type(
+                    revision := getattr(
+                        candidate[1].client, "resident_thread_observation_revision", None
+                    )
+                )
+                is int
+                and revision == read[1]
+            )
+            else None
+            for owner in current.owners
+        )
+        return NativeBackendThreadInventorySnapshot(current, thread_ids)
+
+    return reconcile
+
+
+async def read_native_backend_thread_inventory(
+    *, timeout_s: float = 5.0
+) -> NativeBackendThreadInventorySnapshot:
+    """Read native evidence when no other sources need to await before returning."""
+    return (await prepare_native_backend_thread_inventory(timeout_s=timeout_s))()
 
 
 async def _start_native_backend(
@@ -531,6 +681,7 @@ async def _close_native_backend(
     """Keep an in-flight close visible; remember unknown exit without retaining owners."""
     global _native_backend_exit_coverage_complete
     incarnation_id = backend.resident_incarnation_id
+    _CODEX_INVENTORY_CLIENTS.pop(id(backend), None)
     close_backend = backend.close()
     token = object()
     _CLOSING_NATIVE_BACKENDS[token] = _ClosingNativeBackend(
@@ -5291,6 +5442,7 @@ async def _auto_create_codex_terminal(
     session_init: RunnerSessionInitEnvelope | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     global_instructions: str | None = None,
+    startup_required: bool = False,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -5957,6 +6109,7 @@ async def _auto_create_codex_terminal(
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
     _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
 
+    inventory_incarnation_id = app_server.resident_incarnation_id if startup_required else None
     event_client = CodexAppServerClient(
         ws_url=codex_ws_url,
         client_name="omnigent-codex-native-auto",
@@ -6141,6 +6294,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 workspace=workspace,
                 event_client=event_client,
+                inventory_incarnation_id=inventory_incarnation_id,
                 app_server=app_server,
                 terminal_instance=terminal_instance,
                 routing_summary=_codex_launch.summary,
@@ -6156,6 +6310,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
                 client=retained_resume_client,
+                inventory_incarnation_id=inventory_incarnation_id,
                 app_server=app_server,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
@@ -6382,9 +6537,13 @@ async def _codex_discover_thread_and_forward(
     thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
+    inventory_incarnation_id: str | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
+
+    Inventory binding requires an admission-enabled incarnation captured before
+    connecting the client; None leaves transport metadata and bindings untouched.
 
     Runs as a background task spawned by :func:`_auto_create_codex_terminal`
     so session creation never blocks on TUI startup. Waits for the fresh TUI
@@ -6480,6 +6639,9 @@ async def _codex_discover_thread_and_forward(
     startup_pending_recorded = False
     cancelled = False
     try:
+        _bind_codex_inventory_client(
+            session_id, app_server, event_client, incarnation_id=inventory_incarnation_id
+        )
         while True:
             try:
                 if login_required or startup_pending_recorded:
@@ -6810,9 +6972,13 @@ async def _codex_forward_known_thread(
     app_server: CodexNativeAppServer | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
+    inventory_incarnation_id: str | None = None,
 ) -> None:
     """
     Forward a runner-owned Codex terminal that resumes an existing thread.
+
+    Inventory binding requires an admission-enabled incarnation captured before
+    preloading the client; None leaves transport metadata and bindings untouched.
 
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Codex bridge directory for this session.
@@ -6842,6 +7008,9 @@ async def _codex_forward_known_thread(
 
     cancelled = False
     try:
+        _bind_codex_inventory_client(
+            session_id, app_server, client, incarnation_id=inventory_incarnation_id
+        )
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
         auth_token = auth_factory() if auth_factory is not None else None
@@ -10545,6 +10714,7 @@ async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
         session_init=ctx.session_init,
         ensure_comment_relay=ctx.ensure_comment_relay,
         global_instructions=ctx.global_instructions,
+        startup_required=ctx.startup_required,
     )
 
 

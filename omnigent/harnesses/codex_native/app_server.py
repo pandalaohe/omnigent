@@ -30,6 +30,7 @@ from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.util.codex_inventory import read_loaded_codex_thread_ids
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -1129,6 +1130,11 @@ class CodexAppServerClient:
         # ``None`` marks the end of the event stream (reader exited).
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
+        self._connection_generation = 0
+        self._resident_thread_started_revision: int | None = None
+        self._established_connection: tuple[int, ClientConnection, asyncio.Task[None]] | None = (
+            None
+        )
 
     async def connect(self) -> None:
         """
@@ -1136,6 +1142,10 @@ class CodexAppServerClient:
 
         :returns: None.
         """
+        self._connection_generation += 1
+        generation = self._connection_generation
+        self._established_connection = None
+        self._resident_thread_started_revision = None
         if self._ws_url is not None:
             self._ws = await websockets.connect(
                 self._ws_url,
@@ -1156,6 +1166,7 @@ class CodexAppServerClient:
             self._reader_loop(),
             name="codex-native-app-server-reader",
         )
+        websocket, reader = self._ws, self._reader_task
         await self.request(
             "initialize",
             {
@@ -1169,6 +1180,12 @@ class CodexAppServerClient:
             },
         )
         await self.notify("initialized")
+        if (
+            self._connection_generation == generation
+            and self._ws is websocket
+            and self._reader_task is reader
+        ):
+            self._established_connection = (generation, websocket, reader)
 
     async def close(self) -> None:
         """
@@ -1176,6 +1193,9 @@ class CodexAppServerClient:
 
         :returns: None.
         """
+        self._connection_generation += 1
+        self._established_connection = None
+        self._resident_thread_started_revision = None
         try:
             if self._reader_task is not None:
                 self._reader_task.cancel()
@@ -1192,6 +1212,62 @@ class CodexAppServerClient:
             finally:
                 self._ws = None
                 self._reader_task = None
+
+    def _current_established_connection(
+        self,
+    ) -> tuple[int, ClientConnection, asyncio.Task[None]] | None:
+        connection = self._established_connection
+        if connection is None:
+            return None
+        generation, websocket, reader = connection
+        if (
+            self._ws is not websocket
+            or self._reader_task is not reader
+            or self._connection_generation != generation
+            or reader.done()
+            or reader.cancelling()
+        ):
+            return None
+        return connection
+
+    @property
+    def resident_connection_generation(self) -> int | None:
+        """Current established transport identity; this does not probe vendor state."""
+        connection = self._current_established_connection()
+        return connection[0] if connection is not None else None
+
+    @property
+    def resident_thread_observation_revision(self) -> int | None:
+        """Locally observed thread additions after inventory starts, not vendor freshness."""
+        return (
+            self._resident_thread_started_revision
+            if self._current_established_connection() is not None
+            else None
+        )
+
+    async def read_loaded_thread_ids(self, *, timeout_s: float = 5.0) -> tuple[str, ...] | None:
+        """Read bounded loaded-thread evidence on the current connection only.
+
+        None means unknown, including interrupted or incomplete pagination. IDs
+        alone establish neither Omnigent ownership nor aliases or context absence.
+        """
+        connection = self._current_established_connection()
+        if not 0 < timeout_s <= 5.0 or connection is None:
+            return None
+        if self._resident_thread_started_revision is None:
+            self._resident_thread_started_revision = 0
+        revision = self.resident_thread_observation_revision
+        try:
+            return await read_loaded_codex_thread_ids(
+                self.request,
+                lambda: (
+                    self._current_established_connection() is connection
+                    and self.resident_thread_observation_revision == revision
+                ),
+                timeout_s=timeout_s,
+            )
+        except ConnectionClosed:
+            return None
 
     async def request(self, method: str, params: CodexParams) -> CodexMessage:
         """
@@ -1301,8 +1377,9 @@ class CodexAppServerClient:
         :returns: None.
         """
         assert self._ws is not None
+        websocket = self._ws
         try:
-            async for raw in self._ws:
+            async for raw in websocket:
                 if not isinstance(raw, str):
                     continue
                 decoded: object = json.loads(raw)
@@ -1330,6 +1407,15 @@ class CodexAppServerClient:
                     if future is not None and not future.done():
                         future.set_result(message)
                     continue
+                if (
+                    self._resident_thread_started_revision is not None
+                    and message.get("method") == "thread/started"
+                    and "id" not in message
+                    and (connection := self._current_established_connection()) is not None
+                    and connection[1] is websocket
+                    and connection[2] is asyncio.current_task()
+                ):
+                    self._resident_thread_started_revision += 1
                 await self._events.put(message)
         finally:
             # Wake iter_events() consumers: no further events can arrive.

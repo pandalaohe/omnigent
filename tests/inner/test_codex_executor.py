@@ -204,6 +204,963 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "single",
+        "empty",
+        "pages",
+        "literal",
+        "duplicate",
+        "overlap",
+        "missing-cursor",
+        "oversized",
+        "repeated-cursor",
+        "page-cap",
+        "rpc-error",
+        "timeout",
+        "cancel",
+        "cancelled-future",
+        "not-started",
+        "closing",
+        "cleaned",
+        "no-process",
+        "no-reader",
+        "dead-reader",
+        "process-exit",
+        "transport-error",
+        "wrong-loop",
+        "replace-process",
+        "replace-stdin",
+        "replace-reader",
+        "incarnation",
+        "unbound-pair",
+        "generation",
+        "rebound-pair",
+        "close-during-read",
+        "invalid-timeout",
+    ],
+)
+async def test_sdk_loaded_thread_inventory_uses_only_current_stdio(case):
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+    )
+    proc = _FakeProcess()
+    stdout = _QueuedStdoutPipe()
+    proc.stdout = stdout
+    session._proc = proc
+    session._loop = asyncio.get_running_loop()
+    session._started = True
+    session._cleaned = False
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    session._resident_connection_generation = 0
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
+    await asyncio.sleep(0)
+    session.start = AsyncMock(side_effect=AssertionError("must not start"))
+    session.close = AsyncMock(side_effect=AssertionError("must not close"))
+    entered = asyncio.Event()
+    requests, extra_readers = [], []
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        requests.append(message)
+        entered.set()
+        index = len(requests)
+        data, cursor = ["main"], None
+        if case == "empty":
+            data = []
+        elif case == "literal":
+            data = [" main ", "main"]
+        elif case in {"pages", "overlap"}:
+            data = ["main"] if index == 1 or case == "overlap" else ["side"]
+            cursor = "second" if index == 1 else None
+        elif case == "duplicate":
+            data = ["main", "main"]
+        elif case == "oversized":
+            data = [str(i) for i in range(101)]
+        elif case in {"repeated-cursor", "page-cap"}:
+            data, cursor = [str(index)], "same" if case == "repeated-cursor" else str(index)
+        elif case in {"timeout", "cancel"}:
+            return
+        elif case == "cancelled-future":
+            session._pending_requests[message["id"]].cancel()
+            return
+        elif case == "replace-process":
+            session._proc = _FakeProcess()
+        elif case == "replace-stdin":
+            proc.stdin = _FakePipe()
+        elif case == "replace-reader":
+            extra = asyncio.create_task(asyncio.Event().wait())
+            extra_readers.append(extra)
+            session._reader_task = extra
+        elif case == "incarnation":
+            session._resident_incarnation_id = "restarted-owner"
+        elif case == "generation":
+            session._resident_connection_generation += 1
+        elif case == "rebound-pair":
+            session._resident_established_connection = (*session._resident_established_connection,)
+        elif case == "close-during-read":
+            session._closing = True
+        reply = {"id": message["id"], "result": {"data": data, "nextCursor": cursor}}
+        if case == "missing-cursor":
+            reply["result"].pop("nextCursor")
+        elif case == "rpc-error":
+            reply = {"id": message["id"], "error": {"code": -32601, "message": "unsupported"}}
+        stdout.feed(reply)
+
+    proc.stdin.drain = respond
+    no_rpc = {
+        "not-started",
+        "closing",
+        "cleaned",
+        "no-process",
+        "no-reader",
+        "dead-reader",
+        "process-exit",
+        "transport-error",
+        "wrong-loop",
+        "invalid-timeout",
+        "unbound-pair",
+    }
+    if case == "not-started":
+        session._started = False
+    elif case == "closing":
+        session._closing = True
+    elif case == "cleaned":
+        session._cleaned = True
+    elif case == "no-process":
+        session._proc = None
+    elif case == "no-reader":
+        session._reader_task = None
+    elif case == "dead-reader":
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+    elif case == "process-exit":
+        proc.returncode = 0
+    elif case == "transport-error":
+        session._transport_error = HarnessTransportClosedError("transport lost")
+    elif case == "wrong-loop":
+        session._loop = None
+    elif case == "unbound-pair":
+        session._resident_established_connection = None
+    read = None
+    try:
+        read = asyncio.create_task(
+            session.read_loaded_thread_ids(timeout_s=0 if case == "invalid-timeout" else 0.1)
+        )
+        if case == "cancel":
+            await asyncio.wait_for(entered.wait(), 2)
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        else:
+            result = await asyncio.wait_for(read, 2)
+            assert result == {
+                "single": ("main",),
+                "empty": (),
+                "pages": ("main", "side"),
+                "literal": (" main ", "main"),
+            }.get(case)
+        assert session._pending_requests == {}
+        assert session._events.empty()
+        assert not requests if case in no_rpc else requests
+        if requests:
+            assert all(m["method"] == "thread/list/loaded" for m in requests)
+            assert requests[0]["params"] == {"limit": 100}
+        if case == "pages":
+            assert requests[1]["params"] == {"limit": 100, "cursor": "second"}
+        if case == "page-cap":
+            assert len(requests) == 10
+        session.start.assert_not_called()
+        session.close.assert_not_called()
+        if case in no_rpc:
+            assert session._resident_thread_started_revision is None
+    finally:
+        session._closing = True
+        for task in [reader, *extra_readers, *([read] if read is not None else [])]:
+            task.cancel()
+        await asyncio.gather(
+            reader, *extra_readers, *([read] if read is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.parametrize("change", ["process", "stdin", "closing", "timeout", "observation"])
+async def test_sdk_loaded_thread_inventory_rechecks_after_stdin_lock_wait(change):
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+    )
+    proc = _FakeProcess()
+    session._proc = proc
+    session._loop = asyncio.get_running_loop()
+    session._started, session._cleaned = True, False
+    reader = asyncio.create_task(asyncio.Event().wait())
+    session._reader_task = reader
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
+    await session._stdin_lock.acquire()
+    read = asyncio.create_task(session.read_loaded_thread_ids(timeout_s=0.1))
+    try:
+        await asyncio.sleep(0)
+        assert len(session._pending_requests) == 1
+        target = proc.stdin
+        if change == "process":
+            session._proc = _FakeProcess()
+            target = session._proc.stdin
+        elif change == "stdin":
+            proc.stdin = _FakePipe()
+            target = proc.stdin
+        elif change == "closing":
+            session._closing = True
+        elif change == "observation":
+            session._resident_thread_started_revision += 1
+        if change != "timeout":
+            session._stdin_lock.release()
+        assert await asyncio.wait_for(read, 2) is None
+        assert target.writes == []
+        assert session._pending_requests == {}
+    finally:
+        if session._stdin_lock.locked():
+            session._stdin_lock.release()
+        reader.cancel()
+        read.cancel()
+        await asyncio.gather(reader, read, return_exceptions=True)
+
+
+@pytest.fixture
+async def sdk_inventory_stream(monkeypatch):
+    import omnigent.inner.codex_executor as codex_module
+
+    monkeypatch.setattr(codex_module, "_SDK_INVENTORY_FRAME_LIMIT_BYTES", 1024, raising=False)
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+    )
+    proc = _FakeProcess()
+    proc.stdout = _QueuedStdoutPipe()
+    session._proc = proc
+    session._loop = asyncio.get_running_loop()
+    session._started, session._cleaned = True, False
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
+    await asyncio.sleep(0)
+    try:
+        yield session, proc, reader
+    finally:
+        session._closing = True
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "started-loaded",
+        "started-empty",
+        "started-page-two",
+        "earlier-started",
+        "unrelated",
+        "server-request",
+        "stale-reader",
+        "maintenance-started",
+    ],
+)
+async def test_sdk_loaded_thread_inventory_observes_new_threads(sdk_inventory_stream, case):
+    session, proc, reader = sdk_inventory_stream
+    previous_proc, previous_reader = proc, reader
+    if case == "stale-reader":
+        proc = _FakeProcess()
+        proc.stdout = _QueuedStdoutPipe()
+        session._proc = proc
+        session._reader_task = reader = asyncio.create_task(session._reader_loop())
+        session._resident_connection_generation = 1
+        session._resident_established_connection = (1, proc, proc.stdin, reader, session._loop)
+        await asyncio.sleep(0)
+    session.start = AsyncMock(side_effect=AssertionError("read must not start"))
+    session.close = AsyncMock(side_effect=AssertionError("read must not close"))
+    requests = []
+    resample = False
+    maintenance = asyncio.Queue()
+    if case == "maintenance-started":
+        session._keep_warm_queues["new"] = maintenance
+
+    async def notify(event, stdout=None):
+        (stdout if stdout is not None else proc.stdout).feed(event)
+        queue = maintenance if case == "maintenance-started" else session._events
+        assert await asyncio.wait_for(queue.get(), 1) == event
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        assert message["method"] == "thread/list/loaded"
+        requests.append(message)
+        index = len(requests)
+        if (
+            not resample
+            and case != "earlier-started"
+            and index == (2 if case == "started-page-two" else 1)
+        ):
+            event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+            if case == "unrelated":
+                event["method"] = "turn/completed"
+            elif case == "server-request":
+                event["id"] = 99
+            elif case == "maintenance-started":
+                event["params"]["thread"].update(
+                    ephemeral=True, threadSource="omnigent-keep-warm", forkedFromId="main"
+                )
+            await notify(event, previous_proc.stdout if case == "stale-reader" else None)
+        data = [] if case == "started-empty" else ["main"] if index == 1 else ["side"]
+        if resample or case == "earlier-started":
+            data = ["main", "new"]
+        cursor = "second" if not resample and case == "started-page-two" and index == 1 else None
+        proc.stdout.feed({"id": message["id"], "result": {"data": data, "nextCursor": cursor}})
+
+    proc.stdin.drain = respond
+    try:
+        assert session.resident_thread_observation_revision is None
+        if case == "earlier-started":
+            await notify({"method": "thread/started", "params": {"thread": {"id": "new"}}})
+            assert session.resident_thread_observation_revision is None
+        result = await session.read_loaded_thread_ids(timeout_s=1)
+        changed = case.startswith("started-") or case == "maintenance-started"
+        if changed:
+            assert result is None
+            resample = True
+            assert await session.read_loaded_thread_ids(timeout_s=1) == ("main", "new")
+        else:
+            assert result == (("main", "new") if case == "earlier-started" else ("main",))
+        assert session.resident_thread_observation_revision == (1 if changed else 0)
+        assert not reader.done() and session._pending_requests == {}
+        assert session._events.empty() and session._transport_error is None
+        session.start.assert_not_called()
+        session.close.assert_not_called()
+    finally:
+        if reader is not previous_reader:
+            session._closing = True
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.parametrize("when", ["during-read", "after-timeout", "terminated-frame"])
+async def test_sdk_inventory_frame_overflow_stops_reader(sdk_inventory_stream, when):
+    session, proc, reader = sdk_inventory_stream
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        if when == "after-timeout":
+            proc.stdout._frames.put_nowait(b'{"id":1,"result":{"data":["')
+        elif when == "terminated-frame":
+            proc.stdout.feed(
+                {"id": message["id"], "result": {"data": ["x" * 2048], "nextCursor": None}}
+            )
+        else:
+            proc.stdout._frames.put_nowait(b"x" * 2048)
+
+    proc.stdin.drain = respond
+    assert await session.read_loaded_thread_ids(timeout_s=0.03) is None
+    if when == "after-timeout":
+        proc.stdout._frames.put_nowait(b"x" * 2048)
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert reader.done(), "overflow must stop accumulating stdout after inventory ends"
+    assert isinstance(session._transport_error, HarnessTransportClosedError)
+    assert "frame" in str(session._transport_error).lower()
+    assert "1024" in str(session._transport_error)
+    assert session._pending_requests == {}
+    assert reader.get_coro().cr_frame is None
+    proc.stdout._frames.put_nowait(b"x" * 2048)
+    await asyncio.sleep(0)
+    assert proc.stdout._frames.qsize() == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "none",
+        "unbound",
+        "generation",
+        "process",
+        "stdin",
+        "reader",
+        "cancel-reader",
+        "cleaned",
+        "not-started",
+        "closing",
+        "exit",
+        "error",
+        "loop",
+        "rebind",
+    ],
+)
+async def test_sdk_resident_connection_generation_is_read_only(sdk_inventory_stream, change):
+    session, proc, reader = sdk_inventory_stream
+    assert session.resident_connection_generation == 0
+    assert session.resident_thread_observation_revision is None
+    session._resident_thread_started_revision = 3
+    guard = session._resident_transport_guard()
+    if change == "unbound":
+        session._resident_established_connection = None
+    elif change == "generation":
+        session._resident_connection_generation += 1
+    elif change == "process":
+        session._proc = _FakeProcess()
+    elif change == "stdin":
+        proc.stdin = _FakePipe()
+    elif change == "reader":
+        session._reader_task = None
+    elif change == "cancel-reader":
+        reader.cancel()
+    elif change == "cleaned":
+        session._cleaned = True
+    elif change == "not-started":
+        session._started = False
+    elif change == "closing":
+        session._closing = True
+    elif change == "exit":
+        proc.returncode = 0
+    elif change == "error":
+        session._transport_error = HarnessTransportClosedError("transport lost")
+    elif change == "loop":
+        session._loop = None
+    elif change == "rebind":
+        session._resident_established_connection = (*session._resident_established_connection,)
+    assert session.resident_connection_generation == (0 if change in {"none", "rebind"} else None)
+    assert session.resident_thread_observation_revision == (
+        3 if change in {"none", "rebind"} else None
+    )
+    assert guard() is (change == "none")
+    assert session._pending_requests == {} and not proc.stdin.writes
+    assert session._resident_inventory_frame_limit is None
+
+
+@pytest.mark.parametrize("end", ["complete", "failure", "cancel", "stale", "stdin"])
+async def test_sdk_resident_generation_follows_initialized_transport(monkeypatch, tmp_path, end):
+    import omnigent.inner.codex_executor as module
+
+    monkeypatch.setattr(module, "_codex_home_config_source_from_env", lambda: tmp_path / "empty")
+    monkeypatch.setattr(module, "codex_minimal_config_requested", lambda: True)
+    monkeypatch.setattr(module._proc, "native_server_pid", lambda *_args: None)
+    entered, resume = asyncio.Event(), asyncio.Event()
+    processes = []
+
+    async def spawn(*_args, **_kwargs):
+        proc = _FakeProcess()
+        proc.stdout = _ScriptedStdoutPipe([])
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(module, "_create_subprocess_exec", AsyncMock(side_effect=spawn))
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd=str(tmp_path), env={}, tool_executor=None
+    )
+
+    async def initialize(method, _params):
+        assert method == "initialize"
+        assert session._resident_thread_started_revision is None
+        assert session.resident_thread_observation_revision is None
+        entered.set()
+        await resume.wait()
+        if end == "failure":
+            raise RuntimeError("initialize failed")
+        return {"result": {}}
+
+    session._request = AsyncMock(side_effect=initialize)
+    assert session.resident_connection_generation is None
+    session._resident_thread_started_revision = 7
+    start = asyncio.create_task(session.start())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert session.resident_connection_generation is None
+        assert not session._resident_transport_guard()()
+        if end == "cancel":
+            start.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await start
+        else:
+            if end == "stale":
+                session._resident_connection_generation += 1
+            elif end == "stdin":
+                processes[0].stdin = _FakePipe()
+            resume.set()
+            if end == "failure":
+                with pytest.raises(RuntimeError, match="initialize failed"):
+                    await start
+            else:
+                await start
+        if end == "complete":
+            generation = session.resident_connection_generation
+            assert isinstance(generation, int)
+            guard = session._resident_transport_guard()
+            assert guard()
+            assert session.resident_thread_observation_revision is None
+            session._resident_thread_started_revision = 3
+            await session.start()
+            assert session.resident_connection_generation == generation
+            assert session.resident_thread_observation_revision == 3
+            assert len(processes) == 1
+            await session.close()
+            assert session.resident_connection_generation is None and not guard()
+            assert session._resident_thread_started_revision is None
+            entered.clear()
+            resume.clear()
+            start = asyncio.create_task(session.start())
+            await asyncio.wait_for(entered.wait(), 2)
+            assert session.resident_connection_generation is None
+            resume.set()
+            await start
+            assert session.resident_connection_generation > generation
+            assert not guard() and len(processes) == 2
+        else:
+            assert session.resident_connection_generation is None
+            assert session._resident_established_connection is None
+        assert all(not proc.stdin.writes for proc in processes)
+    finally:
+        resume.set()
+        start.cancel()
+        await asyncio.gather(start, return_exceptions=True)
+        await session.close()
+        assert session._resident_established_connection is None
+        assert session._resident_thread_started_revision is None
+
+
+@pytest.mark.parametrize("inventory", [False, True])
+async def test_sdk_inventory_frame_budget_preserves_other_frames(sdk_inventory_stream, inventory):
+    session, proc, reader = sdk_inventory_stream
+    # An unobserved SDK stream retains its pre-existing large event behavior.
+    payload = "x" * (100 if inventory else 2048)
+    frames = [{"method": "sample/event", "params": {"text": payload}} for _ in range(20)]
+    encoded = b"".join((json.dumps(frame) + "\n").encode() for frame in frames)
+    assert len(encoded) > 1024
+    if inventory:
+
+        async def respond():
+            message = json.loads(proc.stdin.writes[-1])
+            proc.stdout._frames.put_nowait(encoded)
+            proc.stdout.feed(
+                {"id": message["id"], "result": {"data": ["main"], "nextCursor": None}}
+            )
+
+        proc.stdin.drain = respond
+        assert await session.read_loaded_thread_ids() == ("main",)
+    else:
+        proc.stdout._frames.put_nowait(encoded)
+    observed = [await asyncio.wait_for(session._events.get(), 2) for _ in frames]
+    assert observed == frames
+    assert not reader.done() and session._transport_error is None
+
+
+async def test_sdk_inventory_frame_cap_checks_stalled_partial_frame(sdk_inventory_stream):
+    session, proc, previous_reader = sdk_inventory_stream
+    previous_reader.cancel()
+    await asyncio.gather(previous_reader, return_exceptions=True)
+    stream = asyncio.StreamReader()
+    proc.stdout = stream
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    session._resident_established_connection = (0, proc, proc.stdin, reader, session._loop)
+    try:
+        stream.feed_data(b"x" * 8237)
+        await asyncio.sleep(0)
+        assert not stream._buffer and stream._waiter is not None
+        assert not reader.done() and session._transport_error is None
+        assert session._resident_inventory_frame_limit is None
+
+        assert await session.read_loaded_thread_ids(timeout_s=0.03) is None
+        await asyncio.sleep(0)
+        assert reader.done(), "arming must stop an oversized stalled frame without another byte"
+        assert isinstance(session._transport_error, HarnessTransportClosedError)
+        assert "1024" in str(session._transport_error)
+        assert session._pending_requests == {}
+        assert reader.get_coro().cr_frame is None
+        assert proc.stdin.writes == []
+    finally:
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+async def test_sdk_inventory_normalizes_real_subprocess_stdin_eio(sdk_inventory_stream):
+    session, proc, reader = sdk_inventory_stream
+    loop = asyncio.get_running_loop()
+    protocol = asyncio.subprocess.SubprocessStreamProtocol(limit=65536, loop=loop)
+    original_stdin = proc.stdin
+    closed = []
+    transport = SimpleNamespace(
+        write=original_stdin.write,
+        is_closing=lambda: bool(closed),
+        close=lambda: closed.append(True),
+    )
+    stdin = asyncio.StreamWriter(transport, protocol, None, loop)
+    proc.stdin = stdin
+    session._resident_established_connection = (0, proc, stdin, reader, loop)
+    protocol.pause_writing()
+    read = asyncio.create_task(session.read_loaded_thread_ids())
+    try:
+        await asyncio.sleep(0)
+        assert len(original_stdin.writes) == 1 and not read.done()
+        protocol.connection_lost(OSError(errno.EIO, "stdio I/O failure"))
+        assert await asyncio.wait_for(read, 2) is None
+        assert session._pending_requests == {} and not session._stdin_lock.locked()
+    finally:
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+        stdin.close()
+
+
+@pytest.fixture
+async def sdk_inventory_owners():
+    executor = CodexExecutor(codex_path="/opt/work/bin/codex")
+    apps, readers = [], []
+
+    def add(key, ids):
+        app = _CodexAppServerSession(
+            codex_path="/opt/work/bin/codex", cwd="/opt/work/project", env={}, tool_executor=None
+        )
+        app._resident_incarnation_id = f"{len(apps) + 1:032x}"
+        app.thread_id = key
+        app._proc = proc = _FakeProcess()
+        proc.stdout = _QueuedStdoutPipe()
+        app._loop = asyncio.get_running_loop()
+        app._started, app._cleaned = True, False
+        app._reader_task = reader = asyncio.create_task(app._reader_loop())
+        app._resident_established_connection = (0, proc, proc.stdin, reader, app._loop)
+        apps.append(app)
+        readers.append(reader)
+        executor._session_states[key] = _CodexSessionState(app_session=app)
+        app.start = AsyncMock(side_effect=AssertionError("inventory must not start"))
+        app.close = AsyncMock(side_effect=AssertionError("inventory must not close"))
+
+        async def respond():
+            message = json.loads(proc.stdin.writes[-1])
+            proc.stdout.feed({"id": message["id"], "result": {"data": ids, "nextCursor": None}})
+
+        proc.stdin.drain = respond
+        return app
+
+    try:
+        yield executor, add
+    finally:
+        for app in apps:
+            app._closing = True
+            app.start.assert_not_called()
+            app.close.assert_not_called()
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "union",
+        "empty",
+        "collision",
+        "maintenance",
+        "unsupported",
+        "revision-none",
+        "revision-bool",
+        "revision-string",
+        "revision-float",
+        "revision-negative",
+        "revision-later",
+    ],
+)
+async def test_sdk_executor_thread_inventory_collects_registered_owners(
+    sdk_inventory_owners, case
+):
+    executor, add = sdk_inventory_owners
+    apps = []
+    if case != "empty":
+        main, side = add("main", ["main", "sub"]), add("side", [])
+        apps = [main, side]
+        executor._session_states["alias"] = _CodexSessionState(app_session=main)
+        if case == "collision":
+            side._resident_incarnation_id = main.resident_incarnation_id
+        elif case == "maintenance":
+            main._resident_maintenance["maintenance"] = "sub"
+        elif case == "unsupported":
+            executor._session_states["foreign"] = _CodexSessionState(app_session=object())
+        elif case.startswith("revision-"):
+            main._resident_thread_started_revision = {
+                "revision-none": None,
+                "revision-bool": False,
+                "revision-string": "0",
+                "revision-float": 0.0,
+                "revision-negative": -1,
+                "revision-later": 7,
+            }[case]
+            main.read_loaded_thread_ids = AsyncMock(return_value=("main", "sub"))
+    reconcile = await executor.prepare_resident_thread_inventory(timeout_s=0.1)
+    result = reconcile()
+    if case in {"collision", "unsupported"}:
+        assert result.inventory is None and result.thread_ids is None
+        assert all(not app._proc.stdin.writes for app in apps)
+        return
+    assert result.inventory == executor.resident_inventory()
+    assert not result.inventory.aliases_complete and not result.inventory.context_coverage_complete
+    assert result.thread_ids == {
+        "union": (("main", "sub"), ()),
+        "empty": (),
+        "maintenance": (("main", "sub"), (), None),
+    }.get(case, (("main", "sub") if case == "revision-later" else None, ()))
+    if apps:
+        assert result.inventory.owners[0].session_keys == ("alias", "main")
+        assert tuple(o.transport_generation for o in result.inventory.owners) == (
+            (0, 0, None) if case == "maintenance" else (0, 0)
+        )
+        if case.startswith("revision-"):
+            main.read_loaded_thread_ids.assert_awaited_once_with(timeout_s=0.1)
+            assert not main._proc.stdin.writes and len(side._proc.stdin.writes) == 1
+        else:
+            assert all(len(app._proc.stdin.writes) == 1 for app in apps)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "proc",
+        "stdin",
+        "reader",
+        "incarnation",
+        "loop",
+        "closing",
+        "cleaned",
+        "exit",
+        "error",
+        "remove",
+        "replace",
+        "alias",
+        "thread",
+        "collision",
+        "observation",
+        "observation-none",
+        "observation-bool",
+        "observation-string",
+        "observation-float",
+        "observation-negative",
+    ],
+)
+async def test_sdk_executor_thread_inventory_reconciles_after_later_awaits(
+    sdk_inventory_owners, change
+):
+    executor, add = sdk_inventory_owners
+    first, second = add("first", ["first"]), add("second", ["second"])
+    reconcile = await executor.prepare_resident_thread_inventory(timeout_s=0.1)
+    before = reconcile()
+    assert before.thread_ids == (("first",), ("second",))
+    if change == "proc":
+        first._proc = _FakeProcess()
+    elif change == "stdin":
+        first._proc.stdin = _FakePipe()
+    elif change == "reader":
+        first._reader_task = second._reader_task
+    elif change == "incarnation":
+        first._resident_incarnation_id = "changed"
+    elif change == "loop":
+        first._loop = None
+    elif change == "closing":
+        executor._session_states["first"].closing = True
+    elif change == "cleaned":
+        first._cleaned = True
+    elif change == "exit":
+        first._proc.returncode = 0
+    elif change == "error":
+        first._transport_error = HarnessTransportClosedError("gone")
+    elif change == "remove":
+        del executor._session_states["first"]
+    elif change == "replace":
+        replacement = add("first", ["replacement"])
+        replacement._resident_incarnation_id = first.resident_incarnation_id
+    elif change == "alias":
+        executor._session_states["alias"] = _CodexSessionState(app_session=first)
+    elif change == "thread":
+        first.thread_id = "new-thread"
+    elif change == "collision":
+        second._resident_incarnation_id = first.resident_incarnation_id
+    elif change == "observation":
+        event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+        first._proc.stdout.feed(event)
+        assert await asyncio.wait_for(first._events.get(), 1) == event
+    elif change.startswith("observation-"):
+        first._resident_thread_started_revision = {
+            "observation-none": None,
+            "observation-bool": False,
+            "observation-string": "0",
+            "observation-float": 0.0,
+            "observation-negative": -1,
+        }[change]
+    await asyncio.sleep(0)
+    after = reconcile()
+    assert before.thread_ids == (("first",), ("second",))
+    if change == "collision":
+        assert after.inventory is None and after.thread_ids is None
+    else:
+        evidence = dict(
+            zip((o.incarnation_id for o in after.inventory.owners), after.thread_ids, strict=True)
+        )
+        assert evidence.pop(second.resident_incarnation_id) == ("second",)
+        assert all(ids is None for ids in evidence.values())
+
+
+@pytest.mark.parametrize("case", ["deadline", "cancel", "invalid", "not-ready", "rpc-error"])
+async def test_sdk_executor_thread_inventory_bounds_reads_and_preserves_unknowns(
+    sdk_inventory_owners, case
+):
+    executor, add = sdk_inventory_owners
+    apps = [add(f"owner-{i}", [f"owner-{i}"]) for i in range(6)]
+    entered, active = asyncio.Event(), []
+
+    async def stall():
+        active.append(True)
+        if len(active) == 4:
+            entered.set()
+        await asyncio.Event().wait()
+
+    if case in {"deadline", "cancel"}:
+        for app in apps:
+            app._proc.stdin.drain = stall
+    elif case == "not-ready":
+        for app in apps:
+            app._started = False
+    elif case == "rpc-error":
+
+        async def fail():
+            proc = apps[0]._proc
+            message = json.loads(proc.stdin.writes[-1])
+            proc.stdout.feed({"id": message["id"], "error": {"code": -1, "message": "unknown"}})
+
+        apps[0]._proc.stdin.drain = fail
+    read = asyncio.create_task(
+        executor.prepare_resident_thread_inventory(timeout_s=0 if case == "invalid" else 0.1)
+    )
+    try:
+        if case in {"deadline", "cancel"}:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert len(active) == 4
+        if case == "cancel":
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        else:
+            reconcile = await asyncio.wait_for(read, 2)
+            assert reconcile().thread_ids == (
+                (None, *((f"owner-{i}",) for i in range(1, 6)))
+                if case == "rpc-error"
+                else (None,) * 6
+            )
+        assert all(not app._pending_requests for app in apps)
+        if case in {"invalid", "not-ready"}:
+            assert all(not app._proc.stdin.writes for app in apps)
+    finally:
+        read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+@pytest.mark.parametrize("change", ["none", "transport", "observation"])
+async def test_sdk_thread_inventory_through_existing_adapter(sdk_inventory_owners, change):
+    from unittest.mock import Mock
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor, add = sdk_inventory_owners
+    app = add("main", ["main", "sub"])
+    factory = Mock(side_effect=AssertionError("must not construct executor"))
+    adapter = ExecutorAdapter(factory)
+    adapter._executor = executor
+    reconcile = await adapter.prepare_resident_thread_inventory(timeout_s=0.1)
+    initial = reconcile()
+    assert initial.inventory == executor.resident_inventory()
+    assert initial.thread_ids == (("main", "sub"),)
+    assert not initial.inventory.aliases_complete
+    assert not initial.inventory.context_coverage_complete
+    if change != "none":
+        if change == "transport":
+            app._proc.stdin = _FakePipe()
+        else:
+            event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+            app._proc.stdout.feed(event)
+            assert await asyncio.wait_for(app._events.get(), 1) == event
+        await asyncio.sleep(0)
+        assert reconcile().thread_ids == (None,)
+    else:
+        assert reconcile() == initial
+    assert initial.thread_ids == (("main", "sub"),)
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["loaded", "empty", "observation"])
+async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owners, case):
+    from unittest.mock import Mock
+
+    import httpx
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor, add = sdk_inventory_owners
+    owner = add("main", [] if case == "empty" else ["main", "sub"])
+    factory = Mock(side_effect=AssertionError("must not construct executor"))
+    adapter = ExecutorAdapter(factory)
+    adapter._executor = executor
+    if case == "observation":
+        prepare = adapter.prepare_resident_thread_inventory
+
+        async def after_read(*, timeout_s):
+            reconcile = await prepare(timeout_s=timeout_s)
+            event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
+            owner._proc.stdout.feed(event)
+            assert await asyncio.wait_for(owner._events.get(), 1) == event
+            return reconcile
+
+        adapter.prepare_resident_thread_inventory = after_read
+    app = adapter.build()
+    app.state.conversation_id = "conversation"
+    app.state.harness_auth_token = "test-auth"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer test-auth"},
+    ) as client:
+        legacy = await client.get("/v1/sessions/conversation/resident-inventory")
+        assert legacy.status_code == 200 and set(legacy.json()) == {"inventory"}
+        assert owner._proc.stdin.writes == []
+        response = await client.get("/v1/sessions/conversation/resident-thread-inventory")
+    assert response.status_code == 200
+    assert response.json()["inventory"]["owners"][0]["transport_generation"] == 0
+    assert response.json() == {
+        "inventory": legacy.json()["inventory"],
+        "thread_ids": [
+            None if case == "observation" else [] if case == "empty" else ["main", "sub"]
+        ],
+    }
+    assert len(owner._proc.stdin.writes) == 1
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["none", "closing", "unbound", "restart", "maintenance"])
+async def test_sdk_resident_inventory_copies_only_established_generation(
+    sdk_inventory_owners, change
+):
+    executor, add = sdk_inventory_owners
+    app = add("main", ["main"])
+    executor._session_states["alias"] = _CodexSessionState(app_session=app)
+    if change == "closing":
+        executor._session_states["alias"].closing = True
+    elif change == "unbound":
+        app._resident_established_connection = None
+    elif change == "restart":
+        app._resident_connection_generation = 7
+        _, proc, stdin, reader, loop = app._resident_established_connection
+        app._resident_established_connection = (7, proc, stdin, reader, loop)
+    elif change == "maintenance":
+        app._resident_maintenance["maintenance"] = "side"
+    snapshot = executor.resident_inventory()
+    assert snapshot.owners[0].session_keys == ("alias", "main")
+    expected = None if change in {"closing", "unbound"} else 7 if change == "restart" else 0
+    assert snapshot.owners[0].transport_generation == expected
+    if change == "maintenance":
+        assert snapshot.owners[1].transport_generation is None
+    assert not snapshot.aliases_complete and not snapshot.context_coverage_complete
+    assert app._proc.stdin.writes == [] and app._resident_inventory_frame_limit is None
+
+
 class TestCodexExecutor(unittest.TestCase):
     def test_databricks_codex_config_overrides(self):
         overrides = _databricks_codex_config_overrides(
@@ -8788,6 +9745,7 @@ def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monke
                 "started": True,
                 "closing": False,
                 "cleanup_complete": False,
+                "transport_generation": None,
             },
             {
                 "incarnation_id": "2" * 32,
@@ -8796,6 +9754,7 @@ def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monke
                 "started": True,
                 "closing": True,
                 "cleanup_complete": False,
+                "transport_generation": None,
             },
             {
                 "incarnation_id": "3" * 32,
@@ -8804,6 +9763,7 @@ def test_resident_inventory_preserves_owner_identity_and_alias_uncertainty(monke
                 "started": True,
                 "closing": False,
                 "cleanup_complete": False,
+                "transport_generation": None,
             },
         ),
         "ambiguous_context_ids": ("thread-main",),

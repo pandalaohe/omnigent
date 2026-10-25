@@ -44,6 +44,7 @@ from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_t
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     CAP_KEEP_WARM,
+    HostContextInventoryV2ResultFrame,
     HostHelloFrame,
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
@@ -548,6 +549,9 @@ class HostConnection:
     pending_owner_inventory: dict[str, asyncio.Future[HostOwnerInventoryResultFrame]] = field(
         default_factory=dict,
     )
+    pending_context_inventory: dict[str, asyncio.Future[HostContextInventoryV2ResultFrame]] = (
+        field(default_factory=dict)
+    )
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
     # Each item is a ("session", dict) or ("done", dict) tuple.
@@ -689,6 +693,7 @@ class HostRegistry:
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
                 _fail_pending_inventory(old.pending_owner_inventory, old.host_id)
+                _fail_pending_inventory(old.pending_context_inventory, old.host_id)
                 _fail_pending_folder_facts(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -740,6 +745,7 @@ class HostRegistry:
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
         _fail_pending_inventory(removed.pending_owner_inventory, removed.host_id)
+        _fail_pending_inventory(removed.pending_context_inventory, removed.host_id)
         _fail_pending_folder_facts(removed)
         return True
 

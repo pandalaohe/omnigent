@@ -1,7 +1,9 @@
 """Incomplete owner evidence cannot become startup or resident permission."""
 
 import asyncio
+import contextlib
 import threading
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -823,6 +825,8 @@ async def test_host_owner_inventory_compatibility_unknown_never_enqueues(
         "missing-field",
         "extra-field",
         "duplicate-owner",
+        "empty-pending",
+        "duplicate-pending",
         "complete-coverage",
         "wrong-generation",
         "wrong-connection",
@@ -844,6 +848,10 @@ async def test_host_owner_inventory_invalid_reply_is_unknown(host_owner_control,
             body["inventory"]["runners"][0]["unexpected"] = "field"
         elif fault_kind == "duplicate-owner":
             body["inventory"]["runners"] *= 2
+        elif fault_kind == "empty-pending":
+            body["inventory"]["pending_runner_ids"] = [""]
+        elif fault_kind == "duplicate-pending":
+            body["inventory"]["pending_runner_ids"] = ["runner-pending", "runner-pending"]
         elif fault_kind == "complete-coverage":
             body["inventory"]["context_coverage_complete"] = True
         elif fault_kind == "wrong-generation":
@@ -1154,7 +1162,48 @@ async def _exchange_host_context_inventory(setup, **kwargs):
         await asyncio.gather(read, return_exceptions=True)
 
 
-async def test_host_context_inventory_preserves_contexts_and_aliases(host_context_reader):
+@pytest.mark.parametrize("native_threads", [False, True])
+@pytest.mark.parametrize("harness_threads", [None, (("main", "side"), ()), (None, ("side",))])
+async def test_host_context_inventory_preserves_contexts_and_aliases(
+    host_context_reader, native_threads, harness_threads
+):
+    if harness_threads is not None:
+        import json
+
+        async def include_harness(response):
+            await response.aread()
+            payload = response.json()
+            payload["harness_thread_ids"] = [harness_threads]
+            contexts = payload["harnesses"]["contexts"][0]["inventory"]["owners"]
+            for owner, generation in zip(contexts, (0, 7), strict=True):
+                owner["transport_generation"] = generation
+            response._content = json.dumps(payload).encode()
+
+        host_context_reader[-2].event_hooks["response"].append(include_harness)
+    if native_threads:
+        import json
+        from dataclasses import asdict
+
+        from omnigent.runner.native.orchestration import NativeBackendResidentSnapshot
+
+        async def include_native(response):
+            await response.aread()
+            payload = response.json()
+            owner = NativeBackendResidentSnapshot(
+                "native-one",
+                "codex-native",
+                ("native-main", "native-ui"),
+                True,
+                False,
+                False,
+                False,
+                transport_generation=3,
+            )
+            payload["native_backends"]["owners"] = [asdict(owner)]
+            payload["native_thread_ids"] = [["native-main", "native-side"]]
+            response._content = json.dumps(payload).encode()
+
+        host_context_reader[-2].event_hooks["response"].append(include_native)
     result = await _exchange_host_context_inventory(host_context_reader)
     assert result is not None
     assert len(result.runners) == 1
@@ -1166,6 +1215,13 @@ async def test_host_context_inventory_preserves_contexts_and_aliases(host_contex
         ("context-side", ("side",), "thread-side"),
     ]
     assert not result.aliases_complete and not result.context_coverage_complete
+    assert read.inventory.harness_thread_ids == (
+        (harness_threads,) if harness_threads is not None else None
+    )
+    if native_threads:
+        assert read.inventory.native_thread_ids == (("native-main", "native-side"),)
+        assert read.inventory.native_backends.owners[0].session_ids == ("native-main", "native-ui")
+        assert not read.inventory.native_backends.aliases_complete
     assert host_context_reader[-1] == ["/v1/startup/owner-inventory"]
 
 
@@ -1238,7 +1294,16 @@ async def test_host_context_inventory_rechecks_early_runner(
 
 
 @pytest.mark.parametrize(
-    "reason", ["unsupported", "closing", "pending", "host-only", "server-only", "bad-read-id"]
+    "reason",
+    [
+        "unsupported",
+        "closing",
+        "pending",
+        "host-only",
+        "server-only",
+        "bad-read-id",
+        "unbound-sdk-thread",
+    ],
 )
 async def test_host_context_inventory_preserves_unknown_members(host_context_reader, reason):
     control, conversations, _router, _initializer, tunnels, client, requests = host_context_reader
@@ -1261,14 +1326,19 @@ async def test_host_context_inventory_preserves_unknown_members(host_context_rea
 
             await response.aread()
             payload = response.json()
-            payload["read_id"] = "old-read"
+            if reason == "unbound-sdk-thread":
+                payload["harness_thread_ids"] = [[["thread-one"], None]]
+            else:
+                payload["read_id"] = "old-read"
             response._content = json.dumps(payload).encode()
 
         client.event_hooks["response"].append(corrupt)
     result = await _exchange_host_context_inventory(host_context_reader)
     assert result is not None
     assert len(result.runners) == 1 and result.runners[0].inventory is None
-    assert requests == (["/v1/startup/owner-inventory"] if reason == "bad-read-id" else [])
+    assert requests == (
+        ["/v1/startup/owner-inventory"] if reason in {"bad-read-id", "unbound-sdk-thread"} else []
+    )
 
 
 @pytest.mark.parametrize("change", ["host-owner", "binding", "account"])
@@ -1366,6 +1436,48 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "empty",
         "unknown",
         "ambiguous",
+        "ambiguous-literals",
+        "empty-ambiguity",
+        "duplicate-ambiguity",
+        "missing-context-ambiguity",
+        "partial-context-ambiguity",
+        "literal-context-ambiguity",
+        "unknown-contexts",
+        "distinct-context-literals",
+        "duplicate-session-keys",
+        "generation-zero",
+        "generation-later",
+        "generation-missing",
+        "generation-negative",
+        "generation-bool",
+        "generation-string",
+        "generation-float",
+        "generation-not-started",
+        "generation-closing",
+        "generation-cleaned",
+        "native-valid",
+        "native-overlapping-aliases",
+        "native-duplicate-sessions",
+        "native-transport",
+        "native-thread-loaded",
+        "native-thread-empty",
+        "native-thread-unknown",
+        "native-thread-unaligned",
+        "native-thread-duplicate",
+        "native-thread-empty-id",
+        "native-thread-no-transport",
+        "native-thread-non-string",
+        "native-thread-unsupported",
+        "native-thread-exited",
+        "native-thread-too-many",
+        "native-thread-max",
+        "native-thread-owner-max",
+        "native-negative-transport",
+        "native-closing-transport",
+        "native-empty-sessions",
+        "native-empty-session-id",
+        "harness-empty-session-id",
+        "harness-empty-session-id-unknown",
         "bool-string",
         "extra",
         "missing",
@@ -1376,6 +1488,31 @@ async def test_host_context_inventory_bounds_and_drains_reads(host_context_reade
         "duplicate-context",
         "unaligned",
         "closing-harness",
+        "sdk-loaded",
+        "sdk-empty",
+        "sdk-unknown",
+        "sdk-empty-owner",
+        "sdk-empty-manager",
+        "sdk-literal",
+        "sdk-overlap",
+        "sdk-max",
+        "sdk-unaligned-harness",
+        "sdk-unaligned-owner",
+        "sdk-no-harness",
+        "sdk-no-contexts",
+        "sdk-unknown-context",
+        "sdk-duplicate",
+        "sdk-empty-id",
+        "sdk-int",
+        "sdk-bool",
+        "sdk-flat",
+        "sdk-too-many",
+        "sdk-missing-field",
+        "sdk-unbound-loaded",
+        "sdk-unbound-empty",
+        "sdk-unbound-mixed",
+        "sdk-unknown-unbound",
+        "sdk-mixed-generations",
     ],
 )
 def test_runner_context_inventory_strict_wire_decode(case):
@@ -1398,6 +1535,7 @@ def test_runner_context_inventory_strict_wire_decode(case):
                 "started": True,
                 "closing": False,
                 "cleanup_complete": False,
+                "transport_generation": None,
             }
         ],
         "ambiguous_context_ids": [],
@@ -1419,12 +1557,206 @@ def test_runner_context_inventory_strict_wire_decode(case):
         "executor_contexts_complete": False,
         "external_owners_complete": False,
     }
+    payload["native_thread_ids"] = None
+    payload["harness_thread_ids"] = None
+    if case.startswith("generation-"):
+        item = contexts["owners"][0]
+        item["transport_generation"] = 0
+        if case == "generation-later":
+            item["transport_generation"] = 7
+        elif case == "generation-missing":
+            item.pop("transport_generation")
+        elif case in {
+            "generation-negative",
+            "generation-bool",
+            "generation-string",
+            "generation-float",
+        }:
+            item["transport_generation"] = {
+                "generation-negative": -1,
+                "generation-bool": True,
+                "generation-string": "0",
+                "generation-float": 0.0,
+            }[case]
+        elif case in {"generation-not-started", "generation-closing", "generation-cleaned"}:
+            item[
+                {
+                    "generation-not-started": "started",
+                    "generation-closing": "closing",
+                    "generation-cleaned": "cleanup_complete",
+                }[case]
+            ] = case != "generation-not-started"
+    if case.startswith("sdk-"):
+        contexts["owners"][0]["transport_generation"] = 0
+        payload["harness_thread_ids"] = [[["main", "side"]]]
+        if case == "sdk-unbound-mixed":
+            contexts["owners"].append(
+                {**contexts["owners"][0], "incarnation_id": "side", "transport_generation": None}
+            )
+            payload["harness_thread_ids"] = [[None, ["side"]]]
+            contexts["ambiguous_context_ids"] = ["thread-one"]
+        elif case in {"sdk-unbound-loaded", "sdk-unbound-empty"}:
+            contexts["owners"][0]["transport_generation"] = None
+            if case == "sdk-unbound-empty":
+                payload["harness_thread_ids"] = [[[]]]
+        elif case in {"sdk-unknown-unbound", "sdk-mixed-generations"}:
+            contexts["owners"][0].update(closing=True, transport_generation=None)
+            payload["harness_thread_ids"] = [[None]]
+            if case == "sdk-mixed-generations":
+                contexts["owners"].append(
+                    {
+                        **contexts["owners"][0],
+                        "incarnation_id": "side",
+                        "closing": False,
+                        "transport_generation": 7,
+                    }
+                )
+                payload["harness_thread_ids"] = [[None, ["side"]]]
+                contexts["ambiguous_context_ids"] = ["thread-one"]
+        elif case == "sdk-empty":
+            payload["harness_thread_ids"] = [[[]]]
+        elif case == "sdk-unknown":
+            payload["harness_thread_ids"] = [[None]]
+        elif case == "sdk-empty-owner":
+            contexts["owners"] = []
+            payload["harness_thread_ids"] = [[]]
+        elif case == "sdk-empty-manager":
+            payload["harnesses"]["owners"] = []
+            payload["harnesses"]["contexts"] = []
+            payload["harness_thread_ids"] = []
+        elif case == "sdk-literal":
+            payload["harness_thread_ids"] = [[[" main ", "main"]]]
+        elif case == "sdk-overlap":
+            contexts["owners"].append(
+                {**contexts["owners"][0], "incarnation_id": "second", "transport_generation": 7}
+            )
+            payload["harness_thread_ids"] = [[["shared"], ["shared"]]]
+            contexts["ambiguous_context_ids"] = ["thread-one"]
+        elif case == "sdk-max":
+            payload["harness_thread_ids"] = [[[str(i) for i in range(1000)]]]
+        elif case == "sdk-unaligned-harness":
+            payload["harness_thread_ids"] = []
+        elif case == "sdk-unaligned-owner":
+            payload["harness_thread_ids"] = [[]]
+        elif case == "sdk-no-harness":
+            payload["harnesses"] = None
+        elif case == "sdk-no-contexts":
+            payload["harnesses"]["contexts"] = None
+        elif case == "sdk-unknown-context":
+            payload["harnesses"]["contexts"] = [None]
+        elif case == "sdk-duplicate":
+            payload["harness_thread_ids"] = [[["main", "main"]]]
+        elif case == "sdk-empty-id":
+            payload["harness_thread_ids"] = [[[""]]]
+        elif case == "sdk-int":
+            payload["harness_thread_ids"] = [[[1]]]
+        elif case == "sdk-bool":
+            payload["harness_thread_ids"] = [[[True]]]
+        elif case == "sdk-flat":
+            payload["harness_thread_ids"] = [["main"]]
+        elif case == "sdk-too-many":
+            payload["harness_thread_ids"] = [[[str(i) for i in range(1001)]]]
+        elif case == "sdk-missing-field":
+            payload.pop("harness_thread_ids")
+    if case.startswith("native-"):
+        payload["native_backends"]["owners"] = [
+            {
+                "incarnation_id": "native-one",
+                "harness": "codex-native",
+                "session_ids": ["native-main", "native-ui"],
+                "registered": True,
+                "closing": False,
+                "process_exit_confirmed": False,
+                "exit_confirmed": False,
+                "aliases_complete": False,
+                "transport_generation": None,
+            }
+        ]
+        if case == "native-overlapping-aliases":
+            first = payload["native_backends"]["owners"][0]
+            payload["native_backends"]["owners"].append({**first, "incarnation_id": "second"})
+        elif case == "native-duplicate-sessions":
+            payload["native_backends"]["owners"][0]["session_ids"] = ["native-main", "native-main"]
+        elif case == "native-empty-sessions":
+            payload["native_backends"]["owners"][0]["session_ids"] = []
+        elif case == "native-empty-session-id":
+            payload["native_backends"]["owners"][0]["session_ids"] = ["native-main", ""]
+        elif "transport" in case:
+            native = payload["native_backends"]["owners"][0]
+            native["transport_generation"] = -1 if case == "native-negative-transport" else 3
+            native["closing"] = case == "native-closing-transport"
+        if case.startswith("native-thread-"):
+            payload["native_backends"]["owners"][0]["transport_generation"] = 3
+            payload["native_thread_ids"] = [["main", "side"]]
+            if case == "native-thread-empty":
+                payload["native_thread_ids"] = [[]]
+            elif case == "native-thread-unknown":
+                payload["native_thread_ids"] = [None]
+            elif case == "native-thread-too-many":
+                payload["native_thread_ids"] = [[str(i) for i in range(1001)]]
+            elif case in {"native-thread-max", "native-thread-owner-max"}:
+                payload["native_thread_ids"] = [[f" thread-{i} " for i in range(1000)]]
+                if case == "native-thread-owner-max":
+                    first = payload["native_backends"]["owners"][0]
+                    payload["native_backends"]["owners"].append(
+                        {**first, "incarnation_id": "native-two"}
+                    )
+                    payload["native_thread_ids"].append(list(payload["native_thread_ids"][0]))
+            elif case == "native-thread-unaligned":
+                payload["native_thread_ids"] = []
+            elif case == "native-thread-duplicate":
+                payload["native_thread_ids"] = [["main", "main"]]
+            elif case == "native-thread-empty-id":
+                payload["native_thread_ids"] = [[""]]
+            elif case == "native-thread-no-transport":
+                payload["native_backends"]["owners"][0]["transport_generation"] = None
+            elif case == "native-thread-non-string":
+                payload["native_thread_ids"] = [[7]]
+            elif case == "native-thread-unsupported":
+                payload["native_backends"]["owners"][0]["harness"] = "opencode-native"
+            elif case == "native-thread-exited":
+                payload["native_backends"]["owners"][0]["process_exit_confirmed"] = True
     if case == "empty":
         contexts["owners"] = []
     elif case == "unknown":
         payload["harnesses"]["contexts"] = [None]
     elif case == "ambiguous":
         contexts["ambiguous_context_ids"] = ["thread-one"]
+    elif case == "ambiguous-literals":
+        contexts["ambiguous_context_ids"] = [" thread-one ", "thread-one"]
+    elif case == "empty-ambiguity":
+        contexts["ambiguous_context_ids"] = [""]
+    elif case == "duplicate-ambiguity":
+        contexts["ambiguous_context_ids"] = ["thread-one", "thread-one"]
+    elif case in {"unknown-contexts", "distinct-context-literals"}:
+        first = contexts["owners"][0]
+        first["vendor_context_id"] = None if case == "unknown-contexts" else " thread-one "
+        contexts["owners"].append(
+            {
+                **first,
+                "incarnation_id": "context-two",
+                "vendor_context_id": None if case == "unknown-contexts" else "thread-one",
+            }
+        )
+    elif case.endswith("context-ambiguity"):
+        first = contexts["owners"][0]
+        if case == "literal-context-ambiguity":
+            first["vendor_context_id"] = " thread-one "
+        contexts["owners"].append({**first, "incarnation_id": "context-two"})
+        if case != "missing-context-ambiguity":
+            contexts["ambiguous_context_ids"] = ["thread-one"]
+        if case == "partial-context-ambiguity":
+            contexts["owners"].extend(
+                {**first, "incarnation_id": key, "vendor_context_id": "thread-two"}
+                for key in ("context-three", "context-four")
+            )
+    elif case == "duplicate-session-keys":
+        contexts["owners"][0]["session_keys"] = ["main", "main"]
+    elif case.startswith("harness-empty-session-id"):
+        owner["session_id"] = ""
+        payload["harnesses"]["contexts"][0]["owner"]["session_id"] = ""
+        if case == "harness-empty-session-id-unknown":
+            payload["harnesses"]["contexts"] = [None]
     elif case == "bool-string":
         contexts["owners"][0]["started"] = "false"
     elif case == "extra":
@@ -1442,24 +1774,513 @@ def test_runner_context_inventory_strict_wire_decode(case):
         payload["harnesses"]["contexts"] *= 2
     elif case == "duplicate-context":
         contexts["owners"] *= 2
+        contexts["ambiguous_context_ids"] = ["thread-one"]
     elif case == "unaligned":
         payload["harnesses"]["contexts"].append(None)
     elif case == "closing-harness":
         owner["closing"] = True
         payload["harnesses"]["contexts"][0]["owner"]["closing"] = True
     result = _decode_runner_context_inventory(payload)
-    if case not in {"valid", "empty", "unknown", "ambiguous"}:
+    if case not in {
+        "valid",
+        "generation-zero",
+        "generation-later",
+        "empty",
+        "unknown",
+        "ambiguous",
+        "ambiguous-literals",
+        "native-valid",
+        "unknown-contexts",
+        "distinct-context-literals",
+        "native-overlapping-aliases",
+        "native-transport",
+        "native-thread-loaded",
+        "native-thread-empty",
+        "native-thread-unknown",
+        "sdk-loaded",
+        "native-thread-max",
+        "native-thread-owner-max",
+        "sdk-empty",
+        "sdk-unknown",
+        "sdk-empty-owner",
+        "sdk-empty-manager",
+        "sdk-literal",
+        "sdk-overlap",
+        "sdk-max",
+        "sdk-unknown-unbound",
+        "sdk-mixed-generations",
+    }:
         assert result is None
     else:
         assert result is not None
         assert result.external_owners_complete is False
+        if case == "sdk-empty-manager":
+            assert result.harness_thread_ids == ()
+            assert result.harnesses.owners == result.harnesses.contexts == ()
+            return
         read = result.harnesses.contexts[0]
         if case == "unknown":
             assert read is None
-        elif case == "empty":
+        elif case in {"empty", "sdk-empty-owner"}:
             assert read.inventory.owners == ()
         elif case == "ambiguous":
             assert read.inventory.ambiguous_context_ids == ("thread-one",)
             assert read.inventory.aliases_complete is False
         else:
             assert read.inventory.owners[0].session_keys == ("main", "ui")
+        if case in {"generation-zero", "generation-later"}:
+            assert read.inventory.owners[0].transport_generation == (
+                0 if case == "generation-zero" else 7
+            )
+        if case == "native-valid":
+            assert result.native_backends.owners[0].session_ids == ("native-main", "native-ui")
+        elif case == "native-overlapping-aliases":
+            assert len(result.native_backends.owners) == 2
+            assert all(
+                owner.session_ids == ("native-main", "native-ui")
+                for owner in result.native_backends.owners
+            )
+        elif case == "native-transport":
+            assert result.native_backends.owners[0].transport_generation == 3
+        elif case.startswith("native-thread-"):
+            assert (
+                result.native_thread_ids
+                == {
+                    "native-thread-loaded": (("main", "side"),),
+                    "native-thread-empty": ((),),
+                    "native-thread-unknown": (None,),
+                    "native-thread-max": (tuple(f" thread-{i} " for i in range(1000)),),
+                    "native-thread-owner-max": (
+                        tuple(f" thread-{i} " for i in range(1000)),
+                        tuple(f" thread-{i} " for i in range(1000)),
+                    ),
+                }[case]
+            )
+        if case == "ambiguous-literals":
+            assert read.inventory.ambiguous_context_ids == (" thread-one ", "thread-one")
+        if case.startswith("sdk-"):
+            assert (
+                result.harness_thread_ids
+                == {
+                    "sdk-loaded": ((("main", "side"),),),
+                    "sdk-empty": (((),),),
+                    "sdk-unknown": ((None,),),
+                    "sdk-unknown-unbound": ((None,),),
+                    "sdk-mixed-generations": ((None, ("side",)),),
+                    "sdk-empty-owner": ((),),
+                    "sdk-literal": (((" main ", "main"),),),
+                    "sdk-overlap": ((("shared",), ("shared",)),),
+                    "sdk-max": ((tuple(str(i) for i in range(1000)),),),
+                }[case]
+            )
+
+
+def _v2_authority(session_id: str, **overrides):
+    from omnigent.startup_protocol import ContextAuthorityV2
+
+    values = {
+        "session_id": session_id,
+        "account_id": "account",
+        "host_id": "host",
+        "host_generation": "connection",
+        "runner_id": "runner",
+        "runner_generation": "7",
+        "connection_generation": "connection",
+    }
+    values.update(overrides)
+    return ContextAuthorityV2(**values)
+
+
+def _v2_source(scope, *, coverage, authority=None, reason="source_unsupported"):
+    from omnigent.startup_protocol import (
+        ContextEvidenceV2,
+        ContextKeyV2,
+        ContextOperationV2,
+        ContextRecordV2,
+        SourceEvidenceV2,
+        UnresolvedContextV2,
+    )
+
+    authority = authority or _v2_authority(scope.owner_id)
+    complete = coverage == "complete"
+    record = (
+        ContextRecordV2(
+            key=ContextKeyV2(source_owner_incarnation="owner", context_incarnation="context"),
+            vendor_id=None,
+            operation=ContextOperationV2(operation_id="operation", action="create", parent=None),
+            execution_keys=("execution",),
+            provenance="primary",
+            lifecycle="live",
+            aliases=(),
+            revision=1,
+            stop_proof=None,
+            continuity_proof=None,
+        )
+        if complete
+        else None
+    )
+    source = SourceEvidenceV2(
+        scope=scope,
+        producer_incarnation="owner" if complete else None,
+        coverage=coverage,
+        contexts=(record,) if record is not None else (),
+        unresolved=() if complete else (UnresolvedContextV2(candidate=None, reason=reason),),
+        membership_revision=1 if complete else None,
+        context_revision=1 if complete else None,
+        work_revision=None,
+        revision_authority="authoritative_membership" if complete else "observation_only",
+        age_upper_bound_s=1.0,
+        work_bindings=None,
+    )
+    return ContextEvidenceV2(
+        wire_version=2,
+        read_id="v2-read",
+        authority=authority,
+        expected_scopes=(scope,),
+        sources=(source,),
+    )
+
+
+def _empty_authority_evidence(scope, *, coverage, reason):
+    from omnigent.startup_protocol import (
+        ContextEvidenceV2,
+        SourceEvidenceV2,
+        UnresolvedContextV2,
+    )
+
+    return ContextEvidenceV2(
+        wire_version=2,
+        read_id="v2-read",
+        authority=_v2_authority(scope.owner_id),
+        expected_scopes=(scope,),
+        sources=(
+            SourceEvidenceV2(
+                scope=scope,
+                producer_incarnation=None,
+                coverage=coverage,
+                contexts=(),
+                unresolved=(UnresolvedContextV2(candidate=None, reason=reason),),
+                membership_revision=None,
+                context_revision=None,
+                work_revision=None,
+                revision_authority="observation_only",
+                age_upper_bound_s=None,
+                work_bindings=None,
+            ),
+        ),
+    )
+
+
+def test_normalization_never_promotes_v1_evidence_and_fails_closed():
+    from omnigent.server.resident_inventory import normalize_context_inventory_v2
+    from omnigent.startup_protocol import session_context_scopes_v2
+
+    scopes = session_context_scopes_v2("session-one")
+    v1_only = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=None,
+        host_evidence=None,
+        runner_capable=False,
+        host_capable=False,
+        v1_diagnostics=("runner_partial",),
+    )
+    assert v1_only.readiness == "unavailable"
+    assert {item.status for item in v1_only.scopes} == {"unknown"}
+    assert {item.reason for item in v1_only.scopes} == {"peer_needs_update"}
+    assert v1_only.diagnostics == ("runner_partial",)
+
+    foreign = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=_empty_authority_evidence(
+            scopes[0], coverage="unsupported", reason="no_resident_harness"
+        ),
+        host_evidence=_v2_source(scopes[0], coverage="complete"),
+        runner_capable=True,
+        host_capable=True,
+    )
+    by_namespace = {(item.scope.namespace): item for item in foreign.scopes}
+    assert by_namespace["harness"].status == "unknown"
+    assert by_namespace["harness"].reason == "conflicting_observers"
+    assert by_namespace["native"].status == "unknown"
+    assert foreign.readiness == "unavailable"
+
+    wrong_session = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=_v2_source(
+            scopes[0], coverage="complete", authority=_v2_authority("other-session")
+        ),
+        host_evidence=None,
+        runner_capable=True,
+        host_capable=False,
+    )
+    assert wrong_session.scopes[0].status == "unknown"
+    assert wrong_session.scopes[0].reason == "foreign_session"
+
+
+def test_normalization_completes_only_from_each_owning_hop():
+    from omnigent.server.resident_inventory import normalize_context_inventory_v2
+    from omnigent.startup_protocol import (
+        host_context_scope_v2,
+        session_context_scopes_v2,
+    )
+
+    scopes = (
+        *session_context_scopes_v2("session-one"),
+        host_context_scope_v2("session-one"),
+    )
+    normalization = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=_v2_source(scopes[0], coverage="complete"),
+        host_evidence=_v2_source(scopes[3], coverage="complete"),
+        runner_capable=True,
+        host_capable=True,
+    )
+    by_namespace = {item.scope.namespace: item for item in normalization.scopes}
+    assert normalization.readiness == "partial"
+    assert by_namespace["harness"].status == "complete"
+    assert by_namespace["host"].status == "complete"
+    assert by_namespace["native"].status == "unknown"
+
+    complete = normalize_context_inventory_v2(
+        expected_scopes=(scopes[0],),
+        runner_evidence=_v2_source(scopes[0], coverage="complete"),
+        host_evidence=None,
+        runner_capable=True,
+        host_capable=False,
+    )
+    assert complete.readiness == "complete"
+
+    absent = normalize_context_inventory_v2(
+        expected_scopes=(scopes[0],),
+        runner_evidence=None,
+        host_evidence=None,
+        runner_capable=True,
+        host_capable=True,
+    )
+    assert absent.readiness == "unavailable"
+    assert absent.scopes[0].reason == "missing_source"
+
+
+@pytest.mark.asyncio
+async def test_server_reads_v2_only_from_a_runner_that_advertises_it():
+    from omnigent.runner.native import orchestration
+    from omnigent.server.resident_inventory import (
+        HostRunnerMembership,
+        read_runner_context_inventory_v2,
+    )
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
+
+    orchestration.__dict__["_AUTO_CODEX_APP_SERVERS"] = {}
+    orchestration.__dict__["_AUTO_OPENCODE_SERVERS"] = {}
+    orchestration.__dict__["_CLOSING_NATIVE_BACKENDS"] = {}
+    resources = SessionResourceRegistry(TerminalRegistry())
+    runner_app = create_runner_app(server_client=NullServerClient(), resource_registry=resources)
+    requests: list[str] = []
+
+    async def record(request):
+        requests.append(request.url.path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=runner_app),
+        base_url="http://runner",
+        event_hooks={"request": [record]},
+    ) as runner:
+        tunnels = TunnelRegistry()
+        tunnels.register(
+            "runner", FakeWebSocket(), HelloFrame("test", 1, capabilities=[CONTEXT_INVENTORY_V2])
+        )
+        initializer = RunnerSessionInitializer(tunnels, server_version="test")
+        router = Mock()
+        router.runner_has_capability.return_value = True
+        router.client_for_existing_conversation.return_value = SimpleNamespace(
+            runner_id="runner", client=runner
+        )
+        member = HostRunnerMembership("runner", None, ("session-one",))
+        evidence = await read_runner_context_inventory_v2(router, initializer, member)
+        assert evidence is not None
+        assert {source.scope.namespace for source in evidence.sources} == {
+            "harness",
+            "native",
+            "terminal",
+        }
+        assert all(source.coverage != "complete" for source in evidence.sources)
+        assert requests == ["/v2/startup/context-inventory"]
+
+        requests.clear()
+        router.runner_has_capability.return_value = False
+        assert await read_runner_context_inventory_v2(router, initializer, member) is None
+        assert requests == []
+
+
+def _tunnel_v2_client(*, behaviour: str, monkeypatch):
+    """Real tunnel client with a real outbound-queue consumer acting as the runner.
+
+    The transport only enqueues; without a consumer nothing reaches the wire, so
+    every assertion below is about frames the runner actually received.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import RequestFrame, decode_frame
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.startup_protocol import (
+        CONTEXT_INVENTORY_CONTRACT_HEADER,
+        CONTEXT_INVENTORY_V2,
+    )
+
+    registry = TunnelRegistry()
+    requests: list[str] = []
+    witness = SimpleNamespace(
+        head_delivered=asyncio.Event(),
+        body_waiting=asyncio.Event(),
+        body_waiting_at=None,
+        body_cancelled=asyncio.Event(),
+        body_cancelled_at=None,
+        body_returned=asyncio.Event(),
+    )
+
+    class _RunnerSocket:
+        async def send_text(self, data: str) -> None:
+            raise AssertionError("the transport must enqueue, never write the socket directly")
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    session = registry.register(
+        "runner", _RunnerSocket(), HelloFrame("test", 1, capabilities=[CONTEXT_INVENTORY_V2])
+    )
+
+    async def consume() -> None:
+        while True:
+            item = await session.outbound_queue.get()
+            if item is None:
+                return
+            frame = decode_frame(item.data)
+            if not isinstance(frame, RequestFrame):
+                continue
+            requests.append(frame.id)
+            if behaviour == "head-only":
+                state = session.in_flight[frame.id]
+                queue_get = state.body_queue.get
+
+                async def observe_body_get(*, state=state, queue_get=queue_get):
+                    assert state.body_queue.empty()
+                    witness.body_waiting_at = time.monotonic()
+                    witness.body_waiting.set()
+                    try:
+                        item = await queue_get()
+                    except asyncio.CancelledError:
+                        witness.body_cancelled_at = time.monotonic()
+                        witness.body_cancelled.set()
+                        raise
+                    witness.body_returned.set()
+                    return item
+
+                monkeypatch.setattr(state.body_queue, "get", observe_body_get)
+                registry.route_response_frame(
+                    "runner",
+                    ResponseHeadFrame(
+                        frame.id,
+                        200,
+                        [[CONTEXT_INVENTORY_CONTRACT_HEADER, CONTEXT_INVENTORY_V2]],
+                    ),
+                )
+                witness.head_delivered.set()
+
+    consumer = asyncio.create_task(consume())
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner"), base_url="http://runner"
+    )
+    return registry, session, client, requests, witness, consumer
+
+
+async def test_v2_runner_read_is_bounded_without_a_response_head(monkeypatch):
+    from omnigent.server.resident_inventory import (
+        HostRunnerMembership,
+        read_runner_context_inventory_v2,
+    )
+
+    registry, session, client, requests, witness, consumer = _tunnel_v2_client(
+        behaviour="silent", monkeypatch=monkeypatch
+    )
+    try:
+        async with client:
+            router = Mock()
+            router.runner_has_capability.return_value = True
+            router.client_for_existing_conversation.return_value = SimpleNamespace(
+                runner_id="runner", client=client
+            )
+            initializer = RunnerSessionInitializer(registry, server_version="test")
+            started = time.monotonic()
+            result = await asyncio.wait_for(
+                read_runner_context_inventory_v2(
+                    router,
+                    initializer,
+                    HostRunnerMembership("runner", None, ("session-one",)),
+                    timeout_s=0.05,
+                ),
+                timeout=2.0,
+            )
+            assert result is None
+            assert time.monotonic() - started < 1.0
+            assert len(requests) == 1 and not witness.head_delivered.is_set()
+            assert not witness.body_waiting.is_set()
+            assert session.in_flight == {}
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
+async def test_v2_runner_read_is_bounded_when_the_body_never_ends(monkeypatch):
+    from omnigent.server.resident_inventory import (
+        HostRunnerMembership,
+        read_runner_context_inventory_v2,
+    )
+
+    registry, session, client, requests, witness, consumer = _tunnel_v2_client(
+        behaviour="head-only", monkeypatch=monkeypatch
+    )
+    reader = None
+    try:
+        async with client:
+            router = Mock()
+            router.runner_has_capability.return_value = True
+            router.client_for_existing_conversation.return_value = SimpleNamespace(
+                runner_id="runner", client=client
+            )
+            initializer = RunnerSessionInitializer(registry, server_version="test")
+            timeout_s = 0.2
+            scheduling_allowance_s = 0.1
+            started = time.monotonic()
+            reader = asyncio.create_task(
+                read_runner_context_inventory_v2(
+                    router,
+                    initializer,
+                    HostRunnerMembership("runner", None, ("session-one",)),
+                    timeout_s=timeout_s,
+                )
+            )
+            await asyncio.wait_for(witness.body_waiting.wait(), timeout=1.0)
+            assert witness.head_delivered.is_set()
+            assert started <= witness.body_waiting_at < started + timeout_s
+            assert not reader.done()
+            assert not witness.body_cancelled.is_set()
+            assert not witness.body_returned.is_set()
+            assert requests[0] in session.in_flight
+            result = await asyncio.wait_for(reader, timeout=2.0)
+            assert result is None
+            assert time.monotonic() - started < timeout_s + scheduling_allowance_s
+            assert len(requests) == 1
+            assert witness.body_cancelled.is_set()
+            assert (
+                timeout_s
+                <= witness.body_cancelled_at - started
+                < timeout_s + scheduling_allowance_s
+            )
+            assert not witness.body_returned.is_set()
+            assert session.in_flight == {}
+    finally:
+        if reader is not None:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer

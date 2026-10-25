@@ -52,7 +52,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
-from omnigent.inner.executor import ExecutorResidentInventory
+from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -76,7 +76,12 @@ from omnigent.server.schemas import (
     StartupClaimRequestEvent,
     Usage,
 )
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import (
+    CONTEXT_INVENTORY_V2,
+    ContextEvidenceV2,
+    StartupAttemptRef,
+    unknown_context_evidence_v2,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -112,6 +117,7 @@ _POLICY_EVAL_TIMEOUT_S = 86400.0
 _HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
 _UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
 _STARTUP_CLAIM_TIMEOUT_S = 10.0
+_RESIDENT_THREAD_INVENTORY_TIMEOUT_S = 5.0
 
 # Stable, client-visible error code for a turn-context desync (the inner SDK
 # generation outlived its turn — an orphaned tool/policy callback, or a turn
@@ -1001,6 +1007,23 @@ class HarnessApp:
         """Unsupported owners provide unknown coverage rather than an empty inventory."""
         return None
 
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id, read_id, "context_source_unimplemented", unsupported=True
+        )
+
+    async def prepare_resident_thread_inventory(
+        self, *, timeout_s: float = 5.0
+    ) -> Callable[[], ExecutorThreadInventorySnapshot]:
+        """Unsupported enumeration retains fresh metadata and unknown loaded IDs."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: ExecutorThreadInventorySnapshot(None, None)
+        return lambda: ExecutorThreadInventorySnapshot(self.resident_inventory(), None)
+
     async def on_shutdown(self) -> None:
         """
         Subclass hook invoked during lifespan teardown.
@@ -1115,6 +1138,11 @@ class HarnessApp:
         # Health probe lives at root (matches AP's app.py:125).
         app.add_api_route("/health", _health, methods=["GET"])
         app.include_router(self._build_v1_router(), prefix="/v1")
+        app.add_api_route(
+            "/v2/sessions/{conversation_id}/resident-context-inventory",
+            self._get_context_inventory_v2,
+            methods=["GET"],
+        )
         return app
 
     def _check_auth(self, request: Request) -> Response | None:
@@ -1221,6 +1249,8 @@ class HarnessApp:
           ``tool_result``, ``approval``). The body's ``type``
           field discriminates the variant; FastAPI / Pydantic
           rejects unknown values with 422.
+        - ``GET /v1/sessions/{conversation_id}/resident-thread-inventory`` —
+          bounded loaded-thread evidence on existing owners; unknown is not empty.
 
         The handler validates the path's ``conversation_id``
         against :attr:`fastapi.applications.FastAPI.state.conversation_id`
@@ -1236,6 +1266,12 @@ class HarnessApp:
             methods=["GET"],
         )
         router.add_api_route(
+            "/sessions/{conversation_id}/resident-thread-inventory",
+            self._get_resident_thread_inventory,
+            methods=["GET"],
+            response_model=ExecutorThreadInventorySnapshot,
+        )
+        router.add_api_route(
             "/sessions/{conversation_id}/events",
             self._post_session_event,
             methods=["POST"],
@@ -1248,6 +1284,38 @@ class HarnessApp:
         )
         return router
 
+    async def _get_context_inventory_v2(self, conversation_id: str, request: Request) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        read_id = request.query_params.get("read_id", "")
+        if not read_id or len(read_id) > 128 or len(request.query_params.getlist("read_id")) != 1:
+            return JSONResponse({"error": "invalid read_id"}, status_code=422)
+        reconcile = None
+        deadline = asyncio.timeout(_RESIDENT_THREAD_INVENTORY_TIMEOUT_S)
+        try:
+            async with deadline:
+                reconcile = await self.prepare_context_inventory_v2(
+                    conversation_id, read_id, timeout_s=_RESIDENT_THREAD_INVENTORY_TIMEOUT_S
+                )
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        evidence = (
+            reconcile()
+            if reconcile is not None
+            else unknown_context_evidence_v2(conversation_id, read_id, "read_timeout")
+        )
+        return JSONResponse(
+            evidence.model_dump(mode="json"),
+            headers={"Omnigent-Context-Inventory-Contract": CONTEXT_INVENTORY_V2},
+        )
+
     async def _get_resident_inventory(self, conversation_id: str, request: Request) -> Response:
         denied = self._check_auth(request)
         if denied is not None:
@@ -1255,6 +1323,30 @@ class HarnessApp:
         self._check_conversation_id(request, conversation_id)
         snapshot = self.resident_inventory()
         return JSONResponse({"inventory": asdict(snapshot) if snapshot is not None else None})
+
+    async def _get_resident_thread_inventory(
+        self, conversation_id: str, request: Request
+    ) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        read = None
+        deadline = asyncio.timeout(_RESIDENT_THREAD_INVENTORY_TIMEOUT_S)
+        try:
+            async with deadline:
+                read = await self.prepare_resident_thread_inventory(
+                    timeout_s=_RESIDENT_THREAD_INVENTORY_TIMEOUT_S
+                )
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        snapshot = read() if read is not None else ExecutorThreadInventorySnapshot(None, None)
+        return JSONResponse(asdict(snapshot))
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
         """

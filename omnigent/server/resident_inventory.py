@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -15,6 +16,8 @@ from omnigent.db.account_authority import AccountAuthority
 from omnigent.db.db_models import current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    HostContextInventoryV2Frame,
+    HostContextInventoryV2ResultFrame,
     HostOwnedRunner,
     HostOwnerInventoryFrame,
     HostOwnerInventoryResultFrame,
@@ -22,6 +25,18 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.startup_protocol import (
+    CONTEXT_INVENTORY_CONTRACT_HEADER,
+    CONTEXT_INVENTORY_MAX_BYTES,
+    CONTEXT_INVENTORY_V2,
+    ContextAuthorityV2,
+    ContextEvidenceV2,
+    ScopeKeyV2,
+    decode_context_evidence_v2,
+    harness_context_authority_v2,
+    host_context_scope_v2,
+    session_context_scopes_v2,
+)
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore
 
@@ -87,12 +102,49 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
         ):
             return None
         native_ids = [o.incarnation_id for o in snapshot.native_backends.owners]
-        if not all(native_ids) or len(set(native_ids)) != len(native_ids):
+        if (
+            not all(native_ids)
+            or len(set(native_ids)) != len(native_ids)
+            or any(
+                not owner.session_ids
+                or not all(owner.session_ids)
+                or len(set(owner.session_ids)) != len(owner.session_ids)
+                for owner in snapshot.native_backends.owners
+            )
+            or any(
+                owner.transport_generation is not None
+                and (
+                    owner.transport_generation < 0
+                    or owner.harness != "codex-native"
+                    or not owner.registered
+                    or owner.closing
+                    or owner.process_exit_confirmed
+                    or owner.exit_confirmed
+                )
+                for owner in snapshot.native_backends.owners
+            )
+        ):
             return None
+        native_threads = snapshot.native_thread_ids
+        if native_threads is not None:
+            if len(native_threads) != len(snapshot.native_backends.owners):
+                return None
+            for owner, ids in zip(snapshot.native_backends.owners, native_threads, strict=True):
+                if ids is not None and (
+                    owner.transport_generation is None
+                    or len(ids) > 1000
+                    or not all(ids)
+                    or len(set(ids)) != len(ids)
+                ):
+                    return None
         harnesses = snapshot.harnesses
         if harnesses is not None:
             ids = [o.incarnation_id for o in harnesses.owners]
-            if not all(ids) or len(set(ids)) != len(ids):
+            if (
+                not all(ids)
+                or len(set(ids)) != len(ids)
+                or any(not owner.session_id for owner in harnesses.owners)
+            ):
                 return None
             if harnesses.contexts is not None:
                 if len(harnesses.contexts) != len(harnesses.owners):
@@ -101,6 +153,17 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                     if read is None:
                         continue
                     inventory = read.inventory
+                    shared_context_ids = {
+                        context_id
+                        for context_id, count in Counter(
+                            item.vendor_context_id
+                            for item in inventory.owners
+                            if item.vendor_context_id is not None
+                        ).items()
+                        if count > 1
+                    }
+                    if not shared_context_ids.issubset(inventory.ambiguous_context_ids):
+                        return None
                     ids = [o.incarnation_id for o in inventory.owners]
                     if (
                         read.owner != owner
@@ -110,13 +173,52 @@ def _decode_runner_context_inventory(payload: object) -> OwnerRegistrationSnapsh
                         or read.release_generation < 0
                         or inventory.aliases_complete
                         or inventory.context_coverage_complete
+                        or not all(inventory.ambiguous_context_ids)
+                        or len(set(inventory.ambiguous_context_ids))
+                        != len(inventory.ambiguous_context_ids)
                         or not all(ids)
                         or len(set(ids)) != len(ids)
                         or any(
-                            not o.session_keys or not all(o.session_keys) for o in inventory.owners
+                            not o.session_keys
+                            or not all(o.session_keys)
+                            or len(set(o.session_keys)) != len(o.session_keys)
+                            or (
+                                o.transport_generation is not None
+                                and (
+                                    o.transport_generation < 0
+                                    or not o.started
+                                    or o.closing
+                                    or o.cleanup_complete
+                                )
+                            )
+                            for o in inventory.owners
                         )
                     ):
                         return None
+        harness_threads = snapshot.harness_thread_ids
+        if harness_threads is not None:
+            if (
+                harnesses is None
+                or harnesses.contexts is None
+                or len(harness_threads) != len(harnesses.owners)
+            ):
+                return None
+            for read, thread_ids in zip(harnesses.contexts, harness_threads, strict=True):
+                if thread_ids is None:
+                    continue
+                if read is None or len(thread_ids) != len(read.inventory.owners):
+                    return None
+                if any(
+                    ids is not None
+                    and (
+                        owner.transport_generation is None
+                        or len(ids) > 1000
+                        or not all(ids)
+                        or len(set(ids)) != len(ids)
+                    )
+                    for owner, ids in zip(read.inventory.owners, thread_ids, strict=True)
+                ):
+                    return None
         return snapshot
     except (ValueError, TypeError):
         return None
@@ -465,3 +567,224 @@ async def retain_unknown_owner_inventory(
         if exc.code == ErrorCode.UNAUTHORIZED:
             return False
         raise
+
+
+@dataclass(frozen=True)
+class ContextScopeStatus:
+    """One expected scope's observed coverage for a consumer decision."""
+
+    scope: ScopeKeyV2
+    status: Literal["complete", "partial", "unsupported", "unknown"]
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextInventoryNormalization:
+    """Per-scope evidence, never a permission: nothing here releases capacity."""
+
+    scopes: tuple[ContextScopeStatus, ...]
+    readiness: Literal["unavailable", "partial", "complete"]
+    diagnostics: tuple[str, ...] = ()
+
+
+def _owning_sources(
+    scope: ScopeKeyV2,
+    runner_evidence: ContextEvidenceV2 | None,
+    host_evidence: ContextEvidenceV2 | None,
+) -> list[tuple[str, ContextEvidenceV2]]:
+    """Each scope is read from its own hop; another hop's claim is not evidence."""
+    claims: list[tuple[str, ContextEvidenceV2]] = []
+    for hop, evidence in (("runner", runner_evidence), ("host", host_evidence)):
+        if evidence is not None and any(item == scope for item in evidence.expected_scopes):
+            claims.append((hop, evidence))
+    return claims
+
+
+def normalize_context_inventory_v2(
+    *,
+    expected_scopes: tuple[ScopeKeyV2, ...],
+    runner_evidence: ContextEvidenceV2 | None,
+    host_evidence: ContextEvidenceV2 | None,
+    runner_capable: bool,
+    host_capable: bool,
+    v1_diagnostics: tuple[str, ...] = (),
+) -> ContextInventoryNormalization:
+    """Select and normalize v2 evidence; v1 evidence stays veto-only diagnostics."""
+    diagnostics = tuple(v1_diagnostics)
+    if not expected_scopes or len(set(expected_scopes)) != len(expected_scopes):
+        return ContextInventoryNormalization((), "unavailable", diagnostics)
+    statuses: list[ContextScopeStatus] = []
+    for scope in expected_scopes:
+        capable = host_capable if scope.namespace == "host" else runner_capable
+        if not capable:
+            statuses.append(ContextScopeStatus(scope, "unknown", "peer_needs_update"))
+            continue
+        claims = _owning_sources(scope, runner_evidence, host_evidence)
+        if not claims:
+            statuses.append(ContextScopeStatus(scope, "unknown", "missing_source"))
+            continue
+        expected_hop = "host" if scope.namespace == "host" else "runner"
+        if len(claims) > 1 or claims[0][0] != expected_hop:
+            statuses.append(ContextScopeStatus(scope, "unknown", "conflicting_observers"))
+            continue
+        _hop, evidence = claims[0]
+        source = next(
+            (candidate for candidate in evidence.sources if candidate.scope == scope), None
+        )
+        if source is None:
+            statuses.append(ContextScopeStatus(scope, "unknown", "missing_source"))
+            continue
+        if evidence.authority.session_id != scope.owner_id:
+            statuses.append(ContextScopeStatus(scope, "unknown", "foreign_session"))
+            continue
+        if source.coverage == "complete":
+            statuses.append(ContextScopeStatus(scope, "complete"))
+        else:
+            reason = source.unresolved[0].reason if source.unresolved else None
+            statuses.append(ContextScopeStatus(scope, source.coverage, reason))
+    observed = {item.status for item in statuses}
+    if observed == {"complete"}:
+        readiness: Literal["unavailable", "partial", "complete"] = "complete"
+    elif observed & {"complete", "partial", "unsupported"}:
+        readiness = "partial"
+    else:
+        readiness = "unavailable"
+    return ContextInventoryNormalization(tuple(statuses), readiness, diagnostics)
+
+
+async def read_runner_context_inventory_v2(
+    router: RunnerRouter,
+    initializer: RunnerSessionInitializer,
+    member: HostRunnerMembership,
+    *,
+    timeout_s: float = 5.0,
+) -> ContextEvidenceV2 | None:
+    """Read one runner's aggregate v2 evidence on its existing authenticated client."""
+    if not 0 < timeout_s <= 5.0 or not member.session_ids:
+        return None
+    if not router.runner_has_capability(member.runner_id, CONTEXT_INVENTORY_V2):
+        return None
+    session_id = member.session_ids[0]
+    try:
+        # The tunnel transport ignores httpx's per-phase timeouts, so the whole
+        # read (routing, head, body, cleanup) runs under one total deadline.
+        async with asyncio.timeout(timeout_s):
+            routed = await asyncio.to_thread(router.client_for_existing_conversation, session_id)
+            if routed is None or routed.runner_id != member.runner_id:
+                return None
+            generation = initializer.generation_for(routed.runner_id, routed.client)
+            read_id = uuid4().hex
+            async with routed.client.stream(
+                "GET",
+                "/v2/startup/context-inventory",
+                params={"read_id": read_id, "session_id": session_id},
+                timeout=timeout_s,
+                follow_redirects=False,
+            ) as response:
+                if (
+                    response.status_code != 200
+                    or response.headers.get(CONTEXT_INVENTORY_CONTRACT_HEADER)
+                    != CONTEXT_INVENTORY_V2
+                ):
+                    return None
+                payload = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(payload) + len(chunk) > CONTEXT_INVENTORY_MAX_BYTES:
+                        return None
+                    payload.extend(chunk)
+            initializer.require_generation(routed.runner_id, routed.client, generation)
+            return decode_context_evidence_v2(
+                bytes(payload),
+                read_id=read_id,
+                authority=harness_context_authority_v2(session_id),
+                expected_scopes=session_context_scopes_v2(session_id),
+            )
+    except TimeoutError:
+        return None
+    except (httpx.HTTPError, ConnectionError, ValueError):
+        return None
+    except OmnigentError as exc:
+        if exc.code in {
+            ErrorCode.UNAUTHORIZED,
+            ErrorCode.WRONG_REPLICA,
+            ErrorCode.RUNNER_UNAVAILABLE,
+        }:
+            return None
+        raise
+
+
+def _host_context_authority(conn: HostConnection, session_id: str) -> ContextAuthorityV2:
+    return ContextAuthorityV2(
+        session_id=session_id,
+        account_id=None,
+        host_id=conn.host_id,
+        host_generation=conn.startup_generation,
+        runner_id=None,
+        runner_generation=None,
+        connection_generation=conn.hello.connection_id,
+    )
+
+
+async def read_host_context_inventory_v2(
+    hosts: HostRegistry,
+    conn: HostConnection,
+    session_id: str,
+    *,
+    timeout_s: float = 5.0,
+) -> ContextEvidenceV2 | None:
+    """Read the host's own scope; it owns membership, never vendor contexts."""
+    connection_id = conn.hello.connection_id
+    ws = conn.ws
+    owner = (conn.workspace_id, conn.owner, conn.account_generation, conn.startup_generation)
+    if (
+        not 0 < timeout_s <= 5.0
+        or not connection_id
+        or CONTEXT_INVENTORY_V2 not in conn.hello.capabilities
+        or hosts.get(conn.host_id, workspace_id=conn.workspace_id) is not conn
+    ):
+        return None
+    request_id, read_id = uuid4().hex, uuid4().hex
+    future: asyncio.Future[HostContextInventoryV2ResultFrame] = (
+        asyncio.get_running_loop().create_future()
+    )
+    conn.pending_context_inventory[request_id] = future
+    try:
+        async with asyncio.timeout(timeout_s):
+            hosts.send_text(
+                conn,
+                encode_host_frame(
+                    HostContextInventoryV2Frame(
+                        request_id, connection_id, owner[3], read_id, session_id
+                    )
+                ),
+            )
+            result = await future
+        if (
+            hosts.get(conn.host_id, workspace_id=owner[0]) is not conn
+            or conn.ws is not ws
+            or (conn.workspace_id, conn.owner, conn.account_generation, conn.startup_generation)
+            != owner
+            or conn.hello.connection_id != connection_id
+            or result.request_id != request_id
+            or result.connection_id != connection_id
+            or result.host_generation != owner[3]
+            or result.read_id != read_id
+            or result.session_id != session_id
+            or result.evidence is None
+        ):
+            return None
+        payload = json.dumps(result.evidence, separators=(",", ":")).encode()
+        return decode_context_evidence_v2(
+            payload,
+            read_id=read_id,
+            authority=_host_context_authority(conn, session_id),
+            expected_scopes=(host_context_scope_v2(session_id),),
+        )
+    except (ConnectionError, TimeoutError, ValueError):
+        return None
+    finally:
+        conn.pending_context_inventory.pop(request_id, None)
+        if not future.done():
+            future.cancel()
+        elif not future.cancelled():
+            future.exception()
