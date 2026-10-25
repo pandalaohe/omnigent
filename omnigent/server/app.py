@@ -5066,6 +5066,7 @@ def create_app(
                     conn_capabilities=list(conn.hello.capabilities),
                     now=time.time(),
                 )
+                system_status.push_load_lines(host_registry, conn.workspace_id, conn.host_id)
             if cli_retention_coordinator is not None:
                 cli_retention_coordinator.trigger(host_id)
             archive_close_coordinator.trigger_pending(host_id=host_id)
@@ -5137,6 +5138,7 @@ def create_app(
                 auth_provider=auth_provider,
                 permission_store=permission_store,
                 host_versions=_bulk_host_versions,
+                host_registry=host_registry,
             ),
             prefix="/v1",
             tags=["system"],

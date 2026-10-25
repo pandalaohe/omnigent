@@ -3,24 +3,31 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_LOAD_LEVEL_V1,
     CAP_RESOURCE_SNAPSHOT,
+    HostHelloFrame,
     HostResourceSnapshotFrame,
     ResourceMachine,
     ResourceProcessRow,
 )
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.system_status import create_system_status_router
 from omnigent.server.system_status import DEFAULT_HEALTH_CHECK_PROMPT, SystemStatusHub
 from omnigent.stores.host_store import Host
+from omnigent.stores.permission_store import PermissionStore
 
 _ALICE = "alice@example.com"
 _BOB = "bob@example.com"
@@ -66,9 +73,16 @@ def _build(
     admins: tuple[str, ...] | None = ("admin@example.com",),
     hosts: list[Host] | None = None,
     host_versions: Callable[[list[str]], dict[str, str]] | None = None,
+    host_registry: HostRegistry | None = None,
+    permission_store: PermissionStore | None = None,
 ) -> tuple[TestClient, SystemStatusHub]:
     hub = SystemStatusHub(tmp_path, None)
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _workspace(request: Request, call_next):
+        with workspace_scope(int(request.headers.get("X-Test-Workspace", "0"))):
+            return await call_next(request)
 
     @app.exception_handler(OmnigentError)
     async def _handle(_request: Request, exc: OmnigentError) -> JSONResponse:
@@ -79,8 +93,10 @@ def _build(
         create_system_status_router(
             _HostStore(hosts or []),
             auth_provider=_AuthProvider(),
-            permission_store=_PermissionStore(*admins) if admins is not None else None,
+            permission_store=permission_store
+            or (_PermissionStore(*admins) if admins is not None else None),
             host_versions=host_versions,
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -375,3 +391,140 @@ def test_single_user_mode_without_permission_store(tmp_path: Path) -> None:
 
     assert client.get("/v1/system/status").status_code == 200
     assert client.get("/v1/system/settings").status_code == 200
+
+
+def test_load_lines_patch_sends_only_changed_capable_connections(tmp_path: Path) -> None:
+    registry = HostRegistry()
+    client, hub = _build(tmp_path, host_registry=registry)
+    host_a, host_b, old_host = "1" * 32, "2" * 32, "3" * 32
+    connections = {}
+    for workspace_id, host_id, capabilities in (
+        (1, host_a, [CAP_RESOURCE_SNAPSHOT, CAP_LOAD_LEVEL_V1]),
+        (1, host_b, [CAP_RESOURCE_SNAPSHOT, CAP_LOAD_LEVEL_V1]),
+        (1, old_host, [CAP_RESOURCE_SNAPSHOT]),
+        (2, host_a, [CAP_RESOURCE_SNAPSHOT, CAP_LOAD_LEVEL_V1]),
+    ):
+        hello = HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="laptop",
+            runners=[],
+            capabilities=capabilities,
+        )
+        connections[(workspace_id, host_id)] = registry.register(
+            host_id, SimpleNamespace(), hello, "admin@example.com", workspace_id=workspace_id
+        )
+        hub.host_changed(
+            host_id=host_id,
+            workspace_id=workspace_id,
+            owner="admin@example.com",
+            name="laptop",
+            conn_capabilities=capabilities,
+            now=time.time(),
+        )
+    a = connections[(1, host_a)]
+    b = connections[(1, host_b)]
+    old = connections[(1, old_host)]
+    other_workspace = connections[(2, host_a)]
+    headers = {"X-Test-User": "admin@example.com", "X-Test-Workspace": "1"}
+    patch = {"load_lines": {"hosts": {host_a: {"heavy": 6, "new_session": 7}}}}
+    response = client.put("/v1/system/settings", headers=headers, json=patch)
+    assert response.status_code == 200
+    assert response.json()["load_lines"]["hosts"] == {host_a: {"heavy": 6, "new_session": 7}}
+    first = json.loads(a.outbound_queue.get_nowait().data)
+    assert {key: first[key] for key in ("kind", "heavy", "new_session", "mem_pct")} == {
+        "kind": "host.load_lines",
+        "heavy": 6,
+        "new_session": 7,
+        "mem_pct": 90,
+    }
+    assert b.outbound_queue.empty() and old.outbound_queue.empty()
+    assert other_workspace.outbound_queue.empty()
+
+    # Repeating a patch and toggling only the server's queue switch sends no lines.
+    assert client.put("/v1/system/settings", headers=headers, json=patch).status_code == 200
+    assert (
+        client.put(
+            "/v1/system/settings", headers=headers, json={"load_lines": {"queue_enabled": False}}
+        ).status_code
+        == 200
+    )
+    assert all(conn.outbound_queue.empty() for conn in connections.values())
+    before = hub.get_settings()
+    invalid = client.put(
+        "/v1/system/settings",
+        headers=headers,
+        json={
+            "mem_pct": 77,
+            "load_lines": {"default": {"heavy": 5, "new_session": 4}},
+        },
+    )
+    assert invalid.status_code == 400
+    assert hub.get_settings() == before
+    assert all(conn.outbound_queue.empty() for conn in connections.values())
+
+    assert (
+        client.put(
+            "/v1/system/settings",
+            headers=headers,
+            json={
+                "load_lines": {"default": {"heavy": 2, "new_session": 3}},
+            },
+        ).status_code
+        == 200
+    )
+    assert json.loads(b.outbound_queue.get_nowait().data)["heavy"] == 2
+    assert a.outbound_queue.empty() and other_workspace.outbound_queue.empty()
+    assert (
+        client.put(
+            "/v1/system/settings",
+            headers=headers,
+            json={
+                "load_lines": {"hosts": {host_a: None}},
+            },
+        ).status_code
+        == 200
+    )
+    assert json.loads(a.outbound_queue.get_nowait().data)["heavy"] == 2
+    assert b.outbound_queue.empty() and other_workspace.outbound_queue.empty()
+    assert hub.effective_load_lines(2, host_a).heavy == 4
+
+    assert (
+        client.put("/v1/system/settings", headers=headers, json={"mem_pct": 75}).status_code == 200
+    )
+    for conn in (a, b, other_workspace):
+        frame = json.loads(conn.outbound_queue.get_nowait().data)
+        assert frame["mem_pct"] == 75
+        assert frame["revision"] > first["revision"]
+    assert old.outbound_queue.empty()
+    # The persisted document retains the workspace namespace, unlike the API projection.
+    stored = json.loads(hub.settings_path.read_text())
+    assert set(stored["load_lines"]) == {"1"}
+    hub.close()
+
+
+def test_load_lines_admin_authority_uses_current_workspace(tmp_path: Path, db_uri: str) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    with workspace_scope(1):
+        permissions.ensure_user(_ALICE, is_admin=True)
+    with workspace_scope(2):
+        permissions.ensure_user(_ALICE)
+    client, hub = _build(tmp_path, permission_store=permissions)
+    patch = {"load_lines": {"default": {"heavy": 1, "new_session": 64}}}
+    admin = {"X-Test-User": _ALICE, "X-Test-Workspace": "1"}
+    member = {"X-Test-User": _ALICE, "X-Test-Workspace": "2"}
+    assert client.put("/v1/system/settings", headers=admin, json=patch).status_code == 200
+    assert client.get("/v1/system/settings", headers=member).status_code == 403
+    assert client.put("/v1/system/settings", headers=member, json=patch).status_code == 403
+    assert hub.effective_load_lines(1, "host_a").heavy == 1
+    assert hub.effective_load_lines(2, "host_a").heavy == 4
+    # A client cannot submit an outer workspace-id map as its current-workspace patch.
+    assert (
+        client.put(
+            "/v1/system/settings", headers=admin, json={"load_lines": {"2": patch["load_lines"]}}
+        ).status_code
+        == 400
+    )
+    hub.close()
