@@ -2194,7 +2194,32 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    assert [
+        (request.method, request.url.path, json.loads(request.content)) for request in ap_requests
+    ] == [
+        (
+            "POST",
+            "/v1/sessions/conv_123/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "approval_mode": "unknown",
+                    "permission_observation": {
+                        "version": 1,
+                        "source": "native-settings",
+                        "origin": "resume",
+                        "mode": "unknown",
+                        "approval": None,
+                        "reviewer": None,
+                        "sandbox": None,
+                        "profile": None,
+                        "uncertainty": "no-settings",
+                        "requested_mode": None,
+                    },
+                },
+            },
+        )
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -5925,11 +5950,29 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
     old_events = [event for event in session_events if event.session_id == "conv_old"]
-    assert len(old_events) == 1
-    assert old_events[0].body["type"] == "external_native_subagent_snapshot"
-    assert old_events[0].body["data"]["children"] == []
-    assert old_events[0].body["data"]["complete"] is True
-    assert old_events[0].body["data"]["retired"] is True
+    assert len(old_events) == 2
+    assert old_events[0].body == {
+        "type": "external_codex_approval_mode_change",
+        "data": {
+            "approval_mode": "unknown",
+            "permission_observation": {
+                "version": 1,
+                "source": "native-settings",
+                "origin": "resume",
+                "mode": "unknown",
+                "approval": None,
+                "reviewer": None,
+                "sandbox": None,
+                "profile": None,
+                "uncertainty": "no-settings",
+                "requested_mode": None,
+            },
+        },
+    }
+    assert old_events[1].body["type"] == "external_native_subagent_snapshot"
+    assert old_events[1].body["data"]["children"] == []
+    assert old_events[1].body["data"]["complete"] is True
+    assert old_events[1].body["data"]["retired"] is True
     assert hook_posts == []
     assert fake_client.responses == []
 
@@ -6852,8 +6895,8 @@ def test_forwarder_surfaces_failed_command_exit_code() -> None:
     # The exit code (3, from the replayed item above) must appear appended
     # to the captured stderr/stdout. If the suffix were missing the output
     # would be just "boom\n" — a failed command indistinguishable from a
-    # successful one in the UI.
-    assert outputs == ["boom\n\n[exit code: 3]"]
+    # successful one in the UI. The prefix also preserves the terminal status.
+    assert outputs == ["[command status: failed]\nboom\n\n[exit code: 3]"]
 
 
 def test_forwarder_posts_codex_file_change_tool_call() -> None:

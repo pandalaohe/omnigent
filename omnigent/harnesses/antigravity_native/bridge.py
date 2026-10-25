@@ -379,6 +379,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
+    "sys_session_get_startup_observation_v1",
     "sys_session_handover",
     "sys_session_list",
     "sys_session_open",

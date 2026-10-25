@@ -544,11 +544,29 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
     old_events = [event for event in session_events if event.session_id == "conv_old"]
-    assert len(old_events) == 1
-    assert old_events[0].body["type"] == "external_native_subagent_snapshot"
-    assert old_events[0].body["data"]["children"] == []
-    assert old_events[0].body["data"]["complete"] is True
-    assert old_events[0].body["data"]["retired"] is True
+    assert len(old_events) == 2
+    assert old_events[0].body == {
+        "type": "external_codex_approval_mode_change",
+        "data": {
+            "approval_mode": "unknown",
+            "permission_observation": {
+                "version": 1,
+                "source": "native-settings",
+                "origin": "resume",
+                "mode": "unknown",
+                "approval": None,
+                "reviewer": None,
+                "sandbox": None,
+                "profile": None,
+                "uncertainty": "no-settings",
+                "requested_mode": None,
+            },
+        },
+    }
+    assert old_events[1].body["type"] == "external_native_subagent_snapshot"
+    assert old_events[1].body["data"]["children"] == []
+    assert old_events[1].body["data"]["complete"] is True
+    assert old_events[1].body["data"]["retired"] is True
     assert hook_posts == []
     assert fake_client.responses == []
 
