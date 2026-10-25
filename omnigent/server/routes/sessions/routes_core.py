@@ -36,6 +36,8 @@ from omnigent._wrapper_labels import (
 from omnigent.calling_defaults import load_master
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
+    codex_permission_application_receipt,
+    decode_codex_permission_observation,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -177,6 +179,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _child_pending_elicitations_by_parent,
+    _codex_permission_observation_labels,
     _codex_plan_mode_enabled,
     _delete_stored_session_bundle_after_failure,
     _discovery_key,
@@ -293,6 +296,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
+    CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
     CONTINUED_TO_LABEL_KEY,
     DELETION_CLAIM_STALE_AFTER_S,
     PINNED_LABEL_KEY,
@@ -302,6 +306,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     ConversationUpdateResult,
+    _may_collate_to,
     pinned_label_key,
     runner_seen_is_fresh,
     touched_label_key,
@@ -3045,6 +3050,51 @@ def register_core_routes(
     # ── GET /sessions/{session_id} ───────────────────────────────
 
     @router.get(
+        "/sessions/{session_id}/startup-observation/v1",
+        response_model=None,
+    )
+    @router.options(
+        "/sessions/{session_id}/startup-observation/v1",
+        response_model=None,
+    )
+    async def get_permission_startup_observation_v1(
+        request: Request,
+        response: Response,
+        session_id: str,
+    ) -> dict[str, object]:
+        from omnigent.server.permission_tiers import require_permission_protocol
+
+        response.headers["Cache-Control"] = "no-store"
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        require_permission_protocol(request, harness=None, required=True)
+        if request.method == "OPTIONS":
+            # Actual registered handler, authenticated owner scope; no runner/spec/cache read.
+            response.headers["X-Omnigent-Startup-Observation"] = "1"
+            return {"protocol": "permission_startup_observation", "version": 1}
+        from omnigent.server.startup_observation import read_startup_observation
+
+        observation = await read_startup_observation(
+            conv,
+            harness=conv.harness_override,
+            router=runner_router,
+            registry=getattr(request.app.state, "tunnel_registry", None),
+            store=conversation_store,
+        )
+        return {"id": session_id, "startup_observation": observation}
+
+    @router.get(
         "/sessions/{session_id}",
         # See create_session for the response_model=None rationale. We keep
         # response_model=None (no response re-validation/serialization) but
@@ -4734,6 +4784,21 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        labels_to_set = dict(body.labels or {})
+        scalar_keys = [
+            key
+            for key in labels_to_set
+            if _may_collate_to(key, _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY, prefix=False)
+        ]
+        if len(scalar_keys) > 1:
+            raise OmnigentError(
+                "labels contains duplicate Codex approval mode keys",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if scalar_keys:
+            labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = labels_to_set.pop(
+                scalar_keys[0]
+            )
         from omnigent.server.session_collab import (
             AGENT_SESSION_HEADER,
             require_session_action_allowed,
@@ -5208,7 +5273,9 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_approval_mode = body.approval_mode
-        labels_to_set = dict(body.labels or {})
+        if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
+            # A legacy scalar edit cannot retain an earlier settings observation.
+            labels_to_set[CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY] = ""
         requested_speed: str | None = None
         if "speed_tier" in body.model_fields_set:
             speed_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -6037,19 +6104,18 @@ def register_core_routes(
                     "SDK approval mode was not applied by the runner; try again",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            # Raises unless the runner drove the /permissions popup, so the label
-            # can never claim a preset the Codex TUI wasn't switched to. Codex owns
-            # the durable approval state (its own session config); the label is the
-            # web read-back only, so there is no terminal_launch_args coupling here.
+            # Preserve the control response/error handling. A successful response
+            # is an application receipt, not fresh native settings confirmation.
             _require_codex_approval_mode_forward(
                 session_id,
                 requested_codex_approval_mode,
                 _approval_result,
             )
             if not sdk_approval_mode:
-                labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = (
-                    requested_codex_approval_mode
+                receipt_labels, _receipt = _codex_permission_observation_labels(
+                    codex_permission_application_receipt(requested_codex_approval_mode), updated
                 )
+                labels_to_set.update(receipt_labels)
         if requested_codex_approval_mode is not None and sdk_approval_mode and live_forward:
             labels_to_set[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
         if requested_speed is not None:
@@ -6089,8 +6155,6 @@ def register_core_routes(
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if SPEED_TIER_LABEL_KEY in labels_to_set:
             _publish_speed_tier(session_id, labels_to_set[SPEED_TIER_LABEL_KEY])
-        # Only when the switch was forwarded: a silent PATCH writes no label,
-        # and an unconfirmed mode must not reach the picker.
         if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:
             _publish_permission_mode(
                 session_id,
@@ -6102,9 +6166,13 @@ def register_core_routes(
                 labels_to_set[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY],
             )
         if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
+            encoded_observation = labels_to_set.get(CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY)
             _publish_codex_approval_mode(
                 session_id,
                 labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
+                decode_codex_permission_observation(encoded_observation)
+                if encoded_observation
+                else None,
             )
         if CODEX_SDK_APPROVAL_MODE_LABEL_KEY in labels_to_set:
             _publish_codex_approval_mode(

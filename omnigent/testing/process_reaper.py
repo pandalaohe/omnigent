@@ -46,6 +46,18 @@ _KILL_WAIT_S = 5.0
 _EXECNET_BOOTSTRAP = "import sys;exec(eval(sys.stdin.readline()))"
 
 
+class ProcessScanUnavailable(RuntimeError):
+    """The OS denied the process-table enumeration this module needs.
+
+    ``psutil.pids()`` reads the whole table through ``sysctl(KERN_PROC)``;
+    macOS returns EPERM for that read when the calling process sits under a
+    sandbox that denies it (observed shape: ``PermissionError: [Errno 1]``
+    with ``originated from sysctl() malloc 1/3``). The denial says nothing
+    about leaks, so callers must report the leak state as *unverified* — never
+    as "no leaks" — and must not narrow or bypass the identity checks below.
+    """
+
+
 def _proc_argv(proc: psutil.Process) -> list[str]:
     """Return a process's argv, or ``[]`` when unreadable.
 
@@ -131,19 +143,25 @@ def find_leaked_omnigent_processes(data_dir: Path | str) -> list[psutil.Process]
         return []
     me = os.getpid()
     leaked: list[psutil.Process] = []
-    for proc in psutil.process_iter():
-        if proc.pid == me:
-            continue
-        argv = _proc_argv(proc)
-        cmdline = " ".join(argv)
-        if "omnigent" not in cmdline or _is_pytest_process(argv):
-            continue
-        env = _proc_environ(proc)
-        if env.get("OMNIGENT_DATA_DIR", "").rstrip(os.sep) != needle and not (
-            _cmdline_references_dir(argv, needle)
-        ):
-            continue
-        leaked.append(proc)
+    try:
+        processes = psutil.process_iter()
+        for proc in processes:
+            if proc.pid == me:
+                continue
+            argv = _proc_argv(proc)
+            cmdline = " ".join(argv)
+            if "omnigent" not in cmdline or _is_pytest_process(argv):
+                continue
+            env = _proc_environ(proc)
+            if env.get("OMNIGENT_DATA_DIR", "").rstrip(os.sep) != needle and not (
+                _cmdline_references_dir(argv, needle)
+            ):
+                continue
+            leaked.append(proc)
+    except (psutil.AccessDenied, PermissionError) as error:
+        # The loop body only reads through guarded helpers, so an escaping
+        # permission error comes from the enumeration itself.
+        raise ProcessScanUnavailable(f"process table enumeration denied: {error}") from error
     return leaked
 
 

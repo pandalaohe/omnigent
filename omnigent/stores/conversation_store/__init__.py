@@ -82,6 +82,9 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Receiver-owned readback, scoped to one native session instance.
+CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY = "omnigent.codex_native.permission_observation"
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other
@@ -370,6 +373,11 @@ def _may_collate_to(key: str, target: str, *, prefix: bool) -> bool:
     return len(target) in positions
 
 
+def is_codex_permission_observation_label_key(key: str) -> bool:
+    """Return whether a key can collate to the server-owned Codex observation."""
+    return _may_collate_to(key, CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY, prefix=False)
+
+
 def is_touched_label_key(key: str) -> bool:
     """
     Return whether ``key`` belongs to the per-user ``omnigent.touched`` family.
@@ -451,6 +459,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_provider_usage_limits",
         "omnigent.startup",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
         ARTIFACT_LINK_KEY_LABEL,
         ROTATION_SUCCESSOR_LABEL_KEY,
     }

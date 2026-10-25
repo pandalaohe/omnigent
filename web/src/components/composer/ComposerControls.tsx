@@ -28,6 +28,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { permissionModeConcept } from "@/lib/nativeHarnessModes";
+import type { CodexPermissionReadback } from "@/lib/codexApprovalMode";
 import {
   COMPOSER_COLLAPSED_LABEL_CLASS,
   COMPOSER_CONTENT_INSET_CLASS,
@@ -166,6 +167,7 @@ export function ComposerPermissionPicker({
   loading = false,
   interactiveWhileLoading = false,
   onSelect,
+  readback,
   testIdPrefix = "composer",
 }: {
   label: string;
@@ -182,14 +184,16 @@ export function ComposerPermissionPicker({
   loading?: boolean;
   interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
+  readback?: CodexPermissionReadback;
   testIdPrefix?: string;
 }) {
+  const writeDisabled = disabled || (loading && !interactiveWhileLoading);
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
+      <DropdownMenuTrigger asChild disabled={!readback && writeDisabled}>
         <button
           type="button"
-          disabled={disabled || (loading && !interactiveWhileLoading)}
+          disabled={!readback && writeDisabled}
           aria-busy={loading || undefined}
           className={cn(
             "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
@@ -225,15 +229,44 @@ export function ComposerPermissionPicker({
           }
         }}
       >
-        <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
-        <DropdownMenuRadioGroup value={selectedValue ?? undefined} onValueChange={onSelect}>
+        {readback && (
+          <div
+            className="max-w-sm space-y-2 border-b border-border px-2 py-2 text-xs whitespace-normal break-words"
+            data-testid={`${testIdPrefix}-permission-readback`}
+          >
+            <div className="font-medium">{readback.heading}</div>
+            <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
+              {readback.rows.map((row) => (
+                <div key={row.label} className="contents">
+                  <dt className="text-muted-foreground">{row.label}</dt>
+                  <dd className="min-w-0 break-words">{row.value}</dd>
+                </div>
+              ))}
+            </dl>
+            <p className="text-muted-foreground">{readback.note}</p>
+            {writeDisabled && (
+              <p className="text-muted-foreground">
+                {disabledReason ?? "Permission changes are unavailable in this session state"}
+              </p>
+            )}
+          </div>
+        )}
+        <div className="px-2 py-1 text-xs text-muted-foreground">
+          {readback ? "Change permission mode" : label}
+        </div>
+        <DropdownMenuRadioGroup
+          value={selectedValue ?? undefined}
+          onValueChange={(next) => {
+            if (!writeDisabled) onSelect(next);
+          }}
+        >
           {options.map((option) => (
             <DropdownMenuRadioItem
               key={option.value}
               value={option.value}
               data-testid={`${testIdPrefix}-permission-option-${option.value}`}
               data-permission-concept={permissionModeConcept(harness, option.value)}
-              disabled={disabledOptions.includes(option.value)}
+              disabled={writeDisabled || disabledOptions.includes(option.value)}
               title={
                 disabledOptions.includes(option.value)
                   ? `Start a new ${option.label} session to use this mode`

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -98,7 +99,11 @@ os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
 from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine  # noqa: E402
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry  # noqa: E402
-from omnigent.testing.process_reaper import sweep_dead_owner_dirs, write_owner_marker  # noqa: E402
+from omnigent.testing.process_reaper import (  # noqa: E402
+    ProcessScanUnavailable,
+    sweep_dead_owner_dirs,
+    write_owner_marker,
+)
 from tests import _model_pools  # noqa: E402
 
 write_owner_marker(_TEST_OMNIGENT_DATA_DIR)
@@ -126,7 +131,16 @@ def _sweep_orphans_of_dead_runs() -> None:
         # (on Windows ``Path("/tmp")`` is drive-less).
         roots.append((Path("/tmp"), "omni-bench-"))
     for root, prefix in roots:
-        _swept, reaped, survivors = sweep_dead_owner_dirs(root, prefix)
+        try:
+            _swept, reaped, survivors = sweep_dead_owner_dirs(root, prefix)
+        except ProcessScanUnavailable as error:
+            # Best-effort sweep of *other* runs' leftovers; this run's own
+            # teardown still reports the denial and fails.
+            print(
+                f"\norphan sweep skipped: {error}; orphan state UNVERIFIED",
+                file=sys.stderr,
+            )
+            continue
         for cmdline in reaped:
             print(f"\nreaped orphan of a dead pytest run: {cmdline}", file=sys.stderr)
         for cmdline in survivors:
@@ -201,6 +215,9 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
 # Host browser-opener shims and the attempt log the autouse fixture reads;
 # both set by :func:`_install_browser_guard`. The fixture remembers the log
 # offset it already reported in `_BROWSER_GUARD_CHECKED`.
+#: Hand-off filename read by ``infra/fork-ci-check.sh`` before it deletes its
+#: run dir; keep the two spellings in sync.
+_TEARDOWN_RETENTION_FILE = "omnigent-teardown-retention.json"
 _BROWSER_GUARD_DIR: str | None = None
 _BROWSER_GUARD_LOG: Path | None = None
 _BROWSER_GUARD_CHECKED: int = 0
@@ -290,6 +307,36 @@ def _fail_on_host_browser_open() -> Generator[None, None, None]:
         pytest.fail("test tried to open a browser on the host: " + "\n".join(attempts))
 
 
+def _request_run_tmp_retention(retained: list[Path], error: BaseException) -> OSError | None:
+    """Ask the run's temp-dir owner not to delete it after a denied teardown.
+
+    ``infra/fork-ci-check.sh`` removes its own unique temporary run dir when
+    pytest exits, which would also erase the retained data dir and the
+    ``pytest-owner.json`` attribution marker. The hand-off is one JSON file in
+    that run dir; the wrapper honors only a marker inside its own ``$tmp``, and
+    also keeps that dir when the run failed with its data dir still present, so
+    a failed write never turns into silent deletion. Best-effort: a failed
+    write must not mask the original denial.
+
+    :param retained: Paths the teardown refused to delete.
+    :param error: The denial that stopped the process-table read.
+    :returns: The write error when the hand-off could not be written, else
+        ``None`` so the caller can report the fallback truthfully.
+    """
+    marker = Path(_TEST_OMNIGENT_DATA_DIR).parent / _TEARDOWN_RETENTION_FILE
+    payload = {
+        "schema": "omnigent.teardown-retention/1",
+        "status": "unverified",
+        "reason": str(error),
+        "retained": [str(path) for path in retained],
+    }
+    try:
+        marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as write_error:
+        return write_error
+    return None
+
+
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Clean up per-session resources.
 
@@ -301,7 +348,34 @@ def pytest_unconfigure(config: pytest.Config) -> None:
     """
     from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 
-    reaped, survivors = reap_leaked_omnigent_processes(_TEST_OMNIGENT_DATA_DIR)
+    try:
+        reaped, survivors = reap_leaked_omnigent_processes(_TEST_OMNIGENT_DATA_DIR)
+    except ProcessScanUnavailable as error:
+        # The OS refused the process-table read, so this run cannot tell
+        # whether a detached server or runner is still using these paths.
+        # Retain every path and the owner marker: deleting the data dir would
+        # erase the only attribution record a later sweep can act on, and the
+        # harness/browser dirs may still be in use. No deletion, no signal.
+        retained = [Path(_TEST_OMNIGENT_DATA_DIR), Path(_TEST_HARNESS_TMP_PARENT)]
+        if _BROWSER_GUARD_DIR is not None:
+            retained.append(Path(_BROWSER_GUARD_DIR))
+        retention_error = _request_run_tmp_retention(retained, error)
+        print(f"\nprocess reap UNAVAILABLE: {error}", file=sys.stderr)
+        for path in retained:
+            print(f"\nretained: {path}", file=sys.stderr)
+        if retention_error is not None:
+            print(
+                f"\nrun-tmp retention request FAILED: {retention_error}; "
+                f"{Path(_TEST_OMNIGENT_DATA_DIR).parent} is kept only because the "
+                "wrapper finds this run's data directory still present",
+                file=sys.stderr,
+            )
+        print(
+            "\nleak state UNVERIFIED: retained paths are evidence, no deletion "
+            "or signal was attempted",
+            file=sys.stderr,
+        )
+        raise
     for cmdline in reaped:
         print(f"\nreaped leaked omnigent process: {cmdline}", file=sys.stderr)
     for cmdline in survivors:

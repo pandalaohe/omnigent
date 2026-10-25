@@ -2,7 +2,138 @@
 // and `withStallGuard` — the byte-level silence watchdog.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseEvent, withStallGuard } from "./sse";
+import { parseEvent, parseEventLines, parseSseStream, withStallGuard } from "./sse";
+import { decodeCodexPermissionObservation } from "./codexApprovalMode";
+
+describe("native permission SSE readback", () => {
+  const observation = {
+    version: 1,
+    source: "native-settings",
+    origin: "settings-updated",
+    mode: "ask-for-approval",
+    approval: "on-request",
+    reviewer: "user",
+    sandbox: "workspace-write",
+    profile: "workspace",
+    uncertainty: null,
+    requested_mode: null,
+    received_at: 1792749199,
+    runner_id: "runner",
+  };
+  it("parses the actual byte-stream boundary into the same twelve fields as c1", async () => {
+    const packet = `event: session.codex_approval_mode\ndata: ${JSON.stringify({ conversation_id: "permissions", approval_mode: "ask-for-approval", permission_observation: observation })}\n\n`;
+    const stream = new Response(packet).body!;
+    const events = [];
+    for await (const event of parseSseStream(stream)) events.push(event);
+    expect(events).toEqual([
+      {
+        type: "session_codex_approval_mode",
+        conversationId: "permissions",
+        approvalMode: "ask-for-approval",
+        permissionObservation: decodeCodexPermissionObservation(
+          "c1:0,1,2,1,1,2,2,0,0,1792749199,cnVubmVy",
+        ),
+      },
+    ]);
+  });
+  it.each([
+    null,
+    undefined,
+    { ...observation, version: 2 },
+    { ...observation, received_at: Number("9223372036854775807") },
+    { ...observation, mode: "full-access" },
+  ])("keeps invalid/legacy frames as explicit cache-clearing events", (permission_observation) => {
+    expect(
+      parseEvent("session.codex_approval_mode", {
+        conversation_id: "permissions",
+        approval_mode: "",
+        permission_observation,
+      }),
+    ).toEqual({
+      type: "session_codex_approval_mode",
+      conversationId: "permissions",
+      approvalMode: "",
+      permissionObservation: null,
+    });
+  });
+  // Supplemental G1 literals, not captured server packets: the readable
+  // timestamp is what a JS producer's JSON.stringify of the int63 maximum
+  // prints, and the companion is the exact canonical decimal text.
+  const maximumData = {
+    conversation_id: "permissions",
+    approval_mode: "ask-for-approval",
+    permission_observation: { ...observation, received_at: Number("9223372036854775807") },
+    permission_observation_c1: "c1:0,1,2,1,1,2,2,0,0,9223372036854775807,cnVubmVy",
+  };
+  const maximumEvent = {
+    type: "session_codex_approval_mode",
+    conversationId: "permissions",
+    approvalMode: "ask-for-approval",
+    permissionObservation: { ...observation, received_at: "9223372036854775807" },
+  };
+  const entries: [string, () => Promise<unknown[]>][] = [
+    [
+      "raw SSE",
+      async () => {
+        const packet = `event: session.codex_approval_mode\ndata: ${JSON.stringify(maximumData)}\n\n`;
+        const events = [];
+        for await (const event of parseSseStream(new Response(packet).body!)) events.push(event);
+        return events;
+      },
+    ],
+    [
+      "JSONL",
+      async () => [
+        ...parseEventLines([
+          JSON.stringify({ event: "session.codex_approval_mode", data: maximumData }),
+        ]),
+      ],
+    ],
+    ["direct object", async () => [parseEvent("session.codex_approval_mode", maximumData)]],
+  ];
+  it.each(entries)(
+    "takes the exact companion over the readable projection through %s",
+    async (_entry, read) => {
+      expect(await read()).toEqual([maximumEvent]);
+    },
+  );
+  it("separates an absent companion key from a present one whose value is undefined", () => {
+    const frame = {
+      conversation_id: "permissions",
+      approval_mode: "ask-for-approval",
+      permission_observation: observation,
+    };
+    // Only a missing key may fall back to the legacy readable route.
+    expect(parseEvent("session.codex_approval_mode", frame)).toMatchObject({
+      permissionObservation: { received_at: "1792749199" },
+    });
+    // Own key with undefined cannot come from JSON; the direct-object contract
+    // still counts it as a malformed present field, so nothing is trusted.
+    const ownUndefined = { ...frame, permission_observation_c1: undefined };
+    expect(Object.hasOwn(ownUndefined, "permission_observation_c1")).toBe(true);
+    expect(parseEvent("session.codex_approval_mode", ownUndefined)).toMatchObject({
+      permissionObservation: null,
+    });
+  });
+  it("refuses the readable projection when a present companion conflicts or is unknown", () => {
+    const frame = { ...maximumData, permission_observation: observation };
+    for (const permission_observation_c1 of [
+      "c1:0,1,2,1,1,2,2,0,0,1792749200,cnVubmVy",
+      "c2:0,1,2,1,1,2,2,0,0,1792749199,cnVubmVy",
+      null,
+    ]) {
+      expect(
+        parseEvent("session.codex_approval_mode", { ...frame, permission_observation_c1 }),
+        String(permission_observation_c1),
+      ).toEqual({
+        type: "session_codex_approval_mode",
+        conversationId: "permissions",
+        approvalMode: "ask-for-approval",
+        permissionObservation: null,
+      });
+    }
+  });
+});
 import type {
   ElicitationResolved,
   MessageDone,

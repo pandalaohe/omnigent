@@ -871,6 +871,43 @@ class SysSessionGetInfoTool(Tool):
         }
 
 
+class SysSessionGetStartupObservationV1Tool(Tool):
+    """Proposed owner-only observational v1 tool; runner-dispatched, no in-process fallback."""
+
+    @classmethod
+    def name(cls) -> str:
+        return "sys_session_get_startup_observation_v1"
+
+    @classmethod
+    def description(cls) -> str:
+        return (
+            "Read owner/admin-only permission startup comparands for the exact bound runner. "
+            "Negotiates the registered observational protocol first. Missing/old support "
+            "is unknown; never starts a turn, rebinds, recovers or grants authority."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Session to observe; omit for caller.",
+                        }
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
 class SysSessionShareTool(Tool):
     """
     Grant another user (or the public) access to a session.

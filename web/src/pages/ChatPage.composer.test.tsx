@@ -13,8 +13,14 @@ import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
-import { MemoryRouter } from "react-router-dom";
+import {
+  createRef,
+  StrictMode,
+  type ComponentRef,
+  type ReactElement,
+  type ContextType,
+} from "react";
+import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
@@ -39,6 +45,20 @@ import type { ComposerDraftPart } from "@/lib/composerContent";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import { CODEX_PERMISSION_OBSERVATION_LABEL_KEY } from "@/lib/codexApprovalMode";
+import { parseSseStream } from "@/lib/sse";
+import { SidebarDataContext } from "@/hooks/useSidebarData";
+import { TerminalFirstContextProvider } from "@/shell/TerminalFirstContext";
+
+const terminalSidebarData = {
+  mine: { data: undefined },
+  all: { isLoading: false },
+  loadedData: undefined,
+} as NonNullable<ContextType<typeof SidebarDataContext>>;
+
+vi.mock("@/shell/MainTerminalView", () => ({
+  MainTerminalView: () => <div data-testid="terminal-transport-stub" />,
+}));
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -131,12 +151,16 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
-const { composerSessionSnapshot } = vi.hoisted(() => ({
+const { composerSessionSnapshot, composerSessionAccess } = vi.hoisted(() => ({
+  composerSessionAccess: { error: null as Error | null },
   composerSessionSnapshot: {
+    id: null as string | null,
+    runnerId: null as string | null,
     hostId: null as string | null,
     workspace: null as string | null,
     labels: {} as Record<string, string>,
     gitBranch: null as string | null,
+    permissionLevel: null as number | null,
   },
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -144,7 +168,7 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   useSession: () => ({
     session: composerSessionSnapshot,
     isLoading: false,
-    error: null,
+    error: composerSessionAccess.error,
   }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
@@ -173,7 +197,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, computeIsWorking } from "./ChatPage";
+import { ChatPage, Composer, CodexPermissionReadbackChip, computeIsWorking } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
@@ -2661,6 +2685,8 @@ describe("Composer shared visible controls", () => {
     childSessionsArgsSpy.mockClear();
     composerChildSessions.children = [];
     Object.assign(composerSessionSnapshot, {
+      id: null,
+      runnerId: null,
       hostId: null,
       workspace: null,
       labels: {},
@@ -2679,6 +2705,13 @@ describe("Composer shared visible controls", () => {
   // wrapping); the two page-local inline-dropdown popover cases retired with it.
 
   it("renders the same workspace, host, permission and model controls as landing", () => {
+    Object.assign(composerSessionSnapshot, {
+      id: "shared-controls",
+      runnerId: "runner",
+      labels: {
+        [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: "c1:0,1,2,1,1,2,2,0,0,1792749199,cnVubmVy",
+      },
+    });
     useChatStore.setState({
       conversationId: "shared-controls",
       sessionHarness: "codex-native",
@@ -2974,6 +3007,13 @@ describe("Composer shared visible controls", () => {
   );
 
   it("shows Read Only with guidance while disabling the unsupported runtime transition", () => {
+    Object.assign(composerSessionSnapshot, {
+      id: "codex-no-read-only",
+      runnerId: "runner",
+      labels: {
+        [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: "c1:0,1,5,1,1,1,1,0,0,1792749199,cnVubmVy",
+      },
+    });
     useChatStore.setState({
       conversationId: "codex-no-read-only",
       codexApprovalMode: "read-only",
@@ -2988,6 +3028,332 @@ describe("Composer shared visible controls", () => {
     const readOnly = screen.getByTestId("composer-permission-option-read-only");
     expect(readOnly).toHaveAttribute("data-disabled");
     expect(readOnly).toHaveTextContent("Start a new session");
+  });
+});
+
+describe("Composer native permission readback", () => {
+  const encoded = "c1:0,1,2,1,1,2,2,0,0,1792749199,cnVubmVy";
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "native-details",
+      sessionHarness: "codex-native",
+      codexApprovalMode: "full-access",
+      codexPermissionReadbacks: {},
+    });
+    Object.assign(composerSessionSnapshot, {
+      id: "native-details",
+      runnerId: "runner",
+      labels: { [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: encoded },
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    Object.assign(composerSessionSnapshot, {
+      id: null,
+      runnerId: null,
+      labels: {},
+      permissionLevel: null,
+    });
+    useChatStore.setState({ codexPermissionReadbacks: {} });
+    composerSessionAccess.error = null;
+  });
+  it.each([
+    { permissionLevel: 1 },
+    { permissionLevel: 2 },
+    { permissionLevel: 3 },
+    { permissionLevel: 4, readOnlyReason: "Session is read-only" },
+    { permissionLevel: 4, unreachable: true, runnerOnline: false },
+  ])("keeps authorized details reachable with original write gate %j", async (gate) => {
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockResolvedValue();
+    const reconnect = vi.fn();
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ showCodexApprovalMode: true, ...gate, onShowReconnectHelp: reconnect })}
+      />,
+    );
+    const chip = screen.getByTestId("composer-permission-chip");
+    expect(chip).toBeEnabled();
+    fireEvent.keyDown(chip, { key: "Enter" });
+    expect(screen.getByText("Approvals")).toBeInTheDocument();
+    expect(screen.getByText("on-request")).toBeInTheDocument();
+    expect(screen.getByText("workspace-write")).toBeInTheDocument();
+    for (const row of screen.getAllByRole("menuitemradio")) {
+      expect(row).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(row);
+    }
+    expect(setApproval).not.toHaveBeenCalled();
+    expect(reconnect).not.toHaveBeenCalled();
+  });
+  it("does not automatically promote the old report after offline → online", () => {
+    const props = composerProps({
+      permissionLevel: 4,
+      showCodexApprovalMode: true,
+      runnerOnline: false,
+    });
+    const view = renderWithTooltips(<Composer {...props} />);
+    expect(screen.getByTestId("composer-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Unavailable",
+    );
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...props} runnerOnline />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Unconfirmed",
+    );
+  });
+  it("keeps details read-only for an offline runner on a reachable host", () => {
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockResolvedValue();
+    const update = vi.spyOn(sessionsApi, "updateSession");
+    const reconnect = vi.fn();
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          permissionLevel: 4,
+          showCodexApprovalMode: true,
+          runnerOnline: false,
+          unreachable: false,
+          onShowReconnectHelp: reconnect,
+        })}
+      />,
+    );
+    const chip = screen.getByTestId("composer-permission-chip");
+    expect(chip).toBeEnabled();
+    expect(chip).toHaveAccessibleName("Permission mode: Unavailable");
+    fireEvent.keyDown(chip, { key: "Enter" });
+    expect(screen.getByText("Approvals")).toBeInTheDocument();
+    for (const row of screen.getAllByRole("menuitemradio")) {
+      fireEvent.click(row);
+      expect(row).toHaveAttribute("aria-disabled", "true");
+    }
+    expect(setApproval).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(reconnect).not.toHaveBeenCalled();
+  });
+  it("shows receipt request text with no selected executable preset", () => {
+    composerSessionSnapshot.labels = {
+      [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: "c1:1,2,0,0,0,0,0,5,3,-,cnVubmVy",
+    };
+    renderWithTooltips(
+      <Composer {...composerProps({ permissionLevel: 4, showCodexApprovalMode: true })} />,
+    );
+    const chip = screen.getByTestId("composer-permission-chip");
+    expect(chip).toHaveAccessibleName("Permission mode: Unconfirmed");
+    fireEvent.keyDown(chip, { key: "Enter" });
+    expect(screen.getByText("Application response received")).toBeInTheDocument();
+    expect(screen.getByText("Requested")).toBeInTheDocument();
+    expect(screen.getAllByText("Not reported")).toHaveLength(5);
+    for (const row of screen.getAllByRole("menuitemradio"))
+      expect(row).toHaveAttribute("aria-checked", "false");
+  });
+  it("renders an actual parsed SSE frame through the store and menu without a fetch or control call", async () => {
+    composerSessionSnapshot.labels = {};
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockResolvedValue();
+    renderWithTooltips(
+      <Composer {...composerProps({ permissionLevel: 1, showCodexApprovalMode: true })} />,
+    );
+    const chip = screen.getByTestId("composer-permission-chip");
+    expect(chip).toHaveAccessibleName("Permission mode: Unconfirmed");
+    const packet =
+      'event: session.codex_approval_mode\ndata: {"conversation_id":"native-details","approval_mode":"custom","permission_observation":{"version":1,"source":"native-settings","origin":"settings-updated","mode":"custom","approval":"never","reviewer":"auto_review","sandbox":"read-only","profile":"read-only","uncertainty":null,"requested_mode":null,"received_at":1792749200,"runner_id":"runner"}}\n\n';
+    await act(async () => {
+      for await (const event of parseSseStream(new Response(packet).body!))
+        handleSessionEvent(event, "native-details");
+    });
+    expect(chip).toHaveAccessibleName("Permission mode: Custom");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fireEvent.keyDown(chip, { key: "Enter" });
+    expect(screen.getByText("never")).toBeInTheDocument();
+    expect(
+      screen.getByText("auto_review · Current policy does not trigger approval"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("1792749200 (epoch seconds)")).toBeInTheDocument();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(setApproval).not.toHaveBeenCalled();
+  });
+  it("keeps report text and disables every switch while a control request is pending or fails", async () => {
+    let reject!: (error: Error) => void;
+    const pending = new Promise<void>((_resolve, fail) => {
+      reject = fail;
+    });
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockReturnValue(pending);
+    renderWithTooltips(
+      <Composer {...composerProps({ permissionLevel: 4, showCodexApprovalMode: true })} />,
+    );
+    const chip = screen.getByTestId("composer-permission-chip");
+    fireEvent.keyDown(chip, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+    expect(chip).toHaveAccessibleName("Permission mode: Ask for approval · Reported");
+    fireEvent.keyDown(chip, { key: "Enter" });
+    for (const row of screen.getAllByRole("menuitemradio"))
+      expect(row).toHaveAttribute("aria-disabled", "true");
+    await act(async () => {
+      reject(new Error("Permission change failed"));
+    });
+    expect(chip).toHaveAccessibleName("Permission mode: Ask for approval · Reported");
+    expect(screen.getByText("Permission change failed")).toBeInTheDocument();
+  });
+  it.each([null, "another-session", "native-details"])(
+    "withholds details without the loaded session-read context (%s)",
+    (id) => {
+      composerSessionSnapshot.id = id;
+      renderWithTooltips(
+        <Composer {...composerProps({ permissionLevel: 0, showCodexApprovalMode: true })} />,
+      );
+      expect(screen.queryByTestId("composer-permission-chip")).toBeNull();
+    },
+  );
+  it("withholds cached details when the existing session read fails", () => {
+    composerSessionAccess.error = new Error("Session access denied");
+    renderWithTooltips(
+      <Composer {...composerProps({ permissionLevel: 1, showCodexApprovalMode: true })} />,
+    );
+    expect(screen.queryByTestId("composer-permission-chip")).toBeNull();
+  });
+  it("keeps the old report unconfirmed across a binding change and return", () => {
+    const props = composerProps({ permissionLevel: 4, showCodexApprovalMode: true });
+    composerSessionSnapshot.runnerId = "replacement";
+    const view = renderWithTooltips(<Composer {...props} />);
+    expect(screen.getByTestId("composer-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Unconfirmed",
+    );
+    composerSessionSnapshot.runnerId = "runner";
+    view.rerender(
+      <TooltipProvider>
+        <Composer {...props} />
+      </TooltipProvider>,
+    );
+    expect(screen.getByTestId("composer-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Unconfirmed",
+    );
+  });
+  it("keeps terminal details reachable when the composer is absent, without fetching or writing", async () => {
+    const user = userEvent.setup();
+    const session = {
+      id: "native-details",
+      runnerId: "runner",
+      harness: "codex-native",
+      labels: { [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: encoded },
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    renderWithTooltips(
+      <CodexPermissionReadbackChip session={session} permissionLevel={1} offline />,
+    );
+    const chip = screen.getByTestId("terminal-permission-chip");
+    expect(screen.queryByRole("textbox", { name: "Message the agent" })).toBeNull();
+    expect(chip).toHaveAccessibleName("Permission mode: Unavailable");
+    await user.tab();
+    expect(chip).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByText("workspace-write")).toBeInTheDocument();
+    for (const row of screen.getAllByRole("menuitemradio")) {
+      expect(row).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(row);
+    }
+    await user.keyboard("{Escape}");
+    expect(chip).toHaveFocus();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+  it.each(["read failure", "wrong session"])(
+    "withdraws details on the actual Terminal surface after cached %s",
+    async (change) => {
+      Object.assign(composerSessionSnapshot, { permissionLevel: 1 });
+      composerSessionSnapshot.labels = {
+        "omnigent.wrapper": "codex-native-ui",
+        "omnigent.ui": "terminal",
+        [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: encoded,
+      };
+      useChatStore.setState({
+        loadingConversation: false,
+        conversationLoadError: null,
+        boundAgentId: null,
+        boundAgentName: null,
+        sandboxStatus: null,
+      });
+      vi.spyOn(useChatStore.getState(), "switchTo").mockResolvedValue();
+      const queries = new QueryClient({
+        defaultOptions: { queries: { enabled: false, retry: false } },
+      });
+      const page = () => (
+        <QueryClientProvider client={queries}>
+          <MemoryRouter initialEntries={["/c/native-details"]}>
+            <Routes>
+              <Route
+                path="/c/:conversationId"
+                element={
+                  <TerminalFirstContextProvider
+                    value={{
+                      isClaudeNative: false,
+                      isNativeWrapper: true,
+                      isTerminalFirst: true,
+                      isShellView: false,
+                      view: "terminal",
+                      terminalViewKey: null,
+                      setView: vi.fn(),
+                      terminalsAvailable: false,
+                      terminalStartingUp: false,
+                    }}
+                  >
+                    <SidebarDataContext.Provider value={terminalSidebarData}>
+                      <TooltipProvider>
+                        <ChatPage />
+                      </TooltipProvider>
+                    </SidebarDataContext.Provider>
+                  </TerminalFirstContextProvider>
+                }
+              />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+      const view = render(page());
+      expect(screen.getByTestId("terminal-transport-stub")).toBeInTheDocument();
+      expect(screen.getByTestId("terminal-permission-chip")).toBeEnabled();
+      fireEvent.keyDown(screen.getByTestId("terminal-permission-chip"), { key: "Enter" });
+      expect(screen.getByText("Approvals")).toBeInTheDocument();
+      if (change === "read failure")
+        composerSessionAccess.error = new Error("Session access denied");
+      else composerSessionSnapshot.id = "another-session";
+      view.rerender(page());
+      expect(screen.getByTestId("terminal-transport-stub")).toBeInTheDocument();
+      expect(screen.queryByTestId("terminal-permission-chip")).toBeNull();
+      expect(screen.queryByText("Approvals")).toBeNull();
+      queries.clear();
+    },
+  );
+  it("withholds the terminal chip without a readable native session", () => {
+    const session = { id: "native-details", runnerId: "runner", harness: "codex", labels: {} };
+    const view = renderWithTooltips(
+      <CodexPermissionReadbackChip session={null} permissionLevel={1} offline={false} />,
+    );
+    expect(screen.queryByTestId("terminal-permission-chip")).toBeNull();
+    view.rerender(
+      <TooltipProvider>
+        <CodexPermissionReadbackChip session={session} permissionLevel={4} offline={false} />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("terminal-permission-chip")).toBeNull();
+    view.rerender(
+      <TooltipProvider>
+        <CodexPermissionReadbackChip
+          session={{ ...session, harness: "codex-native" }}
+          permissionLevel={0}
+          offline={false}
+        />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("terminal-permission-chip")).toBeNull();
   });
 });
 

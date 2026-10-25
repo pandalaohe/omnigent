@@ -79,6 +79,28 @@ describe("getOutputPreview", () => {
     expect(preview.text).not.toContain("line 81");
   });
 
+  it("keeps a native failed-command marker as the first preview line", () => {
+    // Exact output persisted by the native forwarder through the server consumer
+    // (test_native_failed_command_envelope_persists_and_streams_terminal_status).
+    const output = "[command status: failed]\nboom\n\n[exit code: 3]";
+    const preview = getOutputPreview(output);
+
+    expect(preview.text).toBe(output);
+    expect(preview.text.split("\n")[0]).toBe("[command status: failed]");
+  });
+
+  it("keeps a native declined-command marker visible when the preview truncates", () => {
+    const body = Array.from({ length: 120 }, (_, index) => `line ${index + 1}`).join("\n");
+    const output = `[command status: declined]\n${body}\n[exit code: 3]`;
+    const preview = getOutputPreview(output);
+
+    expect(preview.isTruncated).toBe(true);
+    expect(preview.text.startsWith("[command status: declined]\n")).toBe(true);
+    expect(preview.text).not.toContain("line 120");
+    // The suffix sits past the preview window; only the head is guaranteed.
+    expect(preview.text).not.toContain("[exit code: 3]");
+  });
+
   it("expands long output back to the full text", () => {
     const output = "x".repeat(12_050);
     const collapsed = getOutputPreview(output);
@@ -121,6 +143,20 @@ describe("ToolCard rendering", () => {
     fireEvent.click(trigger);
     expect(screen.getAllByText("Parameters").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+  });
+
+  it("renders the native failed-command status line in the output panel", () => {
+    // The output is the exact persisted text from the native forwarder → server
+    // consumer test; the card must present its first line, not hide it.
+    const { container } = renderCard({
+      name: "shell",
+      argsSummary: "",
+      arguments: { command: "false" },
+      output: "[command status: failed]\nboom\n\n[exit code: 3]",
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(container.textContent).toContain("[command status: failed]");
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {

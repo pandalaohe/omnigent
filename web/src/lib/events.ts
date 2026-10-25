@@ -9,6 +9,7 @@
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
 import type { RoutingDecisionExtras } from "./routingDecision";
+import type { CodexPermissionObservation } from "./codexApprovalMode";
 import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 import type {
   AgyPermission,
@@ -672,7 +673,7 @@ export interface SessionPermissionModeEvent {
 }
 
 /**
- * `session.codex_approval_mode` — active codex-native approval/sandbox switch.
+ * `session.codex_approval_mode` — Codex readback or an application response.
  *
  * Emitted when the web picker switches the mode, and when the Codex forwarder
  * sees a `thread/settings/updated` (a `/permissions` change made in the TUI).
@@ -681,6 +682,8 @@ export interface SessionCodexApprovalModeEvent {
   type: "session_codex_approval_mode";
   conversationId: string;
   approvalMode: string;
+  /** Null/absent reports clear native readback; SDK scalar events keep their old meaning. */
+  permissionObservation?: CodexPermissionObservation | null;
 }
 
 /** Confirmed speed for the next turn, including native TUI changes while idle. */

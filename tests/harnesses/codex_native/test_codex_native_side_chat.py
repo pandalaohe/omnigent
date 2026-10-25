@@ -640,3 +640,81 @@ def test_codex_native_subagent_wrapper_is_recognized() -> None:
     assert is_codex_native_subagent_wrapper("claude-code-native-ui-subagent") is False
     assert is_codex_native_subagent_wrapper("something-else") is False
     assert is_codex_native_subagent_wrapper(None) is False
+
+
+# --------------------------------------------------------------------------- #
+# producer -> label -> origin
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_spawn_item_registration_stamps_the_delegation_label() -> None:
+    """A spawn item's id reaches ``collab_tool_call_id`` and proves a delegation.
+
+    The forwarder sends the spawn item id as ``tool_call_id`` on the
+    ``external_codex_subagent_start`` POST, which the server stores as the
+    child's ``collab_tool_call_id`` label. That label is the only evidence the
+    runner trusts to admit a Codex thread to the parent wake.
+    """
+    import httpx
+
+    from omnigent.runner.subagent_work import (
+        CODEX_NATIVE_ORIGIN_DELEGATED,
+        CODEX_NATIVE_TOOL_CALL_ID_LABEL_KEY,
+        codex_native_origin_from_labels,
+    )
+
+    posted: list[_JsonObject] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(200, json={"child_session_id": "conv_child"})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(_handle)
+    ) as client:
+        child_session_id = await fwd._register_child_session(
+            client,
+            parent_session_id="conv_parent",
+            parent_thread_id="thread_parent",
+            child_thread_id="thread_child",
+            item={"id": "call_7f3a", "agent_nickname": "worker"},
+        )
+
+    assert child_session_id == "conv_child"
+    data = posted[0]["data"]
+    assert data["tool_call_id"] == "call_7f3a"
+    # The labels the server builds from that body (session-event handler).
+    labels = {
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        CODEX_NATIVE_TOOL_CALL_ID_LABEL_KEY: data["tool_call_id"],
+    }
+    assert codex_native_origin_from_labels(labels) == CODEX_NATIVE_ORIGIN_DELEGATED
+
+
+@pytest.mark.asyncio
+async def test_side_fork_registration_stamps_no_delegation_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A /side fork registers with a nickname only, so its origin stays unknown."""
+    from omnigent.runner.subagent_work import (
+        CODEX_NATIVE_ORIGIN_UNKNOWN,
+        codex_native_origin_from_labels,
+    )
+
+    ensure = _ensure_stub("conv_side")
+    monkeypatch.setattr(fwd, "_ensure_child_session", ensure)
+
+    await side_chat.register_side_fork_child(
+        object(),  # ap_client unused: the pipeline is stubbed
+        forwarder_state=fwd._CodexForwarderState(),
+        parent_session_id="conv_parent",
+        parent_thread_id="thread_parent",
+        event=_fork_started(thread_id="thread_side", forked_from="thread_parent"),
+    )
+
+    item = ensure.await_args.kwargs["item"]
+    assert "id" not in item, "a side fork has no spawn item, so it carries no tool_call_id"
+    labels = {
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": item["agent_nickname"],
+    }
+    assert codex_native_origin_from_labels(labels) == CODEX_NATIVE_ORIGIN_UNKNOWN

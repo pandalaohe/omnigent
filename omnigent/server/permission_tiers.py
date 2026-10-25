@@ -124,10 +124,10 @@ def read_permission_state(labels: Mapping[str, str], *, harness: str) -> Confirm
 
 
 def require_permission_protocol(
-    request: object, *, harness: str | None, allow_query: bool = False
+    request: object, *, harness: str | None, allow_query: bool = False, required: bool = False
 ) -> None:
     """Refuse an old client before a tiered session is exposed or changed."""
-    if harness not in TIER_HARNESSES:
+    if harness not in TIER_HARNESSES and not required:
         return
     from fastapi import HTTPException
 

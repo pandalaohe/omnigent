@@ -366,8 +366,193 @@ def test_forwarder_surfaces_failed_command_exit_code() -> None:
     # The exit code (3, from the replayed item above) must appear appended
     # to the captured stderr/stdout. If the suffix were missing the output
     # would be just "boom\n" — a failed command indistinguishable from a
-    # successful one in the UI.
-    assert outputs == ["boom\n\n[exit code: 3]"]
+    # successful one in the UI. The terminal-status marker supplies the
+    # failed/declined state Codex omits from the exit code alone.
+    assert outputs == ["[command status: failed]\nboom\n\n[exit code: 3]"]
+
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code", "output", "expected"),
+    [
+        pytest.param("completed", 0, "hello world\n", "hello world\n", id="completed-zero"),
+        pytest.param("completed", _ABSENT, "hello", "hello", id="completed-no-exit"),
+        pytest.param("completed", _ABSENT, None, "", id="completed-empty"),
+        pytest.param("failed", None, None, "[command status: failed]", id="failed-empty"),
+        pytest.param(
+            "declined", None, None, "[command status: declined]", id="declined-null-null"
+        ),
+        pytest.param("failed", _ABSENT, "", "[command status: failed]", id="failed-empty-string"),
+        pytest.param(
+            "declined",
+            None,
+            "refused\n",
+            "[command status: declined]\nrefused\n",
+            id="declined-output",
+        ),
+        pytest.param(
+            "failed",
+            0,
+            "boom",
+            "[command status: failed]\nboom",
+            id="failed-zero-contradiction",
+        ),
+        pytest.param(
+            "declined",
+            0,
+            None,
+            "[command status: declined]",
+            id="declined-zero-contradiction",
+        ),
+        pytest.param(
+            "failed",
+            3,
+            "boom\n",
+            "[command status: failed]\nboom\n\n[exit code: 3]",
+            id="failed-nonzero",
+        ),
+        pytest.param(
+            "declined",
+            3,
+            None,
+            "[command status: declined]\n[exit code: 3]",
+            id="declined-nonzero",
+        ),
+        pytest.param("inProgress", 0, "here\n", "here\n", id="unknown-zero"),
+        pytest.param("inProgress", None, "here", "here", id="unknown-null-exit"),
+        pytest.param("futureStatus", 3, "boom\n", "boom\n\n[exit code: 3]", id="unknown-nonzero"),
+        pytest.param(_ABSENT, None, "legacy", "legacy", id="legacy-no-status"),
+        pytest.param(
+            _ABSENT, 3, "boom\n", "boom\n\n[exit code: 3]", id="legacy-no-status-nonzero"
+        ),
+        pytest.param(None, 3, "boom\n", "boom\n\n[exit code: 3]", id="legacy-null-status"),
+    ],
+)
+def test_forwarder_command_terminal_status_matrix(
+    status: object, exit_code: object, output: str | None, expected: str
+) -> None:
+    """Only exact failed/declined states change the mirrored command output."""
+    item: dict[str, Any] = {
+        "type": "commandExecution",
+        "id": "call_status",
+        "command": "/bin/zsh -lc 'run'",
+        "cwd": "/repo",
+    }
+    if status is not _ABSENT:
+        item["status"] = status
+    if exit_code is not _ABSENT:
+        item["exitCode"] = exit_code
+    if output is not None:
+        item["aggregatedOutput"] = output
+    posted: list[dict[str, Any]] = []
+
+    asyncio.run(_replay_completed_item(item, _capture_handler(posted)))
+
+    assert [p["data"]["item_type"] for p in posted] == ["function_call", "function_call_output"]
+    call_id = posted[0]["data"]["item_data"]["call_id"]
+    assert call_id == "call_status"
+    assert posted[1]["data"]["item_data"] == {"call_id": call_id, "output": expected}
+
+
+def test_forwarder_failed_command_start_and_completion_post_one_pair(tmp_path: Path) -> None:
+    """A live started call is not re-posted when its failed completion arrives."""
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+    started_item = {
+        "type": "commandExecution",
+        "id": "call_live_failed",
+        "command": "pytest -q",
+        "cwd": "/repo",
+        "status": "inProgress",
+    }
+    completed_item = {
+        **started_item,
+        "status": "failed",
+        "aggregatedOutput": "collecting tests...\n",
+    }
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            for event in (
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": started_item,
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": completed_item,
+                    },
+                },
+            ):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event=event,
+                    forwarder_state=state,
+                )
+
+    asyncio.run(run())
+
+    assert [p["data"]["item_type"] for p in posted] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert posted[0]["data"]["item_data"]["call_id"] == "call_live_failed"
+    assert posted[1]["data"]["item_data"] == {
+        "call_id": "call_live_failed",
+        "output": "[command status: failed]\ncollecting tests...\n",
+    }
+
+
+def test_forwarder_failed_file_change_keeps_summary_output() -> None:
+    """A failed fileChange keeps its summary output without a status marker."""
+    posted: list[dict[str, Any]] = []
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": "call_patch_failed",
+                "status": "failed",
+                "changes": [{"path": "/repo/not-applied.py", "kind": {"type": "add"}}],
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted[1]["data"]["item_data"] == {
+        "call_id": "call_patch_failed",
+        "output": "add /repo/not-applied.py",
+    }
+
+
+def test_forwarder_drops_codex_tool_item_missing_id(caplog: pytest.LogCaptureFixture) -> None:
+    """A commandExecution without an id is dropped, not mirrored."""
+    posted: list[dict[str, Any]] = []
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "commandExecution",
+                "command": "/bin/zsh -lc 'run'",
+                "status": "failed",
+                "aggregatedOutput": "boom",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == []
+    assert "Codex tool item missing string id" in caplog.text
 
 
 def test_forwarder_posts_codex_file_change_tool_call() -> None:
