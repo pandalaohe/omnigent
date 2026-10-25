@@ -150,7 +150,14 @@ import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
-import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
+import {
+  codexApprovalModeFromSession,
+  decodeCodexPermissionObservation,
+  encodeCodexPermissionObservation,
+  CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
+  CODEX_PERMISSION_OBSERVATION_LABEL_KEY,
+  type CodexPermissionCachedReport,
+} from "@/lib/codexApprovalMode";
 import { sdkPermissionModeFromSession } from "@/lib/sdkPermissionModes";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import {
@@ -1154,6 +1161,8 @@ export interface SideChatComposerDraft {
 export const EMPTY_SIDE_CHAT_COMPOSER: SideChatComposerDraft = { text: "", files: [] };
 
 export interface AppChatState {
+  /** Native-only readback cache, keyed by session so background streams cannot cross contexts. */
+  codexPermissionReadbacks: Readonly<Record<string, CodexPermissionCachedReport>>;
   /** The conversation currently on screen. `null` on `/`. */
   conversationId: string | null;
   /**
@@ -1481,6 +1490,10 @@ const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<str
  */
 export function releaseConversation(id: string): void {
   conversationRegistry.release(id);
+  const reports = Object.fromEntries(
+    Object.entries(useChatStore.getState().codexPermissionReadbacks).filter(([key]) => key !== id),
+  );
+  useChatStore.setState({ codexPermissionReadbacks: reports });
 }
 
 // Catalogs that resolved while their bind snapshot was still hydrating.
@@ -2102,6 +2115,7 @@ function cachedEffortFamilyForSession(
 }
 
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
+  codexPermissionReadbacks: {},
   conversationId: null,
   redirectToConversationId: null,
   blocks: [],
@@ -3503,6 +3517,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         throw new Error("chatStore.setEffort: queryClient not initialized");
       }
       const pick = trackLiveSettingPick(conversationId, "reasoningEffort", previous);
+      const permissionBeforeFetch = get().codexPermissionReadbacks[conversationId];
       let updated;
       try {
         const session = await queryClient.fetchQuery({
@@ -3511,6 +3526,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           staleTime: Infinity,
           retry: false,
         });
+        cacheSessionSnapshot(session, permissionBeforeFetch);
         // Harness has no effort control: undo the optimistic session-scoped write
         // so this conversation doesn't claim an effort the server will never hold.
         // SDK harnesses carry no wrapper label, so resolve their declared effort
@@ -3725,16 +3741,68 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setCodexApprovalMode: async (mode) => {
-    const { conversationId } = get();
+    const { conversationId, sessionHarness } = get();
     if (!conversationId) return;
     const previous = get().codexApprovalMode;
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
-    // Optimistic, then reconciled against the mode the server confirms the
-    // Codex thread landed on (or, for SDK sessions, stored).
-    patchSet({ codexApprovalMode: mode });
+    // Native reports are readback, never the optimistic control selection.
+    const native =
+      sessionHarness === "codex-native" ||
+      isCodexNativeSession(queryClient?.getQueryData<Session>(["session", conversationId]));
+    const entryBefore = conversationRegistry.peek(conversationId);
+    const reportBefore = get().codexPermissionReadbacks[conversationId];
+    const sessionBefore = queryClient?.getQueryData<Session>(["session", conversationId]);
+    const contextBefore = JSON.stringify([
+      sessionBefore?.runnerId,
+      sessionBefore?.harness,
+      sessionBefore?.agentId,
+      sessionBefore?.labels?.["omnigent.wrapper"],
+      sessionBefore?.labels?.[CODEX_PERMISSION_OBSERVATION_LABEL_KEY],
+      get().sessionHarness,
+      get().boundAgentId,
+    ]);
+    if (!native) patchSet({ codexApprovalMode: mode });
     try {
       const session = await updateSession(conversationId, { codexApprovalMode: mode });
+      if (native) {
+        const currentState = setterForState(conversationId);
+        const currentSession = queryClient?.getQueryData<Session>(["session", conversationId]);
+        if (
+          !currentState ||
+          conversationRegistry.peek(conversationId) !== entryBefore ||
+          get().codexPermissionReadbacks[conversationId] !== reportBefore ||
+          contextBefore !==
+            JSON.stringify([
+              currentSession?.runnerId,
+              currentSession?.harness,
+              currentSession?.agentId,
+              currentSession?.labels?.["omnigent.wrapper"],
+              currentSession?.labels?.[CODEX_PERMISSION_OBSERVATION_LABEL_KEY],
+              currentState.sessionHarness,
+              currentState.boundAgentId,
+            ])
+        )
+          return;
+        cacheCodexPermissionReport(
+          conversationId,
+          session.labels?.[CODEX_PERMISSION_OBSERVATION_LABEL_KEY] ?? "",
+        );
+        queryClient?.setQueryData(["session", conversationId], {
+          ...(currentSession ?? session),
+          labels: {
+            ...(currentSession?.labels ?? session.labels),
+            [CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY]:
+              session.labels?.[CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] ?? null,
+            [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]:
+              session.labels?.[CODEX_PERMISSION_OBSERVATION_LABEL_KEY] ?? "",
+          },
+        });
+        patchSet({
+          codexApprovalMode: codexApprovalModeFromSession(session) ?? "",
+        });
+        return;
+      }
       patchSet({
         codexApprovalMode:
           sdkPermissionModeFromSession(session, "codex") ??
@@ -3742,7 +3810,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           "",
       });
     } catch (err) {
-      patchSet({ codexApprovalMode: previous });
+      if (!native) patchSet({ codexApprovalMode: previous });
       throw err;
     }
   },
@@ -4141,6 +4209,60 @@ function setterFor(conversationId: string | null): Setter {
   return entrySetter(entry);
 }
 
+/** An observed disconnect/context change cannot be undone by showing the old report again. */
+export function invalidateCodexPermissionReadback(
+  conversationId: string,
+  fallbackEncoded?: string | null,
+): void {
+  const report = useChatStore.getState().codexPermissionReadbacks[conversationId];
+  const session = queryClient?.getQueryData<Session>(["session", conversationId]);
+  cacheCodexPermissionReport(
+    conversationId,
+    report?.encoded ??
+      fallbackEncoded ??
+      session?.labels?.[CODEX_PERMISSION_OBSERVATION_LABEL_KEY] ??
+      "",
+    true,
+  );
+}
+
+function cacheCodexPermissionReport(id: string, encoded: string, stale = false): void {
+  const reports = useChatStore.getState().codexPermissionReadbacks;
+  if (reports[id]?.encoded === encoded && reports[id]?.stale === stale) return;
+  const liveReports = Object.fromEntries(
+    Object.entries(reports).filter(
+      ([key]) => key === id || conversationRegistry.peek(key) !== undefined,
+    ),
+  );
+  useChatStore.setState({
+    codexPermissionReadbacks: {
+      ...liveReports,
+      [id]: { encoded, observation: decodeCodexPermissionObservation(encoded), stale },
+    },
+  });
+}
+
+/** Preserve an event that arrived during the fetch, including a legacy tombstone. */
+function cacheSessionSnapshot(
+  session: Session,
+  before: CodexPermissionCachedReport | undefined,
+): void {
+  const report = useChatStore.getState().codexPermissionReadbacks[session.id];
+  let snapshot = session;
+  if (isCodexNativeSession(session) || session.harness === "codex-native") {
+    if (report !== before && report !== undefined) {
+      snapshot = {
+        ...session,
+        labels: { ...session.labels, [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: report.encoded },
+      };
+    } else {
+      const encoded = session.labels?.[CODEX_PERMISSION_OBSERVATION_LABEL_KEY] ?? "";
+      cacheCodexPermissionReport(session.id, encoded, report?.encoded === encoded && report.stale);
+    }
+  }
+  queryClient?.setQueryData(["session", session.id], snapshot);
+}
+
 /**
  * Move conversation state written before a session existed onto its new entry.
  *
@@ -4472,6 +4594,7 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  */
 async function reconcilePendingElicitations(id: string): Promise<void> {
   if (queryClient === null) return;
+  const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
   let session: Session;
   try {
     session = await queryClient.fetchQuery({
@@ -4488,6 +4611,7 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
   // showing a card that was already answered elsewhere. Gating on the visible
   // conversation made a background reconcile fetch the snapshot and discard it.
   if (isConversationDisposed(id)) return;
+  cacheSessionSnapshot(session, permissionBeforeFetch);
   const stillPending = new Set(
     (session.pendingElicitations ?? [])
       .map((e) => (typeof e.elicitation_id === "string" ? e.elicitation_id : null))
@@ -4702,13 +4826,14 @@ async function refreshSessionBinding(id: string): Promise<void> {
   const stateBeforeFetch = setterForState(id);
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   const startupBeforeFetch = stateBeforeFetch?.startup;
+  const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
   let session: Session;
   try {
     session = await getIndependentSessionMetadata(id);
   } catch {
     return;
   }
-  queryClient.setQueryData(["session", id], session);
+  cacheSessionSnapshot(session, permissionBeforeFetch);
   void queryClient?.invalidateQueries({ queryKey: ["skills", id] });
   // Apply to the conversation this refresh was for, not whichever is on screen:
   // an agent switch in a backgrounded conversation must still re-derive its
@@ -4821,6 +4946,7 @@ async function bindStream(
   const stateBeforeFetch = get();
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   const startupBeforeFetch = stateBeforeFetch.startup;
+  const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -4830,7 +4956,7 @@ async function bindStream(
       fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
     ]);
     if (isConversationDisposed(id)) return;
-    queryClient.setQueryData(["session", id], session);
+    cacheSessionSnapshot(session, permissionBeforeFetch);
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
@@ -5955,6 +6081,7 @@ async function reconcileOnReconnect(
   // `reconcileElicitationBlocks`.
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks);
   const todosAtReconnectStart = get().todos;
+  const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
   const pendingAtReconnectStart = new Set(get().pendingUserMessages.map((p) => p.tempId));
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
@@ -5972,7 +6099,7 @@ async function reconcileOnReconnect(
     return;
   }
   if (stale()) return;
-  queryClient.setQueryData(["session", id], session);
+  cacheSessionSnapshot(session, permissionBeforeFetch);
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
 
   // Page backwards until the fetched window reaches the pre-gap transcript
@@ -7784,13 +7911,13 @@ async function refetchRunnerBackedSessionState(
   const stateBeforeFetch = setterForState(conversationId);
   const launchBeforeFetch = mcpStartupBeforeSnapshot(conversationId, stateBeforeFetch);
   const startupBeforeFetch = stateBeforeFetch?.startup;
+  const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[conversationId];
   let session: Session;
   try {
     if (options.applyBindingPatch === true) {
       session = await getIndependentSessionMetadata(conversationId, {
         refreshState: options.refreshState,
       });
-      queryClient?.setQueryData(["session", conversationId], session);
     } else if (queryClient !== null) {
       session = await queryClient.fetchQuery({
         queryKey: ["session", conversationId],
@@ -7801,11 +7928,18 @@ async function refetchRunnerBackedSessionState(
     } else {
       session = await getSessionSlim(conversationId, { refreshState: options.refreshState });
     }
+    const reportBeforeMerge = useChatStore.getState().codexPermissionReadbacks[conversationId];
+    cacheSessionSnapshot(session, permissionBeforeFetch);
     if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length === 0) {
       // The event can race the bind snapshot's in-flight query. Once that
       // request settles, issue a second read instead of accepting its stale [].
+      // Advance our own snapshot without undoing an intervening native report.
+      const permissionBeforeRetry =
+        reportBeforeMerge === permissionBeforeFetch
+          ? useChatStore.getState().codexPermissionReadbacks[conversationId]
+          : permissionBeforeFetch;
       session = await getSessionSlim(conversationId);
-      queryClient?.setQueryData(["session", conversationId], session);
+      cacheSessionSnapshot(session, permissionBeforeRetry);
     }
   } catch {
     // The runner may have dropped again before the fetch landed. Keep
@@ -8112,9 +8246,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         });
         // The host binding is now durable. Learning it readdresses a stream
         // opened before provisioning, without depending on a browser send.
+        const permissionBeforeFetch =
+          useChatStore.getState().codexPermissionReadbacks[event.conversationId];
         void getSessionSlim(event.conversationId)
           .then((session) => {
-            queryClient?.setQueryData(["session", event.conversationId], session);
+            cacheSessionSnapshot(session, permissionBeforeFetch);
             applyToConversation({ sessionHostId: session.hostId ?? null });
           })
           .catch(() => {});
@@ -8261,13 +8397,44 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // cannot paint Plan mode onto the newly-opened conversation.
       applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
       return;
-    case "session_codex_approval_mode":
-      // A Codex approval switch made in the web picker or the native TUI's
-      // /permissions popup; the server has confirmed it's the live mode.
-      applyToNamedConversation(event.conversationId, {
-        codexApprovalMode: event.approvalMode,
-      });
+    case "session_codex_approval_mode": {
+      if (event.conversationId !== sourceConversationId) return;
+      const cached = queryClient?.getQueryData<Session>(["session", event.conversationId]);
+      const harness = setterForState(event.conversationId)?.sessionHarness ?? cached?.harness;
+      const native =
+        harness === "codex-native" ||
+        (harness == null && (isCodexNativeSession(cached) || event.permissionObservation != null));
+      if (native) {
+        const observation =
+          event.permissionObservation?.mode === event.approvalMode
+            ? event.permissionObservation
+            : null;
+        cacheCodexPermissionReport(
+          event.conversationId,
+          observation ? encodeCodexPermissionObservation(observation) : "",
+        );
+        queryClient?.setQueryData<Session>(["session", event.conversationId], (session) =>
+          session
+            ? {
+                ...session,
+                labels: {
+                  ...session.labels,
+                  [CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY]: event.approvalMode,
+                  [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: observation
+                    ? encodeCodexPermissionObservation(observation)
+                    : "",
+                },
+              }
+            : session,
+        );
+        applyToNamedConversation(event.conversationId, {
+          codexApprovalMode: event.approvalMode,
+        });
+      } else if (event.approvalMode) {
+        applyToNamedConversation(event.conversationId, { codexApprovalMode: event.approvalMode });
+      }
       return;
+    }
     case "session_speed_tier": {
       const speed =
         event.speedTier === "priority"
@@ -8296,6 +8463,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // lifecycle) from a fresh snapshot — the event is the only signal
       // an in-place switch produces; the URL doesn't change, so the
       // switchTo/bindStream path never re-runs.
+      if (event.conversationId === sourceConversationId)
+        invalidateCodexPermissionReadback(event.conversationId);
       applyToNamedConversation(event.conversationId, (s) => ({
         boundAgentId: event.agentId,
         boundAgentName: event.agentName,

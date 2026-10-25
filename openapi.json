@@ -2379,6 +2379,131 @@
         "title": "CodexGoalResponse",
         "type": "object"
       },
+      "CodexPermissionObservation": {
+        "description": "Finite readback categories, never a control request or native attestation.\n\n`received_at` and `runner_id` belong to the receiving application; a\nproducer payload cannot supply them. Values are validated on construction.",
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Approval"
+          },
+          "mode": {
+            "default": "unknown",
+            "title": "Mode",
+            "type": "string"
+          },
+          "origin": {
+            "default": "resume",
+            "title": "Origin",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "received_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Received At"
+          },
+          "requested_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Requested Mode"
+          },
+          "reviewer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reviewer"
+          },
+          "runner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Id"
+          },
+          "sandbox": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox"
+          },
+          "source": {
+            "default": "native-settings",
+            "title": "Source",
+            "type": "string"
+          },
+          "uncertainty": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "no-settings",
+            "title": "Uncertainty"
+          },
+          "version": {
+            "default": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "title": "CodexPermissionObservation",
+        "type": "object"
+      },
       "CompactionCompletedEvent": {
         "description": "Conversation history compaction has finished.\n\nEmitted after compaction completes \u2014 either by the server after\n`compact_conversation_now()` (explicit `/compact`), or by a\nharness that compacted its own internal context. Clients that\nrendered a \"Compacting\u2026\" spinner on\n`CompactionInProgressEvent` should upgrade it to the\npermanent \"Conversation compacted\" marker on this event.\n\nWhen emitted by a harness, `summary` and `summary_model`\nare populated so the runner can persist a compaction item for\nsession resume. When emitted by the server's explicit\n`/compact` path, those fields are `None`.",
         "properties": {
@@ -8168,10 +8293,10 @@
         "type": "object"
       },
       "SessionCodexApprovalModeEvent": {
-        "description": "Active approval/sandbox-mode update from a codex-native session.\n\nEmitted after the web UI switches the mode, and after the Codex forwarder\nobserves a `thread/settings/updated` notification \u2014 an approval change the\nuser made inside Codex's `/permissions` popup, which Omnigent has no other\nway to see. Lets the composer's approval picker track the thread without a\nreload.",
+        "description": "Permission readback or a legacy scalar selection for a Codex session.\n\nNative settings reports retain their observed axes. A successful control\nresponse is only an application receipt with unknown axes. SDK and older\nproducers can still emit the existing scalar selection without an observation.",
         "properties": {
           "approval_mode": {
-            "description": "The active mode, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"`. Category: **transient** (SSE-only). The server also writes `omnigent.codex_native.approval_mode` on the conversation labels (and `terminal_launch_args`), so reconnecting clients restore the same state from the session snapshot.",
+            "description": "A reported preset, custom/unknown, or legacy selection.",
             "title": "Approval Mode",
             "type": "string"
           },
@@ -8179,6 +8304,31 @@
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "permission_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CodexPermissionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional receiver-owned report or application receipt. Neither is command authorization or fresh native confirmation."
+          },
+          "permission_observation_c1": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Server projection of the same observation as the bounded `c1:` text stored on the session labels; present exactly when `permission_observation` is. Never a control input. Category: **transient** (SSE-only). The server also writes `omnigent.codex_native.approval_mode` and a bounded observation label, so reconnecting clients can restore readback without modifying launch args.",
+            "title": "Permission Observation C1"
           },
           "sequence_number": {
             "anyOf": [
@@ -23590,6 +23740,84 @@
           }
         },
         "summary": "Get Session Sign In Link",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/startup-observation/v1": {
+      "get": {
+        "operationId": "get_permission_startup_observation_v1_v1_sessions__session_id__startup_observation_v1_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Permission Startup Observation V1",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "options": {
+        "operationId": "get_permission_startup_observation_v1_v1_sessions__session_id__startup_observation_v1_options",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Permission Startup Observation V1",
         "tags": [
           "sessions"
         ]

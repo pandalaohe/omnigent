@@ -222,8 +222,8 @@ from omnigent.runner.subagent_work import (
     _SubagentWorkEntry,
     _succeeded_parents,
     _truncate_child_preview,
+    entry_owes_parent_wake,
     get_subagent_work,
-    is_codex_native_subagent_wrapper,
     latest_wake_eligible_subagent_work,
     list_subagent_work,
     mark_subagent_work_started,
@@ -636,6 +636,10 @@ class _SessionSnapshot:
     :param wrapper_label: The child's ``omnigent.wrapper`` label, e.g.
         ``"claude-code-native-ui-subagent"``. ``None`` when the server
         recorded no label or the fetch failed.
+    :param labels: The child's full session labels, e.g.
+        ``{"omnigent.codex_native.collab_tool_call_id": "call_7f"}``. ``None``
+        when the server recorded none or the fetch failed. Read for the
+        codex-native origin discriminator only.
     :param host_id: The session's own host binding, e.g. ``"host_a1b2c3"``.
         ``None`` for a hostless row (a co-located child on its parent's
         runner); the REST loader fills it, the init envelope does not carry
@@ -651,6 +655,7 @@ class _SessionSnapshot:
     parent_session_id: str | None = None
     agent_name: str | None = None
     wrapper_label: str | None = None
+    labels: Mapping[str, object] | None = None
     worktree: str | None = None
     host_id: str | None = None
 
@@ -2044,6 +2049,15 @@ def create_runner_app(
     """
     import hmac
 
+    from omnigent.startup_observation import context as observation_context
+    from omnigent.startup_observation import (
+        loaded_build,
+        mark_observation_endpoint,
+        runtime_fingerprint,
+        wait_for_permission_confirmation,
+    )
+
+    observation_build = loaded_build()
     app = FastAPI(title="omnigent-runner")
     startup_admission = StartupAdmission(
         server_client,
@@ -3117,6 +3131,7 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             wrapper_label: str | None = None
+            labels: dict[str, object] | None = None
             host_id: str | None = None
             try:
                 resp = await server_client.get(
@@ -3147,7 +3162,10 @@ def create_runner_app(
                     raw_host_id = body.get("host_id")
                     if isinstance(raw_host_id, str) and raw_host_id:
                         host_id = raw_host_id
-                    wrapper_label = wrapper_label_from_labels(body.get("labels"))
+                    raw_labels = body.get("labels")
+                    wrapper_label = wrapper_label_from_labels(raw_labels)
+                    if isinstance(raw_labels, Mapping):
+                        labels = dict(raw_labels)
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -3160,6 +3178,7 @@ def create_runner_app(
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
                 wrapper_label=wrapper_label,
+                labels=labels,
                 worktree=worktree,
                 host_id=host_id,
             )
@@ -3299,6 +3318,7 @@ def create_runner_app(
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
+            labels=snapshot.labels,
             worktree=snapshot.worktree,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
@@ -4702,6 +4722,43 @@ def create_runner_app(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @app.get("/v1/sessions/{session_id}/startup-observation/v1")
+    async def get_permission_startup_observation_v1(session_id: str) -> JSONResponse:
+        # No init, cache eviction, liveness probe, rebind or process-manager call.
+        cached = _session_init_envelopes.get(session_id)
+        envelope = cached[1] if cached is not None else None
+        state = permission_tiers.state(session_id)
+        binding = observation_context(
+            envelope.snapshot if envelope is not None else None,
+            session_id=session_id,
+            agent_id=envelope.agent_id if envelope is not None else None,
+        )
+        state_context_matches = (
+            state is not None
+            and envelope is not None
+            and state.session_id == session_id
+            and state.host_id == (binding["host_id"] or f"runner:{binding['runner_id']}")
+            and state.workspace == (binding["worktree"] or binding["workspace"])
+        )
+        return JSONResponse(
+            content={
+                "id": session_id,
+                "startup_observation": {
+                    "schema_version": 1,
+                    "binding": binding,
+                    "init_fresh": cached is not None
+                    and time.monotonic() - cached[0] <= _SESSION_INIT_ENVELOPE_TTL_SECONDS,
+                    "state_context_matches": state_context_matches,
+                    "expected_runner_revision": state.revision if state is not None else None,
+                    "harness": permission_tiers.observation_harness(session_id),
+                    "permission_runtime_fingerprint": runtime_fingerprint(PERMISSION_RUNTIME_ID),
+                    "loaded_build": observation_build,
+                },
+            }
+        )
+
+    mark_observation_endpoint(get_permission_startup_observation_v1)
 
     @app.get("/v1/sessions/{session_id}")
     async def get_session(session_id: str) -> JSONResponse:
@@ -6737,23 +6794,30 @@ def create_runner_app(
             )
 
     def _owes_parent_wake(entry: _SubagentWorkEntry) -> bool:
-        """Tool-dispatched children owe a wake; Codex internal threads do not."""
-        codex_internal = is_codex_native_subagent_wrapper(entry.wrapper_label) or (
-            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
-        )
-        return not codex_internal or entry.registered_by is not None
+        """Whether this child's terminal result owes its parent an inbox wake."""
+        return entry_owes_parent_wake(entry, _session_harness_name(entry.parent_session_id))
 
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
-        # A codex-native internal thread (a /side side chat, or one codex
-        # spawned) is consumed inside the parent's own app-server, so waking
-        # the parent would inject a notice into a chat the user is reading.
-        # The skip is narrowed to entries no Omnigent tool registered — the
-        # wrapper label path and forwarder/recovery entries — so a real
-        # sys_session_create / sys_session_send child of a Codex mother
-        # still wakes it (D12).
+        # A codex-native internal thread (a /side side chat) is consumed inside
+        # the parent's own app-server, so waking the parent would inject a
+        # notice into a chat the user is reading. A delegated Codex job is the
+        # exception: its labels prove Codex spawned it for work the mother asked
+        # for, and an Omnigent-registered child of a Codex mother still wakes it
+        # (D12). ``entry_owes_parent_wake`` is the whole rule; the stranded-wake
+        # rescue calls it too.
         if not _owes_parent_wake(entry):
+            _logger.info(
+                "Sub-agent wake suppressed for parent=%s child=%s wrapper=%s origin=%s "
+                "registered_by=%s (Codex-internal thread)",
+                entry.parent_session_id,
+                entry.child_session_id,
+                entry.wrapper_label,
+                entry.native_origin,
+                entry.registered_by,
+                extra={"session_id": runner_primary_session_id()},
+            )
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
@@ -6859,7 +6923,8 @@ def create_runner_app(
         if drained:
             return
         latest = latest_wake_eligible_subagent_work(
-            [entry for entry in list_subagent_work(parent_session_id) if _owes_parent_wake(entry)]
+            list_subagent_work(parent_session_id),
+            _session_harness_name(parent_session_id),
         )
         if latest is None:
             last_async = _last_async_result.get(parent_session_id)
@@ -6885,7 +6950,7 @@ def create_runner_app(
                 if inbox is None or inbox.empty():
                     continue
                 latest = latest_wake_eligible_subagent_work(
-                    [entry for entry in list_subagent_work(parent_id) if _owes_parent_wake(entry)]
+                    list_subagent_work(parent_id), _session_harness_name(parent_id)
                 )
                 if latest is None:
                     last_async = _last_async_result.get(parent_id)
@@ -7684,26 +7749,32 @@ def create_runner_app(
                     _cli_runtime_lifecycle.mark_live(conv)
                     permission_state = permission_tiers.state(conv)
                     if permission_state is not None:
-                        deadline = asyncio.get_running_loop().time() + 20.0
-                        session_path = f"/v1/sessions/{urllib.parse.quote(conv, safe='')}"
-                        while True:
-                            response = await server_client.get(
-                                session_path,
-                                headers={"X-Omnigent-Permission-Tiers": "1"},
-                            )
-                            if response.status_code == 200:
-                                snapshot = response.json()
-                                if (
-                                    isinstance(snapshot, dict)
-                                    and snapshot.get("permission_tier_state") == "ready"
-                                    and snapshot.get("permission_tier_revision")
-                                    == permission_state.revision
-                                    and snapshot.get("permission_tiers_capability") is True
-                                ):
-                                    break
-                            if asyncio.get_running_loop().time() >= deadline:
-                                raise RuntimeError("Permission tier was not confirmed before turn")
-                            await asyncio.sleep(0.1)
+                        observed_init = _session_init_envelopes.get(conv)
+                        await wait_for_permission_confirmation(
+                            server_client,
+                            f"/v1/sessions/{urllib.parse.quote(conv, safe='')}",
+                            permission_state.revision,
+                            {
+                                "session_id": conv,
+                                "host_id": permission_state.host_id,
+                                "workspace": permission_state.workspace,
+                                "init_binding": observation_context(
+                                    observed_init[1].snapshot
+                                    if observed_init is not None
+                                    else None,
+                                    session_id=conv,
+                                    agent_id=(
+                                        observed_init[1].agent_id
+                                        if observed_init is not None
+                                        else None
+                                    ),
+                                ),
+                                "permission_runtime_fingerprint": runtime_fingerprint(
+                                    PERMISSION_RUNTIME_ID
+                                ),
+                                "loaded_build": observation_build,
+                            },
+                        )
                     await _run_turn_bg_setup_and_stream(msg_body, conv, handed_off)
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the

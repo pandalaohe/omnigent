@@ -16,8 +16,9 @@ import asyncio
 import json
 import math
 import threading
+import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.datastructures import Headers
 
+from omnigent import codex_approval_modes as codex_permissions
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     MessageData,
@@ -50,6 +52,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.schemas import BackgroundTaskInfo
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.types import SkillSpec
+from omnigent.stores.conversation_store import CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -6330,6 +6333,164 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[3][1]["message_id"] == "codex:thread_1:turn_1:agentMessage:item_1"
     assert published[4][1]["item"]["type"] == "terminal_command"
     assert published[5][1]["item"]["type"] == "terminal_command"
+
+
+async def _forwarder_envelopes(
+    events: list[dict[str, Any]], *, session_id: str, bridge_dir: Path
+) -> list[dict[str, Any]]:
+    """Run the real Codex native forwarder and return the exact POST bodies."""
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from tests.harnesses.codex_native.session._support import (
+        _capture_handler,
+        _forwarder_context,
+    )
+
+    envelopes: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+    async with httpx.AsyncClient(
+        base_url="http://127.0.0.1:8000",
+        transport=httpx.MockTransport(_capture_handler(envelopes)),
+    ) as forwarder_client:
+        for event in events:
+            await codex_native_forwarder._handle_event(
+                forwarder_client,
+                **_forwarder_context(forwarder_client, bridge_dir, session_id=session_id),
+                event=event,
+                forwarder_state=state,
+            )
+    return envelopes
+
+
+async def test_native_failed_command_envelope_persists_and_streams_terminal_status(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The forwarder's actual failed-command envelope keeps its marker and pairing."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    started_item = {
+        "type": "commandExecution",
+        "id": "call_native_failed",
+        "command": "/bin/zsh -lc 'false'",
+        "cwd": "/repo",
+        "status": "inProgress",
+    }
+    completed_item = {
+        **started_item,
+        "status": "failed",
+        "aggregatedOutput": "boom\n",
+        "exitCode": 3,
+    }
+    envelopes = await _forwarder_envelopes(
+        [
+            {
+                "method": "item/started",
+                "params": {"threadId": "thread_123", "turnId": "turn_123", "item": started_item},
+            },
+            {
+                "method": "item/completed",
+                "params": {"threadId": "thread_123", "turnId": "turn_123", "item": completed_item},
+            },
+        ],
+        session_id=session["id"],
+        bridge_dir=tmp_path,
+    )
+
+    expected_output = "[command status: failed]\nboom\n\n[exit code: 3]"
+    assert [envelope["data"]["item_type"] for envelope in envelopes] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert envelopes[1]["data"]["item_data"]["output"] == expected_output
+
+    item_ids: list[str] = []
+    for envelope in envelopes:
+        resp = await client.post(f"/v1/sessions/{session['id']}/events", json=envelope)
+        assert resp.status_code == 202, resp.text
+        assert resp.json()["queued"] is False
+        item_ids.append(resp.json()["item_id"])
+
+    # Re-posting the same forwarder envelope keeps the existing persisted item.
+    replay = await client.post(f"/v1/sessions/{session['id']}/events", json=envelopes[1])
+    assert replay.status_code in (200, 202), replay.text
+    assert replay.json()["item_id"] == item_ids[1]
+
+    body = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert body["status"] == "idle"
+    assert [item["type"] for item in body["items"]] == ["function_call", "function_call_output"]
+    assert body["items"][0]["data"]["call_id"] == "call_native_failed"
+    assert body["items"][1]["data"] == {
+        "call_id": "call_native_failed",
+        "output": expected_output,
+    }
+
+    done_events = [event for _, event in published]
+    assert [event["item"]["type"] for event in done_events] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert done_events[1]["item"]["call_id"] == "call_native_failed"
+    assert done_events[1]["item"]["output"] == expected_output
+
+
+async def test_native_failed_command_capped_output_keeps_status_head(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The existing output cap keeps the failed marker as the visible first line."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    received = "x" * (MAX_TOOL_OUTPUT_BYTES + 100)
+    completed_item = {
+        "type": "commandExecution",
+        "id": "call_native_long",
+        "command": "/bin/zsh -lc 'false'",
+        "cwd": "/repo",
+        "status": "failed",
+        "aggregatedOutput": received,
+        "exitCode": 3,
+    }
+    envelopes = await _forwarder_envelopes(
+        [
+            {
+                "method": "item/completed",
+                "params": {"threadId": "thread_123", "turnId": "turn_123", "item": completed_item},
+            }
+        ],
+        session_id=session["id"],
+        bridge_dir=tmp_path,
+    )
+
+    assert [envelope["data"]["item_type"] for envelope in envelopes] == [
+        "function_call",
+        "function_call_output",
+    ]
+    capped_output = envelopes[1]["data"]["item_data"]["output"]
+    assert capped_output.startswith("[command status: failed]\n")
+    assert "[output truncated by omnigent:" in capped_output
+    assert received not in capped_output
+    assert len(capped_output.encode("utf-8")) < MAX_TOOL_OUTPUT_BYTES + 200
+
+    for envelope in envelopes:
+        resp = await client.post(f"/v1/sessions/{session['id']}/events", json=envelope)
+        assert resp.status_code == 202, resp.text
+        assert resp.json()["queued"] is False
+
+    body = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    stored_output = body["items"][1]["data"]["output"]
+    # The forwarder caps before upload and the route caps again; both keep the
+    # head, so the marker stays visible even though the notice is re-rendered.
+    assert stored_output.startswith("[command status: failed]\n")
+    assert "[output truncated by omnigent:" in stored_output
+    assert len(stored_output.encode("utf-8")) < MAX_TOOL_OUTPUT_BYTES + 200
+    done_events = [event for _, event in published]
+    assert done_events[-1]["item"]["output"] == stored_output
 
 
 async def test_post_external_function_call_output_preserves_lifecycle_metadata(
@@ -13700,7 +13861,14 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == "unknown"
+    observed = codex_permissions.decode_codex_permission_observation(
+        resp.json()["labels"]["omnigent.codex_native.permission_observation"]
+    )
+    assert observed.source == "application-receipt" and observed.requested_mode == "full-access"
+    assert (observed.approval, observed.reviewer, observed.sandbox, observed.profile) == (
+        None,
+    ) * 4
     # Runtime approval rides the /permissions popup, not launch args: the caller's
     # existing args are left untouched.
     assert resp.json()["terminal_launch_args"] == ["--model", "gpt-5-codex"]
@@ -13714,7 +13882,8 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         event for _, event in published if event["type"] == "session.codex_approval_mode"
     ]
     assert len(mode_events) == 1
-    assert mode_events[0]["approval_mode"] == "full-access"
+    assert mode_events[0]["approval_mode"] == "unknown"
+    assert mode_events[0]["permission_observation"] == observed.to_dict()
 
 
 @pytest.mark.parametrize(
@@ -14047,6 +14216,1297 @@ async def test_post_external_codex_approval_mode_change_requires_a_field(
     )
 
     assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.parametrize(
+    ("settings", "mode"),
+    [
+        (
+            {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+            "full-access",
+        ),
+        (
+            {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "workspaceWrite"},
+            },
+            "ask-for-approval",
+        ),
+        (
+            {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+                "sandboxPolicy": {"type": "workspaceWrite"},
+            },
+            "approve-for-me",
+        ),
+        (
+            {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "readOnly"},
+            },
+            "read-only",
+        ),
+        ({"approvalPolicy": "never", "sandboxPolicy": {"type": "readOnly"}}, "custom"),
+        ({"approvalPolicy": "never"}, "unknown"),
+        (
+            {
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "readOnly"},
+                "activePermissionProfile": {"id": ":danger-full-access"},
+            },
+            "unknown",
+        ),
+        (
+            {
+                "approvalPolicy": "on-failure",
+                "approvalsReviewer": "guardian_subagent",
+                "sandboxPolicy": {"type": "workspaceWrite"},
+            },
+            "custom",
+        ),
+    ],
+)
+async def test_native_permission_observation_chain_preserves_saved_control(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    settings: dict[str, Any],
+    mode: str,
+) -> None:
+    """An actual native settings envelope changes readback, never saved launch args."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    saved_args = ["--model", "gpt-5-codex", "--sandbox", "read-only", "-a", "on-request"]
+    saved = await client.patch(
+        f"/v1/sessions/{session['id']}", json={"terminal_launch_args": saved_args}
+    )
+    assert saved.status_code == 200, saved.text
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], "runner-observer")
+    published.clear()
+    envelopes = await _forwarder_envelopes(
+        [
+            {
+                "method": "thread/settings/updated",
+                "params": {
+                    "threadId": "thread_123",
+                    "threadSettings": settings,
+                },
+            }
+        ],
+        session_id=session["id"],
+        bridge_dir=tmp_path,
+    )
+    envelopes = [
+        packet for packet in envelopes if packet["type"] == "external_codex_approval_mode_change"
+    ]
+    assert len(envelopes) == 1
+    response = await client.post(f"/v1/sessions/{session['id']}/events", json=envelopes[0])
+    assert response.status_code == 202, response.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == saved_args
+    assert set(envelopes[0]["data"]) == {"approval_mode", "permission_observation"}
+    encoded = snapshot["labels"]["omnigent.codex_native.permission_observation"]
+    observed = codex_permissions.decode_codex_permission_observation(encoded)
+    assert observed.mode == mode and observed.runner_id == "runner-observer"
+    assert type(observed.received_at) is int
+    stored = store.get_conversation(session["id"])
+    assert (
+        stored is not None
+        and stored.labels["omnigent.codex_native.permission_observation"] == encoded
+    )
+    mode_events = [
+        event for _, event in published if event["type"] == "session.codex_approval_mode"
+    ]
+    assert len(mode_events) == 1
+    assert mode_events[0]["permission_observation"] == observed.to_dict()
+    assert (
+        mode_events[0]["approval_mode"]
+        == snapshot["labels"]["omnigent.codex_native.approval_mode"]
+    )
+
+
+async def _native_permission_packet(session_id: str, tmp_path: Path) -> dict[str, Any]:
+    """Reuse an actual forwarder envelope for receiver mutation/compatibility cases."""
+    packets = await _forwarder_envelopes(
+        [
+            {
+                "method": "thread/settings/updated",
+                "params": {
+                    "threadId": "thread_123",
+                    "threadSettings": {
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": {"type": "dangerFullAccess"},
+                    },
+                },
+            }
+        ],
+        session_id=session_id,
+        bridge_dir=tmp_path,
+    )
+    return next(
+        packet for packet in packets if packet["type"] == "external_codex_approval_mode_change"
+    )
+
+
+async def test_native_permission_observation_sequence_and_resume_replace_stored_report(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder as fwd
+
+    agent = await create_test_agent(client)
+    saved_args = ["--sandbox", "read-only"]
+    session = await _create_session(client, agent["id"], terminal_launch_args=saved_args)
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    state = fwd._CodexForwarderState()
+    frames = [
+        {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}},
+        {
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+            "activePermissionProfile": {"id": "test-custom"},
+        },
+        {"approvalPolicy": "never"},
+    ]
+    for settings in frames:
+        state.note_thread_settings_updated({"threadSettings": settings})
+        await fwd._sync_codex_approval_mode_change(
+            client, session_id=session["id"], forwarder_state=state
+        )
+    state.note_thread_settings_updated({"threadSettings": {"model": "unrelated-model"}})
+    await fwd._sync_codex_approval_mode_change(
+        client, session_id=session["id"], forwarder_state=state
+    )
+    assert len(published) == 3
+    state.note_resume_response({"result": {}})
+    await fwd._sync_codex_approval_mode_change(
+        client, session_id=session["id"], forwarder_state=state
+    )
+    assert [event["approval_mode"] for _, event in published] == [
+        "full-access",
+        "custom",
+        "unknown",
+        "unknown",
+    ]
+    assert published[1][1]["permission_observation"]["profile"] == "custom"
+    assert published[-1][1]["permission_observation"]["uncertainty"] == "no-settings"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    encoded = snapshot["labels"]["omnigent.codex_native.permission_observation"]
+    assert (
+        codex_permissions.decode_codex_permission_observation(encoded).to_dict()
+        == published[-1][1]["permission_observation"]
+    )
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert row is not None and row.terminal_launch_args == saved_args
+    assert row.labels["omnigent.codex_native.permission_observation"] == encoded
+    reconnected = fwd._CodexForwarderState()
+    reconnected.note_resume_response({"result": {}})
+    await fwd._sync_codex_approval_mode_change(
+        client, session_id=session["id"], forwarder_state=reconnected
+    )
+    assert len(published) == 5
+
+
+async def test_native_permission_receiver_matches_frozen_contract_fixture(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.server.routes._sessions import helpers
+    from tests.test_codex_approval_modes import PERMISSION_OBSERVATION_CONTRACT_FIXTURES
+
+    expected = PERMISSION_OBSERVATION_CONTRACT_FIXTURES[0]
+    monkeypatch.setattr(helpers, "now_epoch", lambda: 1792749199)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(session["id"], "runner")
+    state = fwd._CodexForwarderState()
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "workspaceWrite"},
+                "activePermissionProfile": {"id": ":workspace"},
+            }
+        }
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    await fwd._sync_codex_approval_mode_change(
+        client, session_id=session["id"], forwarder_state=state
+    )
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert (
+        snapshot["labels"]["omnigent.codex_native.permission_observation"] == expected["encoded"]
+    )
+    assert published[0][1]["permission_observation"] == expected["observation"]
+
+
+@pytest.mark.parametrize("runner_id", ["r" * 128, "中" * 42 + "ab"])
+async def test_native_permission_maximum_sql_sse_get_roundtrip(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    runner_id: str,
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    monkeypatch.setattr(helpers, "now_epoch", lambda: (1 << 63) - 1)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], runner_id)
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    published.clear()
+    response = await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+    assert response.status_code == 202, response.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    encoded = snapshot["labels"]["omnigent.codex_native.permission_observation"]
+    assert len(encoded) == len(encoded.encode("ascii")) == 212
+    row = store.get_conversation(session["id"])
+    assert (
+        row is not None and row.labels["omnigent.codex_native.permission_observation"] == encoded
+    )
+    observed = codex_permissions.decode_codex_permission_observation(encoded)
+    assert observed.received_at == (1 << 63) - 1 and observed.runner_id == runner_id
+    event = next(event for _, event in published if event["type"] == "session.codex_approval_mode")
+    assert json.loads(json.dumps(event))["permission_observation"] == observed.to_dict()
+    assert event["permission_observation"] == observed.to_dict()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "null-control",
+        "control",
+        "override",
+        "metadata",
+        "mode",
+        "version",
+        "missing",
+        "receipt",
+        "null-observation",
+        "extra",
+    ],
+)
+async def test_native_permission_invalid_packet_has_no_writes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    mutation: str,
+) -> None:
+    agent = await create_test_agent(client)
+    saved_args = ["--sandbox", "read-only"]
+    session = await _create_session(client, agent["id"], terminal_launch_args=saved_args)
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    match mutation:
+        case "null-control":
+            packet["data"]["terminal_launch_args"] = None
+        case "control":
+            packet["data"]["terminal_launch_args"] = ["--sandbox", "danger-full-access"]
+        case "override":
+            packet["data"]["overrides"] = None
+        case "metadata":
+            packet["data"]["permission_observation"]["runner_id"] = "producer-forgery"
+        case "mode":
+            packet["data"]["approval_mode"] = "read-only"
+        case "version":
+            packet["data"]["permission_observation"]["version"] = 2
+        case "missing":
+            del packet["data"]["permission_observation"]["sandbox"]
+        case "receipt":
+            packet["data"]["permission_observation"] = {
+                key: value
+                for key, value in codex_permissions.codex_permission_application_receipt(
+                    "full-access"
+                )
+                .to_dict()
+                .items()
+                if key not in {"received_at", "runner_id"}
+            }
+        case "null-observation":
+            packet["data"]["permission_observation"] = None
+        case "extra":
+            packet["data"]["unexpected"] = "full-access"
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(session["id"])
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    response = await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+    assert response.status_code == 400, response.text
+    after = store.get_conversation(session["id"])
+    assert before is not None and after is not None
+    assert after.labels == before.labels and after.terminal_launch_args == saved_args
+    assert published == []
+
+
+def _sse_event_frames(body: str, event_type: str) -> list[dict[str, Any]]:
+    """Decode one event type's data frames from a buffered SSE body."""
+    frames: list[dict[str, Any]] = []
+    for block in body.split("\n\n"):
+        lines = block.splitlines()
+        if f"event: {event_type}" not in lines:
+            continue
+        payload = next(line[len("data: ") :] for line in lines if line.startswith("data: "))
+        frames.append(json.loads(payload))
+    return frames
+
+
+async def _publish_while_streaming(
+    client: httpx.AsyncClient,
+    session_id: str,
+    publish: Callable[[], Awaitable[None]],
+    event_type: str,
+) -> list[dict[str, Any]]:
+    """Frames one real stream route produced for a publish issued after subscribe.
+
+    The in-process ASGI transport buffers the response, so the request runs as a
+    task and the body is read after the stream closes; cancellation only cleans
+    up that task.
+    """
+    from omnigent.runtime import session_stream
+    from tests.server.integration.test_sessions_permissions import _end_stream_via_close
+
+    task = asyncio.create_task(client.get(f"/v1/sessions/{session_id}/stream"))
+    try:
+        for _ in range(2000):
+            if session_stream.has_subscribers(session_id):
+                break
+            await asyncio.sleep(0)
+        assert session_stream.has_subscribers(session_id), "stream route never subscribed"
+        await publish()
+        response = await _end_stream_via_close(session_id, task)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert response.status_code == 200, response.text
+    return _sse_event_frames(response.text, event_type)
+
+
+@pytest.mark.parametrize("entry", ["legacy-scalar", "sdk-scalar", "tombstone"])
+async def test_codex_approval_mode_stream_omits_absent_observation_projections(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    db_uri: str,
+    entry: str,
+) -> None:
+    """A scalar or tombstone frame carries neither top-level observation projection."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner-scalar")
+    if entry == "tombstone":
+        packet = await _native_permission_packet(session_id, tmp_path)
+        observed = await client.post(f"/v1/sessions/{session_id}/events", json=packet)
+        assert observed.status_code == 202, observed.text
+        stored = store.get_conversation(session_id)
+        assert stored is not None and stored.labels[CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY]
+
+    async def publish() -> None:
+        if entry == "sdk-scalar":
+            response = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"labels": {"omnigent.codex_sdk.approval_mode": "read-only"}},
+            )
+        else:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "external_codex_approval_mode_change",
+                    "data": {"approval_mode": "read-only"},
+                },
+            )
+        assert response.status_code in {200, 202}, response.text
+
+    frames = await _publish_while_streaming(
+        client, session_id, publish, "session.codex_approval_mode"
+    )
+    assert frames == [
+        {
+            "sequence_number": None,
+            "type": "session.codex_approval_mode",
+            "conversation_id": session_id,
+            "approval_mode": "read-only",
+        }
+    ]
+
+
+@pytest.mark.parametrize("entry", ["observation", "receipt", "null-metadata"])
+async def test_codex_approval_mode_stream_pairs_observation_with_its_saved_text(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    entry: str,
+) -> None:
+    """An observation frame keeps both projections, its internal nulls, and the saved text."""
+    from omnigent.server.routes._sessions import helpers
+
+    agent = await create_test_agent(
+        client,
+        include_llm=False,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "codex-native-ui", "omnigent.ui": "terminal"},
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    if entry == "null-metadata":
+        monkeypatch.setattr(helpers, "now_epoch", lambda: None)
+    else:
+        monkeypatch.setattr(helpers, "now_epoch", lambda: 1792749199)
+        assert store.set_runner_id(session_id, "runner-observer")
+
+    async def publish() -> None:
+        if entry == "receipt":
+
+            def handle(request: httpx.Request) -> httpx.Response:
+                status = 200 if request.method == "POST" else 204
+                return httpx.Response(status, json={"approval_mode": "read-only"})
+
+            async with _runtime_runner(handle):
+                response = await client.patch(
+                    f"/v1/sessions/{session_id}", json={"approval_mode": "read-only"}
+                )
+        else:
+            packet = await _native_permission_packet(session_id, tmp_path)
+            response = await client.post(f"/v1/sessions/{session_id}/events", json=packet)
+        assert response.status_code in {200, 202}, response.text
+
+    frames = await _publish_while_streaming(
+        client, session_id, publish, "session.codex_approval_mode"
+    )
+    assert len(frames) == 1, frames
+    frame = frames[0]
+    snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+    saved = snapshot["labels"][CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY]
+    stored = store.get_conversation(session_id)
+    assert stored is not None
+    assert stored.labels[CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY] == saved
+    assert frame["permission_observation_c1"] == saved
+    assert saved.isascii() and len(saved) <= 212
+    observed = codex_permissions.decode_codex_permission_observation(saved)
+    assert frame["permission_observation"] == observed.to_dict()
+    assert frame["approval_mode"] == observed.mode
+    observation = frame["permission_observation"]
+    assert set(observation) == {
+        "source",
+        "origin",
+        "mode",
+        "approval",
+        "reviewer",
+        "sandbox",
+        "profile",
+        "uncertainty",
+        "requested_mode",
+        "received_at",
+        "runner_id",
+        "version",
+    }
+    match entry:
+        case "observation":
+            assert observation["mode"] == "full-access"
+            assert observation["uncertainty"] is None
+            assert observation["requested_mode"] is None
+            assert observation["received_at"] == 1792749199
+            assert observation["runner_id"] == "runner-observer"
+        case "receipt":
+            assert observation["mode"] == "unknown"
+            assert observation["uncertainty"] == "application-receipt"
+            assert observation["requested_mode"] == "read-only"
+            assert observation["approval"] is None
+            assert observation["reviewer"] is None
+            assert observation["sandbox"] is None
+            assert observation["profile"] is None
+        case "null-metadata":
+            assert observation["received_at"] is None
+            assert observation["runner_id"] is None
+            assert saved.split(",")[9] == "-"
+
+
+async def test_codex_approval_mode_stream_preserves_a_present_null_projection(
+    client: httpx.AsyncClient,
+) -> None:
+    """An explicitly present null observation stays present; only absence is omitted.
+
+    The server publisher emits both projections or neither, so this publishes the
+    malformed-present shape at the stream boundary to pin that the final projection
+    honours key presence instead of stripping nulls.
+    """
+    from omnigent.runtime import session_stream
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    async def publish() -> None:
+        session_stream.publish(
+            session_id,
+            {
+                "type": "session.codex_approval_mode",
+                "conversation_id": session_id,
+                "approval_mode": "read-only",
+                "permission_observation": None,
+            },
+        )
+
+    frames = await _publish_while_streaming(
+        client, session_id, publish, "session.codex_approval_mode"
+    )
+    assert frames == [
+        {
+            "sequence_number": None,
+            "type": "session.codex_approval_mode",
+            "conversation_id": session_id,
+            "approval_mode": "read-only",
+            "permission_observation": None,
+        }
+    ]
+
+
+async def test_stream_keeps_optional_nulls_for_unrelated_events(client: httpx.AsyncClient) -> None:
+    """The event-specific omission leaves other events' null fields on the wire."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    async def publish() -> None:
+        response = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {"omnigent.claude_native.permission_mode": "auto"}},
+        )
+        assert response.status_code == 200, response.text
+
+    frames = await _publish_while_streaming(client, session_id, publish, "session.permission_mode")
+    assert frames == [
+        {
+            "sequence_number": None,
+            "type": "session.permission_mode",
+            "conversation_id": session_id,
+            "permission_mode": "auto",
+            "permission_tier_revision": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize("operation", ["create", "patch"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "omnigent.codex_native.permission_observation",
+        "OMNIGENT.CODEX_NATIVE.PERMISSION_OBSERVATION",
+        "omnígent.codex_native.permission_observation",
+        "omni\u0301gent.codex_native.permission_observation",
+        "ｏmnigent.codex_native.permission_observation",
+        "omni\ufeffgent.codex_native.permission_observation",
+        "omnigent.codex_native.permission_observation ",
+    ],
+)
+async def test_native_permission_reserved_label_cannot_be_seeded(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    operation: str,
+    key: str,
+) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    auth_client.headers["X-Forwarded-Email"] = "owner@example.test"
+    agent = await create_test_agent(auth_client)
+    session = await _create_session(auth_client, agent["id"])
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    assert (
+        await auth_client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+    ).status_code == 202
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(session["id"])
+    assert before is not None
+    before_ids = {row.id for row in store.list_conversations().data}
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    if operation == "create":
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "labels": {key: "c1:0,1,4,2,1,3,3,0,0,-,-"}},
+        )
+    else:
+        permissions = SqlAlchemyPermissionStore(db_uri)
+        permissions.ensure_user("editor@example.test")
+        permissions.grant("editor@example.test", session["id"], 2)
+        response = await auth_client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"title": "must-not-write", "labels": {key: "c1:0,1,4,2,1,3,3,0,0,-,-"}},
+            headers={"X-Forwarded-Email": "editor@example.test"},
+        )
+    assert response.status_code == 400, response.text
+    after = store.get_conversation(session["id"])
+    assert after is not None and after.labels == before.labels and after.title == before.title
+    assert {row.id for row in store.list_conversations().data} == before_ids
+    assert published == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "omnigent.codex_native.permission_observation.notes",
+        "omnigent.codex_native.permission_observation_extra",
+        "omnigent.codex_native.approval_mode.notes",
+        "omnigent.codex_native.approval_mode_extra",
+    ],
+)
+async def test_native_permission_unrelated_labels_remain_editable(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    key: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], labels={key: "created"})
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    assert (
+        await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+    ).status_code == 202
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(session["id"])
+    assert before is not None
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    response = await client.patch(
+        f"/v1/sessions/{session['id']}", json={"labels": {key: "updated"}}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["labels"][key] == "updated"
+    after = store.get_conversation(session["id"])
+    assert after is not None
+    assert (
+        after.labels["omnigent.codex_native.permission_observation"]
+        == before.labels["omnigent.codex_native.permission_observation"]
+    )
+    assert published == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "omnigent.codex_native.approval_mode",
+        "OMNIGENT.CODEX_NATIVE.APPROVAL_MODE",
+        "omnígent.codex_native.approval_mode",
+        "ｏmnigent.codex_native.approval_mode",
+        "omni\ufeffgent.codex_native.approval_mode",
+        "omnigent.codex_native.approval_mode ",
+    ],
+)
+@pytest.mark.parametrize("prior_observation", [False, True])
+@pytest.mark.parametrize("mode", ["read-only", "full-access", "legacy-value", ""])
+async def test_native_permission_generic_scalar_patch_invalidates_observation_without_control(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    prior_observation: bool,
+    mode: str,
+    key: str,
+) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    auth_client.headers["X-Forwarded-Email"] = "owner@example.test"
+    agent = await create_test_agent(auth_client)
+    saved_args = ["--sandbox", "read-only"]
+    session = await _create_session(auth_client, agent["id"], terminal_launch_args=saved_args)
+    if prior_observation:
+        packet = await _native_permission_packet(session["id"], tmp_path)
+        assert (
+            await auth_client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+        ).status_code == 202
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("editor@example.test")
+    permissions.grant("editor@example.test", session["id"], 2)
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    response = await auth_client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"labels": {key: mode}},
+        headers={"X-Forwarded-Email": "editor@example.test"},
+    )
+    assert response.status_code == 200, response.text
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert stored is not None and stored.terminal_launch_args == saved_args
+    assert stored.labels["omnigent.codex_native.approval_mode"] == mode
+    assert stored.labels["omnigent.codex_native.permission_observation"] == ""
+    if key != "omnigent.codex_native.approval_mode":
+        assert key not in stored.labels
+    snapshot = (await auth_client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"] == response.json()["labels"]
+    assert snapshot["labels"]["omnigent.codex_native.permission_observation"] == ""
+    assert published == [
+        (
+            session["id"],
+            {
+                "sequence_number": None,
+                "type": "session.codex_approval_mode",
+                "conversation_id": session["id"],
+                "approval_mode": mode,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("same_value", [False, True])
+@pytest.mark.parametrize(
+    "keys",
+    [
+        ("omnigent.codex_native.approval_mode", "OMNIGENT.CODEX_NATIVE.APPROVAL_MODE"),
+        ("omnígent.codex_native.approval_mode", "omni\ufeffgent.codex_native.approval_mode"),
+    ],
+)
+async def test_native_permission_duplicate_scalar_alias_patch_is_write_free(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+    keys: tuple[str, str],
+    same_value: bool,
+    reverse: bool,
+) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    auth_client.headers["X-Forwarded-Email"] = "owner@example.test"
+    agent = await create_test_agent(auth_client)
+    session = await _create_session(
+        auth_client, agent["id"], terminal_launch_args=["--sandbox", "read-only"]
+    )
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    assert (
+        await auth_client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+    ).status_code == 202
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("editor@example.test")
+    permissions.grant("editor@example.test", session["id"], 2)
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(session["id"])
+    assert before is not None
+    labels = [(keys[0], "read-only"), (keys[1], "read-only" if same_value else "full-access")]
+    if reverse:
+        labels.reverse()
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    response = await auth_client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"title": "must-not-write", "labels": dict(labels)},
+        headers={"X-Forwarded-Email": "editor@example.test"},
+    )
+    assert response.status_code == 400, response.text
+    after = store.get_conversation(session["id"])
+    assert after is not None
+    assert after.labels == before.labels and after.title == before.title
+    assert after.terminal_launch_args == before.terminal_launch_args
+    assert after.updated_at == before.updated_at
+    snapshot = (await auth_client.get(f"/v1/sessions/{session['id']}")).json()
+    assert (
+        snapshot["labels"]["omnigent.codex_native.permission_observation"]
+        == before.labels["omnigent.codex_native.permission_observation"]
+    )
+    assert published == []
+
+
+async def test_native_permission_legacy_scalar_tombstones_same_mode_and_invalid_control_is_atomic(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent = await create_test_agent(client)
+    saved_args = ["--sandbox", "read-only"]
+    session = await _create_session(client, agent["id"], terminal_launch_args=saved_args)
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    url = f"/v1/sessions/{session['id']}/events"
+    assert (await client.post(url, json=packet)).status_code == 202
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    invalid = await client.post(
+        url,
+        json={
+            "type": packet["type"],
+            "data": {
+                "terminal_launch_args": ["--sandbox", "danger-full-access"],
+                "approval_mode": "unknown",
+            },
+        },
+    )
+    assert invalid.status_code == 400, invalid.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert (
+        snapshot["terminal_launch_args"] == saved_args
+        and snapshot["labels"]["omnigent.codex_native.permission_observation"]
+    )
+    legacy = await client.post(
+        url, json={"type": packet["type"], "data": {"approval_mode": "full-access"}}
+    )
+    assert legacy.status_code == 202, legacy.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == saved_args
+    assert snapshot["labels"]["omnigent.codex_native.permission_observation"] == ""
+    assert published == [
+        (
+            session["id"],
+            {
+                "sequence_number": None,
+                "type": "session.codex_approval_mode",
+                "conversation_id": session["id"],
+                "approval_mode": "full-access",
+            },
+        )
+    ]
+
+
+async def test_native_permission_inflight_report_preserves_saved_resume_and_fork_args(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    db_uri: str,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.harnesses.codex_native.launch_args import _codex_resume_permission_params
+
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--sandbox", "danger-full-access", "-a", "never"],
+    )
+    state = fwd._CodexForwarderState(
+        terminal_launch_args=["--sandbox", "danger-full-access", "-a", "never"]
+    )
+    state.note_resume_response(
+        {"result": {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}}
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    packets: list[dict[str, Any]] = []
+
+    async def delayed_delivery(request: httpx.Request) -> httpx.Response:
+        packet = json.loads(request.content)
+        packets.append(packet)
+        entered.set()
+        await release.wait()
+        response = await client.post(request.url.path, json=packet)
+        return httpx.Response(response.status_code, json=response.json())
+
+    saved_args = ["--sandbox", "read-only", "-a", "on-request"]
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(delayed_delivery)
+    ) as sender:
+        pending = asyncio.create_task(
+            fwd._sync_codex_approval_mode_change(
+                sender, session_id=session["id"], forwarder_state=state
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        saved = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={
+                "terminal_launch_args": saved_args,
+                "reasoning_effort": "high",
+                "model_override": "saved-model",
+                "silent": True,
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        release.set()
+        await pending
+        await fwd._sync_codex_approval_mode_change(
+            sender, session_id=session["id"], forwarder_state=state
+        )
+    assert len(packets) == 1 and set(packets[0]["data"]) == {
+        "approval_mode",
+        "permission_observation",
+    }
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == saved_args
+    assert snapshot["reasoning_effort"] == "high" and snapshot["model_override"] == "saved-model"
+    assert _codex_resume_permission_params(snapshot["terminal_launch_args"]) == {
+        "sandbox": "read-only",
+        "approvalPolicy": "on-request",
+    }
+    forked = await client.post(f"/v1/sessions/{session['id']}/fork", json={})
+    assert forked.status_code == 201, forked.text
+    assert forked.json()["terminal_launch_args"] == saved_args
+    assert "omnigent.codex_native.permission_observation" not in forked.json()["labels"]
+    store = SqlAlchemyConversationStore(db_uri)
+    explicit = store.fork_conversation(
+        session["id"],
+        override_terminal_launch_args=["--sandbox", "workspace-write"],
+        override_terminal_launch_args_set=True,
+    )
+    assert explicit.terminal_launch_args == ["--sandbox", "workspace-write"]
+    assert "omnigent.codex_native.permission_observation" not in explicit.labels
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4])
+async def test_native_permission_report_requires_existing_owner_authority(
+    auth_client: httpx.AsyncClient,
+    tmp_path: Path,
+    db_uri: str,
+    level: int,
+) -> None:
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    auth_client.headers["X-Forwarded-Email"] = "owner@example.test"
+    agent = await create_test_agent(auth_client)
+    session = await _create_session(auth_client, agent["id"])
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("reader@example.test")
+    permissions.grant("reader@example.test", session["id"], min(level, 3))
+    headers = {"X-Forwarded-Email": "owner@example.test" if level == 4 else "reader@example.test"}
+    assert (
+        await auth_client.get(f"/v1/sessions/{session['id']}", headers=headers)
+    ).status_code == 200
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    response = await auth_client.post(
+        f"/v1/sessions/{session['id']}/events", json=packet, headers=headers
+    )
+    assert response.status_code == (202 if level == 4 else 403), response.text
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert row is not None
+    assert ("omnigent.codex_native.permission_observation" in row.labels) == (level == 4)
+    if level != 4:
+        switched = await auth_client.patch(
+            f"/v1/sessions/{session['id']}", json={"approval_mode": "full-access"}, headers=headers
+        )
+        assert switched.status_code == 403, switched.text
+
+
+async def test_native_permission_runner_binding_and_readback_context_are_separate(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path: Path,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], "runner-old")
+    ingest = app.state.runner_event_ingest
+
+    async def deliver() -> None:
+        response = await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+        assert response.status_code == 202, response.text
+
+    ack = await ingest(
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="foreign-runner",
+        batch=EventBatchFrame(id="permission-batch", session_id=session["id"], events=[packet]),
+    )
+    assert ack.applied == 0 and ack.error == "event type is not allowed on runner tunnel"
+    assert (
+        "omnigent.codex_native.permission_observation"
+        not in store.get_conversation(session["id"]).labels
+    )
+    await deliver()
+    old = store.get_conversation(session["id"]).labels[
+        "omnigent.codex_native.permission_observation"
+    ]
+    assert codex_permissions.decode_codex_permission_observation(old).runner_id == "runner-old"
+    store.replace_runner_id(session["id"], "runner-new")
+    stale = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert (
+        stale["runner_id"] == "runner-new"
+        and stale["labels"]["omnigent.codex_native.permission_observation"] == old
+    )
+    await deliver()
+    new = store.get_conversation(session["id"]).labels[
+        "omnigent.codex_native.permission_observation"
+    ]
+    assert codex_permissions.decode_codex_permission_observation(new).runner_id == "runner-new"
+    store.clear_runner_id(session["id"])
+    offline = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert (
+        offline["runner_id"] is None
+        and offline["labels"]["omnigent.codex_native.permission_observation"] == new
+    )
+
+
+@pytest.mark.parametrize("matched_binding", [False, True])
+async def test_native_permission_editor_requires_matching_bound_runner_token(
+    auth_client: httpx.AsyncClient,
+    tmp_path: Path,
+    db_uri: str,
+    matched_binding: bool,
+) -> None:
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    auth_client.headers["X-Forwarded-Email"] = "owner@example.test"
+    agent = await create_test_agent(auth_client)
+    session = await _create_session(auth_client, agent["id"])
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("editor@example.test")
+    permissions.grant("editor@example.test", session["id"], 2)
+    # Synthetic fixture credential; no host credential or registered runner is read.
+    binding = "test-permission-binding"
+    runner_id = token_bound_runner_id(binding)
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], runner_id)
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    response = await auth_client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json=packet,
+        headers={
+            "X-Forwarded-Email": "editor@example.test",
+            RUNNER_TUNNEL_TOKEN_HEADER: binding if matched_binding else "test-other-binding",
+        },
+    )
+    assert response.status_code == (202 if matched_binding else 403), response.text
+    row = store.get_conversation(session["id"])
+    assert row is not None
+    assert ("omnigent.codex_native.permission_observation" in row.labels) == matched_binding
+    if matched_binding:
+        assert (
+            codex_permissions.decode_codex_permission_observation(
+                row.labels["omnigent.codex_native.permission_observation"]
+            ).runner_id
+            == runner_id
+        )
+
+
+async def test_native_permission_store_failure_does_not_publish_or_change_control(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    saved_args = ["--sandbox", "read-only"]
+    session = await _create_session(client, agent["id"], terminal_launch_args=saved_args)
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    original = SqlAlchemyConversationStore.set_labels
+
+    def fail(self: Any, session_id: str, labels: dict[str, str]) -> None:
+        if "omnigent.codex_native.permission_observation" in labels:
+            raise RuntimeError("test persistence failure")
+        original(self, session_id, labels)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", fail)
+    with pytest.raises(RuntimeError, match="test persistence failure"):
+        await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert row is not None and row.terminal_launch_args == saved_args
+    assert "omnigent.codex_native.permission_observation" not in row.labels and published == []
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", original)
+    assert (
+        await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+    ).status_code == 202
+    assert len(published) == 1
+
+
+async def test_native_permission_retry_republishes_persisted_observation_after_publish_failure(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+
+    monkeypatch.setattr(helpers, "now_epoch", lambda: 1792749199)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    published: list[dict[str, Any]] = []
+    first = True
+
+    def publish(_session_id: str, event: dict[str, Any]) -> None:
+        nonlocal first
+        if first:
+            first = False
+            raise RuntimeError("test publish failure")
+        published.append(event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", publish)
+    url = f"/v1/sessions/{session['id']}/events"
+    with pytest.raises(RuntimeError, match="test publish failure"):
+        await client.post(url, json=packet)
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    encoded = snapshot["labels"]["omnigent.codex_native.permission_observation"]
+    assert (await client.post(url, json=packet)).status_code == 202
+    assert len(published) == 1
+    assert (
+        published[0]["permission_observation"]
+        == codex_permissions.decode_codex_permission_observation(encoded).to_dict()
+    )
+
+
+@pytest.mark.parametrize("status", [200, 503])
+async def test_native_permission_control_pending_report_and_saved_args_are_independent(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    db_uri: str,
+    status: int,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], terminal_launch_args=["--sandbox", "workspace-write"]
+    )
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session["id"], {"omnigent.wrapper": "codex-native-ui", "omnigent.ui": "terminal"}
+    )
+    packet = await _native_permission_packet(session["id"], tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            entered.set()
+            await release.wait()
+        return httpx.Response(status, json={"approval_mode": "full-access"})
+
+    async with _runtime_runner(handle):
+        pending = asyncio.create_task(
+            client.patch(f"/v1/sessions/{session['id']}", json={"approval_mode": "full-access"})
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        try:
+            before = (await client.get(f"/v1/sessions/{session['id']}")).json()
+            assert "omnigent.codex_native.permission_observation" not in before["labels"]
+            saved_args = ["--sandbox", "read-only", "-a", "on-request"]
+            saved = await client.patch(
+                f"/v1/sessions/{session['id']}",
+                json={"terminal_launch_args": saved_args, "silent": True},
+            )
+            assert saved.status_code == 200, saved.text
+            assert (
+                await client.post(f"/v1/sessions/{session['id']}/events", json=packet)
+            ).status_code == 202
+            reported = (await client.get(f"/v1/sessions/{session['id']}")).json()["labels"][
+                "omnigent.codex_native.permission_observation"
+            ]
+        finally:
+            release.set()
+        response = await pending
+    assert response.status_code == (200 if status == 200 else 503), response.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == saved_args
+    encoded = snapshot["labels"]["omnigent.codex_native.permission_observation"]
+    observed = codex_permissions.decode_codex_permission_observation(encoded)
+    if status == 200:
+        assert observed.source == "application-receipt" and observed.mode == "unknown"
+    else:
+        assert encoded == reported and observed.source == "native-settings"
+
+
+async def test_native_permission_historical_pane_response_is_only_an_application_receipt(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_uri: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.claude_native import bridge as tmux_bridge
+    from omnigent.harnesses.codex_native import bridge
+    from omnigent.runner import native_controls
+    from omnigent.runtime import get_runner_client, set_runner_client
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.helpers import make_test_terminal_instance
+    from tests.runner.native_helpers import _harness_spec
+
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], terminal_launch_args=["--sandbox", "read-only"]
+    )
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session["id"], {"omnigent.wrapper": "codex-native-ui", "omnigent.ui": "terminal"}
+    )
+    historical_pane = (
+        "Permissions updated to Full Access\n"
+        "1. Ask for approval  workspace\n3. Full Access  all files\n"
+    )
+    captured_panes: list[str] = []
+    keys: list[str] = []
+
+    def capture(*_args: object) -> str:
+        captured_panes.append(historical_pane)
+        return historical_pane
+
+    monkeypatch.setattr(tmux_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(tmux_bridge, "_run_tmux", lambda _socket, *args: keys.append(args[-1]))
+    monkeypatch.setattr(
+        native_controls, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None)
+    )
+    monkeypatch.setattr(
+        bridge,
+        "read_bridge_state",
+        lambda _: bridge.CodexNativeBridgeState(
+            session_id=session["id"],
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_test",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    terminals = TerminalRegistry()
+    terminals._by_conversation.setdefault(session["id"], {})[("codex", "main")] = (
+        make_test_terminal_instance("codex", "main", tmp_path)
+    )
+    runner_app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminals
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    previous = get_runner_client()
+    async with _runner_client(runner_app) as runner:
+        created = await runner.post(
+            "/v1/sessions", json={"session_id": session["id"], "agent_id": agent["id"]}
+        )
+        assert created.status_code == 201, created.text
+        set_runner_client(runner)
+        try:
+            response = await client.patch(
+                f"/v1/sessions/{session['id']}", json={"approval_mode": "full-access"}
+            )
+        finally:
+            set_runner_client(previous)
+    assert response.status_code == 200, response.text
+    assert "3" in keys and len(captured_panes) >= 2 and set(captured_panes) == {historical_pane}
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    observed = codex_permissions.decode_codex_permission_observation(
+        snapshot["labels"]["omnigent.codex_native.permission_observation"]
+    )
+    assert observed.source == "application-receipt" and observed.mode == "unknown"
+    assert (
+        observed.requested_mode == "full-access" and observed.uncertainty == "application-receipt"
+    )
+    assert (observed.approval, observed.reviewer, observed.sandbox, observed.profile) == (
+        None,
+    ) * 4
+    assert snapshot["terminal_launch_args"] == ["--sandbox", "read-only"]
+    event = next(event for _, event in published if event["type"] == "session.codex_approval_mode")
+    assert event["permission_observation"] == observed.to_dict()
 
 
 @pytest.mark.parametrize(

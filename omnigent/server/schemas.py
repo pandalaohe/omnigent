@@ -27,6 +27,7 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema
 
+from omnigent.codex_approval_modes import CodexPermissionObservation
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
@@ -4054,28 +4055,31 @@ class SessionPermissionModeEvent(_SSEEventBase):
 
 class SessionCodexApprovalModeEvent(_SSEEventBase):
     """
-    Active approval/sandbox-mode update from a codex-native session.
+    Permission readback or a legacy scalar selection for a Codex session.
 
-    Emitted after the web UI switches the mode, and after the Codex forwarder
-    observes a ``thread/settings/updated`` notification — an approval change the
-    user made inside Codex's ``/permissions`` popup, which Omnigent has no other
-    way to see. Lets the composer's approval picker track the thread without a
-    reload.
+    Native settings reports retain their observed axes. A successful control
+    response is only an application receipt with unknown axes. SDK and older
+    producers can still emit the existing scalar selection without an observation.
 
     :param type: Always ``"session.codex_approval_mode"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
-    :param approval_mode: The active mode, one of ``"ask-for-approval"``,
-        ``"approve-for-me"``, ``"full-access"``, ``"read-only"``.
+    :param approval_mode: A reported preset, custom/unknown, or legacy selection.
+    :param permission_observation: Optional receiver-owned report or application
+        receipt. Neither is command authorization or fresh native confirmation.
+    :param permission_observation_c1: Server projection of the same observation as
+        the bounded ``c1:`` text stored on the session labels; present exactly when
+        ``permission_observation`` is. Never a control input.
 
     Category: **transient** (SSE-only). The server also writes
-    ``omnigent.codex_native.approval_mode`` on the conversation labels (and
-    ``terminal_launch_args``), so reconnecting clients restore the same state
-    from the session snapshot.
+    ``omnigent.codex_native.approval_mode`` and a bounded observation label, so
+    reconnecting clients can restore readback without modifying launch args.
     """
 
     type: Literal["session.codex_approval_mode"]
     conversation_id: str
     approval_mode: str
+    permission_observation: CodexPermissionObservation | None = None
+    permission_observation_c1: str | None = None
 
 
 class SessionAgentChangedEvent(_SSEEventBase):

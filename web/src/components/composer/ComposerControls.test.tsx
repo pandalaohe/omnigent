@@ -1,5 +1,11 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
+import {
+  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  codexPermissionReadback,
+  decodeCodexPermissionObservation,
+} from "@/lib/codexApprovalMode";
 import {
   ComposerHostTrigger,
   ComposerWorkspaceBar,
@@ -14,6 +20,51 @@ import {
 } from "./ChatComposer";
 
 describe("shared composer controls", () => {
+  it.each(["read-only", "nonowner", "offline", "busy"])(
+    "opens native readback with disabled writes (%s) and returns keyboard focus",
+    async () => {
+      const user = userEvent.setup();
+      const onSelect = vi.fn();
+      const readback = codexPermissionReadback(
+        { runnerId: "runner" },
+        decodeCodexPermissionObservation("c1:0,1,1,2,0,1,4,0,0,1792749199,cnVubmVy"),
+        { offline: false },
+      );
+      render(
+        <ComposerPermissionPicker
+          label="Permission mode"
+          value={readback.value}
+          options={CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS}
+          selectedValue={readback.selectedValue}
+          readback={readback}
+          disabled
+          disabledReason="Changes disabled"
+          onSelect={onSelect}
+        />,
+      );
+      const chip = screen.getByRole("button", { name: "Permission mode: Custom" });
+      await user.tab();
+      expect(chip).toHaveFocus();
+      await user.keyboard("{Enter}");
+      const menu = screen.getByRole("menu");
+      expect(menu).toHaveClass("max-w-[calc(100vw-2rem)]");
+      expect(screen.getByText("Sandbox")).toBeInTheDocument();
+      expect(screen.getByText("read-only")).toBeInTheDocument();
+      expect(screen.getByText("never")).toBeInTheDocument();
+      expect(screen.getByText("Not reported")).toBeInTheDocument();
+      expect(screen.getByText("Changes disabled")).toBeInTheDocument();
+      const rows = screen.getAllByRole("menuitemradio");
+      expect(rows).toHaveLength(4);
+      for (const row of rows) {
+        expect(row).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(row);
+      }
+      expect(onSelect).not.toHaveBeenCalled();
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(chip).toHaveFocus();
+    },
+  );
   it("toggles fast directly with distinct icons and no visible label or menu", () => {
     const onSelect = vi.fn();
     const options = [

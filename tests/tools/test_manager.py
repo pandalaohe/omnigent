@@ -64,6 +64,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
+        # Owner/admin startup-observation readback: registered unconditionally
+        # with the read-only session tools, so every test spec carries it.
+        "sys_session_get_startup_observation_v1",
         "sys_session_rename",
         "sys_session_handover",
         # Read-only agent discovery tools are likewise always available

@@ -15,8 +15,10 @@ only an already-mirrored value is not re-posted.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
@@ -405,7 +407,156 @@ def test_thread_settings_updated_records_approval_preset() -> None:
         }
     )
 
-    assert state.approval_preset == "full-access"
+    assert state.permission_observation is not None
+    assert state.permission_observation.mode == "full-access"
+
+
+@pytest.mark.asyncio
+async def test_permission_report_never_sends_cached_control_args() -> None:
+    client = _RecordingClient()
+    saved_args = ["--sandbox", "read-only", "-a", "on-request"]
+    state = fwd._CodexForwarderState(
+        terminal_launch_args=list(saved_args), posted_terminal_launch_args=list(saved_args)
+    )
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            }
+        }
+    )
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    assert len(client.posts) == 1
+    assert set(client.posts[0][1]["data"]) == {"approval_mode", "permission_observation"}
+    assert state.terminal_launch_args == state.posted_terminal_launch_args == saved_args
+
+
+@pytest.mark.asyncio
+async def test_permission_observations_replace_without_combining_frames() -> None:
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.note_resume_response(
+        {"result": {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}}
+    )
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    full = state.permission_observation
+    state.note_thread_settings_updated({"threadSettings": {"model": "gpt-5-codex"}})
+    assert state.permission_observation == full
+    state.note_thread_settings_updated(
+        {"threadSettings": {"approvalPolicy": "never", "sandboxPolicy": {"type": "readOnly"}}}
+    )
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "workspaceWrite"},
+            }
+        }
+    )
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    state.note_thread_settings_updated({"threadSettings": {"approvalPolicy": "never"}})
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    partial = state.permission_observation
+    state.note_resume_response({"error": {"code": -1}})
+    assert state.permission_observation == partial
+    state.note_resume_response({"result": {"thread": {"id": "thread_resumed"}}})
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    reports = [post[1]["data"]["permission_observation"] for post in client.posts]
+    assert [report["mode"] for report in reports] == [
+        "full-access",
+        "custom",
+        "custom",
+        "unknown",
+        "unknown",
+    ]
+    assert reports[3]["sandbox"] is None and reports[4]["uncertainty"] == "no-settings"
+    state.note_parent_rotation("conv_new")
+    await fwd._sync_codex_approval_mode_change(
+        client, session_id="conv_new", forwarder_state=state
+    )
+    assert len(client.posts) == 5
+    state.note_resume_response({"result": {}})
+    await fwd._sync_codex_approval_mode_change(
+        client, session_id="conv_new", forwarder_state=state
+    )
+    assert len(client.posts) == 6 and client.posts[-1][0] == "/v1/sessions/conv_new/events"
+
+
+@pytest.mark.asyncio
+async def test_permission_sync_freezes_sent_version_and_serializes_concurrent_posts() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    packets: list[dict] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        import json
+
+        packets.append(json.loads(request.content))
+        if len(packets) == 1:
+            entered.set()
+            await release.wait()
+        return httpx.Response(202)
+
+    saved_args = ["--sandbox", "read-only"]
+    state = fwd._CodexForwarderState(
+        terminal_launch_args=list(saved_args), posted_terminal_launch_args=list(saved_args)
+    )
+    state.note_resume_response(
+        {"result": {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}}
+    )
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handle)
+    ) as client:
+        first = asyncio.create_task(
+            fwd._sync_codex_approval_mode_change(
+                client, session_id="conv_x", forwarder_state=state
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        state.note_thread_settings_updated({"threadSettings": {"approvalPolicy": "never"}})
+        second = asyncio.create_task(
+            fwd._sync_codex_approval_mode_change(
+                client, session_id="conv_x", forwarder_state=state
+            )
+        )
+        release.set()
+        await asyncio.gather(first, second)
+        await fwd._sync_codex_approval_mode_change(
+            client, session_id="conv_x", forwarder_state=state
+        )
+    assert [packet["data"]["approval_mode"] for packet in packets] == ["full-access", "unknown"]
+    assert all(
+        set(packet["data"]) == {"approval_mode", "permission_observation"} for packet in packets
+    )
+    assert state.posted_permission_observation == state.permission_observation
+    assert state.terminal_launch_args == state.posted_terminal_launch_args == saved_args
+
+
+@pytest.mark.asyncio
+async def test_permission_sync_failure_retries_observation_only() -> None:
+    statuses = iter([400, 202])
+    packets: list[bytes] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        packets.append(request.content)
+        return httpx.Response(next(statuses))
+
+    state = fwd._CodexForwarderState(terminal_launch_args=["--sandbox", "danger-full-access"])
+    state.note_resume_response({"result": {}})
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handle)
+    ) as client:
+        await fwd._sync_codex_approval_mode_change(
+            client, session_id="conv_x", forwarder_state=state
+        )
+        assert state.posted_permission_observation is None
+        await fwd._sync_codex_approval_mode_change(
+            client, session_id="conv_x", forwarder_state=state
+        )
+    assert len(packets) == 2 and packets[0] == packets[1]
+    assert b"terminal_launch_args" not in packets[0]
+    assert state.posted_permission_observation == state.permission_observation
 
 
 @pytest.mark.asyncio
@@ -417,7 +568,16 @@ async def test_sync_codex_approval_mode_change_posts_preset_and_dedupes() -> Non
     label + publishes; a second sync with the same preset must not re-post.
     """
     client = _RecordingClient()
-    state = fwd._CodexForwarderState(approval_preset="read-only")
+    state = fwd._CodexForwarderState()
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "readOnly"},
+            }
+        }
+    )
 
     await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
     await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
@@ -427,11 +587,14 @@ async def test_sync_codex_approval_mode_change_posts_preset_and_dedupes() -> Non
             "/v1/sessions/conv_x/events",
             {
                 "type": "external_codex_approval_mode_change",
-                "data": {"approval_mode": "read-only"},
+                "data": {
+                    "approval_mode": "read-only",
+                    "permission_observation": state.permission_observation.to_payload(),
+                },
             },
         )
     ]
-    assert state.posted_approval_preset == "read-only"
+    assert state.posted_permission_observation == state.permission_observation
 
 
 @pytest.mark.asyncio
@@ -545,7 +708,7 @@ async def test_sync_codex_collaboration_mode_change_posts_and_dedupes() -> None:
 
 @pytest.mark.asyncio
 async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
-    """Codex ``/permissions`` changes mirror to terminal_launch_args once."""
+    """Custom reports replace old labels without synthesizing control args."""
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
     state.note_thread_settings_updated(
@@ -576,30 +739,14 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
             {
                 "type": "external_codex_approval_mode_change",
                 "data": {
-                    "terminal_launch_args": [
-                        "-c",
-                        'default_permissions="dev"',
-                        "-c",
-                        'approval_policy="never"',
-                        "-c",
-                        'approvals_reviewer="auto_review"',
-                    ],
-                    # Same event now also carries the runtime preset (danger sandbox
-                    # → full-access) for the web read-back label.
-                    "approval_mode": "full-access",
+                    "approval_mode": "custom",
+                    "permission_observation": state.permission_observation.to_payload(),
                 },
             },
         )
     ]
-    assert state.posted_terminal_launch_args == [
-        "-c",
-        'default_permissions="dev"',
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        'approvals_reviewer="auto_review"',
-    ]
-    assert state.posted_approval_preset == "full-access"
+    assert state.terminal_launch_args is None and state.posted_terminal_launch_args is None
+    assert state.posted_permission_observation == state.permission_observation
 
 
 @pytest.mark.parametrize("approval_policy", ["on-failure", "on-request"])

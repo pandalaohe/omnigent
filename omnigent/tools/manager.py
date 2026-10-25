@@ -39,6 +39,7 @@ from omnigent.tools.builtins import (
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
+    SysSessionGetStartupObservationV1Tool,
     SysSessionHandoverTool,
     SysSessionListTool,
     SysSessionOpenTool,
@@ -523,6 +524,9 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+        self._tools[SysSessionGetStartupObservationV1Tool.name()] = (
+            SysSessionGetStartupObservationV1Tool()
+        )
 
         # Session sharing: opt-in via the dedicated
         # ``agent_session_sharing`` flag, independent of spawn / declared

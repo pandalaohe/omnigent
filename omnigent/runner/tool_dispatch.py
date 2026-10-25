@@ -402,6 +402,7 @@ _SESSION_QUERY_TOOLS = frozenset(
         "sys_session_list",
         "sys_session_close",
         "sys_session_get_info",
+        "sys_session_get_startup_observation_v1",
         "sys_session_share",
     }
 )
@@ -707,6 +708,7 @@ def build_native_relay_tool_schemas(
     from omnigent.tools.builtins.spawn import (
         SysSessionGetHistoryTool,
         SysSessionGetInfoTool,
+        SysSessionGetStartupObservationV1Tool,
         SysSessionListTool,
     )
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
@@ -752,6 +754,7 @@ def build_native_relay_tool_schemas(
             SysSessionListTool,
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
+            SysSessionGetStartupObservationV1Tool,
             SysSessionRenameTool,
             SysSessionHandoverTool,
             SysAgentGetTool,
@@ -7728,11 +7731,101 @@ async def _execute_session_query_tool(
         )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
+    if tool_name == "sys_session_get_startup_observation_v1":
+        return await _session_startup_observation_v1_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_share":
         return await _session_share_via_rest(args, conversation_id, server_client, agent_spec)
     return await _session_close_via_rest(args, conversation_id, server_client)
+
+
+async def _session_startup_observation_v1_via_rest(
+    args: _JsonObject,
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """Negotiate the exact registered path before any diagnostic GET; no ordinary fallback."""
+    from urllib.parse import quote
+
+    target = args.get("session_id", conversation_id)
+    if set(args) - {"session_id"} or not isinstance(target, str) or not target:
+        return json.dumps({"error": "startup observation v1 accepts only a non-empty session_id"})
+    path = f"/v1/sessions/{quote(target, safe='')}/startup-observation/v1"
+
+    def unknown(reason: str) -> str:
+        return json.dumps(
+            {
+                "session_id": target,
+                "startup_observation": {
+                    "schema_version": 1,
+                    "status": "unknown",
+                    "reason": reason,
+                    "admission": "not_evaluated",
+                },
+            }
+        )
+
+    headers = {"X-Omnigent-Permission-Tiers": "1"}
+    try:
+        async with asyncio.timeout(2.0):
+            negotiation = await server_client.options(
+                path,
+                headers=headers,
+                follow_redirects=False,
+                timeout=2.0,
+            )
+    except (TimeoutError, httpx.RequestError):
+        return unknown("server_support_unknown")
+    if negotiation.status_code in (401, 403):
+        return json.dumps({"session_id": target, "error": "access_denied"})
+    if negotiation.status_code == 404:
+        # May be an old route table OR owner-scoped concealment: do not infer which.
+        return unknown("server_support_unknown")
+    if (
+        negotiation.status_code != 200
+        or negotiation.headers.get("X-Omnigent-Startup-Observation") != "1"
+    ):
+        return unknown("server_support_unknown")
+    try:
+        contract = negotiation.json()
+    except ValueError:
+        return unknown("server_support_unknown")
+    if (
+        not isinstance(contract, dict)
+        or type(contract.get("version")) is not int
+        or contract != {"protocol": "permission_startup_observation", "version": 1}
+    ):
+        return unknown("server_support_unknown")
+    try:
+        async with asyncio.timeout(2.0):
+            response = await server_client.get(
+                path,
+                headers=headers,
+                follow_redirects=False,
+                timeout=2.0,
+            )
+    except (TimeoutError, httpx.RequestError):
+        return unknown("server_observation_unavailable")
+    if response.status_code in (401, 403):
+        return json.dumps({"session_id": target, "error": "access_denied"})
+    if response.status_code != 200:
+        return unknown("server_observation_unavailable")
+    try:
+        payload = response.json()
+    except ValueError:
+        return unknown("server_observation_unavailable")
+    raw = payload.get("startup_observation") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("id") != target
+        or not isinstance(raw, dict)
+        or type(raw.get("schema_version")) is not int
+        or raw.get("schema_version") != 1
+        or raw.get("admission") != "not_evaluated"
+    ):
+        return unknown("server_observation_unsupported")
+    return json.dumps({"session_id": target, "startup_observation": raw})
 
 
 async def _runner_online_or_none(
