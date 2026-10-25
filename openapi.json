@@ -13943,6 +13943,28 @@
         ]
       }
     },
+    "/v1/child-checkin/defaults": {
+      "get": {
+        "operationId": "child_checkin_defaults_v1_child_checkin_defaults_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Child Checkin Defaults V1 Child Checkin Defaults Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Child Checkin Defaults"
+      }
+    },
     "/v1/custom-agents": {
       "get": {
         "operationId": "list_custom_agents_v1_custom_agents_get",

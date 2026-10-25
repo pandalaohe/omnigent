@@ -29,6 +29,7 @@ from omnigent.server.auth import (
     AuthProvider,
     UnifiedAuthProvider,
 )
+from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
 from omnigent.server.routes.sessions.routes_hooks import _approval_timeout_owner
 from omnigent.server.schemas import UserPreferenceNamespace
 from omnigent.server.user_preferences_store import (
@@ -627,6 +628,49 @@ async def test_preferences_api_accepts_child_idle_and_project_host_agents(
         )
         assert initialized.status_code == 200, initialized.text
         assert initialized.json() == envelope
+
+
+async def test_checkin_instructions_defaults_validation_and_reset(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    app = _preferences_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (await client.get("/v1/child-checkin/defaults")).status_code == 401
+        headers = {"x-test-user": "alice@example.com"}
+        defaults = await client.get("/v1/child-checkin/defaults", headers=headers)
+        assert defaults.status_code == 200
+        assert defaults.json() == {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+        for value, status in [
+            (None, 200),
+            ("", 200),
+            ("  custom\ntext  ", 200),
+            ("x" * 4000, 200),
+            ("x" * 4001, 422),
+            ("   ", 422),
+            (123, 422),
+            ("\x00" + "x" * 4000, 200),
+            (None, 200),
+        ]:
+            response = await client.patch(
+                "/v1/me/preferences/child_idle",
+                headers=headers,
+                json={"value": {"checkinInstructions": value}},
+            )
+            assert response.status_code == status, response.text
+            if status == 200:
+                expected = value.replace("\x00", "") if isinstance(value, str) else value
+                assert response.json()["settings"]["child_idle"]["checkinInstructions"] == expected
+                synced = await client.get("/v1/me", headers=headers)
+                assert synced.json()["preferences"] == response.json()
+        initialized = await client.put(
+            "/v1/me/preferences",
+            headers={"x-test-user": "bob@example.com"},
+            json={"version": 1, "settings": {"child_idle": {"checkinInstructions": "A\x00B"}}},
+        )
+        assert initialized.status_code == 200
+        assert initialized.json()["settings"]["child_idle"]["checkinInstructions"] == "AB"
 
 
 @pytest.mark.asyncio

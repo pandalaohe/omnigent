@@ -1,7 +1,13 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
+const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: fetchMock,
+  getCurrentUserId: () => "alice",
+  subscribeIdentity: () => () => {},
+}));
 vi.mock("@/lib/userPreferencesSync", () => ({
   queueUserPreferencePatch: queuePatchMock,
   USER_PREFERENCES_PATCH_REJECTED_EVENT: "omnigent:user-preference-rejected",
@@ -74,19 +80,144 @@ vi.mock("@/hooks/useAgentRegistry", () => ({
 }));
 
 import { ChildSessionsPanel } from "./ChildSessionsPanel";
+import { readChildIdlePreferences, writeChildIdlePreferences } from "@/lib/childIdlePreferences";
 import {
   readSessionCollabPreferences,
   SESSION_COLLAB_DEFAULTS,
   writeSessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
 
+beforeEach(() => {
+  fetchMock.mockResolvedValue({
+    ok: true,
+    json: async () => ({ instructions: "Collect results first." }),
+  });
+});
+
 afterEach(() => {
   cleanup();
   localStorage.clear();
   queuePatchMock.mockReset();
+  fetchMock.mockReset();
 });
 
 describe("ChildSessionsPanel", () => {
+  it("loads the default and saves custom, opt-out and reset without dropping idle settings", async () => {
+    writeChildIdlePreferences({
+      ...readChildIdlePreferences(),
+      minGapSeconds: 7200,
+      enabled: true,
+    });
+    render(<ChildSessionsPanel />);
+    const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
+    await waitFor(() => expect(editor).toHaveValue("Collect results first."));
+    expect(fetchMock).toHaveBeenCalledWith("/v1/child-checkin/defaults", expect.any(Object));
+    expect(screen.getByText("22 / 4000 characters")).toBeInTheDocument();
+    fireEvent.change(editor, { target: { value: "Custom 😀" } });
+    expect(screen.getByText("8 / 4000 characters")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save check-in instructions" }));
+    expect(readChildIdlePreferences()).toMatchObject({
+      checkinInstructions: "Custom 😀",
+      minGapSeconds: 7200,
+      enabled: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send no instructions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save check-in instructions" }));
+    expect(readChildIdlePreferences().checkinInstructions).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+    expect(editor).toHaveValue("Collect results first.");
+    fireEvent.click(screen.getByRole("button", { name: "Save check-in instructions" }));
+    expect(queuePatchMock).toHaveBeenLastCalledWith(
+      "child_idle",
+      expect.objectContaining({ checkinInstructions: null, minGapSeconds: 7200 }),
+    );
+    writeChildIdlePreferences({ ...readChildIdlePreferences(), checkinInstructions: "Keep me" });
+    writeChildIdlePreferences({ ...readChildIdlePreferences(), enabled: false });
+    expect(readChildIdlePreferences().checkinInstructions).toBe("Keep me");
+  });
+
+  it("rejects blank-only and overlong drafts and reports an instruction save rejection", async () => {
+    render(<ChildSessionsPanel />);
+    const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
+    await waitFor(() => expect(editor).toBeEnabled());
+    for (const value of ["   ", "x".repeat(4001)]) {
+      fireEvent.change(editor, { target: { value } });
+      fireEvent.click(screen.getByRole("button", { name: "Save check-in instructions" }));
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+      expect(queuePatchMock).not.toHaveBeenCalled();
+    }
+    fireEvent.change(editor, { target: { value: "Collect" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save check-in instructions" }));
+    fireEvent(
+      window,
+      new CustomEvent("omnigent:user-preference-rejected", { detail: { namespace: "child_idle" } }),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("server rejected these instructions");
+  });
+
+  it("retries failed default loading", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    render(<ChildSessionsPanel />);
+    await screen.findByText(/Could not load default instructions/);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Check-in instructions" })).toHaveValue(
+        "Collect results first.",
+      ),
+    );
+  });
+
+  it("keeps unsaved instructions through preference hydration and unrelated storage events", async () => {
+    render(<ChildSessionsPanel />);
+    const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
+    await waitFor(() => expect(editor).toBeEnabled());
+    fireEvent.change(editor, { target: { value: "Unsaved draft" } });
+    fireEvent(window, new Event("omnigent:child-idle-changed"));
+    expect(editor).toHaveValue("Unsaved draft");
+    fireEvent(window, new StorageEvent("storage", { key: "unrelated" }));
+    expect(editor).toHaveValue("Unsaved draft");
+    writeChildIdlePreferences({ ...readChildIdlePreferences(), enabled: true });
+    expect(editor).toHaveValue("Unsaved draft");
+    fireEvent.click(screen.getByRole("button", { name: "Save check-in instructions" }));
+    expect(readChildIdlePreferences()).toMatchObject({
+      checkinInstructions: "Unsaved draft",
+      enabled: true,
+    });
+    fireEvent.change(editor, { target: { value: "Newer unsaved draft" } });
+    fireEvent(
+      window,
+      new CustomEvent("omnigent:user-preference-rejected", {
+        detail: { namespace: "child_idle", status: 422 },
+      }),
+    );
+    expect(editor).toHaveValue("Newer unsaved draft");
+    expect(screen.getByRole("alert")).toHaveTextContent("server rejected these instructions");
+  });
+
+  it("refreshes a clean editor when a rejected save is rolled back by the server", async () => {
+    render(<ChildSessionsPanel />);
+    const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
+    await waitFor(() => expect(editor).toBeEnabled());
+    fireEvent.change(editor, { target: { value: "Saved draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save check-in instructions" }));
+    fireEvent(window, new StorageEvent("storage", { key: "unrelated" }));
+    expect(editor).toHaveValue("Saved draft");
+    fireEvent(
+      window,
+      new CustomEvent("omnigent:user-preference-rejected", {
+        detail: { namespace: "child_idle", status: 422 },
+      }),
+    );
+    expect(editor).toHaveValue("Saved draft");
+    fireEvent(window, new Event("omnigent:child-idle-changed"));
+    expect(editor).toHaveValue("Saved draft");
+    writeChildIdlePreferences({
+      ...readChildIdlePreferences(),
+      checkinInstructions: "Server value",
+    });
+    await waitFor(() => expect(editor).toHaveValue("Server value"));
+  });
+
   it("saves child controls without dropping existing collaboration preferences", () => {
     writeSessionCollabPreferences({ ...SESSION_COLLAB_DEFAULTS, relayDepthMax: 3 });
     render(<ChildSessionsPanel />);

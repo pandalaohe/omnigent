@@ -172,6 +172,26 @@ class ChildIdleSettings:
     freeze_default: ChildFreezeSettings = field(default_factory=ChildFreezeSettings)
     min_gap_s: int = 3600
     coverage: Literal["changed", "summary"] = "summary"
+    checkin_instructions: str | None = None
+
+
+def normalize_checkin_instructions(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions must be a string or null"
+        )
+    value = value.replace("\x00", "")
+    if len(value) > 4000:
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions must be at most 4000 characters"
+        )
+    if value and not value.strip():
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions cannot contain only whitespace"
+        )
+    return value
 
 
 def _parse_child_freeze_row(value: Any, path: str) -> ChildFreezeSettings:
@@ -230,7 +250,15 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
         value.get("freezeDefault", {}), "child_idle.freezeDefault"
     )
     return ChildIdleSettings(
-        enabled, numbers[0], numbers[1], numbers[2], agents, freeze_default, numbers[3], coverage
+        enabled,
+        numbers[0],
+        numbers[1],
+        numbers[2],
+        agents,
+        freeze_default,
+        numbers[3],
+        coverage,
+        normalize_checkin_instructions(value.get("checkinInstructions")),
     )
 
 
@@ -1105,6 +1133,11 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         "version": USER_PREFERENCE_VERSION,
         "settings": deepcopy(settings),
     }
+    child_idle = copied["settings"].get(CHILD_IDLE_NAMESPACE)
+    if isinstance(child_idle, dict) and "checkinInstructions" in child_idle:
+        child_idle["checkinInstructions"] = normalize_checkin_instructions(
+            child_idle["checkinInstructions"]
+        )
     try:
         serialized = json.dumps(
             copied,

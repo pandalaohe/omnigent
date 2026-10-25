@@ -3712,6 +3712,13 @@ def create_app(
             response["preferences"] = preferences
         return response
 
+    @app.get("/v1/child-checkin/defaults")
+    async def child_checkin_defaults(request: Request) -> dict[str, str]:
+        from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
+
+        require_user(request, auth_provider)
+        return {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+
     def _preferences_store() -> SqlAlchemyUserPreferencesStore:
         if user_preferences_store is None:
             raise StarletteHTTPException(

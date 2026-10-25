@@ -24,6 +24,7 @@ export interface ChildIdlePreferences {
   minGapSeconds: number;
   coverage: "changed" | "summary";
   repeatSeconds: number;
+  checkinInstructions: string | null;
   freezeDefault: ChildFreezePreferences;
   agents: Record<string, ChildFreezePreferences>;
 }
@@ -35,6 +36,7 @@ export const CHILD_IDLE_DEFAULTS: ChildIdlePreferences = {
   minGapSeconds: 3600,
   coverage: "summary",
   repeatSeconds: 0,
+  checkinInstructions: null,
   freezeDefault: CHILD_FREEZE_DEFAULTS,
   agents: {},
 };
@@ -67,6 +69,10 @@ function normalize(value: unknown): ChildIdlePreferences {
     minGapSeconds: number(raw.minGapSeconds, 3600, 0, 86400),
     coverage: raw.coverage === "changed" ? "changed" : "summary",
     repeatSeconds: repeat === 0 || repeat >= 60 ? repeat : 0,
+    checkinInstructions:
+      typeof raw.checkinInstructions === "string"
+        ? raw.checkinInstructions.replaceAll("\0", "")
+        : null,
     freezeDefault: {
       enabled: raw.freezeDefault?.enabled === true,
       checkIntervalSeconds: number(raw.freezeDefault?.checkIntervalSeconds, 3600, 60, 604800),
