@@ -1995,6 +1995,9 @@ def create_app(
                     try:
                         server_disk_pct = await asyncio.to_thread(system_status_hub.disk_usage_pct)
                         system_status_hub.tick(time.time(), server_disk_pct=server_disk_pct)
+                        host_load_notices = getattr(app_inst.state, "host_load_notices", None)
+                        if host_load_notices is not None:
+                            await host_load_notices.tick(system_status_hub, app_inst)
                         ticks += 1
                         if ticks % FLUSH_EVERY_TICKS == 0:
                             await system_status_hub.save_history()
@@ -2184,6 +2187,9 @@ def create_app(
                 system_status_fast_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await system_status_fast_task
+            host_load_notices = getattr(app_inst.state, "host_load_notices", None)
+            if host_load_notices is not None:
+                await host_load_notices.shutdown()
             if system_status_hub is not None:
                 await system_status_hub.save_history()
                 system_status_hub.close()

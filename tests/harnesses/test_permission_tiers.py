@@ -125,6 +125,7 @@ def test_plan_visible_tools_only_include_registered_known_safe_names() -> None:
         "sys_terminal_read",
         "sys_terminal_list",
         "sys_child_cap",
+        "sys_host_load",
     ],
 )
 def test_framework_reads_allow_every_tier_and_are_plan_visible(name: str) -> None:

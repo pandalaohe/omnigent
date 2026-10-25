@@ -2318,6 +2318,15 @@ def register_peer_routes(
         resume_child=_resume_frozen_child,
     )
     if app_state is not None:
+        from omnigent.server.host_load_notices import HostLoadNotices
+
+        app_state.host_load_notices = HostLoadNotices(
+            conversation_store=conversation_store,
+            owner_for=lambda conv: effective_owner_id(conv, conversation_store, permission_store),
+            owns_parent=_owns_idle_parent,
+            true_state=_true_state,
+            post_event=post_event_impl,
+        )
         app_state.peer_sweeper = sweeper
         app_state.child_keep_warm = child_keep_warm
         app_state.child_idle = child_idle

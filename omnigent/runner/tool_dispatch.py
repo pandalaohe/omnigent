@@ -319,6 +319,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 _CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
+_HOST_LOAD_TOOLS = frozenset({"sys_host_load"})
 
 # Both sys_session_create create shapes (JSON and config_path multipart)
 # carry the agent-origin marker: the server charges the owner's open-rate
@@ -602,6 +603,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
+    | _HOST_LOAD_TOOLS
     | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -1076,6 +1078,7 @@ _ALL_LOCAL_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
+    | _HOST_LOAD_TOOLS
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -8756,6 +8759,72 @@ async def _execute_child_cap(
         return json.dumps({"error": f"sys_child_cap failed: {exc}"})
 
 
+async def _execute_host_load(args: _JsonObject, client: httpx.AsyncClient | None) -> str:
+    if args:
+        return json.dumps({"error": "sys_host_load takes no arguments"})
+    if client is None:
+        return json.dumps({"error": "sys_host_load requires server access"})
+    advice = {
+        "spare": "Spare capacity: this host can take more work.",
+        "normal": "Heavy work may proceed; check current load before dispatching more work.",
+        "heavy_hold": "Wait before starting new heavy work on this host; recheck for clearance.",
+        "new_session_hold": (
+            "Wait before starting new heavy work or creating new child sessions on this host; "
+            "recheck for clearance."
+        ),
+        "unknown": (
+            "Load telemetry is unavailable, warming up, or stale. No load hold is confirmed; "
+            "verify capacity before starting heavy work."
+        ),
+    }
+    fields = (
+        "name",
+        "host_id",
+        "state",
+        "cpu_count",
+        "load_per_core",
+        "load_equiv",
+        "estimate",
+        "level",
+        "reason",
+        "lines",
+        "lines_source",
+        "mem_pct",
+        "queued_children",
+        "sampled_at",
+        "level_since",
+    )
+    try:
+        response = await client.get("/v1/system/status", timeout=30)
+        response.raise_for_status()
+        payload = _string_object_dict(response.json())
+        raw_hosts = payload.get("hosts") if payload is not None else None
+        hosts = _json_object_list(raw_hosts)
+        if not isinstance(raw_hosts, list) or len(hosts) != len(raw_hosts):
+            return json.dumps({"error": "sys_host_load received an invalid host list"})
+        return json.dumps(
+            {
+                "hosts": [
+                    {
+                        **{field: host.get(field) for field in fields},
+                        "scheduling_advice": (
+                            "Host is not online; confirm connectivity before dispatching work."
+                            if host.get("state") != "online"
+                            else advice.get(
+                                _optional_string(host.get("level")) or "",
+                                "Unrecognized load level; verify capacity "
+                                "before dispatching work.",
+                            )
+                        ),
+                    }
+                    for host in hosts
+                ]
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_host_load failed: {exc}"})
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -10121,6 +10190,8 @@ async def execute_tool(
             output = await _execute_list_models_tool(agent_spec=agent_spec)
         elif tool_name in _CHILD_CAP_TOOLS:
             output = await _execute_child_cap(args, server_client, conversation_id)
+        elif tool_name in _HOST_LOAD_TOOLS:
+            output = await _execute_host_load(args, server_client)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,
