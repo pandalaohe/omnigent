@@ -538,6 +538,7 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
                 "agent_spec",
                 "server_client",
                 "session_init",
+                "startup_required",
                 "ensure_comment_relay",
                 "global_instructions",
             },

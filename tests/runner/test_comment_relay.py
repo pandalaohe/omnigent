@@ -371,7 +371,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
 
     tools_by_name = {t["name"]: t for t in info["tools"]}
     # The framework comment tools, read-only session-discovery tools
-    # (sys_session_list / sys_session_get_history / sys_session_get_info),
+    # (sys_session_list / sys_session_get_history / sys_session_get_info /
+    # sys_session_get_startup_observation_v1),
     # read-only agent tools (sys_agent_list / sys_agent_get /
     # sys_agent_download), policy tools (sys_add_policy /
     # sys_policy_registry), and OS tools (sys_os_*) — claude-native
@@ -390,6 +391,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_list",
         "sys_session_get_history",
         "sys_session_get_info",
+        "sys_session_get_startup_observation_v1",
         "sys_session_rename",
         "sys_session_handover",
         "sys_agent_list",
