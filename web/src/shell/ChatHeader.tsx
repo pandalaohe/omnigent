@@ -43,6 +43,7 @@ import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
+import type { SessionStartupHold } from "@/lib/types";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
@@ -223,6 +224,8 @@ interface ChatHeaderProps {
   pending?: boolean;
   /** Current session archive state, including directly opened sessions. */
   archived?: boolean;
+  /** Present while the session waits for its host's load to drop before starting. */
+  startupHold?: SessionStartupHold | null;
   /** Gating + handlers for the mobile session-menu FAB. */
   mobileMenu: MobileSessionMenuProps;
 }
@@ -373,6 +376,7 @@ export function ChatHeader({
   onToggleRightPanel,
   pending = false,
   archived = false,
+  startupHold = null,
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
@@ -640,6 +644,15 @@ export function ChatHeader({
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}
             className="pr-1"
           />
+        )}
+        {conversationId && startupHold && (
+          <span
+            className="shrink-0 rounded-full bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-400"
+            title="Waiting to start until its host drops below its new-session line"
+            data-testid="session-startup-hold"
+          >
+            Queued (host load)
+          </span>
         )}
       </div>
 

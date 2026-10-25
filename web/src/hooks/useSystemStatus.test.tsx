@@ -1,6 +1,7 @@
 // The summary must stay nudge-driven (no interval) and catch up after a
 // socket reconnect; the full view must renew its `live=1` lease only while
-// the tab is visible.
+// the tab is visible, and refetch after a settings save so host cards show
+// their new lines. The load-line rule matches the server's.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook } from "@testing-library/react";
@@ -28,7 +29,12 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-import { useSystemStatus, useSystemStatusSummary } from "./useSystemStatus";
+import {
+  loadLinePairError,
+  useSystemStatus,
+  useSystemStatusSummary,
+  useUpdateSystemStatusSettings,
+} from "./useSystemStatus";
 
 const fetchMock = vi.fn();
 
@@ -156,5 +162,46 @@ describe("useSystemStatus", () => {
       await vi.advanceTimersByTimeAsync(30_000);
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useUpdateSystemStatusSettings", () => {
+  it("refetches the full view after a save", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) =>
+      String(input) === "/v1/system/settings"
+        ? mockResponse({})
+        : mockResponse({ ...EMPTY_SUMMARY, server: null, hosts: [] }),
+    );
+    const { result } = renderHook(
+      () => ({ status: useSystemStatus({ live: false }), update: useUpdateSystemStatusSettings() }),
+      { wrapper: makeWrapper() },
+    );
+    await flush();
+    const statusFetches = () =>
+      fetchMock.mock.calls.filter(([input]) => String(input) === "/v1/system/status").length;
+    expect(statusFetches()).toBe(1);
+
+    await act(async () => {
+      await result.current.update.mutateAsync({
+        load_lines: { hosts: { host_1: { heavy: 3, new_session: 6 } } },
+      });
+    });
+    await flush();
+    expect(statusFetches()).toBe(2);
+  });
+});
+
+describe("loadLinePairError", () => {
+  it.each([
+    [4, 5, null],
+    [0.5, 64, null],
+    [5, 5, "The heavy-work line must be below the new-session line."],
+    [6, 5, "The heavy-work line must be below the new-session line."],
+    [0, 5, "The heavy-work line must be above 0."],
+    [-1, 5, "The heavy-work line must be above 0."],
+    [4, 64.5, "The new-session line can be at most 64."],
+    [Number.NaN, 5, "Enter both lines as numbers."],
+  ])("heavy %s, new-session %s -> %s", (heavy, newSession, expected) => {
+    expect(loadLinePairError(heavy, newSession)).toBe(expected);
   });
 });

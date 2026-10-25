@@ -2712,6 +2712,7 @@ export function AppShell() {
                     onToggleRightPanel={toggleRightPanel}
                     pending={pendingConversation}
                     archived={Boolean(activeSession?.archived || activeConv?.archived)}
+                    startupHold={activeSession?.startupHold ?? null}
                     mobileMenu={{
                       fileViewerOpen,
                       panelOpen,

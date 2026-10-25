@@ -10,14 +10,22 @@ import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { type HealthCheckNotice, useStartHealthCheck } from "@/hooks/useStartHealthCheck";
 import {
+  loadLinePairError,
+  MAX_LOAD_LINE,
+  parseLoadLine,
   useSystemHistory,
   useSystemStatus,
   useSystemStatusSettings,
+  useUpdateSystemStatusSettings,
+  type SystemHostLoadLevel,
   type SystemHostState,
+  type SystemLoadLinePair,
   type SystemMonitorOverhead,
   type SystemProcessRow,
   type SystemServerStatus,
@@ -510,16 +518,306 @@ const ProcessTree = memo(function ProcessTree({
   );
 });
 
-function HostCard({
+const LOAD_LEVEL_LABELS: Record<SystemHostLoadLevel, string> = {
+  spare: "Spare capacity",
+  normal: "Normal",
+  heavy_hold: "Above heavy-work line",
+  new_session_hold: "Above new-session line",
+  unknown: "Incomplete data",
+};
+
+const LOAD_LEVEL_STYLES: Record<SystemHostLoadLevel, { dot: string; text: string }> = {
+  spare: { dot: "bg-emerald-500", text: "text-emerald-700 dark:text-emerald-400" },
+  normal: { dot: "bg-muted-foreground", text: "text-foreground" },
+  heavy_hold: { dot: "bg-amber-500", text: "text-amber-700 dark:text-amber-400" },
+  new_session_hold: { dot: "bg-red-500", text: "text-red-700 dark:text-red-400" },
+  unknown: { dot: "bg-muted-foreground/40", text: "text-muted-foreground" },
+};
+
+const ESTIMATE_TITLE =
+  "Estimated: this system has no native load average, so the load counts waiting threads plus the busy share of the cores.";
+
+/** Room past the new-session line so a host above it still reads as a position. */
+const LOAD_SCALE_HEADROOM = 1.5;
+
+function hostLoadLevelLabel(host: SystemStatusHost, level: SystemHostLoadLevel): string {
+  if (host.state === "needs_update") return "Host update needed";
+  const label = LOAD_LEVEL_LABELS[level];
+  if (level !== "heavy_hold" || host.reason !== "memory") return label;
+  const memPct = host.mem_pct ?? null;
+  return `${label} (memory${memPct === null ? "" : ` ${formatPct(memPct, 0)}`})`;
+}
+
+/** Bar from 0 to past the new-session line: both lines marked, the current load as a dot. */
+function LoadScale({ value, lines }: { value: number | null; lines: SystemLoadLinePair }) {
+  const max = lines.new_session * LOAD_SCALE_HEADROOM;
+  const at = (point: number) => `${Math.min(100, Math.max(0, (point / max) * 100))}%`;
+  const spareEnd = Math.min(1, lines.heavy);
+  return (
+    <div
+      role="img"
+      aria-label={`${value === null ? "No current load" : `${value.toFixed(2)} per core`}; heavy-work line ${String(lines.heavy)}, new-session line ${String(lines.new_session)}`}
+      className="relative mt-2 h-2 rounded-full bg-muted"
+      data-testid="host-load-scale"
+    >
+      <span
+        className="absolute inset-y-0 left-0 rounded-l-full bg-emerald-500/25"
+        style={{ width: at(spareEnd) }}
+      />
+      <span
+        className="absolute inset-y-0 bg-amber-500/30"
+        style={{
+          left: at(lines.heavy),
+          width: `calc(${at(lines.new_session)} - ${at(lines.heavy)})`,
+        }}
+      />
+      <span
+        className="absolute inset-y-0 right-0 rounded-r-full bg-red-500/30"
+        style={{ left: at(lines.new_session) }}
+      />
+      <span
+        className="absolute -top-1 h-4 w-0.5 -translate-x-1/2 bg-amber-600 dark:bg-amber-400"
+        style={{ left: at(lines.heavy) }}
+        data-testid="host-load-heavy-mark"
+      />
+      <span
+        className="absolute -top-1 h-4 w-0.5 -translate-x-1/2 bg-red-600 dark:bg-red-400"
+        style={{ left: at(lines.new_session) }}
+        data-testid="host-load-new-session-mark"
+      />
+      {value !== null && (
+        <span
+          className="absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-card bg-foreground"
+          style={{ left: at(value) }}
+          data-testid="host-load-marker"
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Admin edit of one host's lines. "Follow the default" removes the override;
+ * the pair must satisfy the server's rule before it is sent.
+ */
+function HostLinesForm({
+  host,
+  lines,
+  defaultLines,
+  onClose,
+}: {
+  host: SystemStatusHost;
+  lines: SystemLoadLinePair;
+  defaultLines: SystemLoadLinePair | null;
+  onClose: () => void;
+}) {
+  const update = useUpdateSystemStatusSettings();
+  const [followDefault, setFollowDefault] = useState(host.lines_source !== "host");
+  const [heavy, setHeavy] = useState(String(lines.heavy));
+  const [newSession, setNewSession] = useState(String(lines.new_session));
+  const [error, setError] = useState<string | null>(null);
+  const shown = followDefault && defaultLines !== null ? defaultLines : null;
+  const idPrefix = `host-lines-${host.host_id}`;
+
+  return (
+    <form
+      className="mt-3 flex flex-col gap-3 rounded-md border bg-muted/30 p-3"
+      data-testid={`host-lines-form-${host.host_id}`}
+      onSubmit={(event) => {
+        event.preventDefault();
+        let pair: SystemLoadLinePair | null = null;
+        if (!followDefault) {
+          pair = { heavy: parseLoadLine(heavy), new_session: parseLoadLine(newSession) };
+          const invalid = loadLinePairError(pair.heavy, pair.new_session);
+          if (invalid !== null) {
+            setError(invalid);
+            return;
+          }
+        }
+        setError(null);
+        update.mutate(
+          { load_lines: { hosts: { [host.host_id]: pair } } },
+          { onSuccess: onClose, onError: (failure) => setError(failure.message) },
+        );
+      }}
+    >
+      <label className="flex items-center gap-2 text-sm">
+        <Checkbox
+          checked={followDefault}
+          onCheckedChange={(checked) => setFollowDefault(checked === true)}
+        />
+        Follow the default{" "}
+        {defaultLines !== null && (
+          <span className="text-muted-foreground tabular-nums">
+            ({String(defaultLines.heavy)} / {String(defaultLines.new_session)})
+          </span>
+        )}
+      </label>
+      <div className="grid grid-cols-2 gap-3">
+        <label htmlFor={`${idPrefix}-heavy`} className="flex flex-col gap-1">
+          <span className="text-xs font-medium">Heavy-work line (per core)</span>
+          <Input
+            id={`${idPrefix}-heavy`}
+            type="number"
+            min={0}
+            max={MAX_LOAD_LINE}
+            step="any"
+            disabled={followDefault}
+            value={shown === null ? heavy : String(shown.heavy)}
+            onChange={(event) => setHeavy(event.target.value)}
+          />
+        </label>
+        <label htmlFor={`${idPrefix}-new-session`} className="flex flex-col gap-1">
+          <span className="text-xs font-medium">New-session line (per core)</span>
+          <Input
+            id={`${idPrefix}-new-session`}
+            type="number"
+            min={0}
+            max={MAX_LOAD_LINE}
+            step="any"
+            disabled={followDefault}
+            value={shown === null ? newSession : String(shown.new_session)}
+            onChange={(event) => setNewSession(event.target.value)}
+          />
+        </label>
+      </div>
+      {error !== null && (
+        <p role="alert" className="text-xs text-destructive">
+          {error}
+        </p>
+      )}
+      <div className="flex items-center gap-2">
+        <Button type="submit" size="sm" loading={update.isPending}>
+          Save
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={onClose}>
+          Cancel
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * The Load row: load per core and what it divides, the host's level against its
+ * two lines (text beside the colour), a scale marking both lines, queued child
+ * sessions, and the admin's per-host edit.
+ */
+function HostLoad({
+  host,
+  isAdmin,
+  defaultLines,
+}: {
+  host: SystemStatusHost;
+  isAdmin: boolean;
+  defaultLines: SystemLoadLinePair | null;
+}) {
+  const [editing, setEditing] = useState(false);
+  const level = host.level ?? "unknown";
+  const style = LOAD_LEVEL_STYLES[host.state === "needs_update" ? "unknown" : level];
+  const perCore = host.load_per_core ?? null;
+  const loadEquiv = host.load_equiv ?? null;
+  const cores = host.cpu_count ?? null;
+  const lines = host.lines;
+  const queued = host.queued_children ?? 0;
+  return (
+    <div className="mt-3" data-testid={`host-load-${host.host_id}`}>
+      <div className="text-xs text-muted-foreground">Load</div>
+      <div className="text-ui">
+        <span className="font-semibold tabular-nums">
+          {perCore === null ? "—" : perCore.toFixed(2)}
+        </span>{" "}
+        <span className="text-muted-foreground">per core</span>{" "}
+        {loadEquiv !== null && cores !== null && (
+          <>
+            <span
+              className="text-muted-foreground tabular-nums"
+              title={host.estimate ? ESTIMATE_TITLE : undefined}
+              data-testid="host-load-equiv"
+            >
+              ({host.estimate ? "est. " : ""}
+              {loadEquiv.toFixed(1)} / {cores} cores)
+            </span>{" "}
+          </>
+        )}
+        <span aria-hidden="true" className="text-muted-foreground">
+          ·
+        </span>{" "}
+        <span
+          className={cn("inline-flex items-center gap-1.5 font-medium", style.text)}
+          data-testid="host-load-level"
+          data-level={host.state === "needs_update" ? "needs_update" : level}
+        >
+          <span className={cn("size-2 shrink-0 rounded-full", style.dot)} aria-hidden="true" />
+          {hostLoadLevelLabel(host, level)}
+        </span>
+      </div>
+      {lines !== undefined && (
+        <>
+          <LoadScale value={perCore} lines={lines} />
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1">
+              <span className="h-2.5 w-0.5 bg-amber-600 dark:bg-amber-400" aria-hidden="true" />
+              Heavy-work line {String(lines.heavy)}
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="h-2.5 w-0.5 bg-red-600 dark:bg-red-400" aria-hidden="true" />
+              New-session line {String(lines.new_session)}
+            </span>
+            <span data-testid="host-load-lines-source">
+              {host.lines_source === "host" ? "Set for this host" : "Default"}
+            </span>
+            {isAdmin && !editing && (
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                className="ml-auto"
+                onClick={() => setEditing(true)}
+              >
+                Edit lines
+              </Button>
+            )}
+          </div>
+          {queued > 0 && (
+            <p
+              className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+              data-testid="host-load-queued"
+            >
+              {queued === 1 ? "1 child session queued" : `${queued} child sessions queued`} until
+              this host drops below its new-session line
+            </p>
+          )}
+          {isAdmin && editing && (
+            <HostLinesForm
+              host={host}
+              lines={lines}
+              defaultLines={defaultLines}
+              onClose={() => setEditing(false)}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+export function HostCard({
   host,
   threshold,
   sessionTitles,
   nowMs,
+  isAdmin = false,
+  defaultLines = null,
 }: {
   host: SystemStatusHost;
   threshold: number | null;
   sessionTitles: Map<string, string>;
   nowMs: number;
+  /** Shows the per-host line edit. */
+  isAdmin?: boolean;
+  /** The workspace default lines, known to admins only. */
+  defaultLines?: SystemLoadLinePair | null;
 }) {
   const history = useSystemHistory(host.host_id);
   const [processesOpen, setProcessesOpen] = useState(false);
@@ -553,12 +851,12 @@ function HostCard({
             : `Last seen ${relativeTime(host.since * 1000)} ago.`}
         </p>
       )}
-      {host.state === "needs_update" && (
+      {host.state === "needs_update" && machine === null && (
         <p className="mb-3 text-sm text-muted-foreground">Update host to see resources.</p>
       )}
       {machine !== null && (
         <>
-          <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
             <Metric label="CPU" value={formatPct(machine.cpu_pct)} />
             <Metric
               label="Memory"
@@ -572,8 +870,8 @@ function HostCard({
                   : "—"
               }
             />
-            <Metric label="Load" value={formatLoad(machine.load1)} />
           </dl>
+          <HostLoad host={host} isAdmin={isAdmin} defaultLines={defaultLines} />
           {points.length > 0 && firstEntry !== undefined && (
             <>
               <Sparkline
@@ -688,6 +986,7 @@ export function SystemStatusPage() {
   const data = status.data;
   const hostNames = new Map(data.hosts.map((host) => [host.host_id, host.name || host.host_id]));
   const threshold = settings.data?.cpu_pct ?? null;
+  const defaultLines = settings.data?.load_lines.default ?? null;
   return (
     <PageScroll maxWidthClassName="max-w-5xl" contentClassName="px-8">
       <div className="mb-6 flex items-start justify-between gap-4">
@@ -740,6 +1039,8 @@ export function SystemStatusPage() {
               threshold={threshold}
               sessionTitles={sessionTitles}
               nowMs={nowMs}
+              isAdmin={isAdmin}
+              defaultLines={defaultLines}
             />
           ))}
         </div>

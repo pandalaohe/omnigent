@@ -109,6 +109,9 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import {
+  loadLinePairError,
+  MAX_LOAD_LINE,
+  parseLoadLine,
   useSystemStatusSettings,
   useUpdateSystemStatusSettings,
   type SystemStatusSettings,
@@ -668,6 +671,17 @@ export function SystemStatusSettingsSection() {
 
       {settings.data !== undefined && (
         <div className="mt-10 max-w-xl border-t pt-6">
+          <h2 className="text-ui font-semibold">Host load lines</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Default lines for every host in this workspace, as load per core (1-minute load divided
+            by logical cores). A host can override them on its System status card.
+          </p>
+          <LoadLinesSettingsForm settings={settings.data} />
+        </div>
+      )}
+
+      {settings.data !== undefined && (
+        <div className="mt-10 max-w-xl border-t pt-6">
           <h2 className="text-ui font-semibold">Health check</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Opens a session on this project and host and sends the prompt below with a monitor
@@ -677,6 +691,121 @@ export function SystemStatusSettingsSection() {
         </div>
       )}
     </PageScroll>
+  );
+}
+
+interface LoadLinesDraft {
+  heavy: string;
+  newSession: string;
+  queueEnabled: boolean;
+}
+
+function toLoadLinesDraft(settings: SystemStatusSettings): LoadLinesDraft {
+  return {
+    heavy: String(settings.load_lines.default.heavy),
+    newSession: String(settings.load_lines.default.new_session),
+    queueEnabled: settings.load_lines.queue_enabled,
+  };
+}
+
+/** The workspace's default load lines and the queue switch; the pair is checked before saving. */
+function LoadLinesSettingsForm({ settings }: { settings: SystemStatusSettings }) {
+  const update = useUpdateSystemStatusSettings();
+  const [draft, setDraft] = useState<LoadLinesDraft>(() => toLoadLinesDraft(settings));
+  const [invalid, setInvalid] = useState<string | null>(null);
+  const lastSynced = useRef(JSON.stringify(toLoadLinesDraft(settings)));
+
+  useEffect(() => {
+    const next = toLoadLinesDraft(settings);
+    setDraft((current) => (JSON.stringify(current) === lastSynced.current ? next : current));
+    lastSynced.current = JSON.stringify(next);
+  }, [settings]);
+
+  const unchanged = JSON.stringify(draft) === JSON.stringify(toLoadLinesDraft(settings));
+
+  return (
+    <form
+      data-testid="load-lines-form"
+      className="mt-4 flex flex-col gap-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        const pair = {
+          heavy: parseLoadLine(draft.heavy),
+          new_session: parseLoadLine(draft.newSession),
+        };
+        const error = loadLinePairError(pair.heavy, pair.new_session);
+        setInvalid(error);
+        if (error !== null) return;
+        update.mutate({ load_lines: { default: pair, queue_enabled: draft.queueEnabled } });
+      }}
+    >
+      <div className="grid grid-cols-2 gap-3">
+        <div className="flex flex-col gap-1">
+          <label className="flex flex-col gap-1">
+            <span className="text-sm font-medium">Heavy-work line (per core)</span>
+            <Input
+              type="number"
+              min={0}
+              max={MAX_LOAD_LINE}
+              step="any"
+              value={draft.heavy}
+              onChange={(event) =>
+                setDraft((current) => ({ ...current, heavy: event.target.value }))
+              }
+            />
+          </label>
+          <span className="text-xs text-muted-foreground">
+            At or above it, new heavy work on the host waits. Memory above the memory threshold
+            counts too.
+          </span>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="flex flex-col gap-1">
+            <span className="text-sm font-medium">New-session line (per core)</span>
+            <Input
+              type="number"
+              min={0}
+              max={MAX_LOAD_LINE}
+              step="any"
+              value={draft.newSession}
+              onChange={(event) =>
+                setDraft((current) => ({ ...current, newSession: event.target.value }))
+              }
+            />
+          </label>
+          <span className="text-xs text-muted-foreground">
+            Must be above the heavy-work line, at most {MAX_LOAD_LINE}.
+          </span>
+        </div>
+      </div>
+      <div className="flex items-start gap-3">
+        <Switch
+          id="load-lines-queue-enabled"
+          checked={draft.queueEnabled}
+          onCheckedChange={(queueEnabled) => setDraft((current) => ({ ...current, queueEnabled }))}
+          className="mt-0.5 shrink-0"
+        />
+        <div className="flex flex-col gap-0.5">
+          <label htmlFor="load-lines-queue-enabled" className="text-sm font-medium">
+            Queue new child sessions
+          </label>
+          <span className="text-xs text-muted-foreground">
+            Child sessions an agent creates on a host above its new-session line wait and start once
+            the host drops below it. Sessions you start yourself are never queued.
+          </span>
+        </div>
+      </div>
+      {(invalid !== null || update.isError) && (
+        <p role="alert" className="text-sm text-destructive">
+          {invalid ?? update.error?.message}
+        </p>
+      )}
+      <div>
+        <Button type="submit" loading={update.isPending} disabled={unchanged || update.isPending}>
+          Save
+        </Button>
+      </div>
+    </form>
   );
 }
 
