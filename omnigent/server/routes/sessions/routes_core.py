@@ -112,6 +112,13 @@ from omnigent.server.child_keep_warm import (
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import Feature
+from omnigent.server.host_load_queue import LABEL as HOST_LOAD_LABEL
+from omnigent.server.host_load_queue import (
+    HostLoadHold,
+    create_presentation,
+    decide_hold,
+    require_start_allowed,
+)
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.instruction_layers import session_instructions_text
 from omnigent.server.permissions import check_session_access
@@ -333,6 +340,7 @@ async def _wake_runner_for_model_change(
     runner_router: RunnerRouter | None,
 ) -> Conversation:
     """Restore a sleeping native session before applying an explicit model pick."""
+    require_start_allowed(conv)
     if await _get_runner_client(conv.id, runner_router) is not None:
         return conv
     runner_client, conv = await ensure_runner_connected(
@@ -1284,7 +1292,12 @@ def register_core_routes(
         """Save a checked first input, deleting the new session if that fails."""
         if event is None:
             return
-        startup = request.app.state.startup_inputs
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        startup = (
+            request.app.state.host_load_inputs
+            if conv and conv.labels.get(HOST_LOAD_LABEL)
+            else request.app.state.startup_inputs
+        )
         try:
             form = (
                 await request.form()
@@ -1840,7 +1853,8 @@ def register_core_routes(
         user_id: str | None,
         parent_session_id: str | None,
         sub_agent_name: str | None,
-    ) -> AsyncIterator[None]:
+        host_id: str | None = None,
+    ) -> AsyncIterator[HostLoadHold | None]:
         """Hold an agent child's cap check and rate admission through insertion.
 
         An agent's unnamed child create (the runner's ``sys_session_create``
@@ -1858,8 +1872,9 @@ def register_core_routes(
         :param sub_agent_name: Named sub-agent dispatch, or ``None``.
         :raises HTTPException: 429 with the settings refusal text.
         """
+        hold = await decide_hold(request, parent_session_id, host_id, conversation_store)
         if parent_session_id is None or sub_agent_name is not None:
-            yield
+            yield hold
             return
         # Only the runner's sys_session_create POST declares itself as
         # agent-initiated; without the header there is no budget to spend,
@@ -1869,7 +1884,7 @@ def register_core_routes(
             origin.strip().lower() != CREATE_ORIGIN_AGENT
             and RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
         ):
-            yield
+            yield hold
             return
         # Authorize the caller on the parent before charging its owner's
         # window: a forged parent link must not spend the real owner's
@@ -1937,7 +1952,7 @@ def register_core_routes(
             refusal_text = await asyncio.to_thread(admit_open, request.app.state, owner)
             if refusal_text is not None:
                 raise HTTPException(status_code=429, detail=refusal_text)
-            yield
+            yield hold
 
     @router.post(
         "/sessions",
@@ -2045,7 +2060,8 @@ def register_core_routes(
             user_id=user_id,
             parent_session_id=body.parent_session_id,
             sub_agent_name=body.sub_agent_name,
-        ):
+            host_id=body.host_id,
+        ) as hold:
             resp, conv = await _create_session_from_existing_agent(
                 conversation_store,
                 agent_store,
@@ -2060,6 +2076,7 @@ def register_core_routes(
                 artifact_store=artifact_store,
                 background_title_coordinator=background_title_coordinator,
                 project_store=project_store,
+                host_load_hold=hold,
             )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -2078,7 +2095,8 @@ def register_core_routes(
         # from the runner's finally, the relay's resource.created
         # self-heal, or the host-launch-failure path below.
         _terminal_first_create = (
-            conv is not None
+            hold is None
+            and conv is not None
             and body.host_id is not None
             and conv.labels.get(_CLAUDE_NATIVE_UI_LABEL_KEY) == _CLAUDE_NATIVE_UI_LABEL_VALUE
         )
@@ -2092,6 +2110,7 @@ def register_core_routes(
         if (
             _rc is not None
             and conv is not None
+            and hold is None
             and not (
                 getattr(request.app.state, "startup_admission", None) is not None
                 and body.parent_session_id is not None
@@ -2182,7 +2201,7 @@ def register_core_routes(
         # synchronously.
         launch_host_id = resp.host_id
         try:
-            if body.host_type == "managed" and resp.runner_id is None:
+            if hold is None and body.host_type == "managed" and resp.runner_id is None:
                 await _schedule_managed_launch(
                     request,
                     session_id=resp.id,
@@ -2204,7 +2223,7 @@ def register_core_routes(
         # managed) and no runner is bound yet, authorize (caller must
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
-        if launch_host_id is not None and resp.runner_id is None:
+        if hold is None and launch_host_id is not None and resp.runner_id is None:
             if getattr(request.app.state, "startup_admission", None) is not None:
                 assert resp.workspace is not None
                 await _queue_caller_host_preparation(
@@ -2243,7 +2262,7 @@ def register_core_routes(
                         _publish_terminal_pending(resp.id, False)
                     resp.runner_id = runner_id
                     resp.host_id = launch_host_id
-        elif deferred_initial_item is not None and resp.host_id is not None:
+        elif hold is None and deferred_initial_item is not None and resp.host_id is not None:
             request.app.state.startup_inputs.host_changed(request.app, resp.host_id)
 
         # Default-public grant only once every launch step has been accepted, so a
@@ -2259,6 +2278,9 @@ def register_core_routes(
                 host_id=launch_host_id,
             )
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
+        create_presentation(
+            request, resp, hold.host_id if hold else (resp.effective_host_id or resp.host_id)
+        )
         return resp
 
     async def _create_bundled_session_from_multipart(
@@ -2722,7 +2744,17 @@ def register_core_routes(
             user_id=user_id,
             parent_session_id=parsed_metadata.parent_session_id,
             sub_agent_name=None,
-        ):
+            host_id=parsed_metadata.host_id,
+        ) as hold:
+            if hold:
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={
+                        "labels": {
+                            **parsed_metadata.labels,
+                            HOST_LOAD_LABEL: f"queued@{hold.host_id}",
+                        }
+                    }
+                )
             with creation_stage("create_persistence_ms"):
                 result = await complete_child_write(
                     asyncio.to_thread(
@@ -2758,9 +2790,13 @@ def register_core_routes(
             result = result.model_copy(update={"labels": dict(created_conversation.labels or {})})
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
-        if inherited_runner_id is not None and not (
-            getattr(request.app.state, "startup_admission", None) is not None
-            and parsed_metadata.parent_session_id is not None
+        if (
+            hold is None
+            and inherited_runner_id is not None
+            and not (
+                getattr(request.app.state, "startup_admission", None) is not None
+                and parsed_metadata.parent_session_id is not None
+            )
         ):
             # Full session-init envelope, not the legacy id-only body, so the
             # runner stores the global instructions and the rest of the
@@ -2801,7 +2837,7 @@ def register_core_routes(
         # over its tunnel like any session-scoped agent, so no separate
         # bundle delivery is needed. A sub-agent child (inherited runner)
         # is never itself managed — it co-locates on the parent's runner.
-        if parsed_metadata.host_type == "managed" and inherited_runner_id is None:
+        if hold is None and parsed_metadata.host_type == "managed" and inherited_runner_id is None:
             await _schedule_managed_launch(
                 request,
                 session_id=result.session_id,
@@ -2820,7 +2856,7 @@ def register_core_routes(
         # grant above is what resolve_host_launch's session-owner check
         # sees). A sub-agent child (inherited runner) is never launched
         # here — it co-locates on the parent's runner.
-        if parsed_metadata.host_id is not None and inherited_runner_id is None:
+        if hold is None and parsed_metadata.host_id is not None and inherited_runner_id is None:
             from omnigent.harness_aliases import canonicalize_harness
             from omnigent.models.model_catalog import spec_harness
 
@@ -2860,6 +2896,7 @@ def register_core_routes(
                 workspace=parsed_metadata.workspace,
                 host_id=parsed_metadata.host_id,
             )
+        create_presentation(request, result, hold.host_id if hold else parsed_metadata.host_id)
         return result
 
     # ── GET /sessions/projects ────────────────────────────────────

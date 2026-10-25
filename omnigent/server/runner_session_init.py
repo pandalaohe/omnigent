@@ -419,6 +419,9 @@ class RunnerSessionInitializer:
         store_slots: asyncio.Semaphore | None = None,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
+        from omnigent.server.host_load_queue import require_start_allowed
+
+        require_start_allowed(conversation)
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:

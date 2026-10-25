@@ -10048,6 +10048,18 @@
             "description": "Host that launched (or should launch) the runner for this session, e.g. `\"host_a1b2c3d4...\"`. `None` for CLI-initiated sessions.",
             "title": "Host Id"
           },
+          "host_load": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Load"
+          },
           "host_online": {
             "anyOf": [
               {
@@ -10418,9 +10430,26 @@
                 "$ref": "#/components/schemas/SessionStartupStatus"
               },
               {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Startup"
+          },
+          "startup_hold": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startup Hold"
           },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",

@@ -219,6 +219,7 @@ class SystemStatusHub:
         self.settings_path = self._state_dir / "settings.json"
         self._started_at = time.time()
         self._entries: dict[tuple[int, str], _HostEntry] = {}
+        self._queued_children: dict[tuple[int, str], int] = {}
         self._server_points: list[dict[str, Any]] = []
         self._findings: dict[tuple[int | None, str], dict[str, Any]] = {}
         self._viewer_leases: dict[tuple[int, str], float] = {}
@@ -1047,6 +1048,12 @@ class SystemStatusHub:
         """Whether agent-created children may be held in this workspace."""
         return self._workspace_lines(workspace_id)["queue_enabled"]
 
+    def host_load_keys(self) -> list[tuple[int, str]]:
+        return list(self._entries)
+
+    def set_queued_children(self, workspace_id: int, host_id: str, count: int) -> None:
+        self._queued_children[(workspace_id, host_id)] = count
+
     def load_lines_frames(self) -> dict[tuple[int, str], HostLoadLinesFrame]:
         """Capture effective frames so a settings patch can target actual changes."""
         return {
@@ -1112,7 +1119,7 @@ class SystemStatusHub:
             "level_since": entry.level_since if entry is not None else None,
             "lines": {"heavy": lines.heavy, "new_session": lines.new_session},
             "lines_source": source,
-            "queued_children": 0,
+            "queued_children": self._queued_children.get((workspace_id, host_id), 0),
             "mem_pct": _mem_pct(machine) if machine else None,
             "sampled_at": entry.last_snapshot.get("sampled_at")
             if entry is not None and entry.last_snapshot

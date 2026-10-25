@@ -2231,6 +2231,8 @@ class CreatedSessionResponse(BaseModel):
     project_id: str | None = None
     worktree: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
+    host_load: dict[str, Any] | None = None
+    startup: dict[str, Any] | None = None
 
 
 class SessionLabelsResponse(BaseModel):
@@ -2734,7 +2736,9 @@ class SessionResponse(BaseModel):
     inference_error: str | None = None
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
-    startup: SessionStartupStatus | None = None
+    startup: SessionStartupStatus | dict[str, Any] | None = None
+    startup_hold: dict[str, Any] | None = None
+    host_load: dict[str, Any] | None = None
     # Per-MCP-server startup state for native harness sessions
     # (codex-native), present while the harness boots its MCP servers or
     # when servers were cancelled/failed. ``None`` otherwise. Sourced from

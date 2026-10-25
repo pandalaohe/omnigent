@@ -80,13 +80,15 @@ def is_parent_owned_subagent(conv: Conversation) -> bool:
 
 
 def _restorable(conv: Conversation) -> bool:
+    from omnigent.server.host_load_queue import held_host
     from omnigent.server.routes._sessions.common import (
         _intentional_stop_sessions,
         _interrupt_fenced_sessions,
     )
 
     return (
-        conv.agent_id is not None
+        not held_host(conv)
+        and conv.agent_id is not None
         and not conv.archived
         and not is_session_closed(conv.labels, conv.title)
         and (conv.runner_id is None or _intentional_stop_sessions.get(conv.id) != conv.runner_id)

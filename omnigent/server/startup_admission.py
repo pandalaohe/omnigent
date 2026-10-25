@@ -107,9 +107,12 @@ class StartupAdmission:
         return await _resolve_harness_async(conv) if conv is not None else None
 
     async def _eligible(self, startup: StartupSnapshot) -> bool:
+        from omnigent.server.host_load_queue import held_host
+
         conv = await asyncio.to_thread(self.conversations.get_conversation, startup.session_id)
         if (
             conv is None
+            or held_host(conv) is not None
             or conv.archived
             or conv.labels.get(STARTUP_REGISTRATION_LABEL_KEY) == STARTUP_REGISTRATION_PENDING
             or conv.labels.get(STARTUP_CREATE_PREPARATION_LABEL_KEY)
@@ -361,6 +364,12 @@ class StartupAdmission:
         raise StartupQueued(startup.id)
 
     async def _launch(self, startup: StartupSnapshot) -> None:
+        from omnigent.server.host_load_queue import held_host
+
+        row = await asyncio.to_thread(self.conversations.get_conversation, startup.session_id)
+        if row is not None and held_host(row) is not None:
+            await asyncio.to_thread(self.startups.cancel_unissued, startup.id, startup.attempt_id)
+            return
         conn = self.hosts.get(startup.host_id)
         generation = conn.startup_generation if conn is not None else None
         if (

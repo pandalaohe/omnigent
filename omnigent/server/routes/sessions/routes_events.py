@@ -2067,6 +2067,47 @@ def register_events_routes(
                 "Session is archived. Unarchive it before starting new work.",
                 code=ErrorCode.CONFLICT,
             )
+        from omnigent.server.host_load_queue import LABEL, start_allowed
+        from omnigent.stores.conversation_store import ConversationLabelConditionFailed
+
+        if not start_allowed(conv):
+            if body.type == "message" and body.data.get("role") == "user":
+                try:
+                    saved = await request.app.state.host_load_inputs.enqueue(
+                        session_id,
+                        body,
+                        user_id=created_by,
+                        headers=request.headers,
+                        first=False,
+                        while_label=LABEL,
+                    )
+                except ConversationLabelConditionFailed:
+                    refreshed = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                    if refreshed is None:
+                        raise _session_not_found() from None
+                    conv = refreshed
+                else:
+                    return {
+                        "queued": True,
+                        "pending_id": pending_inputs.make_pending_id(session_id, saved.id),
+                    }
+            elif archived_user_work or archived_start_work:
+                raise OmnigentError(
+                    "This session is queued for host load.", code=ErrorCode.CONFLICT
+                )
+
+        if (
+            not isinstance(request, (StartupInputContext, _RunnerEventContext))
+            and body.type == "message"
+            and body.data.get("role") == "user"
+            and (held_inputs := getattr(request.app.state, "host_load_inputs", None)) is not None
+        ):
+            # A label can disappear while release still drains older saved input.
+            async with held_inputs.session_barrier(session_id):
+                pass
+
         if (
             body.type == _RETRY_SESSION_TYPE
             or (body.type == "message" and body.data.get("role") == "user")

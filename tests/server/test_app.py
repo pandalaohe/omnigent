@@ -2630,6 +2630,48 @@ async def _reconnect_with_initialize(
 
 
 @pytest.mark.asyncio
+async def test_runner_reconnect_skips_held_explicit_host_child_then_initializes_after_release(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.host_load_queue import LABEL
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "44444444444444444444444444444444"
+    [parent_id] = _bind_sessions(db_uri, runner_id)
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.get_conversation(parent_id)
+    assert parent is not None
+    child = store.create_conversation(
+        parent_conversation_id=parent_id,
+        kind="sub_agent",
+        agent_id=parent.agent_id,
+        runner_id=runner_id,
+        host_id="55555555555555555555555555555555",
+        workspace="/opt/work/project",
+        labels={LABEL: "queued@55555555555555555555555555555555"},
+    )
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        app.state.runner_router, "client_for_session_resources", lambda *_a, **_k: routed
+    )
+    initialize = AsyncMock(
+        return_value=httpx.Response(
+            201, request=httpx.Request("POST", "http://runner/v1/sessions")
+        )
+    )
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", initialize)
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+    assert child.id not in [call.args[0].id for call in initialize.await_args_list]
+    store.delete_label(child.id, LABEL)
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+    assert child.id in [call.args[0].id for call in initialize.await_args_list]
+
+
+@pytest.mark.asyncio
 async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
     db_uri: str,
     tmp_path: Path,

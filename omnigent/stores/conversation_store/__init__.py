@@ -674,6 +674,10 @@ class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
 
 
+class ConversationLabelConditionFailed(Exception):
+    """A conditional append lost its required label before acquiring the row lock."""
+
+
 class ConversationArchiveClosingError(Exception):
     """Raised when a child create loses to its root archive-close transition."""
 
@@ -1178,6 +1182,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         items: list[NewConversationItem],
+        *,
+        while_label: str | None = None,
     ) -> list[ConversationItem]:
         """
         Append items to a conversation. Assigns a globally unique
@@ -1193,6 +1199,8 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
             to persist.
+        :param while_label: Require this label in the append transaction, or
+            raise ConversationLabelConditionFailed without saving any item.
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
         :raises NativeRecoveryItemSkipped: One historical reasoning item was

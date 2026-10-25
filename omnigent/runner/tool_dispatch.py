@@ -5636,8 +5636,16 @@ async def _complete_created_session(
                     "detail": post_error,
                 }
             else:
-                initial_message = {"status": "sent"}
-                if remote:
+                startup = _string_object_dict(data.get("startup"))
+                held = (
+                    startup is not None
+                    and startup.get("reason") == "host_load"
+                    and startup.get("status") == "queued"
+                )
+                initial_message = (
+                    {"status": "queued", "reason": "host_load"} if held else {"status": "sent"}
+                )
+                if remote and not held:
                     _subagent_work.mark_subagent_work_started(child_id)
     else:
         registration_error = await clear_registration_barrier()
@@ -5673,6 +5681,8 @@ async def _complete_created_session(
             "git_branch": _optional_string(meta.get("git_branch")) if meta is not None else None,
             "harness": _optional_string(meta.get("harness")) if meta is not None else None,
             **({"initial_message": initial_message} if initial_message is not None else {}),
+            **({"host_load": data["host_load"]} if "host_load" in data else {}),
+            **({"startup": data["startup"]} if "startup" in data else {}),
         }
     )
 
@@ -8029,6 +8039,7 @@ async def _session_info_item(
     auto_compact_token_limit = snap.get("auto_compact_token_limit")
     item: _JsonObject = {
         **({"initial_message": initial_message} if initial_message is not None else {}),
+        **({"startup_hold": snap["startup_hold"]} if snap.get("startup_hold") else {}),
         "session_id": snap.get("id"),
         "status": snap.get("status"),
         # Persisted conversation activity is distinct from lifecycle
