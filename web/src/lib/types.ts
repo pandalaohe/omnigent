@@ -293,7 +293,8 @@ export interface BackgroundTaskInfo {
 export interface SessionStartupHold {
   reason: "host_load";
   host_id: string;
-  since: string;
+  /** Unix epoch seconds. */
+  since: number;
 }
 
 export interface Session {

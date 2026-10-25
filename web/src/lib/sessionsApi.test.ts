@@ -224,14 +224,14 @@ describe("createSession", () => {
         agent_id: "agent_xyz",
         status: "idle",
         created_at: 1704067200,
-        startup_hold: { reason: "host_load", host_id: "host_1", since: "2026-10-25T09:56:07Z" },
+        startup_hold: { reason: "host_load", host_id: "host_1", since: 1704067200 },
       }),
     );
     const session = await createSession("agent_xyz");
     expect(session.startupHold).toEqual({
       reason: "host_load",
       host_id: "host_1",
-      since: "2026-10-25T09:56:07Z",
+      since: 1704067200,
     });
   });
 

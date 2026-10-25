@@ -399,7 +399,7 @@ describe("ChatHeader — startup hold", () => {
       sidebarOpen: true,
       conversationId: "child-9",
       conversationTitle: "Run the suite",
-      startupHold: { reason: "host_load", host_id: "h1", since: "2026-10-25T09:56:07Z" },
+      startupHold: { reason: "host_load", host_id: "h1", since: 1704067200 },
     });
     expect(screen.getByTestId("session-startup-hold")).toHaveTextContent("Queued (host load)");
   });
