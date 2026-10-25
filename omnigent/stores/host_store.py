@@ -514,6 +514,22 @@ class HostStore:
 
             # Read after any pending disconnect so the ORM restores online status.
             row = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            existing_by_name = None
+            if row is None:
+                existing_by_name = session.execute(
+                    select(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.user_id == user_id,
+                        SqlHost.name == name,
+                        SqlHost.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                # A reservation or connection can commit between the two reads.
+                # The same identity needs a normal update, not rotation.
+                if existing_by_name is not None and existing_by_name.host_id == host_id:
+                    row = existing_by_name
             if row is not None:
                 if row.deleted_at is not None:
                     raise ValueError("host has been deleted")
@@ -556,14 +572,6 @@ class HostStore:
                 if reowned is not None:
                     return reowned
 
-            existing_by_name = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.user_id == user_id,
-                    SqlHost.name == name,
-                    SqlHost.deleted_at.is_(None),
-                )
-            ).scalar_one_or_none()
             if existing_by_name is not None:
                 if existing_by_name.host_id != rotation_source_id:
                     raise OmnigentError(
