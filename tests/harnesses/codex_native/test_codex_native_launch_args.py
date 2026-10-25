@@ -885,11 +885,18 @@ def profile_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     "linked,subdirectory", [(False, False), (True, False), (False, True), (True, True)]
 )
 @pytest.mark.parametrize("extra_root", [None, "ancestor", "common", "unrelated", "alias"])
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
 def test_workspace_profile_repository_entries(
-    profile_repo: Path, linked: bool, subdirectory: bool, extra_root: str | None
+    profile_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    linked: bool,
+    subdirectory: bool,
+    extra_root: str | None,
+    platform: str,
 ) -> None:
     import subprocess
 
+    monkeypatch.setattr(launch_args, "sys", SimpleNamespace(platform=platform))
     repo = profile_repo.resolve()
     workspace = repo
     common = repo / ".git"
@@ -937,6 +944,9 @@ def test_workspace_profile_repository_entries(
             del expected[str(common / "modules")]
         if extra_root != "common":
             expected[str(root)] = "write"
+    cache = profile_repo.parent / "Library" / "Caches" / "ms-playwright"
+    if platform == "darwin":
+        expected[str(cache)] = "write"
     profile = launch_args.codex_workspace_profile(
         workspace,
         launch_args=["--approve-for-me"],
@@ -946,6 +956,7 @@ def test_workspace_profile_repository_entries(
     )
     assert profile is not None
     assert profile.profile_id == "omnigent-workspace"
+    assert str(cache.resolve()) not in profile.writable_roots
     values = {
         key: tomlkit.parse(f"v = {value}")["v"]
         for key, value in (override.split("=", 1) for override in profile.config_overrides)
@@ -955,6 +966,38 @@ def test_workspace_profile_repository_entries(
         "permissions.omnigent-workspace.filesystem": expected,
         "default_permissions": "omnigent-workspace",
     }
+
+
+@pytest.mark.parametrize("target", ["hooks", "common", "repo", "ancestor"])
+def test_workspace_profile_playwright_cache_preserves_git_protections(
+    profile_repo: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    monkeypatch.setattr(launch_args, "sys", SimpleNamespace(platform="darwin"))
+    cache = profile_repo.parent / "Library" / "Caches" / "ms-playwright"
+    cache.parent.mkdir(parents=True)
+    common = profile_repo.resolve() / ".git"
+    destination = {
+        "hooks": common / "hooks",
+        "common": common,
+        "repo": profile_repo,
+        "ancestor": profile_repo.parent,
+    }[target]
+    cache.symlink_to(destination, target_is_directory=True)
+    profile = launch_args.codex_workspace_profile(
+        profile_repo,
+        launch_args=[],
+        server_overrides=[],
+        private_config={},
+        codex_version=(0, 162, 1),
+    )
+    if target == "hooks":
+        assert profile is None
+    else:
+        assert profile is not None
+        filesystem = tomlkit.parse(f"v = {profile.config_overrides[1].split('=', 1)[1]}")["v"]
+        for name in ("hooks", "config", "config.worktree", "modules", "worktrees"):
+            assert filesystem[str(common / name)] == "read"
+        assert profile.writable_roots == ()
 
 
 @pytest.mark.parametrize(
@@ -1159,11 +1202,13 @@ def test_workspace_profile_declines_unsafe_config(
 )
 def test_workspace_profile_roots_and_network(
     profile_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
     overrides: list[str],
     args: list[str],
     expected_roots: list[str],
     network: bool,
 ) -> None:
+    monkeypatch.setattr(launch_args, "sys", SimpleNamespace(platform="linux"))
     profile = launch_args.codex_workspace_profile(
         profile_repo,
         launch_args=["--cd", "src", "--add-dir", "../extra", *args],

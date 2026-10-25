@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -722,6 +723,9 @@ def codex_workspace_profile(
         common_already_writable = any(
             common.resolve().is_relative_to(Path(root).resolve()) for root in writable_roots
         )
+        automatic_roots: list[str] = []
+        if sys.platform == "darwin":
+            automatic_roots.append(str(Path.home() / "Library" / "Caches" / "ms-playwright"))
         entries = {str(directory): "write" for directory in opened}
         for name in ("hooks", "config", "config.worktree"):
             entries[str(common / name)] = "read"
@@ -737,7 +741,7 @@ def codex_workspace_profile(
             for path, access in entries.items()
             for candidate in (Path(path), Path(path).resolve())
         ]
-        for root in writable_roots:
+        for root in [*writable_roots, *automatic_roots]:
             covered = False
             for path in (Path(root), Path(root).resolve()):
                 matches = [
