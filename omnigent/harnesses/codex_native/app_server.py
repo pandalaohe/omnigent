@@ -89,7 +89,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     codex_app_server_diagnostic_env,
     report_capture_start_failure,
 )
-from omnigent.inner import _proc
+from omnigent.inner import _liveness_exec, _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     CODEX_AGENT_PID_CONFIG_KEY,
@@ -216,7 +216,7 @@ _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CodexModelDiscoveryProcess:
     """Short-lived Codex process plus its bounded stderr drain."""
 
@@ -225,6 +225,7 @@ class _CodexModelDiscoveryProcess:
     session_tag: str | None = None
     owner_lock: CodexNativeProcessOwnerLock | None = None
     process_group_id: int | None = None
+    liveness_fd: int | None = None
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:
@@ -1481,21 +1482,40 @@ async def _start_codex_model_discovery_process(
         config_overrides=config_overrides,
     )
     owner_lock = acquire_codex_native_process_owner_lock()
+    read_fd: int | None = None
+    liveness_fd: int | None = None
     try:
+        spawn_argv = argv
+        if os.name == "posix":
+            read_fd, liveness_fd = os.pipe()
+            spawn_argv = [
+                sys.executable,
+                str(Path(_liveness_exec.__file__)),
+                "--liveness-fd",
+                str(read_fd),
+                codex_path,
+                *argv[1:],
+            ]
         process = await asyncio.create_subprocess_exec(
-            *argv,
+            *spawn_argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=str(cwd),
-            executable=codex_path,
+            executable=codex_path if read_fd is None else None,
+            pass_fds=() if read_fd is None else (read_fd,),
             **_proc.spawn_kwargs(),
         )
     except BaseException:
+        if liveness_fd is not None:
+            os.close(liveness_fd)
         if owner_lock is not None:
             owner_lock.close()
         raise
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
     process_group_id = _process_group_id(process)
     if owner_lock is not None:
         register_codex_native_process(
@@ -1515,6 +1535,7 @@ async def _start_codex_model_discovery_process(
         session_tag=session_tag,
         owner_lock=owner_lock,
         process_group_id=process_group_id,
+        liveness_fd=liveness_fd,
     )
 
 
@@ -1545,6 +1566,10 @@ async def _capture_codex_discovery_stderr_tail(
 async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryProcess) -> None:
     """Terminate a discovery process and finish draining its stderr pipe."""
     try:
+        if discovery.liveness_fd is not None:
+            liveness_fd, discovery.liveness_fd = discovery.liveness_fd, None
+            with contextlib.suppress(OSError):
+                os.close(liveness_fd)
         process = discovery.process
         if process.returncode is None:
             if os.name == "posix":

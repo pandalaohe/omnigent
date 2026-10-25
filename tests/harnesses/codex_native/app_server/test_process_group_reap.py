@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import (
     CodexNativeAppServer,
 )
+from omnigent.inner import _proc
+from tests._helpers.polling import poll_until, poll_until_async
 from tests.harnesses.codex_native.app_server._support import _test_app_server
 
 
@@ -137,11 +144,21 @@ async def test_model_discovery_spawn_registers_crash_safe_entry(
         assert isinstance(captured["kwargs"], dict)
         args = [str(arg) for arg in captured["args"]]
         kwargs = captured["kwargs"]
-        assert kwargs["executable"] == "/test/codex"
+        assert kwargs["executable"] is None
+        assert args[:1] == [sys.executable]
+        assert Path(args[1]).name == "_liveness_exec.py"
+        assert args[2] == "--liveness-fd"
+        read_fd = int(args[3])
+        assert kwargs["pass_fds"] == (read_fd,)
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+        assert discovery.liveness_fd is not None
+        os.fstat(discovery.liveness_fd)
+        args = args[4:]
         tag = discovery.session_tag
         assert tag is not None and tag.startswith(codex_process_registry._model_probe_tag_prefix())
         needle = codex_process_registry.codex_native_session_tag_cmdline_arg(tag)
-        assert args[0] == "codex"
+        assert args[0] == "/test/codex"
         assert "omnigent_crash_teardown_tag" not in args[0]
         assert args[1:] == [
             "app-server",
@@ -207,6 +224,8 @@ async def test_model_discovery_stop_removes_entry_and_releases_lock(
     )
     assert discovery.session_tag is not None
     assert discovery.owner_lock is not None
+    liveness_fd = discovery.liveness_fd
+    assert liveness_fd is not None
     lock_path = Path(discovery.owner_lock.path)
     assert lock_path.exists()
     assert len(_read_discovery_registry_entries(registry_path)) == 1
@@ -215,6 +234,9 @@ async def test_model_discovery_stop_removes_entry_and_releases_lock(
 
     assert _read_discovery_registry_entries(registry_path) == []
     assert not lock_path.exists()
+    assert discovery.liveness_fd is None
+    with pytest.raises(OSError):
+        os.fstat(liveness_fd)
 
 
 @pytest.mark.posix_only
@@ -790,3 +812,133 @@ async def test_model_discovery_spawn_failure_releases_owner_lock(
     assert not acquired[0].exists()
     assert _read_discovery_registry_entries(registry_path) == []
     assert calls["reconciled"] == 1
+
+
+@pytest.mark.posix_only
+def test_model_probe_parent_kill_reaps_only_its_own_tree(tmp_path: Path) -> None:
+    """A killed test/dev owner cannot strand a probe, even in another session."""
+    parent_code = """import asyncio, os, sys
+from pathlib import Path
+from omnigent.harnesses.codex_native.app_server import _start_codex_model_discovery_process
+async def run():
+ root = Path(sys.argv[1])
+ os.environ['OMNIGENT_CODEX_NATIVE_STATE_DIR'] = str(root / 'state')
+ discovery = await _start_codex_model_discovery_process(
+  codex_path=str(root / 'codex'), listen_url='ws://127.0.0.1:1',
+  env=dict(os.environ), cwd=root)
+ (root / 'wrapper').write_text(str(discovery.process.pid))
+ await asyncio.Event().wait()
+asyncio.run(run())
+"""
+    parents: list[subprocess.Popen] = []
+    trees: list[list[psutil.Process]] = []
+    try:
+        for name in ("killed", "live"):
+            root = tmp_path / name
+            root.mkdir()
+            fake = root / "codex"
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, signal, subprocess, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(60)'], start_new_session=True)\n"
+                f"with open({str(root / 'children')!r}, 'w') as f:\n"
+                " f.write(json.dumps([os.getpid(), child.pid]))\n"
+                "time.sleep(60)\n"
+            )
+            fake.chmod(0o755)
+            parent = subprocess.Popen([sys.executable, "-c", parent_code, str(root)])
+            parents.append(parent)
+            poll_until(
+                lambda root=root: (root / "children").exists() and (root / "wrapper").exists(),
+                timeout_s=15,
+                interval_s=0.05,
+            )
+            pids = [
+                int((root / "wrapper").read_text()),
+                *json.loads((root / "children").read_text()),
+            ]
+            trees.append([psutil.Process(pid) for pid in pids])
+        # Let the existing wrapper census observe the child that called setsid.
+        time.sleep(0.3)
+        parents[0].kill()
+        parents[0].wait(timeout=5)
+        poll_until(
+            lambda: all(not _proc.process_alive(proc.pid) for proc in trees[0]),
+            timeout_s=8,
+            interval_s=0.05,
+        )
+        assert parents[1].poll() is None
+        assert all(
+            proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE for proc in trees[1]
+        )
+    finally:
+        for parent in parents:
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait(timeout=5)
+        for tree in trees:
+            for proc in tree:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    proc.send_signal(signal.SIGKILL)
+
+
+@pytest.mark.posix_only
+async def test_cancelled_probe_spawn_closes_its_liveness_pipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancellation before the spawn returns still stops the unregistered child."""
+    from omnigent.harnesses.codex_native import app_server
+
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(app_server, "reconcile_codex_native_process_registry", lambda: None)
+    ready = tmp_path / "ready"
+    fake = tmp_path / "codex"
+    fake.write_text(
+        f"#!{sys.executable}\nimport os, time\n"
+        f"open({str(ready)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n"
+    )
+    fake.chmod(0o755)
+    real_spawn = asyncio.create_subprocess_exec
+    spawned = asyncio.Event()
+    processes: list[asyncio.subprocess.Process] = []
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await real_spawn(*args, **kwargs)
+        processes.append(process)
+        await poll_until_async(ready.exists, timeout_s=10)
+        spawned.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    task = asyncio.create_task(
+        app_server._start_codex_model_discovery_process(
+            codex_path=str(fake),
+            listen_url="ws://127.0.0.1:1",
+            env=dict(os.environ),
+            cwd=tmp_path,
+        )
+    )
+    child = None
+    try:
+        await asyncio.wait_for(spawned.wait(), timeout=15)
+        child = psutil.Process(int(ready.read_text()))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(processes[0].wait(), timeout=8)
+        await poll_until_async(lambda: not _proc.process_alive(child.pid), timeout_s=3)
+        assert not list((tmp_path / "state" / "process-owners").glob("*.lock"))
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+        if child is not None:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                child.kill()

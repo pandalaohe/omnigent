@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import itertools
+import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.terminals import program_status
 from omnigent.terminals.program_status import ProgramStatus, ProgramStatusParser, parse_report
+from tests._helpers.polling import poll_until
 
 
 @pytest.mark.parametrize("ending", [b"\x07", b"\x1b\\"])
@@ -126,6 +131,8 @@ def _mock_relay(monkeypatch: pytest.MonkeyPatch, events: list[object]) -> None:
     clock = itertools.count(step=0.5)
     monkeypatch.setattr(pty, "fork", lambda: (32123, 91))
     monkeypatch.setattr(fcntl, "ioctl", lambda *_: b"\0" * 8)
+    monkeypatch.setattr(fcntl, "fcntl", lambda *_: 0)
+    monkeypatch.setattr(program_status.os, "set_blocking", lambda *_: None)
     monkeypatch.setattr(termios, "tcgetattr", lambda _: ["original"])
     monkeypatch.setattr(termios, "tcsetattr", lambda *_: events.append("termios"))
     monkeypatch.setattr(tty, "setraw", lambda _: None)
@@ -212,7 +219,7 @@ from pathlib import Path
 from omnigent.terminals import program_status
 
 real_waitpid = os.waitpid
-real_write_all = program_status._write_all
+real_write = os.write
 def guarded_signal(*args):
     raise AssertionError('unexpected real signal attempt')
 def observed_waitpid(pid, options):
@@ -233,10 +240,10 @@ def disconnected_write(fd, data):
             raise AssertionError('child did not write to controlling tty')
         time.sleep(0.5)
         raise OSError(errno.EIO, 'outer output disconnected')
-    return real_write_all(fd, data)
+    return real_write(fd, data)
 os.kill = os.killpg = guarded_signal
 os.waitpid = observed_waitpid
-program_status._write_all = disconnected_write
+os.write = disconnected_write
 try:
     program_status.relay(Path(sys.argv[1]), 'claude-code', sys.argv[4:])
 except OSError as exc:
@@ -368,6 +375,119 @@ def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
                 assert process.returncode == (127 if failure == "missing" else 126), output
                 assert b"cannot exec" in output
             assert not state_file.exists()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("failure", ["owner", "parent", "pty"])
+def test_relay_exits_despite_output_backpressure(tmp_path: Path, failure: str) -> None:
+    """Dead runners/panes must release a relay even when nobody drains output."""
+    state_file = tmp_path / "status.json"
+    wrapper_pid_file = tmp_path / "wrapper"
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    command = [
+        sys.executable,
+        str(Path(program_status.__file__)),
+        "--state-file",
+        str(state_file),
+        "--app",
+        "claude-code",
+    ]
+    if failure != "pty":
+        command.extend(["--owner-pid", str(owner.pid)])
+    command.extend(
+        [
+            "--",
+            sys.executable,
+            "-c",
+            "import os,signal; "
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "exec(\"while True: os.write(1, b'x' * 65536)\")",
+        ]
+    )
+    parent_code = (
+        "import json, subprocess, sys, time; from pathlib import Path; "
+        "child = subprocess.Popen(json.loads(sys.argv[1]), start_new_session=True); "
+        "Path(sys.argv[2]).write_text(str(child.pid)); time.sleep(60)"
+    )
+    master, slave = os.openpty()
+    wrapper = child = None
+    parent = None
+    try:
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parent_code, json.dumps(command), str(wrapper_pid_file)],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(slave)
+        slave = -1
+        poll_until(lambda: state_file.exists(), timeout_s=10, interval_s=0.05)
+        wrapper = psutil.Process(int(wrapper_pid_file.read_text()))
+        child = psutil.Process(json.loads(state_file.read_text())["pid"])
+        # Leave stdout unread until both its pipe and the outer PTY are full.
+        time.sleep(0.3)
+        if failure == "owner":
+            owner.kill()
+            owner.wait(timeout=5)
+        elif failure == "parent":
+            parent.kill()
+            parent.wait(timeout=5)
+        else:
+            os.close(master)
+            master = -1
+        poll_until(lambda: not state_file.exists(), timeout_s=7, interval_s=0.05)
+        poll_until(lambda: not _proc.process_alive(wrapper.pid), timeout_s=3, interval_s=0.05)
+        assert not _proc.process_alive(child.pid)
+        if failure != "parent":
+            assert parent.poll() is None
+        if failure != "owner":
+            assert owner.poll() is None
+    finally:
+        for proc in (wrapper, child):
+            if proc is not None:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    proc.kill()
+        for proc in (parent, owner):
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.communicate(timeout=5)
+        if master != -1:
+            os.close(master)
+        if slave != -1:
+            os.close(slave)
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("reader_delay", [0, 3.5], ids=["immediate", "delayed"])
+def test_relay_drains_output_larger_than_its_buffer(tmp_path: Path, reader_delay: float) -> None:
+    master, slave = os.openpty()
+    try:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(program_status.__file__)),
+                "--state-file",
+                str(tmp_path / "status.json"),
+                "--app",
+                "claude-code",
+                "--",
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'x' * 80000)",
+            ],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as process:
+            time.sleep(reader_delay)
+            output, error = process.communicate(timeout=10)
+        assert process.returncode == 0, error
+        assert output == b"x" * 80000
     finally:
         os.close(master)
         os.close(slave)
