@@ -97,6 +97,7 @@ from omnigent.util.reasoning_effort import (
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .async_utils import run_sync_on_thread
+from .codex_config_sync import sync_codex_config
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
 from .codex_staging import (
@@ -1356,7 +1357,8 @@ def _populate_codex_home_config(
       existing private copy keeps its own keys across launches, except the
       lane-owned ``[agents]`` subagent role defaults, which are re-synced
       from the source. On Windows, the source's explicit ``[windows].sandbox``
-      choice is also refreshed.
+      choice is also refreshed. User-level ``codex_config_sync`` can opt into
+      adding a missing non-credential leaf pinned by its approved value digest.
     - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
       available within the private home.
     - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
@@ -1404,11 +1406,20 @@ def _populate_codex_home_config(
             )
         finally:
             probe.close()
-    if not source_dir.is_dir():
-        return
-
     if minimal_config is None:
         minimal_config = codex_minimal_config_requested()
+    config_sync = sync_codex_config(
+        source_dir / "config.toml",
+        target_dir / "config.toml",
+        minimal_config=minimal_config,
+        include_credentials=include_credentials,
+    )
+    if config_sync == "conflict":
+        raise RuntimeError(
+            "Codex config sync conflict; startup stopped to preserve private config"
+        )
+    if not source_dir.is_dir():
+        return
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not include_credentials:
         symlink_files = tuple(
@@ -1534,7 +1545,8 @@ def _populate_codex_home_config(
         if not source_file.is_file():
             continue
         dest_path = target_dir / filename
-        if dest_path.exists() or dest_path.is_symlink():
+        synced_copy = filename == "config.toml" and config_sync == "created"
+        if not synced_copy and (dest_path.exists() or dest_path.is_symlink()):
             if (
                 filename == "config.toml"
                 and not minimal_config
@@ -1560,7 +1572,8 @@ def _populate_codex_home_config(
                     minimal_document[key] = source_config[key]
             dest_path.write_text(tomlkit.dumps(minimal_document))
             continue
-        shutil.copy2(source_file, dest_path)
+        if not synced_copy:
+            shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
             if extend_model_catalog:
