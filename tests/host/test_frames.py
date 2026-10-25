@@ -40,6 +40,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostLoadLinesFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -72,6 +73,7 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     ImportLocalSessionChunkAssembler,
     ImportSessionChunkingUnsupportedError,
+    LoadLevelReport,
     ResourceMachine,
     ResourceProcessRow,
     classify_launch_refusal,
@@ -1392,6 +1394,12 @@ def test_resource_snapshot_frame_round_trip() -> None:
             disk_used=100,
             disk_total=200,
             load1=1.25,
+            cpu_count=24,
+            load_per_core=0.5,
+            swap_used=10,
+            swap_total=20,
+            load_equiv=12.0,
+            estimate=True,
         ),
         processes=[
             ResourceProcessRow(
@@ -1427,6 +1435,7 @@ def test_resource_snapshot_frame_round_trip() -> None:
         runner_count=1,
         sampler_cpu_ms=0.5,
         monitor_rss_delta=4096,
+        load_level=LoadLevelReport("normal", None, "2026-10-25T00:00:00+00:00", 4, 5, None),
     )
 
     decoded = decode_host_frame(encode_host_frame(original))
@@ -3189,4 +3198,13 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                     "had_connected": invalid,
                 }
             )
+        )
+
+
+def test_load_lines_frame_round_trip_and_validation() -> None:
+    frame = HostLoadLinesFrame(4, 5, 90, 2)
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            '{"kind":"host.load_lines","heavy":5,"new_session":4,"mem_pct":90,"revision":1}'
         )

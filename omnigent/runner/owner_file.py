@@ -16,7 +16,6 @@ import contextlib
 import json
 import logging
 import os
-import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +24,7 @@ from typing import Literal
 import psutil
 
 from omnigent.process_logging import data_dir
+from omnigent.util.atomic_json import atomic_write_json
 
 _logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ def write_owner_entry(*, pid: int, conversation_id: str, kind: OwnerKind) -> Non
                     "kind": kind,
                 }
             )
-            _atomic_write_json(
+            atomic_write_json(
                 path,
                 {
                     "runner_pid": os.getpid(),
@@ -187,16 +187,3 @@ def _process_is_live(pid: object, create_time: object) -> bool:
         return abs(process.create_time() - float(create_time)) < _CREATE_TIME_TOLERANCE_S
     except (psutil.Error, OSError, ValueError):
         return False
-
-
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
