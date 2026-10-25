@@ -31,6 +31,28 @@ from tests.harnesses.codex_native.app_server._support import (
 )
 
 
+async def test_native_start_pins_the_app_server_and_remote_tui_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as module
+
+    _disable_codex_startup_rpc(monkeypatch)
+    version = AsyncMock(return_value=(0, 164, 0))
+    monkeypatch.setattr(module, "_codex_cli_version", version)
+    select = Mock(return_value=sys.executable)
+    monkeypatch.setattr(module, "snapshot_codex_binary", select)
+    server = _test_app_server(tmp_path, tmp_path / "home", tmp_path / "bridge", tmp_path)
+    server.codex_path = "/opt/work/omnigent/fork/example/codex-launcher"
+    try:
+        await server.start()
+        select.assert_called_once_with("/opt/work/omnigent/fork/example/codex-launcher")
+        version.assert_awaited_once_with(sys.executable)
+        assert server.codex_path == sys.executable
+        assert server.proc is not None
+    finally:
+        await server.close()
+
+
 @pytest.mark.parametrize("inheritance_fails", [False, True])
 @pytest.mark.parametrize("close_timing", ["before_start", "during_start"])
 async def test_start_reuses_initialized_readiness_client_for_hook_trust(

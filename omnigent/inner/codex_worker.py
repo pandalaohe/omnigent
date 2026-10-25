@@ -7,6 +7,7 @@ from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .codex_binary import codex_binary_read_root
 from .datamodel import OSEnvSpec
 from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .model_signer import SignerReadiness
@@ -74,7 +75,7 @@ def prepare_codex_catalog_probe(
     if not policy.active:
         raise OSError("brokered Codex catalog probe requires an active sandbox")
 
-    codex_dir = Path(codex_path).resolve(strict=False).parent
+    codex_dir = codex_binary_read_root(codex_path)
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
     policy = with_additional_write_roots(policy, [codex_home])
     policy = replace(
@@ -136,7 +137,7 @@ def prepare_codex_worker(
     if egress_rules and worker_env is None:
         raise ValueError("egress-filtered Codex worker requires an owned worker environment")
 
-    codex_dir = Path(codex_path).resolve(strict=False).parent
+    codex_dir = codex_binary_read_root(codex_path)
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
     if skills_dir is not None:
         policy = with_additional_read_roots(policy, [skills_dir])

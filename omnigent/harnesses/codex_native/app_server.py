@@ -90,6 +90,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     report_capture_start_failure,
 )
 from omnigent.inner import _proc
+from omnigent.inner.codex_binary import snapshot_codex_binary
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     CODEX_AGENT_PID_CONFIG_KEY,
@@ -2275,6 +2276,7 @@ class CodexNativeAppServer:
         :raises OmnigentError: ``WORKSPACE_MISSING`` when the session's working
             directory was removed, e.g. a deleted git worktree.
         """
+        self.codex_path = await asyncio.to_thread(snapshot_codex_binary, self.codex_path)
         if not self.cwd.is_dir():
             # Spawning in it would only fail with a bare ENOENT; name the cause.
             raise OmnigentError(

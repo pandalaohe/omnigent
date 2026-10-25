@@ -111,13 +111,17 @@ def test_active_sandbox_preflights_before_creating_launcher(
     create_launcher.assert_not_called()
 
 
+@pytest.mark.parametrize("snapshot", [False, True])
 def test_successful_active_sandbox_returns_owned_launcher(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    snapshot: bool,
 ) -> None:
     codex = tmp_path / "bin" / "codex"
     codex.parent.mkdir()
     codex.touch()
+    if snapshot:
+        (tmp_path / ".omnigent-snapshot.json").write_text("{}")
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     launcher = tmp_path / "launcher"
@@ -151,7 +155,7 @@ def test_successful_active_sandbox_returns_owned_launcher(
     assert codex_home.resolve() in captured["policy"].write_roots
     read_roots = captured["policy"].read_roots
     assert read_roots is not None
-    assert codex.resolve().parent in read_roots
+    assert (tmp_path.resolve() if snapshot else codex.resolve().parent) in read_roots
     assert captured["policy"].spawn_env_allowlist == ["CODEX_HOME", "PATH"]
     assert captured["policy"].allow_network
 

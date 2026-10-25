@@ -71,6 +71,7 @@ from omnigent.harnesses.codex_native.side_chat import (
     is_keep_warm_fork as _is_keep_warm_fork,
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.codex_binary import snapshot_codex_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
 from omnigent.models.codex_model_vocabulary import (
@@ -3228,6 +3229,7 @@ class _CodexAppServerSession:
     async def _start_unchecked(self) -> None:
         if self._started:
             return
+        self._codex_path = await asyncio.to_thread(snapshot_codex_binary, self._codex_path)
         cleanup_task = self._cleanup_task
         if cleanup_task is not None and not cleanup_task.done():
             await asyncio.shield(cleanup_task)
@@ -5351,6 +5353,7 @@ class _CodexSessionState:
     signature: tuple[str | None, str, str, str] | None = None
     closing: bool = False
     close_task: asyncio.Task[None] | None = None
+    codex_path: str | None = None
 
 
 class _AppSessionFactory(Protocol):
@@ -5977,7 +5980,7 @@ class CodexExecutor(Executor):
             # Another waiter may have registered a replacement during cleanup.
             state = self._session_states.setdefault(session_key, _CodexSessionState())
         app_session = self._app_session_factory(
-            codex_path=self._codex_path,
+            codex_path=state.codex_path or self._codex_path,
             cwd=effective_cwd,
             env=self._env,
             tool_executor=self._tool_executor,
@@ -6004,9 +6007,12 @@ class CodexExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
-        binary_identity = _codex_binary_identity(self._codex_path)
         session_key = _session_key(messages)
         state = self._session_states.get(session_key) or _CodexSessionState()
+        if state.codex_path is None:
+            await claim_startup_boundary("executor_prepare")
+            state.codex_path = await asyncio.to_thread(snapshot_codex_binary, self._codex_path)
+        binary_identity = _codex_binary_identity(state.codex_path)
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
         # On the cli-config path (model_provider_override set) the codex binary
@@ -6052,8 +6058,8 @@ class CodexExecutor(Executor):
             binary_identity is None or binary_identity != self._brokered_version_identity
         ):
             # This probe precedes app-session construction and any signer or worker start.
-            await _require_brokered_codex_version(self._codex_path)
-            validated_identity = _codex_binary_identity(self._codex_path)
+            await _require_brokered_codex_version(state.codex_path)
+            validated_identity = _codex_binary_identity(state.codex_path)
             if binary_identity is not None and validated_identity != binary_identity:
                 raise RuntimeError("Codex executable changed during brokered version validation")
             self._brokered_version_identity = validated_identity
