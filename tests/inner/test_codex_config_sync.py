@@ -203,6 +203,71 @@ def test_minimal_probe_keeps_its_narrow_copy(homes: tuple[Path, Path]) -> None:
     assert tomllib.loads((target / "config.toml").read_text()) == {}
 
 
+@pytest.mark.parametrize("signer", [False, True])
+def test_stance_refresh_without_pins_tracks_source_and_removes_stale_keys(
+    homes: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, signer: bool
+) -> None:
+    source, target = homes
+    monkeypatch.setattr(codex_config_sync, "load_global_config", dict)
+    path = target / "config.toml"
+    path.write_text(
+        'model = "session"\napproval_policy = "never"\n'
+        'sandbox_mode = "danger-full-access"\ndefault_permissions = ":danger-full-access"\n'
+    )
+    (source / "config.toml").write_text(
+        'approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n'
+        'approvals_reviewer = "auto_review"\n'
+    )
+    for _restart in range(2):
+        _populate_codex_home_config(
+            target, source, minimal_config=signer, include_credentials=not signer
+        )
+        assert tomllib.loads(path.read_text()) == {
+            "model": "session",
+            "approval_policy": "on-request",
+            "sandbox_mode": "workspace-write",
+            "approvals_reviewer": "auto_review",
+        }
+    (source / "config.toml").write_text('default_permissions = ":workspace"\n')
+    _populate_codex_home_config(
+        target, source, minimal_config=signer, include_credentials=not signer
+    )
+    assert tomllib.loads(path.read_text()) == {
+        "model": "session",
+        "default_permissions": ":workspace",
+    }
+
+
+@pytest.mark.parametrize(
+    "conflict", ["invalid_pin", "source_policy", "target_policy", "missing_source"]
+)
+def test_policy_conflict_does_not_block_permission_refresh(
+    homes: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, conflict: str
+) -> None:
+    source, target = homes
+    source_path, target_path = source / "config.toml", target / "config.toml"
+    source_path.write_text('approvals_reviewer = "auto_review"\n' + _SOURCE)
+    target_path.write_text(
+        'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
+        '[auto_review]\nextra_policy = "different"\n'
+    )
+    if conflict == "invalid_pin":
+        monkeypatch.setattr(
+            codex_config_sync,
+            "load_global_config",
+            lambda: {"codex_config_sync": {"auto_review.extra_policy": "invalid"}},
+        )
+    elif conflict == "source_policy":
+        source_path.write_text('approvals_reviewer = "auto_review"\n')
+    elif conflict == "missing_source":
+        source_path.unlink()
+    _populate_codex_home_config(target, source)
+    assert tomllib.loads(target_path.read_text()) == {
+        **({"approvals_reviewer": "auto_review"} if conflict != "missing_source" else {}),
+        "auto_review": {"extra_policy": "different"},
+    }
+
+
 def test_windows_sandbox_still_refreshes(
     homes: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

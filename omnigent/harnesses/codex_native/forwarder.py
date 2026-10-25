@@ -927,6 +927,10 @@ class _CodexForwarderState:
         self._note_model_fields(result)
         self._note_service_tier(result)
         self._note_approval_mode_fields(result)
+        # Subscription observes resolved defaults; it is not a user choice.
+        # Keep the preset visible without pinning config-derived launch args.
+        if self.terminal_launch_args is not None:
+            self.posted_terminal_launch_args = list(self.terminal_launch_args)
         # Do NOT seed ``posted_model`` here. Omnigent must learn the session's
         # ACTUAL model — including the spawn default — because the cost-budget
         # gate resolves the model as ``conv.model_override or spec.llm.model``,
@@ -4518,7 +4522,7 @@ async def _sync_codex_approval_mode_change(
     if not args_changed and not preset_changed:
         return
     data: _JsonObject = {}
-    if args is not None:
+    if args_changed:
         data["terminal_launch_args"] = args
     if preset is not None:
         data["approval_mode"] = preset

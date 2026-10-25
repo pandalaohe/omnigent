@@ -1356,7 +1356,8 @@ def _populate_codex_home_config(
       are inherited through the app-server RPC after initialization. An
       existing private copy keeps its own keys across launches, except the
       lane-owned ``[agents]`` subagent role defaults, which are re-synced
-      from the source. On Windows, the source's explicit ``[windows].sandbox``
+      from the source. Permission defaults also mirror the source on every
+      start. On Windows, the source's explicit ``[windows].sandbox``
       choice is also refreshed. User-level ``codex_config_sync`` can opt into
       adding a missing non-credential leaf pinned by its approved value digest.
     - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
