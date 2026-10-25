@@ -1414,10 +1414,6 @@ def _populate_codex_home_config(
         minimal_config=minimal_config,
         include_credentials=include_credentials,
     )
-    if config_sync == "conflict":
-        raise RuntimeError(
-            "Codex config sync conflict; startup stopped to preserve private config"
-        )
     if not source_dir.is_dir():
         return
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES

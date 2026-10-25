@@ -20,22 +20,30 @@ Currently, `auto_review.extra_policy` is the supported leaf. On the next private
 app-server start, a matching source value is inserted if missing; an equal target
 value remains untouched. A different target value, a top-level replacement
 `auto_review.policy`, invalid configuration, a symlink, or an observed concurrent
-file change produces `Codex config sync conflict` in the owning process's logs
-and stops startup before subsequent configuration writers, preserving the private
-configuration. `SOURCE_POLICY_MISSING` identifies a
+file change produces `Codex config sync conflict` with a reason code in the
+owning process's logs and skips the optional refresh. The sync leaves the target
+untouched; the existing startup configuration steps continue, including lane
+role defaults, Windows sandbox refresh, and generated provider configuration.
+`SOURCE_POLICY_MISSING` identifies a
 source without the leaf; `SOURCE_POLICY_MISMATCH` identifies an unapproved value.
 Configuration contents are excluded from these messages.
 
 Signer-backed user sessions receive this non-credential leaf separately, without
 copying host provider credentials. Minimal model probes and title workers skip
-the refresh. Ordinary fresh sessions retain their complete-copy behavior after
-source validation; existing homes keep unrelated configuration and formatting.
+the refresh. Ordinary fresh sessions retain their pre-existing complete-copy
+behavior, including after an optional sync conflict. A copied source value is
+part of that initial configuration, not an incremental policy migration. Existing
+homes keep their policy values while the original startup writers still update
+their own settings. Source deletion or edits do not introduce a sync startup gate.
 New or updated files use mode 0600 where the platform supports Unix modes.
 
 Writes use a temporary file and atomic publication, with source and target
 revisions checked immediately before publication. This detects changes during
 preparation, but does not lock out external editors. Failed preparations remove
-their temporary files. Existing app-servers are not hot-reloaded or restarted.
+their temporary files. After a detected concurrent change, subsequent startup
+writers read the current configuration as before. An unparseable target retains
+the existing writers' parse-error behavior; sync adds no startup exception.
+Existing app-servers are not hot-reloaded or restarted.
 File refresh does not attest reviewer loading or override Codex's profile, CLI,
 project, or managed configuration precedence.
 

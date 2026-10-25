@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import stat
-from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -98,8 +97,7 @@ def test_populate_conflicts_keep_the_file_and_do_not_log_config(
         source_path.write_text(source_text)
     target_path.write_text(target_text)
     before = target_path.stat()
-    with pytest.raises(RuntimeError, match="Codex config sync conflict"):
-        _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source)
     assert target_path.read_text() == target_text
     assert target_path.stat() == before
     assert reason in caplog.text
@@ -117,8 +115,7 @@ def test_symlink_is_not_read_or_replaced(
     path = (source if linked == "source" else target) / "config.toml"
     path.unlink(missing_ok=True)
     path.symlink_to(outside)
-    with pytest.raises(RuntimeError, match="Codex config sync conflict"):
-        _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source)
     assert path.is_symlink()
     assert outside.read_text() == _SOURCE
     assert "UNSAFE_FILE" in caplog.text
@@ -142,8 +139,7 @@ def test_change_during_preparation_aborts_without_overwriting(
         path.write_text(concurrent)
 
     monkeypatch.setattr(codex_config_sync.os, "fsync", change_during_flush)
-    with pytest.raises(RuntimeError, match="Codex config sync conflict"):
-        _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source)
     assert target_path.read_text() == (_PRIVATE if changed == "source" else concurrent)
     assert "conflict" in caplog.text
     assert sorted(p.name for p in target.iterdir()) == ["config.toml"]
@@ -160,8 +156,7 @@ def test_atomic_write_failure_keeps_original(
         raise OSError("DO_NOT_LOG")
 
     monkeypatch.setattr(codex_config_sync.os, "replace", fail_replace)
-    with pytest.raises(RuntimeError, match="Codex config sync conflict"):
-        _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source)
     assert target_path.read_text() == _PRIVATE
     assert sorted(p.name for p in target.iterdir()) == ["config.toml"]
     assert "conflict" in caplog.text
@@ -183,10 +178,7 @@ def test_missing_pins_do_not_migrate_and_invalid_pins_conflict(
     monkeypatch.setattr(
         codex_config_sync, "load_global_config", lambda: {"codex_config_sync": pins}
     )
-    with (
-        pytest.raises(RuntimeError, match="Codex config sync conflict") if pins else nullcontext()
-    ):
-        _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source)
     assert path.read_text() == _PRIVATE
     assert ("INVALID_SYNC_CONFIG" in caplog.text) == bool(pins)
 
@@ -254,9 +246,9 @@ def test_hash_covers_toml_value_including_trailing_newline(
 ) -> None:
     source, target = homes
     (source / "config.toml").write_text('[auto_review]\nextra_policy = """\nabc\n"""\n')
-    with pytest.raises(RuntimeError, match="Codex config sync conflict"):
-        _populate_codex_home_config(target, source)
-    assert not (target / "config.toml").exists()
+    (target / "config.toml").write_text(_PRIVATE)
+    _populate_codex_home_config(target, source)
+    assert (target / "config.toml").read_text() == _PRIVATE
     assert "SOURCE_POLICY_MISMATCH" in caplog.text
 
 
@@ -284,68 +276,184 @@ def test_bad_deployment_yaml_is_sanitized(
         raise yaml.YAMLError("DO_NOT_LOG")
 
     monkeypatch.setattr(codex_config_sync, "load_global_config", fail_load)
-    with pytest.raises(RuntimeError, match="Codex config sync conflict"):
-        _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source)
     assert path.read_text() == _PRIVATE
     assert "YAMLError" in caplog.text
     assert "DO_NOT_LOG" not in caplog.text
 
 
-async def test_native_startup_conflict_stops_before_config_writers(
-    homes: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source_policy", ["abc", "changed", None])
+async def test_native_startup_conflict_keeps_existing_initialization(
+    homes: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_policy: str | None,
 ) -> None:
     from unittest.mock import AsyncMock, Mock
 
     from omnigent.harnesses.codex_native import app_server
-    from tests.harnesses.codex_native.app_server._support import _test_app_server
+    from tests.harnesses.codex_native.app_server._support import (
+        _disable_codex_startup_rpc,
+        _test_app_server,
+    )
 
     source, target = homes
+    (source / "config.toml").write_text(
+        _SOURCE.replace('"abc"', f'"{source_policy}"') if source_policy is not None else _PRIVATE
+    )
     path = target / "config.toml"
     content = _PRIVATE + '[auto_review]\nextra_policy = "different"\n'
     path.write_text(content)
     monkeypatch.setenv("CODEX_HOME", str(source))
     monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=(0, 147, 0)))
     monkeypatch.setattr(app_server.CodexNativeAppServer, "_populate_context_catalog", AsyncMock())
-    materialize = Mock(side_effect=AssertionError("later config writer reached"))
+    materialize = Mock(wraps=app_server.materialize_codex_provider_config)
     monkeypatch.setattr(app_server, "materialize_codex_provider_config", materialize)
+    _disable_codex_startup_rpc(monkeypatch)
     server = _test_app_server(tmp_path, target, tmp_path / "bridge", tmp_path)
     try:
-        with pytest.raises(RuntimeError, match="Codex config sync conflict"):
-            await server.start()
-        materialize.assert_not_called()
-        assert path.read_text() == content
-        assert server.proc is None
+        await server.start()
+        materialize.assert_called_once()
+        assert tomllib.loads(path.read_text())["auto_review"]["extra_policy"] == "different"
+        assert server.proc is not None
     finally:
         await server.close()
 
 
-async def test_signer_startup_conflict_stops_before_config_writers(
-    homes: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source_policy", ["unapproved", None])
+async def test_signer_startup_conflict_keeps_existing_initialization(
+    homes: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_policy: str | None,
 ) -> None:
-    from unittest.mock import Mock
+    from unittest.mock import AsyncMock, Mock
 
     from omnigent.inner import codex_executor
-    from tests.inner.test_model_signer_lifecycle import _Signer
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+    from tests.inner.test_codex_executor import _FakeProcess
+    from tests.inner.test_model_signer_lifecycle import _Pipe, _Signer
 
     source, _ = homes
     source_config = source / "config.toml"
-    content = _SOURCE.replace('"abc"', '"unapproved"')
+    content = (
+        _SOURCE.replace('"abc"', f'"{source_policy}"') if source_policy is not None else _PRIVATE
+    )
     source_config.write_text(content)
     monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: source)
     monkeypatch.setattr(codex_executor, "codex_home_staging_root", lambda: tmp_path)
-    materialize = Mock(side_effect=AssertionError("later config writer reached"))
+    materialize = Mock(wraps=codex_executor.materialize_codex_provider_config)
     monkeypatch.setattr(codex_executor, "materialize_codex_provider_config", materialize)
+    monkeypatch.setattr(
+        codex_executor,
+        "prepare_codex_worker",
+        lambda **kwargs: CodexWorkerLaunch("/bin/echo", sandboxed=True),
+    )
+    process = _FakeProcess()
+    process.stdout = _Pipe()
+    process.stderr = _Pipe()
+    monkeypatch.setattr(codex_executor, "_create_subprocess_exec", AsyncMock(return_value=process))
     signer = _Signer([])
     session = codex_executor._CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(tmp_path),
         env={},
         tool_executor=None,
+        codex_config_overrides=['model_providers.fixture.base_url="https://example.test/v1"'],
         signer_factory=lambda: signer,
     )
-    with pytest.raises(RuntimeError, match="Codex config sync conflict"):
+    session._request = AsyncMock(return_value={"result": {}})
+    try:
         await session.start()
-    materialize.assert_not_called()
+        materialize.assert_called_once()
+        assert session._started
+        assert not signer.closed
+        assert session._codex_home_dir is not None
+        data = tomllib.loads((session._codex_home_dir / "config.toml").read_text())
+        assert "auto_review" not in data
+        assert data["model_providers"]["fixture"]["base_url"] == "https://example.test/v1"
+    finally:
+        await session.close()
     assert signer.closed
-    assert session._proc is None
     assert source_config.read_text() == content
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "source_missing",
+        "source_mismatch",
+        "target_different",
+        "replacement",
+        "symlink",
+        "concurrent",
+        "invalid_config",
+        "target_invalid",
+    ],
+)
+def test_conflict_keeps_base_role_and_windows_refresh(
+    homes: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source, target = homes
+    source_path, target_path = source / "config.toml", target / "config.toml"
+    routing = 'windows.sandbox = "unelevated"\n[agents]\ndefault_subagent_model = "host-role"\n'
+    source_path.write_text(routing + '[auto_review]\nextra_policy = "abc"\n')
+    private = (
+        _PRIVATE
+        + 'windows.sandbox = "disabled"\n[agents]\ndefault_subagent_model = "private-role"\n'
+    )
+    target_path.write_text(private + '[auto_review]\nextra_policy = "private"\n')
+    monkeypatch.setattr("omnigent.inner.codex_executor.sys.platform", "win32")
+    if conflict == "source_missing":
+        source_path.write_text(routing)
+    elif conflict == "source_mismatch":
+        source_path.write_text(routing + '[auto_review]\nextra_policy = "changed"\n')
+    elif conflict == "replacement":
+        target_path.write_text(private + '[auto_review]\npolicy = "replacement"\n')
+    elif conflict == "symlink":
+        linked = tmp_path / "linked-source.toml"
+        source_path.rename(linked)
+        source_path.symlink_to(linked)
+    elif conflict == "concurrent":
+        target_path.write_text(private)
+
+        def change_during_flush(fd: int) -> None:
+            target_path.write_text(
+                private.replace('"session"', '"concurrent"')
+                + '[auto_review]\nextra_policy = "private"\n'
+            )
+
+        monkeypatch.setattr(codex_config_sync.os, "fsync", change_during_flush)
+    elif conflict == "invalid_config":
+        monkeypatch.setattr(
+            codex_config_sync, "load_global_config", lambda: {"codex_config_sync": "invalid"}
+        )
+    elif conflict == "target_invalid":
+        target_path.write_text('invalid = ["DO_NOT_LOG",\n')
+    _populate_codex_home_config(target, source)
+    assert "Codex config sync conflict" in caplog.text
+    if conflict == "target_invalid":
+        assert target_path.read_text() == 'invalid = ["DO_NOT_LOG",\n'
+    else:
+        data = tomllib.loads(target_path.read_text())
+        assert data["model"] == ("concurrent" if conflict == "concurrent" else "session")
+        assert data["agents"]["default_subagent_model"] == "host-role"
+        assert data["windows"]["sandbox"] == "unelevated"
+        assert data["auto_review"] == (
+            {"policy": "replacement"} if conflict == "replacement" else {"extra_policy": "private"}
+        )
+
+
+def test_fresh_conflict_retains_base_copy_behavior(
+    homes: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    source, target = homes
+    content = _SOURCE.replace('"abc"', '"changed"')
+    (source / "config.toml").write_text(content)
+    _populate_codex_home_config(target, source)
+    assert (target / "config.toml").read_text() == content
+    assert "SOURCE_POLICY_MISMATCH" in caplog.text

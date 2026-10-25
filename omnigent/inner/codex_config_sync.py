@@ -57,7 +57,8 @@ def sync_codex_config(
     Only ``auto_review.extra_policy`` is supported. Missing pins preserve the
     existing bridge behavior. Minimal probes/titles skip refresh; signer-backed
     user sessions receive the leaf independently of host provider credentials.
-    Conflicts leave the target intact and never log configuration contents.
+    Conflicts skip this optional write without blocking the existing bridge or
+    startup writers. Sync diagnostics never log configuration contents.
     """
     if minimal_config and include_credentials:
         return None
@@ -152,5 +153,5 @@ def sync_codex_config(
     ) as exc:
         # Parser/I/O errors can contain provider values; expose only their type.
         reason = str(exc) if type(exc) is ValueError else type(exc).__name__
-        _logger.warning("Codex config sync conflict: %s; keeping private config", reason)
+        _logger.warning("Codex config sync conflict: %s; skipping optional refresh", reason)
         return "conflict"
