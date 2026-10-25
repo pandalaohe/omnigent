@@ -1491,6 +1491,7 @@ async def _send_hello(
         CAP_FILESYSTEM_ATTACHMENTS,
         CAP_PATH_ATTACHMENTS,
     )
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 
     await send_text(
         encode_frame(
@@ -1503,6 +1504,8 @@ async def _send_hello(
                     SDK_PEER_CAPABILITY,
                     *([CLAUDE_SDK_PEER_CAPABILITY] if claude_peer_receipts_supported() else []),
                     CAP_MCP_REGISTRY,
+                    # The aggregate route is registered by create_runner_app itself.
+                    CONTEXT_INVENTORY_V2,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

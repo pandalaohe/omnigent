@@ -35,7 +35,16 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PATH_ATTACHMENTS,
 )
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import (
+    CONTEXT_INVENTORY_MAX_BYTES,
+    CONTEXT_INVENTORY_V2,
+    ContextAuthorityV2,
+    ContextEvidenceV2,
+    SourceEvidenceV2,
+    StartupAttemptRef,
+    UnresolvedContextV2,
+    host_context_scope_v2,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -83,7 +92,6 @@ CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
 CAP_KEEP_WARM = "keep_warm_v1"
 CAP_WORKTREE_SAFE_ARCHIVE = "worktree_safe_archive_v1"
 CAP_WORKTREE_ARCHIVE_CONTENT = "worktree_archive_content_v1"
-
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
@@ -101,6 +109,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_RESOURCE_SNAPSHOT,
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
+    CONTEXT_INVENTORY_V2,
 ]
 
 
@@ -206,6 +215,8 @@ class HostFrameKind(str, Enum):
     MCP_SERVERS_RESULT = "host.mcp_servers_result"
     OWNER_INVENTORY = "host.owner_inventory"
     OWNER_INVENTORY_RESULT = "host.owner_inventory_result"
+    CONTEXT_INVENTORY_V2 = "host.context_inventory_v2"
+    CONTEXT_INVENTORY_V2_RESULT = "host.context_inventory_v2_result"
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
@@ -1427,10 +1438,34 @@ class HostOwnerInventoryFrame:
 
 
 @dataclass
+class HostContextInventoryV2Frame:
+    """Server → host: read one session's owned membership at evidence version 2."""
+
+    request_id: str
+    connection_id: str
+    host_generation: str
+    read_id: str
+    session_id: str
+
+
+@dataclass
 class HostOwnerInventoryResultFrame:
     request_id: str
     connection_id: str
     host_generation: str
+    inventory: HostOwnerInventorySnapshot | None = None
+
+
+@dataclass
+class HostContextInventoryV2ResultFrame:
+    """Host → server: owned membership plus a v2 envelope that names its own gaps."""
+
+    request_id: str
+    connection_id: str
+    host_generation: str
+    read_id: str
+    session_id: str
+    evidence: dict[str, Any] | None = None
     inventory: HostOwnerInventorySnapshot | None = None
 
 
@@ -1743,6 +1778,8 @@ HostFrame = (
     | HostMcpServersResultFrame
     | HostOwnerInventoryFrame
     | HostOwnerInventoryResultFrame
+    | HostContextInventoryV2Frame
+    | HostContextInventoryV2ResultFrame
     | HostImportLocalFrame
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
@@ -2344,6 +2381,12 @@ def encode_host_frame(frame: HostFrame) -> str:
         return _encode_payload(
             {"kind": HostFrameKind.OWNER_INVENTORY_RESULT.value, **asdict(frame)}
         )
+    if isinstance(frame, HostContextInventoryV2Frame):
+        return _encode_payload({"kind": HostFrameKind.CONTEXT_INVENTORY_V2.value, **asdict(frame)})
+    if isinstance(frame, HostContextInventoryV2ResultFrame):
+        return _encode_payload(
+            {"kind": HostFrameKind.CONTEXT_INVENTORY_V2_RESULT.value, **asdict(frame)}
+        )
     if isinstance(frame, HostMcpServersResultFrame):
         return _encode_payload(
             {
@@ -2653,8 +2696,20 @@ def decode_host_frame(text: str) -> HostFrame:
     :raises ValueError: On malformed JSON, missing ``kind``, unknown
         kind, or missing required fields.
     """
+    lexical_kind, evidence_span, evidence_over_budget = _scan_context_inventory_v2_wire(text)
+    if lexical_kind in _CONTEXT_INVENTORY_V2_VALUES and evidence_over_budget:
+        # Every evidence copy is bounded before parsing; v1 keeps last-kind semantics.
+        raise ValueError("context inventory evidence exceeds its wire byte budget")
     msg = _parse_frame_object(text)
     kind = _parse_host_frame_kind(msg)
+    if kind in _CONTEXT_INVENTORY_V2_KINDS:
+        return _decode_known_host_frame(
+            kind,
+            msg,
+            context_inventory_wire_sound=_context_inventory_v2_wire_is_sound(
+                text, lexical_kind, evidence_span, msg
+            ),
+        )
     return _decode_known_host_frame(kind, msg)
 
 
@@ -2672,6 +2727,169 @@ def _parse_frame_object(text: str) -> _JsonObject:
     if not isinstance(msg, dict):
         raise ValueError(f"frame must be a JSON object, got {type(msg).__name__}")
     return msg
+
+
+_CONTEXT_INVENTORY_V2_KINDS = frozenset(
+    {HostFrameKind.CONTEXT_INVENTORY_V2, HostFrameKind.CONTEXT_INVENTORY_V2_RESULT}
+)
+_CONTEXT_INVENTORY_V2_VALUES = frozenset(kind.value for kind in _CONTEXT_INVENTORY_V2_KINDS)
+
+
+def _skip_json_string(text: str, start: int) -> int:
+    """Return the index just past the string that opens at *start*, or -1."""
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == '"':
+            return index + 1
+        index += 1
+    return -1
+
+
+def _lexical_string_value(text: str, start: int) -> tuple[str | None, int]:
+    """Decode one JSON string token; never the enclosing document."""
+    end = _skip_json_string(text, start)
+    if end < 0:
+        return None, -1
+    try:
+        return json.loads(text[start:end]), end
+    except ValueError:
+        return None, -1
+
+
+def _lexical_value_end(text: str, start: int) -> int | None:
+    """End index of the JSON value at *start*, measured without building it."""
+    if start >= len(text):
+        return None
+    if text[start] == '"':
+        end = _skip_json_string(text, start)
+        return end if end >= 0 else None
+    if text[start] in "[{":
+        depth = 0
+        index = start
+        while index < len(text):
+            char = text[index]
+            if char == '"':
+                index = _skip_json_string(text, index)
+                if index < 0:
+                    return None
+                continue
+            if char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+            index += 1
+        return None
+    index = start
+    while index < len(text) and text[index] not in ",}] \t\r\n":
+        index += 1
+    return index
+
+
+def _scan_context_inventory_v2_wire(
+    text: str,
+) -> tuple[str | None, tuple[int, int] | None, bool]:
+    """Find the last top-level kind/span and bound every evidence value lexically.
+
+    Nothing outside a small key/kind string is decoded, so an oversized evidence
+    value is never built as an object before its budget is judged.
+    """
+    depth = 0
+    index = 0
+    kind: str | None = None
+    evidence_span: tuple[int, int] | None = None
+    evidence_over_budget = False
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            end = _skip_json_string(text, index)
+            if end < 0:
+                return kind, evidence_span, evidence_over_budget
+            if depth == 1:
+                name, _ = _lexical_string_value(text, index)
+                cursor = end
+                while cursor < len(text) and text[cursor].isspace():
+                    cursor += 1
+                if cursor < len(text) and text[cursor] == ":":
+                    cursor += 1
+                    while cursor < len(text) and text[cursor].isspace():
+                        cursor += 1
+                    value_end = _lexical_value_end(text, cursor)
+                    if value_end is not None:
+                        if name == "kind":
+                            kind = (
+                                _lexical_string_value(text, cursor)[0]
+                                if cursor < len(text) and text[cursor] == '"'
+                                else None
+                            )
+                        elif name == "evidence":
+                            evidence_span = (cursor, value_end)
+                            evidence_over_budget = evidence_over_budget or _utf8_size_exceeds(
+                                text, evidence_span, CONTEXT_INVENTORY_MAX_BYTES
+                            )
+                        index = value_end
+                        continue
+            index = end
+            continue
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        index += 1
+    return kind, evidence_span, evidence_over_budget
+
+
+def _utf8_size_exceeds(text: str, span: tuple[int, int], limit: int) -> bool:
+    """Whether the span's UTF-8 size passes *limit*, without copying it."""
+    start, end = span
+    total = 0
+    for index in range(start, end):
+        code = ord(text[index])
+        total += 1 if code < 0x80 else 2 if code < 0x800 else 3 if code < 0x10000 else 4
+        if total > limit:
+            return True
+    return False
+
+
+def _has_repeated_json_fields(text: str) -> bool:
+    """Whether the frame repeats any member, which ``json.loads`` would collapse."""
+    repeated: list[str] = []
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        seen: set[str] = set()
+        for key, _value in pairs:
+            if key in seen:
+                repeated.append(key)
+            seen.add(key)
+        return dict(pairs)
+
+    json.loads(text, object_pairs_hook=unique_object)
+    return bool(repeated)
+
+
+def _context_inventory_v2_wire_is_sound(
+    text: str,
+    lexical_kind: str | None,
+    evidence_span: tuple[int, int] | None,
+    msg: _JsonObject,
+) -> bool:
+    """Judge the raw v2 payload after the parse, without trusting a rebuilt value.
+
+    The byte budget itself was already applied lexically, before this parse. What
+    remains here is ambiguity: the lexical kind must agree with the parsed one, a
+    parsed evidence member must have had a locateable span, and no member may
+    repeat anywhere in the document.
+    """
+    if lexical_kind != msg.get("kind"):
+        return False
+    if "evidence" in msg and evidence_span is None:
+        return False
+    return not _has_repeated_json_fields(text)
 
 
 def _parse_host_frame_kind(msg: _JsonObject) -> HostFrameKind:
@@ -2693,6 +2911,8 @@ def _parse_host_frame_kind(msg: _JsonObject) -> HostFrameKind:
 def _decode_known_host_frame(
     kind: HostFrameKind,
     msg: _JsonObject,
+    *,
+    context_inventory_wire_sound: bool = True,
 ) -> HostFrame:
     """Decode a host frame with a validated kind.
 
@@ -2853,6 +3073,20 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.OWNER_INVENTORY_RESULT:
             return _decode_owner_inventory_result(msg)
+        case HostFrameKind.CONTEXT_INVENTORY_V2:
+            if not context_inventory_wire_sound:
+                raise ValueError("context inventory request is not unambiguous on the wire")
+            return HostContextInventoryV2Frame(
+                request_id=_required_str(msg, "request_id"),
+                connection_id=_required_str(msg, "connection_id"),
+                host_generation=_required_str(msg, "host_generation"),
+                read_id=_required_str(msg, "read_id"),
+                session_id=_required_str(msg, "session_id"),
+            )
+        case HostFrameKind.CONTEXT_INVENTORY_V2_RESULT:
+            return _decode_context_inventory_v2_result(
+                msg, wire_sound=context_inventory_wire_sound
+            )
         case HostFrameKind.PLUGINS:
             return HostPluginsFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.PLUGINS_RESULT:
@@ -3604,7 +3838,8 @@ _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
 _MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id")
 
 
-def _decode_owner_inventory_result(msg: _JsonObject) -> HostOwnerInventoryResultFrame:
+def _decode_owner_inventory_snapshot(msg: _JsonObject) -> HostOwnerInventorySnapshot | None:
+    """Strict copied-registration snapshot; anything unexpected stays unknown."""
     inventory = None
     raw = msg.get("inventory")
     try:
@@ -3633,11 +3868,92 @@ def _decode_owner_inventory_result(msg: _JsonObject) -> HostOwnerInventoryResult
                 inventory = candidate
     except ValueError:
         pass
+    return inventory
+
+
+def _decode_owner_inventory_result(msg: _JsonObject) -> HostOwnerInventoryResultFrame:
     return HostOwnerInventoryResultFrame(
         _required_str(msg, "request_id"),
         _required_str(msg, "connection_id"),
         _required_str(msg, "host_generation"),
-        inventory,
+        _decode_owner_inventory_snapshot(msg),
+    )
+
+
+def _decode_context_inventory_v2_result(
+    msg: _JsonObject, *, wire_sound: bool = True
+) -> HostContextInventoryV2ResultFrame:
+    """Keep a v2 body only when it is closed, belongs to this read and this session."""
+    read_id = _required_str(msg, "read_id")
+    session_id = _required_str(msg, "session_id")
+    evidence = None
+    raw = msg.get("evidence")
+    if wire_sound and isinstance(raw, dict):
+        try:
+            candidate = ContextEvidenceV2.model_validate_json(json.dumps(raw), strict=True)
+        except (ValidationError, ValueError):
+            candidate = None
+        if (
+            candidate is not None
+            and candidate.wire_version == 2
+            and candidate.read_id == read_id
+            and candidate.authority.session_id == session_id
+        ):
+            evidence = candidate.model_dump(mode="json")
+    return HostContextInventoryV2ResultFrame(
+        _required_str(msg, "request_id"),
+        _required_str(msg, "connection_id"),
+        _required_str(msg, "host_generation"),
+        read_id,
+        session_id,
+        evidence,
+        _decode_owner_inventory_snapshot(msg) if evidence is not None else None,
+    )
+
+
+_HOST_CONTEXT_INVENTORY_REASON = "host_owns_membership_not_vendor_contexts"
+
+
+def host_context_inventory_evidence_v2(
+    *,
+    read_id: str,
+    session_id: str,
+    host_id: str,
+    connection_id: str,
+    host_generation: str,
+) -> ContextEvidenceV2:
+    """The host's own scope: it owns runner membership, never vendor contexts."""
+    scope = host_context_scope_v2(session_id)
+    return ContextEvidenceV2(
+        wire_version=2,
+        read_id=read_id,
+        authority=ContextAuthorityV2(
+            session_id=session_id,
+            account_id=None,
+            host_id=host_id,
+            host_generation=host_generation,
+            runner_id=None,
+            runner_generation=None,
+            connection_generation=connection_id,
+        ),
+        expected_scopes=(scope,),
+        sources=(
+            SourceEvidenceV2(
+                scope=scope,
+                producer_incarnation=None,
+                coverage="unsupported",
+                contexts=(),
+                unresolved=(
+                    UnresolvedContextV2(candidate=None, reason=_HOST_CONTEXT_INVENTORY_REASON),
+                ),
+                membership_revision=None,
+                context_revision=None,
+                work_revision=None,
+                revision_authority="observation_only",
+                age_upper_bound_s=0.0,
+                work_bindings=None,
+            ),
+        ),
     )
 
 

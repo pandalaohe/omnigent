@@ -9,6 +9,7 @@ from omnigent.entities.session_startup import StartupReceipt
 
 SDK_STARTUP_SOURCES = frozenset({"codex", "claude-sdk"})
 CONTEXT_INVENTORY_V2 = "resident_context_inventory_v2"
+CONTEXT_INVENTORY_CONTRACT_HEADER = "Omnigent-Context-Inventory-Contract"
 CONTEXT_INVENTORY_MAX_BYTES = 1024 * 1024
 
 OpaqueIdV2 = Annotated[str, Field(min_length=1, max_length=256)]
@@ -216,6 +217,27 @@ class ContextEvidenceV2(_ContextValueV2):
 
 def executor_context_scope_v2(session_id: str) -> ScopeKeyV2:
     return ScopeKeyV2(namespace="harness", owner_id=session_id, population="executor_contexts")
+
+
+def native_context_scope_v2(session_id: str) -> ScopeKeyV2:
+    return ScopeKeyV2(namespace="native", owner_id=session_id, population="backend_contexts")
+
+
+def terminal_context_scope_v2(session_id: str) -> ScopeKeyV2:
+    return ScopeKeyV2(namespace="terminal", owner_id=session_id, population="terminal_roles")
+
+
+def host_context_scope_v2(session_id: str) -> ScopeKeyV2:
+    return ScopeKeyV2(namespace="host", owner_id=session_id, population="runner_membership")
+
+
+def session_context_scopes_v2(session_id: str) -> tuple[ScopeKeyV2, ScopeKeyV2, ScopeKeyV2]:
+    """The three owner scopes one runner aggregates for a conversation."""
+    return (
+        executor_context_scope_v2(session_id),
+        native_context_scope_v2(session_id),
+        terminal_context_scope_v2(session_id),
+    )
 
 
 def harness_context_authority_v2(session_id: str) -> ContextAuthorityV2:

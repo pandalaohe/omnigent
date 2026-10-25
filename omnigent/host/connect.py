@@ -78,6 +78,8 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
+    HostContextInventoryV2Frame,
+    HostContextInventoryV2ResultFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -146,6 +148,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    host_context_inventory_evidence_v2,
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
@@ -5729,6 +5732,32 @@ class HostProcess:
                 encode_host_frame(
                     HostOwnerInventoryResultFrame(
                         frame.request_id, frame.connection_id, frame.host_generation, inventory
+                    )
+                ),
+            )
+        elif isinstance(frame, HostContextInventoryV2Frame):
+            evidence = None
+            inventory = None
+            if self._ws is ws and self._startup_generation == frame.connection_id:
+                inventory = self._owner_inventory_snapshot()
+                evidence = host_context_inventory_evidence_v2(
+                    read_id=frame.read_id,
+                    session_id=frame.session_id,
+                    host_id=self._identity.host_id,
+                    connection_id=frame.connection_id,
+                    host_generation=frame.host_generation,
+                ).model_dump(mode="json")
+            await self._send_text(
+                ws,
+                encode_host_frame(
+                    HostContextInventoryV2ResultFrame(
+                        frame.request_id,
+                        frame.connection_id,
+                        frame.host_generation,
+                        frame.read_id,
+                        frame.session_id,
+                        evidence,
+                        inventory,
                     )
                 ),
             )

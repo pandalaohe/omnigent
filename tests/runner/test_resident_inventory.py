@@ -18,6 +18,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _HarnessEndpoint,
     _SubprocessEntry,
 )
+from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
@@ -1162,3 +1163,101 @@ async def test_runner_native_inventory_total_deadline_drains_all_sources(
     ).json()
     assert body["native_thread_ids"] is None and body["harnesses"] is None
     assert drained.is_set()
+
+
+def _v2_evidence(payload, *, session_id: str):
+    from omnigent.startup_protocol import (
+        decode_context_evidence_v2,
+        harness_context_authority_v2,
+        session_context_scopes_v2,
+    )
+
+    return decode_context_evidence_v2(
+        payload,
+        read_id="v2-read",
+        authority=harness_context_authority_v2(session_id),
+        expected_scopes=session_context_scopes_v2(session_id),
+    )
+
+
+async def test_runner_context_inventory_v2_binds_session_scopes(harness_inventory_reader):
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", ExecutorResidentInventory(owners=()))
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "one"},
+    )
+    assert response.status_code == 200
+    assert response.headers["Omnigent-Context-Inventory-Contract"] == CONTEXT_INVENTORY_V2
+    evidence = _v2_evidence(response.content, session_id="one")
+    assert evidence.read_id == "v2-read"
+    assert [scope.namespace for scope in evidence.expected_scopes] == [
+        "harness",
+        "native",
+        "terminal",
+    ]
+    by_namespace = {source.scope.namespace: source for source in evidence.sources}
+    assert set(by_namespace) == {"harness", "native", "terminal"}
+    assert all(source.coverage != "complete" for source in evidence.sources)
+    assert by_namespace["native"].unresolved[0].reason == "native_context_source_unimplemented"
+    assert by_namespace["terminal"].unresolved[0].reason == (
+        "terminal_context_source_unimplemented"
+    )
+    assert by_namespace["harness"].unresolved[0].reason == "context_source_unimplemented"
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+
+
+async def test_runner_context_inventory_v2_keeps_an_unresident_session_unknown(
+    harness_inventory_reader,
+):
+    _manager, _add, client, requests = harness_inventory_reader
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "absent"},
+    )
+    assert response.status_code == 200
+    evidence = _v2_evidence(response.content, session_id="absent")
+    by_namespace = {source.scope.namespace: source for source in evidence.sources}
+    assert by_namespace["harness"].coverage != "complete"
+    assert by_namespace["harness"].unresolved[0].reason == "no_resident_harness"
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"read_id": "", "session_id": "one"},
+        {"read_id": "x" * 129, "session_id": "one"},
+        {"read_id": "v2-read"},
+        {"read_id": "v2-read", "session_id": ""},
+    ],
+)
+async def test_runner_context_inventory_v2_rejects_incomplete_identity(
+    harness_inventory_reader, params
+):
+    _manager, _add, client, requests = harness_inventory_reader
+    response = await client.get("/v2/startup/context-inventory", params=params)
+    assert response.status_code == 422
+    assert requests == []
+
+
+async def test_runner_context_inventory_v2_rejects_a_duplicate_read_id(
+    harness_inventory_reader,
+):
+    _manager, _add, client, requests = harness_inventory_reader
+    response = await client.get(
+        "/v2/startup/context-inventory?read_id=one&read_id=two&session_id=one"
+    )
+    assert response.status_code == 422
+    assert requests == []
+
+
+async def test_runner_context_inventory_v2_requires_runner_auth(harness_inventory_reader):
+    _manager, _add, client, requests = harness_inventory_reader
+    client.headers.clear()
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "one"},
+    )
+    assert response.status_code == 401
+    assert requests == []

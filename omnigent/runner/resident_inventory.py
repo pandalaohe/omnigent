@@ -1,8 +1,11 @@
 """Runner owner evidence; backend and terminal registrations are not context counts."""
 
 import asyncio
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+
+import httpx
 
 from omnigent.runner.native.orchestration import (
     NativeBackendInventorySnapshot,
@@ -17,6 +20,13 @@ from omnigent.runtime.harnesses.process_manager import (
     HarnessInventorySnapshot,
     HarnessProcessManager,
     HarnessThreadInventorySnapshot,
+)
+from omnigent.startup_protocol import (
+    ContextEvidenceV2,
+    SourceEvidenceV2,
+    UnresolvedContextV2,
+    harness_context_authority_v2,
+    session_context_scopes_v2,
 )
 
 _OWNER_INVENTORY_TIMEOUT_S = 5.0
@@ -97,4 +107,93 @@ async def owner_registration_snapshot(
         harnesses=harnesses,
         native_thread_ids=native.thread_ids if native is not None else None,
         harness_thread_ids=harness_threads,
+    )
+
+
+def _unknown_context_source(scope, reason: str) -> SourceEvidenceV2:
+    """An unsupported source still names its scope and why it cannot answer."""
+    return SourceEvidenceV2(
+        scope=scope,
+        producer_incarnation=None,
+        coverage="unsupported",
+        contexts=(),
+        unresolved=(UnresolvedContextV2(candidate=None, reason=reason),),
+        membership_revision=None,
+        context_revision=None,
+        work_revision=None,
+        revision_authority="observation_only",
+        age_upper_bound_s=None,
+        work_bindings=None,
+    )
+
+
+async def _harness_context_source_v2(
+    session_id: str,
+    scope,
+    process_manager: HarnessProcessManager | None,
+    timeout_s: float,
+) -> SourceEvidenceV2:
+    """Read the resident harness's own v2 evidence; never construct or spawn one."""
+    if process_manager is None:
+        return _unknown_context_source(scope, "no_resident_harness")
+    selected = await process_manager.resident_inventory()
+    owner = next(
+        (
+            candidate
+            for candidate in selected.owners
+            if candidate.session_id == session_id
+            and not candidate.closing
+            and not candidate.wrapper_exited
+            and not candidate.exit_confirmed
+        ),
+        None,
+    )
+    if owner is None:
+        return _unknown_context_source(scope, "no_resident_harness")
+    reconcile = await process_manager.prepare_context_inventory_v2(owner, timeout_s=timeout_s)
+    snapshot = reconcile()
+    sources = snapshot.evidence.sources
+    if snapshot.evidence.authority != harness_context_authority_v2(session_id):
+        return _unknown_context_source(scope, "foreign_session")
+    if len(sources) != 1 or sources[0].scope != scope:
+        return _unknown_context_source(scope, "invalid_harness_evidence")
+    return sources[0]
+
+
+async def session_context_evidence_v2(
+    session_id: str,
+    read_id: str,
+    *,
+    process_manager: HarnessProcessManager | None,
+    timeout_s: float = _OWNER_INVENTORY_TIMEOUT_S,
+) -> ContextEvidenceV2:
+    """Compose the runner's three session scopes into one v2 envelope.
+
+    Only the harness owner can produce context records today; native backends and
+    terminal roles keep explicit unsupported sources rather than empty-but-complete
+    claims. The whole read stays bounded and answers unknown instead of raising.
+    """
+    scopes = session_context_scopes_v2(session_id)
+    started = time.monotonic()
+    harness = _unknown_context_source(scopes[0], "no_resident_harness")
+    if 0 < timeout_s <= 5.0:
+        try:
+            async with asyncio.timeout_at(started + timeout_s):
+                harness = await _harness_context_source_v2(
+                    session_id, scopes[0], process_manager, timeout_s
+                )
+        except TimeoutError:
+            harness = _unknown_context_source(scopes[0], "read_timeout")
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            harness = _unknown_context_source(scopes[0], "invalid_or_failed_read")
+    return ContextEvidenceV2(
+        wire_version=2,
+        read_id=read_id,
+        authority=harness_context_authority_v2(session_id),
+        expected_scopes=scopes,
+        sources=(
+            harness,
+            _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
+            _unknown_context_source(scopes[2], "terminal_context_source_unimplemented"),
+        ),
     )

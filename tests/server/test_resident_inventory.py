@@ -1,7 +1,9 @@
 """Incomplete owner evidence cannot become startup or resident permission."""
 
 import asyncio
+import contextlib
 import threading
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -1871,3 +1873,414 @@ def test_runner_context_inventory_strict_wire_decode(case):
                     "sdk-max": ((tuple(str(i) for i in range(1000)),),),
                 }[case]
             )
+
+
+def _v2_authority(session_id: str, **overrides):
+    from omnigent.startup_protocol import ContextAuthorityV2
+
+    values = {
+        "session_id": session_id,
+        "account_id": "account",
+        "host_id": "host",
+        "host_generation": "connection",
+        "runner_id": "runner",
+        "runner_generation": "7",
+        "connection_generation": "connection",
+    }
+    values.update(overrides)
+    return ContextAuthorityV2(**values)
+
+
+def _v2_source(scope, *, coverage, authority=None, reason="source_unsupported"):
+    from omnigent.startup_protocol import (
+        ContextEvidenceV2,
+        ContextKeyV2,
+        ContextOperationV2,
+        ContextRecordV2,
+        SourceEvidenceV2,
+        UnresolvedContextV2,
+    )
+
+    authority = authority or _v2_authority(scope.owner_id)
+    complete = coverage == "complete"
+    record = (
+        ContextRecordV2(
+            key=ContextKeyV2(source_owner_incarnation="owner", context_incarnation="context"),
+            vendor_id=None,
+            operation=ContextOperationV2(operation_id="operation", action="create", parent=None),
+            execution_keys=("execution",),
+            provenance="primary",
+            lifecycle="live",
+            aliases=(),
+            revision=1,
+            stop_proof=None,
+            continuity_proof=None,
+        )
+        if complete
+        else None
+    )
+    source = SourceEvidenceV2(
+        scope=scope,
+        producer_incarnation="owner" if complete else None,
+        coverage=coverage,
+        contexts=(record,) if record is not None else (),
+        unresolved=() if complete else (UnresolvedContextV2(candidate=None, reason=reason),),
+        membership_revision=1 if complete else None,
+        context_revision=1 if complete else None,
+        work_revision=None,
+        revision_authority="authoritative_membership" if complete else "observation_only",
+        age_upper_bound_s=1.0,
+        work_bindings=None,
+    )
+    return ContextEvidenceV2(
+        wire_version=2,
+        read_id="v2-read",
+        authority=authority,
+        expected_scopes=(scope,),
+        sources=(source,),
+    )
+
+
+def _empty_authority_evidence(scope, *, coverage, reason):
+    from omnigent.startup_protocol import (
+        ContextEvidenceV2,
+        SourceEvidenceV2,
+        UnresolvedContextV2,
+    )
+
+    return ContextEvidenceV2(
+        wire_version=2,
+        read_id="v2-read",
+        authority=_v2_authority(scope.owner_id),
+        expected_scopes=(scope,),
+        sources=(
+            SourceEvidenceV2(
+                scope=scope,
+                producer_incarnation=None,
+                coverage=coverage,
+                contexts=(),
+                unresolved=(UnresolvedContextV2(candidate=None, reason=reason),),
+                membership_revision=None,
+                context_revision=None,
+                work_revision=None,
+                revision_authority="observation_only",
+                age_upper_bound_s=None,
+                work_bindings=None,
+            ),
+        ),
+    )
+
+
+def test_normalization_never_promotes_v1_evidence_and_fails_closed():
+    from omnigent.server.resident_inventory import normalize_context_inventory_v2
+    from omnigent.startup_protocol import session_context_scopes_v2
+
+    scopes = session_context_scopes_v2("session-one")
+    v1_only = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=None,
+        host_evidence=None,
+        runner_capable=False,
+        host_capable=False,
+        v1_diagnostics=("runner_partial",),
+    )
+    assert v1_only.readiness == "unavailable"
+    assert {item.status for item in v1_only.scopes} == {"unknown"}
+    assert {item.reason for item in v1_only.scopes} == {"peer_needs_update"}
+    assert v1_only.diagnostics == ("runner_partial",)
+
+    foreign = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=_empty_authority_evidence(
+            scopes[0], coverage="unsupported", reason="no_resident_harness"
+        ),
+        host_evidence=_v2_source(scopes[0], coverage="complete"),
+        runner_capable=True,
+        host_capable=True,
+    )
+    by_namespace = {(item.scope.namespace): item for item in foreign.scopes}
+    assert by_namespace["harness"].status == "unknown"
+    assert by_namespace["harness"].reason == "conflicting_observers"
+    assert by_namespace["native"].status == "unknown"
+    assert foreign.readiness == "unavailable"
+
+    wrong_session = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=_v2_source(
+            scopes[0], coverage="complete", authority=_v2_authority("other-session")
+        ),
+        host_evidence=None,
+        runner_capable=True,
+        host_capable=False,
+    )
+    assert wrong_session.scopes[0].status == "unknown"
+    assert wrong_session.scopes[0].reason == "foreign_session"
+
+
+def test_normalization_completes_only_from_each_owning_hop():
+    from omnigent.server.resident_inventory import normalize_context_inventory_v2
+    from omnigent.startup_protocol import (
+        host_context_scope_v2,
+        session_context_scopes_v2,
+    )
+
+    scopes = (
+        *session_context_scopes_v2("session-one"),
+        host_context_scope_v2("session-one"),
+    )
+    normalization = normalize_context_inventory_v2(
+        expected_scopes=scopes,
+        runner_evidence=_v2_source(scopes[0], coverage="complete"),
+        host_evidence=_v2_source(scopes[3], coverage="complete"),
+        runner_capable=True,
+        host_capable=True,
+    )
+    by_namespace = {item.scope.namespace: item for item in normalization.scopes}
+    assert normalization.readiness == "partial"
+    assert by_namespace["harness"].status == "complete"
+    assert by_namespace["host"].status == "complete"
+    assert by_namespace["native"].status == "unknown"
+
+    complete = normalize_context_inventory_v2(
+        expected_scopes=(scopes[0],),
+        runner_evidence=_v2_source(scopes[0], coverage="complete"),
+        host_evidence=None,
+        runner_capable=True,
+        host_capable=False,
+    )
+    assert complete.readiness == "complete"
+
+    absent = normalize_context_inventory_v2(
+        expected_scopes=(scopes[0],),
+        runner_evidence=None,
+        host_evidence=None,
+        runner_capable=True,
+        host_capable=True,
+    )
+    assert absent.readiness == "unavailable"
+    assert absent.scopes[0].reason == "missing_source"
+
+
+@pytest.mark.asyncio
+async def test_server_reads_v2_only_from_a_runner_that_advertises_it():
+    from omnigent.runner.native import orchestration
+    from omnigent.server.resident_inventory import (
+        HostRunnerMembership,
+        read_runner_context_inventory_v2,
+    )
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
+
+    orchestration.__dict__["_AUTO_CODEX_APP_SERVERS"] = {}
+    orchestration.__dict__["_AUTO_OPENCODE_SERVERS"] = {}
+    orchestration.__dict__["_CLOSING_NATIVE_BACKENDS"] = {}
+    resources = SessionResourceRegistry(TerminalRegistry())
+    runner_app = create_runner_app(server_client=NullServerClient(), resource_registry=resources)
+    requests: list[str] = []
+
+    async def record(request):
+        requests.append(request.url.path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=runner_app),
+        base_url="http://runner",
+        event_hooks={"request": [record]},
+    ) as runner:
+        tunnels = TunnelRegistry()
+        tunnels.register(
+            "runner", FakeWebSocket(), HelloFrame("test", 1, capabilities=[CONTEXT_INVENTORY_V2])
+        )
+        initializer = RunnerSessionInitializer(tunnels, server_version="test")
+        router = Mock()
+        router.runner_has_capability.return_value = True
+        router.client_for_existing_conversation.return_value = SimpleNamespace(
+            runner_id="runner", client=runner
+        )
+        member = HostRunnerMembership("runner", None, ("session-one",))
+        evidence = await read_runner_context_inventory_v2(router, initializer, member)
+        assert evidence is not None
+        assert {source.scope.namespace for source in evidence.sources} == {
+            "harness",
+            "native",
+            "terminal",
+        }
+        assert all(source.coverage != "complete" for source in evidence.sources)
+        assert requests == ["/v2/startup/context-inventory"]
+
+        requests.clear()
+        router.runner_has_capability.return_value = False
+        assert await read_runner_context_inventory_v2(router, initializer, member) is None
+        assert requests == []
+
+
+def _tunnel_v2_client(*, behaviour: str, monkeypatch):
+    """Real tunnel client with a real outbound-queue consumer acting as the runner.
+
+    The transport only enqueues; without a consumer nothing reaches the wire, so
+    every assertion below is about frames the runner actually received.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import RequestFrame, decode_frame
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.startup_protocol import (
+        CONTEXT_INVENTORY_CONTRACT_HEADER,
+        CONTEXT_INVENTORY_V2,
+    )
+
+    registry = TunnelRegistry()
+    requests: list[str] = []
+    witness = SimpleNamespace(
+        head_delivered=asyncio.Event(),
+        body_waiting=asyncio.Event(),
+        body_waiting_at=None,
+        body_cancelled=asyncio.Event(),
+        body_cancelled_at=None,
+        body_returned=asyncio.Event(),
+    )
+
+    class _RunnerSocket:
+        async def send_text(self, data: str) -> None:
+            raise AssertionError("the transport must enqueue, never write the socket directly")
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    session = registry.register(
+        "runner", _RunnerSocket(), HelloFrame("test", 1, capabilities=[CONTEXT_INVENTORY_V2])
+    )
+
+    async def consume() -> None:
+        while True:
+            item = await session.outbound_queue.get()
+            if item is None:
+                return
+            frame = decode_frame(item.data)
+            if not isinstance(frame, RequestFrame):
+                continue
+            requests.append(frame.id)
+            if behaviour == "head-only":
+                state = session.in_flight[frame.id]
+                queue_get = state.body_queue.get
+
+                async def observe_body_get(*, state=state, queue_get=queue_get):
+                    assert state.body_queue.empty()
+                    witness.body_waiting_at = time.monotonic()
+                    witness.body_waiting.set()
+                    try:
+                        item = await queue_get()
+                    except asyncio.CancelledError:
+                        witness.body_cancelled_at = time.monotonic()
+                        witness.body_cancelled.set()
+                        raise
+                    witness.body_returned.set()
+                    return item
+
+                monkeypatch.setattr(state.body_queue, "get", observe_body_get)
+                registry.route_response_frame(
+                    "runner",
+                    ResponseHeadFrame(
+                        frame.id,
+                        200,
+                        [[CONTEXT_INVENTORY_CONTRACT_HEADER, CONTEXT_INVENTORY_V2]],
+                    ),
+                )
+                witness.head_delivered.set()
+
+    consumer = asyncio.create_task(consume())
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner"), base_url="http://runner"
+    )
+    return registry, session, client, requests, witness, consumer
+
+
+async def test_v2_runner_read_is_bounded_without_a_response_head(monkeypatch):
+    from omnigent.server.resident_inventory import (
+        HostRunnerMembership,
+        read_runner_context_inventory_v2,
+    )
+
+    registry, session, client, requests, witness, consumer = _tunnel_v2_client(
+        behaviour="silent", monkeypatch=monkeypatch
+    )
+    try:
+        async with client:
+            router = Mock()
+            router.runner_has_capability.return_value = True
+            router.client_for_existing_conversation.return_value = SimpleNamespace(
+                runner_id="runner", client=client
+            )
+            initializer = RunnerSessionInitializer(registry, server_version="test")
+            started = time.monotonic()
+            result = await asyncio.wait_for(
+                read_runner_context_inventory_v2(
+                    router,
+                    initializer,
+                    HostRunnerMembership("runner", None, ("session-one",)),
+                    timeout_s=0.05,
+                ),
+                timeout=2.0,
+            )
+            assert result is None
+            assert time.monotonic() - started < 1.0
+            assert len(requests) == 1 and not witness.head_delivered.is_set()
+            assert not witness.body_waiting.is_set()
+            assert session.in_flight == {}
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
+async def test_v2_runner_read_is_bounded_when_the_body_never_ends(monkeypatch):
+    from omnigent.server.resident_inventory import (
+        HostRunnerMembership,
+        read_runner_context_inventory_v2,
+    )
+
+    registry, session, client, requests, witness, consumer = _tunnel_v2_client(
+        behaviour="head-only", monkeypatch=monkeypatch
+    )
+    reader = None
+    try:
+        async with client:
+            router = Mock()
+            router.runner_has_capability.return_value = True
+            router.client_for_existing_conversation.return_value = SimpleNamespace(
+                runner_id="runner", client=client
+            )
+            initializer = RunnerSessionInitializer(registry, server_version="test")
+            timeout_s = 0.2
+            scheduling_allowance_s = 0.1
+            started = time.monotonic()
+            reader = asyncio.create_task(
+                read_runner_context_inventory_v2(
+                    router,
+                    initializer,
+                    HostRunnerMembership("runner", None, ("session-one",)),
+                    timeout_s=timeout_s,
+                )
+            )
+            await asyncio.wait_for(witness.body_waiting.wait(), timeout=1.0)
+            assert witness.head_delivered.is_set()
+            assert started <= witness.body_waiting_at < started + timeout_s
+            assert not reader.done()
+            assert not witness.body_cancelled.is_set()
+            assert not witness.body_returned.is_set()
+            assert requests[0] in session.in_flight
+            result = await asyncio.wait_for(reader, timeout=2.0)
+            assert result is None
+            assert time.monotonic() - started < timeout_s + scheduling_allowance_s
+            assert len(requests) == 1
+            assert witness.body_cancelled.is_set()
+            assert (
+                timeout_s
+                <= witness.body_cancelled_at - started
+                < timeout_s + scheduling_allowance_s
+            )
+            assert not witness.body_returned.is_set()
+            assert session.in_flight == {}
+    finally:
+        if reader is not None:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
