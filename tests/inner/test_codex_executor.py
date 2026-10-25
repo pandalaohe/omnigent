@@ -6976,6 +6976,17 @@ async def test_codex_cli_version_returns_none_on_oserror(
     assert await _codex_cli_version("/usr/local/bin/codex") is None
 
 
+async def test_codex_wrapper_version_probe_receives_runtime_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawn = AsyncMock(return_value=_FakeVersionProcess(stdout=b"codex-cli 0.164.0\n"))
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    env = {"OMNIGENT_CODEX_RUNTIME_BIN": "/opt/work/omnigent/runtime/bin/codex"}
+    assert await _codex_cli_version("/opt/work/omnigent/bin/codex-wrapper", env=env) == (0, 164, 0)
+    assert spawn.await_args.args == ("/opt/work/omnigent/bin/codex-wrapper", "--version")
+    assert spawn.await_args.kwargs["env"] == env
+
+
 async def test_codex_cli_version_times_out_and_kills_proc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9135,8 +9146,9 @@ async def test_resident_inventory_maintenance_follows_owned_parent_cleanup(
     assert snapshot.owners == () and not snapshot.context_coverage_complete
 
 
+@pytest.mark.parametrize("wrapper", [False, True])
 async def test_codex_update_keeps_thread_when_replacement_cannot_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapper: bool
 ) -> None:
     from omnigent.inner import codex_binary
     from omnigent.inner import codex_executor as module
@@ -9145,7 +9157,12 @@ async def test_codex_update_keeps_thread_when_replacement_cannot_start(
     binary = vendor / "bin" / "codex"
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b"\x7fELFold codex")
+    binary.chmod(0o755)
     binary.with_name("codex-code-mode-host").write_bytes(b"old host")
+    launcher = tmp_path / "wrapper" / "codex"
+    launcher.parent.mkdir()
+    launcher.write_text("#!/usr/bin/env node\n// custom wrapper\n")
+    launcher.chmod(0o755)
     (vendor / "codex-package.json").write_text(
         json.dumps(
             {
@@ -9168,12 +9185,14 @@ async def test_codex_update_keeps_thread_when_replacement_cannot_start(
     monkeypatch.setattr(module, "_kill_process_tree", lambda proc: proc.kill())
     spawned = []
     home = None
+    runtime = None
 
     async def spawn(*args, **kwargs):
-        nonlocal home
+        nonlocal home, runtime
         if spawned:
             raise OSError("replacement worker cannot start")
         spawned.append(args[0])
+        runtime = kwargs["env"].get("OMNIGENT_CODEX_RUNTIME_BIN", args[0])
         home = Path(kwargs["env"]["CODEX_HOME"])
         proc = _FakeProcess()
         proc.stdout = _ScriptedStdoutPipe([])
@@ -9201,7 +9220,7 @@ async def test_codex_update_keeps_thread_when_replacement_cannot_start(
         if turns == 1:
             binary.write_bytes(b"replacement that cannot execute")
             binary.with_name("codex-code-mode-host").write_bytes(b"new host")
-        assert Path(spawned[0]).with_name("codex-code-mode-host").read_bytes() == b"old host"
+        assert Path(runtime).with_name("codex-code-mode-host").read_bytes() == b"old host"
         turn = {"id": f"turn-{turns}"}
         asyncio.get_running_loop().call_soon(
             session._events.put_nowait, {"method": "turn/completed", "params": {"turn": turn}}
@@ -9213,17 +9232,24 @@ async def test_codex_update_keeps_thread_when_replacement_cannot_start(
 
     def selected_session(**kwargs):
         session._codex_path = kwargs["codex_path"]
+        session._env = kwargs["env"]
         return factory(**kwargs)
 
-    async def version_check(path):
+    async def version_check(path, *, env=None):
         assert path != str(binary)
+        if wrapper:
+            assert path == str(launcher)
+            path = env["OMNIGENT_CODEX_RUNTIME_BIN"]
         assert Path(path).read_bytes() == b"\x7fELFold codex"
 
     gate = AsyncMock(side_effect=version_check)
     monkeypatch.setattr(module, "_require_brokered_codex_version", gate)
     executor = CodexExecutor(
-        codex_path=str(binary), cwd=str(tmp_path), app_session_factory=selected_session
+        codex_path=str(launcher if wrapper else binary),
+        cwd=str(tmp_path),
+        app_session_factory=selected_session,
     )
+    executor._env["PATH"] = os.pathsep.join([str(launcher.parent), str(binary.parent)])
     executor._signer_backed = True
     try:
         for text in ("first", "retry after update"):
@@ -9239,7 +9265,11 @@ async def test_codex_update_keeps_thread_when_replacement_cannot_start(
         assert len(spawned) == 1 and spawned[0] != str(binary)
         assert methods.count("thread/start") == 1
         factory.assert_called_once()
-        gate.assert_awaited_once_with(spawned[0])
+        if wrapper:
+            assert spawned[0] == str(launcher)
+            gate.assert_awaited_once_with(spawned[0], env=session._env)
+        else:
+            gate.assert_awaited_once_with(spawned[0])
         assert session.thread_id == "thread-kept"
         assert home is not None and (home / "thread.jsonl").read_text() == "remember this thread"
     finally:

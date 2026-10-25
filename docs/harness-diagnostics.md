@@ -451,6 +451,22 @@ quota. The next enabled launch in the same bridge directory removes the prior
 owned file and its rotated predecessor. Other user debug files are never read
 or deleted.
 
+## Codex wrapper runtime selection
+
+Omnigent snapshots recognized Codex packages so an installed CLI update cannot
+change the code-mode host used by an existing app-server. A configured wrapper
+remains the launcher. For an unrecognized launcher, Omnigent searches PATH in
+order, skipping unrecognized launchers, and offers the first recognized package's
+snapshot through `OMNIGENT_CODEX_RUNTIME_BIN` in the launch environment.
+
+Wrappers can opt in by running that executable when the variable is set,
+preserving their existing environment, arguments, and signal forwarding. When
+unset, retain the wrapper's normal executable selection. Wrappers that ignore
+the variable keep their existing behavior. Recognized direct launchers use the
+snapshot directly and need no variable; when PATH contains no recognized package,
+Omnigent leaves the variable unset. Inherited hints are cleared before selection.
+Offered snapshots receive the same live-owner retention as direct snapshots.
+
 ## Codex bridge availability
 
 When an input cannot be delivered because bridge state is unavailable, the

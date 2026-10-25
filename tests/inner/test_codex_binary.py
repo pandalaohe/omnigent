@@ -185,6 +185,73 @@ def test_ambiguous_wrappers_are_not_bypassed(
     assert not (tmp_path / "unused-data").exists()
 
 
+@pytest.mark.parametrize("launch", ["wrapper-with-runtime", "wrapper-only", "direct"])
+def test_wrapper_runtime_hint_preserves_launcher_and_owns_snapshot(
+    package: Path, tmp_path: Path, launch: str
+) -> None:
+    wrapper = tmp_path / "wrapper" / "codex"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/usr/bin/env node\n// preserves custom environment\n")
+    wrapper.chmod(0o755)
+    directories = [str(wrapper.parent)]
+    if launch != "wrapper-only":
+        directories.append(str(package.parent))
+    env = {
+        "PATH": os.pathsep.join(directories),
+        "WRAPPER_SETTING": "preserve",
+        "OMNIGENT_CODEX_RUNTIME_BIN": "stale inherited hint",
+    }
+    original = str(package if launch == "direct" else wrapper)
+    selected = module.snapshot_codex_binary(original, env=env)
+    assert env["WRAPPER_SETTING"] == "preserve"
+    if launch == "wrapper-only":
+        assert selected == original
+        assert "OMNIGENT_CODEX_RUNTIME_BIN" not in env
+        return
+    if launch == "direct":
+        assert selected != original
+        assert "OMNIGENT_CODEX_RUNTIME_BIN" not in env
+        runtime = Path(selected)
+    else:
+        assert selected == original
+        runtime = Path(env["OMNIGENT_CODEX_RUNTIME_BIN"])
+        assert runtime != package
+    assert runtime.read_bytes() == b"\x7fELFold codex"
+    snapshot = runtime.parent.parent
+    owner = json.loads((snapshot / ".owners" / str(os.getpid())).read_text())
+    assert owner["pid"] == os.getpid()
+    stale = time.time() - 8 * 24 * 60 * 60
+    os.utime(snapshot, (stale, stale))
+    module._reap_unused(snapshot.parent, time.time())
+    assert runtime.exists()
+
+
+def test_path_candidate_removed_after_resolution_cannot_be_offered_as_runtime(
+    package: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text("#!/usr/bin/env node\n")
+    manifest = package.parent.parent / "codex-package.json"
+    contents = manifest.read_text()
+    resolve = module._resolved_package
+
+    def update_after_resolving(path):
+        result = resolve(path)
+        if result is not None:
+            manifest.unlink()
+        return result
+
+    env = {"PATH": str(package.parent)}
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "_resolved_package", update_after_resolving)
+        with pytest.raises(OSError):
+            module.snapshot_codex_binary(str(wrapper), env=env)
+    assert "OMNIGENT_CODEX_RUNTIME_BIN" not in env
+    manifest.write_text(contents)
+    assert module.snapshot_codex_binary(str(wrapper), env=env) == str(wrapper)
+    assert Path(env["OMNIGENT_CODEX_RUNTIME_BIN"]).is_file()
+
+
 @pytest.mark.parametrize("state", ["recent", "owner", "child", "unknown", "denied", "unused"])
 def test_gc_requires_old_age_dead_owners_and_no_live_executable(
     package: Path, monkeypatch: pytest.MonkeyPatch, state: str

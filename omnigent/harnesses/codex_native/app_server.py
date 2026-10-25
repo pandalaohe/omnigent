@@ -90,7 +90,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     report_capture_start_failure,
 )
 from omnigent.inner import _proc
-from omnigent.inner.codex_binary import snapshot_codex_binary
+from omnigent.inner.codex_binary import CODEX_RUNTIME_BIN_ENV, snapshot_codex_binary
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     CODEX_AGENT_PID_CONFIG_KEY,
@@ -2276,7 +2276,9 @@ class CodexNativeAppServer:
         :raises OmnigentError: ``WORKSPACE_MISSING`` when the session's working
             directory was removed, e.g. a deleted git worktree.
         """
-        self.codex_path = await asyncio.to_thread(snapshot_codex_binary, self.codex_path)
+        self.codex_path = await asyncio.to_thread(
+            snapshot_codex_binary, self.codex_path, env=self.env
+        )
         if not self.cwd.is_dir():
             # Spawning in it would only fail with a bare ENOENT; name the cause.
             raise OmnigentError(
@@ -2305,7 +2307,11 @@ class CodexNativeAppServer:
         # (``None``) is treated as supported so a flaky probe never
         # silently disables enforcement — a genuine trust failure is then
         # caught below.
-        codex_version = await _codex_cli_version(self.codex_path)
+        codex_version = (
+            await _codex_cli_version(self.codex_path, env=self.env)
+            if CODEX_RUNTIME_BIN_ENV in self.env
+            else await _codex_cli_version(self.codex_path)
+        )
         self.codex_cli_version = codex_version
         policy_hooks_supported = (
             codex_version is None or codex_version >= _MIN_POLICY_HOOK_CODEX_VERSION
@@ -5022,7 +5028,13 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
         if key
-        in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
+        in {
+            "CODEX_HOME",
+            "DATABRICKS_HOST",
+            "DATABRICKS_CODEX_TOKEN",
+            "OTEL_RESOURCE_ATTRIBUTES",
+            CODEX_RUNTIME_BIN_ENV,
+        }
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
     if app_server.session_id:

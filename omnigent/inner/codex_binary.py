@@ -21,6 +21,7 @@ from omnigent.process_logging import data_dir
 _logger = logging.getLogger(__name__)
 _MARKER = ".omnigent-snapshot.json"
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
+CODEX_RUNTIME_BIN_ENV = "OMNIGENT_CODEX_RUNTIME_BIN"
 _NPM_CMD_SHIM = r"""@ECHO off
 GOTO start
 :find_dp0
@@ -202,23 +203,48 @@ def _reap_unused(root: Path, now: float) -> None:
         shutil.rmtree(entry)
 
 
-def snapshot_codex_binary(codex_path: str) -> str:
+def _resolved_package(codex_path: str) -> tuple[Path, Path, str, str] | None:
+    try:
+        binary = _resolve_vendor_binary(Path(codex_path))
+        package = _package(binary) if binary is not None else None
+    except (OSError, ValueError):
+        return None
+    return (binary, *package) if binary is not None and package is not None else None
+
+
+def snapshot_codex_binary(codex_path: str, *, env: dict[str, str] | None = None) -> str:
     """Pin recognized packages; ambiguous wrappers retain their original launch behavior.
 
     Snapshots and their owner records share a cross-process lock with collection.
     A live launcher retains its selection even between worker launches; orphaned
     child executables are checked before old, unowned snapshots can be removed.
+
+    When supplied, env receives a runtime hint for an unrecognized wrapper,
+    selected from the first recognized executable on its PATH. The wrapper
+    remains the launcher. An inherited hint is cleared before selecting one.
     """
-    binary = None
-    try:
-        binary = _resolve_vendor_binary(Path(codex_path))
-        package = _package(binary) if binary is not None else None
-    except (OSError, ValueError):
-        package = None
-    if package is None or binary is None:
+    if env is not None:
+        env.pop(CODEX_RUNTIME_BIN_ENV, None)
+    resolved = _resolved_package(codex_path)
+    if resolved is None:
+        if env is not None:
+            names = ("codex.exe", "codex.cmd", "codex") if os.name == "nt" else ("codex",)
+            for directory in os.get_exec_path(env):
+                for name in names:
+                    candidate = str(Path(directory) / name)
+                    package = (
+                        _resolved_package(candidate) if os.access(candidate, os.X_OK) else None
+                    )
+                    if package is not None:
+                        env[CODEX_RUNTIME_BIN_ENV] = _snapshot_package(package)
+                        return codex_path
         _logger.debug("Codex executable package is not unambiguously resolvable; keeping launcher")
         return codex_path
-    source, version, target = package
+    return _snapshot_package(resolved)
+
+
+def _snapshot_package(resolved: tuple[Path, Path, str, str]) -> str:
+    binary, source, version, target = resolved
     root = data_dir().resolve() / "codex-bin"
     root.mkdir(parents=True, mode=0o700, exist_ok=True)
     if not stat.S_ISDIR(root.lstat().st_mode):
@@ -228,7 +254,7 @@ def snapshot_codex_binary(codex_path: str) -> str:
     root.chmod(0o700)
     with FileLock(str(root / ".lock")):
         before = _identity(source)
-        if _package(binary) != package:
+        if _package(binary) != (source, version, target):
             raise OSError("Codex installation changed before copying; retry startup")
         destination = root / f"{version}-{target}"
         if not destination.exists():
