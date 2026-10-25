@@ -2652,7 +2652,7 @@ function GeneralSection() {
             Keep-warm
           </Link>
           <Link to="#child-idle" className="text-primary underline underline-offset-2">
-            Idle child reminders
+            Child check-ins
           </Link>
           {sessionCollabEnabled && (
             <Link to="#session-collab" className="text-primary underline underline-offset-2">
@@ -2683,7 +2683,7 @@ function GeneralSection() {
           </ExpandableSettings>
           <ExpandableSettings
             id="child-idle"
-            title="Idle child reminders"
+            title="Child check-ins"
             className="mt-4 border-t border-border pt-4"
           >
             <ChildIdleSettings />

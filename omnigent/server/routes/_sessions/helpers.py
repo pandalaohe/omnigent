@@ -8374,7 +8374,7 @@ async def _dispatch_skill_slash_command_to_runner(
     created_by: str | None,
     legacy_skill_names: Mapping[str, str] | None = None,
     startup_input: StartupInputContext | None = None,
-) -> str:
+) -> _SessionEventDispatchResult:
     """
     Persist a skill slash command and forward hidden skill context.
 
@@ -8410,7 +8410,7 @@ async def _dispatch_skill_slash_command_to_runner(
     :param legacy_skill_names: Frontmatter names of the agent's bundled
         skills keyed by command, e.g. ``{"review": "code-review"}``, for
         runners that predate directory-name invocation.
-    :returns: The persisted visible ``slash_command`` item id.
+    :returns: The visible item id and whether the runner accepted the input.
     :raises OmnigentError: If the skill is not exposed for the
         session, or the runner is unreachable while resolving it.
     """
@@ -8435,7 +8435,9 @@ async def _dispatch_skill_slash_command_to_runner(
         legacy_name=(legacy_skill_names or {}).get(skill_name),
     )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
-        return startup_input.input_id
+        return _SessionEventDispatchResult(
+            item_id=startup_input.input_id, pending_id=None, forwarded=False
+        )
     startup_input_id = startup_input.input_id if startup_input is not None else None
 
     response_id = f"turn_{uuid.uuid4().hex}"
@@ -8521,11 +8523,15 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
-        await runner_client.post(
+        response = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
         )
+        if response.status_code >= 400:
+            return _SessionEventDispatchResult(
+                item_id=visible.id, pending_id=None, forwarded=False
+            )
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -8540,7 +8546,7 @@ async def _dispatch_skill_slash_command_to_runner(
             "The runner may be restarting — retry or spawn a new session.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
-    return visible.id
+    return _SessionEventDispatchResult(item_id=visible.id, pending_id=None)
 
 
 def _title_content_from_item(

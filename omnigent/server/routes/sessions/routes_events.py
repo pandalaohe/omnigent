@@ -3797,7 +3797,7 @@ def register_events_routes(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             try:
-                await runner_client.post(
+                tool_response = await runner_client.post(
                     f"/v1/sessions/{session_id}/events",
                     json={
                         "type": "tool_result",
@@ -3816,7 +3816,11 @@ def register_events_routes(
                     "Failed to deliver the tool result to the session runner.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
-            return {"queued": True, "item_id": body.data["call_id"]}
+            return {
+                "queued": True,
+                "item_id": body.data["call_id"],
+                "forwarded": tool_response.status_code < 400,
+            }
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching
@@ -3930,7 +3934,7 @@ def register_events_routes(
                     created_by=created_by,
                     host_error_code=refusal_code,
                 )
-                return {"queued": True, "item_id": item_id}
+                return {"queued": True, "item_id": item_id, "forwarded": False}
             if runner_client is not None:
                 # The source's runner has never initialized this side chat.
                 _runner_needs_session_init = True
@@ -4496,7 +4500,7 @@ def register_events_routes(
                 )
             if runner_router is not None:
                 await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
-            item_id = await _dispatch_skill_slash_command_to_runner(
+            dispatch = await _dispatch_skill_slash_command_to_runner(
                 session_id,
                 conv,
                 body,
@@ -4510,7 +4514,11 @@ def register_events_routes(
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
-            return {"queued": True, "item_id": item_id}
+            return {
+                "queued": True,
+                "item_id": dispatch.item_id,
+                "forwarded": dispatch.forwarded,
+            }
         comment_ids = body.data.pop("omnigent_comment_ids", None)
         comment_store = None
         if comment_ids is not None:
@@ -4584,7 +4592,7 @@ def register_events_routes(
                     )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
-        response: dict[str, Any] = {"queued": True}
+        response: dict[str, Any] = {"queued": True, "forwarded": dispatch.forwarded}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id
         # Native-terminal web message: hand back the pending-input id. It

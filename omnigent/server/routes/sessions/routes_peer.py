@@ -2220,7 +2220,9 @@ def register_peer_routes(
             return "uncertain"
         if isinstance(result, dict) and result.get("forwarded") is False:
             return "rejected"
-        return "accepted"
+        if isinstance(result, dict) and result.get("forwarded") is True:
+            return "accepted"
+        return "uncertain"
 
     async def _resume_frozen_child(child: Conversation, claim: str) -> NoticeOutcome:
         from omnigent.server.peer_sweeper import PeerSweeper

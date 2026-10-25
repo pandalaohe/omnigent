@@ -5130,6 +5130,7 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
 
     assert result.pending_id is None
     assert result.item_id is not None
+    assert result.forwarded is False
     assert [call[0] for call in client.post_json_calls] == [
         "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
     ]
