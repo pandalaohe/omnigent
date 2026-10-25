@@ -642,7 +642,8 @@ def post_evaluate_with_retry(
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
 
     Retries on explicit 429 and 5xx HTTP responses and connection-level errors
-    (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within a
+    (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`,
+    :class:`httpx.RemoteProtocolError`, :class:`httpx.ReadError`) within a
     phase-dependent budget: the tool-call phase (``PHASE_TOOL_CALL``) gets
     :data:`TOOL_CALL_POLICY_RETRY_BUDGET_S` with a
     :data:`_TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S` cap, so a tool call rides
@@ -800,25 +801,28 @@ def post_evaluate_with_retry(
                 f"omnigent {hook_label}: Omnigent request failed; retrying: {exc}",
                 file=sys.stderr,
             )
-        except httpx.HTTPError as exc:
+        except _HELD_POLL_SEVER_ERRORS as exc:
             last_error = f"request error: {exc}"
-            # A connection the gateway tore down after holding the poll is a
-            # sever: the same id re-parks the elicitation. Anything else
-            # mid-stream (a ReadTimeout means the ask itself timed out) is final.
             held_poll_severed = (
-                isinstance(exc, _HELD_POLL_SEVER_ERRORS)
-                and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
             )
-            if not held_poll_severed:
-                print(
-                    f"omnigent {hook_label}: Omnigent request failed: {exc}",
-                    file=sys.stderr,
-                )
-                return None, last_error
             print(
-                f"omnigent {hook_label}: held poll severed by the gateway; re-parking: {exc}",
+                f"omnigent {hook_label}: "
+                + (
+                    "held poll severed by the gateway; re-parking"
+                    if held_poll_severed
+                    else "Omnigent request failed; retrying"
+                )
+                + f": {exc}",
                 file=sys.stderr,
             )
+        except httpx.HTTPError as exc:
+            last_error = f"request error: {exc}"
+            print(
+                f"omnigent {hook_label}: Omnigent request failed: {exc}",
+                file=sys.stderr,
+            )
+            return None, last_error
         if held_poll_severed:
             # The re-park mechanism working as intended, not a transient fault:
             # the budget and backoff are for fast failures, and the accepted

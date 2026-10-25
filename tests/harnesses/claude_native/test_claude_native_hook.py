@@ -1421,6 +1421,29 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
+    posted: list[dict[str, object]] = []
+
+    def _permission_post(
+        _url: str,
+        _headers: dict[str, str],
+        body: dict[str, object],
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        posted.append(dict(body))
+
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", _permission_post)
+    permission_payload = {**payload, "hook_event_name": "PermissionRequest"}
+    for command in ("echo unrelated", "rm -rf /", "rm -rf /"):
+        permission_payload["tool_input"] = {"command": command, "description": "new wording"}
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(permission_payload)))
+        assert (
+            claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+        )
+    assert "_omnigent_approval_origin" not in posted[0]
+    assert posted[1]["_omnigent_approval_origin"] == "omnigent-policy-unavailable"
+    assert "_omnigent_approval_origin" not in posted[2]
+
 
 def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     tmp_path: Path,

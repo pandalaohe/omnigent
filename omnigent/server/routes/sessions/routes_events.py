@@ -265,6 +265,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _append_pending_deferred_approvals,
     _archive_close_in_progress,
     _best_effort_stop,
     _cancel_runner_relays,
@@ -3441,6 +3442,15 @@ def register_events_routes(
                         peer_turn = None
                     if peer_turn is not None:
                         data["peer_turn"] = peer_turn.as_dict()
+            if (
+                conv.kind == "sub_agent"
+                and status in {"idle", "completed", "failed", "stopped", "killed"}
+                and not _is_codex_native_subagent(conv)
+                and not _is_devin_native_subagent(conv)
+            ):
+                data = await _append_pending_deferred_approvals(
+                    data, session_id, conversation_store
+                )
             forward_body = body.model_dump()
             forward_body["data"] = data
             # A cross-host member child's own runner has no parent inbox: the

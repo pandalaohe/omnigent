@@ -346,7 +346,7 @@ _APPROVAL_PENDING_TEXT = (
     "approval. This is not a refusal. Continue with work that does not depend on "
     'it, or end your turn. You will receive "[System: approval #{aid} ...]" when '
     "the user decides; if approved, re-run the exact same call and it will run "
-    "without another prompt."
+    "without another prompt. Provenance: {provenance}"
 )
 
 #: System message posted once the user approves a deferred card.
@@ -360,6 +360,14 @@ _APPROVAL_GRANTED_TEXT = (
 _APPROVAL_DENIED_TEXT = (
     "[System: approval #{aid} denied by the user: do not run {action}.{feedback}]"
 )
+
+
+def _bounded_approval_value(value: Any, limit: int = 16384) -> Any:
+    """Preserve normal inputs and label oversized diagnostic values explicitly."""
+    serialized = json.dumps(value, ensure_ascii=False)
+    if len(serialized) <= limit:
+        return value
+    return {"truncated": True, "preview": serialized[:limit]}
 
 
 def _approval_action_label(tool_name: str, preview: str) -> str:
@@ -1160,11 +1168,18 @@ async def _defer_codex_command_approval(
     if not isinstance(command, str):
         command = ""
     action = _approval_action_label("shell", command)
+    provenance = {
+        "origin": "codex-command-approval",
+        "tool_name": "shell",
+        "tool_input": _bounded_approval_value(codex_request.codex_params),
+        "cwd": cwd,
+    }
     params = ElicitationRequestParams.model_validate(
         {
             **codex_request.params.model_dump(),
             "async_kind": "approval",
             "approval_ref": aid,
+            **provenance,
         }
     )
     await _open_detached_card(
@@ -1172,7 +1187,7 @@ async def _defer_codex_command_approval(
         params,
         elicitation_id=elicitation_id,
         kind="approval",
-        payload={"aid": aid, "action": action},
+        payload={"aid": aid, "action": action, **provenance},
         grant_key=codex_command_grant_key(codex_request.codex_params.get("command"), cwd),
         mirror=True,
         conversation_store=conversation_store,
@@ -1180,7 +1195,9 @@ async def _defer_codex_command_approval(
     )
     _start_background_delivery(
         session_id,
-        _APPROVAL_PENDING_TEXT.format(aid=aid, action=action),
+        _APPROVAL_PENDING_TEXT.format(
+            aid=aid, action=action, provenance=json.dumps(provenance, ensure_ascii=False)
+        ),
         conversation_store=conversation_store,
         runner_router=runner_router,
         elicitation_id=elicitation_id,
@@ -1471,6 +1488,7 @@ def register_hooks_routes(
         permission_mode = payload.get("permission_mode")
         if permission_mode is not None and not isinstance(permission_mode, str):
             permission_mode = None
+        permission_suggestions = payload.get("permission_suggestions")
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
@@ -1629,11 +1647,25 @@ def register_hooks_routes(
             if isinstance(command, str) and command:
                 extras["command"] = command
         deferred_action = ""
+        provenance: dict[str, Any] = {}
         if deferrable:
             assert deferred_aid is not None
             extras["async_kind"] = "approval"
             extras["approval_ref"] = deferred_aid
             deferred_action = _approval_action_label(tool_name, preview_str)
+            provenance = {
+                "origin": (
+                    "omnigent-policy-unavailable"
+                    if payload.get("_omnigent_approval_origin") == "omnigent-policy-unavailable"
+                    else "claude-permission-prompt"
+                ),
+                "permission_mode": permission_mode,
+                "permission_suggestions": _bounded_approval_value(permission_suggestions, 4096),
+                "tool_name": tool_name,
+                "tool_input": _bounded_approval_value(tool_input),
+                "cwd": cwd,
+            }
+            extras.update(provenance)
         asking_name = native_agent.display_name if native_agent is not None else hook_label
         asking_vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
@@ -1660,7 +1692,7 @@ def register_hooks_routes(
                 params,
                 elicitation_id=deferred_elicitation_id,
                 kind="approval",
-                payload={"aid": deferred_aid, "action": deferred_action},
+                payload={"aid": deferred_aid, "action": deferred_action, **provenance},
                 grant_key=grant_key,
                 mirror=True,
                 conversation_store=conversation_store,
@@ -1672,6 +1704,7 @@ def register_hooks_routes(
                     "message": _APPROVAL_PENDING_TEXT.format(
                         aid=deferred_aid,
                         action=deferred_action,
+                        provenance=json.dumps(provenance, ensure_ascii=False),
                     ),
                 },
                 is_claude=is_claude,

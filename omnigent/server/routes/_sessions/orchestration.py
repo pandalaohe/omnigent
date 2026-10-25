@@ -5596,6 +5596,35 @@ async def _enrich_terminal_status_with_subagent_output(
     return {**data, "output": fallback} if fallback is not None else data
 
 
+async def _append_pending_deferred_approvals(
+    data: dict[str, Any],
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> dict[str, Any]:
+    """Annotate parent delivery after the original output has been classified."""
+    try:
+        cards = await asyncio.to_thread(conversation_store.list_detached_cards)
+    except Exception:  # noqa: BLE001 - annotation must not prevent terminal delivery.
+        _logger.warning("Could not read pending approvals for %s", session_id, exc_info=True)
+        return data
+    now = now_epoch()
+    pending = [
+        f"- {card.payload.get('aid', card.elicitation_id)}: "
+        f"{card.payload.get('action', 'Approval requested')} "
+        f"(origin: {card.payload.get('origin') or 'unknown'})"
+        for card in cards
+        if card.session_id == session_id
+        and card.kind == "approval"
+        and card.state == "pending"
+        and card.expires_at > now
+    ]
+    if not pending:
+        return data
+    summary = "Pending deferred approvals:\n" + "\n".join(pending)
+    output = data.get("output")
+    return {**data, "output": f"{output}\n\n{summary}" if output else summary}
+
+
 async def _heal_subagent_runner_binding_via_parent(
     child_conv: Conversation,
     runner_router: RunnerRouter | None,

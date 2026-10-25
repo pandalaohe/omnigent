@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -13,6 +16,7 @@ from omnigent.native.native_policy_hook import (
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
     post_evaluate_with_retry,
+    post_evaluate_with_retry_async,
 )
 
 
@@ -483,10 +487,10 @@ def _make_redirect_then_ok_client(
 
 
 def _make_sequence_client(
-    responses: list[httpx.Response],
+    responses: list[httpx.Response | httpx.HTTPError],
     request_bodies: list[dict[str, object]],
 ) -> type:
-    """Build an httpx.Client stub that returns responses in order."""
+    """Build an httpx.Client stub that returns or raises each outcome in order."""
 
     class _Client:
         def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
@@ -502,18 +506,28 @@ def _make_sequence_client(
             del url
             request_bodies.append(dict(json))
             index = min(len(request_bodies) - 1, len(responses) - 1)
-            return responses[index]
+            response = responses[index]
+            if isinstance(response, httpx.HTTPError):
+                raise response
+            return response
 
     return _Client
 
 
-def test_post_evaluate_with_retry_recovers_from_429_with_stable_elicitation_id(
+@pytest.mark.parametrize("fault", ["429", "protocol", "read"])
+def test_post_evaluate_with_retry_recovers_with_stable_elicitation_id(
     monkeypatch: pytest.MonkeyPatch,
+    fault: str,
 ) -> None:
-    """A transient 429 retries the same logical policy evaluation."""
+    """A rate limit or fast torn connection retries the same policy evaluation."""
     request = httpx.Request("POST", "https://ap/x")
-    responses = [
-        httpx.Response(429, text="rate limited", request=request),
+    faults = {
+        "429": httpx.Response(429, text="rate limited", request=request),
+        "protocol": httpx.RemoteProtocolError("connection torn", request=request),
+        "read": httpx.ReadError("connection torn", request=request),
+    }
+    responses: list[httpx.Response | httpx.HTTPError] = [
+        faults[fault],
         httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request),
     ]
     request_bodies: list[dict[str, object]] = []
@@ -564,12 +578,19 @@ def test_post_evaluate_with_retry_bounds_retry_after(
     assert sleeps == [10.0]
 
 
-def test_post_evaluate_with_retry_fails_closed_after_repeated_429(
+@pytest.mark.parametrize("fault", ["429", "protocol", "read"])
+def test_post_evaluate_with_retry_exhausts_budget_after_repeated_faults(
     monkeypatch: pytest.MonkeyPatch,
+    fault: str,
 ) -> None:
-    """Repeated 429s stop at the existing retry budget and fail closed."""
+    """Fast faults spend the retry budget and preserve the caller's fallback."""
     request = httpx.Request("POST", "https://ap/x")
-    responses = [httpx.Response(429, text="rate limited", request=request)]
+    faults = {
+        "429": httpx.Response(429, text="rate limited", request=request),
+        "protocol": httpx.RemoteProtocolError("connection torn", request=request),
+        "read": httpx.ReadError("connection torn", request=request),
+    }
+    responses: list[httpx.Response | httpx.HTTPError] = [faults[fault]]
     request_bodies: list[dict[str, object]] = []
     now = 0.0
     sleeps: list[float] = []
@@ -592,18 +613,89 @@ def test_post_evaluate_with_retry_fails_closed_after_repeated_429(
     assert resp is None
     assert error is not None
     assert "retry budget exhausted" in error
-    assert "server returned 429" in error
+    assert ("server returned 429" if fault == "429" else "connection torn") in error
     assert sleeps == [1.0, 2.0, 4.0, 8.0]
     assert len(request_bodies) == 5
     assert len({body["_omnigent_elicitation_id"] for body in request_bodies}) == 1
 
 
-def test_post_evaluate_with_retry_keeps_non_429_4xx_single_attempt(
+@pytest.mark.parametrize("error_type", [httpx.RemoteProtocolError, httpx.ReadError])
+@pytest.mark.asyncio
+async def test_post_evaluate_with_retry_async_recovers_with_stable_elicitation_id(
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.TransportError],
 ) -> None:
-    """A non-rate-limit 4xx remains final without sleeping or retrying."""
+    """Async fast tears reattach the same evaluation after transient recovery."""
+    bodies: list[dict[str, object]] = []
+
+    def _post(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            raise error_type("connection torn", request=request)
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request)
+
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S", 0.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_post)) as client:
+        resp, error = await post_evaluate_with_retry_async(
+            client, "https://ap/x", {"event": {"type": "PHASE_TOOL_CALL"}}, 86400.0, "hook"
+        )
+
+    assert resp is not None and resp.json() == {"result": "POLICY_ACTION_ALLOW"}
+    assert error is None
+    assert len(bodies) == 2
+    assert len({body["_omnigent_elicitation_id"] for body in bodies}) == 1
+
+
+@pytest.mark.parametrize("error_type", [httpx.RemoteProtocolError, httpx.ReadError])
+@pytest.mark.parametrize(
+    "phase,last_attempt", [("PHASE_REQUEST", 15.0), ("PHASE_TOOL_CALL", 300.0)]
+)
+@pytest.mark.asyncio
+async def test_post_evaluate_with_retry_async_fast_tears_spend_phase_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.TransportError],
+    phase: str,
+    last_attempt: float,
+) -> None:
+    """Repeated async fast tears exhaust the phase budget without minting another id."""
+    now = 0.0
+    bodies: list[dict[str, object]] = []
+    attempt_times: list[float] = []
+
+    def _post(request: httpx.Request) -> httpx.Response:
+        nonlocal now
+        bodies.append(json.loads(request.content))
+        attempt_times.append(now)
+        now += 1.0
+        raise error_type("connection torn", request=request)
+
+    monkeypatch.setattr(native_policy_hook, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S", 0.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_post)) as client:
+        resp, error = await post_evaluate_with_retry_async(
+            client, "https://ap/x", {"event": {"type": phase}}, 86400.0, "hook"
+        )
+
+    assert resp is None
+    assert error is not None and "retry budget exhausted" in error
+    assert "connection torn" in error
+    assert attempt_times[-1] == last_attempt
+    assert len(bodies) > 1
+    assert len({body["_omnigent_elicitation_id"] for body in bodies}) == 1
+
+
+@pytest.mark.parametrize("fault", ["422", "timeout"])
+def test_post_evaluate_with_retry_keeps_final_errors_single_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    """A non-rate-limit 4xx or read timeout stays final without sleeping or retrying."""
     request = httpx.Request("POST", "https://ap/x")
-    responses = [httpx.Response(422, text="invalid request", request=request)]
+    faults = {
+        "422": httpx.Response(422, text="invalid request", request=request),
+        "timeout": httpx.ReadTimeout("ask timed out", request=request),
+    }
+    responses: list[httpx.Response | httpx.HTTPError] = [faults[fault]]
     request_bodies: list[dict[str, object]] = []
     sleeps: list[float] = []
     monkeypatch.setattr(
@@ -616,7 +708,11 @@ def test_post_evaluate_with_retry_keeps_non_429_4xx_single_attempt(
     resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
 
     assert resp is None
-    assert error == "server returned 422: invalid request"
+    assert error == (
+        "server returned 422: invalid request"
+        if fault == "422"
+        else "request error: ask timed out"
+    )
     assert sleeps == []
     assert len(request_bodies) == 1
 
@@ -671,7 +767,7 @@ def test_post_evaluate_with_retry_reauths_on_login_redirect(
     assert seen_headers[1]["Authorization"] == "Bearer fresh"  # retry: fresh token
 
 
-@pytest.mark.parametrize("sever", ["504", "torn"])
+@pytest.mark.parametrize("sever", ["504", "protocol", "read"])
 def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
     monkeypatch: pytest.MonkeyPatch,
     sever: str,
@@ -714,7 +810,8 @@ def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
             req = httpx.Request("POST", url)
             if sever == "504":
                 return httpx.Response(504, request=req)
-            raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            error_type = httpx.RemoteProtocolError if sever == "protocol" else httpx.ReadError
+            raise error_type("gateway severed the poll", request=req)
 
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
 
@@ -831,8 +928,10 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
     assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
 
 
+@pytest.mark.parametrize("fault", ["503", "protocol", "read"])
 def test_post_evaluate_with_retry_budget_follows_the_request_phase(
     monkeypatch: pytest.MonkeyPatch,
+    fault: str,
 ) -> None:
     """
     A tool-call request rides the long budget; a prompt request keeps the short one.
@@ -864,7 +963,11 @@ def test_post_evaluate_with_retry_budget_follows_the_request_phase(
         def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
             del json
             attempt_times.append(clock["t"])
-            return httpx.Response(503, request=httpx.Request("POST", url))
+            request = httpx.Request("POST", url)
+            if fault == "503":
+                return httpx.Response(503, request=request)
+            error_type = httpx.RemoteProtocolError if fault == "protocol" else httpx.ReadError
+            raise error_type("connection torn", request=request)
 
     monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
 
