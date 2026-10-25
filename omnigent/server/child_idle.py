@@ -12,12 +12,20 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from omnigent.child_checkin import FOLLOWUP_NEXT_KEY, LAST_KEY
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
 from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runtime import turn_activity
 from omnigent.runtime.pending_elicitations import snapshot_for
 from omnigent.server.child_cap import child_cap_for
+from omnigent.server.child_checkin import (
+    checkin_followups,
+    refresh_checkin_followups,
+    session_checkin_instructions,
+    session_checkin_policy,
+    settle_checkin_followups,
+)
 from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
@@ -47,7 +55,7 @@ _logger = logging.getLogger(__name__)
 CHILD_IDLE_LABEL = "omnigent.child_idle"
 CHILD_IDLE_BATCH_LABEL = "omnigent.child_idle_batch"
 CHILD_RESUME_LABEL = "omnigent.child_idle_resume"
-CHECKIN_LAST_LABEL = "omnigent.checkin.last"
+CHECKIN_LAST_LABEL = LAST_KEY
 _BATCH_LEASE_S = 300
 _POST_TIMEOUT_S = 120
 NoticeOutcome = Literal["accepted", "deferred", "rejected", "uncertain"]
@@ -79,6 +87,41 @@ def resolve_checkin_instructions(settings: ChildIdleSettings, override: str | No
     if settings.checkin_instructions is not None:
         return settings.checkin_instructions
     return DEFAULT_CHECKIN_INSTRUCTIONS
+
+
+@dataclass(frozen=True)
+class CheckinPolicy:
+    min_gap_s: int
+    coverage: Literal["changed", "summary"]
+    instructions: str
+    min_gap_source: Literal["session", "user", "default"]
+    coverage_source: Literal["session", "user", "default"]
+    instructions_source: Literal["session", "user", "default"]
+
+
+def effective_checkin_policy(parent: Conversation, settings: ChildIdleSettings) -> CheckinPolicy:
+    overrides = session_checkin_policy(parent.labels)
+    gap = overrides.get("g")
+    coverage = settings.coverage
+    if overrides.get("c") == "changed":
+        coverage = "changed"
+    elif overrides.get("c") == "summary":
+        coverage = "summary"
+    instructions = session_checkin_instructions(parent.labels)
+    return CheckinPolicy(
+        gap if type(gap) is int else settings.min_gap_s,
+        coverage,
+        resolve_checkin_instructions(settings, instructions),
+        "session"
+        if "g" in overrides
+        else ("user" if "minGapSeconds" in settings.checkin_configured_fields else "default"),
+        "session"
+        if "c" in overrides
+        else ("user" if "coverage" in settings.checkin_configured_fields else "default"),
+        "session"
+        if instructions is not None
+        else ("user" if settings.checkin_instructions is not None else "default"),
+    )
 
 
 def transient_child_error(conv: Conversation) -> bool:
@@ -285,8 +328,11 @@ class ChildIdleSweeper:
         if conv.parent_conversation_id is None:
             return None
         parent = self._store.get_conversation(conv.parent_conversation_id)
+        return self._live_parent(parent)
+
+    def _live_parent(self, parent: Conversation | None) -> Conversation | None:
         current = parent
-        seen = {conv.id}
+        seen: set[str] = set()
         for _ in range(32):
             if current is None or current.id in seen or current.archived:
                 return None
@@ -461,6 +507,29 @@ class ChildIdleSweeper:
                         settings_by_parent[parent.id] = settings
                 except Exception:
                     _logger.exception("Could not inspect idle child %s", child.id)
+            for parent_id, raw in (
+                await asyncio.to_thread(self._store.list_label_values, FOLLOWUP_NEXT_KEY)
+            ).items():
+                try:
+                    if int(raw) > self._clock():
+                        continue
+                    parent = await asyncio.to_thread(self._store.get_conversation, parent_id)
+                    parent = await asyncio.to_thread(self._live_parent, parent)
+                    if parent is None:
+                        continue
+                    owner = await asyncio.to_thread(
+                        collab_owner_for, parent, self._store, self._permissions
+                    )
+                    if owner not in settings_by_owner:
+                        settings_by_owner[owner] = await asyncio.to_thread(
+                            read_child_idle_settings, prefs, owner
+                        )
+                    groups.setdefault(parent_id, [])
+                    settings_by_parent[parent_id] = settings_by_owner[owner]
+                except ValueError:
+                    _logger.warning("Invalid follow-up discovery timestamp for %s", parent_id)
+                except Exception:
+                    _logger.exception("Could not inspect follow-ups for %s", parent_id)
             for parent_id, children in groups.items():
                 settings = settings_by_parent[parent_id]
                 try:
@@ -487,7 +556,7 @@ class ChildIdleSweeper:
 
     def _claim_batch(self, parent_id: str) -> str | None:
         parent = self._store.get_conversation(parent_id)
-        if parent is None or parent.archived or not self._owns_parent(parent):
+        if self._live_parent(parent) is None or parent is None:
             return None
         now = self._clock()
         raw = parent.labels.get(CHILD_IDLE_BATCH_LABEL)
@@ -542,12 +611,22 @@ class ChildIdleSweeper:
                         # Re-observe next tick: the post may already have started a turn.
                         continue
                 current.append((fresh, state))
-        if not current:
+        labels = await asyncio.to_thread(refresh_checkin_followups, self._store, parent_id)
+        followups = {
+            key: item
+            for key, item in checkin_followups(labels).items()
+            if settings.enabled and not item.uncertain and item.due <= now
+        }
+        if not current and not followups:
             return
-        if now < min(state.queued for _, state in current) + settings.merge_window_s:
+        if current and now < min(state.queued for _, state in current) + settings.merge_window_s:
             return
         parent = await asyncio.to_thread(self._store.get_conversation, parent_id)
-        if parent is None or not cooldown_open(parent, settings.min_gap_s, self._clock()):
+        parent = await asyncio.to_thread(self._live_parent, parent)
+        if parent is None:
+            return
+        policy = effective_checkin_policy(parent, settings)
+        if not cooldown_open(parent, policy.min_gap_s, self._clock()):
             return
         items = await asyncio.to_thread(
             self._store.list_latest_message_items_for_conversations,
@@ -588,7 +667,7 @@ class ChildIdleSweeper:
             )
         roster: dict[str, str] = {}
         capacity = None
-        if settings.coverage == "summary":
+        if policy.coverage == "summary":
             for child in children:
                 fresh = await asyncio.to_thread(self._store.get_conversation, child.id)
                 if (
@@ -623,11 +702,13 @@ class ChildIdleSweeper:
                 {"cap": cap, "open": count, "free": max(0, cap - count) if cap else None}
             )
         parent = await asyncio.to_thread(self._store.get_conversation, parent_id)
+        parent = await asyncio.to_thread(self._live_parent, parent)
         now = self._clock()
-        if (
-            parent is None
-            or not batch_claim_valid(parent, claim, now)
-            or not cooldown_open(parent, settings.min_gap_s, now)
+        if parent is None:
+            return
+        policy = effective_checkin_policy(parent, settings)
+        if not batch_claim_valid(parent, claim, now) or not cooldown_open(
+            parent, policy.min_gap_s, now
         ):
             return
         old_last = parent.labels.get(CHECKIN_LAST_LABEL)
@@ -663,7 +744,7 @@ class ChildIdleSweeper:
                 self._store.compare_and_set_label, child.id, CHILD_IDLE_LABEL, old_label, reserved
             ):
                 previous.append((child.id, old_label, reserved))
-        if not previous:
+        if not previous and not followups:
             await asyncio.to_thread(
                 self._store.compare_and_set_label,
                 parent_id,
@@ -675,11 +756,21 @@ class ChildIdleSweeper:
         try:
             delivered_ids = {sid for sid, _, _ in previous}
             text = build_checkin_text(
-                resolve_checkin_instructions(settings),
+                policy.instructions,
                 [lines[sid] for sid, _, _ in previous],
                 [line for sid, line in roster.items() if sid not in delivered_ids],
                 capacity,
-                [],
+                [
+                    json.dumps(
+                        {
+                            "id": item.id,
+                            "text": item.text,
+                            "due_minutes_ago": max(0, now - item.due) // 60,
+                        },
+                        ensure_ascii=False,
+                    )
+                    for item in followups.values()
+                ],
             )
             # Preparation and posting share the reserved delivery deadline.
             remaining = int(reserved_last) - self._clock()
@@ -705,3 +796,11 @@ class ChildIdleSweeper:
                 await asyncio.to_thread(
                     self._store.compare_and_set_label, child_id, CHILD_IDLE_LABEL, reserved, label
                 )
+        elif followups:
+            await asyncio.to_thread(
+                settle_checkin_followups,
+                self._store,
+                parent_id,
+                {key: labels[key] for key in followups},
+                outcome,
+            )

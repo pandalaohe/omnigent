@@ -173,6 +173,7 @@ class ChildIdleSettings:
     min_gap_s: int = 3600
     coverage: Literal["changed", "summary"] = "summary"
     checkin_instructions: str | None = None
+    checkin_configured_fields: frozenset[str] = field(default_factory=frozenset, compare=False)
 
 
 def normalize_checkin_instructions(value: Any) -> str | None:
@@ -259,6 +260,7 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
         numbers[3],
         coverage,
         normalize_checkin_instructions(value.get("checkinInstructions")),
+        frozenset(value.keys() & {"minGapSeconds", "coverage"}),
     )
 
 

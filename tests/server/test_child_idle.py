@@ -13,6 +13,13 @@ from typing import Any
 import pytest
 from fastapi import APIRouter
 
+from omnigent.child_checkin import (
+    FOLLOWUP_NEXT_KEY,
+    FOLLOWUP_PREFIX,
+    FollowUp,
+    decode_followup,
+    encode_followup,
+)
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import (
     MessageData,
@@ -20,6 +27,12 @@ from omnigent.entities.conversation import (
 )
 from omnigent.runtime import pending_elicitations, session_stream, turn_activity
 from omnigent.server import child_idle as child_idle_module
+from omnigent.server.child_checkin import (
+    ChildCheckinPatch,
+    ChildFollowupAdd,
+    add_checkin_followup,
+    patch_checkin_labels,
+)
 from omnigent.server.child_idle import (
     CHECKIN_LAST_LABEL,
     CHILD_IDLE_BATCH_LABEL,
@@ -42,6 +55,7 @@ from omnigent.server.user_preferences_store import (
     read_child_idle_settings,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import LabelGroupChange
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 FRESH_AGENT_ID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -144,6 +158,161 @@ def harness(db_uri: str):
     yield _Harness(db_uri)
     pending_elicitations.reset_for_tests()
     turn_activity.reset_for_tests()
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "uncertain", "deferred", "rejected", "exception"])
+async def test_followup_without_children_tracks_delivery_outcome(harness: _Harness, outcome: str):
+    parent = harness.store.create_conversation(title="mother")
+    harness.owned.add(parent.id)
+    harness.settings(minGapSeconds=3600, repeatSeconds=0)
+    item = add_checkin_followup(
+        harness.store,
+        parent.id,
+        ChildFollowupAdd(text="Recheck deployment", after_minutes=15),
+        harness.now - 900,
+    )
+    if outcome == "exception":
+        harness.raise_on_post = True
+    else:
+        harness.outcome = outcome  # type: ignore[assignment]
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+    assert '"text": "Recheck deployment"' in harness.calls[0][1]
+    labels = harness.store.get_conversation(parent.id).labels
+    raw = labels.get(f"{FOLLOWUP_PREFIX}{item.id}")
+    if outcome == "accepted":
+        assert raw is None and FOLLOWUP_NEXT_KEY not in labels
+    elif outcome in ("uncertain", "exception"):
+        assert decode_followup(raw).uncertain is True
+        assert FOLLOWUP_NEXT_KEY not in labels
+    else:
+        assert decode_followup(raw).uncertain is False
+        assert labels[FOLLOWUP_NEXT_KEY] == str(harness.now)
+        assert CHECKIN_LAST_LABEL not in labels
+    harness.now += 3600
+    await harness.sweeper._tick()
+    assert len(harness.calls) == (2 if outcome in ("deferred", "rejected") else 1)
+
+
+@pytest.mark.parametrize("guard", ["disabled", "archived", "ancestor", "closed", "foreign"])
+async def test_followup_discovery_respects_delivery_and_lineage(harness: _Harness, guard: str):
+    ancestor = harness.store.create_conversation(title="ancestor")
+    parent = harness.store.create_conversation(
+        title="mother", kind="sub_agent", parent_conversation_id=ancestor.id
+    )
+    harness.owned.add(parent.id)
+    item = add_checkin_followup(
+        harness.store,
+        parent.id,
+        ChildFollowupAdd(text="Recheck", after_minutes=15),
+        harness.now - 900,
+    )
+    if guard == "disabled":
+        harness.settings(enabled=False)
+    elif guard in ("archived", "ancestor"):
+        harness.store.update_conversation(
+            parent.id if guard == "archived" else ancestor.id, archived=True
+        )
+    elif guard == "closed":
+        harness.store.set_labels(ancestor.id, {"omnigent.closed": "true"})
+    else:
+        harness.owned.clear()
+    await harness.sweeper._tick()
+    assert harness.calls == []
+    assert f"{FOLLOWUP_PREFIX}{item.id}" in harness.store.get_conversation(parent.id).labels
+    harness.settings(enabled=True)
+    harness.store.update_conversation(parent.id, archived=False)
+    harness.store.update_conversation(ancestor.id, archived=False)
+    harness.store.delete_label(ancestor.id, "omnigent.closed")
+    harness.owned.add(parent.id)
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+
+
+async def test_followup_obeys_session_cooldown_and_stale_index_is_repaired(harness: _Harness):
+    parent = harness.store.create_conversation(title="mother")
+    harness.owned.add(parent.id)
+    harness.settings(minGapSeconds=3600)
+    add_checkin_followup(
+        harness.store,
+        parent.id,
+        ChildFollowupAdd(text="Recheck", after_minutes=15),
+        harness.now - 900,
+    )
+    harness.store.set_labels(
+        parent.id, {CHECKIN_LAST_LABEL: str(harness.now), FOLLOWUP_NEXT_KEY: "1"}
+    )
+    await harness.sweeper._tick()
+    assert harness.calls == []
+    assert harness.store.get_conversation(parent.id).labels[FOLLOWUP_NEXT_KEY] == str(harness.now)
+    harness.now += 3599
+    await harness.sweeper._tick()
+    assert harness.calls == []
+    harness.now += 1
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "uncertain"])
+async def test_followup_changed_during_delivery_survives(
+    harness: _Harness, outcome: NoticeOutcome
+):
+    parent = harness.store.create_conversation(title="mother")
+    harness.owned.add(parent.id)
+    item = add_checkin_followup(
+        harness.store,
+        parent.id,
+        ChildFollowupAdd(text="Recheck", after_minutes=15),
+        harness.now - 900,
+    )
+    key = f"{FOLLOWUP_PREFIX}{item.id}"
+    replacement = encode_followup(FollowUp(item.id, harness.now + 3600, "Changed reminder"))
+
+    async def post(_parent: str, _text: str, _claim: str) -> NoticeOutcome:
+        harness.store.mutate_label_group(
+            parent.id,
+            "omnigent.checkin.",
+            lambda _labels: LabelGroupChange({key: replacement}, set()),
+        )
+        return outcome
+
+    harness.sweeper._post_notice = post
+    await harness.sweeper._tick()
+    labels = harness.store.get_conversation(parent.id).labels
+    assert labels[key] == replacement
+    assert labels[FOLLOWUP_NEXT_KEY] == str(harness.now + 3600)
+
+
+@pytest.mark.parametrize("instructions", ["Session text", "", None])
+async def test_session_policy_and_instructions_drive_the_notice(
+    harness: _Harness, instructions: str | None
+):
+    harness.settings(
+        minGapSeconds=3600,
+        coverage="summary",
+        mergeWindowSeconds=0,
+        checkinInstructions="Owner text",
+    )
+    child = harness.child()
+    parent = harness.store.get_conversation(child.parent_conversation_id)
+    patch_checkin_labels(
+        harness.store,
+        parent.id,
+        ChildCheckinPatch(min_gap_seconds=0, coverage="changed", instructions=instructions)
+        if instructions is not None
+        else ChildCheckinPatch(min_gap_seconds=0, coverage="changed"),
+    )
+    harness.store.set_labels(parent.id, {CHECKIN_LAST_LABEL: str(harness.now + 3600)})
+    await harness.sweeper._tick()
+    harness.now += 3600
+    await harness.sweeper._tick()
+    assert len(harness.calls) == 1
+    text = harness.calls[0][1]
+    assert "Capacity:" not in text
+    if instructions == "":
+        assert "<instructions>" not in text
+    else:
+        assert f"<instructions>\n{instructions or 'Owner text'}\n</instructions>" in text
 
 
 async def test_each_child_threshold_and_non_sliding_mother_window(harness: _Harness) -> None:
@@ -514,7 +683,7 @@ async def test_slow_scan_does_not_create_an_expired_batch_lease(
     assert len(harness.calls) == 1
 
 
-@pytest.mark.parametrize("change", ["card", "archive", "binding", "running"])
+@pytest.mark.parametrize("change", ["card", "archive", "binding", "running", "ancestor"])
 async def test_readiness_rechecks_fresh_mother(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
@@ -522,7 +691,12 @@ async def test_readiness_rechecks_fresh_mother(
 
     pending_elicitations.reset_for_tests()
     store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation(title="parent", runner_id="runner-a")
+    ancestor = store.create_conversation(title="ancestor") if change == "ancestor" else None
+    parent = store.create_conversation(
+        title="parent",
+        runner_id="runner-a",
+        parent_conversation_id=ancestor.id if ancestor else None,
+    )
     store.set_session_live_status(parent.id, "idle")
     state = SimpleNamespace()
     posts: list[str] = []
@@ -545,6 +719,9 @@ async def test_readiness_rechecks_fresh_mother(
             store.update_conversation(parent.id, archived=True)
         elif change == "binding":
             store.replace_runner_id(parent.id, "runner-b")
+        elif change == "ancestor":
+            assert ancestor is not None
+            store.update_conversation(ancestor.id, archived=True)
         else:
             monkeypatch.setattr(
                 routes_peer, "_session_status_from_cache", lambda *_args: "running"

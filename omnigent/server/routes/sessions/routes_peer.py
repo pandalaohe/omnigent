@@ -2177,7 +2177,7 @@ def register_peer_routes(
             and runner_router.runner_is_online(conv.runner_id)
         )
 
-    def _idle_notice_eligible(parent: Conversation | None, claim: str) -> bool:
+    async def _idle_notice_eligible(parent: Conversation | None, claim: str) -> bool:
         return bool(
             parent is not None
             and not parent.archived
@@ -2185,6 +2185,7 @@ def register_peer_routes(
             and parent.live_status == "idle"
             and _session_status_from_cache(parent.id, parent.live_status) == "idle"
             and _owns_idle_parent(parent)
+            and await asyncio.to_thread(child_idle._live_parent, parent) is not None
             and not has_pending_card(parent)
             and batch_claim_valid(parent, claim, int(time.time()))
         )
@@ -2193,7 +2194,7 @@ def register_peer_routes(
         from omnigent.server.peer_sweeper import PeerSweeper
 
         parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
-        if parent is None or not _idle_notice_eligible(parent, claim):
+        if parent is None or not await _idle_notice_eligible(parent, claim):
             return "deferred"
         state, _online = await _true_state(parent)
         fresh = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
@@ -2202,7 +2203,7 @@ def register_peer_routes(
             or fresh is None
             or fresh.runner_id != parent.runner_id
             or fresh.archive_revision != parent.archive_revision
-            or not _idle_notice_eligible(fresh, claim)
+            or not await _idle_notice_eligible(fresh, claim)
         ):
             return "deferred"
         try:

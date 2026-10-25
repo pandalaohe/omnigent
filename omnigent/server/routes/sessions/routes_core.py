@@ -865,10 +865,10 @@ def register_core_routes(
             "open_children": open_children,
         }
 
-    async def checkin_write_session(request: Request, session_id: str) -> Conversation:
+    async def checkin_session(request: Request, session_id: str, level: int) -> Conversation:
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, level, permission_store, conversation_store
         )
         conv = access.conversation or await asyncio.to_thread(
             conversation_store.get_conversation, session_id
@@ -877,11 +877,61 @@ def register_core_routes(
             raise _session_not_found()
         return conv
 
+    @router.get("/sessions/{session_id}/child-checkin", include_in_schema=False)
+    async def get_child_checkin(request: Request, session_id: str) -> dict[str, Any]:
+        from omnigent.child_checkin import LAST_KEY
+        from omnigent.server.child_checkin import checkin_followups
+        from omnigent.server.child_idle import effective_checkin_policy
+        from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.user_preferences_store import read_child_idle_settings
+
+        conv = await checkin_session(request, session_id, LEVEL_READ)
+        owner = await asyncio.to_thread(
+            collab_owner_for, conv, conversation_store, permission_store
+        )
+        prefs = getattr(request.app.state, "user_preferences_store", None)
+        settings = await asyncio.to_thread(read_child_idle_settings, prefs, owner)
+        policy = effective_checkin_policy(conv, settings)
+        try:
+            last = int(conv.labels[LAST_KEY])
+            if last < 0:
+                last = None
+        except (KeyError, ValueError):
+            last = None
+        cap, _source = await asyncio.to_thread(
+            child_cap_for, conv, conversation_store, permission_store, prefs
+        )
+        return {
+            "min_gap_seconds": policy.min_gap_s,
+            "coverage": policy.coverage,
+            "instructions_source": policy.instructions_source,
+            "source": policy.min_gap_source,
+            "coverage_source": policy.coverage_source,
+            "delivery": "on" if settings.enabled else "off",
+            "last_delivery": last,
+            "next_allowed": last + policy.min_gap_s if last is not None else None,
+            "follow_ups": [
+                {
+                    "id": item.id,
+                    "due": item.due,
+                    "text": item.text,
+                    "delivery_uncertain": item.uncertain,
+                }
+                for item in sorted(
+                    checkin_followups(conv.labels).values(), key=lambda item: (item.due, item.id)
+                )
+            ],
+            "cap": cap,
+            "open_children": await asyncio.to_thread(
+                conversation_store.count_counted_children, session_id
+            ),
+        }
+
     @router.patch("/sessions/{session_id}/child-checkin", include_in_schema=False)
     async def patch_child_checkin(
         request: Request, session_id: str, body: ChildCheckinPatch
     ) -> dict[str, str]:
-        await checkin_write_session(request, session_id)
+        await checkin_session(request, session_id, LEVEL_EDIT)
         try:
             await asyncio.to_thread(patch_checkin_labels, conversation_store, session_id, body)
         except ConversationNotFoundError as exc:
@@ -897,7 +947,7 @@ def register_core_routes(
         from omnigent.server.session_collab import collab_owner_for
         from omnigent.server.user_preferences_store import read_child_idle_settings
 
-        conv = await checkin_write_session(request, session_id)
+        conv = await checkin_session(request, session_id, LEVEL_EDIT)
         try:
             item = await asyncio.to_thread(
                 add_checkin_followup, conversation_store, session_id, body, int(time.time())
@@ -922,7 +972,7 @@ def register_core_routes(
     async def remove_child_checkin_followup(
         request: Request, session_id: str, fid: str
     ) -> dict[str, str]:
-        await checkin_write_session(request, session_id)
+        await checkin_session(request, session_id, LEVEL_EDIT)
         try:
             await asyncio.to_thread(remove_checkin_followup, conversation_store, session_id, fid)
         except ConversationNotFoundError as exc:

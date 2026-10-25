@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
+from dataclasses import replace
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -15,11 +17,61 @@ from omnigent.child_checkin import (
     INSTRUCTIONS_PREFIX,
     POLICY_KEY,
     FollowUp,
+    decode_followup,
     encode_followup,
     next_followup_due,
 )
 from omnigent.db.utils import strip_nul_bytes
 from omnigent.stores.conversation_store import ConversationStore, LabelGroupChange
+
+_logger = logging.getLogger(__name__)
+
+
+def session_checkin_policy(labels: dict[str, str]) -> dict[str, int | str]:
+    try:
+        policy = json.loads(labels.get(POLICY_KEY, "{}"))
+    except ValueError:
+        policy = {}
+    if not isinstance(policy, dict):
+        return {}
+    return {
+        key: value
+        for key, value in policy.items()
+        if (key == "g" and type(value) is int and 0 <= value <= 86400)
+        or (key == "c" and value in ("changed", "summary"))
+    }
+
+
+def session_checkin_instructions(labels: dict[str, str]) -> str | None:
+    chunks = {key: value for key, value in labels.items() if key.startswith(INSTRUCTIONS_PREFIX)}
+    if not chunks:
+        return None
+    keys = [f"{INSTRUCTIONS_PREFIX}{index}" for index in range(len(chunks))]
+    if (
+        len(chunks) > 4
+        or set(keys) != chunks.keys()
+        or any(len(value) > 250 for value in chunks.values())
+    ):
+        _logger.warning("Invalid session check-in instruction chunks")
+        return None
+    text = strip_nul_bytes("".join(chunks[key] for key in keys))
+    if text and not text.strip():
+        _logger.warning("Invalid blank session check-in instructions")
+        return None
+    return text
+
+
+def checkin_followups(labels: dict[str, str]) -> dict[str, FollowUp]:
+    items: dict[str, FollowUp] = {}
+    for key, raw in labels.items():
+        if not key.startswith(FOLLOWUP_PREFIX):
+            continue
+        item = decode_followup(raw)
+        if item is None:
+            _logger.warning("Invalid check-in follow-up label %s", key)
+        else:
+            items[key] = replace(item, id=key[len(FOLLOWUP_PREFIX) :])
+    return items
 
 
 class ChildCheckinPatch(BaseModel):
@@ -78,18 +130,7 @@ def patch_checkin_labels(
         if patch.reset:
             deletes.add(POLICY_KEY)
         elif {"min_gap_seconds", "coverage"} & patch.model_fields_set:
-            try:
-                policy = json.loads(current.get(POLICY_KEY, "{}"))
-            except ValueError:
-                policy = {}
-            if not isinstance(policy, dict):
-                policy = {}
-            policy = {
-                key: value
-                for key, value in policy.items()
-                if (key == "g" and type(value) is int and 0 <= value <= 86400)
-                or (key == "c" and value in ("changed", "summary"))
-            }
+            policy = session_checkin_policy(current)
             if patch.min_gap_seconds is not None:
                 policy["g"] = patch.min_gap_seconds
             if patch.coverage is not None:
@@ -136,5 +177,32 @@ def remove_checkin_followup(store: ConversationStore, session_id: str, fid: str)
         if key not in current:
             raise KeyError(fid)
         return _indexed_change(current, {}, {key})
+
+    store.mutate_label_group(session_id, CHECKIN_LABEL_PREFIX, change)
+
+
+def refresh_checkin_followups(store: ConversationStore, session_id: str) -> dict[str, str]:
+    return store.mutate_label_group(
+        session_id, CHECKIN_LABEL_PREFIX, lambda current: _indexed_change(current, {}, set())
+    )
+
+
+def settle_checkin_followups(
+    store: ConversationStore,
+    session_id: str,
+    delivered: dict[str, str],
+    outcome: Literal["accepted", "uncertain"],
+) -> None:
+    def change(current: dict[str, str]) -> LabelGroupChange:
+        upserts: dict[str, str] = {}
+        deletes: set[str] = set()
+        for key, raw in delivered.items():
+            if current.get(key) != raw:
+                continue
+            if outcome == "accepted":
+                deletes.add(key)
+            elif (item := decode_followup(raw)) is not None:
+                upserts[key] = encode_followup(replace(item, uncertain=True))
+        return _indexed_change(current, upserts, deletes)
 
     store.mutate_label_group(session_id, CHECKIN_LABEL_PREFIX, change)

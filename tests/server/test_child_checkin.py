@@ -12,6 +12,7 @@ from omnigent.child_checkin import (
     FOLLOWUP_NEXT_KEY,
     FOLLOWUP_PREFIX,
     INSTRUCTIONS_PREFIX,
+    LAST_KEY,
     POLICY_KEY,
     decode_followup,
 )
@@ -76,6 +77,64 @@ async def test_patch_overrides_chunks_reset_and_validation(client: httpx.AsyncCl
     assert not any(key.startswith(INSTRUCTIONS_PREFIX) for key in labels)
 
 
+async def test_read_effective_policy_followups_and_reset(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    path = f"/v1/sessions/{parent.id}/child-checkin"
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = prefs
+    initial = await client.get(path)
+    assert initial.status_code == 200, initial.text
+    assert initial.json() == {
+        "min_gap_seconds": 3600,
+        "coverage": "summary",
+        "instructions_source": "default",
+        "source": "default",
+        "coverage_source": "default",
+        "delivery": "off",
+        "last_delivery": None,
+        "next_allowed": None,
+        "follow_ups": [],
+        "cap": None,
+        "open_children": 0,
+    }
+    prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "child_idle",
+        {
+            "enabled": True,
+            "minGapSeconds": 3600,
+            "coverage": "changed",
+            "checkinInstructions": "Owner text",
+        },
+    )
+    inherited = (await client.get(path)).json()
+    assert (
+        inherited["source"]
+        == inherited["coverage_source"]
+        == inherited["instructions_source"]
+        == "user"
+    )
+    await client.patch(path, json={"min_gap_seconds": 0, "instructions": ""})
+    store.set_labels(
+        parent.id, {LAST_KEY: "100", f"{FOLLOWUP_PREFIX}1234abcd": '{"d":200,"t":"Recheck","u":1}'}
+    )
+    override = (await client.get(path)).json()
+    assert override["min_gap_seconds"] == 0 and override["source"] == "session"
+    assert override["coverage_source"] == "user" and override["instructions_source"] == "session"
+    assert override["next_allowed"] == override["last_delivery"] == 100
+    assert override["follow_ups"] == [
+        {"id": "1234abcd", "due": 200, "text": "Recheck", "delivery_uncertain": True}
+    ]
+    await client.patch(path, json={"reset": True, "reset_instructions": True})
+    restored = (await client.get(path)).json()
+    assert restored["source"] == restored["instructions_source"] == "user"
+
+
 async def test_followup_admission_removal_and_delivery_switch(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -125,6 +184,7 @@ async def test_followup_admission_removal_and_delivery_switch(
 
 async def test_checkin_writes_require_existing_session(client: httpx.AsyncClient):
     path = "/v1/sessions/missing/child-checkin"
+    assert (await client.get(path)).status_code == 404
     assert (await client.patch(path, json={"coverage": "summary"})).status_code == 404
     assert (
         await client.post(f"{path}/follow-ups", json={"text": "later", "after_minutes": 15})
@@ -197,6 +257,11 @@ async def test_checkin_mutations_require_edit_grant(
             ]
             assert all(response.status_code in (403, 404) for response in responses)
             assert not store.get_conversation(parent.id).labels
+            read = await client.get(path, headers=headers)
+            if user == "reader@example.test":
+                assert read.status_code == 200
+            else:
+                assert read.status_code in (403, 404)
         for user in ("editor@example.test", "owner@example.test"):
             headers = {"x-test-user": user}
             assert (
