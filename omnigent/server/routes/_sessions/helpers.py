@@ -11692,7 +11692,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {permission_key!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
-    handoff_key = next((key for key in labels if key.startswith("omnigent.handoff.")), None)
+    from omnigent.child_checkin import CHECKIN_LABEL_PREFIX
+    from omnigent.stores.conversation_store import _may_collate_to
+
+    handoff_key = next(
+        (
+            key
+            for key in labels
+            if key.startswith("omnigent.handoff.")
+            or _may_collate_to(key, CHECKIN_LABEL_PREFIX, prefix=True)
+        ),
+        None,
+    )
     if handoff_key is not None:
         raise OmnigentError(
             f"label {handoff_key!r} is server-internal and cannot be set by clients",

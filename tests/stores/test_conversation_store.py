@@ -36,7 +36,11 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.conversation_store import ConversationUpdateResult
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    ConversationUpdateResult,
+    LabelGroupChange,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
     _literal_like_pattern,
@@ -45,6 +49,165 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.host_store import HostStore
 
 # ── CRUD ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+def test_mutate_label_group_preserves_siblings_and_literal_prefix(
+    request: pytest.FixtureRequest, store_fixture: str
+) -> None:
+    store = request.getfixturevalue(store_fixture)
+    conv = store.create_conversation()
+    store.set_labels(conv.id, {"group_%.a": "old", "group_%.b": "drop", "groupXX.a": "keep"})
+
+    def change(labels: dict[str, str]) -> LabelGroupChange:
+        assert labels == {"group_%.a": "old", "group_%.b": "drop"}
+        return LabelGroupChange({"group_%.a": "new", "group_%.c": "界" * 256}, {"group_%.b"})
+
+    assert store.mutate_label_group(conv.id, "group_%.", change) == {
+        "group_%.a": "new",
+        "group_%.c": "界" * 256,
+    }
+    reloaded = store.get_conversation(conv.id)
+    assert reloaded is not None
+    assert reloaded.labels == {"group_%.a": "new", "group_%.c": "界" * 256, "groupXX.a": "keep"}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        LabelGroupChange({"group.new": "x" * 257}, {"group.old"}),
+        LabelGroupChange({"outside": "new"}, {"group.old"}),
+        LabelGroupChange({"group.new": "new"}, {"outside"}),
+    ],
+)
+def test_mutate_label_group_rejects_changes_atomically(
+    conversation_store: SqlAlchemyConversationStore, change: LabelGroupChange
+) -> None:
+    conv = conversation_store.create_conversation()
+    original = {"group.old": "kept", "outside": "also kept"}
+    conversation_store.set_labels(conv.id, original)
+    with pytest.raises(ValueError):
+        conversation_store.mutate_label_group(conv.id, "group.", lambda _labels: change)
+    reloaded = conversation_store.get_conversation(conv.id)
+    assert reloaded is not None
+    assert reloaded.labels == original
+
+
+def test_label_group_and_discovery_are_workspace_scoped(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    store = conversation_store
+    first = store.create_conversation()
+    store.set_labels(first.id, {"group.next": "10", "group.other": "ignored"})
+    with workspace_scope(42):
+        second = store.create_conversation()
+        store.set_labels(second.id, {"group.next": "20"})
+        assert store.list_label_values("group.next") == {second.id: "20"}
+        with pytest.raises(ConversationNotFoundError):
+            store.mutate_label_group(first.id, "group.", lambda _: LabelGroupChange({}, set()))
+        assert store.mutate_label_group(
+            second.id, "group.", lambda _: LabelGroupChange({"group.next": "30"}, set())
+        ) == {"group.next": "30"}
+    assert store.list_label_values("group.next") == {first.id: "10"}
+
+
+def test_mutate_label_group_serializes_concurrent_admission(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from threading import Barrier
+
+    store = conversation_store
+    conv = store.create_conversation()
+    store.set_labels(conv.id, {f"group.{i}": str(i) for i in range(19)})
+    ready = Barrier(2)
+
+    def add(index: int) -> bool:
+        ready.wait(timeout=5)
+
+        def change(labels: dict[str, str]) -> LabelGroupChange:
+            if len(labels) >= 20:
+                raise ValueError("full")
+            return LabelGroupChange({f"group.{index}": "added"}, set())
+
+        try:
+            store.mutate_label_group(conv.id, "group.", change)
+        except ValueError as error:
+            assert str(error) == "full"
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(add, (19, 20))) == [False, True]
+    reloaded = store.get_conversation(conv.id)
+    assert reloaded is not None
+    assert len(reloaded.labels) == 20
+
+
+def test_mutate_label_group_concurrent_add_remove_keeps_discovery_current(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from threading import Barrier
+
+    from omnigent.child_checkin import (
+        CHECKIN_LABEL_PREFIX,
+        FOLLOWUP_NEXT_KEY,
+        FOLLOWUP_PREFIX,
+        FollowUp,
+        encode_followup,
+        next_followup_due,
+    )
+
+    store = conversation_store
+    conv = store.create_conversation()
+    old_key, new_key = f"{FOLLOWUP_PREFIX}old", f"{FOLLOWUP_PREFIX}new"
+    new_value = encode_followup(FollowUp("new", 20, "new"))
+    store.set_labels(
+        conv.id, {old_key: encode_followup(FollowUp("old", 10, "old")), FOLLOWUP_NEXT_KEY: "10"}
+    )
+    ready = Barrier(2)
+
+    def mutate(add: bool) -> None:
+        ready.wait(timeout=5)
+
+        def change(labels: dict[str, str]) -> LabelGroupChange:
+            updates = {new_key: new_value} if add else {}
+            deletes = set() if add else {old_key}
+            remaining = {
+                key: value for key, value in labels.items() if key not in deletes
+            } | updates
+            due = next_followup_due(remaining)
+            if due is None:
+                deletes.add(FOLLOWUP_NEXT_KEY)
+            else:
+                updates[FOLLOWUP_NEXT_KEY] = str(due)
+            return LabelGroupChange(updates, deletes)
+
+        store.mutate_label_group(conv.id, CHECKIN_LABEL_PREFIX, change)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(mutate, (True, False)))
+    reloaded = store.get_conversation(conv.id)
+    assert reloaded is not None
+    assert reloaded.labels == {new_key: new_value, FOLLOWUP_NEXT_KEY: "20"}
+
+
+def test_fork_drops_entire_checkin_prefix(conversation_store: SqlAlchemyConversationStore) -> None:
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {
+            "omnigent.checkin.policy": "policy",
+            "omnigent.checkin.last": "10",
+            "omnigent.checkin.instr.0": "owner text",
+            "omnigent.checkin.fu.1234abcd": "follow-up",
+            "omnigent.checkin.future": "future state",
+            "omnigent.checkin_other": "keep",
+        },
+    )
+    fork = conversation_store.fork_conversation(source.id)
+    assert fork.labels == {"omnigent.checkin_other": "keep"}
 
 
 class _CommitSerializationFailure(Exception):

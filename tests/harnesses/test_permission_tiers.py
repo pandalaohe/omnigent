@@ -276,6 +276,27 @@ def test_malformed_child_cap_never_falls_back_to_read(cap: object) -> None:
         assert decision(tier, "sys_child_cap", {"cap": cap}).action == Verdict.DENY
 
 
+def test_checkin_read_and_writes_use_distinct_tiers() -> None:
+    assert plan_visible_tool_names(("sys_child_checkin",)) == ("sys_child_checkin",)
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "sys_child_checkin", {"action": "read"}).action == Verdict.ALLOW
+        assert (
+            decision(tier, "sys_child_checkin", {"action": "read", "reset": True}).action
+            == Verdict.DENY
+        )
+    for action in ("set", "follow_up_add", "follow_up_remove"):
+        args: dict[str, object] = {"action": action}
+        if action == "follow_up_add":
+            args.update(text="Recheck", after_minutes=15)
+        elif action == "follow_up_remove":
+            args["id"] = "1234abcd"
+        assert decision("ask", "sys_child_checkin", args).action == Verdict.ASK
+        assert decision("plan", "sys_child_checkin", args).action == Verdict.DENY
+        assert decision("accept-edits", "sys_child_checkin", args).action == Verdict.ASK
+        assert decision("auto", "sys_child_checkin", args).action == Verdict.ALLOW
+        assert decision("full", "sys_child_checkin", args).action == Verdict.ALLOW
+
+
 @pytest.mark.parametrize("encode_arguments", [False, True], ids=["object", "json"])
 @pytest.mark.parametrize(
     ("name", "args", "expected"),
