@@ -4,7 +4,7 @@
 // their new lines. The load-line rule matches the server's.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -188,6 +188,48 @@ describe("useUpdateSystemStatusSettings", () => {
     });
     await flush();
     expect(statusFetches()).toBe(2);
+  });
+});
+
+describe("useUpdateSystemStatusSettings pending state", () => {
+  it("stays pending until the refreshed view arrives", async () => {
+    let releaseView: (() => void) | undefined;
+    let statusCalls = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input) === "/v1/system/settings") return mockResponse({});
+      statusCalls += 1;
+      if (statusCalls === 2) {
+        await new Promise<void>((resolve) => {
+          releaseView = resolve;
+        });
+      }
+      return mockResponse({ ...EMPTY_SUMMARY, server: null, hosts: [] });
+    });
+    const { result } = renderHook(
+      () => ({ status: useSystemStatus({ live: false }), update: useUpdateSystemStatusSettings() }),
+      { wrapper: makeWrapper() },
+    );
+    await flush();
+
+    let saved = false;
+    let save: Promise<unknown> | undefined;
+    act(() => {
+      save = result.current.update
+        .mutateAsync({ load_lines: { hosts: { host_1: { heavy: 3, new_session: 6 } } } })
+        .then(() => {
+          saved = true;
+        });
+    });
+    // The refreshed view is held back: the save must still be pending.
+    await waitFor(() => expect(releaseView).toBeDefined());
+    await waitFor(() => expect(result.current.update.isPending).toBe(true));
+    expect(saved).toBe(false);
+
+    await act(async () => {
+      releaseView?.();
+      await save;
+    });
+    expect(saved).toBe(true);
   });
 });
 

@@ -855,35 +855,36 @@ export function HostCard({
         <p className="mb-3 text-sm text-muted-foreground">Update host to see resources.</p>
       )}
       {machine !== null && (
+        <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <Metric label="CPU" value={formatPct(machine.cpu_pct)} />
+          <Metric
+            label="Memory"
+            value={`${formatBytes(machine.mem_used)} / ${formatBytes(machine.mem_total)}`}
+          />
+          <Metric
+            label="Disk"
+            value={
+              machine.disk_total > 0
+                ? formatPct((machine.disk_used / machine.disk_total) * 100)
+                : "—"
+            }
+          />
+        </dl>
+      )}
+      {/* Lines stay editable while a host is offline or has not sent resources yet. */}
+      {(machine !== null || host.lines !== undefined) && (
+        <HostLoad host={host} isAdmin={isAdmin} defaultLines={defaultLines} />
+      )}
+      {machine !== null && points.length > 0 && firstEntry !== undefined && (
         <>
-          <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-            <Metric label="CPU" value={formatPct(machine.cpu_pct)} />
-            <Metric
-              label="Memory"
-              value={`${formatBytes(machine.mem_used)} / ${formatBytes(machine.mem_total)}`}
-            />
-            <Metric
-              label="Disk"
-              value={
-                machine.disk_total > 0
-                  ? formatPct((machine.disk_used / machine.disk_total) * 100)
-                  : "—"
-              }
-            />
-          </dl>
-          <HostLoad host={host} isAdmin={isAdmin} defaultLines={defaultLines} />
-          {points.length > 0 && firstEntry !== undefined && (
-            <>
-              <Sparkline
-                points={points}
-                threshold={threshold}
-                label={`${name} CPU, last 24 hours`}
-                className="mt-3"
-                latest={hasSample ? (stale ? "stale" : "live") : undefined}
-              />
-              <SparklineAxis firstT={firstEntry.t} nowMs={nowMs} />
-            </>
-          )}
+          <Sparkline
+            points={points}
+            threshold={threshold}
+            label={`${name} CPU, last 24 hours`}
+            className="mt-3"
+            latest={hasSample ? (stale ? "stale" : "live") : undefined}
+          />
+          <SparklineAxis firstT={firstEntry.t} nowMs={nowMs} />
         </>
       )}
       {snapshot !== null && snapshot.processes.length > 0 && (
@@ -986,7 +987,7 @@ export function SystemStatusPage() {
   const data = status.data;
   const hostNames = new Map(data.hosts.map((host) => [host.host_id, host.name || host.host_id]));
   const threshold = settings.data?.cpu_pct ?? null;
-  const defaultLines = settings.data?.load_lines.default ?? null;
+  const defaultLines = settings.data?.load_lines?.default ?? null;
   return (
     <PageScroll maxWidthClassName="max-w-5xl" contentClassName="px-8">
       <div className="mb-6 flex items-start justify-between gap-4">

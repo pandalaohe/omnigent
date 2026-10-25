@@ -210,7 +210,8 @@ export interface SystemStatusSettings {
   disk_pct: number;
   server_5xx_pct: number;
   health_check: HealthCheckSettings;
-  load_lines: SystemLoadLinesSettings;
+  /** Absent from servers that predate the load lines. */
+  load_lines?: SystemLoadLinesSettings;
   /** Shipped prompt to show when `health_check.prompt` is null. */
   default_health_check_prompt: string;
 }
@@ -397,10 +398,13 @@ export function useUpdateSystemStatusSettings() {
       if (!res.ok) throw new Error(await errorMessage(res));
       return (await res.json()) as SystemStatusSettings;
     },
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEY });
-      // Host cards show each host's effective lines from the status view.
-      void queryClient.invalidateQueries({ queryKey: FULL_QUERY_KEY });
-    },
+    // Stay pending until the refetches land, so an editor reopened right after
+    // a save starts from the saved lines rather than the previous ones.
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEY }),
+        // Host cards show each host's effective lines from the status view.
+        queryClient.invalidateQueries({ queryKey: FULL_QUERY_KEY }),
+      ]),
   });
 }

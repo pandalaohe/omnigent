@@ -226,6 +226,19 @@ describe("LoadLinesSettingsForm", () => {
     expect(settingsPutCall()).toBeUndefined();
   });
 
+  it("leaves the form out when the server predates load lines", async () => {
+    const { load_lines: _omitted, ...olderServer } = SETTINGS;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input) === "/v1/system/settings"
+        ? mockResponse(olderServer)
+        : defaultFetch(input, init),
+    );
+    renderSection();
+
+    expect(await screen.findByLabelText(/CPU threshold/)).toHaveValue(85);
+    expect(screen.queryByTestId("load-lines-form")).toBeNull();
+  });
+
   it("lets the field's own limit refuse a new-session line above 64", async () => {
     renderSection();
 

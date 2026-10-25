@@ -633,6 +633,23 @@ describe("SystemStatusPage host load", () => {
     ).toBeNull();
   });
 
+  it("keeps an offline host's lines visible and editable without resources", () => {
+    const view = viewWithLoad({});
+    Object.assign(view.hosts[1], {
+      level: "unknown",
+      lines: { heavy: 3, new_session: 6 },
+      lines_source: "host",
+    });
+    mocks.status.current = { data: view, isLoading: false, isError: false, error: null };
+    renderPage();
+
+    const row = screen.getByTestId("host-load-host_2");
+    expect(within(row).getByTestId("host-load-level")).toHaveTextContent("Incomplete data");
+    expect(row).toHaveTextContent("Heavy-work line 3");
+    expect(within(row).queryByTestId("host-load-marker")).toBeNull();
+    expect(within(row).getByRole("button", { name: "Edit lines" })).toBeInTheDocument();
+  });
+
   it("counts queued child sessions only when there are some", () => {
     const row = renderLoad({ level: "new_session_hold", load_per_core: 5.4, queued_children: 2 });
     expect(within(row).getByTestId("host-load-queued")).toHaveTextContent(
@@ -642,6 +659,13 @@ describe("SystemStatusPage host load", () => {
 
     const none = renderLoad({});
     expect(within(none).queryByTestId("host-load-queued")).toBeNull();
+  });
+
+  it("renders the card for an admin whose server sends no load lines in settings", () => {
+    mocks.settings.current = { data: { cpu_pct: 85 } };
+    const row = renderLoad({});
+    fireEvent.click(within(row).getByRole("button", { name: "Edit lines" }));
+    expect(within(row).getByRole("checkbox", { name: "Follow the default" })).toBeChecked();
   });
 
   it("offers Edit lines to admins only", () => {

@@ -114,6 +114,7 @@ import {
   parseLoadLine,
   useSystemStatusSettings,
   useUpdateSystemStatusSettings,
+  type SystemLoadLinesSettings,
   type SystemStatusSettings,
   type SystemStatusThresholds,
 } from "@/hooks/useSystemStatus";
@@ -669,14 +670,14 @@ export function SystemStatusSettingsSection() {
         </div>
       )}
 
-      {settings.data !== undefined && (
+      {settings.data?.load_lines !== undefined && (
         <div className="mt-10 max-w-xl border-t pt-6">
           <h2 className="text-ui font-semibold">Host load lines</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Default lines for every host in this workspace, as load per core (1-minute load divided
             by logical cores). A host can override them on its System status card.
           </p>
-          <LoadLinesSettingsForm settings={settings.data} />
+          <LoadLinesSettingsForm lines={settings.data.load_lines} />
         </div>
       )}
 
@@ -700,28 +701,28 @@ interface LoadLinesDraft {
   queueEnabled: boolean;
 }
 
-function toLoadLinesDraft(settings: SystemStatusSettings): LoadLinesDraft {
+function toLoadLinesDraft(lines: SystemLoadLinesSettings): LoadLinesDraft {
   return {
-    heavy: String(settings.load_lines.default.heavy),
-    newSession: String(settings.load_lines.default.new_session),
-    queueEnabled: settings.load_lines.queue_enabled,
+    heavy: String(lines.default.heavy),
+    newSession: String(lines.default.new_session),
+    queueEnabled: lines.queue_enabled,
   };
 }
 
 /** The workspace's default load lines and the queue switch; the pair is checked before saving. */
-function LoadLinesSettingsForm({ settings }: { settings: SystemStatusSettings }) {
+function LoadLinesSettingsForm({ lines }: { lines: SystemLoadLinesSettings }) {
   const update = useUpdateSystemStatusSettings();
-  const [draft, setDraft] = useState<LoadLinesDraft>(() => toLoadLinesDraft(settings));
+  const [draft, setDraft] = useState<LoadLinesDraft>(() => toLoadLinesDraft(lines));
   const [invalid, setInvalid] = useState<string | null>(null);
-  const lastSynced = useRef(JSON.stringify(toLoadLinesDraft(settings)));
+  const lastSynced = useRef(JSON.stringify(toLoadLinesDraft(lines)));
 
   useEffect(() => {
-    const next = toLoadLinesDraft(settings);
+    const next = toLoadLinesDraft(lines);
     setDraft((current) => (JSON.stringify(current) === lastSynced.current ? next : current));
     lastSynced.current = JSON.stringify(next);
-  }, [settings]);
+  }, [lines]);
 
-  const unchanged = JSON.stringify(draft) === JSON.stringify(toLoadLinesDraft(settings));
+  const unchanged = JSON.stringify(draft) === JSON.stringify(toLoadLinesDraft(lines));
 
   return (
     <form
