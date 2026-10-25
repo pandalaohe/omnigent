@@ -46,6 +46,10 @@ _FOLDED_ROLE = "folded"
 # even while the server holds a fast-sampling lease.
 _FALLBACK_TREE_INTERVAL_S = 60.0
 
+# Windows load emulation updates every five seconds; allow its first update
+# to finish before treating the initial zero as a measurement.
+_LOADAVG_WARMUP_S = 6.0
+
 _CHILD_BUFFER_SIZE = 1024
 
 _OWNER_KINDS = ("harness", "tmux")
@@ -166,6 +170,7 @@ class ResourceSampler:
         self._fresh_proc_cache: dict[tuple[int, float], _ProcSample] = {}
         self._native_supported: bool | None = None
         self._fallback_tree: tuple[float, dict[int, list[int]]] | None = None
+        self._loadavg_started_at: float | None = None
 
     def sample(
         self,
@@ -353,6 +358,17 @@ class ResourceSampler:
                 load1 = float(os.getloadavg()[0])
             except OSError:
                 _logger.debug("resource sampler could not read load", exc_info=True)
+                load1 = None
+        else:
+            try:
+                load1 = float(psutil.getloadavg()[0])
+                now = time.monotonic()
+                if self._loadavg_started_at is None:
+                    self._loadavg_started_at = now
+                if now - self._loadavg_started_at < _LOADAVG_WARMUP_S:
+                    load1 = None
+            except Exception:  # noqa: BLE001 — one metric must not fail the sample
+                _logger.debug("resource sampler could not read emulated load", exc_info=True)
                 load1 = None
         return ResourceMachine(
             cpu_pct=cpu_pct,

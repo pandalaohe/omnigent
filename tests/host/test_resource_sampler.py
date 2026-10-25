@@ -10,6 +10,7 @@ import time
 from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import psutil
 import pytest
@@ -261,6 +262,114 @@ def test_sample_skips_a_failing_pid(tmp_path: Path) -> None:
     )
 
     assert all(row.pid not in (1_073_741_824, 1_073_741_825) for row in frame.processes)
+
+
+def test_non_posix_load_waits_for_emulation_warmup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first Windows zeros are unknown; a warmed-up zero is valid."""
+    monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
+    clock = SimpleNamespace(value=100.0)
+    monkeypatch.setattr(sampler_mod, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    getloadavg = Mock(
+        side_effect=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (2.5, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    )
+    monkeypatch.setattr(sampler_mod.psutil, "getloadavg", getloadavg)
+    sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
+    getloadavg.assert_not_called()
+
+    assert sampler._machine_metrics().load1 is None
+    getloadavg.assert_called_once_with()
+    clock.value = 105.0
+    assert sampler._machine_metrics().load1 is None
+    clock.value = 106.0
+    assert sampler._machine_metrics().load1 == 2.5
+    clock.value = 107.0
+    assert sampler._machine_metrics().load1 == 0.0
+
+
+def test_non_posix_load_retries_failed_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a successful emulation start begins the warmup clock."""
+    monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
+    clock = SimpleNamespace(value=100.0)
+    monkeypatch.setattr(sampler_mod, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    getloadavg = Mock(
+        side_effect=[
+            OSError("load unavailable"),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (3.25, 0.0, 0.0),
+        ]
+    )
+    monkeypatch.setattr(sampler_mod.psutil, "getloadavg", getloadavg)
+    sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
+
+    assert sampler._machine_metrics().load1 is None
+    clock.value = 200.0
+    assert sampler._machine_metrics().load1 is None
+    clock.value = 205.0
+    assert sampler._machine_metrics().load1 is None
+    clock.value = 206.0
+    assert sampler._machine_metrics().load1 == 3.25
+    assert getloadavg.call_count == 4
+
+
+@pytest.mark.parametrize("failure_at", [0, 1])
+def test_non_posix_load_failure_preserves_the_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_at: int
+) -> None:
+    """Startup and later load errors preserve the frame's other metrics."""
+    monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
+    clock = SimpleNamespace(value=100.0)
+    monkeypatch.setattr(sampler_mod, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    readings: list[object] = [(0.0, 0.0, 0.0), (1.5, 0.0, 0.0), (2.0, 0.0, 0.0)]
+    readings[failure_at] = RuntimeError("load unavailable")
+    getloadavg = Mock(side_effect=readings)
+    monkeypatch.setattr(sampler_mod.psutil, "getloadavg", getloadavg)
+    monkeypatch.setattr(
+        sampler_mod.psutil, "virtual_memory", lambda: SimpleNamespace(total=800, available=300)
+    )
+    monkeypatch.setattr(
+        sampler_mod.psutil, "disk_usage", lambda path: SimpleNamespace(used=200, total=1000)
+    )
+    sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
+    monkeypatch.setattr(sampler, "_machine_cpu_pct", lambda: 25.0)
+
+    for index in range(3):
+        clock.value = 100.0 + index * 6.0
+        frame = sampler.sample(runner_sessions={}, zygote_pid=None, interval_s=60)
+        assert frame.machine.cpu_pct == 25.0
+        assert (frame.machine.mem_used, frame.machine.mem_total) == (500, 800)
+        assert (frame.machine.disk_used, frame.machine.disk_total) == (200, 1000)
+        assert any(row.pid == os.getpid() for row in frame.processes)
+        if index == failure_at:
+            assert frame.machine.load1 is None
+        if index == 2:
+            assert frame.machine.load1 == 2.0
+    assert getloadavg.call_count == 3
+
+
+@pytest.mark.parametrize("load", [1.75, 0.0, None])
+def test_posix_load_uses_os_without_emulation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load: float | None
+) -> None:
+    """POSIX keeps its immediate load value and OSError handling."""
+    monkeypatch.setattr(sampler_mod, "IS_POSIX", True)
+    getloadavg = (
+        Mock(side_effect=OSError("load unavailable"))
+        if load is None
+        else Mock(return_value=(load, 0.0, 0.0))
+    )
+    monkeypatch.setattr(sampler_mod.os, "getloadavg", getloadavg, raising=False)
+    emulated_load = Mock(side_effect=AssertionError("POSIX must use os.getloadavg"))
+    monkeypatch.setattr(sampler_mod.psutil, "getloadavg", emulated_load)
+    sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
+
+    assert sampler._machine_metrics().load1 == load
+    getloadavg.assert_called_once_with()
+    emulated_load.assert_not_called()
 
 
 def _row(
