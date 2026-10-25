@@ -313,10 +313,11 @@ def test_windows_resource_paths_and_filters(value, source_root, expected, monkey
 
 
 @pytest.mark.parametrize("trusted", [True, False])
-@pytest.mark.parametrize("route", ["own", "full", "ordered"])
+@pytest.mark.parametrize("route", ["own", "full", "ordered", "ordered-windows"])
 def test_inline_guard_follows_actual_sdk_extensions(tmp_path, monkeypatch, trusted, route):
     """Use Pi's consumer for context, MCP, resources, trust and guard ordering."""
 
+    from omnigent.harnesses import pi_cli
     from omnigent.inner.pi_settings import ordered_pi_launch
 
     pi = shutil.which("pi")
@@ -461,19 +462,27 @@ export async function main(args, options) {{
         "import {main} from './main.js'; await main(process.argv.slice(2), {});"
     )
     monkeypatch.setenv("PI_CODING_AGENT_DIR", agent.as_uri())
+    executable = sdk / "cli.js"
+    if route == "ordered-windows":
+        executable = tmp_path / "pi.CMD"
+        executable.write_text('@node "%dp0%\\sdk\\cli.js" %*\n')
+        monkeypatch.setattr(pi_cli, "IS_WINDOWS", True)
+        monkeypatch.setattr(pi_cli, "resolve_cli_binary", lambda _: node)
     launcher, args = ordered_pi_launch(
-        str(sdk / "cli.js"),
+        str(executable),
         [str(project), str(active_agent), "--extension", str(guard)],
         extension=guard,
     )
-    if route != "ordered":
+    if not route.startswith("ordered"):
         launcher, args = str(sdk / "probe.js"), [str(project), str(active_agent)]
     home = tmp_path / "home"
     home.mkdir()
 
     def load_resources():
         result = subprocess.run(
-            [node, launcher, *args],
+            [*pi_cli.pi_cli_argv(launcher), *args]
+            if route == "ordered-windows"
+            else [node, launcher, *args],
             text=True,
             capture_output=True,
             check=True,
@@ -491,7 +500,7 @@ export async function main(args, options) {{
     paths = [
         str(Path(path).resolve()) if Path(path).is_absolute() else path for path in loaded["paths"]
     ]
-    if route == "ordered":
+    if route.startswith("ordered"):
         assert paths[-1] == "<inline:omnigent-permission>"
     assert str(user) in paths
     assert str(package_extension) in paths

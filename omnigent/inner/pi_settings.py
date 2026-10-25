@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import TypeAlias, cast
 from urllib.parse import unquote, urlsplit
 
+from omnigent.harnesses.pi_cli import pi_cli_argv
+
 _logger = logging.getLogger(__name__)
 
 _Settings: TypeAlias = dict[str, object]
@@ -84,6 +86,18 @@ const resourceAgentSource = __PI_RESOURCE_AGENT_DIR__;
 """
 
 
+class PiSdkLoaderUnavailableError(ValueError):
+    """A fixed, client-safe failure when extension ordering cannot be proved."""
+
+    code = "pi_sdk_loader_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Pi cannot prove extension ordering: this CLI installation does not expose "
+            "the supported Pi SDK loader"
+        )
+
+
 def ordered_pi_launch(
     executable: str,
     args: list[str],
@@ -103,16 +117,13 @@ def ordered_pi_launch(
     dist = next(
         (
             parent
-            for parent in Path(executable).resolve().parents
+            for parent in Path(pi_cli_argv(executable)[-1]).resolve().parents
             if all((parent / name).is_file() for name in required)
         ),
         None,
     )
     if dist is None:
-        raise ValueError(
-            "Pi cannot prove extension ordering: this CLI installation does not expose "
-            "the supported Pi SDK loader"
-        )
+        raise PiSdkLoaderUnavailableError
     remaining: list[str] = []
     index = 0
     while index < len(args):

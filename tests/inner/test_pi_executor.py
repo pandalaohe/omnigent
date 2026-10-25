@@ -389,7 +389,8 @@ def test_find_pi_cli_uses_off_path_install(monkeypatch, tmp_path):
     assert pi_mod._find_pi_cli() == str(binary)
 
 
-def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_path):
+@pytest.mark.parametrize("launcher_kind", ["npm-shim", "permission-launcher"])
+def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_path, launcher_kind):
     import omnigent.harnesses.pi_cli as pi_cli_mod
     import omnigent.inner.pi_executor as pi_mod
 
@@ -400,6 +401,10 @@ def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_pat
     script.write_text("")
     shim = prefix / "pi.CMD"
     shim.write_text('@"%_prog%" "%dp0%\\node_modules\\pi-agent\\cli.js" %*\n')
+    if launcher_kind == "permission-launcher":
+        script = prefix / "omnigent_pi_permissions.cjs"
+        script.write_text("")
+        shim = script
     node = prefix / "node.exe"
     node.write_text("")
     monkeypatch.setattr(pi_cli_mod, "IS_WINDOWS", True)
@@ -444,6 +449,84 @@ def test_rpc_start_keeps_omnigent_identity_without_saving_session(monkeypatch):
     args = spawn.call_args.args
     assert args[args.index("--session-id") + 1] == "conv_one"
     assert "--no-session" in args
+
+
+def test_windows_sandboxed_permission_launcher_preserves_interpreters(monkeypatch, tmp_path):
+    import os
+    import sys
+    from types import SimpleNamespace
+
+    from omnigent.harnesses import pi_cli
+    from omnigent.inner import pi_executor, sandbox
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    script = tmp_path / "omnigent_pi_permissions.cjs"
+    script.write_text("")
+    node = tmp_path / "node.exe"
+    node.touch()
+    policy = sandbox.SandboxPolicy(
+        backend_type="windows_jobobject",
+        active=True,
+        read_roots=[tmp_path],
+        write_roots=[tmp_path],
+        write_files=[],
+        allow_network=False,
+    )
+    monkeypatch.setattr(pi_cli, "IS_WINDOWS", True)
+    monkeypatch.setattr(sandbox, "resolve_sandbox", lambda *_: policy)
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 3, 0))
+    # Exercise the Windows launcher template without changing pathlib's host semantics.
+    windows_os = SimpleNamespace(
+        **{key: getattr(os, key) for key in dir(os) if key not in {"name", "environ"}},
+        name="nt",
+        environ={},
+    )
+    monkeypatch.setattr(sandbox, "os", windows_os)
+    executor = PiExecutor(
+        pi_path=str(script),
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="windows_jobobject")),
+    )
+    spawn = AsyncMock(return_value=_FakeProcess())
+    monkeypatch.setattr(pi_executor, "_create_subprocess_exec", spawn)
+
+    async def run():
+        try:
+            await executor._ensure_rpc("test-session", "", None, [])
+        finally:
+            await executor.close()
+
+    try:
+        _run(run())
+        assert executor._sandboxed
+        assert spawn.call_args.args[:7] == (
+            sys.executable,
+            "-P",
+            executor._pi_launch_path,
+            str(script),
+            "--mode",
+            "rpc",
+            "--no-session",
+        )
+        target_calls = []
+        activated = []
+        monkeypatch.setattr(sandbox, "activate_sandbox", lambda state: activated.append(state))
+        monkeypatch.setattr(
+            sandbox.subprocess,
+            "run",
+            lambda argv: target_calls.append(argv) or SimpleNamespace(returncode=0),
+        )
+        # Run the actual generated Python wrapper up to the OS spawn boundary.
+        launcher = executor._pi_launch_path
+        monkeypatch.setattr(sys, "argv", [launcher, *spawn.call_args.args[3:]])
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        with pytest.raises(SystemExit) as result:
+            exec(compile(Path(launcher).read_text(), launcher, "exec"))
+        assert result.value.code == 0
+        assert activated and activated[0].backend_type == "windows_jobobject"
+        assert target_calls == [[str(node), *spawn.call_args.args[3:]]]
+    finally:
+        Path(executor._pi_launch_path).unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize("failure", ["unknown-shim", "missing-script", "missing-node"])
