@@ -11950,8 +11950,27 @@ class _PolicyDeadChannelHarnessClient:
 
 
 @pytest.mark.parametrize("streamed", [False, True])
-async def test_policy_sse_delivery_failure_finishes_recovery(streamed: bool) -> None:
+async def test_policy_sse_delivery_failure_finishes_recovery(
+    streamed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Policy dispatch must not cancel itself while recovering its owning turn."""
+    from structlog.dev import ConsoleRenderer, plain_traceback
+
+    # Rich console rendering can block the event loop and consume the recovery deadline.
+    # Keep the error and stack while avoiding that formatting cost.
+    renderers: list[ConsoleRenderer] = []
+    logger = logging.getLogger("omnigent.runner.app")
+    while logger is not None:
+        for handler in logger.handlers:
+            for renderer in getattr(handler.formatter, "processors", ()):
+                if isinstance(renderer, ConsoleRenderer) and all(
+                    renderer is not existing for existing in renderers
+                ):
+                    renderers.append(renderer)
+        logger = logger.parent if logger.propagate else None
+    for renderer in renderers:
+        monkeypatch.setattr(renderer, "exception_formatter", plain_traceback)
+
     conv = f"conv_policy_sse_failure_{streamed}"
     interrupted = asyncio.Event()
     attempts = 0
