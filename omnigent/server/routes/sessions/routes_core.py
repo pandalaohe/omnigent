@@ -106,6 +106,13 @@ from omnigent.server.child_cap import (
     child_cap_for,
     complete_child_write,
 )
+from omnigent.server.child_checkin import (
+    ChildCheckinPatch,
+    ChildFollowupAdd,
+    add_checkin_followup,
+    patch_checkin_labels,
+    remove_checkin_followup,
+)
 from omnigent.server.child_keep_warm import (
     keep_warm_family_for_harness,
     keep_warm_family_from_labels,
@@ -857,6 +864,72 @@ def register_core_routes(
             "source": "session",
             "open_children": open_children,
         }
+
+    async def checkin_write_session(request: Request, session_id: str) -> Conversation:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        return conv
+
+    @router.patch("/sessions/{session_id}/child-checkin", include_in_schema=False)
+    async def patch_child_checkin(
+        request: Request, session_id: str, body: ChildCheckinPatch
+    ) -> dict[str, str]:
+        await checkin_write_session(request, session_id)
+        try:
+            await asyncio.to_thread(patch_checkin_labels, conversation_store, session_id, body)
+        except ConversationNotFoundError as exc:
+            raise _session_not_found() from exc
+        return {"status": "updated"}
+
+    @router.post(
+        "/sessions/{session_id}/child-checkin/follow-ups", status_code=201, include_in_schema=False
+    )
+    async def add_child_checkin_followup(
+        request: Request, session_id: str, body: ChildFollowupAdd
+    ) -> dict[str, Any]:
+        from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.user_preferences_store import read_child_idle_settings
+
+        conv = await checkin_write_session(request, session_id)
+        try:
+            item = await asyncio.to_thread(
+                add_checkin_followup, conversation_store, session_id, body, int(time.time())
+            )
+        except ConversationNotFoundError as exc:
+            raise _session_not_found() from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        owner = await asyncio.to_thread(
+            collab_owner_for, conv, conversation_store, permission_store
+        )
+        settings = await asyncio.to_thread(
+            read_child_idle_settings,
+            getattr(request.app.state, "user_preferences_store", None),
+            owner,
+        )
+        return {"id": item.id, "due": item.due, "delivery": "on" if settings.enabled else "off"}
+
+    @router.delete(
+        "/sessions/{session_id}/child-checkin/follow-ups/{fid}", include_in_schema=False
+    )
+    async def remove_child_checkin_followup(
+        request: Request, session_id: str, fid: str
+    ) -> dict[str, str]:
+        await checkin_write_session(request, session_id)
+        try:
+            await asyncio.to_thread(remove_checkin_followup, conversation_store, session_id, fid)
+        except ConversationNotFoundError as exc:
+            raise _session_not_found() from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Follow-up not found") from exc
+        return {"id": fid, "status": "removed"}
 
     @router.get("/sessions/{session_id}/model-options")
     async def refresh_session_model_options(
