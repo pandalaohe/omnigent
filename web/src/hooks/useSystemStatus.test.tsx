@@ -233,6 +233,30 @@ describe("useUpdateSystemStatusSettings pending state", () => {
   });
 });
 
+describe("useUpdateSystemStatusSettings failed refetch", () => {
+  it("still completes the save when the refreshed view fails to load", async () => {
+    let statusCalls = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input) === "/v1/system/settings") return mockResponse({});
+      statusCalls += 1;
+      return statusCalls === 1
+        ? mockResponse({ ...EMPTY_SUMMARY, server: null, hosts: [] })
+        : mockResponse({ error: { message: "unavailable" } }, 503);
+    });
+    const { result } = renderHook(
+      () => ({ status: useSystemStatus({ live: false }), update: useUpdateSystemStatusSettings() }),
+      { wrapper: makeWrapper() },
+    );
+    await flush();
+
+    await act(async () => {
+      await result.current.update.mutateAsync({ load_lines: { queue_enabled: false } });
+    });
+    expect(statusCalls).toBe(2);
+    await waitFor(() => expect(result.current.update.isSuccess).toBe(true));
+  });
+});
+
 describe("loadLinePairError", () => {
   it.each([
     [4, 5, null],
