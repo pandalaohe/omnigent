@@ -1080,6 +1080,11 @@ class SystemStatusHub:
             # A reconnect receives the latest settings through the lifecycle callback.
             _logger.debug("host disconnected before load lines could be sent")
 
+    def host_name(self, workspace_id: int, host_id: str) -> str:
+        """Resolve a load-notice name without exposing other hosts' telemetry."""
+        entry = self._entries.get((workspace_id, host_id))
+        return entry.name if entry is not None else host_id
+
     def host_load(
         self, workspace_id: int, host_id: str, *, now: float | None = None
     ) -> dict[str, Any]:

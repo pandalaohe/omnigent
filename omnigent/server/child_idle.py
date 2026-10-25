@@ -515,8 +515,19 @@ class ChildIdleSweeper:
         if not previous:
             return
         try:
+            from omnigent.db.db_models import current_workspace_id
+            from omnigent.server.host_load_notices import child_host_ids, hosts_line
+
+            host_summary: list[str] = []
+            hub = getattr(self._app.state, "system_status", None)
+            if hub is not None:
+                hosts = await asyncio.to_thread(child_host_ids, self._store, children)
+                if hosts:
+                    host_summary.append(hosts_line(hub, current_workspace_id(), hosts, now))
             text = "\n".join(
-                ["[System: idle child check-in]"] + [lines[sid] for sid, _, _ in previous]
+                ["[System: idle child check-in]"]
+                + host_summary
+                + [lines[sid] for sid, _, _ in previous]
             )
             outcome = await asyncio.wait_for(
                 self._post_notice(parent_id, text, claim), timeout=_POST_TIMEOUT_S

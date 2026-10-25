@@ -207,6 +207,35 @@ async def test_independent_mothers_restart_and_repeat_cooldown(harness: _Harness
     assert len(harness.calls) == 4
 
 
+async def test_checkin_includes_all_child_hosts_and_spare_capacity(
+    harness: _Harness, tmp_path
+) -> None:
+    from omnigent.server.system_status import SystemStatusHub
+    from tests.server.test_host_load_notices import HOST_A, HOST_B, _report
+
+    first = harness.child("first")
+    parent = harness.store.get_conversation(first.parent_conversation_id)
+    harness.store.set_host_id(parent.id, HOST_A, "/opt/work/project")
+    second = harness.child("second", parent=parent)
+    harness.store.set_host_id(second.id, HOST_B, "/opt/work/other")
+    hub = SystemStatusHub(tmp_path, None)
+    harness.sweeper._app.state.system_status = hub
+    try:
+        await harness.sweeper._tick()
+        harness.now += 5400
+        reporter = SimpleNamespace(hub=hub, clock=SimpleNamespace(now=harness.now))
+        _report(reporter, "spare", host=HOST_A, reason=None)
+        _report(reporter, "normal", host=HOST_B, reason=None)
+        await harness.sweeper._tick()
+        assert len(harness.calls) == 1
+        assert (
+            f"Hosts: laptop-{HOST_A} 4.25/core spare; laptop-{HOST_B} 4.25/core normal"
+            in harness.calls[0][1]
+        )
+    finally:
+        hub.close()
+
+
 @pytest.mark.parametrize("async_kind", [None, "question", "approval"])
 async def test_any_own_pending_card_restarts_idle_clock(
     harness: _Harness, async_kind: str | None
