@@ -7649,6 +7649,36 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.superseded", () => {
+    it.each([false, true])(
+      "follows a clear refusal only while its chat is active (switched away: %s)",
+      async (switchedAway) => {
+        seedSession("conv_old");
+        await useChatStore.getState().switchTo("conv_old");
+        fetchMock.mockImplementation((input, init) => {
+          if (!String(input).endsWith("/conv_old/events"))
+            return Promise.resolve(defaultFetchHandler(input, init));
+          expect(JSON.parse(init!.body as string)).toEqual({ type: "clear", data: {} });
+          if (switchedAway) useChatStore.setState({ conversationId: "conv_current" });
+          return Promise.resolve(
+            mockResponse(
+              {
+                error: {
+                  code: "session_superseded",
+                  message: "Replaced",
+                  successor_id: "conv_next",
+                },
+              },
+              { ok: false, status: 409 },
+            ),
+          );
+        });
+        await expect(useChatStore.getState().clearContext()).rejects.toThrow("Replaced");
+        expect(useChatStore.getState().redirectToConversationId).toBe(
+          switchedAway ? null : "conv_next",
+        );
+      },
+    );
+
     it("follows a superseded label on a cold open", async () => {
       seedSession("conv_old");
       sessionLabels.set("conv_old", { "omnigent.succeeded_by": "conv_next" });
