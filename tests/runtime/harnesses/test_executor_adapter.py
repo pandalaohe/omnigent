@@ -2455,6 +2455,176 @@ def test_completed_observed_tool_request_is_durable() -> None:
     assert list(adapter._pending_mcp_call_ids) == []
 
 
+async def _run_codex_builtin_turn(item: dict[str, Any]) -> list[Any]:
+    """Return the real Codex event iterator's output for one built-in command item."""
+
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.codex_executor import _CodexAppServerSession
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    # The process is never started here: the test drives the notification queue directly.
+    session._proc = SimpleNamespace(returncode=0)
+    session.thread_id = "thread-1"
+    turn_started = asyncio.Event()
+
+    async def _start_turn(*_args: object, **_kwargs: object) -> dict[str, object]:
+        turn_started.set()
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=_start_turn)
+    started_item = {
+        "id": item["id"],
+        "type": item["type"],
+        "command": item["command"],
+        "commandActions": item.get("commandActions", []),
+    }
+    if "cwd" in item:
+        started_item["cwd"] = item["cwd"]
+
+    async def _produce_live_events() -> None:
+        await turn_started.wait()
+        for event in (
+            {"method": "item/started", "params": {"turnId": "turn-1", "item": started_item}},
+            {"method": "item/completed", "params": {"turnId": "turn-1", "item": item}},
+            {"method": "item/completed", "params": {"turnId": "turn-1", "item": item}},
+            {
+                "method": "turn/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "turn": {"id": "turn-1", "status": item.get("status")},
+                },
+            },
+        ):
+            await session._events.put(event)
+
+    producer = asyncio.create_task(_produce_live_events())
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "run it"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd="/tmp/workspace",
+            sandbox="workspace-write",
+        )
+    ]
+    await producer
+    return events
+
+
+async def _stream_turn_events(adapter) -> list[_ParsedSSEEvent]:
+    """Drive one in-process turn through the adapter's ASGI app and parse its SSE."""
+
+    app = adapter.build()
+    app.state.conversation_id = "conv_bug164"
+    app.state.harness_auth_token = "test-auth"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer test-auth"},
+        timeout=20,
+    ) as client:
+        async with client.stream(
+            "POST", "/v1/sessions/conv_bug164/events", json=_start_turn_body()
+        ) as response:
+            assert response.status_code == 200
+            return [event async for event in _stream_iter(response)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item_status", ["failed", "declined"])
+async def test_terminal_builtin_command_reaches_sse_stream_as_error_output(item_status) -> None:
+    """Real Codex iterator output keeps its call_id and marker across the SSE fixture."""
+
+    from omnigent.inner.executor import (
+        MockExecutor,
+        ToolCallComplete,
+        ToolCallRequest,
+        TurnComplete,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    item = {
+        "id": "command-1",
+        "type": "commandExecution",
+        "command": "false",
+        "cwd": "/tmp/workspace",
+        "commandActions": [],
+        "status": item_status,
+        "aggregatedOutput": "refused",
+        "durationMs": 12,
+    }
+    events = await _run_codex_builtin_turn(item)
+    # The real iterator emitted the duplicate completion only once.
+    assert [type(event) for event in events] == [
+        ToolCallRequest,
+        ToolCallRequest,
+        ToolCallComplete,
+        TurnComplete,
+    ]
+    executor = MockExecutor()
+    executor.enqueue_events(events)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    parsed = await _stream_turn_events(adapter)
+
+    items = [event.data["item"] for event in parsed if event.event == "response.output_item.done"]
+    calls = [item for item in items if item.get("type") == "function_call"]
+    outputs = [item for item in items if item.get("type") == "function_call_output"]
+    assert [call["status"] for call in calls] == ["in_progress", "completed"]
+    assert [call["call_id"] for call in calls] == ["command-1", "command-1"]
+    assert len(outputs) == 1
+    assert outputs[0]["call_id"] == "command-1"
+    assert outputs[0]["output"] == f"[command status: {item_status}]\nrefused"
+    # Observed-only: the completion never enters the dispatch bridge.
+    assert list(adapter._pending_mcp_call_ids) == []
+    assert adapter._dispatched_call_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_terminal_builtin_command_prefix_survives_output_cap() -> None:
+    """The status marker stays visible when the received output hits the mirror cap."""
+
+    from omnigent.inner.executor import MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+
+    received = "x" * (MAX_TOOL_OUTPUT_BYTES + 100)
+    item = {
+        "id": "command-long",
+        "type": "commandExecution",
+        "command": "false",
+        "cwd": "/tmp/workspace",
+        "commandActions": [],
+        "status": "failed",
+        "aggregatedOutput": received,
+    }
+    executor = MockExecutor()
+    executor.enqueue_events(await _run_codex_builtin_turn(item))
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    parsed = await _stream_turn_events(adapter)
+
+    items = [event.data["item"] for event in parsed if event.event == "response.output_item.done"]
+    outputs = [item for item in items if item.get("type") == "function_call_output"]
+    assert len(outputs) == 1
+    output = outputs[0]["output"]
+    assert output.startswith("[command status: failed]\n")
+    assert "[output truncated by omnigent:" in output
+    assert len(output.encode("utf-8")) < MAX_TOOL_OUTPUT_BYTES + 200
+    assert received not in output
+
+
 # ── ToolCallComplete suppression scoped to dispatched call ids ──────────────
 #
 # A tool routed through ``_stable_tool_executor`` → ``ctx.dispatch_tool`` already
