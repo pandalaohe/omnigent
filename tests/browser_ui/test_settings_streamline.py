@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, Request, expect
 
+from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 
@@ -152,6 +153,9 @@ def test_quota_default_and_registry_product_exception_persist(
     width: int,
     request: pytest.FixtureRequest,
 ) -> None:
+    browser_contract.json(
+        "/v1/child-checkin/defaults", {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+    )
     agents = [
         {
             "id": f"{harness}-agent",
@@ -298,6 +302,22 @@ def test_legacy_links_open_the_new_group(
     page: Page, appearance_url: str, browser_contract: BrowserContract, old: str, destination: str
 ) -> None:
     browser_contract.json("/v1/calling-defaults/catalogs", {"rows": []})
+    if old == "keep-warm":
+        browser_contract.json(
+            "/v1/me/preferences/keep_warm/convert",
+            {
+                "cells": {},
+                "columns": [],
+                "already": False,
+                "banner": (
+                    "Converted from your previous settings · saved when you first edit. "
+                    "New hosts start off; new agents start off unless their harness has a column."
+                ),
+                "bytes": 36,
+                "migratedToCellsAt": 123,
+            },
+            method="POST",
+        )
     page.goto(f"{appearance_url}/settings/{old}")
     expect(page).to_have_url(f"{appearance_url}{destination}")
     if "#" in destination:
@@ -1180,6 +1200,9 @@ def test_instruction_columns_add_clear_and_reload(
     width: int,
     request: pytest.FixtureRequest,
 ) -> None:
+    browser_contract.json(
+        "/v1/child-checkin/defaults", {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+    )
     layer = {
         "scope": "agent",
         "agent_key": "codex",
