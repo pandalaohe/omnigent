@@ -27,11 +27,13 @@ def _isolated_discovery_registry(
 
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(codex_process_registry, "_ps_output", lambda _columns: "")
-    monkeypatch.setattr(
-        codex_process_registry.os,
-        "killpg",
-        lambda _pgid, _sig: pytest.fail("unexpected real process-group signal"),
-    )
+
+    def absent_group(_pgid: int, sig: int) -> None:
+        if sig == 0:
+            raise ProcessLookupError
+        pytest.fail("unexpected real process-group signal")
+
+    monkeypatch.setattr(codex_process_registry.os, "killpg", absent_group)
     registry_path = tmp_path / "registry.json"
     real_reconcile = codex_process_registry.reconcile_codex_native_process_registry
     real_register = codex_process_registry.register_codex_native_process
@@ -334,7 +336,8 @@ async def test_model_discovery_stop_reaps_group_after_wrapper_exit(
     def _kill_own_group(group: int, sig: int) -> None:
         nonlocal group_gone
         assert group == pgid
-        killed.append(sig)
+        if sig != 0:
+            killed.append(sig)
         real_killpg(group, sig)
         if sig == signal.SIGKILL:
             group_gone = True
@@ -606,6 +609,7 @@ async def test_close_surviving_posix_child_finishes_cleanup(
     assert server.proc is None
     assert server.process_owner_lock is None
     assert not server.exit_confirmed
+    assert server.process_group_id == 456 and server.process_registry_tag == "test-tag"
     with pytest.raises(RuntimeError, match="exit is not confirmed"):
         await server.start()
     assert server.resident_incarnation_id == incarnation_id
@@ -638,6 +642,10 @@ async def test_close_live_process_uses_verified_group_signal(
 
     def _killpg(_pgid: int, sig: int) -> None:
         nonlocal alive
+        if sig == 0:
+            if not alive:
+                raise ProcessLookupError
+            return
         signals.append(sig)
         alive = False
 
@@ -744,10 +752,102 @@ async def test_app_server_group_reaper_refuses_unsafe_and_untagged_groups(monkey
         codex_native_app_server.os, "killpg", lambda _pgid, sig: killed.append(sig)
     )
 
-    assert await codex_native_app_server._reap_process_group_survivors(456, "tag-123")
+    assert not await codex_native_app_server._reap_process_group_survivors(456, "tag-123")
     assert not await codex_native_app_server._reap_process_group_survivors(1, "tag-123")
     assert not await codex_native_app_server._reap_process_group_survivors(os.getpgrp(), "tag-123")
-    assert killed == []
+    assert killed == [0]
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize(
+    "outcome", ["absent", "present", "denied", "failed", "enumeration_unknown"]
+)
+async def test_group_exit_receipt_requires_kernel_absence(monkeypatch, outcome):
+    from omnigent.harnesses.codex_native import app_server as module
+
+    monkeypatch.setattr(
+        module,
+        "_tagged_process_group_members",
+        lambda *_: None if outcome == "enumeration_unknown" else [],
+    )
+    probes = []
+
+    def probe(pgid, sig):
+        assert (pgid, sig) == (456, 0)
+        probes.append(pgid)
+        if outcome == "absent":
+            raise ProcessLookupError
+        if outcome == "denied":
+            raise PermissionError
+        if outcome == "failed":
+            raise OSError("unavailable")
+
+    monkeypatch.setattr(module.os, "killpg", probe)
+    assert await module._reap_process_group_survivors(456, "fixture-tag") is (outcome == "absent")
+    assert probes == ([] if outcome == "enumeration_unknown" else [456])
+
+
+async def test_non_posix_group_exit_is_unavailable(monkeypatch):
+    from omnigent.harnesses.codex_native import app_server as module
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+    assert not await module._reap_process_group_survivors(456, "fixture-tag")
+
+
+@pytest.mark.posix_only
+async def test_unconfirmed_close_retries_the_same_recorded_group(monkeypatch, tmp_path):
+    from omnigent.harnesses.codex_native import app_server as module
+
+    server = _test_app_server(tmp_path, tmp_path / "home", tmp_path / "bridge", tmp_path)
+    server.proc = SimpleNamespace(returncode=0)
+    server._resident_spawned = True
+    server.process_group_id, server.process_registry_tag = 456, "fixture-tag"
+    incarnation = server.resident_incarnation_id
+    alive, probes, unregistered = True, [], []
+    monkeypatch.setattr(module, "_tagged_process_group_members", lambda *_: [])
+
+    def probe(pgid, sig):
+        assert (pgid, sig) == (456, 0)
+        probes.append(pgid)
+        if not alive:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(module.os, "killpg", probe)
+    monkeypatch.setattr(module, "unregister_codex_native_process", unregistered.append)
+    await server.close()
+    assert server.process_exit_confirmed and not server.exit_confirmed
+    assert (server.process_group_id, server.process_registry_tag) == (456, "fixture-tag")
+    assert server.proc is server.process_owner_lock is None
+    assert unregistered == []
+    with pytest.raises(RuntimeError, match="exit is not confirmed"):
+        await server.start()
+    alive = False
+    await server.close()
+    assert server.exit_confirmed and server.resident_incarnation_id == incarnation
+    assert server.process_group_id is server.process_registry_tag is None
+    assert unregistered == ["fixture-tag"] and probes == [456, 456]
+
+
+@pytest.mark.posix_only
+async def test_real_untagged_group_is_not_an_exit_receipt(monkeypatch):
+    from omnigent.harnesses.codex_native import app_server as module
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(60)", start_new_session=True
+    )
+    monkeypatch.setattr(module, "_tagged_process_group_members", lambda *_: [])
+    try:
+        assert not await module._reap_process_group_survivors(process.pid, "fixture-tag")
+        assert process.returncode is None
+    finally:
+        if process.returncode is None:
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), 2)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+    assert await module._reap_process_group_survivors(process.pid, "fixture-tag")
 
 
 @pytest.mark.posix_only

@@ -3042,7 +3042,8 @@ class CodexNativeAppServer:
                 self.process_group_id, self.process_registry_tag
             )
         finally:
-            if self.process_registry_tag is not None and group_empty:
+            group_exit_confirmed = os.name == "posix" and group_empty
+            if self.process_registry_tag is not None and group_exit_confirmed:
                 unregister_codex_native_process(self.process_registry_tag)
             if self.process_owner_lock is not None:
                 self.process_owner_lock.close()
@@ -3077,9 +3078,11 @@ class CodexNativeAppServer:
                     self.proc = None
                     self.stderr_task = None
                     self.context_catalog_task = None
-                    self.process_registry_tag = None
                     self.process_owner_lock = None
-                    self.process_group_id = None
+                    # Retain the exact recorded target while its exit is unknown.
+                    if group_exit_confirmed:
+                        self.process_registry_tag = None
+                        self.process_group_id = None
                     self.agent_pid = None
                     try:
                         if diagnostics is not None:
@@ -3090,9 +3093,7 @@ class CodexNativeAppServer:
                         self.process_exit_confirmed = self.process_exit_confirmed or (
                             process is not None and process.returncode is not None
                         )
-                        self.exit_confirmed = self.exit_confirmed or (
-                            os.name == "posix" and group_empty
-                        )
+                        self.exit_confirmed = self.exit_confirmed or group_exit_confirmed
 
     async def _populate_context_catalog(self, source_home: Path) -> None:
         """Best-effort host model metadata for truthful compact progress."""
@@ -5564,6 +5565,16 @@ def _process_group_id(process: asyncio.subprocess.Process) -> int:
     return process.pid
 
 
+def _process_group_is_absent(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 async def _reap_process_group_survivors(pgid: int | None, session_tag: str | None) -> bool:
     """
     Reap a spawned child's recorded process group.
@@ -5575,11 +5586,11 @@ async def _reap_process_group_survivors(pgid: int | None, session_tag: str | Non
 
     :param pgid: Recorded process group id, or None when unknown.
     :param session_tag: Exact teardown tag embedded in child argv.
-    :returns: True when no tagged same-UID member remains.
+    :returns: True only when the recorded group is confirmed absent.
     """
     if os.name != "posix":
-        return True
-    if pgid is None or session_tag is None:
+        return False
+    if pgid is None or not session_tag:
         return False
     if pgid <= 1 or pgid == os.getpgrp():
         return False
@@ -5587,12 +5598,12 @@ async def _reap_process_group_survivors(pgid: int | None, session_tag: str | Non
     if members is None:
         return False
     if not members:
-        return True
+        return _process_group_is_absent(pgid)
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
-        return members == []
+        return members == [] and _process_group_is_absent(pgid)
     except (PermissionError, OSError):
         return False
     loop = asyncio.get_running_loop()
@@ -5602,18 +5613,18 @@ async def _reap_process_group_survivors(pgid: int | None, session_tag: str | Non
         if members is None:
             return False
         if not members:
-            return True
+            return _process_group_is_absent(pgid)
         await asyncio.sleep(_PROCESS_GROUP_REAP_POLL_SECONDS)
     members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
     if members is None:
         return False
     if not members:
-        return True
+        return _process_group_is_absent(pgid)
     try:
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         members = await asyncio.to_thread(_tagged_process_group_members, pgid, session_tag)
-        return members == []
+        return members == [] and _process_group_is_absent(pgid)
     except (PermissionError, OSError):
         return False
     deadline = loop.time() + _PROCESS_GROUP_KILL_GRACE_SECONDS
@@ -5622,7 +5633,7 @@ async def _reap_process_group_survivors(pgid: int | None, session_tag: str | Non
         if members is None:
             return False
         if not members:
-            return True
+            return _process_group_is_absent(pgid)
         if loop.time() >= deadline:
             return False
         await asyncio.sleep(_PROCESS_GROUP_REAP_POLL_SECONDS)
