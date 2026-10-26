@@ -20,6 +20,7 @@ from omnigent.runtime.harnesses.process_manager import (
 )
 from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 from omnigent.terminals import TerminalRegistry
+from tests.inner.test_native_context_inventory import NATIVE_CONTEXT_CASES
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
 
@@ -1465,6 +1466,34 @@ async def test_runner_context_v2_keeps_cli_resume_history_unsupported(
         assert source.coverage == "unsupported" and source.contexts == ()
         assert source.unresolved[0].reason.startswith(family + "_")
         assert all(s.coverage != "complete" for s in evidence.sources)
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+@pytest.mark.parametrize("family, factory, reason", NATIVE_CONTEXT_CASES)
+async def test_runner_native_context_reason_survives_authenticated_consumer(
+    harness_inventory_reader, tmp_path, family, factory, reason
+):
+    from omnigent.startup_protocol import executor_context_scope_v2
+
+    executor = factory(bridge_dir=tmp_path)
+    executor._bridge_dir = object()
+    executor.run_turn = Mock(side_effect=AssertionError("read must not inject"))
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    for retired in (False, True):
+        if retired:
+            adapter._shutting_down.set()
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        evidence = _v2_evidence(response.content, session_id="one")
+        source = next(s for s in evidence.sources if s.scope == executor_context_scope_v2("one"))
+        assert source.contexts == () and source.coverage != "complete" and source.unresolved
+        if not retired:
+            assert source.coverage == "unsupported" and source.unresolved[0].reason == reason
+        assert all(s.coverage != "complete" and s.work_bindings is None for s in evidence.sources)
+    executor.run_turn.assert_not_called()
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
 
 

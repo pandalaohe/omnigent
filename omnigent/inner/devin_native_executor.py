@@ -36,6 +36,8 @@ from omnigent.native.native_bridge_common import (
 class DevinNativeExecutor(Executor):
     """Harness-side executor for ``omnigent devin`` web-UI turns."""
 
+    _context_inventory_unsupported_reason = "devin_native_hook_context_membership_unsupported"
+
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._inject_lock = asyncio.Lock()

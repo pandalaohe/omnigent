@@ -683,6 +683,9 @@ class Executor:
     Subclass this and implement ``run_turn`` for each backend.
     """
 
+    # Owners can name a known source gap while retaining the safe default reader.
+    _context_inventory_unsupported_reason = "context_source_unimplemented"
+
     async def run_turn(
         self,
         messages: list[Message],  # noqa: ARG002 — abstract method signature; subclasses implement
@@ -730,7 +733,7 @@ class Executor:
         if not 0 < timeout_s <= 5.0:
             return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
         return lambda: unknown_context_evidence_v2(
-            session_id, read_id, "context_source_unimplemented", unsupported=True
+            session_id, read_id, self._context_inventory_unsupported_reason, unsupported=True
         )
 
     async def prepare_resident_thread_inventory(

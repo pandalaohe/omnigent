@@ -64,6 +64,8 @@ class QwenNativeExecutor(Executor):
         :data:`BRIDGE_DIR_ENV_VAR` from the harness spawn env.
     """
 
+    _context_inventory_unsupported_reason = "qwen_native_requested_id_receipt_unsupported"
+
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         # Serializes appends to the shared input file: run_turn (initiating
