@@ -261,7 +261,7 @@ async def test_idle_edge_without_pending_rotation_injects_nothing(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("succession_status", ["done", "pending", "noop"])
+@pytest.mark.parametrize("succession_status", ["done", "pending", "noop", "retired"])
 async def test_pi_rpc_turn_end_releases_only_after_succession(succession_status: str) -> None:
     server = _RotationServerClient(harness="pi", succession_status=succession_status)
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
@@ -344,3 +344,19 @@ async def test_pi_child_clear_never_creates_a_top_level_successor() -> None:
         )
     assert response.status_code == 409
     assert not server.created and not server.succession and not manager.released
+
+
+@pytest.mark.asyncio
+async def test_pi_retired_rotation_is_a_final_conflict() -> None:
+    server = _RotationServerClient(harness="pi", succession_status="retired")
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = _build_app(server, manager)
+    async with _runner_client(app, permission_harness="pi") as client:
+        await _seed_session(client)
+        result = await client.post(
+            f"/v1/sessions/{CONV_ID}/events",
+            json={"type": "message", "content": [{"type": "input_text", "text": "/clear"}]},
+        )
+    assert result.status_code == 409
+    assert result.json()["detail"]["error"] == "succession_retired"
+    assert not manager.released

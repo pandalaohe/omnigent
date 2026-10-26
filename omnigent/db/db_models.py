@@ -1022,6 +1022,7 @@ class SqlSessionSuccession(ConversationBase):
     opening_item_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     dropped: Mapped[str | None] = mapped_column(Text, nullable=True)
     questions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deferred_runners: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

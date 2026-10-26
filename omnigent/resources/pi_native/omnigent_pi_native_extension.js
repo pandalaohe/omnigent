@@ -115,6 +115,11 @@ async function rotationRequest(config, method, resource, body) {
 
 async function rotateNativeSession(config) {
   const oldId = config.pendingRotationSource || config.sessionId;
+  if (config.retiredRotationSource === oldId) {
+    const error = new Error(`Pi session succession was retired; open ${config.retiredSuccessorId || "the successor session"}`);
+    error.retired = true;
+    throw error;
+  }
   config.pendingRotationSource = oldId;
   writeConfig(config);
   const oldPath = `/v1/sessions/${encodeURIComponent(oldId)}`;
@@ -142,6 +147,14 @@ async function rotateNativeSession(config) {
     target_session_id: successorId,
     allow_empty: true,
   });
+  if (succession && succession.status === "retired") {
+    config.retiredRotationSource = oldId;
+    config.retiredSuccessorId = succession.successor_id || null;
+    writeConfig(config);
+    const error = new Error(`Pi session succession was retired; open ${config.retiredSuccessorId || "the successor session"}`);
+    error.retired = true;
+    throw error;
+  }
   if (!succession || succession.status !== "done")
     throw new Error("Pi session succession has not finished");
   // The successor opens in its own bridge and terminal. Retire the old pane
@@ -2472,7 +2485,8 @@ module.exports = function (pi) {
       return !!successor;
     } catch (error) {
       if (ctx && ctx.ui && typeof ctx.ui.notify === "function")
-        ctx.ui.notify(`Omnigent handover is pending; retrying: ${error.message}`, "error");
+        ctx.ui.notify(error.retired ? error.message : `Omnigent handover is pending; retrying: ${error.message}`, "error");
+      if (error.retired) return true;
       pi.__omnigentRotationRetry = setTimeout(() => resumeRotation(ctx), 1000);
       pi.__omnigentRotationRetry.unref();
       return true;

@@ -38,7 +38,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
-from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
+from omnigent._wrapper_labels import (
+    UI_MODE_LABEL_KEY,
+    WRAPPER_LABEL_KEY,
+    is_parent_owned_subagent_labels,
+)
 from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
@@ -451,6 +455,7 @@ def _to_session_succession(row: SqlSessionSuccession) -> SessionSuccession:
         opening_item_id=row.opening_item_id,
         dropped=json.loads(row.dropped) if row.dropped is not None else None,
         questions=json.loads(row.questions) if row.questions is not None else None,
+        deferred_runners=json.loads(row.deferred_runners) if row.deferred_runners else None,
         error=row.error,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -7019,8 +7024,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         def move(ap_sess: Session) -> tuple[list[str], list[str]]:
             if old_id == new_id:
                 raise SuccessionRefusedError("same_session", "a session cannot succeed itself")
-            self._lock_conversation(ap_sess, new_id)
-            self._lock_conversation(ap_sess, old_id)
+            for session_id in sorted((old_id, new_id)):
+                self._lock_conversation(ap_sess, session_id)
             new_row = ap_sess.get(SqlConversation, (workspace_id, new_id))
             if new_row is None:
                 raise SuccessionRefusedError(
@@ -7030,6 +7035,35 @@ class SqlAlchemyConversationStore(ConversationStore):
             if old_row is None:
                 raise SuccessionRefusedError(
                     "not_found", f"conversation {old_id!r} does not exist"
+                )
+            existing = ap_sess.scalar(
+                select(SqlSessionSuccession).where(
+                    SqlSessionSuccession.workspace_id == workspace_id,
+                    SqlSessionSuccession.old_id == old_id,
+                    SqlSessionSuccession.new_id == new_id,
+                )
+            )
+            if existing is not None:
+                return json.loads(existing.direct_ids), json.loads(existing.moved_ids)
+            successor_id = _fetch_labels(ap_sess, old_id).get(SUCCEEDED_BY_LABEL_KEY)
+            competing = ap_sess.scalar(
+                select(SqlSessionSuccession.new_id)
+                .where(
+                    SqlSessionSuccession.workspace_id == workspace_id,
+                    SqlSessionSuccession.old_id == old_id,
+                    SqlSessionSuccession.new_id != new_id,
+                    SqlSessionSuccession.phase.not_in(("done", "void")),
+                )
+                .limit(1)
+            )
+            if (successor_id and successor_id != new_id) or competing:
+                successor_id = (
+                    successor_id if successor_id and successor_id != new_id else competing
+                )
+                raise SuccessionRefusedError(
+                    "already_succeeded",
+                    f"session already succeeded by {successor_id!r}",
+                    successor_id=successor_id,
                 )
             if (
                 new_row.parent_conversation_id is not None
@@ -7060,7 +7094,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # re-read then sees whatever that transition committed.
                 self._lock_conversation(ap_sess, candidate.id)
                 ap_sess.refresh(candidate)
-                if not candidate.archived:
+                if not candidate.archived and not is_parent_owned_subagent_labels(
+                    _fetch_labels(ap_sess, candidate.id)
+                ):
                     kept.append(candidate)
             if not kept and not allow_empty:
                 return ([], [])
@@ -7122,6 +7158,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # Undo: drop the forward pair only now, when the inverse move
                 # has passed every refusal; a refused move must keep it.
                 ap_sess.execute(
+                    update(SqlSessionSuccession)
+                    .where(
+                        SqlSessionSuccession.workspace_id == workspace_id,
+                        SqlSessionSuccession.old_id == new_id,
+                        SqlSessionSuccession.new_id == old_id,
+                    )
+                    .values(
+                        phase="void",
+                        deferred_runners=None,
+                        error="succession reversed",
+                        updated_at=now,
+                    )
+                )
+                ap_sess.execute(
                     delete(SqlConversationLabel).where(
                         SqlConversationLabel.workspace_id == workspace_id,
                         SqlConversationLabel.conversation_id == new_id,
@@ -7178,16 +7228,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             return _to_session_succession(row) if row is not None else None
 
     def list_unfinished_successions(self, limit: int = 100) -> list[SessionSuccession]:
-        """Return receipts whose phase is not ``done``, oldest first."""
+        """Return nonterminal receipts, oldest first."""
         with self._conv_session("list_unfinished_successions") as session:
             rows = session.scalars(
                 select(SqlSessionSuccession)
                 .where(
                     SqlSessionSuccession.workspace_id == current_workspace_id(),
-                    SqlSessionSuccession.phase != "done",
+                    SqlSessionSuccession.phase.not_in(("done", "void")),
                 )
                 .order_by(SqlSessionSuccession.created_at, SqlSessionSuccession.id)
                 .limit(limit)
+            )
+            return [_to_session_succession(row) for row in rows]
+
+    def list_deferred_successions(self) -> list[SessionSuccession]:
+        """Include finished rotations with runner work still outstanding."""
+        with self._conv_session("list_deferred_successions") as session:
+            rows = session.scalars(
+                select(SqlSessionSuccession)
+                .where(
+                    SqlSessionSuccession.workspace_id == current_workspace_id(),
+                    SqlSessionSuccession.phase != "void",
+                    SqlSessionSuccession.deferred_runners.is_not(None),
+                )
+                .order_by(SqlSessionSuccession.created_at, SqlSessionSuccession.id)
             )
             return [_to_session_succession(row) for row in rows]
 
@@ -7206,7 +7270,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         serialized here; ``updated_at`` is always refreshed.
         """
         values: dict[str, Any] = dict(fields)
-        for key in ("opening", "dropped", "questions"):
+        for key in ("opening", "dropped", "questions", "deferred_runners"):
             if key in values and values[key] is not None:
                 values[key] = json.dumps(values[key])
         values["updated_at"] = now_epoch()

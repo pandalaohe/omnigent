@@ -10,9 +10,9 @@ from weakref import WeakValueDictionary
 
 import httpx
 
+from omnigent._wrapper_labels import is_parent_owned_subagent_labels
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
-from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
@@ -62,21 +62,7 @@ def schedule_child_restoration(
 
 def is_parent_owned_subagent(conv: Conversation) -> bool:
     """Native mirrors belong to their parent's runtime, not a separate terminal."""
-    from omnigent.server.routes._sessions.common import (
-        _ACP_SUBAGENT_ID_LABEL_KEY,
-        _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-        _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
-    )
-
-    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    return conv.kind == "sub_agent" and (
-        bool(conv.labels.get(_ACP_SUBAGENT_ID_LABEL_KEY))
-        or wrapper == _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE
-        or (
-            wrapper is not None
-            and any(wrapper == agent.subagent_wrapper_label for agent in native_agents())
-        )
-    )
+    return conv.kind == "sub_agent" and is_parent_owned_subagent_labels(conv.labels)
 
 
 def _restorable(conv: Conversation) -> bool:
