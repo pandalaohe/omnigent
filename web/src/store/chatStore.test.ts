@@ -7649,6 +7649,59 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.superseded", () => {
+    it("follows a superseded label on a cold open", async () => {
+      seedSession("conv_old");
+      sessionLabels.set("conv_old", { "omnigent.succeeded_by": "conv_next" });
+      await useChatStore.getState().switchTo("conv_old");
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_next");
+    });
+
+    it.each(["accepted", "refused"])(
+      "follows an active main chat's %s redirect",
+      async (outcome) => {
+        seedSession("conv_old");
+        await useChatStore.getState().switchTo("conv_old");
+        fetchMock.mockImplementation((input, init) => {
+          if (String(input).endsWith("/conv_old/events")) {
+            return Promise.resolve(
+              outcome === "accepted"
+                ? mockResponse({ queued: true, redirected_to: "conv_next" })
+                : mockResponse(
+                    {
+                      error: {
+                        code: "session_superseded",
+                        message: "Replaced",
+                        successor_id: "conv_next",
+                      },
+                    },
+                    { ok: false, status: 409 },
+                  ),
+            );
+          }
+          return Promise.resolve(defaultFetchHandler(input, init));
+        });
+        await useChatStore
+          .getState()
+          .send(outcome === "accepted" ? "hello" : "/clear", "agent_xyz");
+        expect(useChatStore.getState().redirectToConversationId).toBe("conv_next");
+      },
+    );
+
+    it("does not navigate for a background send", async () => {
+      seedSession("conv_old");
+      seedSession("conv_current");
+      await useChatStore.getState().switchTo("conv_old");
+      await useChatStore.getState().switchTo("conv_current");
+      fetchMock.mockImplementation((input, init) =>
+        String(input).endsWith("/conv_old/events")
+          ? Promise.resolve(mockResponse({ queued: true, redirected_to: "conv_next" }))
+          : Promise.resolve(defaultFetchHandler(input, init)),
+      );
+      await useChatStore
+        .getState()
+        .send("hello", "agent_xyz", undefined, { pinnedConversationId: "conv_old" });
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
     it("records the redirect target for the bound conversation", () => {
       useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
       handleSessionEvent({

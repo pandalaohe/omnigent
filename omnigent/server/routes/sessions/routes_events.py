@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import json
 import secrets
@@ -21,6 +22,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
+from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
@@ -41,7 +43,7 @@ from omnigent.entities.conversation import (
     MessageData,
     parse_item_data,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -311,7 +313,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.server.session_collab import collab_owner_for
+from omnigent.server.session_collab import AGENT_SESSION_HEADER, collab_owner_for
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -1463,6 +1465,56 @@ def register_events_routes(
             trusted_peer=trusted_peer,
         )
 
+    async def _redirected_message(
+        body: SessionEventInput,
+        old_id: str,
+        new_id: str,
+    ) -> SessionEventInput:
+        content = body.data.get("content")
+        copied = []
+        for block in content if isinstance(content, list) else []:
+            file_id = block.get("file_id") if isinstance(block, dict) else None
+            if isinstance(file_id, str) and file_id and file_store is not None:
+                source = await asyncio.to_thread(file_store.get, file_id, session_id=old_id)
+                if source is None:
+                    raise OmnigentError(
+                        "Attachment not found in the previous session", code=ErrorCode.NOT_FOUND
+                    )
+                new_file_id = hashlib.sha256(
+                    f"succession-file:{file_id}:{new_id}".encode()
+                ).hexdigest()[:32]
+                if await asyncio.to_thread(file_store.get, new_file_id, session_id=new_id) is None:
+                    try:
+                        await asyncio.to_thread(
+                            file_store.create,
+                            filename=source.filename,
+                            bytes=source.bytes,
+                            content_type=source.content_type,
+                            session_id=new_id,
+                            file_id=new_file_id,
+                            blob_key=source.blob_key or source.id,
+                            source_metadata=source.source_metadata,
+                        )
+                    except IntegrityError:
+                        if (
+                            await asyncio.to_thread(file_store.get, new_file_id, session_id=new_id)
+                            is None
+                        ):
+                            raise
+                block = {**block, "file_id": new_file_id}
+            copied.append(block)
+        return body.model_copy(
+            update={
+                "data": {
+                    **body.data,
+                    "content": [
+                        {"type": "input_text", "text": f"[Sent to previous session: /c/{old_id}]"},
+                        *copied,
+                    ],
+                }
+            }
+        )
+
     async def _subagent_wake_successor(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1776,6 +1828,75 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if conv.labels.get(SUCCEEDED_BY_LABEL_KEY):
+            target_id = await asyncio.to_thread(
+                resolve_succeeded_by, conversation_store, session_id
+            )
+            observation = body.type.startswith("external_") or body.type in {
+                _SUBAGENT_STATUS_TYPE,
+                SDK_PEER_RECEIPT_EVENT,
+            }
+            if not observation:
+                content = body.data.get("content")
+                text = _message_text(content) if isinstance(content, list) else ""
+                command = (text or "").strip().split(maxsplit=1)[0] if (text or "").strip() else ""
+                is_message = body.type == "message" and body.data.get("role", "user") == "user"
+                control = command in {
+                    "/clear",
+                    "/new",
+                    "/compact",
+                    "/model",
+                    "/effort",
+                    "/permissions",
+                    "/permission",
+                    "/interrupt",
+                    "/stop",
+                    "/sandbox",
+                    "/approval-mode",
+                    "/speed",
+                    "/plan",
+                    "/resume",
+                    "/fork",
+                }
+                if not is_message or control or target_id == session_id:
+                    raise SessionSupersededError(
+                        target_id
+                        if target_id != session_id
+                        else conv.labels[SUCCEEDED_BY_LABEL_KEY]
+                    )
+                try:
+                    parse_item_data(body.type, {"type": body.type, **body.data})
+                except (ValueError, TypeError) as exc:
+                    raise OmnigentError(
+                        f"Invalid message payload: {exc}", code=ErrorCode.INVALID_INPUT
+                    ) from exc
+                if conv.archived and (
+                    AGENT_SESSION_HEADER in request.headers
+                    or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+                ):
+                    from omnigent.server.session_collab import require_session_action_allowed
+
+                    await asyncio.to_thread(
+                        require_session_action_allowed,
+                        conv,
+                        conversation_store,
+                        permission_store,
+                        getattr(request.app.state, "user_preferences_store", None),
+                        action="send",
+                        target=conv,
+                    )
+                await _authorized_conversation(request, target_id, acting_user_id=acting_user_id)
+                redirected = await _redirected_message(body, session_id, target_id)
+                ack = await _post_event_impl(
+                    request,
+                    target_id,
+                    redirected,
+                    in_flight=in_flight,
+                    acting_user_id=acting_user_id,
+                    require_init_success=require_init_success,
+                    trusted_peer=trusted_peer,
+                )
+                return {**ack, "redirected_to": ack.get("redirected_to") or target_id}
         if body.type in {
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
             _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
@@ -2034,7 +2155,6 @@ def register_events_routes(
             _EXTERNAL_SUBAGENT_START_TYPE,
         }
         from omnigent.server.session_collab import (
-            AGENT_SESSION_HEADER,
             require_session_action_allowed,
         )
 

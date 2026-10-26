@@ -222,6 +222,27 @@ export interface SendOptions {
   onError?: (message: string) => void;
 }
 
+function followSupersededSession(sessionId: string, target?: string): void {
+  if (!target || target === sessionId) return;
+  useChatStore.setState((state) =>
+    state.conversationId === sessionId ? { redirectToConversationId: target } : {},
+  );
+}
+
+async function postConversationEvent(
+  ...args: Parameters<typeof postEvent>
+): ReturnType<typeof postEvent> {
+  try {
+    const result = await postEvent(...args);
+    followSupersededSession(args[0], result.redirectedTo);
+    return result;
+  } catch (error) {
+    if (error instanceof ApiError)
+      followSupersededSession(args[0], error.successorId ?? error.redirectedTo);
+    throw error;
+  }
+}
+
 /**
  * A title-less conversation row for the sidebar cache (renders like a fresh
  * session). `provisional` marks the client-only `temp:` row so the sidebar
@@ -2481,7 +2502,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         const content = await composerPartsToContentBlocks(orderedParts, (file) =>
           uploadFileBlock(conversationId, file),
         );
-        await postEvent(conversationId, {
+        await postConversationEvent(conversationId, {
           type: "message",
           data: { role: "user", content, stable_id: head.stableId },
         });
@@ -2783,7 +2804,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (compacts) {
         // Compact controls emit turn status edges, but no user
         // message acknowledgement. Keep the send latch without a pending bubble.
-        await postEvent(sessionId, { type: "compact", data: {} });
+        await postConversationEvent(sessionId, { type: "compact", data: {} });
         queryClient?.invalidateQueries({ queryKey: ["conversations"] });
         return true;
       }
@@ -2830,7 +2851,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(
+      const postResult = await postConversationEvent(
         sessionId,
         {
           type: "message",
@@ -3110,7 +3131,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
-      const postResult = await postEvent(sessionId, {
+      const postResult = await postConversationEvent(sessionId, {
         type: "slash_command",
         data: {
           kind: "skill",
@@ -3218,6 +3239,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     try {
       await interruptSession(sessionId);
     } catch (err) {
+      if (err instanceof ApiError)
+        followSupersededSession(sessionId, err.successorId ?? err.redirectedTo);
       const { message, code } = describeInterruptFailure(err);
       // The request can outlive navigation. Attach the failure to the session
       // whose Stop failed so it remains visible when the user returns.
@@ -3497,7 +3520,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   compact: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
-    await postEvent(conversationId, { type: "compact", data: {} });
+    await postConversationEvent(conversationId, { type: "compact", data: {} });
   },
 
   refreshSessionState: async (conversationId) => {
@@ -4261,6 +4284,7 @@ function cacheSessionSnapshot(
     }
   }
   queryClient?.setQueryData(["session", session.id], snapshot);
+  followSupersededSession(session.id, snapshot.labels?.["omnigent.succeeded_by"]);
 }
 
 /**
