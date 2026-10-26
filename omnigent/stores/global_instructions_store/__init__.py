@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Literal
 
 
 class InstructionRevisionConflict(ValueError):
@@ -22,10 +23,8 @@ class InstructionLayerKey:
             "agent": (True, False),
             "host": (False, True),
             "independent": (True, True),
-            "mother": (False, False),
-            "child": (False, False),
         }
-        if self.scope not in expected or expected[self.scope] != (
+        if self.scope not in {"mother", "child"} and expected.get(self.scope) != (
             bool(self.agent_key.strip()),
             bool(self.host_id.strip()),
         ):
@@ -129,7 +128,11 @@ class GlobalInstructionsStore(ABC):
 
     @abstractmethod
     def latest_layers(
-        self, host_id: str | None, agent_key: str | None
+        self,
+        host_id: str | None,
+        agent_key: str | None,
+        *,
+        role: Literal["mother", "child"] | None = None,
     ) -> list[GlobalInstructionRevision]:
-        """Read the independent setting, or shared → agent → host for a route."""
+        """Read a route and optional role's four keys in one managed session."""
         ...

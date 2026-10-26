@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Literal
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.exc import IntegrityError
@@ -201,9 +202,13 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
             return [_to_entity(row) for row in rows]
 
     def latest_layers(
-        self, host_id: str | None, agent_key: str | None
+        self,
+        host_id: str | None,
+        agent_key: str | None,
+        *,
+        role: Literal["mother", "child"] | None = None,
     ) -> list[GlobalInstructionRevision]:
-        """Read one route through its indexed keys in a single managed session."""
+        """Read route and optional role keys in a single managed session."""
         keys = [InstructionLayerKey()]
         if agent_key:
             keys.append(InstructionLayerKey("agent", agent_key=agent_key))
@@ -214,11 +219,22 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
             if host_id and agent_key
             else None
         )
+        role_keys = [InstructionLayerKey(role)] if role else []
+        if role and agent_key:
+            role_keys.append(InstructionLayerKey(role, agent_key=agent_key))
+        if role and host_id:
+            role_keys.append(InstructionLayerKey(role, host_id=host_id))
+        if role and host_id and agent_key:
+            role_keys.append(InstructionLayerKey(role, agent_key, host_id))
         with self._session("select_route_instruction_layers") as session:
+            revisions = []
             if independent is not None:
                 revision = self._current(session, independent)
                 if revision is not None and revision.text.strip():
-                    return [revision]
-            return [
-                revision for key in keys if (revision := self._current(session, key)) is not None
+                    revisions.append(revision)
+                    keys = []
+            return revisions + [
+                revision
+                for key in keys + role_keys
+                if (revision := self._current(session, key)) is not None
             ]
