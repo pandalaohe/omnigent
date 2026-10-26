@@ -548,6 +548,47 @@ async def test_pi_idle_warming_probe_obeys_live_owner_switch(client, app, db_uri
 
 
 @pytest.mark.asyncio
+async def test_pi_idle_warming_probe_reads_the_sessions_host_cell(
+    client, app, db_uri: str
+) -> None:
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        agent_id=_AGENT_ID,
+        harness_override="pi-native",
+        host_id="1" * 32,
+        workspace="/opt/work/project",
+        labels={"omnigent.running_since": str(int(time.time()))},
+    )
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = prefs
+    prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "keep_warm",
+        {
+            "default": {"main": True},
+            "cells": {"1" * 32: {"harness:pi-native": {"main": True}}},
+        },
+    )
+    event = {"type": "external_session_usage", "data": {"pi_cache_warming_probe": True}}
+    response = await client.post(f"/v1/sessions/{conv.id}/events", json=event)
+    assert response.status_code == 202, response.text
+    assert response.json()["pi_cache_warming_allowed"] is True
+    prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "keep_warm",
+        {
+            "cells": {"2" * 32: {"harness:pi-native": {"main": True}}},
+        },
+    )
+    response = await client.post(f"/v1/sessions/{conv.id}/events", json=event)
+    assert response.status_code == 202, response.text
+    assert response.json()["pi_cache_warming_allowed"] is False
+
+
+@pytest.mark.asyncio
 async def test_flush_with_stale_row_keeps_monotonic_clamp(db_uri: str) -> None:
     """A stale caller-held row must not weaken the forged-low-report clamp.
 

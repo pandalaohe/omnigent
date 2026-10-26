@@ -153,6 +153,17 @@ interface PendingPatch {
 }
 const patchesAfterFlight = new Map<UserPreferenceNamespace, PendingPatch>();
 const inFlightPatches = new Map<UserPreferenceNamespace, number>();
+const patchWaiters = new Set<{
+  namespace: UserPreferenceNamespace;
+  serialized: string;
+  finish: (error?: Error) => void;
+}>();
+
+function settlePatchWaiters(namespace: UserPreferenceNamespace, serialized: string, error?: Error) {
+  for (const waiter of patchWaiters) {
+    if (waiter.namespace === namespace && waiter.serialized === serialized) waiter.finish(error);
+  }
+}
 
 function dirtyOwnerKey(): string {
   return `${activeServerId}:${activeOwnerId ?? "__local__"}`;
@@ -383,6 +394,7 @@ function installRefreshListeners(): void {
 }
 
 function cancelPreferenceActivity(): void {
+  for (const waiter of patchWaiters) waiter.finish(new Error("The account or server changed."));
   for (const timer of pendingTimers.values()) window.clearTimeout(timer);
   pendingTimers.clear();
   patchesAfterFlight.clear();
@@ -578,6 +590,20 @@ function schedulePatch(
           });
           if (!isCurrentPreferenceGeneration(generation)) return;
           if (response?.status === 422) {
+            const body = await response.json().catch(() => null);
+            if (!isCurrentPreferenceGeneration(generation)) return;
+            settlePatchWaiters(
+              namespace,
+              serialized,
+              Object.assign(
+                new Error(
+                  typeof body?.detail === "string"
+                    ? body.detail
+                    : "The server rejected these settings (422).",
+                ),
+                { status: 422 },
+              ),
+            );
             const current = latestNamespaceValue(namespace);
             const currentSerialized = serializedNamespaceValue(namespace, current);
             if (currentSerialized !== serialized) {
@@ -599,6 +625,7 @@ function schedulePatch(
           if (!response?.ok) throw new Error("preference patch failed");
           lastAcknowledged.set(namespace, serialized);
           lastServerValues.set(namespace, syncValue);
+          settlePatchWaiters(namespace, serialized);
           window.dispatchEvent(
             new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
               detail: { namespace },
@@ -636,6 +663,12 @@ function schedulePatch(
                 delayMs: 1000 * 2 ** attempt,
                 attempt: attempt + 1,
               });
+            } else if (attempt >= 3) {
+              settlePatchWaiters(
+                namespace,
+                serialized,
+                new Error("Couldn't save settings. Check your connection and retry."),
+              );
             }
           }
         } finally {
@@ -668,10 +701,62 @@ export function queueUserPreferencePatch(
   }
   const syncValue = namespace === "mobile_assistant" ? mobileSyncValue(value) : value;
   const serialized = JSON.stringify(syncValue);
+  for (const waiter of patchWaiters) {
+    if (waiter.namespace === namespace && waiter.serialized !== serialized) {
+      waiter.finish(new Error("A newer edit replaced this save. Please retry."));
+    }
+  }
   if (lastAcknowledged.get(namespace) === serialized && !readDirtyNamespaces().has(namespace))
     return;
   markDirty(namespace, syncValue);
   schedulePatch(namespace, syncValue, serialized, 250, 0);
+}
+
+/** Observe the exact queued value, rather than an older in-flight namespace acknowledgement. */
+export function queueAcknowledgedUserPreferencePatch(
+  namespace: UserPreferenceNamespace,
+  value: unknown | null,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (
+    typeof window === "undefined" ||
+    applyingServerPreferences ||
+    !serverSupportsPreferences ||
+    preferenceFetcher === null ||
+    !preferenceConnectionIsCurrent()
+  ) {
+    return Promise.reject(new Error("Settings sync is not ready. Try again when connected."));
+  }
+  if (signal?.aborted) return Promise.reject(new Error("Save cancelled."));
+  const serialized = serializedNamespaceValue(namespace, value);
+  if (lastAcknowledged.get(namespace) === serialized && !readDirtyNamespaces().has(namespace)) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const abort = () => waiter.finish(new Error("Save cancelled."));
+    const timer = window.setTimeout(
+      () => waiter.finish(new Error("Save wasn't confirmed. Check your connection and retry.")),
+      30_000,
+    );
+    const waiter = {
+      namespace,
+      serialized,
+      finish: (error?: Error) => {
+        patchWaiters.delete(waiter);
+        window.clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        if (error) reject(error);
+        else resolve();
+      },
+    };
+    patchWaiters.add(waiter);
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      queueUserPreferencePatch(namespace, value);
+    } catch (error) {
+      waiter.finish(error instanceof Error ? error : new Error("Couldn't queue settings."));
+    }
+  });
 }
 
 export function syncAllUserPreferencesFromLocal(): void {
@@ -684,6 +769,7 @@ export function syncAllUserPreferencesFromLocal(): void {
 
 /** Test-only reset for module-scoped boot/debounce state. */
 export function resetUserPreferencesSyncForTests(): void {
+  for (const waiter of patchWaiters) waiter.finish(new Error("Settings sync reset."));
   for (const timer of pendingTimers.values()) window.clearTimeout(timer);
   pendingTimers.clear();
   patchesAfterFlight.clear();

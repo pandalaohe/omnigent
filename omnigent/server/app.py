@@ -160,9 +160,11 @@ from omnigent.server.session_collab import session_peer_enabled
 from omnigent.server.user_preferences_store import (
     USER_PREFERENCE_NAMESPACES,
     USER_PREFERENCES_MAX_BYTES,
+    KeepWarmIdentity,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
+    read_keep_warm_settings,
     touch_runner_log_warning_dismissals,
 )
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -3930,6 +3932,148 @@ def create_app(
     class WorktreeArchiveMigrationRequest(BaseModel):
         model_config = ConfigDict(extra="forbid", strict=True)
         delete_safe: bool
+
+    class KeepWarmConversionRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+        dry_run: bool
+
+    def _keep_warm_conversion_snapshot(
+        owner: str,
+    ) -> tuple[set[KeepWarmIdentity], set[str], list[tuple[str, str]]]:
+        from omnigent.db.utils import builtin_agent_id
+        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.harness_plugins import product_agent_harnesses
+        from omnigent.server.session_collab import collab_owners_for
+        from omnigent.server.session_overrides import AGENT_TEMPLATE_ID_LABEL, harness_for_session
+
+        products = product_agent_harnesses()
+        identities = {
+            KeepWarmIdentity(builtin_agent_id(name), harness) for name, harness in products.items()
+        }
+        legacy_native_agents: list[tuple[str, str]] = []
+        bundles: dict[str, Any | None] = {}
+        for user_agents in (False, True):
+            after = None
+            while True:
+                page = (
+                    agent_store.list_user_agents(owner, limit=1000, after=after)
+                    if user_agents
+                    else agent_store.list(limit=1000, after=after)
+                )
+                for agent in page.data:
+                    harness = (
+                        products.get(agent.name)
+                        if agent.id == builtin_agent_id(agent.name)
+                        else None
+                    )
+                    if harness is None:
+                        loaded = agent_cache.load(
+                            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+                        )
+                        bundles[agent.id] = loaded
+                        harness = (
+                            loaded.spec.executor.config.get("harness") or loaded.spec.executor.type
+                        )
+                    harness = (
+                        harness
+                        if harness.startswith("acp:")
+                        else canonicalize_harness(harness) or harness
+                    )
+                    identities.add(KeepWarmIdentity(agent.id, harness))
+                    family = {"claude-native": "claude", "codex-native": "codex"}.get(
+                        canonicalize_harness(harness) or harness
+                    )
+                    if not user_agents and family is not None:
+                        legacy_native_agents.append((agent.id, family))
+                if not page.has_more or page.last_id is None:
+                    break
+                after = page.last_id
+        if custom_agents_store is not None:
+            offset = 0
+            while True:
+                custom = custom_agents_store.list(owner, limit=1000, offset=offset)
+                for agent in custom:
+                    harness = agent["harness"]
+                    harness = (
+                        harness
+                        if harness.startswith("acp:")
+                        else canonicalize_harness(harness) or harness
+                    )
+                    identities.add(KeepWarmIdentity(agent["id"], harness))
+                if len(custom) < 1000:
+                    break
+                offset += len(custom)
+        after = None
+        hosts: set[str] = set()
+        harness_cache: dict[str, str | None] = {}
+        while True:
+            page = conversation_store.list_conversations(
+                limit=1000, after=after, kind=None, include_archived=False
+            )
+            owners = collab_owners_for(page.data, conversation_store, permission_store)
+            for conv in page.data:
+                if owners.get(conv.id) != owner:
+                    continue
+                hosts.add(conv.host_id or "")
+                if conv.agent_id and not conv.harness_override and conv.agent_id not in bundles:
+                    agent = agent_store.get(conv.agent_id)
+                    bundles[conv.agent_id] = (
+                        agent_cache.load(
+                            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+                        )
+                        if agent is not None
+                        else None
+                    )
+                identities.add(
+                    KeepWarmIdentity(
+                        conv.agent_id,
+                        harness_for_session(conv, harness_cache, bundles=bundles),
+                        conv.labels.get(AGENT_TEMPLATE_ID_LABEL),
+                    )
+                )
+            if not page.has_more or page.last_id is None:
+                break
+            after = page.last_id
+        hosts.update(
+            host.host_id
+            for host in (host_store.list_hosts(owner) if host_store else [])
+            if host.sandbox_provider is None
+        )
+        return identities, hosts, legacy_native_agents
+
+    @app.post(
+        "/v1/me/preferences/keep_warm/convert",
+        dependencies=[Depends(require_json_content_type)],
+        responses=_preferences_error_responses,
+    )
+    async def convert_keep_warm(request: Request) -> dict[str, Any]:
+        store = _preferences_store()
+        owner, create_if_missing = _preferences_owner(request)
+        _check_preference_write_rate(owner)
+        body = await _read_preferences_body(request, KeepWarmConversionRequest)
+        assert isinstance(body, KeepWarmConversionRequest)
+        settings = await asyncio.to_thread(read_keep_warm_settings, store, owner)
+        identities, hosts, legacy_native_agents = (
+            await asyncio.to_thread(_keep_warm_conversion_snapshot, owner)
+            if settings.cells is None
+            else (set(), set(), [])
+        )
+        try:
+            return await asyncio.to_thread(
+                store.convert_keep_warm,
+                owner,
+                identities,
+                hosts,
+                dry_run=body.dry_run,
+                create_if_missing=create_if_missing,
+                legacy_native_agents=legacy_native_agents,
+            )
+        except UserPreferencesUserNotFoundError as exc:
+            raise StarletteHTTPException(
+                status_code=401, detail="Account no longer exists"
+            ) from exc
+        except UserPreferencesValidationError as exc:
+            raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post(
         "/v1/me/preferences/worktree_archive/migrate",
