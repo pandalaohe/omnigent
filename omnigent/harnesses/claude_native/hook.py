@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -773,6 +774,17 @@ def _post_hook_with_reattach(
                 return None
 
 
+def _policy_fallback_marker(bridge_dir: Path, session_id: str, payload: dict[str, object]) -> Path:
+    """Identify a call without storing its arguments in the bridge marker."""
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input")
+    if tool_name == "Bash" and isinstance(tool_input, dict):
+        tool_input = {"command": tool_input.get("command", "")}
+    identity = [session_id, tool_name, tool_input or {}, payload.get("cwd") or ""]
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    return bridge_dir / f"policy-fallback-{digest}"
+
+
 def _main_permission_request(argv: list[str]) -> int:
     """
     Forward one Claude ``PermissionRequest`` hook to the active Omnigent session.
@@ -800,6 +812,12 @@ def _main_permission_request(argv: list[str]) -> int:
     if not session_id:
         print("omnigent claude permission hook: active session missing", file=sys.stderr)
         return 0
+    # This diagnostic only attributes an ask; it never changes its verdict.
+    marker = _policy_fallback_marker(bridge_dir, session_id, payload)
+    with contextlib.suppress(OSError):
+        if time.time() - marker.stat().st_mtime <= 600:
+            payload["_omnigent_approval_origin"] = "omnigent-policy-unavailable"
+        marker.unlink()
     config = read_permission_hook_config(bridge_dir)
     ap_server_url = args.omnigent_server_url or config.get("ap_server_url")
     if not isinstance(ap_server_url, str) or not ap_server_url:
@@ -933,6 +951,13 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # Unrecognized hook event — no policy to evaluate.
         return 0
 
+    marker = _policy_fallback_marker(bridge_dir, session_id, payload)
+    with contextlib.suppress(OSError):
+        marker.unlink(missing_ok=True)
+        for stale in bridge_dir.glob("policy-fallback-*"):
+            if time.time() - stale.stat().st_mtime > 600:
+                stale.unlink(missing_ok=True)
+
     # Stamp the live model from this session's statusLine capture.
     context = eval_request["event"]["context"]
     context["harness"] = "claude-native"
@@ -943,6 +968,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     def _fail_closed(detail: str | None = None) -> int:
         out = fail_ask_hook_output(hook_event, detail)
         if out is not None:
+            if hook_event == "PreToolUse":
+                with contextlib.suppress(OSError):
+                    marker.touch(mode=0o600)
             sys.stdout.write(json.dumps(out))
         return 0
 
