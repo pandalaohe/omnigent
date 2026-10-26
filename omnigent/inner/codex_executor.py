@@ -71,6 +71,7 @@ from omnigent.harnesses.codex_native.side_chat import (
     is_keep_warm_fork as _is_keep_warm_fork,
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.codex_binary import CODEX_RUNTIME_BIN_ENV, snapshot_codex_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
 from omnigent.models.codex_model_vocabulary import (
@@ -645,7 +646,9 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
-async def _codex_cli_version_text(codex_path: str) -> str | None:
+async def _codex_cli_version_text(
+    codex_path: str, *, env: Mapping[str, str] | None = None
+) -> str | None:
     """Return the exact version token reported by ``codex --version``."""
     try:
         proc = await _create_subprocess_exec(
@@ -653,6 +656,7 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except OSError:
         return None
@@ -674,7 +678,9 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
     return match.group(1) if match is not None else None
 
 
-async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
+async def _codex_cli_version(
+    codex_path: str, *, env: Mapping[str, str] | None = None
+) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
 
@@ -690,7 +696,11 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
         ``X.Y.Z`` token (caller treats ``None`` as "version unknown", not
         "too old").
     """
-    raw = await _codex_cli_version_text(codex_path)
+    raw = (
+        await _codex_cli_version_text(codex_path)
+        if env is None
+        else await _codex_cli_version_text(codex_path, env=env)
+    )
     if raw is None:
         return None
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", raw)
@@ -702,13 +712,19 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
 _BROKERED_CODEX_MIN_VERSION = Version("0.146.0")
 
 
-async def _require_brokered_codex_version(codex_path: str) -> None:
+async def _require_brokered_codex_version(
+    codex_path: str, *, env: Mapping[str, str] | None = None
+) -> None:
     """Fail closed unless Codex is a stable release at or above the brokered-auth floor.
 
     The signer rebuilds every request strictly, so a newer Codex that sends an
     unexpected request fails its turn rather than reaching the model.
     """
-    raw = await _codex_cli_version_text(codex_path)
+    raw = (
+        await _codex_cli_version_text(codex_path)
+        if env is None
+        else await _codex_cli_version_text(codex_path, env=env)
+    )
     try:
         version = Version(raw) if raw is not None else None
     except InvalidVersion:
@@ -726,7 +742,10 @@ async def _require_brokered_codex_version(codex_path: str) -> None:
         )
 
 
-def _codex_binary_identity(codex_path: str) -> tuple[int, int, int, int] | None:
+_CodexBinaryIdentity: TypeAlias = tuple[int, int, int, int]
+
+
+def _codex_binary_identity(codex_path: str) -> _CodexBinaryIdentity | None:
     """Return metadata that changes on normal executable replacement/update."""
     try:
         current = Path(codex_path).stat()
@@ -1338,6 +1357,7 @@ def _populate_codex_home_config(
     supported_efforts: frozenset[str] = CODEX_EFFORTS,
     include_credentials: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
+    runtime_bin: str | None = None,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1394,6 +1414,7 @@ def _populate_codex_home_config(
         in the trusted signer process.
     :param required_brokered_probe: Codex path, working directory, and active
         sandbox used to write a network-denied bundled catalog.
+    :param runtime_bin: Selected snapshot offered to a configured wrapper.
     """
     if required_brokered_probe is not None:
         codex_path, cwd, os_env = required_brokered_probe
@@ -1402,12 +1423,22 @@ def _populate_codex_home_config(
             cwd=cwd,
             codex_home=target_dir,
             os_env=os_env,
-            spawn_env_names=["PATH", "LANG", "LC_ALL", "TZ", "HOME", "CODEX_HOME"],
+            spawn_env_names=[
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "TZ",
+                "HOME",
+                "CODEX_HOME",
+                *([CODEX_RUNTIME_BIN_ENV] if runtime_bin is not None else []),
+            ],
+            runtime_bin=runtime_bin,
         )
         try:
             write_required_brokered_model_catalog(
                 target_dir,
                 codex_path=probe.launch_path,
+                runtime_bin=runtime_bin,
             )
         finally:
             probe.close()
@@ -2339,6 +2370,7 @@ def write_required_brokered_model_catalog(
     *,
     codex_path: str,
     timeout: float = 10.0,
+    runtime_bin: str | None = None,
 ) -> Path:
     """Write the bundled Codex catalog required by a brokered session."""
     env = {
@@ -2349,6 +2381,8 @@ def write_required_brokered_model_catalog(
     env.setdefault("PATH", os.defpath)
     env["HOME"] = str(target_dir)
     env["CODEX_HOME"] = str(target_dir)
+    if runtime_bin is not None:
+        env[CODEX_RUNTIME_BIN_ENV] = runtime_bin
     try:
         completed = subprocess.run(
             [codex_path, "debug", "models", "--bundled"],
@@ -3130,6 +3164,7 @@ class _CodexAppServerSession:
         thread_model_provider: str | None = None,
     ) -> None:
         self._codex_path = codex_path
+        self._launch_prepared = False
         self._resident_incarnation_id = uuid4().hex
         self._cwd = cwd
         self._env = env
@@ -3260,6 +3295,11 @@ class _CodexAppServerSession:
         generation = self._resident_connection_generation
         self._resident_established_connection = None
         self._resident_thread_started_revision = None
+        if not self._launch_prepared:
+            self._codex_path = await asyncio.to_thread(
+                snapshot_codex_binary, self._codex_path, env=self._env
+            )
+            self._launch_prepared = True
         cleanup_task = self._cleanup_task
         if cleanup_task is not None and not cleanup_task.done():
             await asyncio.shield(cleanup_task)
@@ -3366,7 +3406,11 @@ class _CodexAppServerSession:
                     lambda: detect_git_root(Path(self._cwd or os.getcwd()).resolve()) is not None
                 )
             ):
-                codex_version = await _codex_cli_version(self._codex_path)
+                codex_version = (
+                    await _codex_cli_version(self._codex_path, env=self._env)
+                    if CODEX_RUNTIME_BIN_ENV in self._env
+                    else await _codex_cli_version(self._codex_path)
+                )
         except Exception:  # noqa: BLE001 - profile discovery keeps the legacy launch.
             logger.warning("Failed to probe Codex permission profile support", exc_info=True)
         if router_bridge_dir is not None:
@@ -3386,6 +3430,7 @@ class _CodexAppServerSession:
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
             include_credentials=self._signer is None,
+            runtime_bin=self._env.get(CODEX_RUNTIME_BIN_ENV),
             required_brokered_probe=(
                 (
                     self._codex_path,
@@ -5526,6 +5571,8 @@ class _CodexSessionState:
     signature: tuple[str | None, str, str, str] | None = None
     closing: bool = False
     close_task: asyncio.Task[None] | None = None
+    codex_path: str | None = None
+    launch_env: dict[str, str] | None = None
 
 
 class _AppSessionFactory(Protocol):
@@ -5719,7 +5766,9 @@ class CodexExecutor(Executor):
         self._skills_filter = skills_filter
         self._skills_dir = skills_dir
         self._signer_backed = signer_launch_config is not None
-        self._brokered_version_identity: tuple[int, int, int, int] | None = None
+        self._brokered_version_identity: (
+            tuple[_CodexBinaryIdentity | None, _CodexBinaryIdentity | None] | None
+        ) = None
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
             raise ImportError(
@@ -6240,9 +6289,9 @@ class CodexExecutor(Executor):
             # Another waiter may have registered a replacement during cleanup.
             state = self._session_states.setdefault(session_key, _CodexSessionState())
         app_session = self._app_session_factory(
-            codex_path=self._codex_path,
+            codex_path=state.codex_path or self._codex_path,
             cwd=effective_cwd,
-            env=self._env,
+            env=state.launch_env if state.launch_env is not None else self._env,
             tool_executor=self._tool_executor,
             raw_elicitation_handler=self._raw_elicitation_handler,
             codex_config_overrides=self._codex_config_overrides,
@@ -6255,6 +6304,7 @@ class CodexExecutor(Executor):
         )
         if isinstance(app_session, _CodexAppServerSession):
             app_session._usage_session_id = session_key
+            app_session._launch_prepared = state.codex_path is not None
         state.app_session = app_session
         state.signature = signature
         return app_session
@@ -6267,9 +6317,20 @@ class CodexExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
-        binary_identity = _codex_binary_identity(self._codex_path)
         session_key = _session_key(messages)
         state = self._session_states.get(session_key) or _CodexSessionState()
+        if state.codex_path is None:
+            await claim_startup_boundary("executor_prepare")
+            state.launch_env = dict(self._env)
+            state.codex_path = await asyncio.to_thread(
+                snapshot_codex_binary, self._codex_path, env=state.launch_env
+            )
+        launch_env = state.launch_env if state.launch_env is not None else self._env
+        runtime_path = launch_env.get(CODEX_RUNTIME_BIN_ENV, state.codex_path)
+        binary_identity = (
+            _codex_binary_identity(state.codex_path),
+            _codex_binary_identity(runtime_path),
+        )
         # cfg.model (per-request /model override) wins over the spec default.
         # An unresolved default comes from the active provider catalog.
         # On the cli-config path (model_provider_override set) the codex binary
@@ -6312,12 +6373,18 @@ class CodexExecutor(Executor):
         ):
             await claim_startup_boundary("executor_prepare")
         if self._signer_backed and (
-            binary_identity is None or binary_identity != self._brokered_version_identity
+            None in binary_identity or binary_identity != self._brokered_version_identity
         ):
             # This probe precedes app-session construction and any signer or worker start.
-            await _require_brokered_codex_version(self._codex_path)
-            validated_identity = _codex_binary_identity(self._codex_path)
-            if binary_identity is not None and validated_identity != binary_identity:
+            if CODEX_RUNTIME_BIN_ENV in launch_env:
+                await _require_brokered_codex_version(state.codex_path, env=launch_env)
+            else:
+                await _require_brokered_codex_version(state.codex_path)
+            validated_identity = (
+                _codex_binary_identity(state.codex_path),
+                _codex_binary_identity(runtime_path),
+            )
+            if None not in binary_identity and validated_identity != binary_identity:
                 raise RuntimeError("Codex executable changed during brokered version validation")
             self._brokered_version_identity = validated_identity
         state = self._session_states.setdefault(session_key, state)

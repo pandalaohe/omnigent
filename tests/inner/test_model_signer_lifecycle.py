@@ -247,9 +247,11 @@ async def test_signer_exit_during_worker_spawn_tears_worker_down(
     assert session._worker_launch is None
 
 
+@pytest.mark.parametrize("wrapper", [False, True])
 async def test_signer_backed_home_excludes_host_credential_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    wrapper: bool,
 ) -> None:
     signer = _Signer([])
     process = _Process()
@@ -265,11 +267,16 @@ async def test_signer_backed_home_excludes_host_credential_files(
     )
     session = _session(tmp_path, signer)
     session._request = AsyncMock(return_value={"result": {}})
+    runtime = "/opt/work/omnigent/runtime/bin/codex"
+    if wrapper:
+        session._launch_prepared = True
+        session._env["OMNIGENT_CODEX_RUNTIME_BIN"] = runtime
 
     await session.start()
 
     assert populate.call_args.kwargs["include_credentials"] is False
     assert populate.call_args.kwargs["minimal_config"] is True
+    assert populate.call_args.kwargs["runtime_bin"] == (runtime if wrapper else None)
     probe_path, probe_cwd, probe_os_env = populate.call_args.kwargs["required_brokered_probe"]
     assert probe_path == "/bin/echo"
     assert probe_cwd == tmp_path

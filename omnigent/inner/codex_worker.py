@@ -7,6 +7,7 @@ from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .codex_binary import CODEX_RUNTIME_BIN_ENV, codex_binary_read_root
 from .datamodel import OSEnvSpec
 from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .model_signer import SignerReadiness
@@ -66,6 +67,7 @@ def prepare_codex_catalog_probe(
     codex_home: Path,
     os_env: OSEnvSpec | None,
     spawn_env_names: Sequence[str],
+    runtime_bin: str | None = None,
 ) -> CodexWorkerLaunch:
     """Prepare a network-denied launcher for ``codex debug models --bundled``."""
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
@@ -74,8 +76,10 @@ def prepare_codex_catalog_probe(
     if not policy.active:
         raise OSError("brokered Codex catalog probe requires an active sandbox")
 
-    codex_dir = Path(codex_path).resolve(strict=False).parent
+    codex_dir = codex_binary_read_root(codex_path)
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
+    if runtime_bin is not None:
+        policy = with_additional_read_roots(policy, [codex_binary_read_root(runtime_bin)])
     policy = with_additional_write_roots(policy, [codex_home])
     policy = replace(
         policy,
@@ -136,10 +140,12 @@ def prepare_codex_worker(
     if egress_rules and worker_env is None:
         raise ValueError("egress-filtered Codex worker requires an owned worker environment")
 
-    codex_dir = Path(codex_path).resolve(strict=False).parent
+    codex_dir = codex_binary_read_root(codex_path)
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
     if skills_dir is not None:
         policy = with_additional_read_roots(policy, [skills_dir])
+    if worker_env is not None and (runtime := worker_env.get(CODEX_RUNTIME_BIN_ENV)):
+        policy = with_additional_read_roots(policy, [codex_binary_read_root(runtime)])
     policy = with_additional_write_roots(policy, [codex_home])
     if signer_readiness is not None:
         if signer_readiness.ca_bundle_path.parent != signer_readiness.socket_path.parent:

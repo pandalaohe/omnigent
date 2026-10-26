@@ -409,10 +409,19 @@ def test_a_users_own_catalog_choice_wins(tmp_path: Path) -> None:
     assert config.read_text() == 'model_catalog_json = "/mine.json"\n'
 
 
+@pytest.mark.parametrize("wrapper", [False, True])
 def test_required_brokered_catalog_is_bundled_private_and_credential_free(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    wrapper: bool,
 ) -> None:
+    from unittest.mock import Mock
+
+    import tomllib
+
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
     captured: dict[str, object] = {}
 
     class _Completed:
@@ -427,7 +436,26 @@ def test_required_brokered_catalog_is_bundled_private_and_credential_free(
 
     monkeypatch.setattr(codex_executor.subprocess, "run", _run)
 
-    catalog_path = write_required_brokered_model_catalog(tmp_path, codex_path="/bin/codex")
+    runtime = "/opt/work/omnigent/runtime/bin/codex"
+    if wrapper:
+        prepare = Mock(return_value=CodexWorkerLaunch("/bin/codex", sandboxed=True))
+        monkeypatch.setattr(codex_executor, "prepare_codex_catalog_probe", prepare)
+        codex_executor._populate_codex_home_config(
+            tmp_path,
+            tmp_path / "missing-source",
+            required_brokered_probe=(
+                "/opt/work/omnigent/bin/wrapper",
+                tmp_path,
+                OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+            ),
+            runtime_bin=runtime,
+        )
+        assert prepare.call_args.kwargs["runtime_bin"] == runtime
+        assert "OMNIGENT_CODEX_RUNTIME_BIN" in prepare.call_args.kwargs["spawn_env_names"]
+        config = tomllib.loads((tmp_path / "config.toml").read_text())
+        catalog_path = Path(config["model_catalog_json"])
+    else:
+        catalog_path = write_required_brokered_model_catalog(tmp_path, codex_path="/bin/codex")
 
     assert captured["argv"] == ["/bin/codex", "debug", "models", "--bundled"]
     assert captured["timeout"] == 10.0
@@ -440,6 +468,7 @@ def test_required_brokered_catalog_is_bundled_private_and_credential_free(
     assert "OPENAI_API_KEY" not in env
     assert "HTTP_PROXY" not in env
     assert "HTTPS_PROXY" not in env
+    assert env.get("OMNIGENT_CODEX_RUNTIME_BIN") == (runtime if wrapper else None)
     assert json.loads(catalog_path.read_text()) == _catalog()
     assert catalog_path.stat().st_mode & 0o777 == 0o600
 
