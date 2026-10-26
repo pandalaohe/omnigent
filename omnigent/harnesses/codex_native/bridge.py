@@ -365,6 +365,7 @@ def _trim_codex_orphan_caches(bridge_dir: Path) -> None:
     if codex_home.is_symlink() or not codex_home.is_dir():
         return
     try:
+        home_stat = codex_home.stat()
         entries = list(codex_home.iterdir())
     except OSError:
         return
@@ -380,6 +381,18 @@ def _trim_codex_orphan_caches(bridge_dir: Path) -> None:
                 entry.unlink()
         except OSError:
             continue
+    try:
+        # Removing caches updates this directory, which unmarked homes use as
+        # activity evidence. Maintenance must not extend their retention.
+        current = codex_home.lstat()
+        if (current.st_dev, current.st_ino) == (home_stat.st_dev, home_stat.st_ino):
+            os.utime(
+                codex_home,
+                ns=(home_stat.st_atime_ns, home_stat.st_mtime_ns),
+                follow_symlinks=False,
+            )
+    except OSError:
+        _logger.warning("Could not preserve Codex orphan cache activity time")
 
 
 def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:

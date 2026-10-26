@@ -1338,6 +1338,24 @@ def test_prune_orphaned_bridge_dirs_removes_expired_unmarked_bridge(
     assert not bridge_dir.exists()
 
 
+def test_unmarked_cache_trim_preserves_retention_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = codex_native_bridge.time.time()
+    bridge_dir, _rollout = _make_unmarked_bridge(tmp_path, inactive_since=now - 8 * 86400)
+    home = bridge_dir / "codex-home"
+    (home / "models_cache.json").write_text("cache")
+    aged_ns = int((now - 8 * 86400) * 1_000_000_000)
+    os.utime(home, ns=(aged_ns, aged_ns))
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    before = codex_native_bridge._codex_newest_activity_time(bridge_dir)
+    assert not codex_native_bridge._codex_orphan_retention_expired(bridge_dir)
+    assert not (home / "models_cache.json").exists()
+    assert codex_native_bridge._codex_newest_activity_time(bridge_dir) == before
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now + 63 * 86400)
+    assert codex_native_bridge._codex_orphan_retention_expired(bridge_dir)
+
+
 def test_prune_orphaned_bridge_dirs_keeps_unmarked_bridge_with_recent_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

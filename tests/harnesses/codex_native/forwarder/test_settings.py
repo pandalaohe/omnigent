@@ -312,6 +312,58 @@ def test_note_resume_response_records_model_without_seeding_baseline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_stance_is_observed_without_persisting_launch_args() -> None:
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    settings = {
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "activePermissionProfile": {"id": ":danger-full-access"},
+    }
+    state.note_resume_response({"result": settings})
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "approval_mode": "full-access",
+                    "permission_observation": state.permission_observation.to_payload(),
+                },
+            },
+        )
+    ]
+    assert "terminal_launch_args" not in client.posts[0][1]["data"]
+    client.posts.clear()
+    state.note_thread_settings_updated({"threadSettings": settings})
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"]["approval_mode"] == "full-access"
+    assert "terminal_launch_args" not in client.posts[0][1]["data"]
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    assert len(client.posts) == 1
+    client.posts.clear()
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+                "activePermissionProfile": {"id": ":workspace"},
+            }
+        }
+    )
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"] == {
+        "approval_mode": "approve-for-me",
+        "permission_observation": state.permission_observation.to_payload(),
+    }
+    assert "terminal_launch_args" not in client.posts[0][1]["data"]
+    assert state.terminal_launch_args is None and state.posted_terminal_launch_args is None
+
+
+@pytest.mark.asyncio
 async def test_sync_after_resume_posts_spawn_model() -> None:
     """End-to-end: an unchanged spawn model is mirrored to AP.
 

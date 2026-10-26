@@ -6794,7 +6794,11 @@ def test_populate_codex_home_config_windows_sandbox_write_failure_keeps_config(
             fault.setattr(
                 os,
                 "fdopen",
-                lambda fd, *args, **kwargs: PartialWriter(real_fdopen(fd, *args, **kwargs)),
+                lambda fd, mode, *args, **kwargs: (
+                    real_fdopen(fd, mode, *args, **kwargs)
+                    if "r" in mode
+                    else PartialWriter(real_fdopen(fd, mode, *args, **kwargs))
+                ),
             )
         elif failure == "chmod":
             fault.setattr(os, "chmod", Mock(side_effect=OSError("cannot set temp mode")))
