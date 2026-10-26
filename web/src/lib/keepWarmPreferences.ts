@@ -8,19 +8,22 @@ import {
   mirrorLegacyChildKeepWarm,
   readSessionCollabPreferences,
 } from "./sessionCollabPreferences";
-import { queueUserPreferencePatch } from "./userPreferencesSync";
+import {
+  queueAcknowledgedUserPreferencePatch,
+  queueUserPreferencePatch,
+} from "./userPreferencesSync";
 
 export const KEEP_WARM_STORAGE_KEY = "omnigent:keep-warm";
 export const KEEP_WARM_CHANGED_EVENT = "omnigent:keep-warm-changed";
 
-export type KeepWarmFamily = "claude" | "codex";
+export type KeepWarmFamily = "claude" | "codex" | "pi";
 
 export function keepWarmFamilyForHarness(
   harness: string | null | undefined,
   capabilitiesByHarness: Record<string, { keep_warm_family?: string | null }>,
 ): KeepWarmFamily | null {
   const family = harness ? capabilitiesByHarness[harness]?.keep_warm_family : null;
-  return family === "claude" || family === "codex" ? family : null;
+  return family === "claude" || family === "codex" || family === "pi" ? family : null;
 }
 
 /** The legacy migration and mirror only ever cover the native CLIs. */
@@ -96,7 +99,14 @@ export interface KeepWarmPreferences {
   agents: Record<string, AgentKeepWarmPreferences>;
   hostOfflineArchiveSeconds: number;
   migratedFromLegacyAt?: number;
+  cells?: KeepWarmCells;
+  migratedToCellsAt?: number;
+  /** Display axes only, including columns whose cells are all off. */
+  columns?: string[];
 }
+
+export type KeepWarmCell = Partial<AgentKeepWarmPreferences>;
+export type KeepWarmCells = Record<string, Record<string, KeepWarmCell>>;
 
 export interface KeepWarmDefaultPreferences {
   main: boolean;
@@ -169,6 +179,19 @@ function normalizeAgentRow(value: unknown): AgentKeepWarmPreferences | null {
   };
 }
 
+function normalizeCell(value: unknown): KeepWarmCell | null {
+  const row = normalizeAgentRow(value);
+  if (!row) return null;
+  const raw = value as Record<string, unknown>;
+  return {
+    ...(typeof raw.main === "boolean" ? { main: raw.main } : {}),
+    ...(typeof raw.child === "boolean" ? { child: raw.child } : {}),
+    ...(row.intervalSeconds !== undefined ? { intervalSeconds: row.intervalSeconds } : {}),
+    ...(positiveInteger(raw.maxSeconds) !== undefined ? { maxSeconds: row.maxSeconds } : {}),
+    ...(row.coldAfterSeconds !== undefined ? { coldAfterSeconds: row.coldAfterSeconds } : {}),
+  };
+}
+
 function normalizeDefaultRow(value: unknown): KeepWarmDefaultPreferences {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return { ...KEEP_WARM_DEFAULT_ROW };
@@ -189,7 +212,7 @@ function normalizeDefaultRow(value: unknown): KeepWarmDefaultPreferences {
 }
 
 /** Drop unknown/invalid fields; per-family clamps apply when a row is resolved. */
-function normalizeKeepWarmPreferences(value: unknown): KeepWarmPreferences {
+export function normalizeKeepWarmPreferences(value: unknown): KeepWarmPreferences {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return defaultKeepWarmPreferences();
   }
@@ -209,16 +232,42 @@ function normalizeKeepWarmPreferences(value: unknown): KeepWarmPreferences {
   const rawMigrated = raw.migratedFromLegacyAt;
   const migratedFromLegacyAt =
     typeof rawMigrated === "number" && Number.isInteger(rawMigrated) ? rawMigrated : undefined;
+  let cells: KeepWarmCells | undefined;
+  if (raw.cells && typeof raw.cells === "object" && !Array.isArray(raw.cells)) {
+    cells = {};
+    for (const [host, rows] of Object.entries(raw.cells)) {
+      if (!rows || typeof rows !== "object" || Array.isArray(rows)) continue;
+      cells[host] = {};
+      for (const [key, cellValue] of Object.entries(rows)) {
+        const row = normalizeCell(cellValue);
+        if (row) cells[host][key] = row;
+      }
+    }
+  }
+  const migratedToCellsAt = Number.isInteger(raw.migratedToCellsAt)
+    ? (raw.migratedToCellsAt as number)
+    : undefined;
+  const columns = Array.isArray(raw.columns)
+    ? [
+        ...new Set(
+          raw.columns.filter((key): key is string => typeof key === "string" && key.length > 0),
+        ),
+      ]
+    : undefined;
   return {
     default: normalizeDefaultRow(raw.default),
     agents,
     hostOfflineArchiveSeconds,
     ...(migratedFromLegacyAt !== undefined ? { migratedFromLegacyAt } : {}),
+    ...(cells !== undefined ? { cells } : {}),
+    ...(migratedToCellsAt !== undefined ? { migratedToCellsAt } : {}),
+    ...(columns !== undefined ? { columns } : {}),
   };
 }
 
-function isKeepWarmPreferencesDefault(preferences: KeepWarmPreferences): boolean {
+export function isKeepWarmPreferencesDefault(preferences: KeepWarmPreferences): boolean {
   return (
+    preferences.cells === undefined &&
     Object.keys(preferences.agents).length === 0 &&
     !preferences.default.main &&
     !preferences.default.child &&
@@ -317,23 +366,23 @@ export interface KeepWarmAgentIdentity {
   harness: string | null | undefined;
 }
 
-/**
- * Persist the namespace locally and to the server. The legacy SCC19 switch is
- * mirrored on every save so a rolled-back client keeps the same behaviour, and
- * unknown legacy keys are never dropped.
- */
-export function writeKeepWarmPreferences(
-  preferences: KeepWarmPreferences,
+/** Preserve unresolved child-on identities when mirroring to older clients. */
+function mirrorKeepWarmPreferences(
+  normalized: KeepWarmPreferences,
   agentIdentities: readonly KeepWarmAgentIdentity[] = [],
 ): void {
-  if (typeof window === "undefined") return;
-  const normalized = normalizeKeepWarmPreferences(preferences);
   const harnessById = new Map(agentIdentities.map((agent) => [agent.id, agent.harness]));
   let hasUnclassifiableChild = false;
-  let hasNativeChild = ["claude-native", "codex-native"].some(
-    (harness) => normalized.agents[`harness:${harness}`]?.child ?? normalized.default.child,
-  );
-  for (const [agentId, row] of Object.entries(normalized.agents)) {
+  let hasNativeChild =
+    normalized.cells === undefined &&
+    ["claude-native", "codex-native"].some(
+      (harness) => normalized.agents[`harness:${harness}`]?.child ?? normalized.default.child,
+    );
+  const rows =
+    normalized.cells === undefined
+      ? Object.entries(normalized.agents)
+      : Object.values(normalized.cells).flatMap((host) => Object.entries(host));
+  for (const [agentId, row] of rows) {
     if (!row.child) continue;
     if (agentId.startsWith("harness:")) {
       if (isLegacyNativeKeepWarmHarness(agentId.slice("harness:".length))) hasNativeChild = true;
@@ -354,7 +403,10 @@ export function writeKeepWarmPreferences(
       ? readSessionCollabPreferences().childKeepWarmEnabled
       : false;
   mirrorLegacyChildKeepWarm(legacyChildKeepWarmEnabled);
+}
 
+function persistKeepWarmPreferences(preferences: KeepWarmPreferences): KeepWarmPreferences {
+  const normalized = normalizeKeepWarmPreferences(preferences);
   const isDefault = isKeepWarmPreferencesDefault(normalized);
   try {
     if (isDefault) window.localStorage.removeItem(KEEP_WARM_STORAGE_KEY);
@@ -363,5 +415,74 @@ export function writeKeepWarmPreferences(
     // Storage denial or quota exhaustion must not break the settings page.
   }
   window.dispatchEvent(new Event(KEEP_WARM_CHANGED_EVENT));
-  queueUserPreferencePatch("keep_warm", isDefault ? null : normalized);
+  return normalized;
+}
+
+function namespaceValue(preferences: KeepWarmPreferences) {
+  if (isKeepWarmPreferencesDefault(preferences)) return null;
+  if (preferences.cells === undefined) return preferences;
+  // Legacy rows remain on the server for rollback; cells saves never rewrite them.
+  const { default: _default, agents: _agents, ...cellsNamespace } = preferences;
+  return cellsNamespace;
+}
+
+export function writeKeepWarmPreferences(
+  preferences: KeepWarmPreferences,
+  agentIdentities: readonly KeepWarmAgentIdentity[] = [],
+): void {
+  if (typeof window === "undefined") return;
+  const normalized = persistKeepWarmPreferences(preferences);
+  mirrorKeepWarmPreferences(normalized, agentIdentities);
+  queueUserPreferencePatch("keep_warm", namespaceValue(normalized));
+}
+
+export async function saveKeepWarmPreferences(
+  preferences: KeepWarmPreferences,
+  agentIdentities: readonly KeepWarmAgentIdentity[],
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new Error("Save cancelled.");
+  const normalized = persistKeepWarmPreferences(preferences);
+  await queueAcknowledgedUserPreferencePatch("keep_warm", namespaceValue(normalized), signal);
+  mirrorKeepWarmPreferences(normalized, agentIdentities);
+}
+
+export function resolveKeepWarmCell(
+  preferences: KeepWarmPreferences,
+  host: string,
+  key: string,
+  harness?: string | null,
+): AgentKeepWarmPreferences {
+  const rows = preferences.cells?.[host];
+  const row = rows?.[key] ?? (harness ? rows?.[`harness:${harness}`] : undefined);
+  return {
+    ...KEEP_WARM_DEFAULT_ROW,
+    ...row,
+    maxSeconds: clampKeepWarmMaxSeconds(row?.maxSeconds ?? KEEP_WARM_DEFAULT_MAX_SECONDS),
+  };
+}
+
+export function turnOffKeepWarmCell(
+  preferences: KeepWarmPreferences,
+  host: string,
+  key: string,
+  harness?: string | null,
+): KeepWarmPreferences {
+  const rows = { ...preferences.cells?.[host] };
+  Reflect.deleteProperty(rows, key);
+  const fallback = !key.startsWith("harness:") && harness ? rows[`harness:${harness}`] : undefined;
+  if (
+    !key.startsWith("harness:") &&
+    (!harness ||
+      (fallback &&
+        (fallback.main ||
+          fallback.child ||
+          fallback.coldAfterSeconds !== undefined ||
+          fallback.intervalSeconds !== undefined ||
+          (fallback.maxSeconds !== undefined &&
+            fallback.maxSeconds !== KEEP_WARM_DEFAULT_MAX_SECONDS))))
+  ) {
+    rows[key] = { main: false, child: false };
+  }
+  return { ...preferences, cells: { ...preferences.cells, [host]: rows } };
 }

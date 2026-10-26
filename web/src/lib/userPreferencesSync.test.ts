@@ -4,6 +4,8 @@ import {
   collectLocalUserPreferences,
   initializeUserPreferencesSync,
   queueUserPreferencePatch,
+  queueAcknowledgedUserPreferencePatch,
+  deactivateUserPreferencesSync,
   refreshUserPreferencesFromServer,
   resetUserPreferencesSyncForTests,
   USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT,
@@ -25,6 +27,153 @@ beforeEach(() => {
   localStorage.clear();
   resetUserPreferencesSyncForTests();
   vi.useRealTimers();
+});
+
+describe("acknowledged preference saves", () => {
+  it.each([
+    { transition: "account", owner: "bob", server: "server-a" },
+    { transition: "server", owner: "alice", server: "server-b" },
+  ])("ignores a delayed 422 body after a $transition switch", async ({ owner, server }) => {
+    vi.useFakeTimers();
+    let releaseBody!: (body: { detail: string }) => void;
+    const delayedBody = new Promise<{ detail: string }>((resolve) => {
+      releaseBody = resolve;
+    });
+    const oldResponse = new Response(null, { status: 422 });
+    const readBody = vi.spyOn(oldResponse, "json").mockReturnValue(delayedBody);
+    const oldFetcher = vi.fn().mockResolvedValue(oldResponse);
+    await initializeUserPreferencesSync(
+      { version: 1, settings: {} },
+      oldFetcher,
+      "alice",
+      "server-a",
+    );
+    queueUserPreferencePatch("keep_warm", { cells: {} });
+    await vi.advanceTimersByTimeAsync(251);
+    expect(readBody).toHaveBeenCalledOnce();
+
+    let acknowledge!: (response: Response) => void;
+    const currentFetcher = vi.fn().mockReturnValue(
+      new Promise<Response>((resolve) => {
+        acknowledge = resolve;
+      }),
+    );
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { keep_warm: { cells: { h2: { codex: { main: true } } } } } },
+      currentFetcher,
+      owner,
+      server,
+    );
+    localStorage.setItem(KEEP_WARM_STORAGE_KEY, JSON.stringify({ cells: {} }));
+    const currentSave = queueAcknowledgedUserPreferencePatch("keep_warm", { cells: {} });
+    const settled: string[] = [];
+    void currentSave.then(
+      () => settled.push("saved"),
+      (error: Error) => settled.push(error.message),
+    );
+    await vi.advanceTimersByTimeAsync(251);
+    expect(currentFetcher).toHaveBeenCalledOnce();
+
+    releaseBody({ detail: "Alice's settings were rejected" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toEqual([]);
+    expect(JSON.parse(localStorage.getItem(KEEP_WARM_STORAGE_KEY)!)).toEqual({ cells: {} });
+    const dirty = JSON.parse(localStorage.getItem("omnigent:user-preferences-dirty-values")!);
+    expect(dirty[`${server}:${owner}`]).toEqual({ keep_warm: { cells: {} } });
+
+    acknowledge(new Response(null, { status: 200 }));
+    await currentSave;
+    expect(settled).toEqual(["saved"]);
+  });
+
+  it("waits for the exact value when an older patch is in flight", async () => {
+    vi.useFakeTimers();
+    let resolveOld!: (response: Response) => void;
+    let resolveNew!: (response: Response) => void;
+    const fetcher = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveOld = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveNew = resolve;
+        }),
+      );
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    queueUserPreferencePatch("keep_warm", { cells: {} });
+    await vi.advanceTimersByTimeAsync(251);
+    const settled = vi.fn();
+    const next = queueAcknowledgedUserPreferencePatch("keep_warm", {
+      cells: { h1: { codex: { main: true } } },
+    });
+    void next.then(settled);
+    await vi.advanceTimersByTimeAsync(251);
+    resolveOld(new Response(null, { status: 200 }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).not.toHaveBeenCalled();
+    resolveNew(new Response(null, { status: 200 }));
+    await next;
+    expect(settled).toHaveBeenCalledOnce();
+  });
+
+  it("returns the 422 detail and does not retry a rejected save", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi
+      .fn()
+      .mockImplementation(() =>
+        Promise.resolve(Response.json({ detail: "64 KiB: 20 hosts, 30 columns" }, { status: 422 })),
+      );
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    const save = queueAcknowledgedUserPreferencePatch("keep_warm", { cells: {} });
+    const rejected = expect(save).rejects.toThrow("64 KiB: 20 hosts, 30 columns");
+    await vi.advanceTimersByTimeAsync(251);
+    await rejected;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("rejects superseded, aborted, unavailable and disposed observers", async () => {
+    vi.useFakeTimers();
+    await expect(queueAcknowledgedUserPreferencePatch("keep_warm", {})).rejects.toThrow(
+      "not ready",
+    );
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, vi.fn(), "alice");
+    const previous = queueAcknowledgedUserPreferencePatch("keep_warm", { cells: {} });
+    const replaced = expect(previous).rejects.toThrow("newer edit");
+    queueUserPreferencePatch("keep_warm", { cells: { h1: {} } });
+    await replaced;
+    const controller = new AbortController();
+    const aborted = queueAcknowledgedUserPreferencePatch(
+      "keep_warm",
+      { cells: {} },
+      controller.signal,
+    );
+    const cancelled = expect(aborted).rejects.toThrow("cancelled");
+    controller.abort();
+    await cancelled;
+    const pending = queueAcknowledgedUserPreferencePatch("keep_warm", { cells: {} });
+    const disposed = expect(pending).rejects.toThrow("account or server changed");
+    deactivateUserPreferencesSync();
+    await disposed;
+  });
+
+  it("settles permanent transport failures and a hung request instead of hanging", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockRejectedValue(new Error("offline"));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    const failed = queueAcknowledgedUserPreferencePatch("keep_warm", { cells: {} });
+    const failure = expect(failed).rejects.toThrow("Couldn't save");
+    await vi.advanceTimersByTimeAsync(10_000);
+    await failure;
+    fetcher.mockReturnValue(new Promise(() => {}));
+    const hung = queueAcknowledgedUserPreferencePatch("keep_warm", { cells: { h1: {} } });
+    const timedOut = expect(hung).rejects.toThrow("wasn't confirmed");
+    await vi.advanceTimersByTimeAsync(30_001);
+    await timedOut;
+  });
 });
 
 describe("user preference synchronization", () => {

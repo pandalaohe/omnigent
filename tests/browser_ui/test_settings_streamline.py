@@ -309,7 +309,7 @@ def test_legacy_links_open_the_new_group(
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_keep_warm_default_and_exception_persist_with_support_reasons(
+def test_keep_warm_table_convert_and_cell_persist_with_support_reasons(
     page: Page, appearance_url: str, browser_contract: BrowserContract, width: int
 ) -> None:
     agents = [
@@ -343,6 +343,24 @@ def test_keep_warm_default_and_exception_persist_with_support_reasons(
             },
         },
     )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "example-host",
+                    "name": "Example host",
+                    "owner": "local",
+                    "status": "online",
+                    "configured_harnesses": {
+                        "claude-native": True,
+                        "codex-native": True,
+                        "openai-agents": True,
+                    },
+                }
+            ]
+        },
+    )
     preferences = {
         "default": {"main": False, "child": False, "maxSeconds": 14400},
         "agents": {
@@ -351,13 +369,33 @@ def test_keep_warm_default_and_exception_persist_with_support_reasons(
                 "child": False,
                 "intervalSeconds": 3300,
                 "maxSeconds": 7200,
-            },
+            }
         },
         "hostOfflineArchiveSeconds": 0,
     }
+    converted_cells = {
+        host: {"harness:claude-native": {"main": True, "maxSeconds": 7200}}
+        for host in ("", "example-host")
+    }
+    conversion_calls: list[bool] = []
 
-    def save(request: Request) -> dict[str, bool]:
-        preferences.update(request.post_data_json["value"])
+    def convert(incoming: Request) -> dict:
+        dry_run = incoming.post_data_json["dry_run"]
+        conversion_calls.append(dry_run)
+        already = "cells" in preferences
+        cells = preferences["cells"] if already else converted_cells
+        columns = sorted({key for rows in cells.values() for key in rows})
+        if not dry_run and not already:
+            preferences.update(cells=cells, migratedToCellsAt=123)
+        return {
+            "cells": cells,
+            "columns": columns,
+            "already": already,
+            "migratedToCellsAt": preferences.get("migratedToCellsAt", 123),
+        }
+
+    def save(incoming: Request) -> dict[str, bool]:
+        preferences.update(incoming.post_data_json["value"])
         return {"ok": True}
 
     browser_contract.json(
@@ -375,53 +413,77 @@ def test_keep_warm_default_and_exception_persist_with_support_reasons(
             "preferences": {"version": 1, "settings": {"keep_warm": preferences}},
         },
     )
+    browser_contract.json("/v1/me/preferences/keep_warm/convert", convert, method="POST")
     browser_contract.json("/v1/me/preferences/keep_warm", save, method="PATCH")
     browser_contract.response("/v1/me/preferences/session_collab", method="PATCH")
     page.add_init_script(
+        "if (!localStorage.getItem('omnigent:keep-warm')) "
         f"localStorage.setItem('omnigent:keep-warm', {json.dumps(json.dumps(preferences))})"
     )
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{appearance_url}/settings/keep-warm")
     section = page.get_by_test_id("keep-warm-settings")
-    expect(section.get_by_text("All agents", exact=True)).to_be_visible()
-    expect(section.get_by_role("switch")).to_have_count(2)
-    expect(section.get_by_text("Claude Code · direct sessions only", exact=False)).to_be_visible()
-    section.get_by_role("switch", name="Keep main sessions warm for all agents").click()
-    section.get_by_role("button", name="Add exception").click()
-    picker = page.get_by_role("dialog", name="Add exception")
+    expect(
+        section.get_by_role("table", name="Keep-warm settings by host and agent")
+    ).to_be_visible()
+    expect(
+        section.get_by_text(
+            "Converted from your previous settings · saved when you first edit", exact=True
+        )
+    ).to_be_visible()
+    expect(section.get_by_role("button", name="Edit Server / Claude Code")).to_contain_text(
+        "Main on"
+    )
+    assert conversion_calls == [True]
+    section.get_by_role("button", name="Add agent", exact=True).click()
+    picker = page.get_by_role("dialog", name="Add agent", exact=True)
     picker.get_by_role("button", name="Not supported here (1)").click()
     expect(
         picker.get_by_role("button", name=re.compile("Other.*no declared keep-warm channel"))
     ).to_be_disabled()
     assert picker.evaluate("element => element.scrollWidth <= element.clientWidth")
-    picker.get_by_role("button", name=re.compile("Codex.*Native CLI")).click()
-    section.get_by_role("switch", name="Keep children warm for Codex").click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
             and response.url.endswith("/v1/me/preferences/keep_warm")
-            and response.request.post_data_json["value"]["agents"]
+        )
+    ):
+        picker.get_by_role("button", name=re.compile("Codex.*Native CLI")).click()
+    section.get_by_role("button", name="Edit Server / Codex").click()
+    editor = page.get_by_role("dialog", name="Server / Codex", exact=True)
+    editor.get_by_role("switch", name="Keep children warm", exact=True).click()
+    editor.get_by_role("spinbutton", name="Keep-warm interval in minutes").fill("10")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/keep_warm")
+            and response.request.post_data_json["value"]["cells"]
+            .get("", {})
             .get("harness:codex-native", {})
             .get("intervalSeconds")
             == 600
         )
     ):
-        section.get_by_role("spinbutton", name="Keep-warm interval for Codex in minutes").fill(
-            "10"
-        )
+        editor.get_by_role("button", name="Save cell", exact=True).click()
+    expect(editor).not_to_be_visible()
     saved = page.evaluate("JSON.parse(localStorage.getItem('omnigent:keep-warm'))")
-    assert saved["default"] == {"main": True, "child": False, "maxSeconds": 14400}
-    assert saved["agents"]["harness:codex-native"]["intervalSeconds"] == 600
-    assert saved["agents"]["harness:codex-native"]["child"] is True
-    assert saved["agents"]["claude-agent"]["intervalSeconds"] == 3300
-    assert "other-agent" not in saved["agents"]
+    assert saved["cells"][""]["harness:codex-native"] == {
+        "child": True,
+        "intervalSeconds": 600,
+    }
+    assert saved["cells"]["example-host"] == converted_cells["example-host"]
     assert saved["hostOfflineArchiveSeconds"] == 0
-    assert preferences["agents"]["harness:codex-native"]["intervalSeconds"] == 600
+    assert preferences["agents"]["claude-agent"]["intervalSeconds"] == 3300
+    assert preferences["default"] == {"main": False, "child": False, "maxSeconds": 14400}
+    assert conversion_calls == [True, False]
     page.reload()
-    expect(
-        section.get_by_role("switch", name="Keep main sessions warm for all agents")
-    ).to_be_checked()
-    expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
+    expect(section.get_by_role("button", name="Edit Server / Codex")).to_contain_text(
+        "Children on"
+    )
+    expect(section.get_by_role("button", name="Edit Server / Claude Code")).to_contain_text(
+        "Main on"
+    )
+    assert conversion_calls.count(False) == 1
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 

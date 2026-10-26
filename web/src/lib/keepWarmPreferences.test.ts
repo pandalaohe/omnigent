@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
-vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatchMock }));
+const { queuePatchMock, queueAckMock } = vi.hoisted(() => ({
+  queuePatchMock: vi.fn(),
+  queueAckMock: vi.fn(),
+}));
+vi.mock("./userPreferencesSync", () => ({
+  queueUserPreferencePatch: queuePatchMock,
+  queueAcknowledgedUserPreferencePatch: queueAckMock,
+}));
 
 import {
   KEEP_WARM_DEFAULTS,
@@ -14,12 +20,17 @@ import {
   setKeepWarmAgent,
   setKeepWarmDefault,
   writeKeepWarmPreferences,
+  normalizeKeepWarmPreferences,
+  resolveKeepWarmCell,
+  saveKeepWarmPreferences,
+  turnOffKeepWarmCell,
 } from "./keepWarmPreferences";
 import { SESSION_COLLAB_STORAGE_KEY } from "./sessionCollabPreferences";
 
 afterEach(() => {
   localStorage.clear();
   queuePatchMock.mockReset();
+  queueAckMock.mockReset();
 });
 
 describe("keep-warm preferences", () => {
@@ -37,11 +48,13 @@ describe("keep-warm preferences", () => {
     const capabilities = {
       "plugin-cli": { keep_warm_family: "claude" },
       codex: { keep_warm_family: "codex" },
+      pi: { keep_warm_family: "pi" },
       "claude-native": { keep_warm_family: null },
       other: { keep_warm_family: "unknown" },
     };
     expect(keepWarmFamilyForHarness("plugin-cli", capabilities)).toBe("claude");
     expect(keepWarmFamilyForHarness("codex", capabilities)).toBe("codex");
+    expect(keepWarmFamilyForHarness("pi", capabilities)).toBe("pi");
     expect(keepWarmFamilyForHarness("claude-native", capabilities)).toBeNull();
     expect(keepWarmFamilyForHarness("other", capabilities)).toBeNull();
     expect(keepWarmFamilyForHarness("missing", capabilities)).toBeNull();
@@ -182,5 +195,109 @@ describe("keep-warm preferences", () => {
       childKeepWarmClaudeIntervalSeconds: 3000,
     });
     expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", null);
+  });
+});
+
+it("keeps empty cells, display columns, timestamps and explicit OFF masks", () => {
+  const preferences = normalizeKeepWarmPreferences({
+    default: { child: true },
+    migratedToCellsAt: 123,
+    cells: { "host-1": { direct: { main: false, child: false }, ca_empty: {} } },
+    columns: ["direct", "harness:pi", "direct"],
+  });
+  writeKeepWarmPreferences(preferences);
+  expect(readKeepWarmPreferences().cells).toEqual({
+    "host-1": { direct: { main: false, child: false }, ca_empty: {} },
+  });
+  expect(readKeepWarmPreferences().columns).toEqual(["direct", "harness:pi"]);
+  expect(readKeepWarmPreferences().migratedToCellsAt).toBe(123);
+  expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", {
+    cells: preferences.cells,
+    columns: ["direct", "harness:pi"],
+    migratedToCellsAt: 123,
+    hostOfflineArchiveSeconds: 14400,
+  });
+  writeKeepWarmPreferences({ ...KEEP_WARM_DEFAULTS, cells: {} });
+  expect(JSON.parse(localStorage.getItem(KEEP_WARM_STORAGE_KEY)!)).toMatchObject({ cells: {} });
+  expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", {
+    cells: {},
+    hostOfflineArchiveSeconds: 14400,
+  });
+});
+
+it.each([
+  [{ "harness:claude-native": { child: true } }, [], false, true],
+  [{ missing: { child: true } }, [], true, true],
+  [{ missing: { child: true } }, [], false, false],
+  [{ sdk: { child: true } }, [{ id: "sdk", harness: "pi" }], true, false],
+  [{}, [], true, false],
+])(
+  "mirrors cells with proven-native, unresolved and known non-native identities",
+  (rows, identities, previous, expected) => {
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({ childKeepWarmEnabled: previous, retained: "yes" }),
+    );
+    writeKeepWarmPreferences(
+      {
+        ...KEEP_WARM_DEFAULTS,
+        default: { main: true, child: true, maxSeconds: 14400 },
+        agents: { legacy: { main: true, child: true, maxSeconds: 14400 } },
+        cells: { "host-1": rows },
+      },
+      identities,
+    );
+    expect(JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY)!)).toMatchObject({
+      childKeepWarmEnabled: expected,
+      retained: "yes",
+    });
+  },
+);
+
+it("turns a direct cell off without exposing its warm harness or changing another host", () => {
+  const preferences = normalizeKeepWarmPreferences({
+    cells: {
+      "host-1": { "harness:codex": { main: true, child: true }, direct: { main: true } },
+      "host-2": { direct: { child: true } },
+    },
+  });
+  const off = turnOffKeepWarmCell(preferences, "host-1", "direct", "codex");
+  expect(off.cells).toEqual({
+    "host-1": {
+      "harness:codex": { main: true, child: true },
+      direct: { main: false, child: false },
+    },
+    "host-2": { direct: { child: true } },
+  });
+  expect(resolveKeepWarmCell(off, "host-1", "direct", "codex")).toEqual({
+    main: false,
+    child: false,
+    maxSeconds: 14400,
+  });
+  expect(resolveKeepWarmCell(off, "new-host", "direct", "codex").main).toBe(false);
+  expect(
+    turnOffKeepWarmCell(preferences, "host-1", "removed-agent").cells?.["host-1"]["removed-agent"],
+  ).toEqual({
+    main: false,
+    child: false,
+  });
+});
+
+it("waits for the namespace acknowledgement before updating the legacy mirror", async () => {
+  let resolve!: () => void;
+  queueAckMock.mockReturnValue(
+    new Promise<void>((done) => {
+      resolve = done;
+    }),
+  );
+  const save = saveKeepWarmPreferences(
+    { ...KEEP_WARM_DEFAULTS, cells: { "": { "harness:claude-native": { child: true } } } },
+    [],
+  );
+  expect(queuePatchMock).not.toHaveBeenCalled();
+  resolve();
+  await save;
+  expect(JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY)!)).toMatchObject({
+    childKeepWarmEnabled: true,
   });
 });
