@@ -2824,7 +2824,7 @@ def create_app(
                     "message": exc.message,
                     **{
                         key: getattr(exc, key)
-                        for key in ("project_id", "project_name", "op_kind")
+                        for key in ("project_id", "project_name", "op_kind", "successor_id")
                         if hasattr(exc, key)
                     },
                 }

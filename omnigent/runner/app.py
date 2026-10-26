@@ -5727,7 +5727,19 @@ def create_runner_app(
                     timeout=30.0,
                 )
                 succession.raise_for_status()
-                if succession.json().get("status") != "done":
+                succession_body = succession.json()
+                if succession_body.get("status") == "retired":
+                    if require_label:
+                        _logger.warning("Pi succession retired for session %s", conv_id)
+                        return False
+                    raise HTTPException(
+                        409,
+                        {
+                            "error": "succession_retired",
+                            "successor_id": succession_body.get("successor_id"),
+                        },
+                    )
+                if succession_body.get("status") != "done":
                     return False
                 await process_manager.release(conv_id)
                 return True
@@ -5739,6 +5751,8 @@ def create_runner_app(
                     extra={"session_id": conv_id},
                 )
                 return False
+        except HTTPException:
+            raise
         except Exception:  # noqa: BLE001 - no retry; the label remains for a manual clear.
             _logger.warning(
                 "Pending rotation /clear failed for session %s",

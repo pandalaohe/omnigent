@@ -22,11 +22,12 @@ import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
-from omnigent.db.utils import generate_task_id
+from omnigent.db.utils import generate_task_id, now_epoch
 from omnigent.entities import Conversation, ErrorData, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
@@ -44,6 +45,7 @@ from omnigent.server.runner_session_init import runner_archive_states_for_conver
 from omnigent.server.schemas import SessionCreatedEvent
 from omnigent.stores.conversation_store import (
     HANDOVER_ITEM_LABEL_KEY,
+    SUCCEEDED_BY_LABEL_KEY,
     ConversationStore,
     SessionSuccession,
 )
@@ -78,7 +80,8 @@ class _SuccessionParked(RuntimeError):
 class _RunnerGroup:
     """One runner's client plus the succession sessions it holds."""
 
-    client: httpx.AsyncClient
+    client: httpx.AsyncClient | None
+    child_only: bool = False
     session_ids: list[str] = field(default_factory=list)
 
 
@@ -118,6 +121,19 @@ async def advance_succession(
                 )
             phase = receipt.phase
             try:
+                if phase == "void":
+                    return receipt
+                receipt = await _retire_stale(receipt, conversation_store)
+                if receipt.phase == "void":
+                    return receipt
+                if phase == "done":
+                    return await _replay_deferred(
+                        receipt,
+                        conversation_store=conversation_store,
+                        runner_router=runner_router,
+                        peer_message_store=peer_message_store,
+                        archive_cleanup=archive_cleanup,
+                    )
                 if phase in {"moved", "rekeyed", "opened"}:
                     successor = await asyncio.to_thread(
                         conversation_store.get_conversation, receipt.new_id
@@ -199,7 +215,7 @@ async def advance_succession(
                     archive_cleanup=archive_cleanup,
                 )
                 return await _record_phase_error(receipt, exc, conversation_store)
-            if receipt.phase == phase or receipt.phase == "done":
+            if receipt.phase == phase:
                 return receipt
             _retry_attempts.pop(receipt.id, None)
 
@@ -223,7 +239,7 @@ async def resume_unfinished_successions(
     :param peer_message_store: Durable peer-message store, or ``None``.
     """
     try:
-        receipts = await asyncio.to_thread(conversation_store.list_unfinished_successions)
+        receipts = await _resumable_receipts(conversation_store)
     except Exception:
         # A failed startup scan must not break boot.
         _logger.exception("Succession startup scan failed")
@@ -260,7 +276,7 @@ async def resume_successions_for_runner(
     :param peer_message_store: Durable peer-message store, or ``None``.
     """
     try:
-        receipts = await asyncio.to_thread(conversation_store.list_unfinished_successions)
+        receipts = await _resumable_receipts(conversation_store)
     except Exception:
         # A failed scan must not break the connect hook.
         _logger.exception("Succession scan failed for runner %s", runner_id)
@@ -276,7 +292,10 @@ async def resume_successions_for_runner(
             # One unreadable receipt must not stop the rest.
             _logger.exception("Succession resume could not read successor %s", receipt.new_id)
             continue
-        if successor is None or successor.runner_id != runner_id:
+        deferred_ids = {entry["runner_id"] for entry in receipt.deferred_runners or []}
+        if (
+            successor is None or successor.runner_id != runner_id
+        ) and runner_id not in deferred_ids:
             continue
         await _resume_one(
             receipt.id,
@@ -285,6 +304,26 @@ async def resume_successions_for_runner(
             peer_message_store=peer_message_store,
             archive_cleanup=archive_cleanup,
         )
+
+
+async def _resumable_receipts(store: ConversationStore) -> list[SessionSuccession]:
+    unfinished = await asyncio.to_thread(store.list_unfinished_successions)
+    deferred = await asyncio.to_thread(store.list_deferred_successions)
+    return list({receipt.id: receipt for receipt in [*unfinished, *deferred]}.values())
+
+
+async def _retire_stale(receipt: SessionSuccession, store: ConversationStore) -> SessionSuccession:
+    old = await asyncio.to_thread(store.get_conversation, receipt.old_id)
+    successor_id = old.labels.get(SUCCEEDED_BY_LABEL_KEY) if old is not None else None
+    if successor_id == receipt.new_id:
+        return receipt
+    return await _advance(
+        receipt,
+        "void",
+        conversation_store=store,
+        deferred_runners=None,
+        error=f"old session succeeded_by is {successor_id!r}, expected {receipt.new_id!r}",
+    )
 
 
 async def _resume_one(
@@ -374,15 +413,21 @@ async def _phase_rekey(
     # Every runner gets the full moved set: the successor's runner also holds
     # work entries for children hosted on the other runners and must rewrite
     # them all, while each runner applies only the archive states it owns.
-    archive_states: dict[str, list[dict[str, Any]]] = {}
-    for moved_id in receipt.moved_ids:
-        conversation = await asyncio.to_thread(conversation_store.get_conversation, moved_id)
-        if conversation is None:
-            continue
-        states = await runner_archive_states_for_conversation(conversation, conversation_store)
-        archive_states[moved_id] = [state.model_dump(mode="json") for state in states]
+    archive_states = await _archive_states(receipt.moved_ids, conversation_store)
     dropped: list[dict[str, Any]] = list(receipt.dropped or [])
-    for group in groups.values():
+    deferred = {entry["runner_id"]: entry for entry in receipt.deferred_runners or []}
+    for runner_id, group in groups.items():
+        if group.child_only and group.client is None:
+            deferred[runner_id] = {"runner_id": runner_id, "session_ids": group.session_ids}
+            receipt = await _advance(
+                receipt,
+                "moved",
+                conversation_store=conversation_store,
+                deferred_runners=list(deferred.values()),
+            )
+            continue
+        if group.client is None:
+            raise RuntimeError(f"runner {runner_id!r} offline during re-key")
         try:
             response = await group.client.post(
                 f"/v1/sessions/{receipt.old_id}/succession",
@@ -394,8 +439,24 @@ async def _phase_rekey(
                 timeout=30.0,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
+            if group.child_only:
+                deferred[runner_id] = {"runner_id": runner_id, "session_ids": group.session_ids}
+                receipt = await _advance(
+                    receipt,
+                    "moved",
+                    conversation_store=conversation_store,
+                    deferred_runners=list(deferred.values()),
+                )
+                continue
             raise RuntimeError(f"runner unreachable during re-key: {exc}") from exc
         if response.status_code == 409:
+            deferred.pop(runner_id, None)
+            receipt = await _advance(
+                receipt,
+                "moved",
+                conversation_store=conversation_store,
+                deferred_runners=list(deferred.values()) or None,
+            )
             _schedule_retry(
                 receipt.id,
                 conversation_store=conversation_store,
@@ -408,6 +469,15 @@ async def _phase_rekey(
                 extra={"session_id": receipt.old_id},
             )
             return receipt
+        if response.status_code >= 500 and group.child_only:
+            deferred[runner_id] = {"runner_id": runner_id, "session_ids": group.session_ids}
+            receipt = await _advance(
+                receipt,
+                "moved",
+                conversation_store=conversation_store,
+                deferred_runners=list(deferred.values()),
+            )
+            continue
         if response.status_code >= 400:
             raise RuntimeError(
                 f"runner refused re-key ({response.status_code}): {response.text[:300]}"
@@ -419,6 +489,7 @@ async def _phase_rekey(
         for item in body.get("dropped") or []:
             if isinstance(item, dict):
                 dropped.append(item)
+        deferred.pop(runner_id, None)
         # A later runner's failure must not lose what an earlier runner
         # already cancelled: a retry calls that runner again, which has
         # nothing left to drop. Persist each report on the same phase.
@@ -433,6 +504,7 @@ async def _phase_rekey(
         "rekeyed",
         conversation_store=conversation_store,
         dropped=dropped,
+        deferred_runners=list(deferred.values()) or None,
     )
 
 
@@ -491,6 +563,7 @@ async def _phase_open(
         children=children,
         questions=questions,
         dropped=dropped,
+        created_at=receipt.created_at,
     )
     payload: dict[str, Any] = {
         "text": text,
@@ -547,14 +620,25 @@ async def _phase_release(
 ) -> SessionSuccession:
     """``opened → released``: drain each runner's held buffer into the successor."""
     groups = await _runner_groups(receipt, conversation_store, runner_router)
-    for group in groups.values():
+    deferred = {entry["runner_id"]: entry for entry in receipt.deferred_runners or []}
+    for runner_id, group in groups.items():
+        if runner_id in deferred:
+            continue
         holds_successor = receipt.new_id in group.session_ids
+        if group.client is None:
+            if group.child_only:
+                deferred[runner_id] = {"runner_id": runner_id, "session_ids": group.session_ids}
+                continue
+            raise RuntimeError(f"runner {runner_id!r} offline at release")
         try:
             response = await group.client.post(
                 f"/v1/sessions/{receipt.new_id}/succession/release",
                 timeout=30.0,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
+            if group.child_only:
+                deferred[runner_id] = {"runner_id": runner_id, "session_ids": group.session_ids}
+                continue
             if holds_successor:
                 raise RuntimeError(f"runner unreachable at release: {exc}") from exc
             _logger.warning(
@@ -564,6 +648,9 @@ async def _phase_release(
             )
             continue
         if response.status_code >= 400:
+            if group.child_only and response.status_code >= 500:
+                deferred[runner_id] = {"runner_id": runner_id, "session_ids": group.session_ids}
+                continue
             if holds_successor:
                 raise RuntimeError(
                     f"runner refused release ({response.status_code}): {response.text[:300]}"
@@ -573,7 +660,12 @@ async def _phase_release(
                 receipt.id,
                 response.status_code,
             )
-    return await _advance(receipt, "released", conversation_store=conversation_store)
+    return await _advance(
+        receipt,
+        "released",
+        conversation_store=conversation_store,
+        deferred_runners=list(deferred.values()) or None,
+    )
 
 
 async def _phase_close_questions(
@@ -671,10 +763,9 @@ async def _runner_groups(
     """
     Group the successor and every moved session by their runner.
 
-    Sessions with no runner are skipped (nothing to re-key there); a bound
-    runner that cannot be resolved blocks the phase — skipping it would
-    leave that runner's state behind. Offline successors park until an
-    external trigger; moved children's runners retain the bounded retry.
+    Sessions without runners and archived moved sessions have no active
+    state to re-key. Only runners whose live bindings are all moved sessions
+    can be deferred; a successor's offline runner parks the rotation.
 
     :param receipt: The succession receipt.
     :param conversation_store: Store holding the conversation rows.
@@ -689,7 +780,7 @@ async def _runner_groups(
         conversations.append(successor)
     for moved_id in receipt.moved_ids:
         conversation = await asyncio.to_thread(conversation_store.get_conversation, moved_id)
-        if conversation is not None:
+        if conversation is not None and not conversation.archived:
             conversations.append(conversation)
 
     groups: dict[str, _RunnerGroup] = {}
@@ -705,7 +796,13 @@ async def _runner_groups(
             runner_router,
             conversation=conversation,
         )
-        if client is None:
+        bound = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, conversation.runner_id
+        )
+        child_only = conversation.runner_id != (
+            successor.runner_id if successor else None
+        ) and all(row.id in receipt.moved_ids for row in bound if not row.archived)
+        if client is None and not child_only:
             message = (
                 f"runner {conversation.runner_id!r} is offline for session {conversation.id!r}"
             )
@@ -714,9 +811,112 @@ async def _runner_groups(
             raise RuntimeError(message)
         groups[conversation.runner_id] = _RunnerGroup(
             client=client,
+            child_only=child_only,
             session_ids=[conversation.id],
         )
     return groups
+
+
+async def _archive_states(
+    session_ids: list[str],
+    store: ConversationStore,
+) -> dict[str, list[dict[str, Any]]]:
+    archive_states: dict[str, list[dict[str, Any]]] = {}
+    for session_id in session_ids:
+        conversation = await asyncio.to_thread(store.get_conversation, session_id)
+        if conversation is not None:
+            states = await runner_archive_states_for_conversation(conversation, store)
+            archive_states[session_id] = [state.model_dump(mode="json") for state in states]
+    return archive_states
+
+
+async def _replay_deferred(
+    receipt: SessionSuccession,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    peer_message_store: PeerMessageStore | None,
+    archive_cleanup: Any,
+) -> SessionSuccession:
+    """Finish child-runner work without delaying the successor's opening."""
+    for entry in list(receipt.deferred_runners or []):
+        receipt = await _read(conversation_store, receipt.id) or receipt
+        if receipt.phase == "void":
+            return receipt
+        receipt = await _retire_stale(receipt, conversation_store)
+        if receipt.phase == "void":
+            return receipt
+        runner_id = entry["runner_id"]
+        conversations = []
+        for session_id in entry["session_ids"]:
+            row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if row is not None and row.runner_id == runner_id:
+                conversations.append(row)
+        remaining = [
+            item for item in receipt.deferred_runners or [] if item["runner_id"] != runner_id
+        ]
+        if not conversations:
+            receipt = await _advance(
+                receipt,
+                receipt.phase,
+                conversation_store=conversation_store,
+                deferred_runners=remaining or None,
+            )
+            continue
+        client = await _get_runner_client(
+            conversations[0].id, runner_router, conversation=conversations[0]
+        )
+        if client is None:
+            continue
+        session_ids = [row.id for row in conversations]
+        try:
+            response = await client.post(
+                f"/v1/sessions/{receipt.old_id}/succession",
+                json={
+                    "target_session_id": receipt.new_id,
+                    "moved_ids": session_ids,
+                    "archive_states": await _archive_states(session_ids, conversation_store),
+                },
+                timeout=30.0,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"deferred runner re-key returned {response.status_code}")
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            dropped = list(receipt.dropped or [])
+            for item in body.get("dropped") or []:
+                if isinstance(item, dict) and item not in dropped:
+                    dropped.append(item)
+            receipt = await _advance(
+                receipt, receipt.phase, conversation_store=conversation_store, dropped=dropped
+            )
+            # Revalidate after the network call: an undo must not release old work.
+            receipt = await _retire_stale(receipt, conversation_store)
+            if receipt.phase == "void":
+                return receipt
+            response = await client.post(
+                f"/v1/sessions/{receipt.new_id}/succession/release", timeout=30.0
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"deferred runner release returned {response.status_code}")
+        except (httpx.HTTPError, ConnectionError, RuntimeError):
+            _schedule_retry(
+                receipt.id,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                peer_message_store=peer_message_store,
+                archive_cleanup=archive_cleanup,
+            )
+            continue
+        receipt = await _advance(
+            receipt,
+            receipt.phase,
+            conversation_store=conversation_store,
+            deferred_runners=remaining or None,
+        )
+    return receipt
 
 
 async def _direct_children(
@@ -816,22 +1016,30 @@ def _opening_text(
     children: list[Conversation],
     questions: list[dict[str, Any]],
     dropped: list[dict[str, Any]],
+    created_at: int | None = None,
 ) -> str:
     """Render the successor's opening message (mechanism, plain English)."""
-    lines: list[str] = []
+    sections: list[str] = []
     if handover:
-        lines.append(handover)
-        lines.append("")
-    lines.append(f"Previous session: /c/{old_id}")
+        sections.append(handover)
+    if created_at is not None and now_epoch() - created_at > 600:
+        rotated_at = datetime.fromtimestamp(created_at, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        sections.append(f"Delivered late: rotation at {rotated_at}.")
+    sections.append(f"Previous session: /c/{old_id}")
     if children:
+        lines = []
         lines.append("Children now under this session:")
         for child in children:
             lines.append(f"- {child.id}: {child.title or child.id}")
+        sections.append("\n".join(lines))
     if questions:
+        lines = []
         lines.append("Questions the previous session had open (closed there — ask again):")
         for question in questions:
             lines.append(f"- {_question_text(question)}")
+        sections.append("\n".join(lines))
     if dropped:
+        lines = []
         lines.append("Stopped and not carried over:")
         for item in dropped:
             kind = item.get("kind", "item")
@@ -841,7 +1049,8 @@ def _opening_text(
             if isinstance(label, str) and label:
                 detail += f": {label}"
             lines.append(detail)
-    return "\n".join(lines)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
 
 
 def _schedule_retry(

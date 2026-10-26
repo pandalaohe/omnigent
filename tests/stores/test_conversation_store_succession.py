@@ -420,3 +420,53 @@ def test_failed_receipt_rolls_back_checkin_transfer_and_children(
     assert successor.labels == {}
     assert child_row.parent_conversation_id == old.id
     assert store.get_succession(old.id, new.id) is None
+
+
+def test_competing_successors_have_one_winner(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    store = conversation_store
+    old = store.create_conversation(title="old").id
+    child = _child(store, old, "child")
+    targets = [store.create_conversation(title=title).id for title in ("one", "two")]
+    barrier = Barrier(2)
+
+    def compete(target: str) -> str:
+        barrier.wait(timeout=10)
+        try:
+            store.reassign_live_children(old, target, f"receipt-{target}", allow_empty=True)
+            return "won"
+        except SuccessionRefusedError as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(compete, targets))
+    assert sorted(outcomes) == ["already_succeeded", "won"]
+    winner = targets[outcomes.index("won")]
+    assert store.get_conversation(old).labels[SUCCEEDED_BY_LABEL_KEY] == winner
+    assert store.get_conversation(child).parent_conversation_id == winner
+
+
+@pytest.mark.parametrize("wrapper", ["claude-code-native-ui-subagent", "codex-native-ui-subagent"])
+def test_direct_parent_owned_mirror_stays_with_old(
+    conversation_store: SqlAlchemyConversationStore,
+    wrapper: str,
+) -> None:
+    store = conversation_store
+    old = store.create_conversation(title="old").id
+    new = store.create_conversation(title="new").id
+    child = _child(store, old, "child")
+    mirror = _child(store, old, "mirror")
+    nested = _child(store, child, "nested mirror")
+    for session_id in (mirror, nested):
+        store.set_labels(session_id, {"omnigent.wrapper": wrapper})
+    direct, moved = _move(store, old, new)
+    assert direct == [child]
+    assert set(moved) == {child, nested}
+    assert store.get_conversation(mirror).parent_conversation_id == old
+    store.update_conversation(old, archived=True, close_cli_on_archive=False)
+    assert store.get_conversation(mirror).archived
+    assert not store.get_conversation(nested).archived

@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.utils import generate_task_id
@@ -282,7 +283,7 @@ def register_succession_routes(
         request: Request,
         session_id: str,
         body: SessionSuccessionRequest,
-    ) -> dict[str, Any]:
+    ) -> Any:
         """
         Hand a top-level session's live children to its successor.
 
@@ -329,7 +330,7 @@ def register_succession_routes(
         if receipt is None:
             receipt_id = uuid4().hex
             try:
-                direct_ids, _moved_ids = await asyncio.to_thread(
+                await asyncio.to_thread(
                     conversation_store.reassign_live_children,
                     session_id,
                     target_id,
@@ -338,14 +339,27 @@ def register_succession_routes(
                     allow_empty=body.allow_empty,
                 )
             except SuccessionRefusedError as exc:
+                if exc.code == "already_succeeded":
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": {
+                                "code": "already_succeeded",
+                                "message": f"succession refused: {exc.code}: {exc}",
+                                "successor_id": exc.successor_id,
+                            }
+                        },
+                    )
                 raise OmnigentError(
                     f"succession refused: {exc.code}: {exc}",
                     code=ErrorCode.CONFLICT,
                 ) from exc
-            if not direct_ids and not body.allow_empty:
+            receipt = await asyncio.to_thread(
+                conversation_store.get_succession, session_id, target_id
+            )
+            if receipt is None:
                 return {"status": "noop"}
-        else:
-            receipt_id = receipt.id
+        receipt_id = receipt.id
 
         receipt = await advance_succession(
             receipt_id,
@@ -354,6 +368,14 @@ def register_succession_routes(
             peer_message_store=peer_message_store,
             archive_cleanup=getattr(request.app.state, "archive_close_coordinator", None),
         )
+        if receipt.phase == "void":
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            return {
+                "status": "retired",
+                "successor_id": (
+                    current.labels.get(SUCCEEDED_BY_LABEL_KEY) if current is not None else None
+                ),
+            }
         return {
             "status": "done" if receipt.phase == "done" else "pending",
             "receipt_id": receipt.id,

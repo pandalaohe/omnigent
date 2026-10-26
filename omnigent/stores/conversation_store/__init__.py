@@ -613,6 +613,8 @@ class SessionSuccession:
     created_at: int
     updated_at: int
 
+    deferred_runners: list[dict[str, Any]] | None = None
+
 
 @dataclass(frozen=True)
 class DetachedCard:
@@ -722,9 +724,10 @@ class SuccessionRefusedError(ValueError):
     caller can map it without parsing the message.
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, successor_id: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.successor_id = successor_id
 
 
 def _is_addable_usage_increment(value: Any) -> bool:
@@ -1592,7 +1595,12 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def list_unfinished_successions(self, limit: int = 100) -> list[SessionSuccession]:
-        """Return receipts whose phase is not ``done``, oldest first."""
+        """Return nonterminal receipts, oldest first."""
+        ...
+
+    @abstractmethod
+    def list_deferred_successions(self) -> list[SessionSuccession]:
+        """Return non-void receipts still owing runner re-key/release, including done."""
         ...
 
     @abstractmethod
