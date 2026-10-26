@@ -17,7 +17,7 @@ import secrets
 import time
 import urllib.parse
 import weakref
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -1955,6 +1955,75 @@ def effective_host_id(
         if ancestor is not None and ancestor.host_id is not None:
             return ancestor.host_id
     return None
+
+
+def runner_is_exclusive(
+    runner_id: str,
+    session_id: str,
+    conversations: Iterable[Conversation],
+) -> bool:
+    """Whether no other unarchived session is bound to this runner."""
+    return not any(
+        row.runner_id == runner_id and row.id != session_id and not row.archived
+        for row in conversations
+    )
+
+
+def retained_runner_ids(
+    conversation_store: ConversationStore,
+    host_id: str,
+    session_id: str,
+) -> list[str]:
+    """Find runners on this host that another live session still needs."""
+    conversations: list[Conversation] = []
+    after = None
+    while True:
+        page = conversation_store.list_conversations(
+            limit=1000,
+            after=after,
+            kind=None,
+            include_search_match=False,
+        )
+        conversations.extend(page.data)
+        if not page.has_more or not page.data:
+            break
+        after = page.data[-1].id
+    by_id: dict[str, Conversation | None] = {row.id: row for row in conversations}
+    children: dict[str, list[str]] = defaultdict(list)
+    groups: dict[str, list[Conversation]] = defaultdict(list)
+    hosts: dict[str, str | None] = {}
+    for row in conversations:
+        if row.runner_id:
+            groups[row.runner_id].append(row)
+    pending = deque(conversations)
+    while pending:
+        row = pending.popleft()
+        parent_id = row.parent_conversation_id
+        if parent_id is not None:
+            children[parent_id].append(row.id)
+        if row.host_id is not None or parent_id is None:
+            hosts[row.id] = row.host_id
+        elif parent_id not in by_id:
+            parent = conversation_store.get_conversation(parent_id)
+            by_id[parent_id] = parent
+            if parent is None:
+                hosts[parent_id] = None
+            else:
+                pending.append(parent)
+    # Propagate inherited hosts once per edge, including hostless subtrees.
+    frontier = deque(hosts)
+    while frontier:
+        parent_id = frontier.popleft()
+        for child_id in children[parent_id]:
+            if child_id not in hosts:
+                hosts[child_id] = hosts[parent_id]
+                frontier.append(child_id)
+    return sorted(
+        runner_id
+        for runner_id, bound in groups.items()
+        if any(hosts.get(row.id) == host_id for row in bound)
+        and not runner_is_exclusive(runner_id, session_id, bound)
+    )
 
 
 def _publish_elicitation_request_to_ancestors(
@@ -6793,14 +6862,13 @@ def _spawn_superseded_runner_stop(
     host_id: str,
     runner_id: str,
     host_registry: HostRegistry,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Stop a relaunch's superseded runner as a retained background task.
 
-    The relaunch has already rotated the session's binding, so the old
-    runner serves nothing — but left alive it idles forever (tunnel still
-    authenticating, transcript forwarder still tailing the session): one
-    leaked generation per relaunch, each holding a native pane. Detached so
+    The relaunch has already rotated the session's binding. Stop its old
+    runner only if no other live session still needs it. Detached so
     the relaunch's latency never waits out the stop's ack timeout; the host
     connection is live by construction here (the launch frame just went
     over it), so delivery is the overwhelmingly common case, and the
@@ -6811,10 +6879,16 @@ def _spawn_superseded_runner_stop(
     :param host_id: The session's owning host.
     :param runner_id: The superseded runner's id.
     :param host_registry: Registry holding the live host tunnel.
+    :param conversation_store: Store holding the current runner bindings.
     """
 
     async def _stop_and_log() -> None:
         try:
+            bound = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+            if not runner_is_exclusive(runner_id, session_id, bound):
+                return
             await _stop_session_host_runner(
                 session_id,
                 host_id,
@@ -6917,6 +6991,9 @@ async def _launch_runner_on_host_locked(
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
+    retained = await asyncio.to_thread(
+        retained_runner_ids, conversation_store, host_conn.host_id, conv.id
+    )
     startup = await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
@@ -6947,7 +7024,7 @@ async def _launch_runner_on_host_locked(
             # doesn't idle on the host forever (tunnel still authenticating,
             # forwarder still tailing this session).
             _spawn_superseded_runner_stop(
-                conv.id, conv.host_id, superseded_runner_id, host_registry
+                conv.id, conv.host_id, superseded_runner_id, host_registry, conversation_store
             )
 
         # Pull workspace from the session row — populated and validated
@@ -6989,6 +7066,7 @@ async def _launch_runner_on_host_locked(
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),
+                retain_runner_ids=retained,
             )
         )
         try:

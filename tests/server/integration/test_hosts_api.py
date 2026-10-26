@@ -752,6 +752,11 @@ async def test_launch_runner_happy_path(
 
     conv = conv_store.create_conversation(agent_id=None)
 
+    for title in ("shared-a", "shared-b"):
+        conv_store.create_conversation(
+            title=title, runner_id="1" * 32, host_id=_HOST_ID, workspace="/opt/work/shared"
+        )
+
     from unittest.mock import AsyncMock
 
     from omnigent.startup_protocol import StartupAttemptRef
@@ -780,6 +785,7 @@ async def test_launch_runner_happy_path(
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
                 assert frame.startup == startup and frame.startup_required
+                assert frame.retain_runner_ids == ["1" * 32]
                 result = encode_host_frame(
                     HostLaunchRunnerResultFrame(
                         request_id=frame.request_id,
@@ -2682,3 +2688,33 @@ async def test_host_cli_retention_reset_external_cancel_after_lease_loss_propaga
 
     # No best-effort pass ran: nothing was posted.
     assert posts == []
+
+
+async def test_launch_runner_retention_failure_preserves_binding(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.server.routes import hosts as host_routes
+
+    app, registry, _host_store, store = host_api_app
+    comm = await _connect_host(app, registry)
+    conv = store.create_conversation(agent_id=None)
+    monkeypatch.setattr(
+        host_routes, "retained_runner_ids", Mock(side_effect=RuntimeError("read failed"))
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+        ) as requester:
+            response = await requester.post(
+                f"/v1/hosts/{_HOST_ID}/runners",
+                json={"session_id": conv.id, "workspace": "/opt/work/app"},
+            )
+        assert response.status_code == 500
+        assert store.get_conversation(conv.id).runner_id is None
+        assert store.get_conversation(conv.id).host_id is None
+        assert registry.get(_HOST_ID).pending_launches == {}
+    finally:
+        comm.stop()

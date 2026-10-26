@@ -1727,6 +1727,7 @@ def register_core_routes(
             resolve_host_launch,
             resolve_launch_timeout_s,
         )
+        from omnigent.server.routes._sessions.helpers import retained_runner_ids
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -1743,6 +1744,9 @@ def register_core_routes(
         conn = target.conn
         from omnigent.server.startup_admission import StartupQueued
 
+        retained = await asyncio.to_thread(
+            retained_runner_ids, conversation_store, host_id, session_id
+        )
         try:
             startup = await host_registry.admit_launch(conn, session_id)
         except StartupQueued:
@@ -1801,6 +1805,7 @@ def register_core_routes(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                retain_runner_ids=retained,
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()

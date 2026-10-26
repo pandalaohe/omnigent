@@ -2256,6 +2256,7 @@ class HostProcess:
                 (rid, handle)
                 for rid, handle in self._runners.items()
                 if handle.session_id == frame.session_id
+                and rid not in (frame.retain_runner_ids or ())
             ]
             for rid, handle in superseded:
                 self._runners.pop(rid, None)

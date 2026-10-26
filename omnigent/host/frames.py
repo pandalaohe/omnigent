@@ -362,6 +362,9 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param retain_runner_ids: Runners that still serve other sessions and must
+        survive this launch. ``None`` from an older server keeps the legacy
+        session-id supersession rule.
     """
 
     request_id: str
@@ -372,6 +375,7 @@ class HostLaunchRunnerFrame:
     inference_config: dict[str, Any] | None = None
     startup: StartupAttemptRef | None = None
     startup_required: bool = False
+    retain_runner_ids: list[str] | None = None
 
 
 @dataclass
@@ -1909,19 +1913,20 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.LAUNCH_RUNNER.value,
-                "request_id": frame.request_id,
-                "binding_token": frame.binding_token,
-                "workspace": frame.workspace,
-                "session_id": frame.session_id,
-                "harness": frame.harness,
-                "inference_config": frame.inference_config,
-                "startup": frame.startup.model_dump() if frame.startup else None,
-                "startup_required": frame.startup_required,
-            }
-        )
+        payload: dict[str, Any] = {
+            "kind": HostFrameKind.LAUNCH_RUNNER.value,
+            "request_id": frame.request_id,
+            "binding_token": frame.binding_token,
+            "workspace": frame.workspace,
+            "session_id": frame.session_id,
+            "harness": frame.harness,
+            "inference_config": frame.inference_config,
+            "startup": frame.startup.model_dump() if frame.startup else None,
+            "startup_required": frame.startup_required,
+        }
+        if frame.retain_runner_ids is not None:
+            payload["retain_runner_ids"] = frame.retain_runner_ids
+        return _encode_payload(payload)
     if isinstance(frame, HostStartupClaimFrame):
         return _encode_payload(
             {
@@ -3266,6 +3271,11 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         ),
         startup_required=(
             _required_bool(msg, "startup_required") if "startup_required" in msg else False
+        ),
+        retain_runner_ids=(
+            _optional_str_list(msg, "retain_runner_ids")
+            if msg.get("retain_runner_ids") is not None
+            else None
         ),
     )
 
