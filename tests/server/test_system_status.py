@@ -7,13 +7,17 @@ import inspect
 import json
 import threading
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from omnigent.host.frames import (
+    CAP_LOAD_LEVEL_V1,
     CAP_RESOURCE_SNAPSHOT,
     HostResourceSnapshotFrame,
+    LoadLevelReport,
     ResourceMachine,
     ResourceProcessRow,
 )
@@ -76,7 +80,7 @@ def _connect(hub: SystemStatusHub, *, host_id: str, now: float, workspace_id: in
         workspace_id=workspace_id,
         owner="alice",
         name=f"laptop-{host_id}",
-        conn_capabilities=[CAP_RESOURCE_SNAPSHOT],
+        conn_capabilities=[CAP_RESOURCE_SNAPSHOT, CAP_LOAD_LEVEL_V1],
         now=now,
     )
 
@@ -121,7 +125,7 @@ def test_host_changed_tracks_connect_disconnect_and_needs_update(tmp_path: Path)
         workspace_id=0,
         owner="alice",
         name="laptop",
-        conn_capabilities=[CAP_RESOURCE_SNAPSHOT],
+        conn_capabilities=[CAP_RESOURCE_SNAPSHOT, CAP_LOAD_LEVEL_V1],
         now=3.0,
     )
     assert entry.state == "online"
@@ -132,7 +136,7 @@ def test_host_changed_tracks_connect_disconnect_and_needs_update(tmp_path: Path)
         workspace_id=0,
         owner="alice",
         name="laptop",
-        conn_capabilities=[CAP_RESOURCE_SNAPSHOT],
+        conn_capabilities=[CAP_RESOURCE_SNAPSHOT, CAP_LOAD_LEVEL_V1],
         now=4.0,
     )
     assert entry.since == 3.0, "an unchanged state must not restamp since"
@@ -828,6 +832,7 @@ def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
         "disk_pct": 90.0,
         "server_5xx_pct": 5.0,
         "health_check": {"project_id": None, "host_id": None, "prompt": None},
+        "load_lines": {},
     }
 
     updated = hub.put_settings({"cpu_pct": 70, "cpu_sustain_min": 3.0})
@@ -873,6 +878,209 @@ def test_fast_hosts_leases(tmp_path: Path) -> None:
     assert set(hub.fast_hosts(110.0)) == {(0, "host_a"), (0, "host_b")}
     assert set(hub.fast_hosts(125.0)) == {(0, "host_a"), (0, "host_b")}
     assert hub.fast_hosts(125.1) == []
+
+
+def test_load_lines_patch_persists_and_isolates_workspaces(tmp_path: Path) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    hub.put_settings(
+        {
+            "load_lines": {
+                "default": {"heavy": 2, "new_session": 3},
+                "hosts": {"host_a": {"heavy": 6, "new_session": 7}},
+                "queue_enabled": False,
+            }
+        },
+        workspace_id=1,
+    )
+    stored = hub.put_settings(
+        {"load_lines": {"hosts": {"host_a": {"heavy": 8, "new_session": 9}}}},
+        workspace_id=2,
+    )
+    system_status.write_settings(hub.settings_path, stored)
+    hub.close()
+    hub = SystemStatusHub(tmp_path, None)
+    assert hub.effective_load_lines(1, "host_a").heavy == 6
+    assert hub.effective_load_lines(2, "host_a").heavy == 8
+    assert hub.queue_enabled(1) is False
+    assert hub.queue_enabled(2) is True
+    assert hub.host_load(1, "host_a")["lines_source"] == "host"
+    assert hub.host_load(3, "host_a")["lines_source"] == "factory"
+
+    removed = hub.put_settings({"load_lines": {"hosts": {"host_a": None}}}, workspace_id=1)
+    assert hub.effective_load_lines(1, "host_a").heavy == 2
+    assert hub.host_load(1, "host_a")["lines_source"] == "default"
+    assert removed["load_lines"]["2"] == stored["load_lines"]["2"]
+    assert hub.get_settings(1)["load_lines"] == {
+        "default": {"heavy": 2.0, "new_session": 3.0},
+        "hosts": {},
+        "queue_enabled": False,
+    }
+    copied = hub.get_settings(2)
+    copied["load_lines"]["hosts"].clear()
+    assert hub.effective_load_lines(2, "host_a").heavy == 8
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        None,
+        {"other_workspace": {}},
+        {"default": {"heavy": 5, "new_session": 4}},
+        {"default": {"heavy": 0, "new_session": 4}},
+        {"default": {"heavy": True, "new_session": 4}},
+        {"default": {"heavy": "2", "new_session": 4}},
+        {"default": {"heavy": float("nan"), "new_session": 4}},
+        {"default": {"heavy": 2, "new_session": float("inf")}},
+        {"default": {"heavy": 2, "new_session": 65}},
+        {"hosts": {"host_a": {"heavy": 2}}},
+        {"hosts": {"": {"heavy": 2, "new_session": 3}}},
+        {"hosts": []},
+        {"queue_enabled": 1},
+    ],
+)
+def test_load_lines_validation_is_atomic(tmp_path: Path, patch: object) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    before = hub.get_settings()
+    revision = hub._lines_revision
+    with pytest.raises(ValueError):
+        hub.put_settings({"mem_pct": 75, "load_lines": patch}, workspace_id=1)
+    assert hub.get_settings() == before
+    assert hub._lines_revision == revision
+
+
+def test_host_load_report_history_and_change_drain(tmp_path: Path, monkeypatch) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    now = float(int(time.time()))
+    _connect(hub, host_id="host_a", now=now, workspace_id=1)
+    announcements = []
+    monkeypatch.setattr(hub, "_announce", announcements.append)
+    report = LoadLevelReport("heavy_hold", "memory", "2026-10-25T00:00:00+00:00", 4, 5, None)
+    frame = _frame()
+    frame = replace(
+        frame,
+        sampled_at=datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        machine=replace(frame.machine, cpu_count=8, load_per_core=0.25, load_equiv=2),
+        load_level=report,
+    )
+    hub.ingest(host_id="host_a", workspace_id=1, frame=frame, now=now)
+    load = hub.host_load(1, "host_a", now=now)
+    assert load["level"] == "heavy_hold", "the server must not reclassify the host's report"
+    assert load["reason"] == "memory"
+    assert load["level_since"] == report.since
+    assert load["load_per_core"] == 0.25
+    assert load["load_equiv"] == 2
+    assert load["cpu_count"] == 8
+    assert load["estimate"] is False
+    assert load["queued_children"] == 0
+    assert load["sampled_at"] == frame.sampled_at
+    assert load["mem_pct"] == 25
+    _tick(hub, now + 60)
+    point = hub._entries[(1, "host_a")].points[-1]
+    assert point["load_per_core"] == 0.25
+    assert point["level"] == "heavy_hold"
+    (change,) = hub.drain_level_changes()
+    assert (change.workspace_id, change.host_id, change.old, change.new) == (
+        1,
+        "host_a",
+        "unknown",
+        "heavy_hold",
+    )
+    assert change.reason == "memory"
+    assert change.load_per_core == 0.25
+    assert change.lines.heavy == 4
+    assert change.at == now
+    assert announcements == [{1}]
+    assert hub.drain_level_changes() == []
+    hub.ingest(host_id="host_a", workspace_id=1, frame=frame, now=now + 60)
+    assert hub.drain_level_changes() == []
+
+
+@pytest.mark.parametrize("boundary", ["disconnect", "stale", "missing_report", "old_host"])
+def test_load_holds_fail_open(tmp_path: Path, boundary: str) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    now = float(int(time.time()))
+    _connect(hub, host_id="host_a", now=now)
+    frame = replace(
+        _frame(),
+        sampled_at=datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        load_level=LoadLevelReport("new_session_hold", "load", "2026-10-25T00:00:00Z", 4, 5, None),
+    )
+    hub.ingest(host_id="host_a", workspace_id=0, frame=frame, now=now)
+    hub.drain_level_changes()
+    if boundary in {"disconnect", "old_host"}:
+        hub.host_changed(
+            host_id="host_a",
+            workspace_id=0,
+            owner="alice",
+            name=None,
+            conn_capabilities=None if boundary == "disconnect" else [CAP_RESOURCE_SNAPSHOT],
+            now=now + 1,
+        )
+        if boundary == "old_host":
+            # A report cannot grant a capability the current connection lacks.
+            hub.ingest(host_id="host_a", workspace_id=0, frame=frame, now=now + 1)
+            assert hub._entries[(0, "host_a")].state == "needs_update"
+    elif boundary == "missing_report":
+        hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=now + 1)
+    else:
+        assert hub.host_load(0, "host_a", now=now + 180)["level"] == "new_session_hold"
+        _tick(hub, now + 181)
+    assert hub.host_load(0, "host_a", now=now + 181)["level"] == "unknown"
+    (change,) = hub.drain_level_changes()
+    assert (change.old, change.new, change.reason) == ("new_session_hold", "unknown", None)
+    if boundary == "disconnect":
+        _connect(hub, host_id="host_a", now=now + 182)
+        assert hub.host_load(0, "host_a", now=now + 182)["level"] == "unknown"
+
+
+@pytest.mark.parametrize("sample", ["stale", "malformed", "future", "naive"])
+def test_load_report_rejects_invalid_sample_time(tmp_path: Path, sample: str) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    now = 1_800_000_000.0
+    _connect(hub, host_id="host_a", now=now)
+    sampled_at = {
+        "stale": datetime.fromtimestamp(now - 181, timezone.utc).isoformat(),
+        "malformed": "not-a-timestamp",
+        "future": datetime.fromtimestamp(now + 1, timezone.utc).isoformat(),
+        "naive": datetime.fromtimestamp(now, timezone.utc).replace(tzinfo=None).isoformat(),
+    }[sample]
+    frame = replace(
+        _frame(),
+        sampled_at=sampled_at,
+        load_level=LoadLevelReport("new_session_hold", "load", "2026-10-25T00:00:00Z", 4, 5, None),
+    )
+    hub.ingest(host_id="host_a", workspace_id=0, frame=frame, now=now)
+    assert hub.host_load(0, "host_a", now=now)["level"] == "unknown"
+    assert hub.drain_level_changes() == []
+
+
+@pytest.mark.parametrize("expiry_via", ["read", "tick"])
+def test_replayed_load_report_expires_from_original_sample(
+    tmp_path: Path, expiry_via: str
+) -> None:
+    hub = SystemStatusHub(tmp_path, None)
+    sampled = 1_800_000_000.0
+    _connect(hub, host_id="host_a", now=sampled)
+    frame = replace(
+        _frame(),
+        sampled_at=datetime.fromtimestamp(sampled, timezone.utc).isoformat(),
+        load_level=LoadLevelReport("new_session_hold", "load", "2026-10-25T00:00:00Z", 4, 5, None),
+    )
+    # Arrival and replays are recent; the original sample still ages out at 181 s.
+    for received in (sampled + 100, sampled + 180):
+        hub.ingest(host_id="host_a", workspace_id=0, frame=frame, now=received)
+        assert hub.host_load(0, "host_a", now=received)["level"] == "new_session_hold"
+    hub.drain_level_changes()
+    if expiry_via == "tick":
+        _tick(hub, sampled + 181)
+        assert hub._entries[(0, "host_a")].level == "unknown"
+    assert hub.host_load(0, "host_a", now=sampled + 181)["level"] == "unknown"
+    (change,) = hub.drain_level_changes()
+    assert (change.old, change.new) == ("new_session_hold", "unknown")
+    for received in (sampled + 200, sampled + 400):
+        hub.ingest(host_id="host_a", workspace_id=0, frame=frame, now=received)
+        assert hub.host_load(0, "host_a", now=received)["level"] == "unknown"
+    assert hub.drain_level_changes() == []
 
 
 def test_hub_never_calls_metrics_snapshot() -> None:

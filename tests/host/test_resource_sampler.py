@@ -17,6 +17,7 @@ import pytest
 
 from omnigent.host import resource_sampler as sampler_mod
 from omnigent.host.frames import ResourceProcessRow
+from omnigent.host.load_level import FACTORY_LINES, LevelState
 from omnigent.host.resource_sampler import (
     ResourceSampler,
     _apply_payload_cap,
@@ -270,7 +271,11 @@ def test_non_posix_load_waits_for_emulation_warmup(
     """The first Windows zeros are unknown; a warmed-up zero is valid."""
     monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
     clock = SimpleNamespace(value=100.0)
-    monkeypatch.setattr(sampler_mod, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    monkeypatch.setattr(
+        sampler_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock.value, time=lambda: clock.value),
+    )
     getloadavg = Mock(
         side_effect=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (2.5, 0.0, 0.0), (0.0, 0.0, 0.0)]
     )
@@ -294,7 +299,11 @@ def test_non_posix_load_retries_failed_initialization(
     """Only a successful emulation start begins the warmup clock."""
     monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
     clock = SimpleNamespace(value=100.0)
-    monkeypatch.setattr(sampler_mod, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    monkeypatch.setattr(
+        sampler_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock.value, time=lambda: clock.value),
+    )
     getloadavg = Mock(
         side_effect=[
             OSError("load unavailable"),
@@ -323,7 +332,11 @@ def test_non_posix_load_failure_preserves_the_sample(
     """Startup and later load errors preserve the frame's other metrics."""
     monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
     clock = SimpleNamespace(value=100.0)
-    monkeypatch.setattr(sampler_mod, "time", SimpleNamespace(monotonic=lambda: clock.value))
+    monkeypatch.setattr(
+        sampler_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock.value, time=lambda: clock.value),
+    )
     readings: list[object] = [(0.0, 0.0, 0.0), (1.5, 0.0, 0.0), (2.0, 0.0, 0.0)]
     readings[failure_at] = RuntimeError("load unavailable")
     getloadavg = Mock(side_effect=readings)
@@ -449,3 +462,73 @@ def test_payload_cap_folds_remaining_rows_under_nearest_kept_parent() -> None:
     assert summary.cpu_pct == 14.0
     assert summary.rss == 14
     assert summary.started_at is None
+
+
+@pytest.mark.parametrize("cadence", [10, 60])
+def test_windows_estimate_uses_minute_cpu_mean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cadence: int,
+) -> None:
+    monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
+    clock = SimpleNamespace(value=0.0)
+    monkeypatch.setattr(
+        sampler_mod,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.value,
+            time=lambda: clock.value,
+        ),
+    )
+    monkeypatch.setattr(sampler_mod.psutil, "getloadavg", lambda: (2.0, 0.0, 0.0))
+    monkeypatch.setattr(sampler_mod.psutil, "cpu_count", lambda **kwargs: 24)
+    monkeypatch.setattr(
+        sampler_mod.psutil, "swap_memory", lambda: SimpleNamespace(used=8, total=16)
+    )
+    times = namedtuple("CpuTimes", "user system idle")
+    monkeypatch.setattr(
+        sampler_mod.psutil, "cpu_times", lambda: times(clock.value * 12, 0, clock.value * 12)
+    )
+    sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
+    assert sampler._machine_metrics().load_per_core is None
+    for second in range(cadence, 121, cadence):
+        clock.value = float(second)
+        machine = sampler._machine_metrics()
+        assert machine.cpu_count == 24
+        assert machine.load_equiv == 14.0
+        assert machine.load_per_core == pytest.approx(14 / 24)
+        assert machine.estimate is True
+        assert (machine.swap_used, machine.swap_total) == (8, 16)
+
+
+def test_windows_varying_cpu_is_averaged_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sampler_mod, "IS_POSIX", False)
+    clock = SimpleNamespace(value=0.0, busy=0.0, idle=0.0)
+    monkeypatch.setattr(
+        sampler_mod,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.value,
+            time=lambda: clock.value,
+        ),
+    )
+    monkeypatch.setattr(sampler_mod.psutil, "getloadavg", lambda: (88.8, 0.0, 0.0))
+    monkeypatch.setattr(sampler_mod.psutil, "cpu_count", lambda **kwargs: 24)
+    times = namedtuple("CpuTimes", "user system idle")
+    monkeypatch.setattr(sampler_mod.psutil, "cpu_times", lambda: times(clock.busy, 0, clock.idle))
+    sampler = ResourceSampler(data_dir=tmp_path, daemon_pid=os.getpid())
+    sampler._machine_metrics()
+    state = LevelState()
+    for minute in range(3):
+        for index, second in enumerate((10, 20, 30, 40, 50, 59)):
+            clock.value = float(minute * 60 + second)
+            clock.busy += 24 if index == 0 else 0
+            clock.idle += 0 if index == 0 else 24
+            machine = sampler._machine_metrics()
+            state.add_sample(clock.value, sampler.sample_load_per_core, 50)
+        # Queue/core 3.7 plus mean CPU share 1/6 stays below the heavy line.
+        assert machine.load_per_core == pytest.approx(3.8666666667)
+        assert state.step((minute + 1) * 60, FACTORY_LINES) == ("normal", None)

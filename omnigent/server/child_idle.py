@@ -754,6 +754,15 @@ class ChildIdleSweeper:
             )
             return
         try:
+            from omnigent.db.db_models import current_workspace_id
+            from omnigent.server.host_load_notices import child_host_ids, hosts_line
+
+            host_summary: list[str] = []
+            hub = getattr(self._app.state, "system_status", None)
+            if hub is not None:
+                hosts = await asyncio.to_thread(child_host_ids, self._store, children)
+                if hosts:
+                    host_summary.append(hosts_line(hub, current_workspace_id(), hosts, now))
             delivered_ids = {sid for sid, _, _ in previous}
             text = build_checkin_text(
                 policy.instructions,
@@ -772,6 +781,7 @@ class ChildIdleSweeper:
                     for item in followups.values()
                 ],
             )
+            text = "\n".join([text, *host_summary])
             # Preparation and posting share the reserved delivery deadline.
             remaining = int(reserved_last) - self._clock()
             outcome = (

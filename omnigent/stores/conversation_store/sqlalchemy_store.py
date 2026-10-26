@@ -2387,6 +2387,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise ValueError("label value exceeds its storage limit")
 
         def write(session: Session) -> bool:
+            try:
+                self._lock_conversation(session, conversation_id)
+            except ConversationNotFoundError:
+                return False
             conditions = (
                 SqlConversationLabel.workspace_id == current_workspace_id(),
                 SqlConversationLabel.conversation_id == conversation_id,
@@ -4702,6 +4706,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         conversation_id: str,
         items: list[NewConversationItem],
+        *,
+        while_label: str | None = None,
     ) -> list[ConversationItem]:
         """
         Append items to a conversation.
@@ -4779,6 +4785,19 @@ class SqlAlchemyConversationStore(ConversationStore):
             # On PostgreSQL this is a row-level FOR UPDATE lock; on
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
+
+            if while_label is not None:
+                from omnigent.stores.conversation_store import ConversationLabelConditionFailed
+
+                present = session.scalar(
+                    select(SqlConversationLabel.key).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key == while_label,
+                    )
+                )
+                if present is None:
+                    raise ConversationLabelConditionFailed
 
             stable_ids = [item.stable_id for item in items if item.stable_id is not None]
             replaced_ids = {item.replaces_pending_id for item in items}

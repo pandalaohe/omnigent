@@ -320,6 +320,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 _CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
 _CHILD_CHECKIN_TOOLS = frozenset({"sys_child_checkin"})
+_HOST_LOAD_TOOLS = frozenset({"sys_host_load"})
 
 # Both sys_session_create create shapes (JSON and config_path multipart)
 # carry the agent-origin marker: the server charges the owner's open-rate
@@ -605,6 +606,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
     | _CHILD_CHECKIN_TOOLS
+    | _HOST_LOAD_TOOLS
     | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -1082,6 +1084,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
     | _CHILD_CHECKIN_TOOLS
+    | _HOST_LOAD_TOOLS
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -5639,8 +5642,16 @@ async def _complete_created_session(
                     "detail": post_error,
                 }
             else:
-                initial_message = {"status": "sent"}
-                if remote:
+                startup = _string_object_dict(data.get("startup"))
+                held = (
+                    startup is not None
+                    and startup.get("reason") == "host_load"
+                    and startup.get("status") == "queued"
+                )
+                initial_message = (
+                    {"status": "queued", "reason": "host_load"} if held else {"status": "sent"}
+                )
+                if remote and not held:
                     _subagent_work.mark_subagent_work_started(child_id)
     else:
         registration_error = await clear_registration_barrier()
@@ -5676,6 +5687,8 @@ async def _complete_created_session(
             "git_branch": _optional_string(meta.get("git_branch")) if meta is not None else None,
             "harness": _optional_string(meta.get("harness")) if meta is not None else None,
             **({"initial_message": initial_message} if initial_message is not None else {}),
+            **({"host_load": data["host_load"]} if "host_load" in data else {}),
+            **({"startup": data["startup"]} if "startup" in data else {}),
         }
     )
 
@@ -8122,6 +8135,7 @@ async def _session_info_item(
     auto_compact_token_limit = snap.get("auto_compact_token_limit")
     item: _JsonObject = {
         **({"initial_message": initial_message} if initial_message is not None else {}),
+        **({"startup_hold": snap["startup_hold"]} if snap.get("startup_hold") else {}),
         "session_id": snap.get("id"),
         "status": snap.get("status"),
         # Persisted conversation activity is distinct from lifecycle
@@ -8878,6 +8892,72 @@ async def _execute_child_checkin(
         return json.dumps(response.json())
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_child_checkin failed: {exc}"})
+
+
+async def _execute_host_load(args: _JsonObject, client: httpx.AsyncClient | None) -> str:
+    if args:
+        return json.dumps({"error": "sys_host_load takes no arguments"})
+    if client is None:
+        return json.dumps({"error": "sys_host_load requires server access"})
+    advice = {
+        "spare": "Spare capacity: this host can take more work.",
+        "normal": "Heavy work may proceed; check current load before dispatching more work.",
+        "heavy_hold": "Wait before starting new heavy work on this host; recheck for clearance.",
+        "new_session_hold": (
+            "Wait before starting new heavy work or creating new child sessions on this host; "
+            "recheck for clearance."
+        ),
+        "unknown": (
+            "Load telemetry is unavailable, warming up, or stale. No load hold is confirmed; "
+            "verify capacity before starting heavy work."
+        ),
+    }
+    fields = (
+        "name",
+        "host_id",
+        "state",
+        "cpu_count",
+        "load_per_core",
+        "load_equiv",
+        "estimate",
+        "level",
+        "reason",
+        "lines",
+        "lines_source",
+        "mem_pct",
+        "queued_children",
+        "sampled_at",
+        "level_since",
+    )
+    try:
+        response = await client.get("/v1/system/status", timeout=30)
+        response.raise_for_status()
+        payload = _string_object_dict(response.json())
+        raw_hosts = payload.get("hosts") if payload is not None else None
+        hosts = _json_object_list(raw_hosts)
+        if not isinstance(raw_hosts, list) or len(hosts) != len(raw_hosts):
+            return json.dumps({"error": "sys_host_load received an invalid host list"})
+        return json.dumps(
+            {
+                "hosts": [
+                    {
+                        **{field: host.get(field) for field in fields},
+                        "scheduling_advice": (
+                            "Host is not online; confirm connectivity before dispatching work."
+                            if host.get("state") != "online"
+                            else advice.get(
+                                _optional_string(host.get("level")) or "",
+                                "Unrecognized load level; verify capacity "
+                                "before dispatching work.",
+                            )
+                        ),
+                    }
+                    for host in hosts
+                ]
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_host_load failed: {exc}"})
 
 
 async def _agent_list_via_rest(
@@ -10247,6 +10327,8 @@ async def execute_tool(
             output = await _execute_child_cap(args, server_client, conversation_id)
         elif tool_name in _CHILD_CHECKIN_TOOLS:
             output = await _execute_child_checkin(args, server_client, conversation_id)
+        elif tool_name in _HOST_LOAD_TOOLS:
+            output = await _execute_host_load(args, server_client)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,

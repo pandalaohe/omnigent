@@ -6870,6 +6870,9 @@ async def _launch_runner_on_host_impl(
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
+    from omnigent.server.host_load_queue import require_start_allowed
+
+    require_start_allowed(conv)
     lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
     async with lock:
         # Re-read under the lock: a binding that moved past the caller's
@@ -11745,7 +11748,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     reserved_startup_key = next(
         (
             key
-            for key in (STARTUP_REGISTRATION_LABEL_KEY, STARTUP_CREATE_PREPARATION_LABEL_KEY)
+            for key in (
+                STARTUP_REGISTRATION_LABEL_KEY,
+                STARTUP_CREATE_PREPARATION_LABEL_KEY,
+                "omnigent.startup.host_load",
+            )
             if key in labels
         ),
         None,

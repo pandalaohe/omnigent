@@ -1995,6 +1995,10 @@ def create_app(
                     try:
                         server_disk_pct = await asyncio.to_thread(system_status_hub.disk_usage_pct)
                         system_status_hub.tick(time.time(), server_disk_pct=server_disk_pct)
+                        await app_inst.state.host_load_queue.tick(system_status_hub, app_inst)
+                        host_load_notices = getattr(app_inst.state, "host_load_notices", None)
+                        if host_load_notices is not None:
+                            await host_load_notices.tick(system_status_hub, app_inst)
                         ticks += 1
                         if ticks % FLUSH_EVERY_TICKS == 0:
                             await system_status_hub.save_history()
@@ -2184,6 +2188,10 @@ def create_app(
                 system_status_fast_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await system_status_fast_task
+            host_load_notices = getattr(app_inst.state, "host_load_notices", None)
+            if host_load_notices is not None:
+                await host_load_notices.shutdown()
+            await app_inst.state.host_load_queue.shutdown()
             if system_status_hub is not None:
                 await system_status_hub.save_history()
                 system_status_hub.close()
@@ -2245,7 +2253,7 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
-    from omnigent.server.startup_inputs import ManagedStartupInputs
+    from omnigent.server.startup_inputs import ManagedStartupInputs, StartupDispatch
 
     startup_inputs = (
         ManagedStartupInputs(conversation_store, host_registry)
@@ -2260,6 +2268,16 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    from omnigent.server.host_load_queue import HostLoadQueue
+
+    app.state.host_load_inputs = ManagedStartupInputs(conversation_store, host_registry)
+    app.state.host_load_queue = HostLoadQueue(conversation_store)
+
+    def _register_startup_dispatch(handler: StartupDispatch) -> None:
+        app.state.host_load_inputs.dispatch = handler
+        if startup_inputs is not None:
+            startup_inputs.dispatch = handler
+
     from omnigent.stores.session_startup_store import SessionStartupStore
 
     app.state.startup_policy = startup_policy
@@ -3977,11 +3995,7 @@ def create_app(
             # Lets the native hook routes read the session owner's
             # approval-timeout setting; absent → defaults.
             user_preferences_store=user_preferences_store,
-            register_startup_dispatch=lambda handler: (
-                setattr(startup_inputs, "dispatch", handler)
-                if startup_inputs is not None
-                else None
-            ),
+            register_startup_dispatch=_register_startup_dispatch,
             register_initial_file_upload=lambda handler: setattr(
                 app.state, "initial_file_upload", handler
             ),
@@ -4663,6 +4677,10 @@ def create_app(
             )
 
         def needs_eager_recovery(conv: Conversation) -> bool:
+            from omnigent.server.host_load_queue import held_host
+
+            if held_host(conv):
+                return False
             if conv.archived:
                 return False
             # Idle runtimes are recreated on their next interaction. Unknown,
@@ -4850,6 +4868,9 @@ def create_app(
                         and not conv.archived
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
+                    from omnigent.server.host_load_queue import held_host
+
+                    initialize_runtime = initialize_runtime and not held_host(conv)
                     # Idle trees reinitialize on demand; active trees recover now.
                     if initialize_runtime:
                         async with store_slots:
@@ -5073,6 +5094,7 @@ def create_app(
                     conn_capabilities=list(conn.hello.capabilities),
                     now=time.time(),
                 )
+                system_status.push_load_lines(host_registry, conn.workspace_id, conn.host_id)
             if cli_retention_coordinator is not None:
                 cli_retention_coordinator.trigger(host_id)
             archive_close_coordinator.trigger_pending(host_id=host_id)
@@ -5144,6 +5166,7 @@ def create_app(
                 auth_provider=auth_provider,
                 permission_store=permission_store,
                 host_versions=_bulk_host_versions,
+                host_registry=host_registry,
             ),
             prefix="/v1",
             tags=["system"],

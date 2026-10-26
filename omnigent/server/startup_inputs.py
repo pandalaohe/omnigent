@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import weakref
@@ -226,6 +227,18 @@ class ManagedStartupInputs:
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
         self._deliveries: dict[tuple[int, str], asyncio.Task[Any]] = {}
+        self._session_barriers: weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def session_barrier(self, session_id: str) -> asyncio.Lock:
+        """Fence normal sends behind release's final drain on this server replica."""
+        key = (current_workspace_id(), session_id)
+        lock = self._session_barriers.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_barriers[key] = lock
+        return lock
 
     async def dispatch_annotation(
         self,
@@ -283,6 +296,7 @@ class ManagedStartupInputs:
         user_id: str | None,
         headers: Headers,
         first: bool = True,
+        while_label: str | None = None,
     ) -> ConversationItem:
         from omnigent.server.background_session_titles import background_session_titles_enabled
         from omnigent.server.routes._sessions.helpers import (
@@ -320,7 +334,12 @@ class ManagedStartupInputs:
                 )
             }
         )
-        saved = await asyncio.to_thread(self.conversations.append, session_id, [item])
+        if while_label is not None:
+            saved = await asyncio.to_thread(
+                self.conversations.append, session_id, [item], while_label=while_label
+            )
+        else:
+            saved = await asyncio.to_thread(self.conversations.append, session_id, [item])
         if saved[0].deduplicated and not _stable_id_reuse_is_exact_retry(saved[0], item):
             raise OmnigentError(
                 "This input id already belongs to a different message", code=ErrorCode.CONFLICT
@@ -503,6 +522,10 @@ class ManagedStartupInputs:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.host_id != connection.host_id:
             return False
+        from omnigent.server.host_load_queue import held_host
+
+        if held_host(conv):
+            return False
         from omnigent.server.startup_registration import (
             STARTUP_CREATE_PREPARATION_LABEL_KEY,
             STARTUP_CREATE_PREPARATION_PENDING,
@@ -650,8 +673,11 @@ class ManagedStartupInputs:
         try:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
             current = await asyncio.to_thread(self.conversations.get_item, session_id, item.id)
+            from omnigent.server.host_load_queue import start_allowed
+
             if (
                 conv is None
+                or not start_allowed(conv)
                 or conv.labels.get(STARTUP_LABEL) == "cancelled"
                 or current is None
                 or current.response_id != PENDING_INPUT_RESPONSE_ID
@@ -709,6 +735,27 @@ class ManagedStartupInputs:
                 await asyncio.to_thread(
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
+                current_conv = await asyncio.to_thread(
+                    self.conversations.get_conversation, session_id
+                )
+                initial = (
+                    current_conv.labels.get("omnigent.initial_message") if current_conv else None
+                )
+                if initial:
+                    with contextlib.suppress(ValueError):
+                        outcome = json.loads(initial)
+                        if (
+                            isinstance(outcome, dict)
+                            and outcome.get("status") == "queued"
+                            and outcome.get("reason") == "host_load"
+                        ):
+                            await asyncio.to_thread(
+                                self.conversations.compare_and_set_label,
+                                session_id,
+                                "omnigent.initial_message",
+                                initial,
+                                json.dumps({"status": "sent"}),
+                            )
             return "submitted" if context.submitted else "not_dispatched"
         except asyncio.CancelledError:
             raise
@@ -746,6 +793,24 @@ class ManagedStartupInputs:
             return "unconfirmed" if uncertain else "not_dispatched"
         finally:
             self._deliveries.pop(key, None)
+
+    async def deliver_session(self, app: Any, session_id: str) -> int:
+        """Drain saved inputs in order, including hostless children on a parent runner."""
+        delivered = 0
+        while True:
+            items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+            head = next((item for item in items if item.status != "failed"), None)
+            if head is None:
+                return delivered
+            if head.status != "in_progress":
+                raise TimeoutError("Saved input is still waiting for its runtime receipt")
+            outcome = await self._deliver(app, session_id, head)
+            if outcome != "submitted":
+                raise RuntimeError(f"Saved input delivery was {outcome}")
+            delivered += 1
+            current = await asyncio.to_thread(self.conversations.get_item, session_id, head.id)
+            if current is not None and current.status == "incomplete":
+                raise TimeoutError("Saved input is still waiting for its runtime receipt")
 
     async def retry(self, session_id: str) -> bool:
         changed = False

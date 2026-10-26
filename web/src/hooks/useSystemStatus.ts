@@ -78,6 +78,22 @@ export interface SystemHostSnapshot {
 /** `"online" | "offline" | "needs_update"` inventory state of one host. */
 export type SystemHostState = "online" | "offline" | "needs_update";
 
+/**
+ * Host-reported load level against its two lines; `"unknown"` when the host
+ * sends no fresh reading (warmup, stale, disconnected, or too old to report).
+ */
+export type SystemHostLoadLevel =
+  "spare" | "normal" | "heavy_hold" | "new_session_hold" | "unknown";
+
+/** Per-core load lines: heavy work waits at `heavy`, new child sessions queue at `new_session`. */
+export interface SystemLoadLinePair {
+  heavy: number;
+  new_session: number;
+}
+
+/** Where a host's effective lines come from. */
+export type SystemLoadLinesSource = "host" | "default" | "factory";
+
 /** One inventory row in the full view. */
 export interface SystemStatusHost {
   host_id: string;
@@ -88,6 +104,22 @@ export interface SystemStatusHost {
   since: number | null;
   last_snapshot: SystemHostSnapshot | null;
   last_runner_count: number;
+  // Host load; absent from servers that predate the load lines.
+  /** 1-minute load divided by logical cores. */
+  load_per_core?: number | null;
+  /** The 1-minute load the per-core value divides; estimated on Windows. */
+  load_equiv?: number | null;
+  /** Whether `load_equiv` is an estimate (Windows has no native load average). */
+  estimate?: boolean;
+  cpu_count?: number | null;
+  level?: SystemHostLoadLevel;
+  /** What set the current hold: `"load"` or `"memory"`. */
+  reason?: string | null;
+  lines?: SystemLoadLinePair;
+  lines_source?: SystemLoadLinesSource;
+  /** Agent-created child sessions waiting for this host to drop below its new-session line. */
+  queued_children?: number;
+  mem_pct?: number | null;
 }
 
 /** One server process point; `req` / `err` are deltas since the prior tick. */
@@ -162,6 +194,14 @@ export interface HealthCheckSettings {
   prompt: string | null;
 }
 
+/** The current workspace's load lines: its default, per-host overrides and the queue switch. */
+export interface SystemLoadLinesSettings {
+  default: SystemLoadLinePair;
+  hosts: Record<string, SystemLoadLinePair>;
+  /** Whether agent-created child sessions queue on a host above its new-session line. */
+  queue_enabled: boolean;
+}
+
 /** `GET|PUT /v1/system/settings` mapping. */
 export interface SystemStatusSettings {
   cpu_pct: number;
@@ -170,6 +210,8 @@ export interface SystemStatusSettings {
   disk_pct: number;
   server_5xx_pct: number;
   health_check: HealthCheckSettings;
+  /** Absent from servers that predate the load lines. */
+  load_lines?: SystemLoadLinesSettings;
   /** Shipped prompt to show when `health_check.prompt` is null. */
   default_health_check_prompt: string;
 }
@@ -180,10 +222,35 @@ export type SystemStatusThresholds = Pick<
   "cpu_pct" | "cpu_sustain_min" | "mem_pct" | "disk_pct" | "server_5xx_pct"
 >;
 
+/** A load-lines patch; a `null` host entry removes its override (follow the default). */
+export interface SystemLoadLinesUpdate {
+  default?: SystemLoadLinePair;
+  hosts?: Record<string, SystemLoadLinePair | null>;
+  queue_enabled?: boolean;
+}
+
 /** A partial settings PUT body; the server merges the groups it receives. */
 export type SystemStatusSettingsUpdate = Partial<
-  SystemStatusThresholds & { health_check: HealthCheckSettings }
+  SystemStatusThresholds & { health_check: HealthCheckSettings; load_lines: SystemLoadLinesUpdate }
 >;
+
+/** Highest line the server accepts, per core. */
+export const MAX_LOAD_LINE = 64;
+
+/** A typed line value; blank reads as missing rather than 0. */
+export function parseLoadLine(text: string): number {
+  return text.trim() === "" ? Number.NaN : Number(text);
+}
+
+/** The server's rule for a line pair, checked before saving; `null` when valid. */
+export function loadLinePairError(heavy: number, newSession: number): string | null {
+  if (!Number.isFinite(heavy) || !Number.isFinite(newSession))
+    return "Enter both lines as numbers.";
+  if (heavy <= 0) return "The heavy-work line must be above 0.";
+  if (heavy >= newSession) return "The heavy-work line must be below the new-session line.";
+  if (newSession > MAX_LOAD_LINE) return `The new-session line can be at most ${MAX_LOAD_LINE}.`;
+  return null;
+}
 
 const SUMMARY_QUERY_KEY = ["system-status", "summary"] as const;
 const FULL_QUERY_KEY = ["system-status", "full"] as const;
@@ -331,8 +398,13 @@ export function useUpdateSystemStatusSettings() {
       if (!res.ok) throw new Error(await errorMessage(res));
       return (await res.json()) as SystemStatusSettings;
     },
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEY });
-    },
+    // Stay pending until the refetches land, so an editor reopened right after
+    // a save starts from the saved lines rather than the previous ones.
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEY }),
+        // Host cards show each host's effective lines from the status view.
+        queryClient.invalidateQueries({ queryKey: FULL_QUERY_KEY }),
+      ]),
   });
 }

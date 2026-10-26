@@ -6765,6 +6765,9 @@ async def ensure_runner_connected(
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         return refreshed if refreshed is not None else conv
 
+    from omnigent.server.host_load_queue import require_start_allowed
+
+    require_start_allowed(conv)
     # Fast path: a live runner tunnel is already reachable.
     runner_client = await _get_runner_client(
         session_id,
@@ -7614,6 +7617,9 @@ async def _ensure_runner_session_initialized(
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
+    from omnigent.server.host_load_queue import require_start_allowed
+
+    require_start_allowed(conv)
     archive_states = await runner_archive_states_for_conversation(
         conv,
         conversation_store,
@@ -9858,6 +9864,9 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    from omnigent.server.host_load_queue import require_start_allowed
+
+    require_start_allowed(conv)
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     usage_admission = None
@@ -13428,6 +13437,7 @@ async def _create_session_from_existing_agent(
     project_store: ProjectStore | None = None,
     conversation_id: str | None = None,
     calling_path_label: str = "POST /v1/sessions",
+    host_load_hold: Any = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -14011,9 +14021,11 @@ async def _create_session_from_existing_agent(
             # A new placement needs admitted host preparation and its own runner.
             inherited_runner_id = None
 
-    defer_host_preparation = admission_enabled and body.host_id is not None
-    defer_initial_items = admission_enabled and (
-        body.host_id is not None or body.parent_session_id is not None
+    defer_host_preparation = admission_enabled and body.host_id is not None and not host_load_hold
+    defer_initial_items = (
+        admission_enabled
+        and not host_load_hold
+        and (body.host_id is not None or body.parent_session_id is not None)
     )
     if defer_initial_items and body.initial_items:
         from omnigent.server.schemas import SessionStartupInput
@@ -14521,6 +14533,8 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if host_load_hold:
+        initial_labels["omnigent.startup.host_load"] = f"queued@{host_load_hold.host_id}"
     initial_labels.update(registry_labels)
     if defer_host_preparation and inherited_runner_id is None:
         from omnigent.server.startup_registration import (
@@ -14863,7 +14877,12 @@ async def _create_session_from_existing_agent(
     except Exception:  # noqa: BLE001
         pass
 
-    if body.initial_items and not defer_initial_items:
+    if host_load_hold and body.initial_items:
+        for index, item in enumerate(body.initial_items):
+            await request.app.state.host_load_inputs.enqueue(
+                conv.id, item, user_id=user_id, headers=request.headers, first=index == 0
+            )
+    if body.initial_items and not defer_initial_items and not host_load_hold:
         runner_client = await _get_runner_client(
             conv.id,
             runner_router,
@@ -16708,16 +16727,29 @@ async def _get_session_snapshot(
     response.inference_error = inference_error
     response.usage_included = include_usage
     response.running_since = running_since
+    from omnigent.server.host_load_queue import presentation
+
+    response.startup_hold = presentation(conv)
     startup_store = (
         getattr(request.app.state, "startup_store", None) if request is not None else None
     )
     if startup_store is not None:
+        from omnigent.entities.session_startup import SessionStartupStatus
+
         response.startup = await asyncio.to_thread(startup_store.presentation, session_id)
-        if response.startup is not None and permission_level is not None and permission_level < 4:
+        if (
+            isinstance(response.startup, SessionStartupStatus)
+            and permission_level is not None
+            and permission_level < 4
+        ):
             response.startup.can_cancel = False
     startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
     if startup is not None and STARTUP_LABEL in conv.labels:
         queued = await startup.pending_snapshot(session_id)
+        known = {item["pending_id"] for item in response.pending_inputs}
+        response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
+    if response.startup_hold is not None and request is not None:
+        queued = await request.app.state.host_load_inputs.pending_snapshot(session_id)
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     return response

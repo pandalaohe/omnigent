@@ -11560,6 +11560,30 @@ def host_disable() -> None:
     click.echo(f"Removed service definition: {_display_path(service.path)}")
 
 
+@host.command("load")
+@click.option("--json", "json_output", is_flag=True, help="Emit the local load contract as JSON.")
+def host_load(json_output: bool) -> None:
+    """Read this host's load level without connecting to a server."""
+    from omnigent.host.load_level import read_local_load
+    from omnigent.process_logging import data_dir
+
+    payload, fresh = read_local_load(data_dir() / "run" / "host-load.json", now=time.time())
+    if json_output:
+        click.echo(json.dumps(payload))
+    else:
+        load = payload["load_per_core"]
+        click.echo(
+            f"level: {payload['level']}  load/core: {load if load is not None else 'unknown'}"
+        )
+        click.echo(
+            f"lines: heavy {payload['lines']['heavy']} / "
+            f"new session {payload['lines']['new_session']}"
+        )
+        click.echo(f"path: {payload['path']}")
+    if not fresh:
+        raise SystemExit(3)
+
+
 @host.command("status")
 @click.option("--server", default=None, help="Inspect only this server target.")
 @click.option("--all", "all_targets", is_flag=True, help="Inspect all known daemon targets.")

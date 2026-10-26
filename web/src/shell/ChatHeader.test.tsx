@@ -10,6 +10,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { copyText } from "@/lib/clipboard";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import type { SessionStartupHold } from "@/lib/types";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import type { ChildSessionLike } from "./subagentRailGroups";
 import { ChatHeader } from "./ChatHeader";
@@ -103,6 +104,7 @@ function renderHeader(props: {
   rightPanelOpen?: boolean;
   showFilesPanel?: boolean;
   pending?: boolean;
+  startupHold?: SessionStartupHold | null;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
@@ -146,6 +148,7 @@ function renderHeader(props: {
             rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
             pending={props.pending}
+            startupHold={props.startupHold}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
@@ -387,6 +390,23 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("ChatHeader — startup hold", () => {
+  it("says the session is queued while its host is over the new-session line", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      conversationTitle: "Run the suite",
+      startupHold: { reason: "host_load", host_id: "h1", since: 1704067200 },
+    });
+    expect(screen.getByTestId("session-startup-hold")).toHaveTextContent("Queued (host load)");
+  });
+
+  it("renders nothing once the hold is gone", () => {
+    renderHeader({ sidebarOpen: true, conversationId: "child-9", conversationTitle: "Run" });
+    expect(screen.queryByTestId("session-startup-hold")).toBeNull();
   });
 });
 

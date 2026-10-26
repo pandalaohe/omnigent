@@ -161,6 +161,7 @@ _READ_NO_PATH = frozenset(
         "sys_project_settings_read",
         "sys_scheduled_task_list",
         "sys_flow_list",
+        "sys_host_load",
         "list_comments",
         "load_skill",
         "read_skill_file",

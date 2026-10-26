@@ -123,6 +123,24 @@ def test_create_sub_agent_conversation(
     assert parent_id_col == [parent.id]
 
 
+def test_conditional_append_and_unhold_share_the_conversation_database(store):
+    from omnigent.entities.conversation import MessageData, NewConversationItem
+    from omnigent.stores.conversation_store import ConversationLabelConditionFailed
+
+    key = "omnigent.startup.host_load"
+    conv = store.create_conversation(labels={key: "queued@sample"})
+    item = NewConversationItem(
+        type="message",
+        response_id="seed",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "saved"}]),
+    )
+    [first] = store.append(conv.id, [item], while_label=key)
+    assert store.compare_and_set_label(conv.id, key, "queued@sample", None)
+    with pytest.raises(ConversationLabelConditionFailed):
+        store.append(conv.id, [item], while_label=key)
+    assert [value.id for value in store.list_items(conv.id).data] == [first.id]
+
+
 # ── get / list ─────────────────────────────────────────
 
 

@@ -282,4 +282,7 @@ def resolve_host_launch(
         if not allowed:
             raise HTTPException(status_code=404, detail="session not found")
 
+    from omnigent.server.host_load_queue import require_start_allowed
+
+    require_start_allowed(conv)
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
