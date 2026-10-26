@@ -433,11 +433,16 @@ async def test_codex_cold_executor_claim_precedes_creation_and_warm_turn_skips_i
     with startup_evidence_scope(ref, lambda _: None, grant):
         async for _ in executor.run_turn(messages, [], "", ExecutorConfig()):
             pass
+        # Cold work claims both package preparation and session construction.
+        assert claims == ["executor_prepare"] * 3
+        assert len(created) == 1
         async for _ in executor.run_turn(messages, [], "", ExecutorConfig()):
             pass
+        assert claims == ["executor_prepare"] * 3
+        assert len(created) == 1
         async for _ in executor.run_turn(messages, [], "", ExecutorConfig(model="gpt-5.5")):
             pass
-    assert claims == ["executor_prepare", "executor_prepare", "executor_prepare"]
+    assert claims == ["executor_prepare"] * 4
     assert len(created) == 2
 
     # A warm follow-up has no new attempt; a later signature change or crash

@@ -21,6 +21,7 @@ from omnigent.inner.codex_executor import (
 from omnigent.inner.executor import TurnComplete
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.runtime.harnesses import _executor_adapter
+from tests._helpers.polling import poll_until_async
 from tests.inner.test_codex_executor import _FakeAppSession, _FakeProcess
 
 
@@ -64,16 +65,23 @@ async def _collect_executor_turn(
 
 
 async def _pending_request(session: _CodexAppServerSession, method: str) -> int:
-    for _ in range(100):
+    request_id: int | None = None
+
+    def pending() -> bool:
+        nonlocal request_id
         proc = session._proc
         writes = proc.stdin.writes if proc is not None and proc.stdin is not None else []
         for wire in reversed(writes):
             request = json.loads(wire.decode("utf-8"))
-            request_id = request.get("id")
-            if request.get("method") == method and request_id in session._pending_requests:
-                return request_id
-        await asyncio.sleep(0)
-    pytest.fail(f"{method} was not sent")
+            candidate = request.get("id")
+            if request.get("method") == method and candidate in session._pending_requests:
+                request_id = candidate
+                return True
+        return False
+
+    await poll_until_async(pending, timeout_s=1, interval_s=0.001)
+    assert request_id is not None, f"{method} was not sent"
+    return request_id
 
 
 async def _pending_start(session: _CodexAppServerSession) -> int:

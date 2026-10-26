@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import tomllib
 
 from omnigent.inner.codex_executor import _CodexAppServerSession, _populate_codex_home_config
 from omnigent.inner.codex_worker import CodexWorkerLaunch
@@ -392,7 +393,7 @@ def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> 
     assert not (target / "auth.json").exists()
     assert not (target / ".credentials.json").exists()
     assert not (target / "memories_1.sqlite").exists()
-    assert not (target / "config.toml").exists()
+    assert tomllib.loads((target / "config.toml").read_text()) == {}
 
 
 async def test_signer_preflight_failure_never_creates_codex_home_or_worker(

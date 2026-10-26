@@ -8048,6 +8048,9 @@ async def test_brokered_version_failure_precedes_signer_session_construction(
     tmp_path: Path,
 ) -> None:
     version_gate = AsyncMock(side_effect=RuntimeError("unsupported Codex wire version"))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.snapshot_codex_binary", lambda path, *, env: path
+    )
     app_session_factory = AsyncMock()
     monkeypatch.setattr(
         "omnigent.inner.codex_executor._require_brokered_codex_version", version_gate
