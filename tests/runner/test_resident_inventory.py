@@ -1310,6 +1310,46 @@ async def test_runner_context_v2_preserves_codex_sdk_key_without_vendor_reads(
         await asyncio.gather(reader, return_exceptions=True)
 
 
+async def test_runner_context_v2_preserves_pi_rpc_pending_and_retired_owner(
+    harness_inventory_reader, monkeypatch
+):
+    from omnigent.inner.pi_executor import PiExecutor, PiSubprocessConfig, _PiRpcSession
+
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: None)
+    executor = PiExecutor(pi_path="/opt/work/bin/pi")
+    monkeypatch.setattr(executor, "_ensure_tool_server", AsyncMock(return_value=None))
+    monkeypatch.setattr(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        executor, "_build_env_and_dir", lambda *a, **kw: PiSubprocessConfig({}, None, [])
+    )
+
+    async def start(rpc, *_args, **_kwargs):
+        rpc._start_generation += 1
+        rpc.process = SimpleNamespace(returncode=None)
+
+    monkeypatch.setattr(_PiRpcSession, "start", start)
+    monkeypatch.setattr(_PiRpcSession, "_close_unobserved", AsyncMock())
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    await executor._ensure_rpc(adapter._session_key, "system", None, [])
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family="pi")
+    for retired in (False, True):
+        if retired:
+            await executor.close_session(adapter._session_key)
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.execution_keys == (adapter._session_key,) and record.vendor_id is None
+        assert record.provenance == "primary" and record.operation.action == "create"
+        assert record.lifecycle == ("unknown" if retired else "starting")
+        assert record.stop_proof is record.continuity_proof is None
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+    executor._ensure_tool_server.assert_awaited_once()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
 async def test_runner_opencode_context_v2_reads_existing_owner_without_probes(
     harness_inventory_reader, monkeypatch, tmp_path
 ):
