@@ -46,7 +46,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -61,6 +61,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 _logger = logging.getLogger(__name__)
 
@@ -319,6 +320,19 @@ class HermesExecutor(Executor):
     def supports_streaming(self) -> bool:
         """Return True — Hermes streams text output."""
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """Persisted Hermes resume history does not prove current occupancy or owned exit."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id,
+            read_id,
+            "hermes_resume_history_context_lifecycle_unsupported",
+            unsupported=True,
+        )
 
     def handles_tools_internally(self) -> bool:
         """Return True — Hermes executes tools inside its own agent loop.

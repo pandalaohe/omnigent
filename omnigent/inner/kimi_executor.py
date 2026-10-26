@@ -65,7 +65,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 
 from omnigent.harness_startup_config import resolve_harness_path
@@ -88,6 +88,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 _logger = logging.getLogger(__name__)
 
@@ -432,6 +433,19 @@ class KimiExecutor(Executor):
 
     def handles_tools_internally(self) -> bool:
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """A shared resume hint and per-turn process do not prove independent context lifetimes."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id,
+            read_id,
+            "kimi_singleton_resume_context_lifecycle_unsupported",
+            unsupported=True,
+        )
 
     def supports_streaming(self) -> bool:
         return True

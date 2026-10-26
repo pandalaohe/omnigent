@@ -1436,6 +1436,38 @@ async def test_runner_context_v2_keeps_history_and_stream_sources_unsupported(
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
 
 
+@pytest.mark.parametrize("family", ["hermes", "kimi"])
+async def test_runner_context_v2_keeps_cli_resume_history_unsupported(
+    harness_inventory_reader, monkeypatch, family
+):
+    from omnigent.inner.hermes_executor import HermesExecutor
+    from omnigent.inner.kimi_executor import KimiExecutor
+    from omnigent.startup_protocol import executor_context_scope_v2
+
+    monkeypatch.setattr(HermesExecutor, "_setup_hermes_home", lambda _: None)
+    if family == "hermes":
+        executor = HermesExecutor(hermes_path="/opt/bin/hermes")
+        executor._session_map["execution"] = "history-id"
+    else:
+        executor = KimiExecutor(binary_path="/opt/bin/kimi")
+        executor._session_id = "history-id"
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("no construction")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    for retired in (False, True):
+        if retired:
+            await executor.close_session("execution")
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        evidence = _v2_evidence(response.content, session_id="one")
+        source = next(s for s in evidence.sources if s.scope == executor_context_scope_v2("one"))
+        assert source.coverage == "unsupported" and source.contexts == ()
+        assert source.unresolved[0].reason.startswith(family + "_")
+        assert all(s.coverage != "complete" for s in evidence.sources)
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
 async def test_runner_context_v2_preserves_pi_rpc_pending_and_retired_owner(
     harness_inventory_reader, monkeypatch
 ):
