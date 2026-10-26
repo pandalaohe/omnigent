@@ -3884,6 +3884,11 @@ def create_runner_app(
                     session_id,
                     server_client=server_client,
                     optional_labels=init_context.labels,
+                    existing_bridge_dir=(
+                        binding.bridge_dir
+                        if (binding := _session_comment_relays.get(session_id))
+                        else None
+                    ),
                 )
             # An agent-cache reset acknowledged while init awaited retired
             # this entry; skip the memoization so the reset wins. Init still
@@ -5847,7 +5852,10 @@ def create_runner_app(
             return
         message = approval["params"].get("message") or "Approval required"
         policy_name = approval["params"].get("policy_name")
-        config_file = await _native_cost_popup_config_file(conv_id, harness)
+        try:
+            config_file = await _native_cost_popup_config_file(conv_id, harness)
+        except HTTPException:
+            return
         await asyncio.to_thread(
             launch_cost_popup,
             socket_path,
@@ -6646,12 +6654,17 @@ def create_runner_app(
             from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
 
             try:
-                resolved_dir = bridge_dir or await _claude_prompt_bridge_dir(session_id)
+                resolved_dir = bridge_dir
                 while _session_message_buffers.get(session_id):
                     if session_id in _active_turns:
                         return
                     try:
+                        if resolved_dir is None:
+                            resolved_dir = await _claude_prompt_bridge_dir(session_id)
                         pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
+                    except HTTPException:
+                        await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+                        continue
                     except (OSError, RuntimeError):
                         _logger.warning(
                             "Failed to inspect pending Claude prompt for %s; retrying",
@@ -6699,7 +6712,11 @@ def create_runner_app(
                 _rewake_parent_if_inbox_stranded(session_id)
                 return
 
-            pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            try:
+                pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            except HTTPException:
+                _start_claude_prompt_waiter(session_id)
+                return
             # Stop/delete can clear the queue while the pane inspection is in flight.
             buf = _session_message_buffers.get(session_id)
             if not buf:
@@ -7484,14 +7501,23 @@ def create_runner_app(
 
         bridge_dir = known_bridge_dir
         if bridge_dir is None:
-            bridge_dir = bridge_dir_for_bridge_id(
-                await _claude_native_bridge_id_with_optional_labels(
+            try:
+                resolved_bridge_id = await _claude_native_bridge_id_with_optional_labels(
                     server_client=server_client,
                     session_id=session_id,
                     session_labels=session_labels,
                 )
-                or session_id
-            )
+            except HTTPException:
+                current = _session_comment_relays.get(session_id)
+                if current is None:
+                    raise
+                bridge_dir = current.bridge_dir
+                _logger.warning(
+                    "Session labels unavailable; keeping the current native relay directory",
+                    extra={"session_id": session_id},
+                )
+            else:
+                bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
         skill_registry = await _session_skill_registry(session_id, spec_entry)
 
         # Re-read after the awaits above: a concurrent caller may have
@@ -8255,6 +8281,7 @@ def create_runner_app(
             codex_labels = await _session_labels_for_runner_spawn(
                 server_client=server_client,
                 session_id=conv,
+                required=True,
             )
             speed = codex_labels.get(SPEED_TIER_LABEL_KEY)
             if valid_speed_tier(speed, "codex-native"):
@@ -8288,6 +8315,7 @@ def create_runner_app(
             antigravity_labels = await _session_labels_for_runner_spawn(
                 server_client=server_client,
                 session_id=conv,
+                required=True,
             )
             antigravity_bid = antigravity_labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
@@ -8504,6 +8532,11 @@ def create_runner_app(
                 conv_id,
                 server_client=server_client,
                 optional_labels=startup_labels,
+                existing_bridge_dir=(
+                    binding.bridge_dir
+                    if (binding := _session_comment_relays.get(conv_id))
+                    else None
+                ),
             )
 
         if dispatch is None:

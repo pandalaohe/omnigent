@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
@@ -30,7 +31,11 @@ from omnigent.runner.app import (
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
 )
-from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_env
+from omnigent.runner.native import (
+    NativeLaunchContext,
+    _claude_native_bridge_id_for_session,
+    _resolve_native_spawn_env,
+)
 from omnigent.runner.permission_tiers import PermissionTierRuntime
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -406,6 +411,96 @@ async def test_resolve_native_spawn_env_codex_failed_label_read_keeps_the_launch
     assert env is not None
     assert env[codex_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] == str(expected)
     assert env[codex_bridge.CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR] == "conv_codex"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge_id", [None, "rotated-bridge"])
+async def test_claude_bridge_id_successful_label_lookup(bridge_id: str | None) -> None:
+    """A successful empty label map still selects the legacy session-id bridge."""
+    from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, json={"labels": {BRIDGE_ID_LABEL_KEY: bridge_id} if bridge_id else {}}
+            )
+        ),
+        base_url="http://ap",
+    ) as client:
+        result = await _claude_native_bridge_id_for_session(
+            server_client=client, session_id="conv_claude"
+        )
+    assert result == (bridge_id or "conv_claude")
+
+
+@pytest.mark.asyncio
+async def test_claude_bridge_id_waits_for_slow_successful_labels() -> None:
+    """An identity read may outlast the advisory timeout without losing its bridge."""
+    from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+
+    async def slow_labels(request: httpx.Request) -> httpx.Response:
+        timeout = request.extensions["timeout"]["read"]
+        try:
+            await asyncio.wait_for(asyncio.sleep(1.1), timeout=timeout)
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout("slow labels", request=request) from exc
+        return httpx.Response(200, json={"labels": {BRIDGE_ID_LABEL_KEY: "rotated-bridge"}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(slow_labels), base_url="http://ap"
+    ) as client:
+        result = await _claude_native_bridge_id_for_session(
+            server_client=client, session_id="conv_claude"
+        )
+    assert result == "rotated-bridge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"", b"[]", b'{"labels":null}'])
+async def test_claude_bridge_id_rejects_unusable_labels(body: bytes) -> None:
+    """Malformed label responses cannot select a legacy bridge."""
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body)),
+        base_url="http://ap",
+    ) as client:
+        with pytest.raises(HTTPException) as error:
+            await _claude_native_bridge_id_for_session(
+                server_client=client, session_id="conv_claude"
+            )
+    assert error.value.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_bridge", [None, Path("/opt/work/claude/live-bridge")])
+async def test_resolve_native_spawn_env_claude_failed_lookup(
+    existing_bridge: Path | None,
+) -> None:
+    """An unavailable identity keeps a known live directory or refuses cold spawn."""
+    from omnigent.harnesses.claude_native.bridge import (
+        BRIDGE_DIR_ENV_VAR,
+        REQUEST_SESSION_ID_ENV_VAR,
+    )
+
+    async with httpx.AsyncClient(
+        transport=_ReadTimeoutTransport(), base_url="http://ap"
+    ) as client:
+        if existing_bridge is None:
+            with pytest.raises(HTTPException) as error:
+                await _resolve_native_spawn_env(
+                    "claude-native", "conv_claude", server_client=client, optional_labels=None
+                )
+            assert error.value.status_code == 503
+        else:
+            env = await _resolve_native_spawn_env(
+                "claude-native",
+                "conv_claude",
+                server_client=client,
+                optional_labels=None,
+                existing_bridge_dir=existing_bridge,
+            )
+            assert env is not None
+            assert env[BRIDGE_DIR_ENV_VAR] == str(existing_bridge)
+            assert env[REQUEST_SESSION_ID_ENV_VAR] == "conv_claude"
 
 
 @pytest.mark.asyncio

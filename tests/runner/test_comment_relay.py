@@ -1336,6 +1336,73 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "503"])
+async def test_comment_relay_retains_bridge_on_label_lookup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """A failed label read during a spec refresh cannot retire the live relay."""
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_id = f"bridge_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(bridge_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    class ServerClient(_SwitchableServerClient):
+        fail_labels = False
+
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            if self.fail_labels and url.endswith("/labels"):
+                if failure == "timeout":
+                    raise httpx.ReadTimeout("labels timed out")
+                return httpx.Response(503, request=httpx.Request("GET", f"http://ap{url}"))
+            return await super().get(url, **kwargs)
+
+    server = ServerClient("same-agent", bridge_id)
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+    specs: dict[str, AgentSpec | ResolvedSpec] = {
+        "same-agent": ResolvedSpec(spec=spec, workdir=tmp_path)
+    }
+    from omnigent.runner import app as runner_app
+
+    callbacks: dict[str, Any] = {}
+    register = runner_app.register_resource_routes
+
+    def capture(app: FastAPI, **kwargs: Any) -> Any:
+        callbacks["ensure"] = kwargs["_ensure_comment_relay_started"]
+        return register(app, **kwargs)
+
+    monkeypatch.setattr(runner_app, "register_resource_routes", capture)
+    app = _switch_app(tmp_path, server, specs)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                original = json.loads(relay_file.read_text())
+                specs["same-agent"] = ResolvedSpec(
+                    spec=AgentSpec(spec_version=1, executor=spec.executor), workdir=tmp_path
+                )
+                await _reset_state(client, session_id)
+                server.fail_labels = True
+                await callbacks["ensure"](session_id)
+                assert relay_file.exists(), "label lookup failure removed the live advertisement"
+                current = json.loads(relay_file.read_text())
+                assert current["url"] == original["url"]
+                assert "list_comments" in _relay_tool_names(relay_file)
+                assert not (bridge_dir_for_bridge_id(session_id) / _TOOL_RELAY_FILE).exists()
+            finally:
+                server.fail_labels = False
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_agent_switch_replaces_relay_in_same_bridge_dir(
     tmp_path: Path,
     terminal_registry_singleton: None,
