@@ -87,6 +87,7 @@ from omnigent.native._native_post_delivery import (
     post_session_succession,
     replay_dead_letters,
 )
+from omnigent.native._native_session_labels import replacement_session_labels
 from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.runtime.tool_output import cap_tool_output
@@ -3149,7 +3150,7 @@ async def _create_thread_replacement_session(
     runner_id = old.get("runner_id")
     labels_value = old.get("labels")
     labels = (
-        {str(key): str(value) for key, value in labels_value.items()}
+        replacement_session_labels({str(key): str(value) for key, value in labels_value.items()})
         if isinstance(labels_value, dict)
         else {}
     )

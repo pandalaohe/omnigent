@@ -69,6 +69,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     post_session_succession,
 )
+from omnigent.native._native_session_labels import replacement_session_labels
 from omnigent.native._native_supersession import (
     post_clear_supersession as _post_clear_supersession,
 )
@@ -5130,7 +5131,7 @@ async def _create_clear_replacement_session(
 
     create_body: dict[str, object] = {
         "agent_id": agent_id,
-        "labels": labels,
+        "labels": replacement_session_labels(labels),
         "workspace": old.get("workspace"),
         "git": None,
     }

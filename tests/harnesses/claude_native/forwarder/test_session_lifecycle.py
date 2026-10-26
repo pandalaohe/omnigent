@@ -84,6 +84,9 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                     "labels": {
                         "omnigent.ui": "terminal",
                         BRIDGE_ID_LABEL_KEY: "bridge_shared",
+                        "omnigent.codex_native.permission_observation": "old observation",
+                        "omnigent.archived_at": "123",
+                        "omnigent.mcp_service.old": "1",
                     },
                 },
             )

@@ -149,6 +149,10 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                     "labels": {
                         "omnigent.wrapper": "codex-native-ui",
                         "omnigent.codex_native.bridge_id": "bridge_shared",
+                        "omnigent.codex_native.permission_observation": "old observation",
+                        "OMNIGENT.CODEX_NATIVE.PERMISSION_OBSERVATION": "alias",
+                        "omnigent.archived_at": "123",
+                        "omnigent.mcp_service.old": "1",
                     },
                 },
             )
