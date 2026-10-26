@@ -210,7 +210,14 @@ def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:
     This filters the model's tool list; the execution gate still checks every
     actual call, including direct extension ``executeTool`` calls.
     """
-    allowed = {*_READ_PATH, *_READ_NO_PATH, *_QUESTION_TOOLS, *_CONTROL_TOOLS, "sys_child_cap"}
+    allowed = {
+        *_READ_PATH,
+        *_READ_NO_PATH,
+        *_QUESTION_TOOLS,
+        *_CONTROL_TOOLS,
+        "sys_child_cap",
+        "sys_child_checkin",
+    }
     return tuple(dict.fromkeys(name for name in names if name in allowed))
 
 
@@ -518,6 +525,12 @@ def _adapt_unbound_call(
             if not ((type(cap) is int and cap > 0) or cap == "none"):
                 raise ValueError("Child cap must be a positive integer or 'none'")
             return ToolIntent(ToolKind.OTHER, name, digest, context)
+        if name == "sys_child_checkin":
+            from omnigent.tools.builtins.child_checkin import validate_child_checkin_arguments
+
+            action = validate_child_checkin_arguments(arguments)
+            kind = ToolKind.READ if action == "read" else ToolKind.OTHER
+            return ToolIntent(kind, name, digest, context)
         if name in _OPERATIONAL_TOOLS:
             return ToolIntent(ToolKind.OTHER, name, digest, context)
         if name in _QUESTION_TOOLS:

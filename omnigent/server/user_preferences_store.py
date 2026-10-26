@@ -167,9 +167,32 @@ class ChildIdleSettings:
     enabled: bool = False
     idle_threshold_s: int = 3600
     merge_window_s: int = 1800
-    repeat_s: int = 14400
+    repeat_s: int = 0
     agents: dict[str, ChildFreezeSettings] = field(default_factory=dict)
     freeze_default: ChildFreezeSettings = field(default_factory=ChildFreezeSettings)
+    min_gap_s: int = 3600
+    coverage: Literal["changed", "summary"] = "summary"
+    checkin_instructions: str | None = None
+    checkin_configured_fields: frozenset[str] = field(default_factory=frozenset, compare=False)
+
+
+def normalize_checkin_instructions(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions must be a string or null"
+        )
+    value = value.replace("\x00", "")
+    if len(value) > 4000:
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions must be at most 4000 characters"
+        )
+    if value and not value.strip():
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions cannot contain only whitespace"
+        )
+    return value
 
 
 def _parse_child_freeze_row(value: Any, path: str) -> ChildFreezeSettings:
@@ -200,7 +223,8 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
     for key, default, minimum, maximum in (
         ("idleThresholdSeconds", 3600, 60, 604800),
         ("mergeWindowSeconds", 1800, 0, 86400),
-        ("repeatSeconds", 14400, 0, 604800),
+        ("repeatSeconds", 0, 0, 604800),
+        ("minGapSeconds", 3600, 0, 86400),
     ):
         number = value.get(key, default)
         if type(number) is not int or not minimum <= number <= maximum:
@@ -212,6 +236,9 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
                 "child_idle.repeatSeconds must be 0 or at least 60"
             )
         numbers.append(number)
+    coverage = value.get("coverage", "summary")
+    if coverage not in ("changed", "summary"):
+        raise UserPreferencesValidationError("child_idle.coverage must be changed or summary")
     raw_agents = value.get("agents", {})
     if not isinstance(raw_agents, dict):
         raise UserPreferencesValidationError("child_idle.agents must be an object")
@@ -223,7 +250,18 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
     freeze_default = _parse_child_freeze_row(
         value.get("freezeDefault", {}), "child_idle.freezeDefault"
     )
-    return ChildIdleSettings(enabled, numbers[0], numbers[1], numbers[2], agents, freeze_default)
+    return ChildIdleSettings(
+        enabled,
+        numbers[0],
+        numbers[1],
+        numbers[2],
+        agents,
+        freeze_default,
+        numbers[3],
+        coverage,
+        normalize_checkin_instructions(value.get("checkinInstructions")),
+        frozenset(value.keys() & {"minGapSeconds", "coverage"}),
+    )
 
 
 def read_child_idle_settings(
@@ -1097,6 +1135,11 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         "version": USER_PREFERENCE_VERSION,
         "settings": deepcopy(settings),
     }
+    child_idle = copied["settings"].get(CHILD_IDLE_NAMESPACE)
+    if isinstance(child_idle, dict) and "checkinInstructions" in child_idle:
+        child_idle["checkinInstructions"] = normalize_checkin_instructions(
+            child_idle["checkinInstructions"]
+        )
     try:
         serialized = json.dumps(
             copied,

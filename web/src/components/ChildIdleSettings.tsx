@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 
 import { NumericField, SettingRow } from "@/components/SettingsFields";
 import { ExceptionList } from "@/components/ExceptionList";
@@ -68,6 +68,7 @@ function FreezeControls({
 
 export function ChildIdleSettings() {
   const [preferences, setPreferences] = useState(readChildIdlePreferences);
+  const coverageId = useId();
   const registry = useAgentRegistry();
   const renderEditor = useCallback(
     (
@@ -104,9 +105,9 @@ export function ChildIdleSettings() {
   return (
     <div className="flex flex-col gap-4" data-testid="child-idle-settings">
       <p className="text-sm text-muted-foreground">
-        Tell a parent when a child stays idle, stops after a temporary service error, loses its
-        runner, or stops making progress. Each notice can start a parent turn. Works independently
-        of keep-warm.
+        Fallback check-ins tell a parent when a child stays idle, stops after a temporary service
+        error, loses its runner, or stops making progress. Each check-in can start a parent turn.
+        Completion and approval notices are unaffected. Works independently of keep-warm.
       </p>
       <SettingRow
         label="Remind parent sessions"
@@ -122,7 +123,6 @@ export function ChildIdleSettings() {
         [
           ["idleThresholdSeconds", "Idle for", "Idle threshold in minutes", 1, 10080],
           ["mergeWindowSeconds", "Combine reminders for", "Merge window in minutes", 0, 1440],
-          ["repeatSeconds", "Remind again after", "Repeat interval in minutes", 0, 10080],
         ] as const
       ).map(([key, label, ariaLabel, min, max]) => (
         <label key={key} className="flex flex-wrap items-center justify-between gap-2 text-sm">
@@ -142,6 +142,74 @@ export function ChildIdleSettings() {
           </span>
         </label>
       ))}
+      <SettingRow
+        label="At most one check-in per parent every"
+        hint="0 uses per-child reminders without a shared parent interval."
+      >
+        <NumericField
+          ariaLabel="Minimum check-in gap in minutes"
+          value={preferences.minGapSeconds / 60}
+          min={0}
+          max={1440}
+          disabled={!anyEnabled}
+          onCommit={(minutes) =>
+            writeChildIdlePreferences({ ...preferences, minGapSeconds: minutes * 60 })
+          }
+        />
+        <span className="text-sm text-muted-foreground">min</span>
+      </SettingRow>
+      <fieldset className="space-y-3" disabled={!anyEnabled}>
+        <legend className="mb-3 text-sm font-medium">Check-in coverage</legend>
+        {(
+          [
+            ["changed", "Changed children only"],
+            ["summary", "Changed children + all other open children"],
+          ] as const
+        ).map(([value, label]) => (
+          <label key={value} className="flex items-start gap-2.5 text-ui">
+            <input
+              type="radio"
+              name={coverageId}
+              value={value}
+              checked={preferences.coverage === value}
+              onChange={() => writeChildIdlePreferences({ ...preferences, coverage: value })}
+              className="mt-1 accent-primary"
+            />
+            <span>{label}</span>
+          </label>
+        ))}
+      </fieldset>
+      <SettingRow
+        label="Remind again"
+        hint="Repeat a check-in when a child's state has not changed. Off sends no repeat reminders."
+      >
+        <span className="text-sm text-muted-foreground">
+          {preferences.repeatSeconds === 0 ? "Off" : "On"}
+        </span>
+        <Switch
+          aria-label="Remind again"
+          checked={preferences.repeatSeconds > 0}
+          disabled={!anyEnabled}
+          onCheckedChange={(enabled) =>
+            writeChildIdlePreferences({ ...preferences, repeatSeconds: enabled ? 14400 : 0 })
+          }
+        />
+      </SettingRow>
+      {preferences.repeatSeconds > 0 && (
+        <SettingRow label="Remind again after" hint="Time before repeating an unchanged check-in.">
+          <NumericField
+            ariaLabel="Repeat interval in minutes"
+            value={preferences.repeatSeconds / 60}
+            min={1}
+            max={10080}
+            disabled={!anyEnabled}
+            onCommit={(minutes) =>
+              writeChildIdlePreferences({ ...preferences, repeatSeconds: minutes * 60 })
+            }
+          />
+          <span className="text-sm text-muted-foreground">min</span>
+        </SettingRow>
+      )}
       <div className="flex flex-col gap-4">
         <div className="flex items-center gap-1.5 text-sm font-medium">
           Child freeze monitoring{" "}

@@ -21,7 +21,10 @@ export interface ChildIdlePreferences {
   enabled: boolean;
   idleThresholdSeconds: number;
   mergeWindowSeconds: number;
+  minGapSeconds: number;
+  coverage: "changed" | "summary";
   repeatSeconds: number;
+  checkinInstructions: string | null;
   freezeDefault: ChildFreezePreferences;
   agents: Record<string, ChildFreezePreferences>;
 }
@@ -30,7 +33,10 @@ export const CHILD_IDLE_DEFAULTS: ChildIdlePreferences = {
   enabled: false,
   idleThresholdSeconds: 3600,
   mergeWindowSeconds: 1800,
-  repeatSeconds: 14400,
+  minGapSeconds: 3600,
+  coverage: "summary",
+  repeatSeconds: 0,
+  checkinInstructions: null,
   freezeDefault: CHILD_FREEZE_DEFAULTS,
   agents: {},
 };
@@ -43,7 +49,7 @@ function normalize(value: unknown): ChildIdlePreferences {
     typeof input === "number" && Number.isInteger(input) && input >= min && input <= max
       ? input
       : fallback;
-  const repeat = number(raw.repeatSeconds, 14400, 0, 604800);
+  const repeat = number(raw.repeatSeconds, 0, 0, 604800);
   const agents: Record<string, ChildFreezePreferences> = {};
   if (raw.agents && typeof raw.agents === "object" && !Array.isArray(raw.agents)) {
     for (const [id, row] of Object.entries(raw.agents)) {
@@ -60,7 +66,13 @@ function normalize(value: unknown): ChildIdlePreferences {
     enabled: raw.enabled === true,
     idleThresholdSeconds: number(raw.idleThresholdSeconds, 3600, 60, 604800),
     mergeWindowSeconds: number(raw.mergeWindowSeconds, 1800, 0, 86400),
-    repeatSeconds: repeat === 0 || repeat >= 60 ? repeat : 14400,
+    minGapSeconds: number(raw.minGapSeconds, 3600, 0, 86400),
+    coverage: raw.coverage === "changed" ? "changed" : "summary",
+    repeatSeconds: repeat === 0 || repeat >= 60 ? repeat : 0,
+    checkinInstructions:
+      typeof raw.checkinInstructions === "string"
+        ? raw.checkinInstructions.replaceAll("\0", "")
+        : null,
     freezeDefault: {
       enabled: raw.freezeDefault?.enabled === true,
       checkIntervalSeconds: number(raw.freezeDefault?.checkIntervalSeconds, 3600, 60, 604800),

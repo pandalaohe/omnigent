@@ -319,6 +319,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 _CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
+_CHILD_CHECKIN_TOOLS = frozenset({"sys_child_checkin"})
 
 # Both sys_session_create create shapes (JSON and config_path multipart)
 # carry the agent-origin marker: the server charges the owner's open-rate
@@ -603,6 +604,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
+    | _CHILD_CHECKIN_TOOLS
     | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -1079,6 +1081,7 @@ _ALL_LOCAL_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
+    | _CHILD_CHECKIN_TOOLS
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -8849,6 +8852,34 @@ async def _execute_child_cap(
         return json.dumps({"error": f"sys_child_cap failed: {exc}"})
 
 
+async def _execute_child_checkin(
+    args: _JsonObject, client: httpx.AsyncClient | None, conversation_id: str | None
+) -> str:
+    from omnigent.tools.builtins.child_checkin import validate_child_checkin_arguments
+
+    if client is None or conversation_id is None:
+        return json.dumps({"error": "sys_child_checkin requires server access and a session id"})
+    try:
+        action = validate_child_checkin_arguments(args)
+        path = f"/v1/sessions/{conversation_id}/child-checkin"
+        body = {key: value for key, value in args.items() if key != "action"}
+        if action == "read":
+            response = await client.get(path, timeout=30)
+        elif action == "set":
+            if "min_gap_minutes" in body:
+                body["min_gap_seconds"] = cast(int, body.pop("min_gap_minutes")) * 60
+            response = await client.patch(path, json=body, timeout=30)
+        elif action == "follow_up_add":
+            response = await client.post(f"{path}/follow-ups", json=body, timeout=30)
+        else:
+            response = await client.delete(f"{path}/follow-ups/{body['id']}", timeout=30)
+        if response.is_error:
+            return json.dumps({"error": response.json(), "status_code": response.status_code})
+        return json.dumps(response.json())
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_child_checkin failed: {exc}"})
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -10214,6 +10245,8 @@ async def execute_tool(
             output = await _execute_list_models_tool(agent_spec=agent_spec)
         elif tool_name in _CHILD_CAP_TOOLS:
             output = await _execute_child_cap(args, server_client, conversation_id)
+        elif tool_name in _CHILD_CHECKIN_TOOLS:
+            output = await _execute_child_checkin(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,

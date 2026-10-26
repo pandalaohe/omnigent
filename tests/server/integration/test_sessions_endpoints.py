@@ -810,6 +810,7 @@ async def test_background_title_failure_does_not_break_subsequent_user_turn(
             json=first_message,
         )
         assert first_response.status_code == 202, first_response.text
+        assert first_response.json()["forwarded"] is True
 
         store = SqlAlchemyConversationStore(db_uri)
         store.update_conversation(session["id"], title="investigate the timeout")
@@ -1060,6 +1061,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
 
             first = await client.post(f"/v1/sessions/{session_id}/events", json=message)
             assert first.status_code == 202, first.text
+            assert first.json()["forwarded"] is True
             assert message_forwards() == 1
             # The runner learns the message's id so a failed turn can name it.
             forwarded_body = json.loads(
@@ -1069,6 +1071,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
 
             second = await client.post(f"/v1/sessions/{session_id}/events", json=message)
             assert second.status_code == 202, second.text
+            assert second.json()["forwarded"] is True
             # Same queued entry, no second message forward (the idempotent
             # terminal ensure may still probe), still exactly one queued message.
             assert second.json()["pending_id"] == first.json()["pending_id"]
@@ -2898,10 +2901,12 @@ async def test_external_subagent_start_accepts_legacy_payload_without_tool_use_i
 # ── POST /v1/sessions/{id}/events skill slash_command ─────
 
 
+@pytest.mark.parametrize("runner_status", [202, 503])
 async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     metadata_rows: list[dict[str, object]],
+    runner_status: int,
 ) -> None:
     """
     Structured skill slash commands persist two durable records.
@@ -2942,7 +2947,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             )
         if request.method == "POST" and request.url.path.endswith("/events"):
             forwarded.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": True})
+        return httpx.Response(runner_status, json={"queued": True})
 
     _capture_published(monkeypatch, published)
     async with httpx.AsyncClient(
@@ -2978,6 +2983,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
 
     _assert_activity_metadata(metadata_rows, session["id"], "slash_command")
     assert resp.json()["queued"] is True
+    assert resp.json()["forwarded"] is (runner_status < 400)
     assert len(resp.json()["item_id"]) == 32
 
     items_resp = await client.get(f"/v1/sessions/{session['id']}/items")
@@ -3016,9 +3022,10 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         }
     ]
     event_types = [event["type"] for _, event in published]
-    assert event_types == ["response.output_item.done"]
-    assert published[0][1]["item"]["type"] == "slash_command"
-    assert published[0][1]["item"]["id"] == visible["id"]
+    assert event_types == (["response.output_item.done"] if runner_status < 400 else [])
+    if published:
+        assert published[0][1]["item"]["type"] == "slash_command"
+        assert published[0][1]["item"]["id"] == visible["id"]
 
     # The dispatch also seeds the sidebar title from the typed command,
     # mirroring the plain-message path. Without it, a session whose FIRST

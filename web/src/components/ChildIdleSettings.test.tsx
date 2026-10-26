@@ -5,6 +5,7 @@ import {
   CHILD_IDLE_DEFAULTS,
   CHILD_IDLE_STORAGE_KEY,
   readChildIdlePreferences,
+  writeChildIdlePreferences,
 } from "@/lib/childIdlePreferences";
 import { ChildIdleSettings } from "./ChildIdleSettings";
 
@@ -60,11 +61,15 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-describe("idle child reminders", () => {
+describe("child check-ins", () => {
   it("starts off and updates its own namespace without changing keep-warm", () => {
     localStorage.setItem("omnigent:keep-warm", '{"agents":{}}');
     render(<ChildIdleSettings />);
     expect(screen.getByRole("spinbutton", { name: "Idle threshold in minutes" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Remind again" })).not.toBeChecked();
+    expect(screen.getByText("Off")).toBeInTheDocument();
+    expect(screen.queryByRole("spinbutton", { name: "Repeat interval in minutes" })).toBeNull();
+    expect(screen.getByText(/Completion and approval notices are unaffected/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch", { name: /Remind parent sessions/ }));
     expect(queuePatch).toHaveBeenLastCalledWith("child_idle", {
       ...CHILD_IDLE_DEFAULTS,
@@ -73,23 +78,70 @@ describe("idle child reminders", () => {
     for (const [name, value] of [
       ["Idle threshold in minutes", "120"],
       ["Merge window in minutes", "10"],
-      ["Repeat interval in minutes", "0"],
+      ["Minimum check-in gap in minutes", "120"],
     ]) {
       fireEvent.change(screen.getByRole("spinbutton", { name }), { target: { value } });
     }
+    fireEvent.click(screen.getByRole("radio", { name: "Changed children only" }));
     expect(readChildIdlePreferences()).toEqual({
+      ...CHILD_IDLE_DEFAULTS,
       enabled: true,
       idleThresholdSeconds: 7200,
       mergeWindowSeconds: 600,
-      repeatSeconds: 0,
-      freezeDefault: CHILD_IDLE_DEFAULTS.freezeDefault,
-      agents: {},
+      minGapSeconds: 7200,
+      coverage: "changed",
     });
     expect(localStorage.getItem("omnigent:keep-warm")).toBe('{"agents":{}}');
     fireEvent.click(screen.getByRole("switch", { name: /Remind parent sessions/ }));
     expect(readChildIdlePreferences().enabled).toBe(false);
     expect(readChildIdlePreferences().idleThresholdSeconds).toBe(7200);
     expect(screen.getByRole("spinbutton", { name: "Idle threshold in minutes" })).toBeDisabled();
+  });
+
+  it("keeps a saved repeat interval and can turn repeat reminders off", () => {
+    localStorage.setItem(
+      CHILD_IDLE_STORAGE_KEY,
+      JSON.stringify({ enabled: true, repeatSeconds: 7200, coverage: "summary" }),
+    );
+    render(<ChildIdleSettings />);
+    expect(screen.getByRole("switch", { name: "Remind again" })).toBeChecked();
+    expect(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" })).toHaveValue(120);
+    expect(
+      screen.getByRole("radio", { name: "Changed children + all other open children" }),
+    ).toBeChecked();
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Minimum check-in gap in minutes" }), {
+      target: { value: "0" },
+    });
+    expect(readChildIdlePreferences().repeatSeconds).toBe(7200);
+    expect(readChildIdlePreferences().minGapSeconds).toBe(0);
+    fireEvent.click(screen.getByRole("switch", { name: "Remind again" }));
+    expect(readChildIdlePreferences().repeatSeconds).toBe(0);
+    expect(screen.queryByRole("spinbutton", { name: "Repeat interval in minutes" })).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "Remind again" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" }), {
+      target: { value: "30" },
+    });
+    expect(readChildIdlePreferences().repeatSeconds).toBe(1800);
+  });
+
+  it.each([
+    [0, 0],
+    [86400, 86400],
+    [-1, 3600],
+    [86401, 3600],
+    [1.5, 3600],
+    ["60", 3600],
+  ])("normalizes minimum gap %j to %i seconds", (minGapSeconds, expected) => {
+    localStorage.setItem(
+      CHILD_IDLE_STORAGE_KEY,
+      JSON.stringify({ minGapSeconds, coverage: "invalid", repeatSeconds: 1 }),
+    );
+    const preferences = readChildIdlePreferences();
+    expect(preferences.minGapSeconds).toBe(expected);
+    expect(preferences.coverage).toBe("summary");
+    expect(preferences.repeatSeconds).toBe(0);
+    writeChildIdlePreferences(preferences);
+    expect(queuePatch).toHaveBeenLastCalledWith("child_idle", preferences);
   });
 
   it("hydrates server changes and recovers corrupt local preferences", () => {
@@ -103,6 +155,12 @@ describe("idle child reminders", () => {
     fireEvent(window, new Event("omnigent:child-idle-changed"));
     expect(screen.getByRole("spinbutton", { name: "Idle threshold in minutes" })).toHaveValue(30);
     expect(screen.getByRole("spinbutton", { name: "Merge window in minutes" })).toHaveValue(30);
+    expect(screen.getByRole("spinbutton", { name: "Minimum check-in gap in minutes" })).toHaveValue(
+      60,
+    );
+    expect(
+      screen.getByRole("radio", { name: "Changed children + all other open children" }),
+    ).toBeChecked();
   });
 
   it("keeps the prior valid number when an out-of-range draft is blurred", () => {
@@ -112,6 +170,11 @@ describe("idle child reminders", () => {
     fireEvent.change(input, { target: { value: "0" } });
     fireEvent.blur(input);
     expect(input).toHaveValue(60);
+    expect(queuePatch).not.toHaveBeenCalled();
+    const gap = screen.getByRole("spinbutton", { name: "Minimum check-in gap in minutes" });
+    fireEvent.change(gap, { target: { value: "1441" } });
+    fireEvent.blur(gap);
+    expect(gap).toHaveValue(60);
     expect(queuePatch).not.toHaveBeenCalled();
   });
 
@@ -136,6 +199,10 @@ describe("idle child reminders", () => {
       screen.queryByRole("switch", { name: "Monitor Agent B children" }),
     ).not.toBeInTheDocument();
     expect(screen.getByRole("spinbutton", { name: "Merge window in minutes" })).toBeEnabled();
+    expect(
+      screen.getByRole("spinbutton", { name: "Minimum check-in gap in minutes" }),
+    ).toBeEnabled();
+    expect(screen.getByRole("switch", { name: "Remind again" })).toBeEnabled();
   });
 
   it("keeps a legacy raw-id row while saving a new harness exception", () => {

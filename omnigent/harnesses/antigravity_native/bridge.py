@@ -356,6 +356,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_cancel_async",
     "sys_cancel_task",
     "sys_child_cap",
+    "sys_child_checkin",
     "sys_flow_cancel",
     "sys_flow_list",
     "sys_flow_start",

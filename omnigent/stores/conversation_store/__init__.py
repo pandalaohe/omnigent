@@ -6,7 +6,7 @@ import math
 import time
 import unicodedata
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -96,6 +96,15 @@ ARCHIVE_LOCK_LABEL_KEY = "omnigent.archive_locked"
 DELETION_CLAIM_STALE_AFTER_S = 15 * 60
 DELETION_CLAIM_HEARTBEAT_INTERVAL_S = 60
 ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S = 15 * 60
+
+
+@dataclass(frozen=True)
+class LabelGroupChange:
+    """Label updates and removals computed from one locked group snapshot."""
+
+    upserts: dict[str, str]
+    deletes: set[str]
+
 
 DeletionClaimResult = Literal["claimed", "locked", "busy", "not_found"]
 ArchiveLockWriteResult = Literal["updated", "busy", "not_found"]
@@ -1541,8 +1550,9 @@ class ConversationStore(ABC):
         One write transaction: lock ``new`` then ``old``, re-read each direct
         child of ``old`` under its own lock and keep only the unarchived ones,
         reparent them to ``new``, rewrite ``root_conversation_id`` across
-        their subtrees, write the succession labels and the receipt with
-        phase ``moved``. Unless ``allow_empty``, no child kept means nothing is written and
+        their subtrees, move durable check-in labels (keeping each session's
+        own delivery timestamp), and write the succession labels and receipt
+        with phase ``moved``. Unless ``allow_empty``, no child kept means nothing is written and
         ``([], [])`` is returned; refusals raise before any write.
 
         :param old_id: Top-level session whose children move.
@@ -1911,6 +1921,28 @@ class ConversationStore(ABC):
             rather than wall-clock drift between evaluate()
             and the actual DB write.
         """
+        ...
+
+    @abstractmethod
+    def mutate_label_group(
+        self,
+        conversation_id: str,
+        prefix: str,
+        change: Callable[[dict[str, str]], LabelGroupChange],
+    ) -> dict[str, str]:
+        """Read and mutate a label prefix atomically, returning its final values.
+
+        The callback may run again after a transaction retry. Every changed
+        key must start with ``prefix`` and values must fit the label column;
+        invalid changes raise ``ValueError`` without persisting any changes.
+        Upserts take precedence over deletions of the same key.
+        Missing conversations raise ``ConversationNotFoundError``.
+        """
+        ...
+
+    @abstractmethod
+    def list_label_values(self, key: str) -> dict[str, str]:
+        """Return conversation ids and values for one key in this workspace."""
         ...
 
     @abstractmethod

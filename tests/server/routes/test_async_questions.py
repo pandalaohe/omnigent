@@ -424,6 +424,15 @@ async def test_failed_dispatch_does_not_mark_question_comments_addressed(
 
     assert response.status_code == 409, response.text
     assert updated == []
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+        },
+    )
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": True, "item_id": "failure-item", "forwarded": False}
 
 
 async def test_async_question_shape_errors_and_many_questions(
