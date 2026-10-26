@@ -1455,6 +1455,8 @@ export interface ChatActions {
    * there is no active conversation.
    */
   compact: () => Promise<void>;
+  /** Run the native harness's /clear in the session terminal. */
+  clearContext: () => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -3521,6 +3523,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postConversationEvent(conversationId, { type: "compact", data: {} });
+  },
+  clearContext: async () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    await postEvent(conversationId, { type: "clear", data: {} });
   },
 
   refreshSessionState: async (conversationId) => {
