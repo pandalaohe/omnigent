@@ -9330,10 +9330,12 @@ async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
     assert "the server rejected the host tunnel request" in str(err)
 
 
+@pytest.mark.parametrize("retain_previous", [False, True])
 async def test_handle_launch_supersedes_previous_runner_for_same_session(
     tmp_path: Path,
+    retain_previous: bool,
 ) -> None:
-    """A relaunch for a session tears down that session's previous runner.
+    """A listed shared runner survives; older frames retain legacy supersession.
 
     The server rotates the binding token on every relaunch, so without
     this the host accumulates one live runner per attempt — each with a
@@ -9366,33 +9368,37 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
             )
         )
         first_handle = host._runners[first.runner_id]
-        second = await host._handle_launch(
-            HostLaunchRunnerFrame(
-                request_id="req_b",
-                binding_token="tok_b",
-                workspace=str(workspace),
-                session_id="conv_super",
-            )
+        next_launch = HostLaunchRunnerFrame(
+            request_id="req_b",
+            binding_token="tok_b",
+            workspace=str(workspace),
+            session_id="conv_super",
         )
+        if retain_previous:
+            next_launch.retain_runner_ids = [first.runner_id]
+        second = await host._handle_launch(next_launch)
 
-    assert first.status == "launched" and second.status == "launched"
-    # The superseded runner is untracked at once; its termination runs
-    # detached, so poll-wait briefly for the process to go down.
-    assert first.runner_id not in host._runners
-    for _ in range(70):
-        if first_handle.proc.poll() is not None:
-            break
-        await asyncio.sleep(0.1)
-    assert first_handle.proc.poll() is not None, (
-        "the previous runner for the session must be terminated on relaunch"
-    )
-    for _ in range(50):
-        if maintenance_reasons:
-            break
-        await asyncio.sleep(0.01)
-    assert maintenance_reasons == ["runner_superseded"]
-    assert second.runner_id in host._runners
-    _cleanup_host(host)
+    try:
+        assert first.status == "launched" and second.status == "launched"
+        if retain_previous:
+            assert first.runner_id in host._runners
+            assert first_handle.proc.poll() is None
+            assert maintenance_reasons == []
+        else:
+            assert first.runner_id not in host._runners
+            for _ in range(70):
+                if first_handle.proc.poll() is not None:
+                    break
+                await asyncio.sleep(0.1)
+            assert first_handle.proc.poll() is not None
+            for _ in range(50):
+                if maintenance_reasons:
+                    break
+                await asyncio.sleep(0.01)
+            assert maintenance_reasons == ["runner_superseded"]
+        assert second.runner_id in host._runners
+    finally:
+        _cleanup_host(host)
 
 
 async def test_handle_launch_leaves_other_sessions_runners_alone(

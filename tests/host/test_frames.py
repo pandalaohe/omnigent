@@ -789,7 +789,8 @@ def test_hello_frame_omitted_filesystem_roots_is_legacy_false() -> None:
     assert decoded.filesystem_roots is False
 
 
-def test_launch_runner_frame_round_trip() -> None:
+@pytest.mark.parametrize("retained", [None, [], ["runner_shared"]])
+def test_launch_runner_frame_round_trip(retained: list[str] | None) -> None:
     """
     Verify HostLaunchRunnerFrame survives encode → decode.
 
@@ -799,15 +800,34 @@ def test_launch_runner_frame_round_trip() -> None:
     original = HostLaunchRunnerFrame(
         request_id="req_001",
         binding_token="secret_token_xyz",
-        workspace="/Users/corey/projects/frontend",
+        workspace="/opt/work/app",
         session_id="conv_abc123",
     )
+    if retained is not None:
+        original.retain_runner_ids = retained
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
     assert decoded.request_id == "req_001"
     assert decoded.binding_token == "secret_token_xyz"
-    assert decoded.workspace == "/Users/corey/projects/frontend"
+    assert decoded.workspace == "/opt/work/app"
     assert decoded.session_id == "conv_abc123"
+    assert getattr(decoded, "retain_runner_ids", None) == retained
+
+
+@pytest.mark.parametrize("retained", ["runner_shared", [1], {"runner": "shared"}])
+def test_launch_runner_rejects_malformed_retained_runners(retained: object) -> None:
+    with pytest.raises(ValueError, match="retain_runner_ids"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.launch_runner",
+                    "request_id": "req",
+                    "binding_token": "test-token",
+                    "workspace": "/opt/work/app",
+                    "retain_runner_ids": retained,
+                }
+            )
+        )
 
 
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
