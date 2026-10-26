@@ -43,6 +43,111 @@ def test_two_replicas_reserve_only_two_and_restart_retains_permits(db_uri):
     assert stores[0].reserve(uuid4().hex) is None
 
 
+@pytest.mark.parametrize("unbound", [False, True])
+def test_reconnect_keeps_unreconciled_runtime_generation_unknown(db_uri, unbound):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=4, deployment_resident_limit=8)
+    store.register_host_generation(host, "old-generation")
+    queued = enqueue(store, host)
+    attempt = store.reserve(host)
+    assert store.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="old-runtime",
+        host_generation="old-generation",
+        boundary="runner_prepare",
+        claim_id="old-claim",
+    )
+    if unbound:
+        with store._session("seed_unbound_predecessor_generation") as db:
+            db.get(SqlSessionStartup, (current_workspace_id(), queued.id)).host_generation = None
+    old = store.get(queued.id)
+    enqueue(store, host)
+    store.register_host_generation(host, "new-generation")
+    assert store.get(queued.id) == old
+    assert store.reserve(host) is None
+    reloaded = SessionStartupStore(db_uri)
+    assert reloaded.get(queued.id) == old
+    reloaded.register_host_generation(host, "new-generation")
+    reloaded.configure(host, host_resident_limit=20, deployment_resident_limit=20)
+    assert reloaded.reserve(host) is None
+    assert reloaded.confirm_stopped(queued.id, attempt.attempt_id)
+    assert reloaded.reserve(host) is None
+
+
+@pytest.mark.parametrize(
+    "population", ["fresh", "unassigned", "current", "released", "other_host", "other_workspace"]
+)
+def test_host_generation_does_not_veto_without_an_unreconciled_runtime(db_uri, population):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=4, deployment_resident_limit=8)
+    store.register_host_generation(host, "old-generation")
+    if population != "fresh":
+        owned_host = uuid4().hex if population == "other_host" else host
+        workspace = 17 if population == "other_workspace" else current_workspace_id()
+        with workspace_scope(workspace):
+            store.configure(owned_host, host_resident_limit=4, deployment_resident_limit=8)
+            store.register_host_generation(owned_host, "old-generation")
+            queued = enqueue(store, owned_host)
+            attempt = store.reserve(owned_host)
+            if population != "unassigned":
+                assert store.claim_boundary(
+                    queued.id,
+                    attempt.attempt_id,
+                    runtime_id="runtime",
+                    host_generation="old-generation",
+                    boundary="runner_prepare",
+                    claim_id="claim",
+                )
+            if population == "released":
+                assert store.confirm_stopped(queued.id, attempt.attempt_id)
+    generation = "old-generation" if population == "current" else "new-generation"
+    store.register_host_generation(host, generation)
+    with store._session("inspect_generation_unknown_scope") as db:
+        budget = db.get(SqlStartupBudget, f"{current_workspace_id()}:{host}")
+        assert not budget.resident_inventory_unknown
+    followup = enqueue(store, host)
+    assert store.reserve(host).id == followup.id
+
+
+def test_reconnect_keeps_idle_resident_runtime_unknown(db_uri):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=4, deployment_resident_limit=8)
+    store.register_host_generation(host, "old-generation")
+    queued = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=uuid4().hex,
+        operation_key="idle",
+        input_id=None,
+    )
+    attempt = store.reserve(host)
+    assert store.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="idle-runtime",
+        host_generation="old-generation",
+        boundary="runner_prepare",
+        claim_id="claim",
+    )
+    for phase in ("runtime_ready", "tools_ready"):
+        assert store.observe(
+            StartupReceipt(
+                startup_id=queued.id,
+                attempt_id=attempt.attempt_id,
+                runtime_id="idle-runtime",
+                source="runner",
+                phase=phase,
+            )
+        )
+    idle = store.get(queued.id)
+    assert idle.resident and not idle.occupied
+    store.register_host_generation(host, "new-generation")
+    assert store.get(queued.id) == idle
+    enqueue(store, host)
+    assert store.reserve(host) is None
+
+
 def test_receipt_writes_refuse_rotated_account_in_same_transaction(db_uri):
     store = SessionStartupStore(db_uri)
     host = uuid4().hex
