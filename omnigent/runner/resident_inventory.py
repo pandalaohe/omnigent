@@ -10,6 +10,7 @@ import httpx
 from omnigent.runner.native.orchestration import (
     NativeBackendInventorySnapshot,
     native_backend_resident_inventory,
+    opencode_context_source_v2,
     prepare_native_backend_thread_inventory,
 )
 from omnigent.runner.resource_registry import (
@@ -169,9 +170,8 @@ async def session_context_evidence_v2(
 ) -> ContextEvidenceV2:
     """Compose the runner's three session scopes into one v2 envelope.
 
-    Only the harness owner can produce context records today; native backends and
-    terminal roles keep explicit unsupported sources rather than empty-but-complete
-    claims. The whole read stays bounded and answers unknown instead of raising.
+    Native OpenCode owners retain partial operation evidence; other native sources
+    and terminal roles remain unsupported. Reads neither construct nor probe owners.
     """
     scopes = session_context_scopes_v2(session_id)
     started = time.monotonic()
@@ -193,7 +193,8 @@ async def session_context_evidence_v2(
         expected_scopes=scopes,
         sources=(
             harness,
-            _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
+            opencode_context_source_v2(session_id)
+            or _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
             _unknown_context_source(scopes[2], "terminal_context_source_unimplemented"),
         ),
     )

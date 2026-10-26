@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
@@ -146,8 +147,13 @@ class OpenCodeClient:
         headers: Mapping[str, str] | None = None,
         directory: str | None = None,
         client: httpx.AsyncClient | None = None,
+        context_observer: Callable[[str, str | None], Callable[[OpenCodeSession | None], None]]
+        | None = None,
+        forwarder_observer: Callable[[bool], None] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._context_observer = context_observer
+        self._forwarder_observer = forwarder_observer
         default_headers: dict[str, str] = dict(headers or {})
         if directory:
             default_headers.setdefault("x-opencode-directory", directory)
@@ -216,6 +222,23 @@ class OpenCodeClient:
 
     # --- sessions --------------------------------------------------------
 
+    @contextmanager
+    def _context_operation(
+        self, action: str, session_id: str | None
+    ) -> Iterator[Callable[[OpenCodeSession | None], None]]:
+        finish = self._context_observer(action, session_id) if self._context_observer else None
+        try:
+            yield finish if finish is not None else lambda _result: None
+        except BaseException:
+            if finish is not None:
+                finish(None)
+            raise
+
+    def observe_forwarder(self, active: bool) -> None:
+        """Notify the existing backend owner without granting alias or exit proof."""
+        if self._forwarder_observer is not None:
+            self._forwarder_observer(active)
+
     async def create_session(self, payload: _JsonMapping | None = None) -> OpenCodeSession:
         """
         Create an OpenCode session (``POST /session``).
@@ -227,10 +250,13 @@ class OpenCodeClient:
             :func:`omnigent.harnesses.opencode_native.http_transport.build_prompt_payload`.
         :returns: The created session.
         """
-        data = await self._request_json("POST", "/session", json_body=payload or {})
-        if not isinstance(data, Mapping):
-            raise OpenCodeClientError("OpenCode create_session returned a non-object body")
-        return OpenCodeSession.from_payload(data)
+        with self._context_operation("create", None) as finish:
+            data = await self._request_json("POST", "/session", json_body=payload or {})
+            if not isinstance(data, Mapping):
+                raise OpenCodeClientError("OpenCode create_session returned a non-object body")
+            result = OpenCodeSession.from_payload(data)
+            finish(result)
+            return result
 
     async def get_session(self, session_id: str) -> OpenCodeSession | None:
         """
@@ -239,17 +265,19 @@ class OpenCodeClient:
         :param session_id: OpenCode session id.
         :returns: The session, or ``None`` when it does not exist.
         """
-        response = await self._client.request("GET", f"/session/{session_id}")
-        if response.status_code == 404:
-            return None
-        if response.status_code >= 400:
-            raise OpenCodeClientError(
-                f"OpenCode get_session failed: {response.status_code} {response.text[:500]}"
-            )
-        data = response.json()
-        if not isinstance(data, Mapping):
-            return None
-        return OpenCodeSession.from_payload(data)
+        with self._context_operation("resume", session_id) as finish:
+            response = await self._client.request("GET", f"/session/{session_id}")
+            if response.status_code == 404:
+                finish(None)
+                return None
+            if response.status_code >= 400:
+                raise OpenCodeClientError(
+                    f"OpenCode get_session failed: {response.status_code} {response.text[:500]}"
+                )
+            data = response.json()
+            result = OpenCodeSession.from_payload(data) if isinstance(data, Mapping) else None
+            finish(result)
+            return result
 
     async def list_messages(self, session_id: str) -> list[_JsonObject]:
         """
@@ -426,12 +454,15 @@ class OpenCodeClient:
         :param payload: Optional fork body, e.g. ``{"messageID": "msg_..."}``.
         :returns: The new forked session.
         """
-        data = await self._request_json(
-            "POST", f"/session/{session_id}/fork", json_body=payload or {}
-        )
-        if not isinstance(data, Mapping):
-            raise OpenCodeClientError("OpenCode fork returned a non-object body")
-        return OpenCodeSession.from_payload(data)
+        with self._context_operation("fork", session_id) as finish:
+            data = await self._request_json(
+                "POST", f"/session/{session_id}/fork", json_body=payload or {}
+            )
+            if not isinstance(data, Mapping):
+                raise OpenCodeClientError("OpenCode fork returned a non-object body")
+            result = OpenCodeSession.from_payload(data)
+            finish(result)
+            return result
 
     # --- permissions -----------------------------------------------------
 

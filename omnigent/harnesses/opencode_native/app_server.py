@@ -34,7 +34,8 @@ import shutil
 import socket
 import subprocess
 import uuid
-from collections.abc import Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -53,8 +54,18 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
+    OpenCodeSession,
 )
 from omnigent.inner import _proc
+from omnigent.startup_protocol import (
+    ContextKeyV2,
+    ContextOperationV2,
+    ContextRecordV2,
+    SourceEvidenceV2,
+    UnresolvedContextV2,
+    VendorContextIdV2,
+    native_context_scope_v2,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -435,6 +446,10 @@ class OpenCodeNativeServer:
         self._resident_spawned = False
         self._lifecycle_lock = asyncio.Lock()
         self._start_generation = 0
+        self._context_records: dict[ContextKeyV2, ContextRecordV2] = {}
+        self._context_overflow = False
+        self._context_closing = False
+        self._context_forwarder: bool | None = None
 
     @property
     def base_url(self) -> str:
@@ -481,6 +496,8 @@ class OpenCodeNativeServer:
             if (self._resident_spawned or self.process is not None) and not self.exit_confirmed:
                 raise RuntimeError("Previous OpenCode server exit is not confirmed")
             self._start_generation += 1
+            self._context_closing = False
+            self._context_forwarder = None
             await self._start()
 
     async def _start(self) -> None:
@@ -571,10 +588,166 @@ class OpenCodeNativeServer:
             self.base_url,
             headers=self.auth_headers,
             directory=directory or str(self.workspace),
+            context_observer=partial(
+                self._begin_context, self.resident_incarnation_id, self._start_generation
+            ),
+            forwarder_observer=partial(
+                self._observe_forwarder, self.resident_incarnation_id, self._start_generation
+            ),
+        )
+
+    def _begin_context(
+        self, incarnation: str, generation: int, action: str, session_id: str | None
+    ) -> Callable[[OpenCodeSession | None], None]:
+        """Retain the operation before its REST request; a lost reply remains unknown."""
+        parents = [
+            record
+            for record in self._context_records.values()
+            if record.key.source_owner_incarnation == incarnation
+            and record.vendor_id is not None
+            and record.vendor_id.value == session_id
+        ]
+        parent = parents[0] if len(parents) == 1 else None
+        operation = ContextOperationV2(
+            operation_id=uuid.uuid4().hex,
+            action="resume" if action == "resume" else "fork" if action == "fork" else "create",
+            parent=parent.key if action == "fork" and parent is not None else None,
+        )
+        key = (
+            parent.key
+            if action == "resume" and parent is not None
+            else ContextKeyV2(
+                source_owner_incarnation=incarnation, context_incarnation=uuid.uuid4().hex
+            )
+        )
+        record = ContextRecordV2(
+            key=key,
+            vendor_id=(
+                parent.vendor_id
+                if parent
+                else VendorContextIdV2(namespace="opencode", value=session_id)
+            )
+            if action == "resume" and session_id and len(session_id) <= 256
+            else None,
+            operation=parent.operation
+            if action == "resume" and parent is not None and parent.operation.action == "fork"
+            else operation,
+            execution_keys=parent.execution_keys if action == "resume" and parent else (),
+            provenance=parent.provenance
+            if action == "resume" and parent is not None
+            else "managed_side_chat"
+            if operation.parent is not None
+            else "unknown"
+            if action == "fork"
+            else "primary",
+            lifecycle="starting",
+            aliases=(),
+            revision=parent.revision + 1 if parent is not None and key == parent.key else 0,
+            stop_proof=None,
+            continuity_proof=None,
+        )
+        if key not in self._context_records and len(self._context_records) >= 1000:
+            self._context_overflow = True
+            return lambda _result: None
+        self._context_records[key] = record
+
+        def finish(result: OpenCodeSession | None) -> None:
+            current = self._context_records[key]
+            if current.revision != record.revision:
+                return
+            # A client is tied to the backend generation that created it, not its URL.
+            live = (
+                self.resident_incarnation_id == incarnation
+                and self._start_generation == generation
+                and not self._context_closing
+                and not self.process_exit_confirmed
+                and self.process is not None
+                and self.process.returncode is None
+                and result is not None
+                and (action != "resume" or result.id == session_id)
+                and (action != "fork" or result.id != session_id)
+            )
+            try:
+                self._context_records[key] = current.model_copy(
+                    update={
+                        "vendor_id": VendorContextIdV2(namespace="opencode", value=result.id)
+                        if live and result
+                        else current.vendor_id,
+                        "execution_keys": (result.id,)
+                        if live and result
+                        else current.execution_keys,
+                        "lifecycle": "live" if live else "unknown",
+                        "revision": current.revision + 1,
+                    }
+                )
+            except ValueError:
+                self._context_records[key] = current.model_copy(update={"lifecycle": "unknown"})
+
+        return finish
+
+    def _observe_forwarder(self, incarnation: str, generation: int, active: bool) -> None:
+        if (incarnation, generation) == (self.resident_incarnation_id, self._start_generation):
+            self._context_forwarder = active
+            if not active:
+                self._mark_contexts("unknown")
+
+    def _mark_contexts(self, lifecycle: str) -> None:
+        for key, record in self._context_records.items():
+            if key.source_owner_incarnation == self.resident_incarnation_id:
+                self._context_records[key] = record.model_copy(
+                    update={
+                        "lifecycle": lifecycle,
+                        "revision": record.revision + 1,
+                    }
+                )
+
+    def context_source_v2(self, session_id: str) -> SourceEvidenceV2:
+        """Pure partial evidence: attached TUI/bridge operations are not exhaustively owned."""
+        records, unresolved = (
+            [],
+            [
+                UnresolvedContextV2(
+                    candidate=None, reason="unobserved_bridge_and_native_contexts"
+                ),
+                UnresolvedContextV2(
+                    candidate=None, reason="readonly_alias_provenance_unavailable"
+                ),
+            ],
+        )
+        for key, record in self._context_records.items():
+            if key.source_owner_incarnation == self.resident_incarnation_id:
+                records.append(record)
+            else:
+                unresolved.append(
+                    UnresolvedContextV2(
+                        candidate=key.context_incarnation, reason="old_backend_generation"
+                    )
+                )
+        if self._context_overflow or len(unresolved) > 997:
+            records = []
+            unresolved = [UnresolvedContextV2(candidate=None, reason="context_history_budget")]
+        elif self._context_forwarder is not True:
+            unresolved.append(
+                UnresolvedContextV2(candidate=None, reason="forwarder_not_observed_live")
+            )
+        return SourceEvidenceV2(
+            scope=native_context_scope_v2(session_id),
+            producer_incarnation=self.resident_incarnation_id,
+            coverage="partial",
+            contexts=tuple(records),
+            unresolved=tuple(unresolved),
+            membership_revision=None,
+            context_revision=None,
+            work_revision=None,
+            revision_authority="observation_only",
+            age_upper_bound_s=None,
+            work_bindings=None,
         )
 
     def close(self) -> Coroutine[None, None, None]:
         """Bind teardown to this start attempt before a caller defers awaiting it."""
+        self._context_closing = True
+        self._mark_contexts("closing")
         return self._close_generation(self._start_generation)
 
     async def _close_generation(self, start_generation: int) -> None:
@@ -584,6 +757,8 @@ class OpenCodeNativeServer:
 
     async def _close_locked(self) -> None:
         """Terminate the server subprocess if running."""
+        self._context_closing = True
+        self._mark_contexts("closing")
         process = self.process
         if process is None:
             return
@@ -597,6 +772,7 @@ class OpenCodeNativeServer:
         self.process_exit_confirmed = True
         if self.process is process:
             self.process = None
+        self._mark_contexts("unknown")
 
 
 def client_for_state(

@@ -339,6 +339,7 @@ class OpenCodeNativeForwarder:
         """
         attempt = 0
         backoff = 0.5
+        self._opencode.observe_forwarder(True)
         try:
             while True:
                 if attempt == 0:
@@ -362,6 +363,7 @@ class OpenCodeNativeForwarder:
                 await asyncio.sleep(min(backoff, 5.0))
                 backoff = min(backoff * 2, 5.0)
         finally:
+            self._opencode.observe_forwarder(False)
             # Never leave a parked ``question`` task orphaned when the consume
             # loop exits (cap reached, return, or cancellation): cancel them all.
             await self._cancel_question_tasks()

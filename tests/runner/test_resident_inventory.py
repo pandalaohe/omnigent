@@ -577,6 +577,8 @@ async def harness_inventory_reader(monkeypatch, tmp_path):
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_OPENCODE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_opencode_context_history_overflow", False)
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
     manager = HarnessProcessManager(tmp_parent=tmp_path)
     manager._started = True
@@ -1246,6 +1248,42 @@ async def test_runner_context_inventory_v2_preserves_real_claude_primary(
         assert native.coverage == terminal.coverage == "unsupported"
     factory.assert_called_once()
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+async def test_runner_opencode_context_v2_reads_existing_owner_without_probes(
+    harness_inventory_reader, monkeypatch, tmp_path
+):
+    from omnigent.harnesses.opencode_native import app_server
+
+    monkeypatch.setattr(app_server, "find_opencode_cli", lambda _path: "/opt/bin/opencode")
+    server = app_server.OpenCodeNativeServer(
+        bridge_dir=tmp_path, workspace=tmp_path, port=49231, verify_version=False
+    )
+    server.process = SimpleNamespace(returncode=None)
+    _, _, client, requests = harness_inventory_reader
+    native = server.client()
+    try:
+        native._client.request = AsyncMock(
+            return_value=httpx.Response(200, json={"id": "primary"})
+        )
+        await native.create_session()
+        native._client.request.side_effect = AssertionError("inventory cannot query a vendor")
+        orchestration._AUTO_OPENCODE_SERVERS["one"] = server
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        evidence = _v2_evidence(response.content, session_id="one")
+        source = evidence.sources[1]
+        assert source.coverage == "partial" and source.scope.namespace == "native"
+        assert source.contexts[0].vendor_id.value == "primary"
+        assert source.contexts[0].key.source_owner_incarnation == server.resident_incarnation_id
+        assert source.contexts[0].execution_keys == ("primary",)
+        assert source.revision_authority == "observation_only"
+        assert not source.contexts[0].aliases and source.unresolved
+        native._client.request.assert_awaited_once()
+        assert requests == []
+    finally:
+        await native.aclose()
 
 
 async def test_runner_context_inventory_v2_keeps_an_unresident_session_unknown(
