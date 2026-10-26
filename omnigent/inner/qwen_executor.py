@@ -34,6 +34,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.acp_context_inventory import AcpContextAttempt, AcpProcessContextSource
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -53,6 +54,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.startup_protocol import ContextEvidenceV2
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +252,7 @@ class QwenExecutor(Executor):
 
         # Asyncio subprocess (created on first run_turn call).
         self._proc: asyncio.subprocess.Process | None = None
+        self._context_source = AcpProcessContextSource("qwen-acp", lambda: self._proc)
         # Serializes stdin writes: run_turn (prompt / request replies) and the
         # adapter's interrupt_session() write from different tasks.
         self._write_lock = asyncio.Lock()
@@ -319,6 +322,16 @@ class QwenExecutor(Executor):
     # ------------------------------------------------------------------
 
     async def _start_process(self) -> None:
+        attempt = self._context_source.begin_process()
+        try:
+            await self._start_process_unobserved()
+        except BaseException:
+            self._context_source.failed(attempt)
+            raise
+        finally:
+            self._context_source.process_started()
+
+    async def _start_process_unobserved(self) -> None:
         """Start ``qwen --acp`` as an asyncio subprocess.
 
         The StreamReader limit is set to 16 MiB so that qwen's large
@@ -333,6 +346,11 @@ class QwenExecutor(Executor):
         # derived from the initialize response, so it's stale too.
         self._initialized = False
         self._image_supported = False
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._config_option_ids.clear()
+        self._active_model = None
+        self._tool_names.clear()
         env = await self._build_spawn_env()
         # Resolve the path to spawn: the bare qwen binary, or a sandbox launcher
         # that confines the whole process tree when os_env requests it.
@@ -491,6 +509,13 @@ class QwenExecutor(Executor):
             logger.debug("qwen stderr reader stopped: %s", exc)
 
     async def _read_stdout(self) -> None:
+        process, generation = self._proc, self._context_source.generation
+        try:
+            await self._read_stdout_unobserved()
+        finally:
+            self._context_source.transport_ended(process, generation)
+
+    async def _read_stdout_unobserved(self) -> None:
         """Continuously read NDJSON lines from qwen stdout.
 
         Decoded messages are dispatched:
@@ -644,6 +669,16 @@ class QwenExecutor(Executor):
         self._initialized = True
 
     async def _ensure_session(self) -> str:
+        if self._session_id is not None:
+            return self._session_id
+        attempt = self._context_source.begin_session()
+        try:
+            return await self._ensure_session_unobserved(attempt)
+        except BaseException:
+            self._context_source.failed(attempt)
+            raise
+
+    async def _ensure_session_unobserved(self, attempt: AcpContextAttempt) -> str:
         """Create (or reuse) an ACP session, returning its server-assigned id.
 
         :returns: The session id string assigned by qwen.
@@ -674,12 +709,15 @@ class QwenExecutor(Executor):
         # Qwen assigns (possibly remaps) the session id — always use what
         # the server returns, not what we sent.
         result = resp.get("result", {})
-        self._note_config_options(result.get("configOptions"))
         server_session_id = result.get("sessionId")
         if not server_session_id:
             raise RuntimeError(
                 "qwen ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
+        if not self._context_source.accepts_reply(attempt):
+            raise RuntimeError("Qwen session/new crossed process generation")
+        self._context_source.bind(attempt, server_session_id)
+        self._note_config_options(result.get("configOptions"))
         self._session_id = server_session_id
         return self._session_id
 
@@ -1493,6 +1531,7 @@ class QwenExecutor(Executor):
                     # subprocess dies. Surface it as a clean retryable error
                     # rather than letting it raise out of the generator.
                     self._session_id = None
+                    self._context_source.reset_session()
                     self._system_prompt_sent = False
                     yield ExecutorError(message=f"qwen process error: {exc}", retryable=True)
                     return
@@ -1502,6 +1541,7 @@ class QwenExecutor(Executor):
                     # one — and re-send the system prompt into that fresh session.
                     if "Session not found" in error_msg:
                         self._session_id = None
+                        self._context_source.reset_session()
                         self._system_prompt_sent = False
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
@@ -1597,7 +1637,22 @@ class QwenExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""
 
+        del session_key
+        self._context_source.per_key_close()
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        return await self._context_source.prepare(session_id, read_id, timeout_s=timeout_s)
+
     async def close(self) -> None:
+        keys = self._context_source.begin_close()
+        try:
+            await self._close_unobserved()
+        finally:
+            self._context_source.end_close(keys)
+
+    async def _close_unobserved(self) -> None:
         """Terminate the qwen subprocess and clean up."""
         with contextlib.suppress(Exception):
             self._mcp.close()

@@ -1310,6 +1310,46 @@ async def test_runner_context_v2_preserves_codex_sdk_key_without_vendor_reads(
         await asyncio.gather(reader, return_exceptions=True)
 
 
+@pytest.mark.parametrize("family", ["acp", "goose", "qwen"])
+async def test_runner_context_v2_preserves_partial_acp_process_scope(
+    harness_inventory_reader, monkeypatch, tmp_path, family
+):
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.inner.qwen_executor import QwenExecutor
+
+    if family == "acp":
+        executor = AcpExecutor(AcpAgentConfig(command="fake-acp"), cwd=str(tmp_path))
+    elif family == "goose":
+        executor = GooseExecutor(cwd=str(tmp_path))
+    else:
+        executor = QwenExecutor(cwd=str(tmp_path))
+    executor._proc = SimpleNamespace(returncode=None)
+    monkeypatch.setattr(executor._mcp, "session_new_servers", lambda **_: [])
+    executor._rpc = AsyncMock(return_value={"result": {"sessionId": "primary"}})
+    await executor._ensure_session()
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    executor._rpc.side_effect = AssertionError("inventory must not query a vendor")
+    for retired in (False, True):
+        if retired:
+            await executor.close_session(adapter._session_key)
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.vendor_id.value == "primary"
+        assert record.execution_keys == record.aliases == ()
+        assert record.lifecycle == ("unknown" if retired else "live")
+        assert record.stop_proof is record.continuity_proof is None
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+        assert "independent_sdk_key_mapping_unsupported" in {r.reason for r in source.unresolved}
+    executor._rpc.assert_awaited_once()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
 async def test_runner_context_v2_preserves_pi_rpc_pending_and_retired_owner(
     harness_inventory_reader, monkeypatch
 ):

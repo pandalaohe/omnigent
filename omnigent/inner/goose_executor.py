@@ -43,6 +43,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.acp_context_inventory import AcpContextAttempt, AcpProcessContextSource
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -60,6 +61,7 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
+from omnigent.startup_protocol import ContextEvidenceV2
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +241,7 @@ class GooseExecutor(Executor):
         self._builtins = tuple(builtins) if builtins is not None else _DEFAULT_BUILTINS
 
         self._proc: asyncio.subprocess.Process | None = None
+        self._context_source = AcpProcessContextSource("goose-acp", lambda: self._proc)
         self._queue: asyncio.Queue[_AcpJsonObject] = asyncio.Queue()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -279,12 +282,23 @@ class GooseExecutor(Executor):
 
     def _reset_process_state(self) -> None:
         """Clear state owned by a goose ACP subprocess."""
+        self._context_source.reset_session()
         self._session_id = None
         self._system_prompt_sent = False
         self._initialized = False
         self._image_supported = False
 
     async def _start_process(self) -> None:
+        attempt = self._context_source.begin_process()
+        try:
+            await self._start_process_unobserved()
+        except BaseException:
+            self._context_source.failed(attempt)
+            raise
+        finally:
+            self._context_source.process_started()
+
+    async def _start_process_unobserved(self) -> None:
         """Start ``goose acp`` as an asyncio subprocess.
 
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
@@ -417,6 +431,13 @@ class GooseExecutor(Executor):
             logger.debug("goose stderr reader stopped: %s", exc)
 
     async def _read_stdout(self) -> None:
+        process, generation = self._proc, self._context_source.generation
+        try:
+            await self._read_stdout_unobserved()
+        finally:
+            self._context_source.transport_ended(process, generation)
+
+    async def _read_stdout_unobserved(self) -> None:
         """Continuously read NDJSON lines from goose stdout.
 
         Responses (``id`` + no ``method``) resolve the matching ``_pending``
@@ -527,6 +548,16 @@ class GooseExecutor(Executor):
         self._initialized = True
 
     async def _ensure_session(self) -> str:
+        if self._session_id is not None:
+            return self._session_id
+        attempt = self._context_source.begin_session()
+        try:
+            return await self._ensure_session_unobserved(attempt)
+        except BaseException:
+            self._context_source.failed(attempt)
+            raise
+
+    async def _ensure_session_unobserved(self, attempt: AcpContextAttempt) -> str:
         """Create (or reuse) an ACP session, returning Goose's assigned id.
 
         Goose assigns its own ``sessionId`` (a date-stamped id like
@@ -556,6 +587,9 @@ class GooseExecutor(Executor):
             raise RuntimeError(
                 "goose ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
+        if not self._context_source.accepts_reply(attempt):
+            raise RuntimeError("Goose session/new crossed process generation")
+        self._context_source.bind(attempt, server_session_id)
         self._session_id = server_session_id
         return self._session_id
 
@@ -1243,6 +1277,7 @@ class GooseExecutor(Executor):
                 except Exception as exc:
                     logger.exception("goose process response retrieval failed")
                     self._session_id = None
+                    self._context_source.reset_session()
                     self._system_prompt_sent = False
                     yield ExecutorError(message=f"goose process error: {exc}", retryable=True)
                     return
@@ -1250,6 +1285,7 @@ class GooseExecutor(Executor):
                     error_msg = response["error"].get("message", "Unknown ACP error")
                     if "Session not found" in error_msg:
                         self._session_id = None
+                        self._context_source.reset_session()
                         self._system_prompt_sent = False
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
@@ -1303,7 +1339,22 @@ class GooseExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""
 
+        del session_key
+        self._context_source.per_key_close()
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        return await self._context_source.prepare(session_id, read_id, timeout_s=timeout_s)
+
     async def close(self) -> None:
+        keys = self._context_source.begin_close()
+        try:
+            await self._close_unobserved()
+        finally:
+            self._context_source.end_close(keys)
+
+    async def _close_unobserved(self) -> None:
         """Terminate the goose subprocess and clean up."""
         with contextlib.suppress(Exception):
             self._mcp.close()
