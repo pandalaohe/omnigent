@@ -259,10 +259,6 @@ Cross-harness journeys:
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
   ID beginning with `omnigent/`; bare and picker-qualified unlisted IDs are rejected.
-  `tests/runtime/test_inference_routing.py::test_pi_picker_preserves_models_with_colliding_ids`
-  checks both picker rows when a bare ID and a prefixed literal collide. The allowed
-  picker target wins; an exact literal is a fallback when that target is not allowed.
-  Literal fallback requires an allowlist; decoding without one is unchanged.
   Browser acceptance is separate: select each row in the new-session composer,
   launch, and confirm Pi reports the model that row represents.
 - **`model-and-effort`, Pi thinking compatibility (own environment):**

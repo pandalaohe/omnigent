@@ -88,6 +88,7 @@ async def test_app_server_start_passes_native_filter_only_to_enabled_subprocess(
     monkeypatch.setenv("CODEX_HOME", str(source_home))
     monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=(0, 152, 1)))
     monkeypatch.setattr(app_server, "acquire_codex_native_process_owner_lock", lambda: None)
+    monkeypatch.setattr(app_server, "snapshot_codex_binary", lambda path, *, env: path)
 
     class SpawnObserved(Exception):
         pass
