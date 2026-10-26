@@ -44,6 +44,8 @@ async def context_v2_native(tmp_path, monkeypatch):
     monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
     monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
     monkeypatch.setattr(orchestration, "_CODEX_INVENTORY_CLIENTS", {})
     orchestration._bind_codex_inventory_client(

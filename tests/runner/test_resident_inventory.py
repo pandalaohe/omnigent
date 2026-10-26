@@ -241,6 +241,7 @@ def native_thread_inventory(monkeypatch):
         "_STARTING_NATIVE_BACKENDS",
         "_CLOSING_NATIVE_BACKENDS",
         "_CODEX_INVENTORY_CLIENTS",
+        "_RETIRED_NATIVE_OWNERS",
     ):
         monkeypatch.setattr(orchestration, name, {})
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
@@ -268,6 +269,102 @@ def native_thread_inventory(monkeypatch):
         return backend, client
 
     return add
+
+
+@pytest.mark.parametrize("outcome", ["returned", "raised", "cancelled"])
+async def test_native_retired_owner_remains_after_unconfirmed_close(
+    native_thread_inventory, outcome
+):
+    backend, _client = native_thread_inventory("main", bind=False)
+    orchestration._AUTO_CODEX_APP_SERVERS.pop("main")
+    failure = {
+        "returned": None,
+        "raised": RuntimeError("close unconfirmed"),
+        "cancelled": asyncio.CancelledError(),
+    }[outcome]
+    backend.close = AsyncMock(side_effect=failure)
+    if failure is None:
+        await orchestration._close_native_backend("main", "codex-native", backend)
+    else:
+        with pytest.raises(type(failure)):
+            await orchestration._close_native_backend("main", "codex-native", backend)
+    (owner,) = orchestration.native_backend_resident_inventory().owners
+    assert owner.incarnation_id == "backend-main"
+    assert owner.session_ids == ("main",)
+    assert owner.closing and not owner.registered and not owner.exit_confirmed
+    assert owner.transport_generation is None
+    assert not orchestration._CLOSING_NATIVE_BACKENDS
+    backend.close.assert_awaited_once()
+
+
+async def test_native_retired_owner_does_not_borrow_successor_exit_proof(
+    harness_inventory_reader, native_thread_inventory
+):
+    _manager, _add, client, requests = harness_inventory_reader
+    backend, _ = native_thread_inventory("main", bind=False)
+    orchestration._AUTO_CODEX_APP_SERVERS.pop("main")
+    orchestration._AUTO_CODEX_APP_SERVERS["alias"] = backend
+    backend.close = AsyncMock()
+
+    async def replace_during_client_close():
+        backend.resident_incarnation_id = "successor-main"
+        backend.process_exit_confirmed = backend.exit_confirmed = True
+
+    await orchestration._close_native_backend(
+        "main", "codex-native", backend, close_client=replace_during_client_close
+    )
+    (old,) = [
+        owner
+        for owner in orchestration.native_backend_resident_inventory().owners
+        if not owner.registered
+    ]
+    assert old.incarnation_id == "backend-main"
+    assert old.session_ids == ("alias", "main")
+    assert not old.process_exit_confirmed and not old.exit_confirmed
+    backend.close.assert_not_awaited()
+    backend.process_exit_confirmed = backend.exit_confirmed = False
+    orchestration._AUTO_CODEX_APP_SERVERS["main"] = backend
+    inventory = orchestration.native_backend_resident_inventory()
+    assert {owner.incarnation_id for owner in inventory.owners} == {
+        "backend-main",
+        "successor-main",
+    }
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "alias"},
+    )
+    native = _v2_evidence(response.content, session_id="alias").sources[1]
+    assert native.coverage == "unsupported" and native.contexts == ()
+    assert any(
+        gap.candidate == "backend-main" and gap.reason == "native_predecessor_exit_unconfirmed"
+        for gap in native.unresolved
+    )
+    assert native.revision_authority == "observation_only"
+    assert native.membership_revision is native.age_upper_bound_s is native.work_bindings is None
+    assert requests == []
+
+
+async def test_native_retired_owner_budget_keeps_missing_candidates_unknown(
+    harness_inventory_reader, native_thread_inventory, monkeypatch
+):
+    _manager, _add, client, requests = harness_inventory_reader
+    monkeypatch.setattr(orchestration, "_MAX_RETIRED_NATIVE_OWNERS", 1)
+    for session in ("first", "second"):
+        backend, _ = native_thread_inventory(session, bind=False)
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(session)
+        backend.close = AsyncMock()
+        await orchestration._close_native_backend(session, "codex-native", backend)
+    inventory = orchestration.native_backend_resident_inventory()
+    assert len(inventory.owners) == 1 and inventory.owners[0].session_ids == ("first",)
+    assert not inventory.exit_coverage_complete
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "second"},
+    )
+    native = _v2_evidence(response.content, session_id="second").sources[1]
+    assert native.coverage == "unsupported" and native.contexts == ()
+    assert "native_owner_exit_coverage_incomplete" in {gap.reason for gap in native.unresolved}
+    assert requests == []
 
 
 @pytest.mark.parametrize(

@@ -152,6 +152,7 @@ async def test_delayed_helper_close_cannot_adopt_restart_before_spawn(
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
     server = _test_app_server(tmp_path, tmp_path / "home", tmp_path / "bridge", tmp_path)
     await server.start()
     old_id = server.resident_incarnation_id
@@ -204,7 +205,12 @@ async def test_delayed_helper_close_cannot_adopt_restart_before_spawn(
         assert server.resident_incarnation_id != old_id
         assert not server.exit_confirmed
         snapshot = orchestration.native_backend_resident_inventory()
-        assert snapshot.owners == () and not snapshot.exit_coverage_complete
+        (retired,) = snapshot.owners
+        assert retired.incarnation_id == old_id
+        assert (
+            retired.closing and not retired.exit_confirmed and not retired.process_exit_confirmed
+        )
+        assert not snapshot.exit_coverage_complete
     finally:
         allow_client.set()
         allow_spawn.set()

@@ -354,6 +354,8 @@ async def test_context_v2_close_retains_runner_tombstone(context_server, monkeyp
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
     monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
     await client.create_session()
     key = server.context_source_v2("conversation").contexts[0].key
@@ -400,6 +402,8 @@ async def test_context_v2_retired_gap_survives_backend_replacement(context_serve
     monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [old])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
     monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
     source = orchestration.native_context_source_v2("conversation")
     assert "context_history_budget" in {u.reason for u in source.unresolved}
@@ -497,6 +501,7 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
     started: dict[str, object] = {}
 
     class _FakeProc:
@@ -537,14 +542,16 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert server.process_exit_confirmed
     assert not server.exit_confirmed
     closing = orchestration.native_backend_resident_inventory()
-    assert closing.owners == ()
+    (retired,) = closing.owners
+    assert retired.incarnation_id == incarnation_id
+    assert retired.closing and retired.process_exit_confirmed and not retired.exit_confirmed
     assert not closing.exit_coverage_complete
     with pytest.raises(RuntimeError, match="exit is not confirmed"):
         await server.start()
     # A future lifecycle owner can supply authoritative descendant-exit proof.
     server.exit_confirmed = True
     await orchestration._close_native_backend("owned", "opencode-native", server)
-    assert (orchestration.native_backend_resident_inventory()).owners == ()
+    assert (orchestration.native_backend_resident_inventory()).owners == closing.owners
     assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
     await server.start()
     assert server.resident_incarnation_id != incarnation_id

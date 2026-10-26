@@ -454,12 +454,14 @@ _native_backend_exit_coverage_complete = True
 # Immutable evidence only: closing a backend must not keep SDK/process handles alive.
 _RETIRED_NATIVE_CONTEXTS: list[SourceEvidenceV2] = []
 _native_context_history_overflow = False
+_RETIRED_NATIVE_OWNERS: dict[tuple[_NativeBackendHarness, str], NativeBackendResidentSnapshot] = {}
+_MAX_RETIRED_NATIVE_OWNERS = 1000
 
 
 def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
-    from omnigent.startup_protocol import UnresolvedContextV2
+    from omnigent.startup_protocol import UnresolvedContextV2, native_context_scope_v2
 
     backends: list[_NativeBackend] = []
     registered = _AUTO_OPENCODE_SERVERS.get(session_id)
@@ -486,10 +488,37 @@ def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
     sources.extend(
         source for source in _RETIRED_NATIVE_CONTEXTS if source.scope.owner_id == session_id
     )
-    if not sources:
+    gaps = [
+        UnresolvedContextV2(
+            candidate=owner.incarnation_id, reason="native_predecessor_exit_unconfirmed"
+        )
+        for owner in _RETIRED_NATIVE_OWNERS.values()
+        if session_id in owner.session_ids
+    ]
+    if not _native_backend_exit_coverage_complete:
+        gaps.append(
+            UnresolvedContextV2(candidate=None, reason="native_owner_exit_coverage_incomplete")
+        )
+    if not sources and not gaps:
         return None
-    current = sources[0]
-    unresolved = list(current.unresolved)
+    current = (
+        sources[0]
+        if sources
+        else SourceEvidenceV2(
+            scope=native_context_scope_v2(session_id),
+            producer_incarnation=None,
+            coverage="unsupported",
+            contexts=(),
+            unresolved=tuple(gaps[:999]),
+            membership_revision=None,
+            context_revision=None,
+            work_revision=None,
+            revision_authority="observation_only",
+            age_upper_bound_s=None,
+            work_bindings=None,
+        )
+    )
+    unresolved = [*current.unresolved, *gaps] if sources else gaps
     for source in sources[1:]:
         if len(unresolved) + len(source.contexts) + len(source.unresolved) > 1000:
             return current.model_copy(
@@ -627,6 +656,21 @@ def native_backend_resident_inventory() -> NativeBackendInventorySnapshot:
                 transport_generation=transport_generation,
             )
         )
+    positions = {
+        (owner.harness, owner.incarnation_id): index for index, owner in enumerate(snapshots)
+    }
+    for key, retired in _RETIRED_NATIVE_OWNERS.items():
+        if (index := positions.get(key)) is None:
+            snapshots.append(retired)
+        else:
+            current = snapshots[index]
+            snapshots[index] = dataclasses.replace(
+                current,
+                session_ids=tuple(sorted(set(current.session_ids) | set(retired.session_ids))),
+                closing=True,
+                exit_confirmed=False,
+                transport_generation=None,
+            )
     return NativeBackendInventorySnapshot(tuple(snapshots), _native_backend_exit_coverage_complete)
 
 
@@ -729,11 +773,47 @@ async def read_native_backend_thread_inventory(
     return (await prepare_native_backend_thread_inventory(timeout_s=timeout_s))()
 
 
+def _native_owner_sessions(
+    session_id: str, harness: _NativeBackendHarness, backend: _NativeBackend
+) -> tuple[str, ...]:
+    registry = _AUTO_CODEX_APP_SERVERS if harness == "codex-native" else _AUTO_OPENCODE_SERVERS
+    return tuple(
+        sorted({session_id} | {name for name, current in registry.items() if current is backend})[
+            :1000
+        ]
+    )
+
+
+def _retain_native_owner(
+    harness: _NativeBackendHarness,
+    backend: _NativeBackend,
+    incarnation: str,
+    known_sessions: tuple[str, ...],
+) -> None:
+    global _native_backend_exit_coverage_complete
+    _native_backend_exit_coverage_complete = False
+    key = (harness, incarnation)
+    previous = _RETIRED_NATIVE_OWNERS.get(key)
+    if previous is None and len(_RETIRED_NATIVE_OWNERS) >= _MAX_RETIRED_NATIVE_OWNERS:
+        return
+    sessions = set(known_sessions) | (set(previous.session_ids) if previous is not None else set())
+    _RETIRED_NATIVE_OWNERS[key] = NativeBackendResidentSnapshot(
+        incarnation,
+        harness,
+        tuple(sorted(sessions)[:1000]),
+        registered=False,
+        closing=True,
+        process_exit_confirmed=(
+            incarnation == backend.resident_incarnation_id and backend.process_exit_confirmed
+        ),
+        exit_confirmed=False,
+    )
+
+
 async def _start_native_backend(
     session_id: str, harness: _NativeBackendHarness, backend: _NativeBackend
 ) -> None:
     """Expose preparation without publishing a backend into the live map early."""
-    global _native_backend_exit_coverage_complete
     token = object()
     _STARTING_NATIVE_BACKENDS[token] = (session_id, harness, backend)
     try:
@@ -742,9 +822,19 @@ async def _start_native_backend(
             _AUTO_CODEX_APP_SERVERS if harness == "codex-native" else _AUTO_OPENCODE_SERVERS
         ).get(session_id)
         if registered is not None and registered is not backend:
-            _native_backend_exit_coverage_complete = False
+            _retain_native_owner(
+                harness,
+                registered,
+                registered.resident_incarnation_id,
+                _native_owner_sessions(session_id, harness, registered),
+            )
     except BaseException:
-        _native_backend_exit_coverage_complete = False
+        _retain_native_owner(
+            harness,
+            backend,
+            backend.resident_incarnation_id,
+            _native_owner_sessions(session_id, harness, backend),
+        )
         raise
     finally:
         _STARTING_NATIVE_BACKENDS.pop(token, None)
@@ -758,8 +848,9 @@ async def _close_native_backend(
     close_client: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Keep an in-flight close visible; remember unknown exit without retaining owners."""
-    global _native_backend_exit_coverage_complete, _native_context_history_overflow
+    global _native_context_history_overflow
     incarnation_id = backend.resident_incarnation_id
+    known_sessions = _native_owner_sessions(session_id, harness, backend)
     _CODEX_INVENTORY_CLIENTS.pop(id(backend), None)
     close_backend = backend.close()
     token = object()
@@ -778,7 +869,7 @@ async def _close_native_backend(
                 close_backend.close()
     finally:
         if incarnation_id != backend.resident_incarnation_id or not backend.exit_confirmed:
-            _native_backend_exit_coverage_complete = False
+            _retain_native_owner(harness, backend, incarnation_id, known_sessions)
         if harness in {"opencode-native", "codex-native"}:
             from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
             from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer

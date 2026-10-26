@@ -848,7 +848,9 @@ async def test_native_backend_inventory_records_unknown_exit_without_retaining_o
         await closing_task
 
     after = orchestration.native_backend_resident_inventory()
-    assert after.owners == ()
+    assert [owner.incarnation_id for owner in after.owners] == (
+        [] if outcome == "confirmed" else [backend.resident_incarnation_id]
+    )
     assert not orchestration._CLOSING_NATIVE_BACKENDS
     if outcome == "confirmed":
         assert after.exit_coverage_complete
@@ -858,6 +860,7 @@ async def test_native_backend_inventory_records_unknown_exit_without_retaining_o
         outcome = "confirmed"
         await orchestration._close_native_backend("owned", harness, backend)  # type: ignore[arg-type]
         assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
+        assert orchestration.native_backend_resident_inventory().owners == after.owners
 
 
 async def test_client_close_does_not_retarget_a_new_backend_incarnation(
@@ -1680,9 +1683,14 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         """
         del transport, terminal_launch_args
         snapshot = orchestration.native_backend_resident_inventory()
-        (owner,) = snapshot.owners
+        (owner,) = [owner for owner in snapshot.owners if owner.registered]
         assert owner.registered and not owner.closing
         assert snapshot.exit_coverage_complete is (not overwrite)
+        assert len(snapshot.owners) == (2 if overwrite else 1)
+        if overwrite:
+            (retired,) = [owner for owner in snapshot.owners if not owner.registered]
+            assert retired.incarnation_id != owner.incarnation_id
+            assert retired.closing and not retired.exit_confirmed
         raise RuntimeError(f"thread {loaded_thread_id} already has an active writer")
 
     class _UnreachableResourceRegistry:
