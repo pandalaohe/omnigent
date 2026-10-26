@@ -87,7 +87,17 @@ class NullServerClient:
         :param kwargs: Extra keyword arguments (ignored).
         :returns: Stub 200 response with empty JSON body.
         """
-        del url, kwargs
+        del kwargs
+        if url.endswith("/labels"):
+
+            class _LabelsResponse(self._Response):
+                """Match the labels endpoint's empty-label success response."""
+
+                def json(self) -> dict[str, Any]:
+                    """Return an authoritative empty label map."""
+                    return {"labels": {}}
+
+            return _LabelsResponse()
         return self._Response()
 
     async def post(self, url: str, **kwargs: Any) -> _Response:

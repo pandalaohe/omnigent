@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
@@ -139,6 +139,57 @@ async def test_question_buffers_messages_and_resumes_fifo(
     first_body, second_body = harness.posted_bodies
     assert first_body["content"][-1]["content"][0]["text"] == "first"
     assert second_body["content"][-1]["content"][0]["text"] == "second"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_drain", [False, True])
+async def test_buffered_messages_retry_unavailable_bridge_labels(
+    monkeypatch: pytest.MonkeyPatch,
+    pending_prompt: dict[str, bool],
+    fail_drain: bool,
+) -> None:
+    """Label failure during a background prompt check preserves the accepted FIFO."""
+    app, harness = _build_app()
+    sid = uuid.uuid4().hex
+    state = {"unavailable": True, "fail_next": False, "drain_failed": False, "failures": 0}
+
+    async def bridge_id(**_: Any) -> str:
+        if state["unavailable"] or state["fail_next"]:
+            state["fail_next"] = False
+            state["failures"] += 1
+            raise HTTPException(status_code=503, detail="labels unavailable")
+        return f"bridge_{sid}"
+
+    def inspect(_: Path) -> bool:
+        if fail_drain and not state["drain_failed"]:
+            state["drain_failed"] = True
+            state["fail_next"] = True
+        return False
+
+    monkeypatch.setattr(runner_app, "_claude_native_bridge_id_for_session", bridge_id)
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", inspect)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201
+        app.state.active_turns[sid] = None
+        response = await client.post(f"/v1/sessions/{sid}/events", json=_message("keep queued"))
+        assert response.status_code == 202
+        app.state.active_turns.pop(sid)
+        await app.state.check_and_start_next_turn(sid)
+        await _until(lambda: state["failures"] >= 2)
+        assert len(app.state.session_message_buffers[sid]) == 1
+        assert harness.posted_bodies == []
+        state["unavailable"] = False
+        await _until(
+            lambda: (
+                len(harness.posted_bodies) == 1
+                and sid not in app.state.claude_prompt_waiters
+                and sid not in app.state.active_turns
+            )
+        )
+        assert not app.state.session_message_buffers.get(sid)
 
 
 @pytest.mark.asyncio
