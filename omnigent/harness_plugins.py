@@ -155,6 +155,16 @@ class HarnessPluginState:
     load_errors: dict[str, str]
 
 
+@dataclass(frozen=True)
+class LoadedHarnessManifest:
+    """Copied declarations from an already loaded registry, without loader/error details."""
+
+    contribution_names: tuple[str, ...]
+    harness_ids: frozenset[str]
+    modules: tuple[tuple[str, str], ...]
+    load_errors: frozenset[str]
+
+
 CLAUDE_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="claude",
     display_name="Claude",
@@ -1283,14 +1293,40 @@ def native_provider_for_key(key: str) -> NativeHarnessProvider | None:
     return None
 
 
-def harness_modules() -> dict[str, str]:
-    """Return runtime harness module mapping, aliases included."""
-    modules = _merge_dict(lambda contribution: contribution.harness_modules)
-    for alias, canonical in harness_aliases().items():
+def _harness_module_mapping(contributions: tuple[HarnessContribution, ...]) -> dict[str, str]:
+    modules: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    for contribution in contributions:
+        modules.update(contribution.harness_modules)
+        aliases.update(contribution.aliases)
+    for alias, canonical in aliases.items():
         module = modules.get(canonical)
         if module is not None:
             modules.setdefault(alias, module)
     return modules
+
+
+def loaded_harness_manifest() -> LoadedHarnessManifest | None:
+    """Read only the existing cache; never discover or load an entry point."""
+    state = _state
+    if state is None:
+        return None
+    modules = _harness_module_mapping(state.contributions)
+    return LoadedHarnessManifest(
+        contribution_names=tuple(contribution.name for contribution in state.contributions),
+        harness_ids=frozenset(
+            harness
+            for contribution in state.contributions
+            for harness in contribution.valid_harnesses
+        ),
+        modules=tuple(sorted(modules.items())),
+        load_errors=frozenset(state.load_errors),
+    )
+
+
+def harness_modules() -> dict[str, str]:
+    """Return runtime harness module mapping, aliases included."""
+    return _harness_module_mapping(plugin_state().contributions)
 
 
 def model_env_keys() -> dict[str, str]:

@@ -32,7 +32,7 @@ import sys
 import time
 import uuid
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -44,7 +44,7 @@ from pydantic import TypeAdapter
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_retention import cli_family_for_resident_harness
 from omnigent.debug_logging import debug_event
-from omnigent.harness_plugins import missing_install_packages
+from omnigent.harness_plugins import loaded_harness_manifest, missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
@@ -65,6 +65,7 @@ from omnigent.startup_protocol import (
     CONTEXT_INVENTORY_MAX_BYTES,
     CONTEXT_INVENTORY_V2,
     ContextEvidenceV2,
+    UnresolvedContextV2,
     decode_context_evidence_v2,
     executor_context_scope_v2,
     harness_context_authority_v2,
@@ -247,6 +248,13 @@ def _socket_path(instance_dir: Path, conversation_id: str) -> Path:
     return instance_dir / f"conv-{conversation_id}.sock"
 
 
+def _registered_module_path(harness: str, modules: Mapping[str, str]) -> str | None:
+    module = modules.get(harness)
+    if module is None and harness.startswith("acp:"):
+        return modules.get("acp")
+    return module
+
+
 def _resolve_module_path(harness: str) -> str:
     """
     Look up the harness name in :data:`_HARNESS_MODULES`.
@@ -267,15 +275,9 @@ def _resolve_module_path(harness: str) -> str:
         registry is empty — common during Phase 1 step 2 before
         wraps land in step 4).
     """
-    module_path = _HARNESS_MODULES.get(harness)
+    module_path = _registered_module_path(harness, _HARNESS_MODULES)
     if module_path is not None:
         return module_path
-    # Generic-ACP ids (``acp:<slug>``) all resolve to the base ``acp`` module;
-    # the slug selecting the concrete agent is read from the spec at spawn.
-    if harness.startswith("acp:"):
-        acp_module = _HARNESS_MODULES.get("acp")
-        if acp_module is not None:
-            return acp_module
     package = missing_install_packages().get(harness)
     if package:
         raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")
@@ -844,6 +846,8 @@ class HarnessProcessManager:
 
         if not 0 < timeout_s <= 5.0:
             return lambda: unknown("invalid_read_budget")
+        module_manifest = tuple(sorted(_HARNESS_MODULES.copy().items()))
+        contribution_manifest = loaded_harness_manifest()
         try:
             async with asyncio.timeout_at(started + timeout_s):
                 selection = await self._select_resident_inventory_owner(owner)
@@ -882,7 +886,57 @@ class HarnessProcessManager:
         def reconcile() -> HarnessContextEvidenceSnapshotV2:
             if not still_current():
                 return unknown("owner_changed")
+            current_modules = tuple(sorted(_HARNESS_MODULES.copy().items()))
+            current_contributions = loaded_harness_manifest()
+            reason = None
+            modules = dict(current_modules)
+            if (
+                current_modules != module_manifest
+                or current_contributions != contribution_manifest
+            ):
+                reason = "harness_source_manifest_changed"
+            elif current_contributions is None:
+                reason = "harness_source_manifest_unavailable"
+            elif current_contributions.load_errors:
+                reason = "harness_plugin_load_errors"
+            elif any(
+                modules.get(name) != module for name, module in current_contributions.modules
+            ):
+                reason = "harness_registry_manifest_mismatch"
+            elif not _registered_module_path(owner.harness, modules):
+                reason = "harness_source_unregistered"
+            elif _registered_module_path(
+                owner.harness, dict(current_contributions.modules)
+            ) != _registered_module_path(owner.harness, modules):
+                reason = "harness_registry_manifest_mismatch"
             elapsed = time.monotonic() - started
+            sources = evidence.sources
+            if reason is not None:
+                sources = tuple(
+                    source.model_copy(
+                        update={
+                            "coverage": "unsupported"
+                            if source.coverage == "unsupported"
+                            else "partial",
+                            "unresolved": (
+                                *source.unresolved[:999],
+                                UnresolvedContextV2(
+                                    candidate=None,
+                                    reason=reason
+                                    if len(source.unresolved) < 1000
+                                    else "harness_manifest_reason_budget",
+                                ),
+                            ),
+                            "membership_revision": None,
+                            "context_revision": None,
+                            "work_revision": None,
+                            "revision_authority": "observation_only",
+                            "age_upper_bound_s": None,
+                            "work_bindings": None,
+                        }
+                    )
+                    for source in sources
+                )
             aged = evidence.model_copy(
                 update={
                     "sources": tuple(
@@ -895,7 +949,7 @@ class HarnessProcessManager:
                                 ),
                             }
                         )
-                        for source in evidence.sources
+                        for source in sources
                     ),
                 }
             )

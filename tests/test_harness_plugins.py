@@ -41,6 +41,40 @@ def _install_entry_points(
     )
 
 
+def test_loaded_harness_manifest_never_loads_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    discover = Mock(side_effect=AssertionError("inventory must not discover plugins"))
+    monkeypatch.setattr(hp, "_entry_points", discover)
+    assert hp.loaded_harness_manifest() is None
+    discover.assert_not_called()
+
+    contribution = hp.HarnessContribution(
+        name="fixture-plugin",
+        valid_harnesses=frozenset({"fixture"}),
+        harness_modules={"fixture": "omnigent.community.fixture"},
+        aliases={"fixture-alias": "fixture"},
+    )
+    errors = {"broken-plugin": "not disclosed"}
+    monkeypatch.setattr(hp, "_state", hp.HarnessPluginState((contribution,), errors))
+    first = hp.loaded_harness_manifest()
+    assert first is not None
+    assert first.contribution_names == ("fixture-plugin",)
+    assert first.harness_ids == frozenset({"fixture"})
+    assert dict(first.modules) == {
+        "fixture": "omnigent.community.fixture",
+        "fixture-alias": "omnigent.community.fixture",
+    }
+    assert first.load_errors == frozenset({"broken-plugin"})
+    assert "not disclosed" not in repr(first)
+    contribution.harness_modules["fixture"] = "omnigent.community.changed"
+    errors.clear()
+    second = hp.loaded_harness_manifest()
+    assert second != first and dict(first.modules)["fixture"] == "omnigent.community.fixture"
+    assert first.load_errors == frozenset({"broken-plugin"})
+    discover.assert_not_called()
+
+
 def test_community_harness_contribution_is_merged(monkeypatch: pytest.MonkeyPatch) -> None:
     def _contribution() -> hp.HarnessContribution:
         return hp.HarnessContribution(
