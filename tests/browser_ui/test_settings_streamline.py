@@ -742,7 +742,8 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
     request: pytest.FixtureRequest,
 ) -> None:
     storage_key = "omnigent:usage-context-preferences"
-    source_key = '["host-friendly","polly","pi","model-a"]'
+    host_id = "11111111-1111-4111-8111-111111111111"
+    source_key = json.dumps([host_id, "polly", "pi", "model-a"], separators=(",", ":"))
     legacy = {
         "version": 5,
         "showProviderUsageLimits": True,
@@ -774,13 +775,13 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
     )
     browser_contract.json("/v1/me/preferences/usage_context", save_preferences, method="PATCH")
     browser_contract.response("/v1/me/preferences/session_collab", method="PATCH")
-    browser_contract.json("/v1/hosts/host-friendly/mcp-servers", {"servers": []})
+    browser_contract.json(f"/v1/hosts/{host_id}/mcp-servers", {"servers": []})
     browser_contract.json(
         "/v1/hosts",
         {
             "hosts": [
                 {
-                    "host_id": "host-friendly",
+                    "host_id": host_id,
                     "name": "Example host",
                     "status": "online",
                     "configured_harnesses": {"pi": True},
@@ -799,11 +800,16 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{appearance_url}/settings/context-usage")
     section = page.locator("#context-usage")
-    edit = section.get_by_role("button", name="Edit Example host Polly model-a", exact=True)
+    open_manager = section.get_by_role(
+        "button", name="Manage Example host × Polly · Pi", exact=True
+    )
+    open_manager.click()
+    manager = page.get_by_role("dialog", name="Manage saved sources", exact=True)
+    edit = manager.get_by_role("button", name="Edit Example host Polly model-a", exact=True)
     edit.click()
-    capacity = section.get_by_role("spinbutton", name="Edit context total", exact=True)
-    tokens = section.get_by_role("spinbutton", name="Edit compact buffer", exact=True)
-    percent = section.get_by_role("spinbutton", name="Edit compact buffer percent", exact=True)
+    capacity = manager.get_by_role("spinbutton", name="Edit context total", exact=True)
+    tokens = manager.get_by_role("spinbutton", name="Edit compact buffer", exact=True)
+    percent = manager.get_by_role("spinbutton", name="Edit compact buffer percent", exact=True)
     expect(capacity).to_have_value("100000")
     expect(tokens).to_have_value("20000")
 
@@ -813,48 +819,58 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
             [storage_key, source_key],
         )
 
-    section.get_by_role("button", name="Percent", exact=True).last.click()
+    buffer_unit = manager.get_by_role("group", name="Edit buffer unit", exact=True)
+    buffer_unit.get_by_role("button", name="Percent", exact=True).click()
     percent.fill("10")
     percent.blur()
-    section.get_by_role("button", name="Tokens", exact=True).last.click()
+    buffer_unit.get_by_role("button", name="Tokens", exact=True).click()
     expect(tokens).to_have_value("20000")
-    save = section.get_by_role("button", name="Save", exact=True)
+    save = manager.get_by_role("button", name="Save", exact=True)
     save.click()
     assert saved()["autoCompactBufferPercent"] == 10
     assert saved()["autoCompactBufferTokens"] == 20000
     edit.click()
     tokens.fill("100000")
     tokens.blur()
-    expect(section.get_by_role("alert")).to_be_visible()
+    expect(manager.get_by_role("alert")).to_be_visible()
     expect(save).to_be_disabled()
     assert saved()["autoCompactBufferTokens"] == 20000
     tokens.fill("20000")
     tokens.blur()
     capacity.fill("20000")
     capacity.blur()
-    expect(section.get_by_role("alert")).to_be_visible()
+    expect(manager.get_by_role("alert")).to_be_visible()
     expect(save).to_be_disabled()
     assert saved()["contextWindowTokens"] == 100000
     capacity.fill("100000")
     capacity.blur()
     tokens.fill("0")
     tokens.blur()
-    section.get_by_role("button", name="Percent", exact=True).last.click()
+    buffer_unit.get_by_role("button", name="Percent", exact=True).click()
     expect(percent).to_have_value("10")
     percent.fill("0")
     percent.blur()
-    section.get_by_role("button", name="Tokens", exact=True).last.click()
+    buffer_unit.get_by_role("button", name="Tokens", exact=True).click()
     expect(tokens).to_have_value("0")
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
             and response.url.endswith("/v1/me/preferences/usage_context")
+            and response.request.post_data_json["value"]["overrides"][source_key][
+                "autoCompactBufferPercent"
+            ]
+            == 0
+            and response.request.post_data_json["value"]["overrides"][source_key][
+                "autoCompactBufferTokens"
+            ]
+            == 0
         )
     ):
         save.click()
     assert saved()["autoCompactBufferPercent"] == 0
     assert saved()["autoCompactBufferTokens"] == 0
     page.reload()
+    open_manager.click()
     edit.click()
     expect(tokens).to_have_value("0")
     assert saved()["autoCompactBufferPercent"] == 0
@@ -870,6 +886,290 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
             tokens.blur()
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         page.screenshot(path=str(output / f"buffer-manual-{width}.png"), full_page=True)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_saved_sources_grid_manager_layers_and_confirmed_merge(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    request: pytest.FixtureRequest,
+) -> None:
+    host_a = "11111111-1111-4111-8111-111111111111"
+    host_b = "22222222-2222-4222-8222-222222222222"
+    storage_key = "omnigent:usage-context-preferences"
+
+    def stored_key(parts: list[str]) -> str:
+        return json.dumps(parts, separators=(",", ":"))
+
+    prefix = "claude-opus-provider-variant-with-a-long-shared-context-profile-name-" * 2
+    models = [prefix + "standard", prefix + "extended", "sonnet", "sonnet-extended", "haiku"]
+    claude_keys = [stored_key([host_a, "claude", "claude-native", model]) for model in models]
+    codex_keys = [
+        stored_key([host_a, "codex", "codex-native", model]) for model in ("gpt-x", "gpt-y")
+    ]
+    auto_key = stored_key([host_a, "opencode", "opencode", ""])
+    other_host_key = stored_key([host_b, "codex-sdk", "codex", "gpt-x"])
+    claude_cell = stored_key([host_a, "claude", "claude-native", "", "cell"])
+    codex_cell = stored_key([host_a, "codex", "codex-native", "", "cell"])
+    claude_column = stored_key(["", "claude", "claude-native", "", "column"])
+    nine = {
+        **{
+            key: {"contextWindowTokens": 550000, "autoCompactBufferTokens": 32000}
+            for key in claude_keys
+        },
+        **{
+            key: {"contextWindowTokens": 400000, "autoCompactBufferTokens": 0}
+            for key in codex_keys
+        },
+        auto_key: {"contextWindowTokens": 200000, "autoCompactBufferTokens": None},
+        other_host_key: {"contextWindowTokens": 300000, "autoCompactBufferTokens": None},
+    }
+    sparse = {
+        key: value
+        for key, value in nine.items()
+        if key in {claude_keys[0], codex_keys[0], auto_key, other_host_key}
+    }
+    synced = {
+        "value": {
+            "version": 6,
+            "showProviderUsageLimits": True,
+            "overrides": sparse,
+            "lastProviderUsageLimits": {},
+        }
+    }
+    writes: list[dict] = []
+
+    def save_preferences(incoming: Request) -> dict[str, bool]:
+        value = incoming.post_data_json["value"]
+        writes.append(value)
+        synced["value"] = value
+        return {"ok": True}
+
+    def saved_overrides() -> dict:
+        return page.evaluate("key => JSON.parse(localStorage.getItem(key)).overrides", storage_key)
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"usage_context": synced["value"]}},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/preferences",
+        lambda _: {
+            "user_id": "local",
+            "preferences": {"version": 1, "settings": {"usage_context": synced["value"]}},
+        },
+    )
+    browser_contract.json("/v1/me/preferences/usage_context", save_preferences, method="PATCH")
+    browser_contract.response("/v1/me/preferences/session_collab", method="PATCH")
+    harnesses = ("claude-native", "codex-native", "opencode", "codex")
+    browser_contract.json(
+        "/v1/agents",
+        {
+            "data": [
+                {
+                    "id": f"saved-source-{harness}",
+                    "name": name,
+                    "harness": harness,
+                    "builtin": True,
+                    "product_of": harness,
+                }
+                for name, harness in zip(
+                    ("claude", "codex", "opencode", "codex-sdk"), harnesses, strict=True
+                )
+            ],
+            "has_more": False,
+        },
+    )
+    browser_contract.json(
+        "/v1/harnesses",
+        {
+            "data": [{"id": harness, "label": harness} for harness in harnesses],
+            "capabilities_by_harness": {
+                harness: {
+                    "integration_mode": "sdk-in-process" if harness == "codex" else "native-tui"
+                }
+                for harness in harnesses
+            },
+        },
+    )
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": host_id,
+                    "name": name,
+                    "owner": "local",
+                    "status": "online",
+                    "configured_harnesses": dict.fromkeys(harnesses, True),
+                }
+                for host_id, name in ((host_a, "Alpha"), (host_b, "Beta"))
+            ]
+        },
+    )
+    for host_id in (host_a, host_b):
+        browser_contract.json(f"/v1/hosts/{host_id}/mcp-servers", {"servers": []})
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(f"{appearance_url}/settings/context-usage")
+    section = page.get_by_test_id("saved-context-sources")
+    table = section.get_by_role("table", name="Saved context sources by computer and agent")
+    open_manager = section.get_by_role(
+        "button", name="Manage Alpha × Claude Code · Claude Code", exact=True
+    )
+    expect(open_manager).to_be_visible()
+    expect(table.get_by_role("row")).to_have_count(4)
+    expect(table.get_by_text("1 model override", exact=True)).to_have_count(4)
+    page.evaluate("document.fonts.ready")
+    sparse_height = table.evaluate("element => element.getBoundingClientRect().height")
+    synced["value"] = {**synced["value"], "overrides": nine}
+    page.reload()
+    expect(open_manager).to_be_visible()
+    expect(table.get_by_text("5 model overrides", exact=True)).to_be_visible()
+    expect(table.get_by_role("row")).to_have_count(4)
+    page.evaluate("document.fonts.ready")
+    grown_height = table.evaluate("element => element.getBoundingClientRect().height")
+    assert grown_height <= sparse_height + 1
+    assert table.locator("..").evaluate("element => element.clientHeight <= 320")
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    expect(section.get_by_text(models[0], exact=True)).to_have_count(0)
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
+    table.scroll_into_view_if_needed()
+    page.screenshot(path=str(output / f"saved-sources-count-grid-{width}.png"), full_page=True)
+
+    open_manager.click()
+    manager = page.get_by_role("dialog", name="Manage saved sources", exact=True)
+    proposal = "7 model records with identical values can be merged into 2 cell values."
+    expect(manager.get_by_text(proposal, exact=True)).to_be_visible()
+    expect(manager.get_by_role("navigation", name="Saved source computers")).to_contain_text(
+        "Alpha"
+    )
+    expect(manager.get_by_role("navigation", name="Saved source computers")).to_contain_text(
+        "Beta"
+    )
+    for index, model in enumerate(models[:2]):
+        label = manager.get_by_text(model, exact=True)
+        label.scroll_into_view_if_needed()
+        expect(label).to_be_in_viewport()
+        assert label.evaluate(
+            """element => {
+                const style = getComputedStyle(element);
+                return style.textOverflow !== 'ellipsis' && style.whiteSpace !== 'nowrap'
+                    && (style.webkitLineClamp === 'none' || style.webkitLineClamp === '')
+                    && element.scrollWidth <= element.clientWidth + 1
+                    && element.scrollHeight <= element.clientHeight + 1;
+            }"""
+        )
+        assert manager.evaluate("element => element.scrollWidth <= element.clientWidth")
+        page.screenshot(
+            path=str(output / f"saved-sources-full-model-{index}-{width}.png"), full_page=True
+        )
+    assert writes == []
+    manager.get_by_role("button", name="Keep", exact=True).click()
+    expect(manager.get_by_role("button", name="Merge", exact=True)).to_have_count(0)
+    assert saved_overrides() == nine
+    assert synced["value"]["overrides"] == nine
+    assert writes == []
+    manager.get_by_role("button", name="Close", exact=True).click()
+    open_manager.click()
+    expect(manager.get_by_text(proposal, exact=True)).to_be_visible()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/usage_context")
+        )
+    ):
+        manager.get_by_role("button", name="Merge", exact=True).click()
+    merged = synced["value"]["overrides"]
+    assert len(writes) == 1
+    assert len(merged) == 4
+    assert set(nine) - set(merged) == set(claude_keys + codex_keys)
+    assert set(merged) - set(nine) == {claude_cell, codex_cell}
+    assert merged[claude_cell] == nine[claude_keys[0]]
+    assert merged[codex_cell] == nine[codex_keys[0]]
+    assert merged[auto_key] == nine[auto_key]
+    assert merged[other_host_key] == nine[other_host_key]
+    assert saved_overrides() == merged
+    expect(manager.get_by_role("button", name="Merge", exact=True)).to_have_count(0)
+    expect(manager.get_by_text(models[0], exact=True)).to_have_count(0)
+    expect(
+        manager.get_by_text("Context 550,000 · Alpha × Claude Code", exact=True)
+    ).to_be_visible()
+    page.screenshot(path=str(output / f"saved-sources-merged-{width}.png"), full_page=True)
+    manager.get_by_role("button", name="Close", exact=True).click()
+    page.reload()
+    expect(table.get_by_text("550,000 / 32,000", exact=True)).to_be_visible()
+    assert saved_overrides() == merged
+
+    layered = {
+        claude_keys[0]: {"contextWindowTokens": 300000, "autoCompactBufferTokens": None},
+        claude_keys[1]: {"contextWindowTokens": None, "autoCompactBufferTokens": 10000},
+        claude_cell: {"contextWindowTokens": 400000, "autoCompactBufferTokens": 20000},
+        claude_column: {"contextWindowTokens": 500000, "autoCompactBufferTokens": 30000},
+    }
+    synced["value"] = {**synced["value"], "overrides": layered}
+    writes.clear()
+    page.reload()
+    expect(table.get_by_text("400,000 / 20,000", exact=True)).to_be_visible()
+    open_manager.click()
+    exact_row = manager.get_by_text(models[0], exact=True).locator("xpath=../..")
+    inherited_row = manager.get_by_text(models[1], exact=True).locator("xpath=../..")
+    expect(exact_row.get_by_text("Context 300,000 · model override", exact=True)).to_be_visible()
+    expect(
+        exact_row.get_by_text("Buffer 20,000 · Alpha × Claude Code", exact=True)
+    ).to_be_visible()
+    expect(inherited_row.get_by_text("Context 400,000 · Alpha × Claude Code")).to_be_visible()
+    expect(inherited_row.get_by_text("Buffer 10,000 · model override")).to_be_visible()
+    expect(
+        manager.get_by_text("Claude Code · all hosts: 500,000 context · 30,000 buffer", exact=True)
+    ).to_be_visible()
+    manager.get_by_role("button", name="Edit Alpha Claude Code All models", exact=True).click()
+    manager.get_by_role("spinbutton", name="Edit context total", exact=True).fill("")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/usage_context")
+        )
+    ):
+        manager.get_by_role("button", name="Save", exact=True).click()
+    expect(inherited_row.get_by_text("Context 500,000 · Claude Code · all hosts")).to_be_visible()
+    assert synced["value"]["overrides"][claude_cell] == {
+        "contextWindowTokens": None,
+        "autoCompactBufferTokens": 20000,
+    }
+    manager.get_by_role("button", name=f"Edit Alpha Claude Code {models[0]}", exact=True).click()
+    expect(
+        manager.get_by_role("spinbutton", name="Edit compact buffer", exact=True)
+    ).to_have_value("")
+    manager.get_by_role("spinbutton", name="Edit context total", exact=True).fill("250000")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/usage_context")
+        )
+    ):
+        manager.get_by_role("button", name="Save", exact=True).click()
+    saved = synced["value"]["overrides"]
+    assert len(writes) == 2
+    assert saved[claude_keys[0]] == {
+        "contextWindowTokens": 250000,
+        "autoCompactBufferTokens": None,
+    }
+    assert saved[claude_keys[1]] == layered[claude_keys[1]]
+    assert saved[claude_column] == layered[claude_column]
+    expect(exact_row.get_by_text("Context 250,000 · model override", exact=True)).to_be_visible()
+    expect(
+        exact_row.get_by_text("Buffer 20,000 · Alpha × Claude Code", exact=True)
+    ).to_be_visible()
+    exact_row.scroll_into_view_if_needed()
+    page.screenshot(path=str(output / f"saved-sources-provenance-{width}.png"), full_page=True)
+    assert manager.evaluate("element => element.scrollWidth <= element.clientWidth")
 
 
 @pytest.mark.parametrize("width", [1440, 390])

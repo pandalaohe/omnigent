@@ -1,9 +1,15 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerContextRing } from "./ComposerContextRing";
+import {
+  DEFAULT_USAGE_CONTEXT_PREFERENCES,
+  writeUsageContextPreferences,
+  usageContextSourceKey,
+  usageContextLevelKey,
+} from "@/lib/usageContextPreferences";
 
 function renderRing(contextWindow: number | null, tokensUsed: number | null) {
   return render(
@@ -14,6 +20,7 @@ function renderRing(contextWindow: number | null, tokensUsed: number | null) {
 }
 
 afterEach(cleanup);
+beforeEach(() => localStorage.clear());
 
 describe("ComposerContextRing", () => {
   it("renders nothing when the context window is unknown or zero", () => {
@@ -66,5 +73,40 @@ describe("ComposerContextRing", () => {
     const ring = screen.getByTestId("composer-context-ring");
     expect(ring).toHaveClass("text-muted-foreground");
     expect(ring.className).not.toMatch(/text-(warning|destructive)/);
+  });
+
+  it("uses layered values in the ring and explains invalid buffer fallback", async () => {
+    const source = { hostId: "host-a", agentName: "codex", harness: "codex", model: "gpt-x" };
+    writeUsageContextPreferences({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: {
+        [usageContextLevelKey(source, "cell")]: {
+          contextWindowTokens: 400_000,
+          autoCompactBufferTokens: 500_000,
+        },
+        [usageContextLevelKey(source, "column")]: {
+          contextWindowTokens: 500_000,
+          autoCompactBufferTokens: 20_000,
+        },
+      },
+    });
+    localStorage.setItem("omnigent:context-indicator-mode", "compact");
+    render(
+      <TooltipProvider>
+        <ComposerContextRing
+          contextWindow={200_000}
+          autoCompactTokenLimit={190_000}
+          tokensUsed={190_000}
+          sourceKey={usageContextSourceKey(source)}
+        />
+      </TooltipProvider>,
+    );
+    expect(screen.getByLabelText("50% of compact budget used")).toBeInTheDocument();
+    await userEvent.setup().tab();
+    expect(await screen.findByText("Context · host-a × codex")).toBeInTheDocument();
+    expect(screen.getByText("Buffer 20,000 · codex · all hosts")).toBeInTheDocument();
+    expect(
+      screen.getByText("Ignored host-a × codex: buffer ≥ context; using codex · all hosts."),
+    ).toBeInTheDocument();
   });
 });
