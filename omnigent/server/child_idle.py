@@ -760,9 +760,12 @@ class ChildIdleSweeper:
             host_summary: list[str] = []
             hub = getattr(self._app.state, "system_status", None)
             if hub is not None:
-                hosts = await asyncio.to_thread(child_host_ids, self._store, children)
-                if hosts:
-                    host_summary.append(hosts_line(hub, current_workspace_id(), hosts, now))
+                try:
+                    hosts = await asyncio.to_thread(child_host_ids, self._store, children)
+                    if hosts:
+                        host_summary.append(hosts_line(hub, current_workspace_id(), hosts, now))
+                except Exception:  # noqa: BLE001 — optional telemetry must not suppress check-ins
+                    _logger.warning("Child check-in host summary unavailable", exc_info=True)
             delivered_ids = {sid for sid, _, _ in previous}
             text = build_checkin_text(
                 policy.instructions,

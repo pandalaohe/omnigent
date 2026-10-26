@@ -381,8 +381,9 @@ async def test_independent_mothers_restart_and_repeat_cooldown(harness: _Harness
     assert len(harness.calls) == 4
 
 
+@pytest.mark.parametrize("summary_fails", [False, True])
 async def test_checkin_includes_all_child_hosts_and_spare_capacity(
-    harness: _Harness, tmp_path
+    harness: _Harness, tmp_path, monkeypatch: pytest.MonkeyPatch, summary_fails: bool
 ) -> None:
     from omnigent.server.system_status import SystemStatusHub
     from tests.server.test_host_load_notices import HOST_A, HOST_B, _report
@@ -394,6 +395,12 @@ async def test_checkin_includes_all_child_hosts_and_spare_capacity(
     harness.store.set_host_id(second.id, HOST_B, "/opt/work/other")
     hub = SystemStatusHub(tmp_path, None)
     harness.sweeper._app.state.system_status = hub
+    if summary_fails:
+
+        def fail_host_lookup(*_args):
+            raise RuntimeError("host summary unavailable")
+
+        monkeypatch.setattr("omnigent.server.host_load_notices.child_host_ids", fail_host_lookup)
     try:
         await harness.sweeper._tick()
         harness.now += 5400
@@ -402,10 +409,14 @@ async def test_checkin_includes_all_child_hosts_and_spare_capacity(
         _report(reporter, "normal", host=HOST_B, reason=None)
         await harness.sweeper._tick()
         assert len(harness.calls) == 1
-        assert (
-            f"Hosts: laptop-{HOST_A} 4.25/core spare; laptop-{HOST_B} 4.25/core normal"
-            in harness.calls[0][1]
-        )
+        assert first.id in harness.calls[0][1] and second.id in harness.calls[0][1]
+        if summary_fails:
+            assert "Hosts:" not in harness.calls[0][1]
+        else:
+            assert (
+                f"Hosts: laptop-{HOST_A} 4.25/core spare; laptop-{HOST_B} 4.25/core normal"
+                in harness.calls[0][1]
+            )
     finally:
         hub.close()
 
