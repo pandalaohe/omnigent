@@ -416,6 +416,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        keep_warm_family="pi",
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -629,6 +630,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
+        keep_warm_family="pi",
     ),
     "openai-agents": _C(
         _IM.SDK_IN_PROCESS,

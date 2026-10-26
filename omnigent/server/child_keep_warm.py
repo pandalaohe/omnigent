@@ -83,7 +83,6 @@ from omnigent.server.session_live_state import (
 from omnigent.server.session_overrides import (
     AGENT_TEMPLATE_ID_LABEL,
     harness_for_session,
-    resolve_override,
 )
 from omnigent.server.user_preferences_store import (
     KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S,
@@ -92,6 +91,7 @@ from omnigent.server.user_preferences_store import (
     KEEP_WARM_MAX_BOUNDS_S,
     KeepWarmSettings,
     keep_warm_for_agent,
+    keep_warm_row,
     migrate_legacy_keep_warm,
     read_keep_warm_settings,
 )
@@ -611,9 +611,9 @@ def keep_warm_family_for_harness(harness: str | None) -> Literal["claude", "code
     :returns: ``"claude"`` / ``"codex"`` for a server-ping channel,
         ``"pi"`` for Pi's provider-aware native cache reporting, else ``None``.
     """
-    if harness in ("pi", "pi-native"):
-        return "pi"
-    return _server_keep_warm_family_for_harness(harness)
+    record = harness_capabilities().get(harness or "")
+    family = record.keep_warm_family if record is not None else None
+    return family if family in ("claude", "codex", "pi") else None
 
 
 def _server_keep_warm_family_for_harness(
@@ -675,9 +675,9 @@ def pi_cache_warming_allowed(conv: Conversation, settings: KeepWarmSettings, now
         or _has_sync_pending(conv.id)
     ):
         return False
-    row = resolve_override(
-        settings.agents,
-        settings.default,
+    row = keep_warm_row(
+        settings,
+        host_id=conv.host_id,
         template_id=conv.labels.get(AGENT_TEMPLATE_ID_LABEL),
         agent_id=conv.agent_id,
         harness=harness_for_session(conv, {}),
@@ -799,6 +799,7 @@ def cold_after_for_agent(
     *,
     template_id: str | None = None,
     harness: str | None = None,
+    host_id: str | None = None,
 ) -> int | None:
     """
     Return the selected row's cold-after seconds, ignoring its switches.
@@ -808,9 +809,9 @@ def cold_after_for_agent(
     :returns: The stored ``cold_after_s`` (``0`` = never cold), or ``None``
         for the per-family rule.
     """
-    row = resolve_override(
-        settings.agents,
-        settings.default,
+    row = keep_warm_row(
+        settings,
+        host_id=host_id,
         template_id=template_id,
         agent_id=agent_id,
         harness=harness,
@@ -1336,7 +1337,12 @@ class ChildKeepWarmSweeper:
                 self._migrated_owners.add(owner)
         settings = await asyncio.to_thread(read_keep_warm_settings, preferences_store, owner)
         max_low, max_high = KEEP_WARM_MAX_BOUNDS_S
-        for row in (*settings.agents.values(), settings.default):
+        rows = (
+            [row for cells in settings.cells.values() for row in cells.values()]
+            if settings.cells is not None
+            else [*settings.agents.values(), settings.default]
+        )
+        for row in rows:
             clamped = min(max(row.max_s, max_low), max_high)
             self._scan_window_s = max(self._scan_window_s, clamped + _SLACK_S)
             # A session untouched for N can still need a tick when its N edge
@@ -1408,13 +1414,15 @@ class ChildKeepWarmSweeper:
                 by_session[conv.id] = None
                 continue
             template_id = conv.labels.get(AGENT_TEMPLATE_ID_LABEL)
-            if template_id in settings.agents:
+            if settings.cells is None and template_id in settings.agents:
                 by_session[conv.id] = settings.agents[template_id].cold_after_s
                 continue
-            if conv.agent_id in settings.agents:
+            if settings.cells is None and conv.agent_id in settings.agents:
                 by_session[conv.id] = settings.agents[conv.agent_id].cold_after_s
                 continue
-            if not any(key.startswith("harness:") for key in settings.agents):
+            if settings.cells is None and not any(
+                key.startswith("harness:") for key in settings.agents
+            ):
                 by_session[conv.id] = settings.default.cold_after_s
                 continue
             try:
@@ -1427,6 +1435,7 @@ class ChildKeepWarmSweeper:
                 conv.agent_id,
                 template_id=template_id,
                 harness=harness,
+                host_id=conv.host_id,
             )
         return by_session
 
@@ -1553,11 +1562,16 @@ class ChildKeepWarmSweeper:
         settings = await self._settings_for(owner, now, settings_cache)
         template_id = conv.labels.get(AGENT_TEMPLATE_ID_LABEL)
         cold_after = cold_after_for_agent(
-            settings, conv.agent_id, template_id=template_id, harness=harness
+            settings, conv.agent_id, template_id=template_id, harness=harness, host_id=conv.host_id
         )
         resolved = (
             keep_warm_for_agent(
-                settings, conv.agent_id, family, template_id=template_id, harness=harness
+                settings,
+                conv.agent_id,
+                family,
+                template_id=template_id,
+                harness=harness,
+                host_id=conv.host_id,
             )
             if family
             else None
@@ -1964,11 +1978,16 @@ class ChildKeepWarmSweeper:
         settings = await self._settings_for(owner, now, {})
         template_id = conv.labels.get(AGENT_TEMPLATE_ID_LABEL)
         cold_after = cold_after_for_agent(
-            settings, conv.agent_id, template_id=template_id, harness=harness
+            settings, conv.agent_id, template_id=template_id, harness=harness, host_id=conv.host_id
         )
         resolved = (
             keep_warm_for_agent(
-                settings, conv.agent_id, family, template_id=template_id, harness=harness
+                settings,
+                conv.agent_id,
+                family,
+                template_id=template_id,
+                harness=harness,
+                host_id=conv.host_id,
             )
             if family
             else None
