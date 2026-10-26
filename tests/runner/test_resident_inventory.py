@@ -1350,6 +1350,59 @@ async def test_runner_context_v2_preserves_partial_acp_process_scope(
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
 
 
+@pytest.mark.parametrize("family", ["copilot", "cursor", "antigravity"])
+async def test_runner_context_v2_reads_persistent_sdk_state_without_construction(
+    harness_inventory_reader, monkeypatch, tmp_path, family
+):
+    from omnigent.inner.antigravity_executor import AntigravityExecutor
+    from omnigent.inner.copilot_executor import CopilotExecutor, _CopilotSessionState
+    from omnigent.inner.cursor_executor import CursorExecutor, _CursorSessionState
+    from tests.inner.test_antigravity_executor import _install_fake_sdk as install_antigravity
+    from tests.inner.test_copilot_executor import _install_fake_copilot as install_copilot
+    from tests.inner.test_cursor_executor import _install_fake_sdk as install_cursor
+
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    key = adapter._session_key
+    if family == "copilot":
+        captured = install_copilot(monkeypatch)
+        executor = CopilotExecutor(
+            cwd=str(tmp_path), github_host="example.test", github_token="fixture-token"
+        )
+        state = _CopilotSessionState()
+        executor._session_states[key] = state
+        await executor._ensure_session(state, None, [], "")
+        creates = captured["create_kwargs"]
+    elif family == "cursor":
+        captured = install_cursor(monkeypatch)
+        executor = CursorExecutor(cwd=str(tmp_path), api_key="fixture-key")
+        state = _CursorSessionState()
+        executor._session_states[key] = state
+        await executor._ensure_session(state, "auto-smart", [])
+        creates = captured["create_models"]
+    else:
+        captured = install_antigravity(monkeypatch, scripts=[])
+        executor = AntigravityExecutor(api_key="fixture-key")
+        await executor._ensure_agent(key, model=None, system_prompt="", tools=[])
+        creates = captured["agents"]
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    for retired in (False, True):
+        if retired:
+            await executor.close_session(key)
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.execution_keys == (key,) and record.vendor_id is None
+        assert record.lifecycle == ("unknown" if retired else "live")
+        assert record.provenance == "primary" and record.operation.action == "create"
+        assert record.aliases == () and record.stop_proof is record.continuity_proof is None
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+    assert len(creates) == 1
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
 async def test_runner_context_v2_preserves_pi_rpc_pending_and_retired_owner(
     harness_inventory_reader, monkeypatch
 ):

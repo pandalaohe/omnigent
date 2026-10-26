@@ -52,7 +52,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
 
+from omnigent.inner.sdk_context_inventory import SdkContextSource
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.startup_protocol import ContextEvidenceV2, ContextKeyV2
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 from .datamodel import OSEnvSpec
@@ -578,6 +580,8 @@ async def _bridge_spawn_in_cwd(cwd: str) -> AsyncIterator[None]:
 class _CursorSessionState:
     """Per-Omnigent-conversation SDK session state."""
 
+    context_key: ContextKeyV2 | None = None
+    retired: bool = False
     client: object | None = None  # cursor_sdk.AsyncClient
     agent: _CursorAgent | None = None  # cursor_sdk.AsyncAgent
     system_prompt: str | None = None
@@ -631,6 +635,13 @@ class CursorExecutor(Executor):
         self._skills_filter = skills_filter
         self._permission_mode = permission_mode or "auto"
         self._session_states: dict[str, _CursorSessionState] = {}
+        self._context_source = SdkContextSource(
+            lambda: {
+                state.context_key
+                for state in self._session_states.values()
+                if state.context_key is not None and state.agent is not None
+            }
+        )
         # Installed by the runtime adapter; routes a bridged-tool call back into
         # Omnigent's session (policy gating, sub-agent dispatch, logging).
         self._tool_executor: ToolExecutor | None = None
@@ -646,6 +657,11 @@ class CursorExecutor(Executor):
 
     def supports_streaming(self) -> bool:
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        return await self._context_source.prepare(session_id, read_id, timeout_s=timeout_s)
 
     def supports_tool_calling(self) -> bool:
         return True
@@ -814,6 +830,8 @@ class CursorExecutor(Executor):
         including those that execute silently without emitting ``tool_call``
         SDK messages.
         """
+        if state.retired:
+            raise RuntimeError("Cursor state retired during startup")
         if state.agent is not None:
             return
         try:
@@ -846,10 +864,27 @@ class CursorExecutor(Executor):
         # Cursor's shell tools execute there, not in the runner daemon's
         # directory (the SDK spawns the bridge without a cwd=). See
         # _bridge_spawn_in_cwd.
-        async with _bridge_spawn_in_cwd(cwd):
-            client = await AsyncClient.launch_bridge(workspace=cwd)
+        execution_keys = tuple(
+            k for k, current in self._session_states.items() if current is state
+        )
+        key = self._context_source.begin(execution_keys)
+        state.context_key = key
+
+        def current() -> bool:
+            return (
+                not state.retired
+                and state.context_key == key
+                and all(self._session_states.get(k) is state for k in execution_keys)
+            )
+
+        client = None
+        agent = None
         try:
+            async with _bridge_spawn_in_cwd(cwd):
+                client = await AsyncClient.launch_bridge(workspace=cwd)
             model = await _resolve_model_against_catalog(client, model, self._api_key)
+            if not current():
+                raise RuntimeError("Cursor state retired during startup")
             local_kwargs: _JsonObject = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
@@ -871,12 +906,22 @@ class CursorExecutor(Executor):
                 name=self._agent_name,
                 local=local,
             )
+            if not current():
+                raise RuntimeError("Cursor state retired during startup")
         except BaseException:
-            await _safe_close(client)
+            self._context_source.mark(key, "closing")
+            try:
+                if agent is not None:
+                    await _safe_close(agent)
+                if client is not None:
+                    await _safe_close(client)
+            finally:
+                self._context_source.mark(key, "unknown")
             raise
         state.client = client
         state.agent = agent
         state.model = model
+        self._context_source.mark(key, "live")
 
     async def run_turn(
         self,
@@ -902,6 +947,8 @@ class CursorExecutor(Executor):
                 or state.tools_fingerprint != tools_fp
             ):
                 await self._close_state(state)
+                if self._session_states.get(session_key) is not state:
+                    raise RuntimeError("Cursor state retired during rebuild")
                 state = _CursorSessionState()
                 self._session_states[session_key] = state
             is_first_turn = not state.has_sent_prompt
@@ -910,11 +957,11 @@ class CursorExecutor(Executor):
             await self._ensure_session(state, model, tools)
             state.requested_model = requested_model
         except UnresolvableCursorModelError as exc:
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             yield ExecutorError(message=str(exc))
             return
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             yield ExecutorError(message=f"Failed to start cursor-sdk agent: {exc}")
             return
 
@@ -1027,7 +1074,7 @@ class CursorExecutor(Executor):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — the SDK run failed mid-turn
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             yield ExecutorError(message=f"cursor-sdk turn failed: {exc}", retryable=True)
             return
 
@@ -1037,21 +1084,21 @@ class CursorExecutor(Executor):
         # session down (the agent/bridge may be in an inconsistent state).
         status = getattr(result, "status", "")
         if status == "error":
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             detail = getattr(result, "result", "") or "cursor-sdk run reported an error"
             yield ExecutorError(message=f"cursor-sdk run error: {detail}", retryable=True)
             return
         if status == "expired":
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             detail = getattr(result, "result", "") or "cursor-sdk run expired"
             yield ExecutorError(message=f"cursor-sdk run expired: {detail}", retryable=True)
             return
         if status == "cancelled":
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             yield TurnCancelled(reason="cursor-sdk run cancelled")
             return
         if status != "finished":
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             detail = getattr(result, "result", "") or "cursor-sdk run finished with unknown status"
             yield ExecutorError(
                 message=f"cursor-sdk run returned non-finished status {status!r}: {detail}",
@@ -1085,6 +1132,15 @@ class CursorExecutor(Executor):
         yield TurnComplete(response=final, usage=turn_usage)
 
     async def _close_state(self, state: _CursorSessionState) -> None:
+        state.retired = True
+        key, state.context_key = state.context_key, None
+        self._context_source.mark(key, "closing")
+        try:
+            await self._close_state_unobserved(state)
+        finally:
+            self._context_source.mark(key, "unknown")
+
+    async def _close_state_unobserved(self, state: _CursorSessionState) -> None:
         if state.agent is not None:
             await _safe_close(state.agent)
             state.agent = None
@@ -1107,6 +1163,11 @@ class CursorExecutor(Executor):
         if state is not None:
             await self._close_state(state)
 
+    async def _close_session_state(self, session_key: str, state: _CursorSessionState) -> None:
+        if self._session_states.get(session_key) is state:
+            self._session_states.pop(session_key)
+        await self._close_state(state)
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
         if state is None:
@@ -1115,7 +1176,7 @@ class CursorExecutor(Executor):
         # pi/cursor-acp executors (a resumed turn would bypass the runner's
         # interrupt marker).
         try:
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             return True
         except Exception as exc:  # noqa: BLE001 — close failures surface as False
             logger.debug("CursorExecutor: close after interrupt failed: %s", exc)
