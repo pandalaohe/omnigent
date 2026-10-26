@@ -8,11 +8,13 @@ import { useHosts } from "@/hooks/useHosts";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import {
   layerId,
+  layerShape,
   instructionRegistryItems,
   instructionGridAxes,
   hasInstructionText,
   useSaveInstructionLayer,
   type InstructionLayer,
+  type InstructionRole,
   useInstructionLayers,
   useInstructionPreview,
   type LayerKey,
@@ -56,6 +58,9 @@ export function InstructionsPage() {
     initialText: string;
   } | null>(null);
   const session = params.get("session");
+  const roleParam = params.get("role");
+  const role: InstructionRole =
+    roleParam === "mother" || roleParam === "child" ? roleParam : "route";
   const view = session || params.get("view") === "route" ? "route" : "overview";
   const hostId = params.get("host") ?? hosts.data?.[0]?.host_id ?? "";
   const agentKey = params.get("agent") ?? data.data?.agents[0]?.key ?? "";
@@ -152,11 +157,23 @@ export function InstructionsPage() {
     if (!canEdit) return;
     const existing = data.data?.data.find((layer) => layerId(layer) === layerId(key));
     const stack =
-      key.scope === "independent" && !hasInstructionText(existing?.text)
+      layerShape(key) === "independent" && !hasInstructionText(existing?.text)
         ? [
-            { scope: "shared", agent_key: "", host_id: "" },
-            { scope: "agent", agent_key: key.agent_key, host_id: "" },
-            { scope: "host", agent_key: "", host_id: key.host_id },
+            {
+              scope: key.scope === "independent" ? "shared" : key.scope,
+              agent_key: "",
+              host_id: "",
+            },
+            {
+              scope: key.scope === "independent" ? "agent" : key.scope,
+              agent_key: key.agent_key,
+              host_id: "",
+            },
+            {
+              scope: key.scope === "independent" ? "host" : key.scope,
+              agent_key: "",
+              host_id: key.host_id,
+            },
           ]
             .map(
               (source) =>
@@ -216,41 +233,67 @@ export function InstructionsPage() {
               <TabsTrigger value="route">Route total</TabsTrigger>
             </TabsList>
             <TabsContent value="overview" className="mt-4 space-y-4">
-              <LayerGrid
-                data={data.data}
-                hosts={axes.hosts}
-                allHosts={hosts.data ?? []}
-                agents={axes.agents}
-                agentLayers={axes.agentLayers}
-                hostLayers={axes.hostLayers}
-                onRemove={remove}
-                addAgent={
-                  <AgentPicker
-                    items={pickerItems}
-                    taken={new Set(axes.agents.map((agent) => agent.key))}
-                    onPick={(key) => {
-                      const latest = readInstructionGridPreferences();
-                      setLayout({ ...latest, agents: [...latest.agents, key] });
-                    }}
-                    title="Add agent"
-                    description="Give one agent its own instruction text."
-                    trigger={<Button variant="outline">Add agent</Button>}
-                  />
+              <Tabs
+                value={role}
+                onValueChange={(value) =>
+                  setParams((previous) => {
+                    const next = new URLSearchParams(previous);
+                    next.set("role", value);
+                    return next;
+                  })
                 }
-                addHost={
-                  <HostPicker
-                    hosts={hosts.data ?? []}
-                    taken={new Set(axes.hosts.map((host) => host.host_id))}
-                    onPick={(id) => {
-                      const latest = readInstructionGridPreferences();
-                      setLayout({ ...latest, hosts: [...latest.hosts, id] });
-                    }}
+              >
+                <TabsList aria-label="Instruction grid">
+                  <TabsTrigger value="route">Shared instructions</TabsTrigger>
+                  <TabsTrigger value="mother">Mother</TabsTrigger>
+                  <TabsTrigger value="child">Child</TabsTrigger>
+                </TabsList>
+                <TabsContent value={role} className="mt-2">
+                  <LayerGrid
+                    role={role}
+                    data={data.data}
+                    hosts={axes.hosts}
+                    allHosts={hosts.data ?? []}
+                    agents={axes.agents}
+                    agentLayers={axes.agentLayers}
+                    hostLayers={axes.hostLayers}
+                    onRemove={remove}
+                    addAgent={
+                      <AgentPicker
+                        items={pickerItems}
+                        taken={new Set(axes.agents.map((agent) => agent.key))}
+                        onPick={(key) => {
+                          const latest = readInstructionGridPreferences();
+                          setLayout({ ...latest, agents: [...latest.agents, key] });
+                        }}
+                        title="Add agent"
+                        description="Give one agent its own instruction text."
+                        trigger={<Button variant="outline">Add agent</Button>}
+                      />
+                    }
+                    addHost={
+                      <HostPicker
+                        hosts={hosts.data ?? []}
+                        taken={new Set(axes.hosts.map((host) => host.host_id))}
+                        onPick={(id) => {
+                          const latest = readInstructionGridPreferences();
+                          setLayout({ ...latest, hosts: [...latest.hosts, id] });
+                        }}
+                      />
+                    }
+                    canEdit={canEdit}
+                    onEdit={edit}
+                    onRoute={(host, agent) =>
+                      route({
+                        host,
+                        agent,
+                        ...(role === "route" ? {} : { child: role === "child" ? "1" : "0" }),
+                        ...(role === "mother" ? { spawn: "1" } : {}),
+                      })
+                    }
                   />
-                }
-                canEdit={canEdit}
-                onEdit={edit}
-                onRoute={(host, agent) => route({ host, agent })}
-              />
+                </TabsContent>
+              </Tabs>
             </TabsContent>
             <TabsContent value="route" className="mt-4 space-y-5">
               {session && (
@@ -361,11 +404,12 @@ export function InstructionsPage() {
             name={removal.name}
             layers={removal.layers.map((layer) => ({
               id: layerId(layer),
+              grid: layer.scope === "mother" || layer.scope === "child" ? layer.scope : "route",
               label:
-                layer.scope === "agent"
+                layerShape(layer) === "agent"
                   ? (data.data?.agents.find((agent) => agent.key === layer.agent_key)
                       ?.display_name ?? layer.agent_key)
-                  : layer.scope === "host"
+                  : layerShape(layer) === "host"
                     ? (hosts.data?.find((host) => host.host_id === layer.host_id)?.name ??
                       layer.host_id)
                     : `${hosts.data?.find((host) => host.host_id === layer.host_id)?.name ?? layer.host_id} / ${data.data?.agents.find((agent) => agent.key === layer.agent_key)?.display_name ?? layer.agent_key}`,

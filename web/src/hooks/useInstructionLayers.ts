@@ -6,6 +6,7 @@ import type { InstructionGridLayout } from "@/lib/instructionGridPreferences";
 import { authenticatedFetch } from "@/lib/identity";
 
 export type LayerScope = "shared" | "agent" | "host" | "independent" | "mother" | "child";
+export type InstructionRole = "route" | "mother" | "child";
 export interface LayerKey {
   scope: LayerScope;
   agent_key: string;
@@ -13,6 +14,11 @@ export interface LayerKey {
 }
 export function layerId(key: LayerKey) {
   return JSON.stringify([key.scope, key.agent_key, key.host_id]);
+}
+export function layerShape(key: LayerKey): "shared" | "agent" | "host" | "independent" {
+  if (key.scope !== "mother" && key.scope !== "child") return key.scope;
+  if (key.agent_key) return key.host_id ? "independent" : "agent";
+  return key.host_id ? "host" : "shared";
 }
 export interface InstructionLayer extends LayerKey {
   text: string;
@@ -84,21 +90,23 @@ export function instructionGridAxes(
   const hostLayers = new Map<string, InstructionLayer[]>();
   const eligibleLayers = data.data.filter((layer) => {
     if (!hasInstructionText(layer.text)) return false;
-    if (layer.scope === "agent") return agentKeys.has(layer.agent_key);
+    const shape = layerShape(layer);
+    if (shape === "agent") return agentKeys.has(layer.agent_key);
     const existingHost = hostIds.has(layer.host_id) && !layer.host_removed;
     return (
       existingHost &&
-      (layer.scope === "host" || (layer.scope === "independent" && agentKeys.has(layer.agent_key)))
+      (shape === "host" || (shape === "independent" && agentKeys.has(layer.agent_key)))
     );
   });
   const append = (map: Map<string, InstructionLayer[]>, id: string, layer: InstructionLayer) => {
     map.set(id, [...(map.get(id) ?? []), layer]);
   };
   for (const layer of eligibleLayers) {
-    if (layer.scope === "agent" || layer.scope === "independent") {
+    const shape = layerShape(layer);
+    if (shape === "agent" || shape === "independent") {
       append(agentLayers, layer.agent_key, layer);
     }
-    if (layer.scope === "host" || layer.scope === "independent") {
+    if (shape === "host" || shape === "independent") {
       append(hostLayers, layer.host_id, layer);
     }
   }
