@@ -149,16 +149,58 @@ async def _harness_context_source_v2(
         ),
         None,
     )
-    if owner is None:
-        return _unknown_context_source(scope, "no_resident_harness")
-    reconcile = await process_manager.prepare_context_inventory_v2(owner, timeout_s=timeout_s)
-    snapshot = reconcile()
-    sources = snapshot.evidence.sources
-    if snapshot.evidence.authority != harness_context_authority_v2(session_id):
-        return _unknown_context_source(scope, "foreign_session")
-    if len(sources) != 1 or sources[0].scope != scope:
-        return _unknown_context_source(scope, "invalid_harness_evidence")
-    return sources[0]
+    source = _unknown_context_source(scope, "no_resident_harness")
+    reconcile = None
+    if owner is not None:
+        reconcile = await process_manager.prepare_context_inventory_v2(owner, timeout_s=timeout_s)
+    current = await process_manager.resident_inventory()
+    if reconcile is not None:
+        snapshot = reconcile()
+        sources = snapshot.evidence.sources
+        if snapshot.evidence.authority != harness_context_authority_v2(session_id):
+            source = _unknown_context_source(scope, "foreign_session")
+        elif len(sources) != 1 or sources[0].scope != scope:
+            source = _unknown_context_source(scope, "invalid_harness_evidence")
+        else:
+            source = sources[0]
+    current_live = {
+        candidate.incarnation_id
+        for candidate in current.owners
+        if not candidate.closing and not candidate.wrapper_exited and not candidate.exit_confirmed
+    }
+    predecessors = {
+        candidate.incarnation_id
+        for candidate in (*selected.owners, *current.owners)
+        if candidate.session_id == session_id
+        and not candidate.exit_confirmed
+        and candidate.incarnation_id not in current_live
+    }
+    gaps = tuple(
+        UnresolvedContextV2(candidate=incarnation, reason="harness_predecessor_exit_unconfirmed")
+        for incarnation in sorted(predecessors)
+    )
+    if not selected.exit_coverage_complete or not current.exit_coverage_complete:
+        gaps += (UnresolvedContextV2(candidate=None, reason="harness_exit_coverage_incomplete"),)
+    if not gaps:
+        return source
+    unresolved = (*source.unresolved, *gaps)
+    if len(unresolved) > 1000:
+        unresolved = (
+            *unresolved[:999],
+            UnresolvedContextV2(candidate=None, reason="harness_predecessor_reason_budget"),
+        )
+    return source.model_copy(
+        update={
+            "coverage": "unsupported" if source.coverage == "unsupported" else "partial",
+            "unresolved": unresolved,
+            "membership_revision": None,
+            "context_revision": None,
+            "work_revision": None,
+            "revision_authority": "observation_only",
+            "age_upper_bound_s": None,
+            "work_bindings": None,
+        }
+    )
 
 
 async def session_context_evidence_v2(

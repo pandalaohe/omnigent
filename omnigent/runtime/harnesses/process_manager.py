@@ -127,6 +127,8 @@ _SOCKET_MODE = 0o600
 # NOT depend on a specific value.
 _DEFAULT_IDLE_TIMEOUT_S = 60 * 60  # 1 hour
 RETENTION_LEASE_S = 1200
+# Diagnostic candidates are bounded independently of resident capacity policy.
+_MAX_RETIRED_OWNER_CANDIDATES = 1000
 
 # How often the idle reaper wakes up to check for stale entries.
 # Picking 1/30th of the timeout keeps reaping reasonably prompt
@@ -663,6 +665,7 @@ class HarnessProcessManager:
         self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
         self._closing_entries: dict[str, tuple[str, _SubprocessEntry]] = {}
+        self._retired_owners: dict[str, HarnessResidentSnapshot] = {}
         self._spawning_sessions: set[str] = set()
         self._exit_coverage_complete = True
         # Per-conversation in-flight harness response_id. The runner's
@@ -784,6 +787,12 @@ class HarnessProcessManager:
                 )
                 for session_id, entry, closing in entries
             )
+            current_incarnations = {snapshot.incarnation_id for snapshot in snapshots}
+            retired = tuple(
+                owner
+                for incarnation, owner in self._retired_owners.items()
+                if incarnation not in current_incarnations
+            )
             contexts = None
             if context_reads is not None:
                 reads = {
@@ -809,9 +818,9 @@ class HarnessProcessManager:
                     for snapshot, (session_id, entry, closing) in zip(
                         snapshots, entries, strict=True
                     )
-                )
+                ) + (None,) * len(retired)
             return HarnessInventorySnapshot(
-                snapshots,
+                snapshots + retired,
                 self._exit_coverage_complete and not self._spawning_sessions,
                 contexts,
             )
@@ -1170,12 +1179,7 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
-                    if (
-                        not released.exit_confirmed
-                        and self._entries.get(conversation_id) is not released
-                    ):
-                        self._exit_coverage_complete = False
-                    self._closing_entries.pop(released.incarnation_id, None)
+                    self._finish_closing_entry(conversation_id, released)
                 raise
             if closed:
                 self._closing_entries.pop(released.incarnation_id, None)
@@ -1517,12 +1521,7 @@ class HarnessProcessManager:
                         if not await self._close_entry(entry):
                             self._entries[conversation_id] = entry
                     finally:
-                        if (
-                            not entry.exit_confirmed
-                            and self._entries.get(conversation_id) is not entry
-                        ):
-                            self._exit_coverage_complete = False
-                        self._closing_entries.pop(entry.incarnation_id, None)
+                        self._finish_closing_entry(conversation_id, entry)
                     raise RuntimeError(
                         "HarnessProcessManager shut down during spawn for "
                         f"conversation {conversation_id!r}"
@@ -1818,12 +1817,7 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
-                    if (
-                        not entry.exit_confirmed
-                        and self._entries.get(conversation_id) is not entry
-                    ):
-                        self._exit_coverage_complete = False
-                    self._closing_entries.pop(entry.incarnation_id, None)
+                    self._finish_closing_entry(conversation_id, entry)
                 raise
             if closed:
                 self._closing_entries.pop(entry.incarnation_id, None)
@@ -2105,6 +2099,23 @@ class HarnessProcessManager:
             stderr=None,
             env=effective_env,
         )
+
+    def _finish_closing_entry(self, session_id: str, entry: _SubprocessEntry) -> None:
+        if not entry.exit_confirmed and self._entries.get(session_id) is not entry:
+            self._exit_coverage_complete = False
+            if len(self._retired_owners) < _MAX_RETIRED_OWNER_CANDIDATES:
+                self._retired_owners.setdefault(
+                    entry.incarnation_id,
+                    HarnessResidentSnapshot(
+                        entry.incarnation_id,
+                        session_id,
+                        entry.harness,
+                        closing=True,
+                        wrapper_exited=entry.process.returncode is not None,
+                        exit_confirmed=False,
+                    ),
+                )
+        self._closing_entries.pop(entry.incarnation_id, None)
 
     async def _close_entry(self, entry: _SubprocessEntry) -> bool:
         """

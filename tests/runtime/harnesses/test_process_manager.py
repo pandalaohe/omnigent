@@ -2594,11 +2594,28 @@ async def test_inventory_records_unknown_exit_without_retaining_the_wrapper(
                 expected_activity_token=manager._retention_activity_token("conv_wrapper", entry),
             )
     snapshot = await manager.resident_inventory()
-    assert snapshot.owners == ()
+    (retired,) = snapshot.owners
+    assert retired.incarnation_id == entry.incarnation_id
+    assert retired.session_id == "conv_wrapper"
+    assert retired.closing and retired.wrapper_exited and not retired.exit_confirmed
     assert not snapshot.exit_coverage_complete
     assert not manager._closing_entries
     assert await close(entry)
-    assert (await manager.resident_inventory()).owners == ()
+    # A wrapper-only late close cannot establish the vendor/descendant lifetime.
+    assert (await manager.resident_inventory()).owners == (retired,)
+    replacement = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    manager._entries["conv_wrapper"] = replacement
+    current = await manager.resident_inventory(context_reads=())
+    assert {owner.incarnation_id for owner in current.owners} == {
+        retired.incarnation_id,
+        replacement.incarnation_id,
+    }
+    assert current.contexts == (None, None)
     assert not (await manager.resident_inventory()).exit_coverage_complete
 
 
@@ -2933,9 +2950,41 @@ async def test_shutdown_spawn_close_remains_in_inventory(
         with pytest.raises(asyncio.CancelledError if outcome == "cancelled" else RuntimeError):
             await task
     snapshot = await manager.resident_inventory()
-    assert snapshot.owners == ()
+    assert [owner.incarnation_id for owner in snapshot.owners] == (
+        [] if outcome == "confirmed" else [entry.incarnation_id]
+    )
+    assert all(owner.closing and not owner.exit_confirmed for owner in snapshot.owners)
     assert snapshot.exit_coverage_complete is (outcome == "confirmed")
     assert not manager._closing_entries
+
+
+async def test_retired_owner_candidate_budget_never_becomes_empty_proof(
+    short_tmp_parent, monkeypatch
+):
+    from omnigent.runtime.harnesses import process_manager
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    monkeypatch.setattr(process_manager, "_MAX_RETIRED_OWNER_CANDIDATES", 1)
+
+    async def failed_close(entry):
+        entry.process.returncode = 0
+        raise RuntimeError("owned exit unconfirmed")
+
+    monkeypatch.setattr(manager, "_close_entry", failed_close)
+    for session in ("first", "second"):
+        manager._entries[session] = _SubprocessEntry(
+            SimpleNamespace(returncode=None),
+            _NoopHarnessClient(),  # type: ignore[arg-type]
+            _CleanupCountingEndpoint(),  # type: ignore[arg-type]
+            "codex",
+        )
+        with pytest.raises(RuntimeError, match="owned exit unconfirmed"):
+            await manager.release(session)
+    snapshot = await manager.resident_inventory(context_reads=())
+    assert len(snapshot.owners) == 1 and snapshot.owners[0].session_id == "first"
+    assert snapshot.contexts == (None,)
+    assert not snapshot.exit_coverage_complete
+    assert not manager._entries and not manager._closing_entries
 
 
 async def test_shutdown_during_spawn_leaves_no_live_process(

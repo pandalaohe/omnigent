@@ -1185,6 +1185,136 @@ def _v2_evidence(payload, *, session_id: str):
     )
 
 
+@pytest.mark.parametrize("successor", [False, True])
+async def test_runner_preserves_unconfirmed_predecessor_after_registry_replacement(
+    harness_inventory_reader, monkeypatch, tmp_path, successor
+):
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+
+    manager, add, client, requests = harness_inventory_reader
+    retired, _ = await add("one", ExecutorResidentInventory(owners=()))
+
+    async def failed_close(entry):
+        entry.process.returncode = 0
+        raise RuntimeError("owned exit unconfirmed")
+
+    monkeypatch.setattr(manager, "_close_entry", failed_close)
+    with monkeypatch.context() as setup:
+        setup.setattr(
+            manager, "_retention_expiry", HarnessProcessManager._retention_expiry.__get__(manager)
+        )
+        with pytest.raises(RuntimeError, match="owned exit unconfirmed"):
+            await manager.release("one")
+    if successor:
+        executor = AcpExecutor(AcpAgentConfig(command="fake-acp"), cwd=str(tmp_path))
+        executor._proc = SimpleNamespace(returncode=None)
+        monkeypatch.setattr(executor._mcp, "session_new_servers", lambda **_: [])
+        executor._rpc = AsyncMock(return_value={"result": {"sessionId": "new-primary"}})
+        await executor._ensure_session()
+        current, _ = await add("one", None, executor=executor, harness_family="acp")
+        current.incarnation_id = "successor-one"
+        executor._rpc.side_effect = AssertionError("read must not query a vendor")
+    response = await client.get("/v1/startup/owner-inventory?read_id=predecessor")
+    body = response.json()["harnesses"]
+    assert {owner["incarnation_id"] for owner in body["owners"]} == (
+        {"harness-one", "successor-one"} if successor else {"harness-one"}
+    )
+    assert len(body["contexts"]) == len(body["owners"])
+    assert body["contexts"][-1] is None
+    assert not body["exit_coverage_complete"]
+    requests.clear()
+    source = _v2_evidence(
+        (
+            await client.get(
+                "/v2/startup/context-inventory",
+                params={"read_id": "v2-read", "session_id": "one"},
+            )
+        ).content,
+        session_id="one",
+    ).sources[0]
+    assert any(
+        gap.candidate == retired.incarnation_id
+        and gap.reason == "harness_predecessor_exit_unconfirmed"
+        for gap in source.unresolved
+    )
+    assert source.coverage == ("partial" if successor else "unsupported")
+    assert [record.vendor_id.value for record in source.contexts] == (
+        ["new-primary"] if successor else []
+    )
+    assert source.revision_authority == "observation_only"
+    assert source.age_upper_bound_s is source.work_revision is source.work_bindings is None
+    assert requests == (
+        [("one", "/v2/sessions/one/resident-context-inventory")] if successor else []
+    )
+
+
+async def test_runner_v2_rechecks_owner_after_final_registry_wait(
+    harness_inventory_reader, monkeypatch
+):
+    manager, add, client, requests = harness_inventory_reader
+    retired, _ = await add("one", ExecutorResidentInventory(owners=()))
+    original = manager.resident_inventory
+    entered, resume = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def inventory(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            await resume.wait()
+        return await original(**kwargs)
+
+    monkeypatch.setattr(manager, "resident_inventory", inventory)
+    task = asyncio.create_task(
+        client.get(
+            "/v2/startup/context-inventory",
+            params={"read_id": "v2-read", "session_id": "one"},
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        replacement, _ = await add("one", ExecutorResidentInventory(owners=()))
+        replacement.incarnation_id = "replacement-one"
+        resume.set()
+        source = _v2_evidence((await asyncio.wait_for(task, 2)).content, session_id="one").sources[
+            0
+        ]
+        assert "owner_changed" in {gap.reason for gap in source.unresolved}
+        assert any(gap.candidate == retired.incarnation_id for gap in source.unresolved)
+        assert source.contexts == () and source.revision_authority == "observation_only"
+        assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+    finally:
+        resume.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_runner_v2_retired_owner_reason_budget_stays_unknown(harness_inventory_reader):
+    from omnigent.runtime.harnesses.process_manager import HarnessResidentSnapshot
+
+    manager, _add, client, requests = harness_inventory_reader
+    manager._retired_owners = {
+        f"retired-{index}": HarnessResidentSnapshot(
+            f"retired-{index}", "one", "codex", True, True, False
+        )
+        for index in range(1000)
+    }
+    manager._exit_coverage_complete = False
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "one"},
+    )
+    source = _v2_evidence(response.content, session_id="one").sources[0]
+    assert len(source.unresolved) == 1000
+    assert source.unresolved[-1].reason == "harness_predecessor_reason_budget"
+    assert source.coverage == "unsupported" and source.contexts == ()
+    assert source.revision_authority == "observation_only"
+    assert source.membership_revision is source.age_upper_bound_s is None
+    assert requests == []
+
+
 async def test_runner_context_inventory_v2_binds_session_scopes(harness_inventory_reader):
     _manager, add, client, requests = harness_inventory_reader
     await add("one", ExecutorResidentInventory(owners=()))
