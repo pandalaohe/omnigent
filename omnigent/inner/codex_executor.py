@@ -3027,6 +3027,14 @@ def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None
             error = f"Command exited with status {exit_code}."
             suffix = f"[exit code: {exit_code}]"
             result = f"{result}\n{suffix}" if result else suffix
+        # failed/declined may omit exitCode, so the numeric exit alone cannot
+        # decide success; prefixing the marker keeps it visible under the cap.
+        command_status = item.get("status")
+        if command_status in ("failed", "declined"):
+            status = ToolCallStatus.ERROR
+            error = f"Command ended with status {command_status}."
+            marker = f"[command status: {command_status}]"
+            result = f"{marker}\n{result}" if result else marker
     else:
         changes = item.get("changes")
         assert isinstance(changes, list)

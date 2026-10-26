@@ -4982,6 +4982,300 @@ def test_codex_builtin_command_completion_surfaces_nonzero_exit() -> None:
     assert completion.error == "Command exited with status 3."
 
 
+_OMITTED = object()
+
+
+@pytest.mark.parametrize(
+    ("item_status", "exit_code", "output", "expected_status", "expected_result", "expected_error"),
+    [
+        pytest.param(
+            "failed",
+            _OMITTED,
+            "boom",
+            ToolCallStatus.ERROR,
+            "[command status: failed]\nboom",
+            "Command ended with status failed.",
+            id="failed-no-exit-code",
+        ),
+        pytest.param(
+            "failed",
+            None,
+            None,
+            ToolCallStatus.ERROR,
+            "[command status: failed]",
+            "Command ended with status failed.",
+            id="failed-null-exit-code-empty-output",
+        ),
+        pytest.param(
+            "declined",
+            _OMITTED,
+            "refused",
+            ToolCallStatus.ERROR,
+            "[command status: declined]\nrefused",
+            "Command ended with status declined.",
+            id="declined-no-exit-code",
+        ),
+        pytest.param(
+            "declined",
+            None,
+            "",
+            ToolCallStatus.ERROR,
+            "[command status: declined]",
+            "Command ended with status declined.",
+            id="declined-empty-output",
+        ),
+        pytest.param(
+            "failed",
+            0,
+            "boom",
+            ToolCallStatus.ERROR,
+            "[command status: failed]\nboom",
+            "Command ended with status failed.",
+            id="failed-zero-exit-contradiction",
+        ),
+        pytest.param(
+            "declined",
+            0,
+            None,
+            ToolCallStatus.ERROR,
+            "[command status: declined]",
+            "Command ended with status declined.",
+            id="declined-zero-exit-contradiction",
+        ),
+        pytest.param(
+            "failed",
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "[command status: failed]\nboom\n[exit code: 3]",
+            "Command ended with status failed.",
+            id="failed-nonzero-exit",
+        ),
+        pytest.param(
+            "declined",
+            3,
+            None,
+            ToolCallStatus.ERROR,
+            "[command status: declined]\n[exit code: 3]",
+            "Command ended with status declined.",
+            id="declined-nonzero-exit",
+        ),
+        pytest.param(
+            "completed",
+            0,
+            "ok\n",
+            ToolCallStatus.SUCCESS,
+            "ok\n",
+            None,
+            id="completed-zero-exit",
+        ),
+        pytest.param(
+            "completed",
+            _OMITTED,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="completed-no-exit-code",
+        ),
+        pytest.param(
+            "completed",
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="completed-nonzero-exit",
+        ),
+        pytest.param(
+            _OMITTED,
+            0,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="legacy-absent-status-zero-exit",
+        ),
+        pytest.param(
+            _OMITTED,
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="legacy-absent-status-nonzero-exit",
+        ),
+        pytest.param(
+            None,
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="legacy-null-status-nonzero-exit",
+        ),
+        pytest.param(
+            None,
+            None,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="legacy-null-status-null-exit",
+        ),
+        pytest.param(
+            "inProgress",
+            0,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="unknown-status-zero-exit",
+        ),
+        pytest.param(
+            "inProgress",
+            None,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="unknown-status-null-exit",
+        ),
+        pytest.param(
+            "inProgress",
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="unknown-status-nonzero-exit",
+        ),
+    ],
+)
+def test_codex_builtin_command_completion_status_matrix(
+    item_status: object,
+    exit_code: object,
+    output: str | None,
+    expected_status: ToolCallStatus,
+    expected_result: str,
+    expected_error: str | None,
+) -> None:
+    """Only documented failed/declined states override the numeric exit rule."""
+
+    item: dict[str, Any] = {
+        "id": "command-status",
+        "type": "commandExecution",
+        "command": "false",
+    }
+    if item_status is not _OMITTED:
+        item["status"] = item_status
+    if exit_code is not _OMITTED:
+        item["exitCode"] = exit_code
+    if output is not None:
+        item["aggregatedOutput"] = output
+
+    completion = _codex_builtin_tool_completion(item)
+
+    assert completion is not None
+    assert completion.status is expected_status
+    assert completion.result == expected_result
+    assert completion.error == expected_error
+
+
+async def test_run_turn_reports_failed_builtin_command_without_redispatch() -> None:
+    """A failed command from the app server is a terminal ERROR, reported once."""
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    turn_started = asyncio.Event()
+
+    async def _start_turn(*_args: object, **_kwargs: object) -> dict[str, object]:
+        turn_started.set()
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=_start_turn)
+
+    command_item = {
+        "id": "command-1",
+        "type": "commandExecution",
+        "command": "false",
+        "cwd": "/tmp/workspace",
+        "commandActions": [],
+    }
+    completed_item = {
+        **command_item,
+        "status": "failed",
+        "aggregatedOutput": "boom\n",
+        "durationMs": 12,
+    }
+
+    async def _produce_live_events() -> None:
+        await turn_started.wait()
+        for event in (
+            {"method": "item/started", "params": {"turnId": "turn-1", "item": command_item}},
+            {
+                "method": "item/completed",
+                "params": {"turnId": "turn-1", "item": completed_item},
+            },
+            {
+                "method": "item/completed",
+                "params": {"turnId": "turn-1", "item": completed_item},
+            },
+            {
+                "method": "turn/completed",
+                "params": {"turnId": "turn-1", "turn": {"id": "turn-1", "status": "failed"}},
+            },
+        ):
+            await session._events.put(event)
+
+    producer = asyncio.create_task(_produce_live_events())
+
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "run it"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    await producer
+
+    tool_events = [
+        event for event in events if isinstance(event, (ToolCallRequest, ToolCallComplete))
+    ]
+    assert [type(event).__name__ for event in tool_events] == [
+        "ToolCallRequest",
+        "ToolCallRequest",
+        "ToolCallComplete",
+    ]
+    assert [event.metadata["call_id"] for event in tool_events] == [
+        "command-1",
+        "command-1",
+        "command-1",
+    ]
+    assert [event.metadata["observed_call_completed"] for event in tool_events[:2]] == [
+        False,
+        True,
+    ]
+    # Observed-only: Codex ran the command itself, so nothing may be redispatched.
+    assert all(event.metadata.get("internally_executed") is True for event in tool_events[:2])
+    completion = tool_events[2]
+    assert completion.status is ToolCallStatus.ERROR
+    assert completion.result == "[command status: failed]\nboom\n"
+    assert completion.error == "Command ended with status failed."
+    assert completion.duration_ms == 12.0
+
+
 async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
     """Adopt fallback must drop a stale final-answer item rather
     than adopt it as the new turn's response.
