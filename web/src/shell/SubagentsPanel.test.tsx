@@ -1751,6 +1751,8 @@ describe("SubagentsPanel", () => {
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
+    fireEvent.click(collapseToggleFor(container, "conv_child"));
+    fireEvent.click(collapseToggleFor(container, "conv_grandchild"));
 
     // Depth-first order: each child is followed by its own subtree.
     const rows = screen.getAllByTestId("subagent-row");
@@ -1779,6 +1781,7 @@ describe("SubagentsPanel", () => {
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
+    fireEvent.click(collapseToggleFor(container, "conv_parent"));
 
     const firstLevelConnector = childRow(container, "conv_leaf").querySelector(
       "[data-subagent-connector]",
@@ -1811,40 +1814,50 @@ describe("SubagentsPanel", () => {
     ).toBeNull();
   });
 
-  it("collapses and expands a row's nested subagents", () => {
+  it("starts a row's nested subagents collapsed and toggles them independently", () => {
     mockChildTree({
       conv_root: [
         childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" }),
         childInfo({ id: "conv_leaf", tool: "Explore", session_name: "leaf" }),
       ],
-      conv_child: [childInfo({ id: "conv_grandchild", tool: "Explore", session_name: "files" })],
+      conv_child: [
+        childInfo({
+          id: "conv_grandchild",
+          tool: "Explore",
+          session_name: "files",
+          labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+        }),
+      ],
+      conv_leaf: [childInfo({ id: "conv_other_grandchild", tool: "researcher" })],
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
-    expect(screen.getAllByTestId("subagent-collapse-toggle")).toHaveLength(1);
+    expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
+    expect(screen.getAllByTestId("subagent-collapse-toggle")).toHaveLength(2);
 
-    const toggle = screen.getByTestId("subagent-collapse-toggle");
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
+    const toggle = collapseToggleFor(container, "conv_child");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-label", "Expand subagents");
     expect(toggle).toHaveClass("size-6");
 
     fireEvent.click(toggle);
 
-    expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
+    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
     expect(childRow(container, "conv_leaf")).toBeInTheDocument();
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(toggle).toHaveAttribute("aria-label", "Expand subagents");
+    expect(container.querySelector('[data-child-session-id="conv_other_grandchild"]')).toBeNull();
+    expect(collapseToggleFor(container, "conv_leaf")).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
 
     fireEvent.click(toggle);
 
-    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
+    expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-label", "Expand subagents");
   });
 
-  it("preserves a nested row's collapsed state when its parent unmounts it", () => {
+  it("preserves a nested row's expanded state when its parent unmounts it", () => {
     mockChildTree({
       conv_root: [childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" })],
       conv_child: [childInfo({ id: "conv_grandchild", tool: "Explore", session_name: "files" })],
@@ -1854,21 +1867,22 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const childToggle = collapseToggleFor(container, "conv_child");
+    fireEvent.click(childToggle);
     const grandchildToggle = collapseToggleFor(container, "conv_grandchild");
 
     fireEvent.click(grandchildToggle);
-    expect(container.querySelector('[data-child-session-id="conv_ggchild"]')).toBeNull();
-    expect(grandchildToggle).toHaveAttribute("aria-expanded", "false");
+    expect(childRow(container, "conv_ggchild")).toBeInTheDocument();
+    expect(grandchildToggle).toHaveAttribute("aria-expanded", "true");
 
     fireEvent.click(childToggle);
     expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
 
     fireEvent.click(childToggle);
     expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
-    expect(container.querySelector('[data-child-session-id="conv_ggchild"]')).toBeNull();
+    expect(childRow(container, "conv_ggchild")).toBeInTheDocument();
     expect(collapseToggleFor(container, "conv_grandchild")).toHaveAttribute(
       "aria-expanded",
-      "false",
+      "true",
     );
   });
 
@@ -1881,7 +1895,9 @@ describe("SubagentsPanel", () => {
       c3: [childInfo({ id: "c4", tool: "researcher" })],
     });
 
-    renderPanel({ rootSessionId: "conv_root" });
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+    fireEvent.click(collapseToggleFor(container, "c1"));
+    fireEvent.click(collapseToggleFor(container, "c2"));
 
     expect(
       screen.getAllByTestId("subagent-row").map((r) => r.getAttribute("data-child-session-id")),
@@ -1926,6 +1942,7 @@ describe("SubagentsPanel", () => {
       conversationId: "conv_grandchild",
       rootSessionId: "conv_root",
     });
+    fireEvent.click(collapseToggleFor(container, "conv_child"));
 
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
@@ -2133,7 +2150,7 @@ describe("SubagentsPanel", () => {
     expect(mirrorRow).not.toHaveClass("host-color");
   });
 
-  it("keeps a real child's own mirrors nested under it without a Subagents zone", () => {
+  it("keeps a real child's own mirrors collapsed until expanded without a Subagents zone", () => {
     mockChildTree({
       conv_root: [childInfo({ id: "real", tool: "researcher", session_name: "auth" })],
       real: [
@@ -2148,9 +2165,10 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    // The root has no mirrors of its own, so no zone header — the nested
-    // mirror renders directly under its real parent.
+    // The root has no mirrors of its own, so no zone header.
     expect(screen.queryByTestId("subagent-subagents-zone")).toBeNull();
+    expect(container.querySelector('[data-child-session-id="nested-mirror"]')).toBeNull();
+    fireEvent.click(collapseToggleFor(container, "real"));
     const nested = childRow(container, "nested-mirror");
     expect(nested).toHaveAttribute("data-depth", "2");
     expect(within(nested).queryByTestId("rail-agent-badge")).toBeNull();
