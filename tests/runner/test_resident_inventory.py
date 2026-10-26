@@ -1282,6 +1282,59 @@ def _v2_evidence(payload, *, session_id: str):
     )
 
 
+@pytest.mark.parametrize("state", ["failed_cleanup", "transfer", "overflow"])
+async def test_runner_v2_preserves_terminal_candidate_after_failed_cleanup(
+    tmp_path, monkeypatch, state
+):
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals import registry as terminal_owners
+
+    terminals = TerminalRegistry()
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "term.sock",
+        private_dir=tmp_path / "term",
+        running=True,
+    )
+    terminals._by_conversation["one"] = {("codex", "main"): instance}
+    target = "one"
+    if state == "failed_cleanup":
+        monkeypatch.setattr(
+            instance, "close", AsyncMock(side_effect=RuntimeError("unconfirmed close"))
+        )
+        await terminals.cleanup_conversation("one")
+        assert terminals.registration_snapshot() == ()
+    else:
+        if state == "overflow":
+            monkeypatch.setattr(terminal_owners, "_MAX_UNCERTAIN_TERMINAL_OWNERS", 1)
+            target = "two"
+        assert terminals.transfer("one", "two", "codex", "main")
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    app = create_runner_app(
+        server_client=NullServerClient(), resource_registry=resources, auth_token="fixture-auth"
+    )
+    async with _runner_client(app) as client:
+        response = await client.get(
+            "/v2/startup/context-inventory",
+            params={"read_id": "v2-read", "session_id": target},
+            headers={"Authorization": "Bearer fixture-auth"},
+        )
+    terminal = _v2_evidence(response.content, session_id=target).sources[2]
+    assert terminal.coverage == "unsupported" and terminal.contexts == ()
+    if state == "overflow":
+        assert "terminal_owner_history_budget" in {gap.reason for gap in terminal.unresolved}
+    else:
+        assert any(gap.candidate == instance.diagnostic_id for gap in terminal.unresolved)
+    assert terminal.revision_authority == "observation_only"
+    assert (
+        terminal.membership_revision
+        is terminal.age_upper_bound_s
+        is terminal.work_bindings
+        is None
+    )
+
+
 @pytest.mark.parametrize("successor", [False, True])
 async def test_runner_preserves_unconfirmed_predecessor_after_registry_replacement(
     harness_inventory_reader, monkeypatch, tmp_path, successor

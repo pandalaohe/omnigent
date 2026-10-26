@@ -203,11 +203,34 @@ async def _harness_context_source_v2(
     )
 
 
+def _terminal_context_source_v2(session_id: str, scope, resources: SessionResourceRegistry):
+    source = _unknown_context_source(scope, "terminal_context_source_unimplemented")
+    terminals = resources.terminal_registry
+    if terminals is None:
+        return source
+    rows, overflow = terminals.owner_uncertainty_snapshot()
+    unresolved = (
+        *source.unresolved,
+        *(
+            UnresolvedContextV2(candidate=row.instance_id, reason="terminal_lifetime_unconfirmed")
+            for row in rows
+            if row.conversation_id == session_id
+        ),
+    )
+    if overflow or len(unresolved) > 1000:
+        unresolved = (
+            *unresolved[:999],
+            UnresolvedContextV2(candidate=None, reason="terminal_owner_history_budget"),
+        )
+    return source.model_copy(update={"unresolved": unresolved})
+
+
 async def session_context_evidence_v2(
     session_id: str,
     read_id: str,
     *,
     process_manager: HarnessProcessManager | None,
+    resources: SessionResourceRegistry,
     timeout_s: float = _OWNER_INVENTORY_TIMEOUT_S,
 ) -> ContextEvidenceV2:
     """Compose the runner's three session scopes into one v2 envelope.
@@ -237,6 +260,6 @@ async def session_context_evidence_v2(
             harness,
             native_context_source_v2(session_id)
             or _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
-            _unknown_context_source(scopes[2], "terminal_context_source_unimplemented"),
+            _terminal_context_source_v2(session_id, scopes[2], resources),
         ),
     )

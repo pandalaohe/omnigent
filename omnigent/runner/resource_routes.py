@@ -238,7 +238,7 @@ def register_resource_routes(
         if len(request.query_params.getlist("read_id")) != 1:
             raise HTTPException(status_code=422, detail="exactly one read_id is required")
         evidence = await session_context_evidence_v2(
-            session_id, read_id, process_manager=process_manager
+            session_id, read_id, process_manager=process_manager, resources=resource_registry
         )
         return JSONResponse(
             evidence.model_dump(mode="json"),

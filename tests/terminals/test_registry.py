@@ -80,6 +80,9 @@ def test_registration_snapshot_preserves_identity_and_copies_stopped_state(tmp_p
     )
     reg._by_conversation["conv_old"] = {("claude", "main"): original}
     before = reg.registration_snapshot()
+    candidates, overflow = reg.owner_uncertainty_snapshot()
+    assert candidates == before and not overflow
+    assert reg._uncertain_owners == {}
     assert before[0].instance_id == original.diagnostic_id
     assert not hasattr(before[0], "instance")
     with pytest.raises(FrozenInstanceError):
@@ -95,6 +98,11 @@ def test_registration_snapshot_preserves_identity_and_copies_stopped_state(tmp_p
     assert moved[0].observed_running is False
     assert before[0].conversation_id == "conv_old"
     assert before[0].observed_running is True
+    candidates, overflow = reg.owner_uncertainty_snapshot()
+    assert not overflow
+    assert {row.conversation_id for row in candidates} == {"conv_old", "conv_new"}
+    assert {row.instance_id for row in candidates} == {original.diagnostic_id}
+    assert not any(hasattr(row, "instance") for row in candidates)
 
     replacement = TerminalInstance(
         name="claude",
@@ -316,6 +324,152 @@ async def test_close_expected_closes_its_own_instance(tmp_path: Path) -> None:
     assert closed is True
     assert mine.closed is True
     assert reg.get("conv_close_expected_own", "claude", "main") is None
+    (candidate,), overflow = reg.owner_uncertainty_snapshot()
+    assert candidate.instance_id == mine.diagnostic_id and not overflow
+    assert candidate.observed_running is True
+
+
+@pytest.mark.parametrize("operation", ["cleanup", "shutdown"])
+async def test_terminal_bulk_cancel_retains_all_removed_candidates(
+    tmp_path, monkeypatch, operation
+):
+    reg = TerminalRegistry()
+    instances = {
+        name: TerminalInstance(
+            name=name,
+            session_key="main",
+            socket_path=tmp_path / f"{name}.sock",
+            private_dir=tmp_path / name,
+            running=True,
+        )
+        for name in ("first", "second")
+    }
+    for instance in instances.values():
+        monkeypatch.setattr(instance, "close", AsyncMock())
+    instances["first"].close.side_effect = asyncio.CancelledError()
+    reg._by_conversation["one"] = {
+        (name, "main"): instance for name, instance in instances.items()
+    }
+    with pytest.raises(asyncio.CancelledError):
+        if operation == "cleanup":
+            await reg.cleanup_conversation("one")
+        else:
+            await reg.shutdown()
+    assert reg.registration_snapshot() == ()
+    candidates, overflow = reg.owner_uncertainty_snapshot()
+    assert {row.instance_id for row in candidates} == {
+        instance.diagnostic_id for instance in instances.values()
+    }
+    assert not overflow
+    instances["second"].close.assert_not_awaited()
+
+
+async def test_terminal_close_collision_keeps_old_candidate_and_successor(tmp_path, monkeypatch):
+    reg = TerminalRegistry()
+    old, new = (
+        TerminalInstance(
+            name="codex",
+            session_key="main",
+            socket_path=tmp_path / f"{name}.sock",
+            private_dir=tmp_path / name,
+            running=True,
+        )
+        for name in ("old", "new")
+    )
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def close():
+        entered.set()
+        await resume.wait()
+        raise RuntimeError("close unconfirmed")
+
+    monkeypatch.setattr(old, "close", close)
+    reg._by_conversation["one"] = {("codex", "main"): old}
+    task = asyncio.create_task(reg.close("one", "codex", "main", expected=old))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert reg.registration_snapshot() == ()
+        assert reg.owner_uncertainty_snapshot()[0][0].instance_id == old.diagnostic_id
+        reg._by_conversation["one"] = {("codex", "main"): new}
+        resume.set()
+        with pytest.raises(RuntimeError, match="close unconfirmed"):
+            await asyncio.wait_for(task, 2)
+        assert reg.get("one", "codex", "main") is new
+        candidates, overflow = reg.owner_uncertainty_snapshot()
+        assert {row.instance_id for row in candidates} == {old.diagnostic_id, new.diagnostic_id}
+        assert not overflow
+    finally:
+        resume.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_terminal_uncertainty_budget_never_becomes_empty_proof(tmp_path, monkeypatch):
+    reg = TerminalRegistry()
+    monkeypatch.setattr(registry_mod, "_MAX_UNCERTAIN_TERMINAL_OWNERS", 1)
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "term.sock",
+        private_dir=tmp_path / "term",
+        running=True,
+    )
+    reg._by_conversation["old"] = {("codex", "main"): instance}
+    assert reg.transfer("old", "new", "codex", "main")
+    candidates, overflow = reg.owner_uncertainty_snapshot()
+    assert len(candidates) == 1 and candidates[0].conversation_id == "old"
+    assert candidates[0].instance_id == instance.diagnostic_id and overflow
+    assert reg.get("new", "codex", "main") is instance
+    assert reg.owner_uncertainty_snapshot() == (candidates, overflow)
+
+
+async def test_terminal_birth_candidate_precedes_launch_await(tmp_path, monkeypatch):
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="shell",
+        session_key="main",
+        socket_path=tmp_path / "term.sock",
+        private_dir=tmp_path / "term",
+        running=False,
+    )
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def launch(**_kwargs):
+        entered.set()
+        await resume.wait()
+        instance.running = True
+
+    monkeypatch.setattr(instance, "launch", launch)
+    monkeypatch.setattr(instance, "is_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(instance, "server_pid", AsyncMock(return_value=None))
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    monkeypatch.setattr(
+        registry_mod,
+        "create_terminal_instance",
+        lambda *_args, **_kwargs: TerminalCreateResult(instance=instance, cwd=tmp_path),
+    )
+    task = asyncio.create_task(reg.launch("one", "shell", "main", TerminalEnvSpec(command="bash")))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert reg.registration_snapshot() == ()
+        (candidate,), overflow = reg.owner_uncertainty_snapshot()
+        assert candidate.instance_id == instance.diagnostic_id and not overflow
+        assert candidate.observed_running is False
+        before = dict(reg._uncertain_owners)
+        assert reg.owner_uncertainty_snapshot() == ((candidate,), False)
+        assert reg._uncertain_owners == before
+        instance.is_alive.assert_not_awaited()
+        instance.server_pid.assert_not_awaited()
+        resume.set()
+        assert await asyncio.wait_for(task, 2) is instance
+        assert reg.registration_snapshot()[0].instance_id == candidate.instance_id
+    finally:
+        resume.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await reg.shutdown()
 
 
 @pytest.mark.asyncio
