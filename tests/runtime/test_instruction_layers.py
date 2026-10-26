@@ -5,11 +5,59 @@ import pytest
 from omnigent.harness_plugins import accepted_harnesses, native_harnesses
 from omnigent.runtime.instruction_layers import (
     agent_key_for_harness,
+    compose_role,
     compose_route,
     compose_session_text,
     instruction_agents,
+    select_role_layers,
 )
 from omnigent.stores.global_instructions_store import GlobalInstructionRevision
+
+
+@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("independent", ["", " \n\t", "  Independent\n"])
+@pytest.mark.parametrize(
+    "host_id,agent_key", [(None, None), ("h1", None), (None, "codex"), ("h1", "codex")]
+)
+def test_role_selection_preserves_revisions_order_and_bytes(role, independent, host_id, agent_key):
+    def revision(text, agent="", host="", scope=role):
+        return GlobalInstructionRevision(text, text, 1, None, scope, agent, host)
+
+    shared = revision("  Shared\n")
+    agent = revision("\tAgent  ", "codex")
+    host = revision(" Host \n", host="h1")
+    cell = revision(independent, "codex", "h1")
+    revisions = [
+        cell,
+        host,
+        revision("Other agent", "claude"),
+        agent,
+        revision("Other host", host="h2"),
+        shared,
+        revision("Wrong role", scope="child" if role == "mother" else "mother"),
+        revision("Route independent", "codex", "h1", "independent"),
+    ]
+    expected = [shared]
+    if agent_key:
+        expected.append(agent)
+    if host_id:
+        expected.append(host)
+    if host_id and agent_key and independent.strip():
+        expected = [cell]
+    selected = select_role_layers(revisions, role, host_id, agent_key)
+    assert selected == expected
+    assert all(actual is original for actual, original in zip(selected, expected, strict=True))
+    assert compose_role(selected) == "\n\n".join(r.text for r in expected)
+
+
+@pytest.mark.parametrize("role", ["mother", "child"])
+def test_role_selection_skips_blank_sources(role):
+    rows = [
+        GlobalInstructionRevision("s", " \n", 1, None, role),
+        GlobalInstructionRevision("a", "", 1, None, role, "codex"),
+    ]
+    assert select_role_layers(rows, role, "h1", "codex") == []
+    assert compose_role([]) == ""
 
 
 @pytest.mark.parametrize("independent", ["", "I"])

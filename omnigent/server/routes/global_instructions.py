@@ -15,7 +15,11 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.instruction_layers import (
     INSTRUCTION_SIZE_REMINDER_CHARS,
     InstructionAgent,
+    compose_role,
+    compose_route,
+    compose_session_text,
     instruction_agents,
+    select_role_layers,
 )
 from omnigent.server.agent_quota import QuotaContext
 from omnigent.server.auth import LEVEL_READ, AuthProvider
@@ -345,16 +349,18 @@ def create_global_instructions_router(
         if agent:
             _key("agent", agent, "")
         if host_id or agent or spawn:
-            from omnigent.runtime.instruction_layers import compose_route, compose_session_text
-
-            layers = await asyncio.to_thread(store.latest_layers, host_id, agent)
+            layers = await asyncio.to_thread(
+                store.latest_layers, host_id, agent, role="mother" if spawn else None
+            )
             route_text = compose_route(layers).text
-            mother = await asyncio.to_thread(store.current, scope="mother") if spawn else None
+            mother_text = (
+                compose_role(select_role_layers(layers, "mother", host_id, agent)) if spawn else ""
+            )
             text = compose_session_text(
                 route_text,
                 has_parent=False,
                 spawn=spawn,
-                mother_text=mother.text if mother else "",
+                mother_text=mother_text,
                 quota_line=await current_quota(request, user_id, host_id) if spawn else "",
             )
             result = _to_response(None)
@@ -377,15 +383,19 @@ def create_global_instructions_router(
                     await asyncio.to_thread(host_store.get_host, revision.host_id) is None
                 )
             stale: list[str] = []
-            if revision.scope == "independent" and revision.text.strip():
-                for scope, key, host in (
+            role_independent = (
+                revision.scope in {"mother", "child"} and revision.agent_key and revision.host_id
+            )
+            if (revision.scope == "independent" or role_independent) and revision.text.strip():
+                for shape, key, host in (
                     ("shared", "", ""),
                     ("agent", revision.agent_key, ""),
                     ("host", "", revision.host_id),
                 ):
+                    scope = revision.scope if role_independent else shape
                     other = by_key.get((scope, key, host))
                     if other is not None and other.created_us > revision.created_us:
-                        stale.append(scope)
+                        stale.append(shape)
             data.append(_layer_response(revision, host_removed=host_removed, stale_layers=stale))
         return {
             "data": data,

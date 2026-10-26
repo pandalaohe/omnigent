@@ -80,6 +80,62 @@ async def test_quota_resolver_runs_only_for_nonblank_mother(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("independent", ["", " Role cell "])
+@pytest.mark.parametrize("route_independent", [False, True])
+async def test_scoped_roles_compose_after_route_and_gate_quota(
+    instructions, role, independent, route_independent
+):
+    instructions.save(" \n", created_by=None, scope=role)
+    instructions.save(" Column ", created_by=None, scope=role, agent_key="codex")
+    instructions.save(" Host ", created_by=None, scope=role, host_id="host-a")
+    instructions.save("Other agent", created_by=None, scope=role, agent_key="claude")
+    instructions.save(
+        independent, created_by=None, scope=role, agent_key="codex", host_id="host-a"
+    )
+    if route_independent:
+        instructions.save(
+            "Route cell", created_by=None, scope="independent", agent_key="codex", host_id="host-a"
+        )
+    resolver = Mock(return_value="Quota")
+    result = await session_instructions_text(
+        conversation(parent_conversation_id="parent" if role == "child" else None),
+        quota_resolver=resolver,
+    )
+    route_text = "Route cell" if route_independent else "S\n\nA\n\nH"
+    role_text = independent if independent else " Column \n\n Host "
+    assert result == route_text + "\n\n" + role_text + ("\n\nQuota" if role == "mother" else "")
+    assert resolver.call_count == (1 if role == "mother" else 0)
+
+
+@pytest.mark.asyncio
+async def test_unmatched_mother_column_does_not_trigger_quota(instructions):
+    instructions.save(" \n", created_by=None, scope="mother")
+    instructions.save("Other mother", created_by=None, scope="mother", agent_key="claude")
+    resolver = Mock(return_value="Quota")
+    assert (
+        await session_instructions_text(conversation(), quota_resolver=resolver) == "S\n\nA\n\nH"
+    )
+    resolver.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent", [None, "parent"])
+async def test_legacy_role_startup_preserves_exact_padding(instructions, parent):
+    instructions.save("  Route\n", created_by=None)
+    instructions.save("", created_by=None, scope="agent", agent_key="codex")
+    instructions.save("", created_by=None, scope="host", host_id="host-a")
+    instructions.save("  Mother \n", created_by=None, scope="mother")
+    instructions.save("\tChild  ", created_by=None, scope="child")
+    result = await session_instructions_text(
+        conversation(parent_conversation_id=parent), quota_resolver=lambda _: " Quota \n"
+    )
+    assert result == (
+        "  Route\n\n\n\tChild  " if parent else "  Route\n\n\n  Mother \n\n\n Quota \n"
+    )
+
+
+@pytest.mark.asyncio
 async def test_initializer_transports_quota_after_mother_block(instructions):
     payloads = []
 

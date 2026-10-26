@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import type { InstructionRole } from "@/hooks/useInstructionLayers";
 import {
   Dialog,
   DialogContent,
@@ -17,7 +18,7 @@ export function RemoveAxisDialog({
   onConfirm,
 }: {
   name: string;
-  layers: { id: string; label: string; chars: number }[];
+  layers: { id: string; label: string; chars: number; grid: InstructionRole }[];
   loading: boolean;
   error: string | null;
   onCancel: () => void;
@@ -38,13 +39,29 @@ export function RemoveAxisDialog({
             is kept and can be restored.
           </DialogDescription>
         </DialogHeader>
-        <ul className="space-y-2 text-sm">
-          {layers.map((layer) => (
-            <li key={layer.id}>
-              {layer.label} · {layer.chars.toLocaleString()} chars
-            </li>
-          ))}
-        </ul>
+        {(
+          [
+            ["route", "Shared instructions"],
+            ["mother", "Mother"],
+            ["child", "Child"],
+          ] as const
+        ).map(([grid, label]) => {
+          const items = layers.filter((layer) => layer.grid === grid);
+          return items.length > 0 ? (
+            <section key={grid} className="space-y-2 text-sm">
+              <h3 className="font-medium">
+                {label} · {items.length} {items.length === 1 ? "layer" : "layers"}
+              </h3>
+              <ul className="space-y-2">
+                {items.map((layer) => (
+                  <li key={layer.id}>
+                    {layer.label} · {layer.chars.toLocaleString()} chars
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ) : null;
+        })}
         {error && (
           <p role="alert" className="text-sm text-destructive">
             {error}

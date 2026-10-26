@@ -10,6 +10,8 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  hasInstructionText,
+  layerShape,
   useInstructionRevisions,
   useSaveInstructionLayer,
   type InstructionLayer,
@@ -75,8 +77,10 @@ export function LayerEditor({
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
-            {layerKey.scope === "independent"
-              ? "This setting replaces Shared, Agent and Host instructions on this route. Role blocks still apply."
+            {layerShape(layerKey) === "independent"
+              ? layerKey.scope === "independent"
+                ? "This setting replaces Shared, Agent and Host instructions on this route. Role blocks still apply."
+                : `This setting replaces Shared, Agent and Host ${layerKey.scope} instructions on this route. Shared instructions still apply.`
               : "Blank text turns this layer off. Other layers keep applying."}
           </DialogDescription>
         </DialogHeader>
@@ -129,7 +133,7 @@ export function LayerEditor({
             Save layer
           </Button>
         </div>
-        {layerKey.scope === "independent" && layer?.text.trim() && (
+        {layerShape(layerKey) === "independent" && hasInstructionText(layer?.text) && (
           <Button
             variant="outline"
             disabled={save.isPending}
