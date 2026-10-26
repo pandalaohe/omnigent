@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { AgentPicker } from "@/components/AgentPicker";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
 import { PageScroll } from "@/components/PageScroll";
@@ -61,6 +61,10 @@ export function InstructionsPage() {
   const roleParam = params.get("role");
   const role: InstructionRole =
     roleParam === "mother" || roleParam === "child" ? roleParam : "route";
+  const requestedRole = useRef<string>(role);
+  useLayoutEffect(() => {
+    requestedRole.current = role;
+  }, [role]);
   const view = session || params.get("view") === "route" ? "route" : "overview";
   const hostId = params.get("host") ?? hosts.data?.[0]?.host_id ?? "";
   const agentKey = params.get("agent") ?? data.data?.agents[0]?.key ?? "";
@@ -235,13 +239,16 @@ export function InstructionsPage() {
             <TabsContent value="overview" className="mt-4 space-y-4">
               <Tabs
                 value={role}
-                onValueChange={(value) =>
+                onValueChange={(value) => {
+                  // Focus and mousedown can request the same role before the URL render commits.
+                  if (requestedRole.current === value) return;
+                  requestedRole.current = value;
                   setParams((previous) => {
                     const next = new URLSearchParams(previous);
                     next.set("role", value);
                     return next;
-                  })
-                }
+                  });
+                }}
               >
                 <TabsList aria-label="Instruction grid">
                   <TabsTrigger value="route">Shared instructions</TabsTrigger>

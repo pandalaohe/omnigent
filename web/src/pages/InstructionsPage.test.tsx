@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstructionsPage } from "./InstructionsPage";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -101,7 +101,21 @@ function layer(
   };
 }
 function Location() {
-  return <output data-testid="location">{useLocation().search}</output>;
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="location" data-history-key={location.key}>
+        {location.search}
+      </output>
+      <button type="button" onClick={() => navigate(-1)}>
+        History back
+      </button>
+      <button type="button" onClick={() => navigate(1)}>
+        History forward
+      </button>
+    </>
+  );
 }
 function page(url = "/settings/instructions") {
   return render(
@@ -242,6 +256,69 @@ describe("InstructionsPage", () => {
     expect(mocks.save).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "Edit Mother block" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit Child block" })).not.toBeInTheDocument();
+  });
+
+  it("restores role selection through real history Back and Forward while Child retains focus", async () => {
+    page("/settings/instructions?role=route&host=host-a&agent=codex&peer=0&custom=retained");
+    const location = screen.getByTestId("location");
+    const sharedHistoryKey = location.getAttribute("data-history-key");
+    const mother = screen.getByRole("tab", { name: "Mother" });
+    const child = screen.getByRole("tab", { name: "Child" });
+    await userEvent.click(mother);
+    await waitFor(() => {
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("mother");
+      expect(mother).toHaveAttribute("aria-selected", "true");
+    });
+    const motherHistoryKey = location.getAttribute("data-history-key");
+    await userEvent.click(child);
+    await waitFor(() => {
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("child");
+      expect(child).toHaveAttribute("aria-selected", "true");
+    });
+    const childHistoryKey = location.getAttribute("data-history-key");
+    expect(child).toHaveFocus();
+
+    // Toolbar history navigation does not move focus to an in-page button.
+    fireEvent.click(screen.getByRole("button", { name: "History back" }));
+    await waitFor(() => {
+      expect(location).not.toHaveAttribute("data-history-key", childHistoryKey);
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("mother");
+      expect(location).toHaveAttribute("data-history-key", motherHistoryKey);
+      expect(mother).toHaveAttribute("aria-selected", "true");
+      expect(child).toHaveAttribute("aria-selected", "false");
+    });
+    expect(child).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "History back" }));
+    await waitFor(() => {
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("route");
+      expect(location).toHaveAttribute("data-history-key", sharedHistoryKey);
+      expect(screen.getByRole("tab", { name: "Shared instructions" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    });
+    expect(child).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "History forward" }));
+    await waitFor(() => {
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("mother");
+      expect(location).toHaveAttribute("data-history-key", motherHistoryKey);
+      expect(mother).toHaveAttribute("aria-selected", "true");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "History forward" }));
+    await waitFor(() => {
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("child");
+      expect(location).toHaveAttribute("data-history-key", childHistoryKey);
+      expect(child).toHaveAttribute("aria-selected", "true");
+    });
+    expect(child).toHaveFocus();
+    expect(Object.fromEntries(new URLSearchParams(location.textContent!))).toEqual({
+      role: "child",
+      host: "host-a",
+      agent: "codex",
+      peer: "0",
+      custom: "retained",
+    });
+    expect(mocks.save).not.toHaveBeenCalled();
   });
 
   it.each(["mother", "child"] as const)(
