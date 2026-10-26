@@ -9,6 +9,13 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { SavedContextSources } from "@/components/SavedContextSources";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { formatTokenCountShort } from "@/lib/formatCost";
 import {
   formatProviderUsageLimits,
@@ -17,10 +24,14 @@ import {
 } from "@/lib/providerUsageLimits";
 import {
   fixedBufferFitsCapacity,
-  usageContextOverrideFor,
+  resolveUsageContext,
+  usageContextLevelKey,
+  usageContextLevelLabel,
   usageContextSourceKey,
-  writeUsageContextOverride,
+  patchUsageContextOverrides,
   writeUsageContextPreferences,
+  type UsageContextLevel,
+  type UsageContextOverridePatch,
 } from "@/lib/usageContextPreferences";
 import { useChatStore } from "@/store/chatStore";
 
@@ -44,7 +55,7 @@ function SourceValue({ label, value }: { label: string; value: string }) {
   return (
     <span className="min-w-0">
       <span className="text-muted-foreground">{label}</span>{" "}
-      <span className="font-medium text-foreground">{value}</span>
+      <span className="break-all font-medium text-foreground">{value}</span>
     </span>
   );
 }
@@ -59,8 +70,19 @@ export function ContextUsageSettings() {
   const sessionProviderUsageLimits = useChatStore((state) => state.providerUsageLimits);
   const { session } = useSession(conversationId);
   const { data: hosts = [] } = useHosts();
-  const sourceKey = usageContextSourceKey({ hostId: session?.hostId, agentName, harness, model });
-  const activeOverride = usageContextOverrideFor(preferences, sourceKey);
+  const source = {
+    hostId: session?.hostId ?? "",
+    agentName: agentName ?? "",
+    harness: harness ?? "",
+    model: model ?? "",
+  };
+  const sourceKey = usageContextSourceKey(source);
+  const [editLevel, setEditLevel] = useState<UsageContextLevel>("model");
+  const editKey = usageContextLevelKey(source, editLevel);
+  const activeOverride = preferences.overrides[editKey] ?? {
+    contextWindowTokens: null,
+    autoCompactBufferTokens: null,
+  };
   const [contextWindowDraft, setContextWindowDraft] = useState(
     activeOverride.contextWindowTokens?.toString() ?? "",
   );
@@ -74,6 +96,14 @@ export function ContextUsageSettings() {
   const bufferMode = activeOverride.compactBufferMode ?? "tokens";
   const reportedContextWindow = useChatStore((state) => state.contextWindow);
   const reportedCompactLimit = useChatStore((state) => state.autoCompactTokenLimit);
+  const resolved = resolveUsageContext(preferences, sourceKey, {
+    contextWindow: reportedContextWindow,
+    autoCompactTokenLimit: reportedCompactLimit,
+  });
+  const editedLevelContext = resolveUsageContext(preferences, editKey, {
+    contextWindow: reportedContextWindow,
+    autoCompactTokenLimit: reportedCompactLimit,
+  }).contextWindow.value;
   const codexSession = harness === "codex" || harness === "codex-native";
   const { data: codexRateLimits, isLoading: rateLimitsLoading } = useCodexRateLimits(
     session?.hostId ?? null,
@@ -90,10 +120,11 @@ export function ContextUsageSettings() {
     activeOverride.autoCompactBufferTokens,
     activeOverride.autoCompactBufferPercent,
     sourceKey,
+    editKey,
   ]);
 
-  const writeOverride = (patch: Partial<typeof activeOverride>) =>
-    writeUsageContextOverride(preferences, sourceKey, { ...activeOverride, ...patch });
+  const writeOverride = (patch: UsageContextOverridePatch) =>
+    patchUsageContextOverrides(preferences, [editKey], patch);
   const commitContextWindow = () => {
     const next = optionalNumber(contextWindowDraft);
     if (contextWindowDraft.trim() !== "" && next === null) {
@@ -105,7 +136,18 @@ export function ContextUsageSettings() {
       setInputError("Enter a non-negative token buffer.");
       return;
     }
-    if (!fixedBufferFitsCapacity(fixed, next ?? reportedContextWindow)) {
+    const nextContext = resolveUsageContext(
+      {
+        ...preferences,
+        overrides: {
+          ...preferences.overrides,
+          [editKey]: { ...activeOverride, contextWindowTokens: next },
+        },
+      },
+      editKey,
+      { contextWindow: reportedContextWindow, autoCompactTokenLimit: reportedCompactLimit },
+    ).contextWindow.value;
+    if (bufferMode === "tokens" && !fixedBufferFitsCapacity(fixed, nextContext)) {
       setInputError("Context total must exceed the saved token buffer.");
       return;
     }
@@ -123,34 +165,20 @@ export function ContextUsageSettings() {
       );
       return;
     }
-    if (
-      bufferMode === "tokens" &&
-      !fixedBufferFitsCapacity(next, activeOverride.contextWindowTokens ?? reportedContextWindow)
-    ) {
+    if (bufferMode === "tokens" && !fixedBufferFitsCapacity(next, editedLevelContext)) {
       setInputError("Token buffer must be less than the context total.");
       return;
     }
     setInputError("");
     writeOverride(
       bufferMode === "percent"
-        ? { autoCompactBufferPercent: next }
+        ? { compactBufferMode: "percent", autoCompactBufferPercent: next }
         : { autoCompactBufferTokens: next },
     );
   };
 
-  const effectiveContextWindow = optionalNumber(contextWindowDraft) ?? reportedContextWindow;
-  const effectiveBuffer =
-    bufferMode === "percent"
-      ? effectiveContextWindow != null && bufferNumber(percentDraft, true) != null
-        ? (effectiveContextWindow * bufferNumber(percentDraft, true)!) / 100
-        : null
-      : bufferNumber(bufferDraft, false);
-  const calculatedCompactPoint =
-    effectiveContextWindow != null &&
-    effectiveBuffer != null &&
-    effectiveContextWindow > effectiveBuffer
-      ? effectiveContextWindow - effectiveBuffer
-      : reportedCompactLimit;
+  const effectiveContextWindow = resolved.contextWindow.value;
+  const calculatedCompactPoint = resolved.autoCompactTokenLimit;
   const reportedBufferPlaceholder =
     reportedContextWindow != null &&
     reportedCompactLimit != null &&
@@ -195,10 +223,28 @@ export function ContextUsageSettings() {
           <h3 className="text-sm font-medium text-foreground">Current source</h3>
           <p
             className="mt-1 text-sm text-muted-foreground"
-            title="Overrides are saved for this exact computer, agent, harness, and model. Reported values alone do not create a saved override."
+            title="Each field inherits from the next level when empty. Reported values alone do not create a saved override."
           >
-            Overrides are remembered when all four fields match.
+            Model overrides inherit computer × agent values, then agent values for all hosts.
           </p>
+        </div>
+        <div className="grid gap-1.5 text-sm">
+          <span>Edit values for</span>
+          <Select
+            value={editLevel}
+            onValueChange={(value) => setEditLevel(value as UsageContextLevel)}
+          >
+            <SelectTrigger aria-label="Edit source level">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="model">This model</SelectItem>
+              <SelectItem value="cell">
+                {hostName} × {sourceLabels.agentLabel}
+              </SelectItem>
+              <SelectItem value="column">{sourceLabels.agentLabel} · all hosts</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
         <div className="grid gap-2 rounded-xl border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2">
           <SourceValue label="Computer" value={hostName} />
@@ -214,7 +260,7 @@ export function ContextUsageSettings() {
               min={1}
               step={1000}
               value={contextWindowDraft}
-              placeholder={reportedContextWindow?.toString() ?? "Auto"}
+              placeholder={resolved.contextWindow.value?.toString() ?? "Auto"}
               onChange={(event) => setContextWindowDraft(event.target.value)}
               onBlur={commitContextWindow}
               onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
@@ -229,7 +275,19 @@ export function ContextUsageSettings() {
                 size="xs"
                 variant={bufferMode === "tokens" ? "secondary" : "outline"}
                 aria-pressed={bufferMode === "tokens"}
-                onClick={() => writeOverride({ compactBufferMode: "tokens" })}
+                onClick={() => {
+                  if (
+                    !fixedBufferFitsCapacity(
+                      activeOverride.autoCompactBufferTokens,
+                      editedLevelContext,
+                    )
+                  ) {
+                    setInputError("Token buffer must be less than the context total.");
+                    return;
+                  }
+                  setInputError("");
+                  writeOverride({ compactBufferMode: "tokens" });
+                }}
               >
                 Tokens
               </Button>
@@ -284,17 +342,58 @@ export function ContextUsageSettings() {
             ? ` · ${savedOverrideCount} source${savedOverrideCount === 1 ? "" : "s"} saved`
             : ""}
         </p>
+        <div
+          className="grid gap-1 text-xs text-muted-foreground"
+          data-testid="current-source-resolution"
+        >
+          <p>
+            Context {resolved.contextWindow.value?.toLocaleString() ?? "Auto"} ·{" "}
+            {usageContextLevelLabel(resolved.contextWindow.level, {
+              hostLabel: hostName,
+              agentLabel: sourceLabels.agentLabel,
+            })}
+          </p>
+          <p>
+            Buffer {resolved.buffer.value?.toLocaleString() ?? "Auto"}
+            {resolved.buffer.mode === "percent" && resolved.buffer.value != null ? "%" : ""} ·{" "}
+            {usageContextLevelLabel(resolved.buffer.level, {
+              hostLabel: hostName,
+              agentLabel: sourceLabels.agentLabel,
+            })}
+          </p>
+          {resolved.ignored.map((item) => (
+            <p key={item.level}>
+              Ignored{" "}
+              {usageContextLevelLabel(item.level, {
+                hostLabel: hostName,
+                agentLabel: sourceLabels.agentLabel,
+              })}
+              : {item.reason}; using{" "}
+              {usageContextLevelLabel(resolved.buffer.level, {
+                hostLabel: hostName,
+                agentLabel: sourceLabels.agentLabel,
+              })}
+              .
+            </p>
+          ))}
+        </div>
         <p className="text-xs text-muted-foreground">
-          Compact point = context total minus the selected buffer. Empty fields follow the active
-          session’s reported values. Manual values change only this indicator.
+          Compact point = context total minus the selected buffer. Empty fields inherit from the
+          next level. Manual values change only this indicator.
         </p>
         <SavedContextSources
           registryItems={registry.items}
           preferences={preferences}
           currentSourceKey={sourceKey}
           hosts={hosts}
-          currentOverride={activeOverride}
+          currentOverride={
+            preferences.overrides[sourceKey] ?? {
+              contextWindowTokens: null,
+              autoCompactBufferTokens: null,
+            }
+          }
           reportedContextWindow={reportedContextWindow}
+          reportedAutoCompactTokenLimit={reportedCompactLimit}
         />
       </div>
 

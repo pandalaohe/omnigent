@@ -25,10 +25,10 @@ export interface UsageContextOverridePatch {
 }
 
 export interface UsageContextPreferences {
-  version: 5;
+  version: 5 | 6;
   /** Show provider-reported usage windows beside the context ring. */
   showProviderUsageLimits: boolean;
-  /** Display overrides scoped to the exact Host, agent, harness, and model. */
+  /** Model, computer × agent, and agent column display overrides. */
   overrides: Record<string, UsageContextOverride>;
   /** Last valid provider reading for the exact Host/agent/harness/model source. */
   lastProviderUsageLimits: Record<string, ProviderUsageLimitsSnapshot>;
@@ -42,7 +42,7 @@ export interface UsageContextSource {
 }
 
 export const DEFAULT_USAGE_CONTEXT_PREFERENCES: UsageContextPreferences = {
-  version: 5,
+  version: 6,
   showProviderUsageLimits: true,
   overrides: {},
   lastProviderUsageLimits: {},
@@ -84,6 +84,21 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     for (const [key, candidate] of Object.entries(raw.overrides).slice(0, 100)) {
       if (key.length === 0 || key.length > 512 || !candidate || typeof candidate !== "object")
         continue;
+      try {
+        const parts: unknown = JSON.parse(key);
+        if (
+          Array.isArray(parts) &&
+          parts.length === 5 &&
+          parts.every((part) => typeof part === "string") &&
+          parts[4] !== "cell" &&
+          parts[4] !== "column"
+        ) {
+          overrides[key] = candidate as UsageContextOverride;
+          continue;
+        }
+      } catch {
+        // Legacy opaque keys still use the value normalizer below.
+      }
       const source = candidate as Partial<UsageContextOverride> & {
         autoCompactThresholdPercent?: unknown;
       };
@@ -138,7 +153,7 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     for (const [key, snapshot] of entries) lastProviderUsageLimits[key] = snapshot;
   }
   return {
-    version: 5,
+    version: 6,
     showProviderUsageLimits:
       raw.showProviderUsageLimits !== undefined
         ? raw.showProviderUsageLimits !== false
@@ -180,16 +195,173 @@ export function usageContextSourceFromKey(sourceKey: string): UsageContextSource
   }
 }
 
-export function usageContextOverrideFor(
+export type UsageContextLevel = "model" | "cell" | "column";
+export type UsageContextValueLevel = UsageContextLevel | "reported";
+
+export function usageContextLevelKey(source: UsageContextSource, level: UsageContextLevel): string {
+  if (level === "model") return usageContextSourceKey(source);
+  return JSON.stringify([
+    level === "column" ? "" : source.hostId,
+    source.agentName,
+    source.harness,
+    "",
+    level,
+  ]);
+}
+
+/** Unknown levels remain stored but have no display or resolution semantics. */
+export function usageContextRecordFromKey(
+  key: string,
+): { source: UsageContextSource; level: UsageContextLevel } | null {
+  const model = usageContextSourceFromKey(key);
+  if (model) return { source: model, level: "model" };
+  try {
+    const parts: unknown = JSON.parse(key);
+    if (
+      !Array.isArray(parts) ||
+      parts.length !== 5 ||
+      parts.some((part) => typeof part !== "string")
+    )
+      return null;
+    const [hostId, agentName, harness, modelName, level] = parts;
+    if (
+      modelName !== "" ||
+      (level !== "cell" && level !== "column") ||
+      (level === "column" && hostId !== "")
+    )
+      return null;
+    return { source: { hostId, agentName, harness, model: "" }, level };
+  } catch {
+    return null;
+  }
+}
+
+export function usageContextLevelLabel(
+  level: UsageContextValueLevel,
+  labels: { hostLabel: string; agentLabel: string },
+): string {
+  if (level === "model") return "model override";
+  if (level === "cell") return `${labels.hostLabel} × ${labels.agentLabel}`;
+  if (level === "column") return `${labels.agentLabel} · all hosts`;
+  return "reported";
+}
+
+export interface ResolvedUsageContext {
+  contextWindow: { value: number | null; level: UsageContextValueLevel };
+  buffer: { mode: "tokens" | "percent"; value: number | null; level: UsageContextValueLevel };
+  autoCompactTokenLimit: number | null;
+  ignored: { level: UsageContextLevel; reason: "buffer ≥ context" }[];
+}
+
+export function resolveUsageContext(
   preferences: UsageContextPreferences,
   sourceKey: string,
-): UsageContextOverride {
-  return (
-    preferences.overrides[sourceKey] ?? {
-      contextWindowTokens: null,
-      autoCompactBufferTokens: null,
+  reported: { contextWindow: number | null; autoCompactTokenLimit: number | null },
+): ResolvedUsageContext {
+  const record = usageContextRecordFromKey(sourceKey);
+  const levels: UsageContextLevel[] =
+    record?.level === "column"
+      ? ["column"]
+      : record?.level === "cell"
+        ? ["cell", "column"]
+        : ["model", "cell", "column"];
+  const candidates = record
+    ? levels.map((level) => ({
+        level,
+        override: preferences.overrides[usageContextLevelKey(record.source, level)],
+      }))
+    : [];
+  let contextWindow: ResolvedUsageContext["contextWindow"] = {
+    value: reported.contextWindow,
+    level: "reported",
+  };
+  for (const { level, override } of candidates) {
+    const value = positiveInteger(override?.contextWindowTokens);
+    if (value !== null) {
+      contextWindow = { value, level };
+      break;
     }
-  );
+  }
+  const reportedBuffer =
+    reported.contextWindow != null &&
+    reported.autoCompactTokenLimit != null &&
+    reported.autoCompactTokenLimit <= reported.contextWindow
+      ? reported.contextWindow - reported.autoCompactTokenLimit
+      : null;
+  const ignored: ResolvedUsageContext["ignored"] = [];
+  for (const { level, override } of candidates) {
+    const mode = override?.compactBufferMode ?? "tokens";
+    const value =
+      mode === "percent"
+        ? bufferPercent(override?.autoCompactBufferPercent)
+        : nonNegativeInteger(override?.autoCompactBufferTokens);
+    if (value === null) continue;
+    if (mode === "tokens" && !fixedBufferFitsCapacity(value, contextWindow.value)) {
+      ignored.push({ level, reason: "buffer ≥ context" });
+      continue;
+    }
+    const tokens =
+      mode === "percent" && contextWindow.value != null
+        ? (contextWindow.value * value) / 100
+        : value;
+    return {
+      contextWindow,
+      buffer: { mode, value, level },
+      ignored,
+      autoCompactTokenLimit:
+        contextWindow.value != null ? contextWindow.value - tokens : reported.autoCompactTokenLimit,
+    };
+  }
+  const effectiveReportedBuffer = fixedBufferFitsCapacity(reportedBuffer, contextWindow.value)
+    ? reportedBuffer
+    : null;
+  return {
+    contextWindow,
+    buffer: { mode: "tokens", value: effectiveReportedBuffer, level: "reported" },
+    ignored,
+    autoCompactTokenLimit:
+      contextWindow.value != null && effectiveReportedBuffer != null
+        ? contextWindow.value - effectiveReportedBuffer
+        : null,
+  };
+}
+
+/** Pure proposal; only the manager's Merge action persists these replacements. */
+export function proposeUsageContextCollapse(preferences: UsageContextPreferences): {
+  removed: string[];
+  added: Record<string, UsageContextOverride>;
+} {
+  const normalized = normalizeUsageContextPreferences(preferences);
+  const groups = new Map<string, { key: string; override: UsageContextOverride }[]>();
+  for (const [key, override] of Object.entries(normalized.overrides)) {
+    const source = usageContextSourceFromKey(key);
+    if (!source) continue;
+    const cellKey = usageContextLevelKey(source, "cell");
+    const group = groups.get(cellKey) ?? [];
+    group.push({ key, override });
+    groups.set(cellKey, group);
+  }
+  const removed: string[] = [];
+  const added: Record<string, UsageContextOverride> = {};
+  const signature = (override: UsageContextOverride) =>
+    JSON.stringify([
+      override.contextWindowTokens,
+      override.compactBufferMode ?? "tokens",
+      override.autoCompactBufferTokens,
+      override.autoCompactBufferPercent ?? null,
+    ]);
+  for (const [cellKey, group] of groups) {
+    const first = group[0]!;
+    if (
+      group.length < 2 ||
+      Object.hasOwn(preferences.overrides, cellKey) ||
+      group.some(({ override }) => signature(override) !== signature(first.override))
+    )
+      continue;
+    removed.push(...group.map(({ key }) => key));
+    added[cellKey] = first.override;
+  }
+  return { removed, added };
 }
 
 export function readUsageContextPreferences(): UsageContextPreferences {
@@ -267,7 +439,7 @@ export function writeUsageContextOverride(
   } else {
     overrides[sourceKey] = normalizedOverride;
   }
-  writeUsageContextPreferences({ ...preferences, version: 5, overrides });
+  writeUsageContextPreferences({ ...preferences, version: 6, overrides });
 }
 
 /**
@@ -323,7 +495,7 @@ export function patchUsageContextOverrides(
       overrides[sourceKey] = next;
     }
   }
-  writeUsageContextPreferences({ ...preferences, version: 5, overrides });
+  writeUsageContextPreferences({ ...preferences, version: 6, overrides });
 }
 
 /** Remove many sources with a single sync write. */
@@ -340,7 +512,7 @@ export function deleteUsageContextOverrides(
     }
   }
   if (!removed) return;
-  writeUsageContextPreferences({ ...preferences, version: 5, overrides });
+  writeUsageContextPreferences({ ...preferences, version: 6, overrides });
 }
 
 /** Return the last valid reading for one exact Host/agent/harness/model source. */
@@ -387,7 +559,7 @@ export function writeLastProviderUsageLimits(
     .slice(0, MAX_PROVIDER_USAGE_SOURCES);
   const next = {
     ...preferences,
-    version: 5,
+    version: 6,
     lastProviderUsageLimits: Object.fromEntries(entries),
   } satisfies UsageContextPreferences;
   if (displayIsUnchanged) {
@@ -397,28 +569,4 @@ export function writeLastProviderUsageLimits(
   } else {
     writeUsageContextPreferences(next);
   }
-}
-
-export function resolveUsageContextLimits(
-  preferences: UsageContextPreferences,
-  sourceKey: string,
-  reportedContextWindow: number | null,
-  reportedAutoCompactTokenLimit: number | null,
-): { contextWindow: number | null; autoCompactTokenLimit: number | null } {
-  const override = usageContextOverrideFor(preferences, sourceKey);
-  const contextWindow = override.contextWindowTokens ?? reportedContextWindow;
-  const buffer =
-    override.compactBufferMode === "percent"
-      ? override.autoCompactBufferPercent == null || contextWindow == null
-        ? null
-        : (contextWindow * override.autoCompactBufferPercent) / 100
-      : override.autoCompactBufferTokens;
-  const manualCompactLimit =
-    contextWindow != null && buffer != null && contextWindow > buffer
-      ? contextWindow - buffer
-      : null;
-  return {
-    contextWindow,
-    autoCompactTokenLimit: manualCompactLimit ?? reportedAutoCompactTokenLimit,
-  };
 }
