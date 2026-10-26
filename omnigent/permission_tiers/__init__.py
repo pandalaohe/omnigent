@@ -597,6 +597,12 @@ def _protected_paths(context: TrustedHostContext) -> tuple[tuple[str, ...], tupl
 class _UnboundShellWrite(ValueError):
     """Legal shell execution whose write locations cannot be bound reliably."""
 
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"{reason}; write with absolute literal paths: no cd except a literal absolute "
+            "cd /dir && prefix, no tee / redirect to $ targets"
+        )
+
 
 def _command_paths(
     command: str,
@@ -648,6 +654,29 @@ def _command_paths(
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
         lexer.whitespace_split = True
         tokens = list(lexer)
+    if (
+        writes_only
+        and context.platform != "windows"
+        and not powershell
+        and len(tokens) > 3
+        and raw_tokens[0] == "cd"
+        and tokens[1].startswith("/")
+        and not any(char in raw_tokens[1] for char in "$`\\~*?[{}\r\n")
+        and raw_tokens[2] == "&&"
+    ):
+        paths = _command_paths(
+            " ".join(raw_tokens[3:]),
+            replace(context, cwd=_resolve(os.path.normpath(tokens[1]), context).path),
+            depth=depth,
+            writes_only=True,
+        )
+        if paths and any(
+            "\n" in raw
+            or (raw and all(char in ";|&()" for char in raw) and raw not in ("&&", "|"))
+            for raw in raw_tokens[3:]
+        ):
+            raise _UnboundShellWrite("Shell cwd changes outside an && chain cannot be bound")
+        return paths
     paths = []
     for index, token in enumerate(tokens):
         shell = token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
@@ -712,14 +741,19 @@ def _command_paths(
                 if raw in (">", ">>", ">|", "&>", "&>>", "<>") or (
                     raw == ">&" and not destination.isdigit() and destination != "-"
                 ):
-                    candidates.append(destination)
+                    if destination != "/dev/null" or context.platform == "windows":
+                        candidates.append(destination)
             else:
                 segment.append(tokens[index])
             index += 1
         segments.append(segment)
         cwd_changed = False
         for segment in segments:
-            candidates.extend(_write_operands(segment))
+            candidates.extend(
+                _write_operands(
+                    segment, posix_shell=context.platform != "windows" and not powershell
+                )
+            )
             prefix = 0
             while prefix < len(segment) and (
                 segment[prefix] in ("if", "then", "else", "elif", "do", "!", "command", "builtin")
@@ -756,7 +790,7 @@ def _command_paths(
                 token = context.home + token[5:]
             elif token == "${HOME}" or token.startswith("${HOME}/"):
                 token = context.home + token[7:]
-        if writes_only and "$" in token:
+        if writes_only and any(char in token for char in "$`"):
             raise _UnboundShellWrite("Shell write target expansion cannot be bound")
         if "$" in token or (not writes_only and any(char in token for char in "*?=")):
             continue
@@ -764,7 +798,7 @@ def _command_paths(
     return tuple(paths)
 
 
-def _write_operands(tokens: list[str]) -> list[str]:
+def _write_operands(tokens: list[str], *, posix_shell: bool) -> list[str]:
     """Select reliable direct targets; retain all locations for unbound mutations."""
     conservative = [
         value.split(":" if ":" in value else "=", 1)[1]
@@ -827,10 +861,16 @@ def _write_operands(tokens: list[str]) -> list[str]:
                 if any(value.startswith(("-i", "--in-place")) for value in arguments)
                 else []
             )
+        if command == "tee":
+            if offset or not posix_shell:
+                return conservative
+            stop = arguments.index("--") if "--" in arguments else len(arguments)
+            return [value for value in arguments[:stop] if value and not value.startswith("-")] + (
+                arguments[stop + 1 :]
+            )
         if command in (
             "rm",
             "mv",
-            "tee",
             "chmod",
             "chown",
             "del",
@@ -1042,7 +1082,10 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 for form in (path, _absolute(original, context))
             ):
                 return TierDecision(Verdict.DENY, control_reason, "control-path")
-            if any(_under(candidate, path, windows) for candidate in intent.command_paths):
+            if any(
+                _under(candidate, path, windows)
+                for candidate in (*intent.command_paths, *intent.command_write_paths)
+            ):
                 return TierDecision(Verdict.DENY, control_reason, "control-path")
         if intent.kind == ToolKind.EDIT and target is not None:
             is_protected = target.path in intent.protected_exact_paths or any(
