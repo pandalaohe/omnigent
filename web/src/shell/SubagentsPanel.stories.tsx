@@ -213,6 +213,18 @@ export const DeepTreeActiveGrandchild: Story = {
       tree: deepTree,
     }),
   ],
+  play: async ({ canvasElement }) => {
+    const expandRow = async (id: string) => {
+      const toggle = canvasElement
+        .querySelector(`[data-child-session-id="${id}"]`)
+        ?.closest("li")
+        ?.querySelector<HTMLElement>('[data-testid="subagent-collapse-toggle"]');
+      if (!toggle) throw new Error(`Sub-agent collapse toggle for ${id} not found`);
+      await userEvent.click(toggle);
+    };
+    await expandRow("child-coder");
+    await expandRow("grandchild-active");
+  },
 };
 
 const iconTree = {
@@ -261,14 +273,6 @@ export const BrandIconsCollapsed: Story = {
       tree: iconTree,
     }),
   ],
-  play: async ({ canvasElement }) => {
-    const row = canvasElement.querySelector('[data-child-session-id="child-claude"]');
-    const toggle = row
-      ?.closest("li")
-      ?.querySelector<HTMLElement>('[data-testid="subagent-collapse-toggle"]');
-    if (!toggle) throw new Error("Sub-agent collapse toggle not found");
-    await userEvent.click(toggle);
-  },
 };
 
 const groupedHosts = [
