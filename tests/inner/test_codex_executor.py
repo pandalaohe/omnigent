@@ -204,6 +204,213 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+@pytest.fixture
+async def context_v2_sdk(sdk_inventory_stream):
+    app, proc, _reader = sdk_inventory_stream
+    executor = CodexExecutor(
+        codex_path="/opt/work/bin/codex", app_session_factory=lambda **kw: app
+    )
+    state = _CodexSessionState()
+    executor._session_states["sdk-key"] = state
+    assert (
+        await executor._ensure_app_session(
+            "sdk-key",
+            state,
+            signature=(None, "cwd", "model", "sandbox"),
+            effective_cwd="/opt/work/project",
+        )
+        is app
+    )
+    read = await executor.prepare_context_inventory_v2("external-conversation", "read")
+    return app, proc, executor, read
+
+
+async def test_context_v2_sdk_primary_and_real_maintenance_retirement(context_v2_sdk):
+    app, proc, _, read = context_v2_sdk
+    calls = []
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        method = message["method"]
+        calls.append(method)
+        if method == "turn/start":
+            result = {"turn": {"id": "turn"}}
+            proc.stdout.feed(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "maintenance",
+                        "turn": {"id": "turn"},
+                    },
+                }
+            )
+        else:
+            result = {"thread": {"id": "maintenance" if method == "thread/fork" else "primary"}}
+        proc.stdout.feed({"id": message["id"], "result": result})
+
+    proc.stdin.drain = respond
+    await app._request("thread/start", {})
+    app.thread_id = "primary"
+    created = read().sources[0].contexts[0]
+    assert created.execution_keys == ("sdk-key",) and created.provenance == "primary"
+    assert created.operation.action == "create" and created.lifecycle == "live"
+    await app._request("thread/resume", {"threadId": "primary"})
+    assert read().sources[0].contexts[0].key == created.key
+    assert (await app.keep_warm_ping()).outcome == "ok"
+    source = read().sources[0]
+    primary, maintenance = source.contexts
+    assert primary.key == created.key and primary.lifecycle == "live"
+    assert maintenance.key != primary.key and maintenance.operation.parent == primary.key
+    assert maintenance.provenance == "maintenance" and maintenance.operation.action == "fork"
+    assert maintenance.execution_keys == ("maintenance",) and maintenance.lifecycle == "unknown"
+    assert (
+        not maintenance.aliases and maintenance.stop_proof is maintenance.continuity_proof is None
+    )
+    assert source.coverage == "partial" and source.revision_authority == "observation_only"
+    assert calls == ["thread/start", "thread/resume", "thread/fork", "turn/start"]
+
+
+@pytest.mark.parametrize(
+    "outcome", ["success", "rpc-error", "cancel", "generation", "incarnation", "malformed"]
+)
+async def test_context_v2_sdk_retains_pending_and_rejects_stale_reply(context_v2_sdk, outcome):
+    app, proc, _, read = context_v2_sdk
+    entered = asyncio.Event()
+
+    async def sent():
+        entered.set()
+
+    proc.stdin.drain = sent
+    task = asyncio.create_task(app._request("thread/start", {}))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (pending,) = read().sources[0].contexts
+        assert pending.lifecycle == "starting" and pending.vendor_id is None
+        request = json.loads(proc.stdin.writes[-1])
+        if outcome == "generation":
+            app._resident_connection_generation += 1
+        elif outcome == "incarnation":
+            app._resident_incarnation_id = "replacement"
+        if outcome == "cancel":
+            task.cancel()
+        else:
+            proc.stdout.feed(
+                {
+                    "id": request["id"],
+                    **(
+                        {"error": {"code": -1, "message": "lost"}}
+                        if outcome == "rpc-error"
+                        else {
+                            "result": {} if outcome == "malformed" else {"thread": {"id": "reply"}}
+                        }
+                    ),
+                }
+            )
+        if outcome in {"rpc-error", "cancel"}:
+            with pytest.raises(asyncio.CancelledError if outcome == "cancel" else RuntimeError):
+                await task
+        else:
+            await task
+        (after,) = read().sources[0].contexts
+        assert after.key == pending.key
+        assert after.lifecycle == ("live" if outcome == "success" else "unknown")
+        assert (after.vendor_id is not None) is (outcome == "success")
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_context_v2_sdk_before_start_and_close_keep_occupied_candidate(
+    context_v2_sdk, monkeypatch
+):
+    app, _, executor, read = context_v2_sdk
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def start():
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(app, "start", start)
+    stream = app.run_turn(
+        messages=[],
+        tools=[],
+        system_prompt="",
+        model=None,
+        cwd="/opt/work/project",
+        sandbox="read-only",
+    )
+    task = asyncio.create_task(anext(stream))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (reserved,) = read().sources[0].contexts
+        assert reserved.lifecycle == "reserved" and reserved.vendor_id is None
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert read().sources[0].contexts[0].lifecycle == "unknown"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await stream.aclose()
+    entered.clear()
+
+    async def close():
+        entered.set()
+        await release.wait()
+        app._cleaned = True
+
+    monkeypatch.setattr(app, "close", close)
+    closing = asyncio.create_task(executor.close_session("sdk-key"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert read().sources[0].contexts[0].lifecycle == "closing"
+    finally:
+        release.set()
+        await closing
+    assert executor._session_states == {}
+    (retired,) = read().sources[0].contexts
+    assert retired.key == reserved.key and retired.lifecycle == "unknown"
+    assert retired.stop_proof is None
+
+
+async def test_context_v2_sdk_overlapping_resume_reuses_identity_after_failure(context_v2_sdk):
+    app, proc, _, read = context_v2_sdk
+    sent = asyncio.Event()
+    requests = []
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        requests.append(message)
+        if len(requests) == 2:
+            sent.set()
+        else:
+            proc.stdout.feed({"id": message["id"], "result": {"thread": {"id": "primary"}}})
+
+    proc.stdin.drain = respond
+    await app._request("thread/start", {})
+    key = read().sources[0].contexts[0].key
+    first = asyncio.create_task(app._request("thread/resume", {"threadId": "primary"}))
+    try:
+        await asyncio.wait_for(sent.wait(), 2)
+        proc.stdin.drain = lambda: asyncio.sleep(0)
+        second = asyncio.create_task(app._request("thread/resume", {"threadId": "primary"}))
+        await asyncio.sleep(0)
+        message = json.loads(proc.stdin.writes[-1])
+        proc.stdout.feed({"id": message["id"], "error": {"code": -1, "message": "lost"}})
+        with pytest.raises(RuntimeError):
+            await second
+        proc.stdout.feed({"id": requests[1]["id"], "result": {"thread": {"id": "primary"}}})
+        await first
+        (unknown,) = read().sources[0].contexts
+        assert unknown.key == key and unknown.lifecycle == "unknown"
+        proc.stdin.drain = respond
+        await app._request("thread/resume", {"threadId": "primary"})
+        (resumed,) = read().sources[0].contexts
+        assert resumed.key == key and resumed.lifecycle == "live"
+    finally:
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+
 @pytest.mark.parametrize(
     "case",
     [

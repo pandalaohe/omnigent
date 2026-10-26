@@ -577,8 +577,8 @@ async def harness_inventory_reader(monkeypatch, tmp_path):
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
-    monkeypatch.setattr(orchestration, "_RETIRED_OPENCODE_CONTEXTS", [])
-    monkeypatch.setattr(orchestration, "_opencode_context_history_overflow", False)
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
     manager = HarnessProcessManager(tmp_parent=tmp_path)
     manager._started = True
@@ -1248,6 +1248,66 @@ async def test_runner_context_inventory_v2_preserves_real_claude_primary(
         assert native.coverage == terminal.coverage == "unsupported"
     factory.assert_called_once()
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+async def test_runner_context_v2_preserves_codex_sdk_key_without_vendor_reads(
+    harness_inventory_reader,
+):
+    import asyncio
+
+    from omnigent.inner.codex_executor import (
+        CodexExecutor,
+        _CodexAppServerSession,
+        _CodexSessionState,
+    )
+
+    app = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd=None, env={}, tool_executor=None
+    )
+    executor = CodexExecutor(
+        codex_path="/opt/work/bin/codex", app_session_factory=lambda **kw: app
+    )
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    state = _CodexSessionState()
+    executor._session_states[adapter._session_key] = state
+    await executor._ensure_app_session(
+        adapter._session_key,
+        state,
+        signature=(None, "cwd", "model", "sandbox"),
+        effective_cwd="/opt/work/project",
+    )
+    app._proc = SimpleNamespace(returncode=None, stdin=object())
+    app._started, app._cleaned = True, False
+    app._loop = asyncio.get_running_loop()
+    reader = asyncio.create_task(asyncio.Event().wait())
+    app._reader_task = reader
+    app._resident_established_connection = (0, app._proc, app._proc.stdin, reader, app._loop)
+
+    async def send(message):
+        app._pending_requests[message["id"]].set_result({"result": {"thread": {"id": "primary"}}})
+
+    app._send_message = AsyncMock(side_effect=send)
+    try:
+        await app._request("thread/start", {})
+        _manager, add, client, requests = harness_inventory_reader
+        await add("one", None, executor=executor, adapter=adapter, harness_family="codex")
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.vendor_id.value == "primary" and record.execution_keys == (
+            adapter._session_key,
+        )
+        assert record.provenance == "primary" and record.lifecycle == "live"
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+        assert record.stop_proof is record.continuity_proof is None
+        app._send_message.assert_awaited_once()
+        assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+    finally:
+        app._closing = True
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
 
 
 async def test_runner_opencode_context_v2_reads_existing_owner_without_probes(

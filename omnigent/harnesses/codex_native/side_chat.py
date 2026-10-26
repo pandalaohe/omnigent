@@ -164,7 +164,9 @@ async def fork_ephemeral_side_thread(
     }
     if developer_instructions is not None:
         params["developerInstructions"] = developer_instructions
-    response = await codex_client.request("thread/fork", params)
+    response = await codex_client.request(
+        "thread/fork", params, context_provenance="managed_side_chat"
+    )
     result = response.get("result")
     thread = result.get("thread") if isinstance(result, dict) else None
     child_thread_id = thread.get("id") if isinstance(thread, dict) else None

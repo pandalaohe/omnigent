@@ -353,8 +353,8 @@ async def test_context_v2_close_retains_runner_tombstone(context_server, monkeyp
     server, client, _, _ = context_server
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
-    monkeypatch.setattr(orchestration, "_RETIRED_OPENCODE_CONTEXTS", [])
-    monkeypatch.setattr(orchestration, "_opencode_context_history_overflow", False)
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
     await client.create_session()
     key = server.context_source_v2("conversation").contexts[0].key
     entered, release = asyncio.Event(), asyncio.Event()
@@ -373,13 +373,13 @@ async def test_context_v2_close_retains_runner_tombstone(context_server, monkeyp
     try:
         await asyncio.wait_for(entered.wait(), 2)
         assert (
-            orchestration.opencode_context_source_v2("conversation").contexts[0].lifecycle
+            orchestration.native_context_source_v2("conversation").contexts[0].lifecycle
             == "closing"
         )
     finally:
         release.set()
         await task
-    source = orchestration.opencode_context_source_v2("conversation")
+    source = orchestration.native_context_source_v2("conversation")
     assert source.contexts[0].key == key and source.contexts[0].lifecycle == "unknown"
     assert source.contexts[0].stop_proof is None and source.coverage == "partial"
 
@@ -399,13 +399,13 @@ async def test_context_v2_retired_gap_survives_backend_replacement(context_serve
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
     monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
-    monkeypatch.setattr(orchestration, "_RETIRED_OPENCODE_CONTEXTS", [old])
-    monkeypatch.setattr(orchestration, "_opencode_context_history_overflow", False)
-    source = orchestration.opencode_context_source_v2("conversation")
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [old])
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
+    source = orchestration.native_context_source_v2("conversation")
     assert "context_history_budget" in {u.reason for u in source.unresolved}
     assert source.coverage == "partial"
-    monkeypatch.setattr(orchestration, "_RETIRED_OPENCODE_CONTEXTS", [old] * 1000)
-    source = orchestration.opencode_context_source_v2("conversation")
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [old] * 1000)
+    source = orchestration.native_context_source_v2("conversation")
     assert source.contexts == () and source.unresolved[0].reason == "context_history_budget"
 
 

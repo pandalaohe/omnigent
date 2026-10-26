@@ -2062,7 +2062,7 @@ def test_normalization_completes_only_from_each_owning_hop():
 
 
 @pytest.mark.asyncio
-async def test_server_reads_v2_only_from_a_runner_that_advertises_it():
+async def test_server_reads_v2_only_from_a_runner_that_advertises_it(monkeypatch):
     from omnigent.runner.native import orchestration
     from omnigent.server.resident_inventory import (
         HostRunnerMembership,
@@ -2070,9 +2070,9 @@ async def test_server_reads_v2_only_from_a_runner_that_advertises_it():
     )
     from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 
-    orchestration.__dict__["_AUTO_CODEX_APP_SERVERS"] = {}
-    orchestration.__dict__["_AUTO_OPENCODE_SERVERS"] = {}
-    orchestration.__dict__["_CLOSING_NATIVE_BACKENDS"] = {}
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
     resources = SessionResourceRegistry(TerminalRegistry())
     runner_app = create_runner_app(server_client=NullServerClient(), resource_registry=resources)
     requests: list[str] = []

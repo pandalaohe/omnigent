@@ -452,11 +452,12 @@ _STARTING_NATIVE_BACKENDS: dict[object, tuple[str, _NativeBackendHarness, _Nativ
 _native_backend_exit_coverage_complete = True
 
 # Immutable evidence only: closing a backend must not keep SDK/process handles alive.
-_RETIRED_OPENCODE_CONTEXTS: list[SourceEvidenceV2] = []
-_opencode_context_history_overflow = False
+_RETIRED_NATIVE_CONTEXTS: list[SourceEvidenceV2] = []
+_native_context_history_overflow = False
 
 
-def opencode_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
+def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
+    from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.startup_protocol import UnresolvedContextV2
 
@@ -464,23 +465,26 @@ def opencode_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
     registered = _AUTO_OPENCODE_SERVERS.get(session_id)
     if registered is not None:
         backends.append(registered)
+    codex = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    if codex is not None:
+        backends.append(codex)
     backends.extend(
         backend
         for name, harness, backend in _STARTING_NATIVE_BACKENDS.values()
-        if name == session_id and harness == "opencode-native"
+        if name == session_id and harness in {"opencode-native", "codex-native"}
     )
     backends.extend(
         row.backend
         for row in _CLOSING_NATIVE_BACKENDS.values()
-        if row.session_id == session_id and row.harness == "opencode-native"
+        if row.session_id == session_id and row.harness in {"opencode-native", "codex-native"}
     )
     sources = [
         backend.context_source_v2(session_id)
         for backend in {id(b): b for b in backends}.values()
-        if isinstance(backend, OpenCodeNativeServer)
+        if isinstance(backend, (OpenCodeNativeServer, CodexNativeAppServer))
     ]
     sources.extend(
-        source for source in _RETIRED_OPENCODE_CONTEXTS if source.scope.owner_id == session_id
+        source for source in _RETIRED_NATIVE_CONTEXTS if source.scope.owner_id == session_id
     )
     if not sources:
         return None
@@ -503,7 +507,7 @@ def opencode_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
             )
             for row in source.contexts
         )
-    if _opencode_context_history_overflow or len(unresolved) > 1000:
+    if _native_context_history_overflow or len(unresolved) > 1000:
         return current.model_copy(
             update={
                 "contexts": (),
@@ -534,6 +538,17 @@ def _bind_codex_inventory_client(
     incarnation_id: str | None,
 ) -> None:
     """Observe the forwarder's existing client without taking over its lifecycle."""
+    from omnigent.harnesses.codex_native.app_server import (
+        CodexAppServerClient,
+        CodexNativeAppServer,
+    )
+
+    if (
+        isinstance(backend, CodexNativeAppServer)
+        and isinstance(client, CodexAppServerClient)
+        and _AUTO_CODEX_APP_SERVERS.get(session_id) is backend
+    ):
+        backend.bind_context_client(client)
     if (
         incarnation_id is None
         or backend is None
@@ -743,7 +758,7 @@ async def _close_native_backend(
     close_client: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Keep an in-flight close visible; remember unknown exit without retaining owners."""
-    global _native_backend_exit_coverage_complete, _opencode_context_history_overflow
+    global _native_backend_exit_coverage_complete, _native_context_history_overflow
     incarnation_id = backend.resident_incarnation_id
     _CODEX_INVENTORY_CLIENTS.pop(id(backend), None)
     close_backend = backend.close()
@@ -764,31 +779,32 @@ async def _close_native_backend(
     finally:
         if incarnation_id != backend.resident_incarnation_id or not backend.exit_confirmed:
             _native_backend_exit_coverage_complete = False
-        if harness == "opencode-native":
+        if harness in {"opencode-native", "codex-native"}:
+            from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
             from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
 
-            if isinstance(backend, OpenCodeNativeServer):
+            if isinstance(backend, (OpenCodeNativeServer, CodexNativeAppServer)):
                 source = backend.context_source_v2(session_id)
                 previous = next(
                     (
                         index
-                        for index, row in enumerate(_RETIRED_OPENCODE_CONTEXTS)
+                        for index, row in enumerate(_RETIRED_NATIVE_CONTEXTS)
                         if (row.scope, row.producer_incarnation)
                         == (source.scope, source.producer_incarnation)
                     ),
                     None,
                 )
                 if previous is not None:
-                    _RETIRED_OPENCODE_CONTEXTS[previous] = source
+                    _RETIRED_NATIVE_CONTEXTS[previous] = source
                 elif (
-                    len(_RETIRED_OPENCODE_CONTEXTS) < 1000
-                    and sum(len(row.contexts) for row in _RETIRED_OPENCODE_CONTEXTS)
+                    len(_RETIRED_NATIVE_CONTEXTS) < 1000
+                    and sum(len(row.contexts) for row in _RETIRED_NATIVE_CONTEXTS)
                     + len(source.contexts)
                     <= 1000
                 ):
-                    _RETIRED_OPENCODE_CONTEXTS.append(source)
+                    _RETIRED_NATIVE_CONTEXTS.append(source)
                 else:
-                    _opencode_context_history_overflow = True
+                    _native_context_history_overflow = True
         _CLOSING_NATIVE_BACKENDS.pop(token, None)
 
 

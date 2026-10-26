@@ -10,7 +10,7 @@ import httpx
 from omnigent.runner.native.orchestration import (
     NativeBackendInventorySnapshot,
     native_backend_resident_inventory,
-    opencode_context_source_v2,
+    native_context_source_v2,
     prepare_native_backend_thread_inventory,
 )
 from omnigent.runner.resource_registry import (
@@ -193,7 +193,7 @@ async def session_context_evidence_v2(
         expected_scopes=scopes,
         sources=(
             harness,
-            opencode_context_source_v2(session_id)
+            native_context_source_v2(session_id)
             or _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
             _unknown_context_source(scopes[2], "terminal_context_source_unimplemented"),
         ),

@@ -52,6 +52,10 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_context_catalog,
     write_policy_hook_config,
 )
+from omnigent.harnesses.codex_native.context_inventory import (
+    CodexContextInventory,
+    CodexContextProvenance,
+)
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
 from omnigent.harnesses.codex_native.launch_args import (
     MIN_NATIVE_PROFILE_CODEX_VERSION,
@@ -126,6 +130,11 @@ from omnigent.process_logging import (
     log_info_once,
     log_once,
     redact_log_text,
+)
+from omnigent.startup_protocol import (
+    SourceEvidenceV2,
+    UnresolvedContextV2,
+    native_context_scope_v2,
 )
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
@@ -1131,6 +1140,8 @@ class CodexAppServerClient:
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
         self._connection_generation = 0
+        self._context_inventory: CodexContextInventory | None = None
+        self._context_current: Callable[[], bool] = lambda: False
         self._resident_thread_started_revision: int | None = None
         self._established_connection: tuple[int, ClientConnection, asyncio.Task[None]] | None = (
             None
@@ -1193,6 +1204,8 @@ class CodexAppServerClient:
 
         :returns: None.
         """
+        if self._context_inventory is not None:
+            self._context_inventory.mark(self._context_inventory.incarnation, "unknown")
         self._connection_generation += 1
         self._established_connection = None
         self._resident_thread_started_revision = None
@@ -1269,7 +1282,45 @@ class CodexAppServerClient:
         except ConnectionClosed:
             return None
 
-    async def request(self, method: str, params: CodexParams) -> CodexMessage:
+    def bind_context_inventory(
+        self, inventory: CodexContextInventory, current: Callable[[], bool]
+    ) -> None:
+        """Bind the real backend owner; a standalone bridge client has no such authority."""
+        self._context_inventory, self._context_current = inventory, current
+
+    async def request(
+        self,
+        method: str,
+        params: CodexParams,
+        *,
+        context_provenance: CodexContextProvenance | None = None,
+    ) -> CodexMessage:
+        inventory, owner_current = self._context_inventory, self._context_current
+        connection = self._current_established_connection()
+        finish = (
+            inventory.begin(
+                method,
+                params,
+                domain=inventory.incarnation,
+                current=lambda: (
+                    owner_current()
+                    and connection is not None
+                    and self._current_established_connection() is connection
+                ),
+                provenance=context_provenance,
+            )
+            if inventory is not None
+            else lambda _response: None
+        )
+        try:
+            response = await self._request_unobserved(method, params)
+        except BaseException:
+            finish(None)
+            raise
+        finish(response)
+        return response
+
+    async def _request_unobserved(self, method: str, params: CodexParams) -> CodexMessage:
         """
         Send one JSON-RPC request and wait for its response.
 
@@ -1419,6 +1470,8 @@ class CodexAppServerClient:
                 await self._events.put(message)
         finally:
             # Wake iter_events() consumers: no further events can arrive.
+            if self._context_inventory is not None:
+                self._context_inventory.mark(self._context_inventory.incarnation, "unknown")
             self._events.put_nowait(None)
 
 
@@ -2344,6 +2397,58 @@ class CodexNativeAppServer:
     _resident_spawned: bool = field(default=False, init=False, repr=False)
     _lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _start_generation: int = field(default=0, init=False, repr=False)
+    _context_inventory: CodexContextInventory | None = field(default=None, init=False, repr=False)
+    _context_closing: bool = field(default=False, init=False, repr=False)
+    _context_history_unknown: bool = field(default=False, init=False, repr=False)
+
+    def bind_context_client(self, client: CodexAppServerClient) -> None:
+        incarnation, generation = self.resident_incarnation_id, self._start_generation
+        if self._context_inventory is None or self._context_inventory.incarnation != incarnation:
+            self._context_history_unknown |= self._context_inventory is not None
+            self._context_inventory = CodexContextInventory(incarnation)
+        client.bind_context_inventory(
+            self._context_inventory,
+            lambda: (
+                self.resident_incarnation_id == incarnation
+                and self._start_generation == generation
+                and not self._context_closing
+                and self.proc is not None
+                and self.proc.returncode is None
+                and not self.process_exit_confirmed
+            ),
+        )
+
+    def context_source_v2(self, session_id: str) -> SourceEvidenceV2:
+        inventory = self._context_inventory
+        if inventory is None or inventory.incarnation != self.resident_incarnation_id:
+            # No owner-bound operation has been observed; a read allocates nothing.
+            return SourceEvidenceV2(
+                scope=native_context_scope_v2(session_id),
+                producer_incarnation=self.resident_incarnation_id,
+                coverage="partial",
+                contexts=(),
+                unresolved=(
+                    UnresolvedContextV2(
+                        candidate=None,
+                        reason=(
+                            "native_context_operations_unobserved"
+                            if inventory is None
+                            else "old_backend_history_unreconciled"
+                        ),
+                    ),
+                ),
+                membership_revision=None,
+                context_revision=None,
+                work_revision=None,
+                revision_authority="observation_only",
+                age_upper_bound_s=None,
+                work_bindings=None,
+            )
+        return inventory.source(
+            native_context_scope_v2(session_id),
+            "native_tui_and_bridge_contexts_unobserved",
+            *(("old_backend_history_unreconciled",) if self._context_history_unknown else ()),
+        )
 
     async def start(self) -> None:
         """Start without replacing an incarnation whose exit is unconfirmed."""
@@ -2351,6 +2456,7 @@ class CodexNativeAppServer:
             if (self._resident_spawned or self.proc is not None) and not self.exit_confirmed:
                 raise RuntimeError("Previous Codex app-server exit is not confirmed")
             self._start_generation += 1
+            self._context_closing = False
             await self._start()
 
     async def _start(self) -> None:
@@ -2892,12 +2998,21 @@ class CodexNativeAppServer:
 
     def close(self) -> Coroutine[None, None, None]:
         """Bind teardown to this start attempt before a caller defers awaiting it."""
+        self._context_closing = True
+        if self._context_inventory is not None:
+            self._context_inventory.mark(self._context_inventory.incarnation, "closing")
         return self._close_generation(self._start_generation)
 
     async def _close_generation(self, start_generation: int) -> None:
         async with self._lifecycle_lock:
             if start_generation == self._start_generation:
-                await self._close_locked()
+                try:
+                    await self._close_locked()
+                finally:
+                    if self._context_inventory is not None:
+                        self._context_inventory.mark(
+                            self._context_inventory.incarnation, "unknown"
+                        )
 
     async def _close_locked(self) -> None:
         """
