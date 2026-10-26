@@ -124,6 +124,234 @@ def test_resident_inventory_reads_registered_claude_clients_without_sdk(monkeypa
     assert main.session_keys == ("main",)
 
 
+async def _primary_contexts(executor, session_id="conversation"):
+    evidence = (await executor.prepare_context_inventory_v2(session_id, "read"))()
+    (source,) = evidence.sources
+    assert source.coverage == "partial"
+    assert source.revision_authority == "observation_only"
+    assert source.membership_revision is source.work_revision is None
+    assert source.age_upper_bound_s is source.work_bindings is None
+    assert source.unresolved
+    return source
+
+
+@pytest.mark.asyncio
+async def test_context_inventory_v2_tracks_primary_connect_reuse_and_close(monkeypatch):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    entered, release = asyncio.Event(), asyncio.Event()
+    closing, finish_close = asyncio.Event(), asyncio.Event()
+
+    class Client(_SDKClient):
+        async def connect(self):
+            entered.set()
+            await release.wait()
+
+    async def close(client):
+        closing.set()
+        await finish_close.wait()
+
+    monkeypatch.setattr(executor, "_force_close_client", close)
+    factory = Mock(side_effect=Client)
+    sdk, options = SimpleNamespace(ClaudeSDKClient=factory), SimpleNamespace()
+    connecting = asyncio.create_task(
+        executor._get_or_create_client(sdk, session_key="main", options=options, model=None)
+    )
+    cleanup = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (pending,) = (await _primary_contexts(executor)).contexts
+        assert pending.lifecycle == "starting" and pending.operation.action == "create"
+        assert pending.provenance == "primary" and not pending.aliases
+        assert pending.vendor_id is pending.stop_proof is pending.continuity_proof is None
+        assert pending.execution_keys == ("main",)
+        release.set()
+        client = await connecting
+        read = await executor.prepare_context_inventory_v2("main", "prepared")
+        (live,) = read().sources[0].contexts
+        assert live.key == pending.key and live.lifecycle == "live"
+        assert live.operation == pending.operation and live.revision > pending.revision
+        assert (
+            await executor._get_or_create_client(
+                sdk, session_key="main", options=options, model=None
+            )
+            is client
+        )
+        (resumed,) = (await _primary_contexts(executor)).contexts
+        assert resumed.key == live.key and resumed.operation.action == "resume"
+        assert resumed.operation.operation_id != live.operation.operation_id
+        factory.assert_called_once()
+        cleanup = asyncio.create_task(executor.close_session("main"))
+        await asyncio.wait_for(closing.wait(), 2)
+        assert read().sources[0].contexts[0].lifecycle == "closing"
+        assert executor.resident_inventory() is None
+        finish_close.set()
+        await cleanup
+        (retired,) = (await _primary_contexts(executor)).contexts
+        assert retired.key == live.key and retired.lifecycle == "unknown"
+        assert retired.stop_proof is None
+        assert not executor._clients and not executor._resident_connecting
+    finally:
+        release.set()
+        finish_close.set()
+        await asyncio.gather(connecting, *([cleanup] if cleanup else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_context_inventory_v2_retains_failed_birth_and_replacement(monkeypatch, failure):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Client(_SDKClient):
+        async def connect(self):
+            entered.set()
+            await release.wait()
+            raise RuntimeError("connect failed")
+
+    monkeypatch.setattr(executor, "_force_close_client", AsyncMock())
+    connecting = asyncio.create_task(
+        executor._get_or_create_client(
+            SimpleNamespace(ClaudeSDKClient=Client),
+            session_key="main",
+            options=SimpleNamespace(),
+            model=None,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (pending,) = (await _primary_contexts(executor)).contexts
+        if failure == "cancel":
+            connecting.cancel()
+        else:
+            release.set()
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError):
+            await connecting
+        await executor._get_or_create_client(
+            SimpleNamespace(ClaudeSDKClient=_SDKClient),
+            session_key="main",
+            options=SimpleNamespace(),
+            model=None,
+        )
+        source = await _primary_contexts(executor)
+        old, new = source.contexts
+        assert old.key == pending.key and old.lifecycle == "unknown"
+        assert new.key != old.key and new.lifecycle == "live"
+        assert new.operation.action == old.operation.action == "create"
+        assert "client_absence_unconfirmed" in {row.reason for row in source.unresolved}
+    finally:
+        release.set()
+        connecting.cancel()
+        await asyncio.gather(connecting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_context_inventory_v2_cancel_eviction_keeps_closing_until_cleanup(monkeypatch):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def close(client):
+        entered.set()
+        await finish.wait()
+
+    monkeypatch.setattr(executor, "_force_close_client", close)
+    await executor._get_or_create_client(
+        SimpleNamespace(ClaudeSDKClient=_SDKClient),
+        session_key="main",
+        options=SimpleNamespace(),
+        model=None,
+    )
+    executor._evict_client_on_cancel("main")
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert (await _primary_contexts(executor)).contexts[0].lifecycle == "closing"
+    finally:
+        finish.set()
+        await asyncio.gather(*executor._cancel_close_tasks)
+    assert (await _primary_contexts(executor)).contexts[0].lifecycle == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_context_inventory_v2_bounds_retained_lifetimes(monkeypatch):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    monkeypatch.setattr(executor, "_force_close_client", AsyncMock())
+    for index in range(1001):
+        await executor._get_or_create_client(
+            SimpleNamespace(ClaudeSDKClient=_SDKClient),
+            session_key="main",
+            options=SimpleNamespace(),
+            model=None,
+        )
+        await executor._close_live_client("main")
+        if index == 999:
+            assert len((await _primary_contexts(executor)).contexts) == 1000
+    source = await _primary_contexts(executor)
+    assert not source.contexts and source.unresolved[0].reason == "context_history_budget"
+    assert len(executor._retired_contexts) == 1000
+
+
+@pytest.mark.asyncio
+async def test_context_inventory_v2_replacement_keeps_identity_and_rejects_late_events(
+    monkeypatch,
+):
+    from claude_agent_sdk import SystemMessage
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    monkeypatch.setattr(executor, "_force_close_client", AsyncMock())
+    sdk, options = SimpleNamespace(ClaudeSDKClient=_SDKClient), SimpleNamespace()
+    previous = None
+    for index in range(2):
+        await executor._get_or_create_client(sdk, session_key="main", options=options, model=None)
+        state = executor._clients["main"]
+        if index:
+            assert previous is not None
+            executor._observe_resident_context(
+                "main",
+                previous.client,
+                previous,
+                SystemMessage("init", {"session_id": "late"}),
+                SimpleNamespace(SystemMessage=SystemMessage, ResultMessage=type("Result", (), {})),
+            )
+            assert state.vendor_context_id is None
+        executor._observe_resident_context(
+            "main",
+            state.client,
+            state,
+            SystemMessage("init", {"session_id": "shared"}),
+            SimpleNamespace(SystemMessage=SystemMessage, ResultMessage=type("Result", (), {})),
+        )
+        if not index:
+            previous = state
+            await executor.close_session("main")
+    old, new = (await _primary_contexts(executor)).contexts
+    assert old.vendor_id == new.vendor_id and old.vendor_id.value == "shared"
+    assert old.key != new.key and old.execution_keys == new.execution_keys == ("main",)
+    assert not old.aliases and not new.aliases
+    assert old.lifecycle == "unknown" and new.lifecycle == "live"
+    executor._observe_resident_context(
+        "main",
+        state.client,
+        state,
+        SystemMessage("init", {"session_id": "conflict"}),
+        SimpleNamespace(SystemMessage=SystemMessage, ResultMessage=type("Result", (), {})),
+    )
+    assert (await _primary_contexts(executor)).contexts[1].lifecycle == "unknown"
+
+
 @pytest.mark.asyncio
 async def test_resident_inventory_keeps_connecting_client_incarnation(monkeypatch):
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor

@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypeAlias, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -73,6 +73,18 @@ from omnigent.startup_evidence import (
     ClaudeTurnEvidence,
     StartupPermissionUnavailable,
     claim_startup_boundary,
+)
+from omnigent.startup_protocol import (
+    ContextEvidenceV2,
+    ContextKeyV2,
+    ContextOperationV2,
+    ContextRecordV2,
+    SourceEvidenceV2,
+    UnresolvedContextV2,
+    VendorContextIdV2,
+    executor_context_scope_v2,
+    harness_context_authority_v2,
+    unknown_context_evidence_v2,
 )
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -871,6 +883,9 @@ class _ClaudeClientState:
     resident_incarnation_id: str = field(default_factory=lambda: uuid4().hex)
     vendor_context_id: str | None = None
     resident_context_conflict: bool = False
+    context_operation: ContextOperationV2 | None = None
+    context_lifecycle: Literal["starting", "live", "closing", "unknown"] = "unknown"
+    context_revision: int = 0
 
 
 @dataclass
@@ -1948,6 +1963,9 @@ class ClaudeSDKExecutor(Executor):
         self._clients: dict[str, _ClaudeClientState] = {}
         self._resident_connecting: dict[object, tuple[str, _ClaudeClientState]] = {}
         self._resident_inventory_detached = False
+        self._context_incarnation = uuid4().hex
+        self._retired_contexts: dict[tuple[str, str], ContextRecordV2] = {}
+        self._context_history_overflow = False
         # Per-session query slots serializing real turns and keep-warm pings.
         self._query_slots: dict[str, _QuerySlot] = {}
         self._active_turns: dict[str, int] = {}
@@ -2112,10 +2130,13 @@ class ClaudeSDKExecutor(Executor):
                     original_stderr(line)
 
             options.stderr = _tee_stderr
+            operation = ContextOperationV2(operation_id=uuid4().hex, action="create")
             client = sdk.ClaudeSDKClient(options)
             original_prompt = getattr(options, "system_prompt", None)
             original_extra_args = getattr(options, "extra_args", {})
             state = _ClaudeClientState(client=client, model=model)
+            state.context_operation = operation
+            state.context_lifecycle = "starting"
             token = object()
             self._resident_connecting[token] = (session_key, state)
             connected = False
@@ -2175,6 +2196,7 @@ class ClaudeSDKExecutor(Executor):
                     connected = True
             except asyncio.TimeoutError as exc:
                 self._resident_inventory_detached = True
+                state.context_lifecycle = "closing"
                 await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
@@ -2189,6 +2211,7 @@ class ClaudeSDKExecutor(Executor):
                 ) from exc
             except Exception as exc:
                 self._resident_inventory_detached = True
+                state.context_lifecycle = "closing"
                 # The CLI may exit immediately (e.g. ``unknown option``) before
                 # the SDK's async stderr reader has flushed all output.  A brief
                 # yield lets pending reader callbacks deliver remaining lines so
@@ -2210,6 +2233,7 @@ class ClaudeSDKExecutor(Executor):
                 if not connected:
                     # Best-effort connect teardown cannot acknowledge context absence.
                     self._resident_inventory_detached = True
+                    self._retain_context(session_key, state, "unknown")
                     self._resident_connecting.pop(token, None)
                 # Restore on both paths so post-connect stderr flows
                 # directly to the original callback and ``connect_stderr``
@@ -2220,20 +2244,36 @@ class ClaudeSDKExecutor(Executor):
                     options.extra_args = original_extra_args
             if session_key in self._clients:
                 self._resident_inventory_detached = True
+                self._retain_context(session_key, self._clients[session_key], "unknown")
             state.effort = getattr(options, "effort", None)
             state.permission_mode = getattr(options, "permission_mode", None)
             state.loop = asyncio.get_running_loop()
             state.task = cast("asyncio.Task[None] | None", asyncio.current_task())
+            state.context_lifecycle = (
+                "live" if state.context_lifecycle == "starting" else "unknown"
+            )
+            state.context_revision += 1
             self._clients[session_key] = state
             self._resident_connecting.pop(token, None)
             return client
 
+        # Reusing the owned client resumes its lifetime, not a new context.
+        if state.context_operation is not None:
+            state.context_operation = ContextOperationV2(operation_id=uuid4().hex, action="resume")
+            state.context_revision += 1
         if state.model != model:
             await state.client.set_model(model)
             state.model = model
         return state.client
 
     async def close_session(self, session_key: str) -> None:
+        candidates = list(self._resident_connecting.values())
+        if (state := self._clients.get(session_key)) is not None:
+            candidates.append((session_key, state))
+        for key, state in candidates:
+            if key == session_key:
+                state.context_lifecycle = "closing"
+                state.context_revision += 1
         await self.finish_peer_messages(session_key)
         self._crashed_sessions.pop(session_key, None)
         self._query_slots.pop(session_key, None)
@@ -2256,6 +2296,13 @@ class ClaudeSDKExecutor(Executor):
             return
         # Best-effort teardown is not an owned context-absence acknowledgment.
         self._resident_inventory_detached = True
+        self._retain_context(session_key, state, "closing")
+        try:
+            await self._disconnect_client(session_key, state)
+        finally:
+            self._retain_context(session_key, state, "unknown")
+
+    async def _disconnect_client(self, session_key: str, state: _ClaudeClientState) -> None:
         try:
             current_loop = asyncio.get_running_loop()
             current_task = asyncio.current_task()
@@ -2295,11 +2342,13 @@ class ClaudeSDKExecutor(Executor):
         if state is None:
             return
         self._resident_inventory_detached = True
+        self._retain_context(session_key, state, "closing")
         # Close in the background: an await here runs under an in-flight
         # cancellation and could itself be cancelled, leaking the CLI process.
         task = asyncio.create_task(self._force_close_client(state.client))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+        task.add_done_callback(lambda _done: self._retain_context(session_key, state, "unknown"))
 
     async def _evict_terminated_client(self, session_key: str) -> None:
         """Discard a cached client after its CLI child exits."""
@@ -2830,8 +2879,116 @@ class ClaudeSDKExecutor(Executor):
             return
         if owner.vendor_context_id is None:
             owner.vendor_context_id = context_id
+            owner.context_revision += 1
         elif owner.vendor_context_id != context_id:
             owner.resident_context_conflict = True
+            owner.context_lifecycle = "unknown"
+            owner.context_revision += 1
+
+    def _context_record(
+        self, session_key: str, state: _ClaudeClientState
+    ) -> ContextRecordV2 | None:
+        if state.context_operation is None:
+            return None
+        return ContextRecordV2(
+            key=ContextKeyV2(
+                source_owner_incarnation=self._context_incarnation,
+                context_incarnation=state.resident_incarnation_id,
+            ),
+            vendor_id=(
+                VendorContextIdV2(namespace="claude-sdk", value=state.vendor_context_id)
+                if state.vendor_context_id is not None
+                else None
+            ),
+            operation=state.context_operation,
+            execution_keys=(session_key,),
+            provenance="primary",
+            lifecycle=state.context_lifecycle,
+            aliases=(),
+            revision=state.context_revision,
+            stop_proof=None,
+            continuity_proof=None,
+        )
+
+    def _retain_context(
+        self,
+        session_key: str,
+        state: _ClaudeClientState,
+        lifecycle: Literal["closing", "unknown"],
+    ) -> None:
+        """Keep bounded metadata after teardown, without retaining SDK handles."""
+        state.context_lifecycle = lifecycle
+        state.context_revision += 1
+        key = (session_key, state.resident_incarnation_id)
+        if key not in self._retired_contexts and len(self._retired_contexts) >= 1000:
+            self._context_history_overflow = True
+            return
+        try:
+            record = self._context_record(session_key, state)
+        except ValueError:
+            self._context_history_overflow = True
+            return
+        if record is not None:
+            self._retired_contexts[key] = record
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """Read this adapter-owned executor; the outer session ID is not its SDK key."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+
+        def observe() -> ContextEvidenceV2:
+            candidates = list(self._clients.items()) + list(self._resident_connecting.values())
+            if (
+                self._context_history_overflow
+                or len(candidates) + len(self._retired_contexts) > 1000
+            ):
+                return unknown_context_evidence_v2(session_id, read_id, "context_history_budget")
+            records = list(self._retired_contexts.values())
+            reasons = ["sdk_subcontexts_unobserved"]
+            if self._resident_inventory_detached:
+                reasons.append("client_absence_unconfirmed")
+            for key, state in candidates:
+                record = self._context_record(key, state)
+                if record is None:
+                    reasons.append("primary_operation_unobserved")
+                else:
+                    records.append(record)
+            return ContextEvidenceV2(
+                wire_version=2,
+                read_id=read_id,
+                authority=harness_context_authority_v2(session_id),
+                expected_scopes=(executor_context_scope_v2(session_id),),
+                sources=(
+                    SourceEvidenceV2(
+                        scope=executor_context_scope_v2(session_id),
+                        producer_incarnation=self._context_incarnation,
+                        coverage="partial",
+                        contexts=tuple(records),
+                        unresolved=tuple(
+                            UnresolvedContextV2(candidate=None, reason=reason)
+                            for reason in reasons
+                        ),
+                        membership_revision=None,
+                        context_revision=None,
+                        work_revision=None,
+                        revision_authority="observation_only",
+                        age_upper_bound_s=None,
+                        work_bindings=None,
+                    ),
+                ),
+            )
+
+        def reconcile() -> ContextEvidenceV2:
+            try:
+                return observe()
+            except ValueError:
+                return unknown_context_evidence_v2(
+                    session_id, read_id, "context_identity_conflict"
+                )
+
+        return reconcile
 
     def resident_inventory(self) -> ExecutorResidentInventory | None:
         """Copy registered client owners without loading or probing the SDK.

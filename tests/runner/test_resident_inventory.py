@@ -612,9 +612,11 @@ async def harness_inventory_reader(monkeypatch, tmp_path):
 
     async with AsyncExitStack() as stack:
 
-        async def add(session_id, inventory):
-            owner = Owner(inventory)
-            adapter = ExecutorAdapter(forbidden)
+        async def add(
+            session_id, inventory, *, executor=None, adapter=None, harness_family="codex"
+        ):
+            owner = executor if executor is not None else Owner(inventory)
+            adapter = adapter if adapter is not None else ExecutorAdapter(forbidden)
             adapter._executor = owner
             harness = adapter.build()
             harness.state.conversation_id = session_id
@@ -631,7 +633,7 @@ async def harness_inventory_reader(monkeypatch, tmp_path):
                     event_hooks={"request": [record]},
                 )
             )
-            entry = _SubprocessEntry(Process(), client, _HarnessEndpoint(), "codex")
+            entry = _SubprocessEntry(Process(), client, _HarnessEndpoint(), harness_family)
             entry.incarnation_id = f"harness-{session_id}"
             manager._entries[session_id] = entry
             manager._retention_managed[session_id] = 0.0
@@ -1205,6 +1207,45 @@ async def test_runner_context_inventory_v2_binds_session_scopes(harness_inventor
     )
     assert by_namespace["harness"].unresolved[0].reason == "context_source_unimplemented"
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+
+
+async def test_runner_context_inventory_v2_preserves_real_claude_primary(
+    harness_inventory_reader, monkeypatch
+):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    assert adapter._session_key != "one"
+    factory = Mock(return_value=SimpleNamespace(connect=AsyncMock(), disconnect=AsyncMock()))
+    await executor._get_or_create_client(
+        SimpleNamespace(ClaudeSDKClient=factory),
+        session_key=adapter._session_key,
+        options=SimpleNamespace(),
+        model=None,
+    )
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family="claude-sdk")
+    for retired in (False, True):
+        if retired:
+            monkeypatch.setattr(executor, "_force_close_client", AsyncMock())
+            await executor.close_session(adapter._session_key)
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        assert response.status_code == 200
+        sources = _v2_evidence(response.content, session_id="one").sources
+        harness, native, terminal = sources
+        assert harness.coverage == "partial" and harness.unresolved
+        (record,) = harness.contexts
+        assert record.operation.action == "create" and record.provenance == "primary"
+        assert record.execution_keys == (adapter._session_key,)
+        assert record.lifecycle == ("unknown" if retired else "live")
+        assert record.stop_proof is record.continuity_proof is None
+        assert native.coverage == terminal.coverage == "unsupported"
+    factory.assert_called_once()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
 
 
 async def test_runner_context_inventory_v2_keeps_an_unresident_session_unknown(
