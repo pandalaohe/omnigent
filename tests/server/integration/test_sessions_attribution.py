@@ -865,12 +865,12 @@ async def test_post_event_wake_held_when_a_later_chain_link_is_pre_release(
 
 
 @pytest.mark.asyncio
-async def test_post_event_plain_message_to_a_succeeded_session_is_unchanged(
+async def test_post_event_plain_message_to_a_succeeded_session_preserves_actor(
     auth_client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A user message to a succeeded session stays there, not on the successor."""
+    """A redirected user message keeps its authenticated author's attribution."""
     from omnigent.server.routes import sessions as sessions_mod
     from omnigent.server.routes.sessions import routes_events as events_mod
 
@@ -894,9 +894,15 @@ async def test_post_event_plain_message_to_a_succeeded_session_is_unchanged(
         headers={"X-Forwarded-Email": "alice@example.com"},
     )
     assert resp.status_code == 202, resp.text
+    assert resp.json()["redirected_to"] == new_id
 
     conv_store = SqlAlchemyConversationStore(db_uri)
     old_items = await asyncio.to_thread(conv_store.list_items, old_id)
-    assert [item.data.content[0]["text"] for item in old_items.data] == ["hello"]
+    assert old_items.data == []
     new_items = await asyncio.to_thread(conv_store.list_items, new_id)
-    assert new_items.data == []
+    [persisted] = new_items.data
+    assert persisted.created_by == "alice@example.com"
+    assert persisted.data.content == [
+        {"type": "input_text", "text": f"[Sent to previous session: /c/{old_id}]"},
+        {"type": "input_text", "text": "hello"},
+    ]
