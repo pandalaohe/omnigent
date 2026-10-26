@@ -143,6 +143,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                 json={
                     "id": "conv_old",
                     "agent_id": "ag_codex",
+                    "title": "续接状态检查",
                     "terminal_launch_args": ["--approve-for-me"],
                     "runner_id": "runner_123",
                     "labels": {
@@ -271,6 +272,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         "/v1/sessions",
         {
             "agent_id": "ag_codex",
+            "title": "续接状态检查",
             "labels": {
                 "omnigent.wrapper": "codex-native-ui",
                 "omnigent.codex_native.bridge_id": "bridge_shared",
@@ -286,7 +288,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     assert (
         "POST",
         "/v1/sessions/conv_old/succession",
-        {"target_session_id": "conv_new"},
+        {"target_session_id": "conv_new", "allow_empty": True},
     ) in requests
     assert [
         payload["data"]["status"]
@@ -326,6 +328,12 @@ def test_forwarder_rotation_failure_preserves_old_target(
     :param tmp_path: Temporary bridge directory.
     :returns: None.
     """
+
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        codex_native_forwarder, "_fetch_session_snapshot", AsyncMock(return_value={"labels": {}})
+    )
 
     class _FakeCoalescer:
         """
@@ -573,14 +581,17 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("deleted_project", [False, True])
+@pytest.mark.parametrize("title", ["Saved name", None])
 async def test_thread_replacement_preserves_project_or_retries_unfiled(
-    tmp_path: Path, deleted_project: bool
+    tmp_path: Path, deleted_project: bool, title: str | None
 ) -> None:
     creates: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json={"agent_id": "agent", "project_id": "project"})
+            return httpx.Response(
+                200, json={"agent_id": "agent", "project_id": "project", "title": title}
+            )
         if request.method == "POST" and request.url.path == "/v1/sessions":
             creates.append(json.loads(request.content))
             if deleted_project and len(creates) == 1:
@@ -600,12 +611,15 @@ async def test_thread_replacement_preserves_project_or_retries_unfiled(
         )
 
     assert result == "replacement"
+    assert all(body.get("title") == title for body in creates)
     assert creates[0]["project_id"] == "project"
     assert creates[0]["workspace"] is None
     assert creates[0]["git"] is None
     if deleted_project:
         assert len(creates) == 2
-        assert set(creates[1]) == {"agent_id", "labels"}
+        assert set(creates[1]) == {"agent_id", "labels"} | (
+            {"title"} if title is not None else set()
+        )
     else:
         assert len(creates) == 1
 

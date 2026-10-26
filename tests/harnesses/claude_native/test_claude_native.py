@@ -12702,8 +12702,9 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("deleted_project", [False, True])
+@pytest.mark.parametrize("title", ["Saved name", None])
 async def test_clear_replacement_preserves_project_or_retries_unfiled(
-    tmp_path: Path, deleted_project: bool, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, deleted_project: bool, title: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     bridge_dir.mkdir(parents=True)
@@ -12718,6 +12719,7 @@ async def test_clear_replacement_preserves_project_or_retries_unfiled(
                     "agent_id": "agent",
                     "project_id": "project",
                     "workspace": "/opt/work/project",
+                    "title": title,
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
@@ -12735,6 +12737,7 @@ async def test_clear_replacement_preserves_project_or_retries_unfiled(
         )
 
     assert result == "replacement"
+    assert all(body.get("title") == title for body in creates)
     assert creates[0]["project_id"] == "project"
     assert creates[0]["workspace"] == "/opt/work/project"
     assert creates[0]["git"] is None
@@ -12745,6 +12748,7 @@ async def test_clear_replacement_preserves_project_or_retries_unfiled(
             "labels": creates[0]["labels"],
             "workspace": "/opt/work/project",
             "git": None,
+            **({"title": title} if title is not None else {}),
         }
     else:
         assert len(creates) == 1

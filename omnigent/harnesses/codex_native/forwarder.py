@@ -3046,6 +3046,23 @@ async def _maybe_rotate_session_on_thread_started(
     await old_usage_coalescer.flush()
     old_elicitation_tracker = target.elicitation_tracker
     old_session_id = target.session_id
+    from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
+
+    allow_empty = False
+    try:
+        old = await _fetch_session_snapshot(ap_client, old_session_id)
+    except (httpx.HTTPError, ValueError, RuntimeError):
+        _logger.warning(
+            "Failed to read Codex rotation intent; retaining empty-session succession gate; "
+            "old_session=%s",
+            old_session_id,
+            exc_info=True,
+        )
+    else:
+        old_labels = old.get("labels")
+        allow_empty = (
+            not isinstance(old_labels, dict) or ROTATE_REQUESTED_LABEL_KEY not in old_labels
+        )
     prepared = read_bridge_state(bridge_dir)
     if (
         prepared is not None
@@ -3086,6 +3103,7 @@ async def _maybe_rotate_session_on_thread_started(
         ap_client,
         old_session_id=old_session_id,
         new_session_id=new_session_id,
+        allow_empty=allow_empty,
     )
     return True
 
@@ -3133,6 +3151,8 @@ async def _create_thread_replacement_session(
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
     create_body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
+    if (title := old.get("title")) is not None:
+        create_body["title"] = title
     project_id = old.get("project_id")
     if isinstance(project_id, str):
         create_body.update({"project_id": project_id, "workspace": None, "git": None})

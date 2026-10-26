@@ -38,6 +38,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     HANDOVER_ITEM_LABEL_KEY,
+    ROTATE_REQUESTED_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
 )
@@ -555,6 +556,105 @@ async def test_succession_can_archive_without_live_children(
     )
     assert retry.json()["status"] == "done"
     assert len(_succession_notices(store, new)) == 1
+
+
+@pytest.mark.parametrize("requested_handover", [False, True])
+@pytest.mark.parametrize("source_failure", [None, "503", "timeout", "nonobject", "invalid-json"])
+async def test_codex_childless_rotation_carries_handover_only_on_user_clear(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    requested_handover: bool,
+    source_failure: str | None,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+        include_llm=False,
+    )
+    old = agent["_session_id"]
+    store.update_conversation(old, title="mother")
+    store.set_runner_id(old, RUNNER_ID)
+    new = store.create_conversation(agent_id=agent["id"], title="mother").id
+    store.set_runner_id(new, RUNNER_ID)
+    handover = store.append(
+        old,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=generate_task_id(),
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Continue the migration."}],
+                ),
+            )
+        ],
+    )[0]
+    labels = {HANDOVER_ITEM_LABEL_KEY: handover.id}
+    if requested_handover:
+        labels[ROTATE_REQUESTED_LABEL_KEY] = "true"
+    store.set_labels(old, labels)
+    # A prepared replacement is the retry path after its terminal was transferred.
+    monkeypatch.setattr(
+        forwarder,
+        "read_bridge_state",
+        lambda _path: SimpleNamespace(
+            permission_profile=None, thread_id="thread_new", session_id=new
+        ),
+    )
+    if source_failure is not None:
+        request = httpx.Request("GET", f"http://test/v1/sessions/{old}")
+        failures = {
+            "503": httpx.HTTPStatusError(
+                "unavailable", request=request, response=httpx.Response(503, request=request)
+            ),
+            "timeout": httpx.ReadTimeout("unavailable", request=request),
+            "nonobject": RuntimeError("Codex session snapshot response was not an object"),
+            "invalid-json": ValueError("invalid JSON"),
+        }
+        monkeypatch.setattr(
+            forwarder, "_fetch_session_snapshot", AsyncMock(side_effect=failures[source_failure])
+        )
+    target = forwarder._ForwarderTarget(
+        session_id=old,
+        thread_id="thread_old",
+        delta_coalescer=forwarder._OutputTextDeltaCoalescer(client, old),
+        usage_coalescer=forwarder._SessionUsageCoalescer(client, old),
+        elicitation_tracker=forwarder._CodexElicitationTaskTracker(),
+    )
+    try:
+        rotated = await forwarder._maybe_rotate_session_on_thread_started(
+            ap_client=client,
+            target=target,
+            bridge_dir=tmp_path,
+            app_server_url="ws://test",
+            event={"method": "thread/started", "params": {"thread": {"id": "thread_new"}}},
+        )
+        assert rotated and target.session_id == new and target.thread_id == "thread_new"
+        receipt = store.get_succession(old, new)
+        if requested_handover or source_failure is not None:
+            assert receipt is None
+            assert not store.get_conversation(old).archived
+            wake.assert_not_awaited()
+        else:
+            assert receipt is not None and receipt.phase == "done"
+            assert receipt.moved_ids == []
+            assert receipt.opening is not None
+            assert "Continue the migration." in receipt.opening["text"]
+            assert len(_succession_notices(store, new)) == 1
+            assert store.get_conversation(old).archived
+            wake.assert_awaited_once()
+            assert "Continue the migration." in wake.await_args.args[1]
+    finally:
+        await target.delta_coalescer.close()
+        await target.usage_coalescer.close()
+        await target.elicitation_tracker.close()
 
 
 async def test_succession_noop_for_child_session(

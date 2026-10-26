@@ -5131,6 +5131,8 @@ async def _create_clear_replacement_session(
         "workspace": old.get("workspace"),
         "git": None,
     }
+    if (title := old.get("title")) is not None:
+        create_body["title"] = title
     project_id = old.get("project_id")
     if isinstance(project_id, str):
         create_body["project_id"] = project_id

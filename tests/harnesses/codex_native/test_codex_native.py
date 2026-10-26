@@ -2868,6 +2868,12 @@ def test_forwarder_rotation_failure_preserves_old_target(
     :returns: None.
     """
 
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        codex_native_forwarder, "_fetch_session_snapshot", AsyncMock(return_value={"labels": {}})
+    )
+
     class _FakeCoalescer:
         """
         Test coalescer that records lifecycle calls.
