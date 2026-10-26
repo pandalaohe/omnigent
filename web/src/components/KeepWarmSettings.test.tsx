@@ -71,6 +71,7 @@ vi.mock("@/lib/agentLabels", async (original) => ({
         "claude-sdk": { keep_warm_family: "claude", integration_mode: "sdk-in-process" },
         "codex-native": { keep_warm_family: "codex", integration_mode: "native-tui" },
         pi: { keep_warm_family: "pi", integration_mode: "cli-subprocess" },
+        "pi-native": { keep_warm_family: "pi", integration_mode: "native-tui" },
       },
     }),
 }));
@@ -107,6 +108,14 @@ vi.mock("@/hooks/useAgentRegistry", async (original) => ({
         label: "Pi",
         harness: "pi",
         section: "sdk",
+        source: "builtin",
+        deployed: true,
+      },
+      {
+        key: "harness:pi-native",
+        label: "Pi",
+        harness: "pi-native",
+        section: "native",
         source: "builtin",
         deployed: true,
       },
@@ -205,6 +214,60 @@ async function saveCell() {
 }
 
 describe("KeepWarmSettings table", () => {
+  it("keeps the sticky corner above scrolling headers in one table layer", async () => {
+    await mount();
+    const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
+    const corner = within(table).getByRole("columnheader", { name: "Host / Agent" });
+    const headers = within(table)
+      .getAllByRole("columnheader")
+      .filter((header) => header !== corner);
+    const rows = within(table).getAllByRole("rowheader");
+    // jsdom cannot paint; verify sticky ownership, opaque surfaces and relative layers.
+    expect(corner.closest("thead")).not.toHaveClass("sticky");
+    expect(corner).toHaveClass("sticky", "top-0", "left-0", "bg-card-solid");
+    const layer = (element: HTMLElement) => Number(element.className.match(/\bz-(\d+)\b/)?.[1]);
+    expect(headers.length).toBeGreaterThan(0);
+    for (const header of headers) {
+      expect(header).toHaveClass("sticky", "top-0", "bg-card-solid");
+      expect(layer(corner)).toBeGreaterThan(layer(header));
+      for (const row of rows) expect(layer(header)).toBeGreaterThan(layer(row));
+    }
+  });
+
+  it("distinguishes same-name harness columns and keeps editor targets consistent", async () => {
+    state.preview.columns = ["harness:pi", "harness:pi-native"];
+    state.preview.cells = {
+      h1: { "harness:pi": { child: true }, "harness:pi-native": { main: false, child: false } },
+    };
+    await mount();
+    const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
+    const sdkHeader = within(table).getByRole("columnheader", { name: /^Pi · pi(?: |$)/ });
+    const nativeHeader = within(table).getByRole("columnheader", {
+      name: /^Pi · pi-native(?: |$)/,
+    });
+    expect(within(sdkHeader).getByText("Pi · pi", { exact: true })).toBeVisible();
+    expect(within(nativeHeader).getByText("Pi · pi-native", { exact: true })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Remove Pi · pi column" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Remove Pi · pi-native column" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Pi · pi-native" }));
+    expect(screen.getByRole("dialog", { name: "Hawk / Pi · pi-native" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
+    await saveCell();
+    expect(latestCells()).toEqual({
+      h1: { "harness:pi": { child: true }, "harness:pi-native": { main: true } },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Pi · pi" }));
+    expect(screen.getByRole("dialog", { name: "Hawk / Pi · pi" })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Keep children warm" })).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Pi · pi-native column" }));
+    expect(
+      screen.getByRole("dialog", { name: "Remove Pi · pi-native column?" }),
+    ).toBeInTheDocument();
+  });
+
   it("previews the authoritative payload without writing, retaining off columns and unknown hosts", async () => {
     state.preview.cells = {
       h1: { "harness:claude-native": { main: true } },

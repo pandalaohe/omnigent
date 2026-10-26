@@ -325,7 +325,23 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
   );
   const harnessFor = (key: string) =>
     key.startsWith("harness:") ? key.slice(8) : byKey.get(key)?.harness;
-  const labelFor = (key: string) => byKey.get(key)?.label ?? registry.legacyLabels[key] ?? key;
+  const baseLabelFor = (key: string) => byKey.get(key)?.label ?? registry.legacyLabels[key] ?? key;
+  const columnsByLabel = new Map<string, string[]>();
+  for (const key of columns) {
+    const label = baseLabelFor(key);
+    columnsByLabel.set(label, [...(columnsByLabel.get(label) ?? []), key]);
+  }
+  const labelFor = (key: string) => {
+    const label = baseLabelFor(key);
+    const matches = columnsByLabel.get(label) ?? [];
+    if (matches.length < 2) return label;
+    const harness = harnessFor(key);
+    const suffix =
+      harness && matches.filter((column) => harnessFor(column) === harness).length === 1
+        ? harness
+        : key;
+    return `${label} · ${suffix}`;
+  };
   const familyFor = (key: string) => keepWarmFamilyForHarness(harnessFor(key), capabilities);
   const rowFor = (host: string, key: string) => {
     const row = resolveKeepWarmCell(data, host, key, harnessFor(key));
@@ -521,13 +537,17 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         <div className="max-h-[32rem] overflow-auto rounded-lg border">
           <table className="w-full border-collapse text-left text-sm">
             <caption className="sr-only">Keep-warm settings by host and agent</caption>
-            <thead className="sticky top-0 z-20 bg-muted">
+            <thead>
               <tr>
-                <th scope="col" className="sticky left-0 z-30 min-w-36 bg-muted p-3">
+                <th scope="col" className="sticky top-0 left-0 z-30 min-w-36 bg-card-solid p-3">
                   Host / Agent
                 </th>
                 {columns.map((key) => (
-                  <th scope="col" key={key} className="min-w-48 border-l p-3 align-top">
+                  <th
+                    scope="col"
+                    key={key}
+                    className="sticky top-0 z-20 min-w-48 border-l bg-card-solid p-3 align-top"
+                  >
                     <span className="block max-w-56 break-words font-medium">{labelFor(key)}</span>
                     <Button
                       variant="ghost"
@@ -548,7 +568,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                 <tr key={host} className="border-t">
                   <th
                     scope="row"
-                    className="sticky left-0 z-10 max-w-52 bg-card p-3 align-top font-medium"
+                    className="sticky left-0 z-10 max-w-52 bg-card-solid p-3 align-top font-medium"
                   >
                     <span className="block break-words">{hostName(host)}</span>
                     {host !== "" && (
