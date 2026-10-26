@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
+import httpx
 import psutil
 import pytest
 
@@ -56,7 +57,7 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMetadata, ModelWireAPI
 from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 from omnigent.server.schemas import ElicitationResult
@@ -5419,6 +5420,87 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
     ):
         executor = PiExecutor(gateway=True, model="databricks-gpt-5-4")
     assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_rpc_launch_carries_gateway_efforts_from_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    mixed: bool,
+) -> None:
+    base = "https://rpc.example/proxy/v1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/proxy/model_group/info"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "model_group": "custom-model",
+                        "supported_reasoning_efforts": ["low", "high", "max"],
+                    }
+                ]
+            },
+        )
+
+    from omnigent.models import model_catalog
+
+    transport = httpx.MockTransport(handler)
+    fetch = model_catalog.fetch_openai_reasoning_metadata
+    monkeypatch.setattr(
+        model_catalog, "fetch_openai_reasoning_metadata", lambda p: fetch(p, transport=transport)
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.pi_executor._fetch_shell_command_token", AsyncMock(return_value="test-key")
+    )
+    monkeypatch.setattr(model_catalog, "fetch_databricks_model_service_entries", lambda *_: ())
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", lambda *_: ())
+    base_urls = {"openai": base}
+    if mixed:
+        base_urls["claude"] = "https://workspace.example.databricks.com/ai-gateway/anthropic"
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://rpc.example",
+        base_urls_override=base_urls,
+        gateway_auth_command="get-test-token",
+    )
+    configs = []
+
+    def build_env(_tools, _port, _token, models, **kwargs):
+        configs.append(models)
+        return PiSubprocessConfig(env={}, tmp_dir="", extra_args=[])
+
+    monkeypatch.setattr(executor, "_build_env_and_dir", build_env)
+    monkeypatch.setattr(executor, "_ensure_tool_server", AsyncMock(return_value=None))
+    monkeypatch.setattr(_PiRpcSession, "start", AsyncMock())
+    _run(executor._ensure_rpc("test-session", "system", "custom-model", []))
+    models = configs[0]["providers"]["databricks-completions"]["models"]
+    assert len(models) == 1 and models[0]["reasoning"] is True
+    assert models[0]["thinkingLevelMap"] == {
+        "off": None,
+        "minimal": None,
+        "low": "low",
+        "medium": None,
+        "high": "high",
+        "xhigh": None,
+        "max": "max",
+    }
+
+
+def test_gateway_efforts_do_not_cross_provider_urls() -> None:
+    config = _build_models_json(
+        "https://example.test",
+        "test-key",
+        {"openai": "https://example.test/served/v1"},
+        model="custom-model",
+        provider_reasoning={
+            "https://example.test/other/v1": {
+                "custom-model": ModelReasoningMetadata(efforts=frozenset({"low", "high"}))
+            }
+        },
+    )
+    assert "thinkingLevelMap" not in config["providers"]["databricks-completions"]["models"][0]
 
 
 def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:

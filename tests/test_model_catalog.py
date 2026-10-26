@@ -1948,6 +1948,54 @@ def test_openai_compatible_listing_hits_the_versioned_base() -> None:
     ]
 
 
+@pytest.mark.parametrize("failure", [None, 401, 404, 500, "timeout", "redirect", "malformed"])
+def test_gateway_reasoning_discovery_is_optional_and_keeps_url_prefix(failure) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/proxy/model_group/info"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        if isinstance(failure, int):
+            return httpx.Response(failure)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timeout", request=request)
+        if failure == "redirect":
+            return httpx.Response(302, headers={"Location": "https://other.example/info"})
+        if failure == "malformed":
+            return httpx.Response(200, text="not json")
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "model_group": "custom-model",
+                        "supported_reasoning_efforts": ["low", "high", "max"],
+                    },
+                    {"model_group": "bad-list", "supported_reasoning_efforts": ["low", 1]},
+                    {"model_group": "empty-list", "supported_reasoning_efforts": []},
+                ]
+            },
+        )
+
+    metadata = model_catalog.fetch_openai_reasoning_metadata(
+        ResolvedModelProvider(
+            kind="gateway",
+            family="openai",
+            base_url="https://gateway.example/proxy/v1/",
+            api_key="test-key",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    assert len(requests) == 1
+    if failure is None:
+        assert set(metadata) == {"custom-model"}
+        reasoning = metadata["custom-model"]
+        assert reasoning is not None and reasoning.efforts == frozenset({"low", "high", "max"})
+    else:
+        assert metadata == {}
+
+
 def test_openai_compatible_listing_mints_bearer_via_auth_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

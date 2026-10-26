@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from omnigent.models.model_metadata import ModelCapability, ModelMetadata
+from omnigent.models.claude_model_vocabulary import canonical_claude_id, normalized_model_id
+from omnigent.models.model_fallbacks import (
+    PI_ANTHROPIC_ADAPTIVE_THINKING,
+    PI_ANTHROPIC_BUDGET_THINKING,
+    PI_ANTHROPIC_THINKING_REQUIRED,
+)
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelReasoningMetadata
 
 if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
@@ -76,9 +83,8 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 # through the Responses API instead and do not need it.
 PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
-# Claude models support extended thinking; reasoning:true in the model entry
-# enables Pi's thinking level controls. Paired with forceAdaptiveThinking in the
-# provider compat block so Pi sends thinking.type.adaptive (required by claude-4+).
+# Claude models support extended thinking; reasoning:true enables Pi's controls.
+# Adaptive versus budget-based thinking is configured per model.
 PI_CLAUDE_THINKING_MODEL_FRAGMENTS: tuple[str, ...] = ("claude",)
 
 
@@ -88,10 +94,35 @@ class PiModelEntry(TypedDict):
     id: str
     input: NotRequired[list[str]]
     reasoning: NotRequired[bool]
+    thinkingLevelMap: NotRequired[dict[str, str | None]]
+    compat: NotRequired[dict[str, bool]]
     # Omitted when the catalog reports no limit; Pi then applies its own
     # defaults (128000 / 16384).
     contextWindow: NotRequired[int]
     maxTokens: NotRequired[int]
+
+
+def pi_model_with_thinking_defaults(entry: PiModelEntry) -> PiModelEntry:
+    """Fill Anthropic defaults, respecting explicit level maps and compatibility flags.
+
+    Normalize known ID variants for matching only; preserve the provider's actual ID.
+    """
+    model = normalized_model_id(canonical_claude_id(entry["id"]) or entry["id"])
+    model = re.sub(r"(?:-\d{8})?(?:-v\d+:\d+)?$", "", model)
+    compat = entry.get("compat", {})
+    for fallback, adaptive in (
+        (PI_ANTHROPIC_ADAPTIVE_THINKING, True),
+        (PI_ANTHROPIC_BUDGET_THINKING, False),
+    ):
+        if model in fallback.model_ids and "forceAdaptiveThinking" not in compat:
+            entry = {
+                **entry,
+                "reasoning": True,
+                "compat": {**compat, "forceAdaptiveThinking": adaptive},
+            }
+    if model in PI_ANTHROPIC_THINKING_REQUIRED.model_ids and "thinkingLevelMap" not in entry:
+        return {**entry, "reasoning": True, "thinkingLevelMap": {"off": None}}
+    return entry
 
 
 def pi_model_is_reasoning(model_id: str) -> bool:
@@ -137,6 +168,23 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if pi_model_entry_is_reasoning(model):
         entry["reasoning"] = True
+    return pi_model_with_reasoning_metadata(entry, model.metadata.reasoning)
+
+
+def pi_model_with_reasoning_metadata(
+    entry: PiModelEntry, reasoning: ModelReasoningMetadata | None
+) -> PiModelEntry:
+    """Restrict declared effort levels without allowing thinking to be disabled."""
+    levels = ("minimal", "low", "medium", "high", "xhigh", "max")
+    if reasoning is not None and reasoning.efforts.intersection(levels):
+        return {
+            **entry,
+            "reasoning": True,
+            "thinkingLevelMap": {
+                "off": None,
+                **{level: level if level in reasoning.efforts else None for level in levels},
+            },
+        }
     return entry
 
 
@@ -251,6 +299,7 @@ def enrich_databricks_model_catalog(
                         live.cost_tier if live.cost_tier is not None else metadata.cost_tier
                     ),
                     wire_apis=live.wire_apis or metadata.wire_apis,
+                    reasoning=live.reasoning or metadata.reasoning,
                 ),
             )
         )

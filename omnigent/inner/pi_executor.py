@@ -76,14 +76,17 @@ from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
-from omnigent.models.model_metadata import ModelWireAPI
+from omnigent.models.model_metadata import ModelReasoningMetadata, ModelWireAPI
 from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
+    PiModelEntry,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
     pi_model_is_reasoning,
     pi_model_json_entry,
+    pi_model_with_reasoning_metadata,
+    pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
@@ -1518,6 +1521,7 @@ def _build_models_json(
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
     model_metadata: Mapping[str, Mapping[str, int]] | None = None,
+    provider_reasoning: Mapping[str, Mapping[str, ModelReasoningMetadata]] | None = None,
 ) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
@@ -1595,7 +1599,10 @@ def _build_models_json(
             registered_model = replace(catalog_model, id=model)
         # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
         # not assignable to it (dict value types are invariant), so copy.
-        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        model_entry: PiModelEntry = pi_model_json_entry(registered_model)
+        if provider_name == "databricks-anthropic":
+            model_entry = pi_model_with_thinking_defaults(model_entry)
+        entry: _JsonObject = dict(model_entry)
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
@@ -1690,14 +1697,27 @@ def _build_models_json(
                 url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
                 for url in (base_urls or {}).values()
             ):
-                entry = dict(pi_generic_model_json_entry(model))
+                model_entry = pi_generic_model_json_entry(model)
             else:
-                entry = {"id": model, "input": ["text", "image"]}
-                if pi_model_is_reasoning(model):
-                    entry["reasoning"] = True
+                model_entry = {"id": model, "input": ["text", "image"]}
+                if pi_model_is_reasoning(model) or (
+                    provider["api"] == "anthropic-messages"
+                    and model_catalog.model_family_token(model) == "claude"
+                ):
+                    model_entry["reasoning"] = True
+            if provider["api"] == "anthropic-messages":
+                model_entry = pi_model_with_thinking_defaults(model_entry)
+            entry = dict(model_entry)
             provider["models"] = [*provider["models"], entry]
     for provider in config["providers"].values():
         for entry in provider["models"]:
+            model_id = str(entry["id"])
+            reasoning = (provider_reasoning or {}).get(provider["baseUrl"], {}).get(model_id)
+            if reasoning is not None:
+                capability_entry = pi_model_with_reasoning_metadata({"id": model_id}, reasoning)
+                if "thinkingLevelMap" in capability_entry:
+                    entry["reasoning"] = True
+                    entry["thinkingLevelMap"] = capability_entry["thinkingLevelMap"]
             limits = (model_metadata or {}).get(str(entry["id"]), {})
             if "context_window" in limits:
                 entry["contextWindow"] = limits["context_window"]
@@ -2842,6 +2862,7 @@ class PiExecutor(Executor):
             raise ValueError(f"unsupported Pi OpenAI wire API: {openai_wire_api!r}")
         self._openai_wire_api = openai_wire_api
         self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
+        self._provider_reasoning: dict[str, dict[str, ModelReasoningMetadata]] = {}
         self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
         interval = (
@@ -3150,6 +3171,22 @@ class PiExecutor(Executor):
             return self._gateway_model_wire_apis
         if self._gateway:
             await self._get_gateway_token()
+            for family, base_url in (self._base_urls_override or {}).items():
+                if (
+                    not base_url
+                    or _is_databricks_gateway_base_url(base_url)
+                    or base_url in self._provider_reasoning
+                ):
+                    continue
+                self._provider_reasoning[base_url] = await run_sync_on_thread(
+                    model_catalog.fetch_openai_reasoning_metadata,
+                    model_catalog.ResolvedModelProvider(
+                        kind="gateway",
+                        family=family,
+                        base_url=base_url,
+                        api_key=self._databricks_token,
+                    ),
+                )
         workspace_url = self._gateway_workspace_url if self._gateway else None
         if workspace_url is None:
             self._gateway_model_entries = ()
@@ -3719,6 +3756,7 @@ class PiExecutor(Executor):
                 model_wire_apis=wire_catalog,
                 openai_wire_api=self._openai_wire_api,
                 model_metadata=self._model_metadata,
+                provider_reasoning=self._provider_reasoning,
             )
 
         if state.rpc is not None:
