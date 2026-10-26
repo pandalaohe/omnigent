@@ -1403,6 +1403,39 @@ async def test_runner_context_v2_reads_persistent_sdk_state_without_construction
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
 
 
+@pytest.mark.parametrize("family", ["agents", "responses", "databricks"])
+async def test_runner_context_v2_keeps_history_and_stream_sources_unsupported(
+    harness_inventory_reader, family
+):
+    from omnigent.inner.databricks_executor import DatabricksExecutor
+    from omnigent.inner.open_responses_sdk import OpenResponsesExecutor
+    from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+    from omnigent.startup_protocol import executor_context_scope_v2
+
+    factories = {
+        "agents": OpenAIAgentsSDKExecutor,
+        "responses": OpenResponsesExecutor,
+        "databricks": DatabricksExecutor,
+    }
+    executor = factories[family](client=object())
+    executor.run_turn = Mock(side_effect=AssertionError("inventory must not start work"))
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("inventory must not construct")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    response = await client.get(
+        "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+    )
+    evidence = _v2_evidence(response.content, session_id="one")
+    source = next(s for s in evidence.sources if s.scope == executor_context_scope_v2("one"))
+    assert all(s.coverage != "complete" for s in evidence.sources)
+    assert source.coverage == "unsupported" and source.contexts == ()
+    assert source.unresolved[0].reason.startswith(family + "_")
+    assert source.producer_incarnation is source.work_bindings is None
+    assert source.revision_authority == "observation_only"
+    executor.run_turn.assert_not_called()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+
+
 async def test_runner_context_v2_preserves_pi_rpc_pending_and_retired_owner(
     harness_inventory_reader, monkeypatch
 ):

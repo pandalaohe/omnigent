@@ -24,13 +24,14 @@ import shlex
 import shutil
 import subprocess
 import time
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
 
 from omnigent.models import model_catalog
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 if TYPE_CHECKING:
     import configparser
@@ -1391,6 +1392,16 @@ class DatabricksExecutor(Executor):
 
     def supports_streaming(self) -> bool:
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """A request stream does not establish resident context or descendant ownership."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id, read_id, "databricks_stream_context_identity_unsupported", unsupported=True
+        )
 
     def supports_tool_calling(self) -> bool:
         return True

@@ -34,6 +34,7 @@ from omnigent.llms.errors import is_context_length_exceeded as _is_context_lengt
 from omnigent.models import model_catalog
 from omnigent.process_logging import redact_log_text
 from omnigent.spec.types import RetryPolicy
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
 
@@ -1255,6 +1256,19 @@ class OpenAIAgentsSDKExecutor(Executor):
 
     def supports_streaming(self) -> bool:
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """SQLite session keys identify replay history, not owned vendor context lifetimes."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id,
+            read_id,
+            "agents_history_and_run_context_identity_unsupported",
+            unsupported=True,
+        )
 
     def supports_tool_calling(self) -> bool:
         return True

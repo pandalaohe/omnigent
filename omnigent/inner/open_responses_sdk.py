@@ -17,7 +17,7 @@ import json
 import logging
 import os
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
@@ -27,6 +27,7 @@ import pydantic
 from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.models import model_catalog
 from omnigent.spec.types import RetryPolicy
+from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 from omnigent.util.json_types import JsonValue
 
 if TYPE_CHECKING:
@@ -518,6 +519,16 @@ class OpenResponsesExecutor(Executor):
 
     def supports_streaming(self) -> bool:
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        """Response IDs link replay history; stream completion is not context-stop proof."""
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+        return lambda: unknown_context_evidence_v2(
+            session_id, read_id, "responses_chain_context_identity_unsupported", unsupported=True
+        )
 
     def supports_tool_calling(self) -> bool:
         return True
