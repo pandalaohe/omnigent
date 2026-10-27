@@ -32,6 +32,7 @@ from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions.helpers import _session_status_cache
 from omnigent.server.routes._sessions.orchestration import _labels_for_viewer
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.standing_pass import StandingPassService
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import GuardrailsSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -103,6 +104,7 @@ async def recent_route(
     peer_store = SqlAlchemyPeerMessageStore(db_uri)
 
     app = FastAPI()
+    app.state.standing_pass_service = StandingPassService(store)
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(request: Request, exc: OmnigentError) -> JSONResponse:

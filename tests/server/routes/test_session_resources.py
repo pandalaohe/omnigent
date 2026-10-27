@@ -42,6 +42,7 @@ from omnigent.server.auth import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.standing_pass import StandingPassService
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.host_store import HostStore
 from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
@@ -546,6 +547,9 @@ def app(runner_globals_reset: None) -> FastAPI:
     host_registry = HostRegistry()
     app.state.test_conversation_store = conversation_store
     app.state.test_host_registry = host_registry
+    app.state.standing_pass_service = Mock(
+        spec=StandingPassService, first_message=lambda _conversation, body: body
+    )
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -2271,6 +2275,9 @@ def file_app(
     del runner_globals_reset
 
     test_app = FastAPI()
+    test_app.state.standing_pass_service = Mock(
+        spec=StandingPassService, first_message=lambda _conversation, body: body
+    )
     host_registry = HostRegistry()
     host_registry.register(
         "host_files",
