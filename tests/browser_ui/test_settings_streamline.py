@@ -754,6 +754,7 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     expect(unavailable).to_be_disabled()
     expect(unavailable).not_to_be_checked()
     picker.get_by_role("button", name="Done", exact=True).click()
+    expect(picker).not_to_be_visible()
     dialog = page.get_by_role("dialog", name="Project settings", exact=True)
     assert dialog.evaluate("element => element.scrollWidth <= element.clientWidth")
     panel.evaluate("element => element.scrollIntoView({block: 'center'})")
