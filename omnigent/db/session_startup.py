@@ -73,6 +73,7 @@ class SqlSessionStartup(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     admitted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     first_dispatch_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    release_receipt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("workspace_id", "owner_user_id", "operation_key"),

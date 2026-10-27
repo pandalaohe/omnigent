@@ -11065,6 +11065,8 @@
               "ready_empty",
               "waiting_input",
               "working",
+              "opened",
+              "operator_released",
               "cancelled",
               "stopped",
               "command_completed"
@@ -12025,6 +12027,167 @@
           }
         },
         "title": "StartupInputOptions",
+        "type": "object"
+      },
+      "StartupReleaseReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "actor_account_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Account Generation"
+          },
+          "actor_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor User Id"
+          },
+          "current_host_generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Host Generation",
+            "type": "string"
+          },
+          "released_at": {
+            "format": "int64",
+            "title": "Released At",
+            "type": "integer"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/StartupReleaseTarget"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current_host_generation",
+          "targets",
+          "actor_user_id",
+          "actor_account_generation",
+          "released_at"
+        ],
+        "title": "StartupReleaseReceipt",
+        "type": "object"
+      },
+      "StartupReleaseRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "current_host_generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Host Generation",
+            "type": "string"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/StartupReleaseTarget"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current_host_generation",
+          "targets"
+        ],
+        "title": "StartupReleaseRequest",
+        "type": "object"
+      },
+      "StartupReleaseTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Attempt Id",
+            "type": "string"
+          },
+          "host_generation": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Generation"
+          },
+          "input_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Id"
+          },
+          "runner_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Id"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "session_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "startup_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Startup Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "startup_id",
+          "session_id",
+          "attempt_id",
+          "input_id",
+          "runtime_id",
+          "host_generation",
+          "runner_id"
+        ],
+        "title": "StartupReleaseTarget",
         "type": "object"
       },
       "StoreHarnessCredentialRequest": {
@@ -16368,6 +16531,58 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/startup-releases": {
+      "post": {
+        "operationId": "release_startups_v1_hosts__host_id__startup_releases_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartupReleaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupReleaseReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Startups",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/worktrees": {
       "get": {
         "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached, updated_at?}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
@@ -16775,6 +16990,47 @@
           }
         },
         "summary": "Initialize User Preferences"
+      }
+    },
+    "/v1/me/preferences/keep_warm/convert": {
+      "post": {
+        "operationId": "convert_keep_warm_v1_me_preferences_keep_warm_convert_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Convert Keep Warm V1 Me Preferences Keep Warm Convert Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Convert Keep Warm"
       }
     },
     "/v1/me/preferences/worktree_archive/migrate": {

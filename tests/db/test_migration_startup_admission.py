@@ -46,6 +46,14 @@ def test_populated_startup_migrations_round_trip(db_uri):
         assert row.state == "uncertain" and row.occupied and row.resident
         assert row.admitted_at is None and row.first_dispatch_at is None
         assert row.admission_mode == "guarded" and row.policy_revision == 0
+        assert row.release_receipt is None
+    assert "session_startup_releases" not in sa.inspect(engine).get_table_names()
+    release_column = next(
+        item
+        for item in sa.inspect(engine).get_columns("session_startups")
+        if item["name"] == "release_receipt"
+    )
+    assert release_column["nullable"]
     column = next(
         item
         for item in sa.inspect(engine).get_columns("session_startups")

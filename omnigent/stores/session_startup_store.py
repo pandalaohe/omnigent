@@ -10,7 +10,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import AccountAuthority, require_active_account
-from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+from omnigent.db.db_models import (
+    SqlConversationMetadata,
+    SqlHost,
+    SqlSessionPermission,
+    current_workspace_id,
+)
 from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -19,7 +24,12 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities.host_recovery import HostRecoveryPlan
-from omnigent.entities.session_startup import SessionStartupStatus, StartupReceipt
+from omnigent.entities.session_startup import (
+    SessionStartupStatus,
+    StartupReceipt,
+    StartupReleaseReceipt,
+    StartupReleaseRequest,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 
 if TYPE_CHECKING:
@@ -49,6 +59,7 @@ class StartupSnapshot:
     first_dispatch_at: int | None
     admission_mode: Literal["guarded", "startup_only"]
     policy_revision: int
+    release_receipt: dict | None = None
 
 
 def _snapshot(row: SqlSessionStartup) -> StartupSnapshot:
@@ -491,6 +502,12 @@ class SessionStartupStore:
             if row is None:
                 return None
             now = now_epoch()
+            stuck = (
+                row.admission_mode == "startup_only"
+                and row.occupied
+                and row.admitted_at is not None
+                and now >= row.admitted_at + 180
+            )
             position = None
             if row.state == "queued":
                 position = db.scalar(
@@ -508,8 +525,8 @@ class SessionStartupStore:
                     "id": row.id,
                     "attempt_id": row.attempt_id,
                     "input_id": row.input_id,
-                    "state": row.state,
-                    "reason": row.reason,
+                    "state": "uncertain" if stuck else row.state,
+                    "reason": "opening_unconfirmed" if stuck else row.reason,
                     "elapsed_seconds": max(0, now - row.created_at),
                     "admitted_elapsed_seconds": (
                         max(0, now - row.admitted_at) if row.admitted_at is not None else None
@@ -552,8 +569,14 @@ class SessionStartupStore:
             select(SqlSessionStartup).where(
                 SqlSessionStartup.workspace_id == current_workspace_id(),
                 SqlSessionStartup.host_id == host_id,
-                SqlSessionStartup.state == "uncertain",
                 SqlSessionStartup.occupied.is_(True),
+                or_(
+                    SqlSessionStartup.state == "uncertain",
+                    (
+                        (SqlSessionStartup.admission_mode == "startup_only")
+                        & (SqlSessionStartup.admitted_at <= now_epoch() - 180)
+                    ),
+                ),
             )
         ).all()
         return sum(
@@ -606,6 +629,9 @@ class SessionStartupStore:
                 else None
             )
             latest = self._current_session_row(db, session_id) if reuse_startup_id else None
+            current = self._current_session_row(db, session_id)
+            if current is not None and current.release_receipt is not None:
+                raise ValueError("Released startup requires explicit reconciliation")
             if reuse_startup_id and (
                 reuse is None
                 or reuse.owner_user_id != owner_user_id
@@ -787,7 +813,9 @@ class SessionStartupStore:
                 .where(
                     SqlSessionStartup.workspace_id == current_workspace_id(),
                     SqlSessionStartup.host_id == host_id,
-                    SqlSessionStartup.state.in_(("queued", "starting", "verifying", "uncertain")),
+                    SqlSessionStartup.state.in_(
+                        ("queued", "starting", "verifying", "uncertain", "blocked", "cancelling")
+                    ),
                 )
                 .with_for_update()
             ).all()
@@ -801,7 +829,19 @@ class SessionStartupStore:
                         )
                         changed.append(_snapshot(row))
                     continue
-                if not row.occupied or row.cancel_requested:
+                if not row.occupied:
+                    continue
+                if row.admission_mode == "startup_only":
+                    if row.admitted_at is not None and current_time >= row.admitted_at + 180:
+                        if (row.state, row.reason) != ("uncertain", "opening_unconfirmed"):
+                            row.state, row.reason, row.updated_at = (
+                                "uncertain",
+                                "opening_unconfirmed",
+                                current_time,
+                            )
+                            changed.append(_snapshot(row))
+                    continue
+                if row.cancel_requested or row.state in ("blocked", "cancelling"):
                     continue
                 if row.admitted_at is None:
                     if row.state != "uncertain":
@@ -853,6 +893,136 @@ class SessionStartupStore:
             return changed
 
         return run_write_transaction(self._session, "expire_startup_observation_budget", write)
+
+    def release_startups(
+        self,
+        host_id: str,
+        request: StartupReleaseRequest,
+        *,
+        actor_user_id: str | None,
+        actor_account_generation: str | None,
+    ) -> StartupReleaseReceipt:
+        """Commit the exact owner exception without cancelling input or stopping a runtime."""
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+
+        targets = sorted(request.targets, key=lambda target: target.startup_id)
+        if len({target.startup_id for target in targets}) != len(targets):
+            raise OmnigentError("Duplicate startup target", code=ErrorCode.CONFLICT)
+        request = request.model_copy(update={"targets": targets})
+
+        def write(db: Session) -> StartupReleaseReceipt:
+            if actor_user_id is not None:
+                require_active_account(db, actor_user_id, generation=actor_account_generation)
+            _, budget = self._budgets(db, host_id)
+            host = db.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            if host is None or host.deleted_at is not None:
+                raise OmnigentError("Host not found", code=ErrorCode.NOT_FOUND)
+            if (host.user_id, host.account_generation) != (
+                actor_user_id if actor_user_id is not None else RESERVED_USER_LOCAL,
+                actor_account_generation,
+            ):
+                raise OmnigentError("Host owner required", code=ErrorCode.FORBIDDEN)
+            rows = []
+            for target in targets:
+                row = db.get(
+                    SqlSessionStartup,
+                    (current_workspace_id(), target.startup_id),
+                    with_for_update=True,
+                )
+                binding = db.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), target.session_id),
+                    with_for_update=True,
+                )
+                if actor_user_id is not None:
+                    permission = db.scalar(
+                        select(SqlSessionPermission)
+                        .where(
+                            SqlSessionPermission.workspace_id == current_workspace_id(),
+                            SqlSessionPermission.user_id == actor_user_id,
+                            SqlSessionPermission.conversation_id == target.session_id,
+                        )
+                        .with_for_update()
+                    )
+                    if permission is None or permission.level != LEVEL_OWNER:
+                        raise OmnigentError("Session owner required", code=ErrorCode.FORBIDDEN)
+                if (
+                    row is None
+                    or binding is None
+                    or row.host_id != host_id
+                    or row.session_id != target.session_id
+                    or binding.runner_id != target.runner_id
+                    or (
+                        binding.host_id != host_id
+                        and (
+                            row.preparation is None
+                            or (binding.host_id, binding.runner_id)
+                            != (
+                                row.preparation["previous_host_id"],
+                                row.preparation["previous_runner_id"],
+                            )
+                        )
+                    )
+                    or (row.attempt_id, row.runtime_id, row.host_generation, row.input_id)
+                    != (
+                        target.attempt_id,
+                        target.runtime_id,
+                        target.host_generation,
+                        target.input_id,
+                    )
+                    or (current := self._current_session_row(db, row.session_id, locked=True))
+                    is None
+                    or current.id != row.id
+                ):
+                    raise OmnigentError("Startup target changed; refresh", code=ErrorCode.CONFLICT)
+                rows.append(row)
+            released = [row.release_receipt for row in rows if row.release_receipt is not None]
+            if released:
+                receipt = StartupReleaseReceipt.model_validate(released[0])
+                if (
+                    len(released) != len(rows)
+                    or any(value != released[0] for value in released)
+                    or receipt.model_dump(
+                        exclude={"actor_user_id", "actor_account_generation", "released_at"}
+                    )
+                    != request.model_dump()
+                    or receipt.actor_user_id != actor_user_id
+                    or receipt.actor_account_generation != actor_account_generation
+                ):
+                    raise OmnigentError("Release operation changed", code=ErrorCode.CONFLICT)
+                return receipt
+            if budget.current_generation != request.current_host_generation:
+                raise OmnigentError("Host generation changed; refresh", code=ErrorCode.CONFLICT)
+            now = now_epoch()
+            if any(
+                row.admission_mode != "startup_only"
+                or row.release_receipt is not None
+                or not row.occupied
+                or row.state not in ("starting", "verifying", "uncertain", "blocked", "cancelling")
+                or row.admitted_at is None
+                or now < row.admitted_at + 180
+                for row in rows
+            ):
+                raise OmnigentError(
+                    "Startup is no longer releasable; refresh", code=ErrorCode.CONFLICT
+                )
+            receipt = StartupReleaseReceipt(
+                **request.model_dump(),
+                actor_user_id=actor_user_id,
+                actor_account_generation=actor_account_generation,
+                released_at=now,
+            )
+            for row in rows:
+                row.occupied = False
+                row.release_receipt = receipt.model_dump(mode="json")
+                row.state, row.reason, row.updated_at = (
+                    "operator_released",
+                    "delivery_unconfirmed",
+                    now,
+                )
+            return receipt
+
+        return run_write_transaction(self._session, "release_exact_startup_permits", write)
 
     def reserve(
         self, host_id: str, *, eligible_ids: set[str] | None = None
@@ -923,6 +1093,9 @@ class SessionStartupStore:
             rows = db.scalars(query.order_by(SqlSessionStartup.sequence)).all()
             eligible = []
             for row in rows:
+                current = self._current_session_row(db, row.session_id)
+                if current is not None and current.release_receipt is not None:
+                    continue
                 if row.admission_mode != host.admission_mode:
                     continue
                 reuses_resident = (
@@ -1136,6 +1309,8 @@ class SessionStartupStore:
                 return None
             self._budgets(db, row.host_id)
             db.refresh(row, with_for_update=True)
+            if row.release_receipt is not None:
+                return None
             if compare and row.attempt_id != expected_attempt_id:
                 return None
             if compare:
@@ -1242,10 +1417,12 @@ class SessionStartupStore:
                 .with_for_update()
             ):
                 previous.occupied = previous.resident = False
-                previous.state = "cancelled" if previous.cancel_requested else "stopped"
+                if previous.release_receipt is None:
+                    previous.state = "cancelled" if previous.cancel_requested else "stopped"
                 previous.updated_at = now_epoch()
         row.occupied = row.resident = False
-        row.state = "cancelled" if row.cancel_requested else "stopped"
+        if row.release_receipt is None:
+            row.state = "cancelled" if row.cancel_requested else "stopped"
         row.updated_at = now_epoch()
 
     def confirm_stopped(self, startup_id: str, attempt_id: str) -> bool:
@@ -1275,7 +1452,7 @@ class SessionStartupStore:
                 return False
             self._budgets(db, row.host_id)
             db.refresh(row, with_for_update=True)
-            if row.attempt_id != attempt_id:
+            if row.attempt_id != attempt_id or row.release_receipt is not None:
                 return False
             row.cancel_requested = True
             if row.runtime_id is None:
@@ -1365,9 +1542,12 @@ class SessionStartupStore:
             if (
                 (
                     not row.occupied
-                    and not (row.admission_mode == "startup_only" and row.state == "opened")
+                    and not (
+                        row.admission_mode == "startup_only"
+                        and (row.state == "opened" or row.release_receipt is not None)
+                    )
                 )
-                or row.cancel_requested
+                or (row.cancel_requested and row.release_receipt is None)
                 or row.state == "blocked"
                 or row.attempt_id != attempt_id
                 or row.runtime_id != runtime_id
@@ -1479,6 +1659,32 @@ class SessionStartupStore:
                 return False
             if receipt.phase == "stopped":
                 self._settle_runtime_stopped(db, row)
+                return True
+            if row.release_receipt is not None:
+                if receipt.phase == "opening_settled":
+                    return row.admission_mode == "startup_only" and receipt.source == "runner"
+                if receipt.phase in ("input_dispatched", "input_accepted", "work_started"):
+                    if row.proof_source is None or (
+                        row.proof_source,
+                        row.vendor_session_id,
+                        row.vendor_turn_id,
+                    ) != (receipt.source, receipt.vendor_session_id, receipt.vendor_turn_id):
+                        return False
+                elif receipt.source not in ("runner", row.proof_source):
+                    return False
+                if receipt.phase in (
+                    "runtime_ready",
+                    "tools_ready",
+                    "input_accepted",
+                    "work_started",
+                ):
+                    setattr(row, receipt.phase, True)
+                elif receipt.phase == "input_dispatched":
+                    if row.first_dispatch_at is None:
+                        row.first_dispatch_at = now_epoch()
+                else:
+                    return False
+                row.updated_at = now_epoch()
                 return True
             if row.cancel_requested:
                 return False

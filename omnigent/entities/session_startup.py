@@ -15,6 +15,7 @@ StartupState = Literal[
     "waiting_input",
     "working",
     "opened",
+    "operator_released",
     "cancelled",
     "stopped",
     "command_completed",
@@ -69,3 +70,28 @@ class StartupReceipt(BaseModel):
     vendor_session_id: str | None = Field(default=None, max_length=256)
     vendor_turn_id: str | None = Field(default=None, max_length=256)
     reason: str | None = Field(default=None, max_length=128)
+
+
+class StartupReleaseTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    startup_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    attempt_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    input_id: str | None = Field(pattern=r"^[0-9a-f]{32}$")
+    runtime_id: str | None = Field(max_length=128)
+    host_generation: str | None = Field(max_length=128)
+    runner_id: str | None = Field(max_length=128)
+
+
+class StartupReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    current_host_generation: str = Field(min_length=1, max_length=128)
+    targets: list[StartupReleaseTarget] = Field(min_length=1, max_length=2)
+
+
+class StartupReleaseReceipt(StartupReleaseRequest):
+    actor_user_id: str | None
+    actor_account_generation: str | None
+    released_at: int

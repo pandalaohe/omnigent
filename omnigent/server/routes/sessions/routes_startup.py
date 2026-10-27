@@ -4,8 +4,12 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException, Request
 
-from omnigent.db.account_authority import AccountAuthority
-from omnigent.entities.session_startup import SessionStartupStatus
+from omnigent.db.account_authority import AccountAuthority, account_generation
+from omnigent.entities.session_startup import (
+    SessionStartupStatus,
+    StartupReleaseReceipt,
+    StartupReleaseRequest,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import session_stream
@@ -26,6 +30,44 @@ def register_startup_routes(
     permission_store: PermissionStore | None,
     auth_provider: AuthProvider | None,
 ) -> None:
+    @router.post("/hosts/{host_id}/startup-releases", response_model=StartupReleaseReceipt)
+    async def release_startups(
+        request: Request, host_id: str, body: StartupReleaseRequest
+    ) -> StartupReleaseReceipt:
+        user_id = get_user_id(request, auth_provider)
+        for target in body.targets:
+            await require_access_and_level(
+                user_id, target.session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            conversation = await asyncio.to_thread(
+                conversation_store.get_conversation, target.session_id
+            )
+            if conversation is None:
+                raise HTTPException(404, "Session not found")
+            if conversation.archived:
+                raise HTTPException(409, "Session is archived; refresh before release")
+        admission = getattr(request.app.state, "startup_admission", None)
+        store = getattr(request.app.state, "startup_store", None)
+        if admission is None or store is None or admission.policy.mode != "startup_only":
+            raise HTTPException(409, "Startup-only queue is not enabled")
+        receipt = await asyncio.to_thread(
+            store.release_startups,
+            host_id,
+            body,
+            actor_user_id=user_id,
+            actor_account_generation=account_generation(user_id) if user_id is not None else None,
+        )
+        for target in receipt.targets:
+            status = await asyncio.to_thread(store.presentation, target.session_id)
+            session_stream.publish(
+                target.session_id,
+                SessionStartupEvent(
+                    type="session.startup", conversation_id=target.session_id, startup=status
+                ).model_dump(),
+            )
+        await admission.advance(host_id)
+        return receipt
+
     @router.post("/sessions/{session_id}/startup/recreate-exemption", include_in_schema=False)
     async def recreate_exemption(request: Request, session_id: str) -> dict[str, bool]:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()

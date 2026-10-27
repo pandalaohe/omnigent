@@ -518,12 +518,17 @@ class StartupAdmission:
 
     async def recover_session(self, session_id: str, conn: HostConnection) -> bool:
         current = await asyncio.to_thread(self.startups.for_session, session_id)
-        if current is not None and current.state in ("starting", "verifying", "uncertain"):
+        if current is not None and (
+            current.release_receipt is not None
+            or current.state in ("starting", "verifying", "uncertain")
+        ):
             from omnigent.server.startup_observations import reconcile_startup_observations
 
             await reconcile_startup_observations(
                 self._app, self.conversations, self.hosts, self.startups, current
             )
+        if current is not None and current.release_receipt is not None:
+            return False
         await self.queue_session(conn, session_id)
         await self.advance(conn.host_id)
         current = await asyncio.to_thread(self.startups.for_session, session_id)
@@ -557,6 +562,7 @@ class StartupAdmission:
             current is not None
             and current.preparation is not None
             and current.input_id is not None
+            and current.reason != "opening_unconfirmed"
         ):
             return await self._resume_prepared_input(current, conn)
         # Receipt waiting has no pending command. The host worker wakes on
