@@ -991,8 +991,9 @@ def test_workspace_profile_repository_entries(
         ("modules", "repository has submodules"),
         ("missing-common-config", "a protected Git path is missing"),
         ("missing-hooks", "a protected Git path is missing"),
-        ("missing-common-worktree-config", "a protected Git path is missing"),
-        ("missing-own-worktree-config", "a protected Git path is missing"),
+        ("missing-common-worktree-config", None),
+        ("missing-own-worktree-config", None),
+        ("missing-both-worktree-configs", None),
         ("old-version", "unsupported platform or Codex version"),
         ("custom-profile", "a custom permission profile is configured"),
     ],
@@ -1051,6 +1052,9 @@ def test_windows_sdk_workspace_profile_guards(
         (common / "config.worktree").unlink()
     elif guard == "missing-own-worktree-config":
         (own / "config.worktree").unlink()
+    elif guard == "missing-both-worktree-configs":
+        for directory in {common, own}:
+            (directory / "config.worktree").unlink()
     monkeypatch.setattr(launch_args, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
     profile = launch_args.codex_workspace_profile(
         workspace,

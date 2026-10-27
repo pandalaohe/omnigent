@@ -723,12 +723,11 @@ def codex_workspace_profile(
                 return decline("common worktreeConfig could not be read")
             if result.stdout.strip() == "true":
                 return decline("extensions.worktreeConfig is enabled")
-            # Windows drops missing deny targets; never silently reopen their creation.
-            protected = [common / name for name in ("hooks", "config", "config.worktree")]
+            # Git ignores a missing config.worktree while worktreeConfig is disabled.
+            # Other missing deny targets are unsafe.
+            protected = [common / name for name in ("hooks", "config")]
             if git_dir is not None:
-                protected.extend(
-                    git_dir / name for name in ("commondir", "gitdir", "config.worktree")
-                )
+                protected.extend(git_dir / name for name in ("commondir", "gitdir"))
             if any(not path.exists() for path in protected):
                 return decline("a protected Git path is missing")
         if not _git_profile_config_is_safe(top, opened):
