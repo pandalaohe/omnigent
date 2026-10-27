@@ -183,6 +183,37 @@ def test_list_conversations_archived_filter(store: SqlAlchemyConversationStore) 
     assert any(c.archived for c in all_.data)
 
 
+def test_list_live_host_sessions_crosses_dbs(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+) -> None:
+    import time
+
+    from omnigent.stores.host_store import HostStore
+
+    host_id = "a" * 32
+    HostStore(f"sqlite:///{omnigent_db}").upsert_on_connect(host_id, "test-host", "local")
+    running = store.create_conversation(
+        title="running", host_id=host_id, workspace="/opt/work/test"
+    )
+    store.set_session_live_status(running.id, "running")
+    idle = store.create_conversation(
+        title="idle", host_id=host_id, workspace="/opt/work/test", runner_id="runner_idle"
+    )
+    store.touch_runner_liveness(["runner_idle"], int(time.time()))
+    store.create_conversation(
+        title="stale", host_id=host_id, workspace="/opt/work/test", runner_id="runner_stale"
+    )
+    store.touch_runner_liveness(["runner_stale"], int(time.time()) - 180)
+    store.create_conversation(title="stopped", host_id=host_id, workspace="/opt/work/test")
+    foreign = store.create_conversation(title="foreign")
+    store.set_session_live_status(foreign.id, "running")
+    assert {c.id for c in store.list_conversations(host_id=host_id, live_only=True).data} == {
+        running.id,
+        idle.id,
+    }
+
+
 def test_kind_derived_from_parent_nullness_not_metadata(
     omnigent_db: Path,
     store: SqlAlchemyConversationStore,

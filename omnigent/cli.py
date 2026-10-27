@@ -11066,55 +11066,88 @@ def _add_daemon_host_status(
 
 def _add_daemon_sessions(
     payload: _HostPayload,
-    record: _HostDaemonRecord,
     *,
-    connected_sessions_only: bool,
+    include_archived: bool,
+    archived_limit: int,
 ) -> None:
-    """
-    Add owned sessions and runner connectivity to a daemon payload.
-
-    :param payload: Payload from :func:`_base_daemon_status_payload`.
-    :param record: Daemon registry record to inspect.
-    :param connected_sessions_only: Whether session listing should use
-        the server's connected filter.
-    """
-    sessions_result = _sessions_for_daemon(
-        record,
-        connected_only=connected_sessions_only,
-    )
-    sessions = sessions_result.sessions
-    if sessions_result.base_url is not None and sessions:
-        sessions = _annotate_sessions_with_runner_online(
-            base_url=sessions_result.base_url,
+    """List live host sessions first, then a bounded archive when requested."""
+    base_url = payload.get("server_url")
+    host_id = payload.get("host_id")
+    if not isinstance(base_url, str) or not isinstance(host_id, str) or not host_id:
+        payload["error"] = payload.get("error") or "server URL or host id is not available"
+        return
+    sessions: list[_HostSessionRow] = []
+    payload["archived_sessions_has_more"] = False
+    for archived in [False, True] if include_archived else [False]:
+        after: str | None = None
+        seen_cursors: set[str] = set()
+        remaining = archived_limit
+        while True:
+            params: dict[str, str | int] = {
+                "host_id": host_id,
+                "kind": "any",
+                "limit": min(100, remaining) if archived else 100,
+                "include_archived": "true" if archived else "false",
+                "visibility": "all",
+            }
+            if archived:
+                params["archived_only"] = "true"
+            else:
+                params["live_only"] = "true"
+            if after is not None:
+                params["after"] = after
+            page = _decode_sessions_page(
+                _host_http_json(
+                    base_url=base_url,
+                    method="GET",
+                    path="/v1/sessions",
+                    params=params,
+                    host_id=host_id,
+                )
+            )
+            if page.error is not None:
+                payload["error"] = payload.get("error") or page.error
+                break
+            sessions.extend(row for row in page.sessions if row.get("host_id") == host_id)
+            remaining -= len(page.sessions)
+            if archived and remaining <= 0:
+                payload["archived_sessions_has_more"] = page.has_more
+                break
+            if not page.has_more:
+                break
+            if page.last_id is None or page.last_id in seen_cursors:
+                payload["error"] = (
+                    payload.get("error") or "session list returned an invalid cursor"
+                )
+                break
+            seen_cursors.add(page.last_id)
+            after = page.last_id
+        if payload.get("error"):
+            break
+    payload["sessions"] = cast(
+        _HostJsonValue,
+        _annotate_sessions_with_runner_online(
+            base_url=base_url,
             sessions=sessions,
-        )
-    payload["sessions"] = cast(_HostJsonValue, sessions)
-    if sessions_result.error is not None and payload["error"] is None:
-        payload["error"] = sessions_result.error
+        ),
+    )
 
 
 def _daemon_status_payload(
     record: _HostDaemonRecord,
     *,
     include_sessions: bool,
-    connected_sessions_only: bool,
+    include_archived: bool = False,
+    archived_limit: int = 100,
 ) -> _HostPayload:
-    """
-    Build a display payload for one daemon.
-
-    :param record: Daemon registry record to inspect.
-    :param include_sessions: Whether to include session rows.
-    :param connected_sessions_only: Whether session listing should use
-        the server's connected filter.
-    :returns: JSON-serializable status payload.
-    """
+    """Build daemon status with its live sessions and optional bounded archive."""
     payload = _base_daemon_status_payload(record)
     _add_daemon_host_status(payload)
     if include_sessions:
         _add_daemon_sessions(
             payload,
-            record,
-            connected_sessions_only=connected_sessions_only,
+            include_archived=include_archived,
+            archived_limit=archived_limit,
         )
     return payload
 
@@ -11488,6 +11521,10 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
             )
             console.print(f"  [red]error={_host_markup(message)}[/red]")
         _add_host_payload_sessions_table(console, payload)
+        if payload.get("archived_sessions_has_more"):
+            console.print(
+                "  [dim]More archived sessions exist; increase --archived-limit (max 1000).[/dim]"
+            )
 
 
 @host.command("enable")
@@ -11587,7 +11624,19 @@ def host_load(json_output: bool) -> None:
 @host.command("status")
 @click.option("--server", default=None, help="Inspect only this server target.")
 @click.option("--all", "all_targets", is_flag=True, help="Inspect all known daemon targets.")
-@click.option("--sessions", is_flag=True, help="Include session table.")
+@click.option("--sessions", is_flag=True, help="Include live sessions, including children.")
+@click.option(
+    "--include-archived",
+    is_flag=True,
+    help="Also include archived sessions (requires --sessions).",
+)
+@click.option(
+    "--archived-limit",
+    type=click.IntRange(1, 1000),
+    default=100,
+    show_default=True,
+    help="Maximum archived sessions per host.",
+)
 @click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
 @click.pass_context
 def host_status(
@@ -11595,6 +11644,8 @@ def host_status(
     server: str | None,
     all_targets: bool,
     sessions: bool,
+    include_archived: bool,
+    archived_limit: int,
     json_output: bool,
 ) -> None:
     """
@@ -11605,8 +11656,12 @@ def host_status(
         ``"https://example.databricksapps.com"``.
     :param all_targets: Whether to inspect every known daemon target.
     :param sessions: Whether to include the session table.
+    :param include_archived: Include a bounded archive after live sessions.
+    :param archived_limit: Maximum archived sessions per host.
     :param json_output: Whether to emit machine-readable JSON.
     """
+    if include_archived and not sessions:
+        raise click.UsageError("--include-archived requires --sessions")
     if server is None:
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=True)
@@ -11619,7 +11674,8 @@ def host_status(
         return _daemon_status_payload(
             record,
             include_sessions=sessions,
-            connected_sessions_only=True,
+            include_archived=include_archived,
+            archived_limit=archived_limit,
         )
 
     with concurrent.futures.ThreadPoolExecutor() as pool:

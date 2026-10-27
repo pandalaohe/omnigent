@@ -249,6 +249,30 @@ async def test_sessions_list_page_binds_are_bounded(
     )
 
 
+async def test_host_session_page_does_not_rebind_all_host_history(
+    acl_client: httpx.AsyncClient,
+    seeded_users: dict[str, int],
+    sql_capture: _SqlCapture,
+    db_uri: str,
+) -> None:
+    from omnigent.stores.host_store import HostStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    host = HostStore(db_uri).upsert_on_connect("a" * 32, "test-host", _USER_MANY)
+    for conv in store.list_conversations(limit=1000, accessible_by=_USER_MANY).data:
+        store.set_host_id(conv.id, host_id=host.host_id, workspace="/opt/work/omnigent/fork/test")
+        store.set_session_live_status(conv.id, "running")
+    sql_capture.statements.clear()
+    response = await acl_client.get(
+        "/v1/sessions",
+        params={"limit": 1, "host_id": host.host_id, "kind": "any", "live_only": "true"},
+        headers={"X-Forwarded-Email": _USER_MANY},
+    )
+    assert response.status_code == 200, response.text
+    assert len(response.json()["data"]) == 1
+    assert sql_capture.max_binds() <= _MAX_SANE_BINDS, sql_capture.relevant()
+
+
 async def test_sessions_list_cost_does_not_scale_with_accessible_total(
     acl_client: httpx.AsyncClient,
     seeded_users: dict[str, int],

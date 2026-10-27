@@ -16777,6 +16777,47 @@
         "summary": "Initialize User Preferences"
       }
     },
+    "/v1/me/preferences/keep_warm/convert": {
+      "post": {
+        "operationId": "convert_keep_warm_v1_me_preferences_keep_warm_convert_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Convert Keep Warm V1 Me Preferences Keep Warm Convert Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Convert Keep Warm"
+      }
+    },
     "/v1/me/preferences/worktree_archive/migrate": {
       "post": {
         "operationId": "migrate_worktree_archive_v1_me_preferences_worktree_archive_migrate_post",
@@ -18914,6 +18955,17 @@
             }
           },
           {
+            "description": "Return only sessions with a fresh runner heartbeat or a running/waiting turn. Includes idle connected sessions; an online host alone does not make a session live.",
+            "in": "query",
+            "name": "live_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Live Only",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "query",
             "name": "created_after",
             "required": false,
@@ -19050,7 +19102,7 @@
             }
           },
           {
-            "description": "Conversation kind to return. `\"default\"` (the default) returns only top-level user-initiated sessions \u2014 the sidebar's view. `\"sub_agent\"` returns only sub-agent child sessions. `\"any\"` returns both; this lets the new-session agent picker discover agents that are only bound to sub-agent sessions (e.g. ones uploaded via `sys_session_create`).",
+            "description": "Conversation kind to return. `\"default\"` (the default) returns only top-level user-initiated sessions \u2014 the sidebar's view. `\"sub_agent\"` returns only sub-agent child sessions. `\"any\"` returns both; this lets the new-session agent picker discover agents that are only bound to sub-agent sessions (e.g. ones uploaded via `sys_session_create`). When combined with `host_id`, `\"any\"` also includes side chats.",
             "in": "query",
             "name": "kind",
             "required": false,

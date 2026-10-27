@@ -1790,6 +1790,41 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     assert runner_status_calls == ["runner_abc"]
 
 
+def test_host_status_pages_live_sessions_before_bounded_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"server_url": "https://server.example.com", "host_id": "host_abc", "error": None}
+    live = [{"id": f"live-{index}", "host_id": "host_abc"} for index in range(101)]
+    archived = [{"id": f"archived-{index}", "host_id": "host_abc"} for index in range(200)]
+    requests = []
+
+    def request(**kwargs: Any) -> cli._HostHttpResult:
+        params = kwargs["params"]
+        assert params["kind"] == "any"
+        assert params["host_id"] == "host_abc"
+        assert params["limit"] <= 100
+        archive = params.get("archived_only") == "true"
+        requests.append(archive)
+        rows = archived if archive else live
+        start = next((i + 1 for i, row in enumerate(rows) if row["id"] == params.get("after")), 0)
+        page = rows[start : start + params["limit"]]
+        return cli._HostHttpResult(
+            status_code=200,
+            body={
+                "data": page,
+                "last_id": page[-1]["id"],
+                "has_more": start + len(page) < len(rows),
+            },
+        )
+
+    monkeypatch.setattr(cli, "_host_http_json", request)
+    monkeypatch.setattr(cli, "_annotate_sessions_with_runner_online", lambda **kw: kw["sessions"])
+    cli._add_daemon_sessions(payload, include_archived=True, archived_limit=150)
+    assert payload["sessions"] == live + archived[:150]
+    assert payload["archived_sessions_has_more"] is True
+    assert requests == [False, False, True, True]
+
+
 def test_host_status_reports_unreachable_daemon_without_traceback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
