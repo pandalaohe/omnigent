@@ -244,12 +244,6 @@ export const SettingsHarnessesSection = () => {
               />
             ))}
           </div>
-          <section className="mt-8 flex flex-col gap-3">
-            <h2 className="text-ui font-medium">Session picker</h2>
-            <div className="rounded-xl border border-border bg-card p-4">
-              <HideUnconfiguredHarnessesControl />
-            </div>
-          </section>
           <details
             id="calling-defaults"
             open={defaultsOpen}
@@ -267,6 +261,12 @@ export const SettingsHarnessesSection = () => {
               </div>
             )}
           </details>
+          <section className="mt-8 flex flex-col gap-3">
+            <h2 className="text-ui font-medium">Session picker</h2>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <HideUnconfiguredHarnessesControl />
+            </div>
+          </section>
         </>
       )}
       {fixTarget && (
