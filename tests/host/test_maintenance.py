@@ -137,6 +137,10 @@ async def test_host_janitor_uses_absolute_unresolved_harness_tmp_parent(
         "omnigent.harnesses.codex_native.process_registry.reap_orphaned_codex_model_probes",
         lambda: 0,
     )
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: 0,
+    )
     janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=configured_root)
 
     janitor.trigger("runner_exited")
