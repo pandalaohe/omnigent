@@ -306,8 +306,10 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable", [False, True])
 async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
     monkeypatch: pytest.MonkeyPatch,
+    unavailable: bool,
 ) -> None:
     """
     A failed switch surfaces 503 so the label is never persisted.
@@ -320,6 +322,8 @@ async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
     def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
         """Fail the way an unreachable mode does."""
         del bridge_dir, mode, timeout_s
+        if unavailable:
+            raise claude_native_bridge.ClaudePermissionModeSwitchError("unavailable")
         raise RuntimeError("The mode is not available in this session's cycle.")
 
     monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
@@ -345,10 +349,12 @@ async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
 
     assert resp.status_code == 503, resp.text
     body = resp.json()
-    # The error CODE names the failure category; the runner deliberately
-    # redacts exception text from client-facing details (the cause is logged
-    # server-side instead), so the detail is the fixed safe string.
     assert body.get("error") == "claude_native_permission_mode_failed", body
+    if unavailable:
+        assert "not available in this session's cycle" in body["detail"]
+        assert "previous permission mode was retained" in body["detail"]
+    else:
+        assert "not available in this session's cycle" not in body["detail"]
 
 
 @pytest.mark.asyncio

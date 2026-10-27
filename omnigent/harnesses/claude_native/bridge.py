@@ -65,7 +65,7 @@ from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 from urllib import request
 
 from filelock import FileLock
@@ -5728,10 +5728,39 @@ def _dedent_overlay_lines(overlay_lines: list[str]) -> str:
     ).strip()
 
 
+class ClaudePermissionModeSwitchError(RuntimeError):
+    """A mode-switch failure with a controlled, client-safe explanation."""
+
+    def __init__(
+        self, reason: Literal["unavailable", "launch-only", "terminal", "restore"]
+    ) -> None:
+        self.client_detail = {
+            "unavailable": (
+                "The mode is not available in this session's cycle for the current model. "
+                "The previous permission mode was retained."
+            ),
+            "launch-only": (
+                "Auto cannot be selected from Don't ask on a running session because "
+                "Don't ask cannot be restored. Start a new session in Auto instead. "
+                "The previous permission mode was retained."
+            ),
+            "terminal": (
+                "The terminal failed while switching permission modes. "
+                "The previous permission mode was retained."
+            ),
+            "restore": (
+                "The terminal could not restore the previous permission mode. "
+                "Check the terminal before continuing."
+            ),
+        }[reason]
+        super().__init__(self.client_detail)
+
+
 def _read_settled_permission_mode(
     socket_path: str,
     tmux_target: str,
     *,
+    bridge_dir: Path,
     previous: str | None = None,
 ) -> str | None:
     """
@@ -5744,6 +5773,7 @@ def _read_settled_permission_mode(
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge whose pending prompts must stop mode changes.
     :param previous: Mode read before the keystroke that prompted this
         read, e.g. ``"plan"``. The pane keeps rendering it until the TUI
         repaints, so a read that returns it is treated as not-yet-settled
@@ -5756,9 +5786,11 @@ def _read_settled_permission_mode(
     deadline = time.monotonic() + _MODE_FOOTER_SETTLE_TIMEOUT_S
     while True:
         pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             pane = _capture_pane(socket_path, tmux_target)
+            _raise_if_user_prompt_pending(bridge_dir, pane)
         mode = _permission_mode_from_pane(pane)
         if mode is not None and mode != previous:
             return mode
@@ -5784,7 +5816,8 @@ def set_permission_mode(
     dialog, settings load at startup), so this drives the TUI's shift+tab
     cycle, reading the mode footer after each press. The cycle is walked
     rather than computed: its width varies with which optional modes are
-    enabled, so a fixed press count could land on the wrong mode.
+    enabled, so a fixed press count could land on the wrong mode. A full lap
+    retains the original mode and reports the target as unavailable.
 
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
@@ -5811,30 +5844,65 @@ def set_permission_mode(
     # this gate a shift+tab sent mid-boot is dropped and the read below
     # reports a mode the keystroke never reached.
     _wait_for_claude_prompt_ready(socket_path, tmux_target, timeout_s=timeout_s)
-    current = _read_settled_permission_mode(socket_path, tmux_target)
+    current = _read_settled_permission_mode(socket_path, tmux_target, bridge_dir=bridge_dir)
     if current is None:
         pane = _capture_pane(socket_path, tmux_target)
         raise RuntimeError(
             "Claude Code did not render a permission-mode footer, so its current "
             f"mode could not be read.{_format_terminal_failure_tail(pane)}"
         )
-    seen = [current]
-    for _ in range(_MODE_CYCLE_MAX_PRESSES):
+    original = current
+    # Don't-ask cannot be re-entered through Shift+Tab. Refuse a potentially
+    # unavailable Auto target before leaving this launch-only mode.
+    if original == "dontAsk" and mode == "auto":
+        raise ClaudePermissionModeSwitchError("launch-only")
+    failure: RuntimeError | OSError | None = None
+    try:
+        for _ in range(_MODE_CYCLE_MAX_PRESSES):
+            if current == mode:
+                return current
+            # No ``-l``: tmux must interpret ``BTab`` as the shift+tab key.
+            _raise_if_user_prompt_pending(bridge_dir, "")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BTab")
+            settled = _read_settled_permission_mode(
+                socket_path, tmux_target, bridge_dir=bridge_dir, previous=current
+            )
+            if settled is None:
+                break
+            if settled != current:
+                current = settled
+                if current == original:
+                    raise ClaudePermissionModeSwitchError("unavailable")
         if current == mode:
             return current
-        # No ``-l``: tmux must interpret ``BTab`` as the shift+tab key.
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BTab")
-        settled = _read_settled_permission_mode(socket_path, tmux_target, previous=current)
-        if settled is not None:
-            current = settled
-            seen.append(current)
-    if current == mode:
-        return current
-    raise RuntimeError(
-        f"Could not switch Claude Code to {mode!r} mode: cycled shift+tab "
-        f"{_MODE_CYCLE_MAX_PRESSES} times and only reached {sorted(set(seen))}. "
-        "The mode is not available in this session's cycle."
-    )
+    except (ClaudePermissionModeSwitchError, ClaudeInjectionCancelled, ClaudeUserPromptPending):
+        raise
+    except (RuntimeError, OSError) as exc:
+        failure = exc
+    # Verify the original footer before claiming recovery from a failed or incomplete lap.
+    for press in range(_MODE_CYCLE_MAX_PRESSES + 1):
+        try:
+            current = _read_settled_permission_mode(
+                socket_path, tmux_target, bridge_dir=bridge_dir, previous=original
+            )
+            if current is None:
+                continue
+            if current == original:
+                raise ClaudePermissionModeSwitchError(
+                    "terminal" if failure is not None else "unavailable"
+                ) from failure
+            if press < _MODE_CYCLE_MAX_PRESSES:
+                _raise_if_user_prompt_pending(bridge_dir, "")
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BTab")
+        except (
+            ClaudePermissionModeSwitchError,
+            ClaudeInjectionCancelled,
+            ClaudeUserPromptPending,
+        ):
+            raise
+        except (RuntimeError, OSError) as exc:
+            failure = failure or exc
+    raise ClaudePermissionModeSwitchError("restore") from failure
 
 
 def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
@@ -9152,7 +9220,7 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     and parses both the permission-mode footer and any settled ``/btw``
     overlay from it, so the forwarder spawns one ``capture-pane``
     subprocess per poll rather than one per signal. Returns an empty
-    :class:`PaneSignals` when the terminal isn't up.
+    :class:`PaneSignals` when the terminal isn't up or an injection is active.
 
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
@@ -9165,11 +9233,16 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     tmux_target = payload.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return PaneSignals()
-    pane = _capture_pane(socket_path, tmux_target)
-    return PaneSignals(
-        permission_mode=_permission_mode_from_pane(pane),
-        btw_overlay=_btw_overlay_from_pane(pane),
-    )
+    try:
+        with _bridge_injection_file_lock(bridge_dir).acquire(timeout=0):
+            pane = _capture_pane(socket_path, tmux_target)
+            return PaneSignals(
+                permission_mode=_permission_mode_from_pane(pane),
+                btw_overlay=_btw_overlay_from_pane(pane),
+            )
+    except FileLockTimeout:
+        # A settings operation may walk through several modes before settling.
+        return PaneSignals()
 
 
 def dismiss_btw_overlay(bridge_dir: Path) -> bool:
