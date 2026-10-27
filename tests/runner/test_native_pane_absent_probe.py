@@ -176,6 +176,7 @@ async def test_popped_but_alive_pane_is_not_torn_down(
 
     instance = SimpleNamespace(
         running=True,
+        diagnostic_id="race-terminal",
         socket_path=tmp_path / "tmux.sock",
         close=_slow_close,
         probe_alive=_still_alive,

@@ -127,6 +127,8 @@ class _SubAgentSnapshotServer(NullServerClient):
             )
         if u.endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
+        if u.endswith("/labels"):
+            return self._Resp({"labels": {}})
         return super()._Response()
 
 
@@ -285,7 +287,7 @@ class _ShadowedSnapshotServer(_SubAgentSnapshotServer):
             )
         if u.endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
-        return super(_SubAgentSnapshotServer, self)._Response()
+        return await super().get(url)
 
 
 @pytest.mark.asyncio
