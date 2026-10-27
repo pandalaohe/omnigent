@@ -2713,7 +2713,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                     },
                 },
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path in {
             "/v1/sessions/conv_new",
@@ -2825,14 +2825,8 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     ]
     assert (
         "POST",
-        "/v1/sessions",
-        {
-            "agent_id": "ag_codex",
-            "labels": {
-                "omnigent.wrapper": "codex-native-ui",
-                "omnigent.codex_native.bridge_id": "bridge_shared",
-            },
-        },
+        "/v1/sessions/conv_old/successor",
+        None,
     ) in requests
     assert (
         "POST",
@@ -2890,7 +2884,7 @@ def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
                     "labels": {"omnigent.wrapper": "codex-native-ui"},
                 },
             )
-        if request.method == "POST" and path == "/v1/sessions":
+        if request.method == "POST" and path == "/v1/sessions/conv_old/successor":
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "PATCH" and path in {
             "/v1/sessions/conv_new",
@@ -6003,7 +5997,7 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
                     "labels": {},
                 },
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path in {
             "/v1/sessions/conv_new",

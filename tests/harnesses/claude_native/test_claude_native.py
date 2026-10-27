@@ -12701,15 +12701,13 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("deleted_project", [False, True])
-@pytest.mark.parametrize("title", ["Saved name", None])
-async def test_clear_replacement_preserves_project_or_retries_unfiled(
-    tmp_path: Path, deleted_project: bool, title: str | None, monkeypatch: pytest.MonkeyPatch
+async def test_clear_replacement_requests_server_owned_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     bridge_dir.mkdir(parents=True)
     (bridge_dir / "bridge.json").write_text('{"bridge_id":"bridge"}')
-    creates: list[dict[str, Any]] = []
+    creates: list[bytes] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
@@ -12719,13 +12717,11 @@ async def test_clear_replacement_preserves_project_or_retries_unfiled(
                     "agent_id": "agent",
                     "project_id": "project",
                     "workspace": "/opt/work/project",
-                    "title": title,
+                    "title": "Saved name",
                 },
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            creates.append(json.loads(request.content))
-            if deleted_project and len(creates) == 1:
-                return httpx.Response(404, json={"error": {"code": "not_found"}})
+        if request.method == "POST" and request.url.path == "/v1/sessions/old/successor":
+            creates.append(request.content)
             return httpx.Response(201, json={"id": "replacement"})
         return httpx.Response(200, json={})
 
@@ -12737,18 +12733,4 @@ async def test_clear_replacement_preserves_project_or_retries_unfiled(
         )
 
     assert result == "replacement"
-    assert all(body.get("title") == title for body in creates)
-    assert creates[0]["project_id"] == "project"
-    assert creates[0]["workspace"] == "/opt/work/project"
-    assert creates[0]["git"] is None
-    if deleted_project:
-        assert len(creates) == 2
-        assert creates[1] == {
-            "agent_id": creates[0]["agent_id"],
-            "labels": creates[0]["labels"],
-            "workspace": "/opt/work/project",
-            "git": None,
-            **({"title": title} if title is not None else {}),
-        }
-    else:
-        assert len(creates) == 1
+    assert creates == [b""]

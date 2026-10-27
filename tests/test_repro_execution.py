@@ -1495,9 +1495,29 @@ assert len(error['detail']) == 2048
     ["collection_error", "collection_incomplete", "truncated", "malformed", "interrupted", "none"],
 )
 def test_subprocess_capture_completeness_is_separate_from_inventory(tmp_path, monkeypatch, kind):
+    import subprocess
+
     from dev.repro_env import execution
 
     # Isolate metadata from this test's temporary directory; test the real subprocess journal.
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
     monkeypatch.setattr(execution, "launch_observations", lambda root: {})
     (tmp_path / "execution-context.json").write_text("{}")
     script = """
