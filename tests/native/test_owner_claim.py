@@ -49,6 +49,7 @@ def test_owner_death_requires_resolvable_identity(
     gone: bool,
     probe: bool,
 ) -> None:
+    monkeypatch.setattr(owner_claim, "IS_WINDOWS", False)
     monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: current_ns)
     monkeypatch.setattr(owner_claim, "IS_LINUX", current_ns != "none")
     monkeypatch.setattr(
@@ -68,6 +69,7 @@ def test_owner_death_requires_resolvable_identity(
 def test_unreadable_linux_namespace_remains_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(owner_claim, "IS_WINDOWS", False)
     monkeypatch.setattr(owner_claim, "IS_LINUX", True)
 
     def unreadable(_path: str) -> str:

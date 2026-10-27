@@ -15,7 +15,12 @@ from collections.abc import Generator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from filelock import FileLock
+
+from omnigent._platform import IS_WINDOWS
 from omnigent.harnesses.codex_native.state import _codex_native_state_root
+from omnigent.inner import _proc
+from omnigent.native import owner_claim, windows_processes
 
 try:
     import fcntl
@@ -77,7 +82,7 @@ class CodexNativeProcessOwnerLock:
     Kernel-backed liveness handle for a native Codex launcher process.
 
     :param path: Path to the owner lock file.
-    :param fd: Open file descriptor holding an exclusive flock.
+    :param fd: Open descriptor; POSIX holds a flock, Windows records an owner claim.
     """
 
     path: Path
@@ -96,6 +101,18 @@ class CodexNativeProcessOwnerLock:
             os.close(self.fd)
         with contextlib.suppress(OSError):
             self.path.unlink()
+        if IS_WINDOWS:
+            # Keep ownership evidence if a failed teardown left a registry entry.
+            with _registry_lock(codex_native_process_registry_path()):
+                entries = _read_registry(codex_native_process_registry_path())
+                if entries is not None and not any(
+                    entry.owner_lock_path == str(self.path) for entry in entries
+                ):
+                    with contextlib.suppress(OSError):
+                        self.path.with_name(self.path.name + ".owner").unlink()
+                    for record in self.path.parent.glob(f"{self.path.name}.*.tree.json"):
+                        with contextlib.suppress(OSError):
+                            record.unlink()
 
 
 def codex_native_process_registry_path() -> Path:
@@ -116,10 +133,11 @@ def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | N
     the flock, making its children eligible for the next reconciliation
     sweep. A healthy concurrent launcher still holds the lock, so its
     child entries are skipped even when their child PID/tag are live.
+    Windows records the launcher's boot-qualified PID alongside the lock instead.
 
     :returns: Held owner lock, or ``None`` if it could not be created.
     """
-    if fcntl is None:
+    if fcntl is None and not IS_WINDOWS:
         return None
     root = _codex_native_state_root() / _OWNER_LOCK_DIR
     fd: int | None = None
@@ -127,7 +145,10 @@ def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | N
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = root / f"{uuid.uuid4().hex}.lock"
         fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if IS_WINDOWS:
+            owner_claim.write_owner_claim(root, filename=path.name + ".owner")
+        elif fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         _logger.warning("codex-native process owner lock create failed", exc_info=True)
         if fd is not None:
@@ -193,9 +214,10 @@ def register_codex_native_process(
     )
     path = registry_path or codex_native_process_registry_path()
     with _registry_lock(path):
-        entries = [
-            existing for existing in _read_registry(path) if existing.session_tag != session_tag
-        ]
+        current = _read_registry(path)
+        if current is None:
+            return
+        entries = [existing for existing in current if existing.session_tag != session_tag]
         entries.append(entry)
         _write_registry(path, entries)
 
@@ -216,7 +238,10 @@ def unregister_codex_native_process(
         return
     path = registry_path or codex_native_process_registry_path()
     with _registry_lock(path):
-        entries = [entry for entry in _read_registry(path) if entry.session_tag != session_tag]
+        current = _read_registry(path)
+        if current is None:
+            return
+        entries = [entry for entry in current if entry.session_tag != session_tag]
         _write_registry(path, entries)
 
 
@@ -235,9 +260,19 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     reaped = 0
     with _registry_lock(path):
         survivors: list[CodexNativeProcessEntry] = []
-        for entry in _read_registry(path):
+        entries = _read_registry(path)
+        if entries is None:
+            return 0
+        for entry in entries:
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
+                continue
+            if IS_WINDOWS:
+                result = _reap_windows_entry(entry)
+                if result is None:
+                    survivors.append(entry)
+                elif result:
+                    reaped += 1
                 continue
             matches_entry = _process_matches_entry(entry)
             if matches_entry is None:
@@ -261,8 +296,72 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 continue
             reaped += 1
             _reap_tmux_session(entry.tmux_session_name)
-        _write_registry(path, survivors)
+        saved = _write_registry(path, survivors)
+        if saved and IS_WINDOWS:
+            for entry in entries:
+                if entry.owner_lock_path and not any(
+                    survivor.owner_lock_path == entry.owner_lock_path for survivor in survivors
+                ):
+                    lock_path = Path(entry.owner_lock_path)
+                    with contextlib.suppress(OSError):
+                        lock_path.with_name(lock_path.name + ".owner").unlink()
+                    with contextlib.suppress(OSError):
+                        lock_path.unlink()
+                    for record in lock_path.parent.glob(f"{lock_path.name}.*.tree.json"):
+                        with contextlib.suppress(OSError):
+                            record.unlink()
     return reaped
+
+
+def _reap_windows_entry(entry: CodexNativeProcessEntry) -> bool | None:
+    """Use a qualified dead owner and whole argv tags instead of POSIX groups."""
+    if not entry.owner_lock_path:
+        return None
+    lock_path = Path(entry.owner_lock_path)
+    claim = owner_claim.read_owner_claim(lock_path.parent, filename=lock_path.name + ".owner")
+    if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_pid_alive):
+        return None
+    if not entry.process_start_identity or not entry.process_start_identity.startswith("windows:"):
+        return None
+    try:
+        birth = float(entry.process_start_identity.removeprefix("windows:"))
+    except ValueError:
+        return None
+    reaped = False
+    for record in lock_path.parent.glob(f"{lock_path.name}.*.tree.json"):
+        if not windows_processes.reap_record(record):
+            return None
+        reaped = True
+    if _pid_alive(entry.pid):
+        record = lock_path.with_name(f"{lock_path.name}.{entry.pid}.tree.json")
+        return True if windows_processes.reap_tree(entry.pid, birth, record_path=record) else None
+    # The launcher shim may have exited while the tagged app-server survived.
+    try:
+        username = windows_processes.psutil.Process().username()
+        matches = []
+        complete = True
+        for process in windows_processes.psutil.process_iter():
+            try:
+                if process.username() == username and any(
+                    arg
+                    in (
+                        f"{_TAG_ARG_PREFIX}{entry.session_tag}",
+                        codex_native_session_tag_cmdline_arg(entry.session_tag),
+                    )
+                    for arg in process.cmdline()
+                ):
+                    matches.append((process.pid, process.create_time()))
+            except windows_processes.psutil.NoSuchProcess:
+                continue
+            except windows_processes.psutil.AccessDenied:
+                complete = False
+        for pid, started in matches:
+            record = lock_path.with_name(f"{lock_path.name}.{pid}.tree.json")
+            if not windows_processes.reap_tree(pid, started, record_path=record):
+                complete = False
+        return bool(matches) or reaped if complete else None
+    except windows_processes.psutil.Error:
+        return None
 
 
 @contextlib.contextmanager
@@ -280,6 +379,11 @@ def _registry_lock(path: Path) -> Generator[None, None, None]:
     :param path: Registry file path being mutated.
     :returns: Context manager guarding the mutation.
     """
+    if IS_WINDOWS:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with FileLock(str(path) + ".lock", timeout=10):
+            yield
+        return
     if fcntl is None:
         yield
         return
@@ -304,30 +408,31 @@ def _registry_lock(path: Path) -> Generator[None, None, None]:
                 os.close(fd)
 
 
-def _read_registry(path: Path) -> list[CodexNativeProcessEntry]:
+def _read_registry(path: Path) -> list[CodexNativeProcessEntry] | None:
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return []
-    except OSError:
+    except (OSError, UnicodeError):
         _logger.warning("codex-native process registry read failed", exc_info=True)
-        return []
+        return None
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         _logger.warning("codex-native process registry JSON is malformed; ignoring")
-        return []
+        return None
     if not isinstance(payload, list):
-        return []
+        return None
     entries: list[CodexNativeProcessEntry] = []
     for item in payload:
         entry = _entry_from_json(item)
-        if entry is not None:
-            entries.append(entry)
+        if entry is None:
+            return None
+        entries.append(entry)
     return entries
 
 
-def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
+def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> bool:
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         payload = []
@@ -339,8 +444,10 @@ def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
         os.replace(tmp, path)
+        return True
     except OSError:
         _logger.warning("codex-native process registry write failed", exc_info=True)
+        return False
 
 
 def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
@@ -375,6 +482,12 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
 
 
 def _owner_lock_held(owner_lock_path: str | None) -> bool:
+    if IS_WINDOWS:
+        if not owner_lock_path:
+            return True
+        path = Path(owner_lock_path)
+        claim = owner_claim.read_owner_claim(path.parent, filename=path.name + ".owner")
+        return claim is None or not owner_claim.owner_is_gone(claim, process_alive=_pid_alive)
     if not owner_lock_path:
         return False
     if fcntl is None:
@@ -401,6 +514,8 @@ def _owner_lock_held(owner_lock_path: str | None) -> bool:
 
 
 def _pid_alive(pid: int) -> bool:
+    if IS_WINDOWS:
+        return _proc.process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -427,6 +542,9 @@ def _process_matches_entry(entry: CodexNativeProcessEntry) -> bool | None:
 
 
 def _process_start_identity(pid: int) -> str | None:
+    if IS_WINDOWS:
+        birth = windows_processes.process_birth(pid)
+        return f"windows:{birth}" if birth is not None else None
     proc_stat = Path("/proc") / str(pid) / "stat"
     with contextlib.suppress(OSError, IndexError):
         raw = proc_stat.read_text(encoding="utf-8")

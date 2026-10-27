@@ -913,7 +913,7 @@ def reap_orphaned_terminals() -> int:
 
     :returns: The number of orphaned instance dirs reaped.
     """
-    if not _tmux_available():
+    if IS_WINDOWS or not _tmux_available():
         return 0
     reaped = 0
     for entry in _terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"):

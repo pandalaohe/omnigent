@@ -1972,6 +1972,15 @@ class HarnessProcessManager:
         spawn_started_at = time.monotonic()
         process = await self._spawn_harness_process(runner_argv, effective_env)
         try:
+            if IS_WINDOWS:
+                from omnigent.native.windows_processes import process_birth
+
+                birth = process_birth(process.pid)
+                if birth is None:
+                    raise RuntimeError("Cannot record Windows harness process identity")
+                (self._instance_dir / f"conv-{process.pid}.process.json").write_text(
+                    json.dumps({"pid": process.pid, "create_time": birth}), encoding="utf-8"
+                )
             await _wait_for_bind(process, endpoint, harness, conversation_id)
             # The harness process has bound its socket and is ready to serve —
             # the observable "harness started" edge. Report the spawn->ready
@@ -2057,6 +2066,8 @@ class HarnessProcessManager:
                 close_subprocess_transport(process)
             with contextlib.suppress(Exception):
                 endpoint.cleanup()
+            if IS_WINDOWS and process.returncode is not None:
+                (self._instance_dir / f"conv-{process.pid}.process.json").unlink(missing_ok=True)
             raise
 
     async def _spawn_harness_process(
@@ -2206,6 +2217,10 @@ class HarnessProcessManager:
         finally:
             if closed:
                 entry.exit_confirmed = True
+                if IS_WINDOWS:
+                    (self._instance_dir / f"conv-{entry.process.pid}.process.json").unlink(
+                        missing_ok=True
+                    )
                 self._closing_entries.pop(entry.incarnation_id, None)
                 with contextlib.suppress(Exception):
                     close_subprocess_transport(entry.process)
@@ -2362,29 +2377,27 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
                 continue
             pid = claim.pid
         else:
-            # A bare PID from a build that predates owner claims.
-            try:
-                pid = int(sentinel.read_text(encoding="utf-8").strip())
-            except (OSError, ValueError) as exc:
-                _logger.warning(
-                    "could not read AP_PID sentinel at %s: %s; skipping",
-                    sentinel,
-                    exc,
-                )
-                continue
-            if _pid_alive(pid):
-                continue
+            # Legacy PIDs cannot establish which process domain owns the tree.
+            continue
         _logger.info(
             "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
             child,
             pid,
         )
-        await _kill_orphan_runners(child)
-        shutil.rmtree(child, ignore_errors=True)
+        if await _kill_orphan_runners(child):
+            shutil.rmtree(child, ignore_errors=True)
 
 
-async def _kill_orphan_runners(instance_dir: Path) -> None:
+async def _kill_orphan_runners(instance_dir: Path) -> bool:
     """Terminate runner processes whose sockets live under *instance_dir*."""
+    if IS_WINDOWS:
+        from omnigent.native import windows_processes
+
+        complete = True
+        for record in instance_dir.glob("conv-*.process.json"):
+            if not await asyncio.to_thread(windows_processes.reap_record, record):
+                complete = False
+        return complete
     all_pids: set[int] = set()
     for socket_file in instance_dir.glob("conv-*.sock"):
         for pid in await _pids_holding_socket(socket_file):
@@ -2400,7 +2413,7 @@ async def _kill_orphan_runners(instance_dir: Path) -> None:
                 )
 
     if not all_pids:
-        return
+        return True
     await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
     for pid in all_pids:
         if not _pid_alive(pid):
@@ -2411,6 +2424,7 @@ async def _kill_orphan_runners(instance_dir: Path) -> None:
         )
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    return True
 
 
 def _pid_alive(pid: int) -> bool:
