@@ -233,6 +233,7 @@ describe("ChildSessionsPanel", () => {
     fireEvent.change(screen.getByRole("textbox", { name: /Remaining quota floor/ }), {
       target: { value: "0" },
     });
+    fireEvent.click(screen.getByText("Deciding period"));
     fireEvent.change(screen.getByRole("textbox", { name: "All products" }), {
       target: { value: "5h" },
     });
@@ -265,6 +266,7 @@ describe("ChildSessionsPanel", () => {
       quotaPeriods: { codex: "7d" },
     });
     render(<ChildSessionsPanel />);
+    fireEvent.click(screen.getByText("Deciding period"));
     expect(screen.getByRole("textbox", { name: "All products" })).toHaveValue("");
     expect(screen.getByText("7d")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit Codex" })).toBeInTheDocument();
@@ -284,6 +286,7 @@ describe("ChildSessionsPanel", () => {
 
   it("requires a period before saving an added exception", () => {
     render(<ChildSessionsPanel />);
+    fireEvent.click(screen.getByText("Deciding period"));
     fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
     fireEvent.click(screen.getByRole("button", { name: /Kite.*Native CLI/ }));
     fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));

@@ -76,7 +76,7 @@ export function LayerGrid({
       <Button
         size="sm"
         variant="ghost"
-        aria-label={`Remove ${name} ${axis === "hosts" ? "row" : "column"}`}
+        aria-label={`Remove ${name} ${axis === "hosts" ? "column" : "row"}`}
         disabled={!!held && !canEdit}
         title={held && !canEdit ? "Only administrators can clear saved text." : undefined}
         onClick={() => onRemove(axis, id, name)}
@@ -93,7 +93,7 @@ export function LayerGrid({
           ? "An independent cell replaces all three on its route. Mother and child instructions apply afterwards."
           : `An independent cell replaces only these ${role} instructions. Shared instructions still apply.`}
       </p>
-      <div className="overflow-x-auto rounded-lg border">
+      <div className="max-h-[32rem] overflow-auto rounded-lg border">
         <table className="w-full border-collapse text-left">
           <caption className="sr-only">
             {role === "route"
@@ -102,28 +102,18 @@ export function LayerGrid({
           </caption>
           <thead>
             <tr className="border-b bg-muted/40">
-              <th className="min-w-40 p-2">
+              <th scope="col" className="sticky top-0 left-0 z-30 min-w-36 bg-card-solid p-2">
                 {cell(
                   { scope: role === "route" ? "shared" : role, agent_key: "", host_id: "" },
                   "Shared",
                 )}
               </th>
-              {agents.map((agent) => (
-                <th key={agent.key} className="min-w-44 border-l p-2">
-                  {cell(
-                    { scope: role === "route" ? "agent" : role, agent_key: agent.key, host_id: "" },
-                    agent.display_name,
-                  )}
-                  {remove("agents", agent.key, agent.display_name)}
-                </th>
-              ))}
-              <th className="border-l p-2">{addAgent}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {hosts.map((host) => (
-              <tr className="border-b last:border-b-0" key={host.host_id}>
-                <th className="p-2 font-normal">
+              {hosts.map((host) => (
+                <th
+                  scope="col"
+                  key={host.host_id}
+                  className="sticky top-0 z-20 min-w-44 border-l bg-card-solid p-2 align-top"
+                >
                   {cell(
                     {
                       scope: role === "route" ? "host" : role,
@@ -134,7 +124,30 @@ export function LayerGrid({
                   )}
                   {remove("hosts", host.host_id, host.name)}
                 </th>
-                {agents.map((agent) => {
+              ))}
+              <th scope="col" className="sticky top-0 z-20 border-l bg-card-solid p-2">
+                {addHost}
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {agents.map((agent) => (
+              <tr className="border-b last:border-b-0" key={agent.key}>
+                <th
+                  scope="row"
+                  className="sticky left-0 z-10 max-w-52 bg-card-solid p-2 align-top font-normal"
+                >
+                  {cell(
+                    {
+                      scope: role === "route" ? "agent" : role,
+                      agent_key: agent.key,
+                      host_id: "",
+                    },
+                    agent.display_name,
+                  )}
+                  {remove("agents", agent.key, agent.display_name)}
+                </th>
+                {hosts.map((host) => {
                   const size = data.route_sizes.find(
                     (route) => route.host_id === host.host_id && route.agent_key === agent.key,
                   );
@@ -145,7 +158,7 @@ export function LayerGrid({
                   };
                   const independent = layers.get(layerId(independentKey));
                   return (
-                    <td className="border-l p-2 align-top" key={agent.key}>
+                    <td className="border-l p-2 align-top" key={host.host_id}>
                       {independent &&
                       !independent.host_removed &&
                       hasInstructionText(independent.text) ? (
@@ -201,9 +214,11 @@ export function LayerGrid({
               </tr>
             ))}
             <tr>
-              <th className="p-2 font-normal">{addHost}</th>
-              {agents.map((agent) => (
-                <td key={agent.key} className="border-l p-2" />
+              <th scope="row" className="sticky left-0 z-10 bg-card-solid p-2 font-normal">
+                {addAgent}
+              </th>
+              {hosts.map((host) => (
+                <td key={host.host_id} className="border-l p-2" />
               ))}
               <td className="border-l p-2" />
             </tr>
@@ -212,7 +227,7 @@ export function LayerGrid({
       </div>
       {hosts.length === 0 && agents.length === 0 && (
         <p className="text-sm text-muted-foreground">
-          Add an agent column or a host row to give one agent or one host its own text.
+          Add an agent row or a host column to give one agent or one host its own text.
         </p>
       )}
       {allHosts.length === 0 && (

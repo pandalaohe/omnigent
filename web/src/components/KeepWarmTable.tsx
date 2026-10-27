@@ -128,7 +128,7 @@ function CellEditor({
   family: KeepWarmFamily | null;
   busy: boolean;
   error?: string;
-  onSave: (row: AgentKeepWarmPreferences, axis?: "row" | "column") => void;
+  onSave: (row: AgentKeepWarmPreferences, axis?: "host" | "agent") => void;
   onOff: () => void;
   onClose: () => void;
 }) {
@@ -239,16 +239,16 @@ function CellEditor({
           )}
         </div>
         <div className="flex flex-wrap gap-2 border-t pt-4">
-          <Button variant="outline" size="sm" disabled={busy} onClick={() => onSave(draft, "row")}>
-            Fill host row
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => onSave(draft, "host")}>
+            Fill host column
           </Button>
           <Button
             variant="outline"
             size="sm"
             disabled={busy}
-            onClick={() => onSave(draft, "column")}
+            onClick={() => onSave(draft, "agent")}
           >
-            Fill agent column
+            Fill agent row
           </Button>
           <Button variant="ghost" size="sm" disabled={busy} onClick={onOff}>
             Turn off
@@ -438,7 +438,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     }
   }
 
-  function editCells(row: AgentKeepWarmPreferences, axis?: "row" | "column") {
+  function editCells(row: AgentKeepWarmPreferences, axis?: "host" | "agent") {
     if (!editing) return;
     void save((base) => {
       let next: KeepWarmPreferences = {
@@ -447,9 +447,9 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         cells: { ...base.cells },
       };
       const targets =
-        axis === "row"
+        axis === "host"
           ? columns.map((key) => ({ host: editing.host, key }))
-          : axis === "column"
+          : axis === "agent"
             ? hosts.map((host) => ({ host, key: editing.key }))
             : [editing];
       for (const target of targets) {
@@ -469,7 +469,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         <div className="space-y-1">
           <p className="text-sm font-medium">Keep sessions warm</p>
           <p className="text-xs text-muted-foreground">
-            New hosts start off; new agents start off unless their harness has a column.
+            New hosts start off; new agents start off unless their harness has a row.
           </p>
         </div>
         <AgentPicker
@@ -481,7 +481,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
               : "This agent has no declared keep-warm channel"
           }
           title="Add agent"
-          description="Add an agent or harness column. Agents may follow matching harness cells."
+          description="Add an agent or harness row. Agents may follow matching harness cells."
           trigger={
             <Button variant="outline" size="sm" disabled={!editable}>
               Add agent
@@ -540,44 +540,44 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
             <thead>
               <tr>
                 <th scope="col" className="sticky top-0 left-0 z-30 min-w-36 bg-card-solid p-3">
-                  Host / Agent
+                  Agent / Host
                 </th>
-                {columns.map((key) => (
+                {hosts.map((host) => (
                   <th
                     scope="col"
-                    key={key}
+                    key={host}
                     className="sticky top-0 z-20 min-w-48 border-l bg-card-solid p-3 align-top"
                   >
-                    <span className="block max-w-56 break-words font-medium">{labelFor(key)}</span>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="-ml-2 mt-1 h-7 text-xs"
-                      disabled={!editable}
-                      aria-label={`Remove ${labelFor(key)} column`}
-                      onClick={() => setRemoving(key)}
-                    >
-                      Remove
-                    </Button>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {hosts.map((host) => (
-                <tr key={host} className="border-t">
-                  <th
-                    scope="row"
-                    className="sticky left-0 z-10 max-w-52 bg-card-solid p-3 align-top font-medium"
-                  >
-                    <span className="block break-words">{hostName(host)}</span>
+                    <span className="block max-w-56 break-words font-medium">{hostName(host)}</span>
                     {host !== "" && (
                       <span className="mt-1 block text-xs font-normal text-muted-foreground">
                         {knownHosts.get(host)?.status ?? "Unavailable host"}
                       </span>
                     )}
                   </th>
-                  {columns.map((key) => {
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {columns.map((key) => (
+                <tr key={key} className="border-t">
+                  <th
+                    scope="row"
+                    className="sticky left-0 z-10 max-w-52 bg-card-solid p-3 align-top font-medium"
+                  >
+                    <span className="block break-words">{labelFor(key)}</span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="-ml-2 mt-1 h-7 text-xs"
+                      disabled={!editable}
+                      aria-label={`Remove ${labelFor(key)} row`}
+                      onClick={() => setRemoving(key)}
+                    >
+                      Remove
+                    </Button>
+                  </th>
+                  {hosts.map((host) => {
                     const family = familyFor(key);
                     const row = rowFor(host, key);
                     const machine = knownHosts.get(host);
@@ -595,7 +595,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                       !!harnessFor(key) &&
                       !!data.cells?.[host]?.[`harness:${harnessFor(key)}`];
                     return (
-                      <td key={key} className="border-l p-1 align-top">
+                      <td key={host} className="border-l p-1 align-top">
                         <button
                           type="button"
                           disabled={!editable}
@@ -704,7 +704,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Remove {removing ? labelFor(removing) : ""} column?</DialogTitle>
+            <DialogTitle>Remove {removing ? labelFor(removing) : ""} row?</DialogTitle>
             <DialogDescription>
               This clears its overrides on{" "}
               {Object.values(data.cells ?? {}).filter((rows) => removing && rows[removing]).length}{" "}
@@ -742,7 +742,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                 }));
               }}
             >
-              Remove column
+              Remove row
             </Button>
           </DialogFooter>
         </DialogContent>
