@@ -432,7 +432,8 @@ async def test_missing_dispatcher_releases_only_an_ungranted_attempt(db_uri, phy
 
 
 @pytest.mark.asyncio
-async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
+@pytest.mark.parametrize("first_input_mode", ["guarded", "startup_only"])
+async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri, first_input_mode):
     conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
     registry, host = HostRegistry(), uuid4().hex
     conn = registry.register(
@@ -474,6 +475,9 @@ async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
                 phase=phase,
             )
         )
+    old = startups.get(empty.id)
+    if first_input_mode == "startup_only":
+        admission.policy = StartupAdmissionPolicy(None, None, 2, mode="startup_only")
     item = await inputs.enqueue(
         conv.id,
         SessionEventInput(type="message", data={"role": "user", "content": []}),
@@ -482,6 +486,9 @@ async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
     )
     first = await admission.queue_session(conn, conv.id)
     assert first.id != empty.id and first.input_id == item.id
+    assert first.admission_mode == first_input_mode
+    assert first.policy_revision == old.policy_revision + int(first_input_mode == "startup_only")
+    assert startups.get(empty.id) == old
     assert (await admission.queue_session(conn, conv.id)).id == first.id
     delivered = []
 

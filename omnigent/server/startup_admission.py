@@ -173,6 +173,14 @@ class StartupAdmission:
             == STARTUP_CREATE_PREPARATION_PENDING
         ):
             raise StartupQueued(None)
+        await asyncio.to_thread(
+            self.startups.configure,
+            conn.host_id,
+            host_resident_limit=self.policy.host_resident_limit,
+            deployment_resident_limit=self.policy.deployment_resident_limit,
+            startup_limit=self.policy.startup_limit,
+            mode=self.policy.mode,
+        )
         current = await asyncio.to_thread(self.startups.for_session, session_id)
         pending = await self._generic_pending(session_id)
         head = next((item for item in pending if item.status != "failed"), None)
@@ -204,13 +212,6 @@ class StartupAdmission:
         if head is not None and head.status != "in_progress":
             # A submitted input predates admission. Reconcile it instead of replaying.
             raise StartupQueued(None)
-        await asyncio.to_thread(
-            self.startups.configure,
-            conn.host_id,
-            host_resident_limit=self.policy.host_resident_limit,
-            deployment_resident_limit=self.policy.deployment_resident_limit,
-            startup_limit=self.policy.startup_limit,
-        )
         return await self.coordinator.enqueue(
             session_id,
             input_id=head.id if head else None,
@@ -269,6 +270,7 @@ class StartupAdmission:
             host_resident_limit=self.policy.host_resident_limit,
             deployment_resident_limit=self.policy.deployment_resident_limit,
             startup_limit=self.policy.startup_limit,
+            mode=self.policy.mode,
         )
         generation = current.runtime_generation + 1 if current else 1
         return await asyncio.to_thread(

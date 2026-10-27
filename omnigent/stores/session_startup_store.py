@@ -1,7 +1,7 @@
 """Atomic host startup admission shared by application replicas."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from sqlalchemy import case, func, or_, select
@@ -47,6 +47,8 @@ class StartupSnapshot:
     proof_source: str | None
     admitted_at: int | None
     first_dispatch_at: int | None
+    admission_mode: str
+    policy_revision: int
 
 
 def _snapshot(row: SqlSessionStartup) -> StartupSnapshot:
@@ -114,27 +116,51 @@ class SessionStartupStore:
         self,
         host_id: str,
         *,
-        host_resident_limit: int,
-        deployment_resident_limit: int,
+        host_resident_limit: int | None = None,
+        deployment_resident_limit: int | None = None,
         startup_limit: int = 2,
+        mode: Literal["guarded", "startup_only"] = "guarded",
     ) -> None:
-        if (
-            any(
-                type(value) is not int
-                for value in (host_resident_limit, deployment_resident_limit, startup_limit)
-            )
-            or min(host_resident_limit, deployment_resident_limit) < 1
-            or startup_limit not in (1, 2)
-        ):
+        if type(startup_limit) is not int or startup_limit not in (1, 2):
             raise ValueError("Resident limits must be positive and startup limit must be 1 or 2")
+        if mode == "guarded":
+            if (
+                type(host_resident_limit) is not int
+                or host_resident_limit < 1
+                or type(deployment_resident_limit) is not int
+                or deployment_resident_limit < 1
+            ):
+                raise ValueError("Resident limits must be positive")
+        elif (
+            mode != "startup_only"
+            or startup_limit != 2
+            or (host_resident_limit is not None or deployment_resident_limit is not None)
+        ):
+            raise ValueError("startup_only requires two starts and no resident limits")
 
         def write(db: Session) -> None:
             deployment, host = self._budgets(db, host_id)
-            deployment.resident_limit = deployment_resident_limit
-            host.resident_limit = host_resident_limit
+            changed = host.admission_mode != mode or host.startup_limit != startup_limit
+            if mode == "guarded":
+                assert host_resident_limit is not None and deployment_resident_limit is not None
+                changed |= (
+                    host.resident_limit != host_resident_limit
+                    or deployment.resident_limit != deployment_resident_limit
+                )
+                deployment.resident_limit = deployment_resident_limit
+                host.resident_limit = host_resident_limit
+            host.policy_revision = (host.policy_revision or 0) + int(changed)
+            host.admission_mode = mode
             host.startup_limit = startup_limit
 
         run_write_transaction(self._session, "configure_capacity", write)
+
+    @staticmethod
+    def _current_policy(row: SqlSessionStartup, host: SqlStartupBudget) -> bool:
+        return (
+            row.admission_mode == host.admission_mode
+            and row.policy_revision == host.policy_revision
+        )
 
     def get(self, startup_id: str) -> StartupSnapshot | None:
         with self._session("read_startup") as db:
@@ -610,6 +636,8 @@ class SessionStartupStore:
                 family_id=parent.family_id if parent else session_id,
                 sequence=deployment.next_sequence,
                 state="queued",
+                admission_mode=host.admission_mode or "guarded",
+                policy_revision=host.policy_revision or 0,
                 occupied=False,
                 resident=False,
                 runtime_ready=False,
@@ -841,13 +869,18 @@ class SessionStartupStore:
 
             if (
                 host.fenced
-                or self._resident_inventory_unknown(db)
-                or deployment.resident_limit == 0
-                or host.resident_limit == 0
+                or (
+                    host.admission_mode != "startup_only"
+                    and (
+                        self._resident_inventory_unknown(db)
+                        or deployment.resident_limit == 0
+                        or host.resident_limit == 0
+                    )
+                )
                 or count(*scope, SqlSessionStartup.occupied.is_(True)) >= host.startup_limit
             ):
                 return None
-            full = (
+            full = host.admission_mode != "startup_only" and (
                 residents(*scope) >= host.resident_limit
                 or residents() >= deployment.resident_limit
             )
@@ -857,6 +890,8 @@ class SessionStartupStore:
             rows = db.scalars(query.order_by(SqlSessionStartup.sequence)).all()
             eligible = []
             for row in rows:
+                if row.admission_mode != host.admission_mode:
+                    continue
                 reuses_resident = (
                     row.runtime_id is not None
                     and db.scalar(
@@ -919,6 +954,7 @@ class SessionStartupStore:
             )
             row = family_heads[next_family]
             row.state, row.occupied, row.resident = "starting", True, True
+            row.policy_revision = host.policy_revision
             row.attempt_id, row.updated_at, row.admitted_at = uuid4().hex, now, now
             host.last_family_id = row.family_id
             return _snapshot(row)
@@ -934,7 +970,8 @@ class SessionStartupStore:
             db.refresh(row, with_for_update=True)
             if (
                 host.fenced
-                or self._resident_inventory_unknown(db)
+                or not self._current_policy(row, host)
+                or (row.admission_mode != "startup_only" and self._resident_inventory_unknown(db))
                 or row.cancel_requested
                 or row.state == "blocked"
                 or row.attempt_id != attempt_id
@@ -989,8 +1026,10 @@ class SessionStartupStore:
             db.refresh(row, with_for_update=True)
             if (
                 host.fenced
+                or not self._current_policy(row, host)
                 or (
-                    self._resident_inventory_unknown(db)
+                    row.admission_mode != "startup_only"
+                    and self._resident_inventory_unknown(db)
                     and not (boundary == "input_dispatch" and "resident_reuse" in row.cold_claims)
                 )
                 or row.cancel_requested

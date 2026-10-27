@@ -12,6 +12,12 @@ class SqlStartupBudget(OmnigentBase):
     scope: Mapped[str] = mapped_column(String(80), primary_key=True)
     resident_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     startup_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    admission_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="guarded", server_default="guarded"
+    )
+    policy_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     next_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     last_family_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     fenced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -41,6 +47,12 @@ class SqlSessionStartup(OmnigentBase):
     family_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
+    admission_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="guarded", server_default="guarded"
+    )
+    policy_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
     attempt_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     runtime_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

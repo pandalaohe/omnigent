@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from PIL import Image, ImageSequence, UnidentifiedImageError
@@ -53,9 +53,12 @@ SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 
 @dataclass(frozen=True)
 class StartupAdmissionPolicy:
-    host_resident_limit: int
-    deployment_resident_limit: int
+    host_resident_limit: int | None
+    deployment_resident_limit: int | None
     startup_limit: int
+    mode: Literal["guarded", "startup_only"] = "guarded"
+    observation_timeout_seconds: int = 180
+    stuck_release: Literal["manual"] = "manual"
 
 
 def startup_admission_policy(config: Mapping[str, Any]) -> StartupAdmissionPolicy | None:
@@ -67,9 +70,25 @@ def startup_admission_policy(config: Mapping[str, Any]) -> StartupAdmissionPolic
         raise ValueError("startup_admission requires a boolean enabled setting")
     if not raw.get("enabled", False):
         return None
+    mode = raw.get("mode", "guarded")
+    if mode not in ("guarded", "startup_only"):
+        raise ValueError("startup_admission mode must be guarded or startup_only")
+    timeout = raw.get("observation_timeout_seconds", 180)
+    if (
+        type(timeout) is not int
+        or timeout != 180
+        or raw.get("stuck_release", "manual") != "manual"
+    ):
+        raise ValueError("startup_admission requires a 180 second marker and manual release")
     host = raw.get("host_resident_limit")
     deployment = raw.get("deployment_resident_limit")
     starts = raw.get("startup_limit", 2)
+    if mode == "startup_only":
+        if type(starts) is not int or starts != 2 or host is not None or deployment is not None:
+            raise ValueError(
+                "startup_admission startup_only requires two starts and no resident limits"
+            )
+        return StartupAdmissionPolicy(None, None, 2, mode="startup_only")
     if (
         type(host) is not int
         or host < 1
