@@ -22,6 +22,9 @@ from omnigent.harnesses.codex_native.app_server import (
 from omnigent.inner import _proc
 from tests._helpers.polling import poll_until, poll_until_async
 from tests.harnesses.codex_native.app_server._support import _test_app_server
+from tests.harnesses.codex_native.test_codex_native_app_server_rpc import (
+    context_v2_native as context_v2_native,
+)
 
 
 def _isolated_discovery_registry(
@@ -870,6 +873,142 @@ async def test_real_untagged_group_is_not_an_exit_receipt(monkeypatch):
             process.kill()
             await process.wait()
     assert await module._reap_process_group_survivors(process.pid, "fixture-tag")
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("replacement", [False, True], ids=["retained-owner", "replacement"])
+async def test_real_owned_group_keeps_context_work_unknown_through_close_and_retry(
+    context_v2_native, monkeypatch, tmp_path, replacement, record_property
+):
+    """Scripted Codex RPC + real benign OS child; no vendor process."""
+    from omnigent.harnesses.codex_native import app_server as module
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resident_inventory import session_context_work_evidence_v2
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    backend, client, websocket = context_v2_native
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(60)", start_new_session=True
+    )
+    backend.proc = process
+    backend._resident_spawned = True
+    backend.process_group_id = process.pid
+    backend.process_registry_tag = "p4e-untagged-owned"
+    incarnation = backend.resident_incarnation_id
+    tag, pgid = backend.process_registry_tag, backend.process_group_id
+    unregistered = []
+    monkeypatch.setattr(module, "unregister_codex_native_process", unregistered.append)
+    entered = asyncio.Event()
+    requests = []
+    delayed = closing = None
+
+    async def respond(raw):
+        request = json.loads(raw)
+        if request["method"] == "thread/fork":
+            requests.append(request)
+            entered.set()
+            return
+        result = (
+            {"thread": {"id": "primary"}}
+            if request["method"] == "thread/start"
+            else {"turn": {"id": "turn-one"}}
+        )
+        client._pending_requests[request["id"]].set_result({"result": result})
+
+    async def read():
+        return await session_context_work_evidence_v2(
+            "conversation",
+            "posix-acceptance",
+            process_manager=None,
+            resources=SessionResourceRegistry(),
+        )
+
+    websocket.send.side_effect = respond
+    try:
+        await client.request("thread/start", {})
+        await client.request("turn/start", {"threadId": "primary"})
+        before = await read()
+        (primary,) = before.context.sources[1].contexts
+        (work,) = before.inventory.observations
+        assert (work.runtime_id, work.generation) == (incarnation, str(backend._start_generation))
+        assert work.live_turn and not work.no_live_work_confirmed and not work.no_owned_descendants
+        assert before.assessment.reason == "other_session_working"
+        delayed = asyncio.create_task(client.request("thread/fork", {"threadId": "primary"}))
+        await asyncio.wait_for(entered.wait(), 2)
+        keys = {row.key for row in backend.context_source_v2("conversation").contexts}
+        closing = asyncio.create_task(
+            orchestration._close_native_backend("conversation", "codex-native", backend)
+        )
+        await poll_until_async(lambda: backend._context_closing, timeout_s=2)
+        during = await read()
+        assert during.context.sources[1].work_bindings is None
+        assert during.context.sources[1].coverage == "partial"
+        assert primary.key in {row.key for row in during.context.sources[1].contexts}
+        assert not during.inventory.observations and not during.assessment.allowed
+        assert not during.inventory.local_complete and not during.inventory.execution_fence
+        assert not await module._reap_process_group_survivors(pgid, tag)
+        assert process.returncode is None
+        await asyncio.wait_for(closing, 8)
+        assert process.returncode is None and not backend.exit_confirmed
+        assert (backend.process_group_id, backend.process_registry_tag) == (pgid, tag)
+        assert unregistered == []
+
+        if replacement:
+            new = _test_app_server(
+                tmp_path, tmp_path / "new-home", tmp_path / "new-bridge", tmp_path
+            )
+            orchestration._AUTO_CODEX_APP_SERVERS["conversation"] = new
+        client._pending_requests[requests[0]["id"]].set_result(
+            {"result": {"thread": {"id": "late-side"}}}
+        )
+        await delayed
+        old_source = backend.context_source_v2("conversation")
+        assert {row.key for row in old_source.contexts} == keys
+        assert all(
+            row.lifecycle == "unknown" and row.stop_proof is None for row in old_source.contexts
+        )
+        if replacement:
+            observed = (await read()).context.sources[1]
+            assert observed.producer_incarnation == new.resident_incarnation_id
+            assert not observed.contexts and observed.work_bindings is None
+            assert {key.context_incarnation for key in keys} <= {
+                u.candidate for u in observed.unresolved
+            }
+
+        process.terminate()
+        await asyncio.wait_for(process.wait(), 2)
+        assert await module._reap_process_group_survivors(pgid, tag)
+        await orchestration._close_native_backend("conversation", "codex-native", backend)
+        assert backend.exit_confirmed and backend.resident_incarnation_id == incarnation
+        assert backend.process_group_id is backend.process_registry_tag is None
+        assert unregistered == [tag]
+        after = await read()
+        assert not after.inventory.observations and not after.assessment.allowed
+        assert not after.inventory.local_complete and not after.inventory.execution_fence
+        assert all(
+            row.lifecycle == "unknown" and row.stop_proof is row.continuity_proof is None
+            for row in backend.context_source_v2("conversation").contexts
+        )
+    finally:
+        if process.returncode is None:
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), 2)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+        for task in (delayed, closing):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (delayed, closing) if task is not None), return_exceptions=True
+        )
+        record_property("proof_kind", "scripted Codex RPC + real benign OS child")
+        record_property(
+            "owned_process",
+            json.dumps({"pid": process.pid, "pgid": pgid, "returncode": process.returncode}),
+        )
+        assert process.returncode is not None
 
 
 @pytest.mark.posix_only
