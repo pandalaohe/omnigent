@@ -1100,6 +1100,7 @@ def build_native_controls(
         current mode.
         """
         from omnigent.harnesses.claude_native.bridge import (
+            ClaudePermissionModeSwitchError,
             bridge_dir_for_bridge_id,
             set_permission_mode,
         )
@@ -1120,13 +1121,14 @@ def build_native_controls(
                 timeout_s=1.0,
             )
         except (RuntimeError, ValueError) as exc:
+            detail = _client_safe_error_detail(exc, context="claude-native permission mode change")
+            if isinstance(exc, ClaudePermissionModeSwitchError):
+                detail = exc.client_detail
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "claude_native_permission_mode_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="claude-native permission mode change"
-                    ),
+                    "detail": detail,
                 },
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})

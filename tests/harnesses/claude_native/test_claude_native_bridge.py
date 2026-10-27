@@ -6928,9 +6928,11 @@ def test_set_permission_mode_is_a_noop_when_already_in_target(
     assert fake.presses == 0, f"Expected no shift+tab presses, got {fake.presses}."
 
 
+@pytest.mark.parametrize("start", ["default", "acceptEdits", "plan"])
 def test_set_permission_mode_raises_when_target_not_in_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    start: str,
 ) -> None:
     """
     An unreachable mode fails loud instead of landing somewhere else.
@@ -6947,11 +6949,166 @@ def test_set_permission_mode_raises_when_target_not_in_cycle(
         tmux_target="claude:0.0",
     )
     # No ``auto`` in this session's cycle.
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"], start=start)
+
+    def run_and_observe(cmd: list[str], **kwargs: object) -> object:
+        result = fake.run(cmd, **kwargs)
+        if cmd[-1] == "BTab":
+            assert claude_native_bridge.read_pane_signals(bridge_dir).permission_mode is None
+        return result
+
+    monkeypatch.setattr("subprocess.run", run_and_observe)
+
+    with pytest.raises(
+        claude_native_bridge.ClaudePermissionModeSwitchError,
+        match="not available in this session's cycle",
+    ):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert fake.cycle[fake.index] == start
+    assert claude_native_bridge.read_pane_signals(bridge_dir).permission_mode == start
+
+
+def test_set_permission_mode_retries_a_dropped_first_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan", "auto"])
+    dropped = False
+
+    def run(cmd: list[str], **kwargs: object) -> object:
+        nonlocal dropped
+        if cmd[-1] == "BTab" and not dropped:
+            dropped = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return fake.run(cmd, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(claude_native_bridge, "_MODE_FOOTER_SETTLE_TIMEOUT_S", 0.0)
+
+    assert claude_native_bridge.set_permission_mode(bridge_dir, mode="auto") == "auto"
+    assert fake.cycle[fake.index] == "auto"
+
+
+@pytest.mark.parametrize("operation", ["send-keys", "capture-pane"])
+def test_set_permission_mode_restores_after_a_transient_tmux_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"], start="plan")
+    failed = False
+
+    def run(cmd: list[str], **kwargs: object) -> object:
+        nonlocal failed
+        if operation in cmd and fake.presses == 1 and not failed:
+            failed = True
+            return SimpleNamespace(returncode=1, stdout="", stderr="temporary failure")
+        return fake.run(cmd, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", run)
+
+    with pytest.raises(RuntimeError):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto")
+
+    assert failed
+    assert fake.cycle[fake.index] == "plan"
+
+
+def test_set_permission_mode_restores_after_search_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
     fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"])
     monkeypatch.setattr("subprocess.run", fake.run)
+    monkeypatch.setattr(claude_native_bridge, "_MODE_CYCLE_MAX_PRESSES", 2)
 
-    with pytest.raises(RuntimeError, match="not available in this session's cycle"):
+    with pytest.raises(claude_native_bridge.ClaudePermissionModeSwitchError):
         claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert fake.presses == 3
+    assert fake.cycle[fake.index] == "default"
+
+
+def test_set_permission_mode_reports_when_restoration_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"], start="plan")
+
+    def run(cmd: list[str], **kwargs: object) -> object:
+        if "send-keys" in cmd and fake.presses >= 1:
+            return SimpleNamespace(returncode=1, stdout="", stderr="terminal unavailable")
+        return fake.run(cmd, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(claude_native_bridge, "_MODE_CYCLE_MAX_PRESSES", 2)
+
+    with pytest.raises(
+        claude_native_bridge.ClaudePermissionModeSwitchError,
+        match="could not restore the previous permission mode",
+    ) as error:
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto")
+
+    assert "was retained" not in error.value.client_detail
+
+
+@pytest.mark.parametrize("surface", ["unreadable", "prompt"])
+def test_set_permission_mode_sends_no_more_keys_when_the_pane_becomes_unsafe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"], start="plan")
+
+    def run(cmd: list[str], **kwargs: object) -> object:
+        if surface == "unreadable" and "capture-pane" in cmd and fake.presses >= 1:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return fake.run(cmd, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(claude_native_bridge, "_MODE_FOOTER_SETTLE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(claude_native_bridge, "_MODE_CYCLE_MAX_PRESSES", 2)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_has_approval_wait",
+        lambda _: surface == "prompt" and fake.presses >= 1,
+    )
+    error = (
+        claude_native_bridge.ClaudeUserPromptPending
+        if surface == "prompt"
+        else claude_native_bridge.ClaudePermissionModeSwitchError
+    )
+    with pytest.raises(error):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto")
+
+    assert fake.presses == 1
+
+
+def test_set_permission_mode_retains_dont_ask_when_auto_may_be_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    fake = _FakeModeCycleTmux(["dontAsk", "default", "acceptEdits", "plan"], start="dontAsk")
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    with pytest.raises(claude_native_bridge.ClaudePermissionModeSwitchError):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert fake.presses == 0
+    assert fake.cycle[fake.index] == "dontAsk"
 
 
 @pytest.mark.parametrize(
