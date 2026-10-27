@@ -268,6 +268,9 @@ class ToolManager:
 
         for tool in (SysProjectSettingsReadTool(), SysProjectSettingsUpdateTool()):
             self._tools[tool.name()] = tool
+        from omnigent.tools.builtins.standing_pass import SysStandingPassTool
+
+        self._tools[SysStandingPassTool.name()] = SysStandingPassTool()
 
     def _register_scheduled_task_tools(self) -> None:
         """

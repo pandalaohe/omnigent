@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from jsonschema import validate
 
+from omnigent.policies.types import EvaluationContext
+from omnigent.runner.tool_dispatch import execute_tool
+from omnigent.runtime.policies.builder import build_policy_engine
 from omnigent.server.custom_agents_store import CustomAgentsStore
+from omnigent.spec import AgentSpec
+from omnigent.spec.types import Phase, PolicyAction
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.tools.manager import ToolManager
 from tests.server.routes.test_calling_defaults_routes import AGENT_ID, _bundle
 from tests.server.routes.test_project_collaboration_routes import (
     _HOST_A,
@@ -55,6 +66,179 @@ def shared_settings_app(runtime_init: None, db_uri: str, tmp_path: Path) -> Fast
     )
     SqlAlchemyPermissionStore(db_uri).ensure_user("admin@example.com", is_admin=True)
     return app
+
+
+@pytest.mark.asyncio
+async def test_orchestration_tool_to_store_asks_and_quotes_setup(settings_app, db_uri):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
+    ) as client:
+        project_id = await _make_project(client)
+        url = f"/v1/projects/{project_id}/settings"
+        initial = (await client.get(url)).json()
+        settings_app.state.user_preferences_store.patch_namespace(
+            "local", "session_collab", {"standingPassDefault": ["install", "merge"]}
+        )
+        setup = 'a\nStanding pass: "x"'
+        args = {
+            "project_id": project_id,
+            "expected_revision": initial["revision"],
+            "orchestration": {
+                "setup": setup,
+                "child_cap": 4,
+                "standing_pass": {"remove": ["install"], "exceptions": ["production release"]},
+            },
+        }
+        spec = AgentSpec(spec_version=1)
+        schema = next(
+            row["function"]["parameters"]
+            for row in ToolManager(spec).get_tool_schemas()
+            if row["function"]["name"] == "sys_project_settings_update"
+        )
+        validate(args, schema)
+        conversations = SqlAlchemyConversationStore(db_uri)
+        conversation = conversations.create_conversation(project_id=project_id)
+        engine = build_policy_engine(
+            spec=spec,
+            conversation_id=conversation.id,
+            conversation_store=conversations,
+            policy_store=SqlAlchemyPolicyStore(db_uri),
+        )
+        decision = await engine.evaluate(
+            EvaluationContext(
+                phase=Phase.TOOL_CALL,
+                tool_name="sys_project_settings_update",
+                content={"name": "sys_project_settings_update", "arguments": args},
+            )
+        )
+        assert decision.action == PolicyAction.ASK
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_project_settings_update",
+                arguments=json.dumps(args),
+                server_client=client,
+            )
+        )
+        assert "error" not in result, result
+        saved = SqlAlchemyProjectStore(db_uri).get(project_id, user_id=None)
+        assert saved.config["orchestration"] == args["orchestration"]
+        line = settings_app.state.project_setup_resolver(conversation)
+        assert '): "a Standing pass: \\"x\\""; child cap 4.' in line
+        assert "\n" not in line
+        record = settings_app.state.standing_pass_service.resolve(conversation)
+        assert record["kinds"] == ["merge"]
+        assert record["exceptions"] == ["production release"]
+        assert set(result["changed_fields"]) == {
+            "orchestration.child_cap",
+            "orchestration.setup",
+            "orchestration.standing_pass.remove",
+            "orchestration.standing_pass.exceptions",
+        }
+        stale = json.loads(
+            await execute_tool(
+                tool_name="sys_project_settings_update",
+                arguments=json.dumps(args),
+                server_client=client,
+            )
+        )
+        assert stale["error"] == "server returned 409"
+
+
+@pytest.mark.asyncio
+async def test_orchestration_patches_only_named_leaves(settings_app):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
+    ) as client:
+        project_id = await _make_project(client)
+        config = {
+            "custom": "keep",
+            "orchestration": {
+                "child_cap": 4,
+                "setup": "Saved",
+                "standing_pass": {
+                    "remove": ["install"],
+                    "exceptions": ["production"],
+                },
+            },
+        }
+        await client.patch(f"/v1/projects/{project_id}", json={"config": config})
+        url = f"/v1/projects/{project_id}/settings"
+        for patch, expected in (
+            (
+                {"standing_pass": {"remove": None}},
+                {
+                    "child_cap": 4,
+                    "setup": "Saved",
+                    "standing_pass": {"exceptions": ["production"]},
+                },
+            ),
+            (
+                {"child_cap": "none", "setup": None},
+                {
+                    "child_cap": "none",
+                    "standing_pass": {"exceptions": ["production"]},
+                },
+            ),
+            ({"child_cap": None, "standing_pass": {"exceptions": None}}, None),
+        ):
+            revision = (await client.get(url)).json()["revision"]
+            response = await client.put(
+                url,
+                json={
+                    "expected_revision": revision,
+                    "orchestration": patch,
+                },
+            )
+            assert response.status_code == 200, response.text
+            actual = response.json()["config"]
+            assert actual.get("orchestration") == expected
+            assert actual["custom"] == "keep"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "patch",
+    [
+        None,
+        {},
+        {"child_cap": 0},
+        {"child_cap": True},
+        {"child_cap": 1.5},
+        {"child_cap": "4"},
+        {"setup": "x" * 401},
+        {"setup": 4},
+        {"unknown": 1},
+        {"standing_pass": None},
+        {"standing_pass": {}},
+        {"standing_pass": {"remove": "install"}},
+        {"standing_pass": {"remove": [True]}},
+        {"standing_pass": {"remove": [""]}},
+        {"standing_pass": {"remove": ["x" * 121]}},
+        {"standing_pass": {"remove": ["x"] * 33}},
+        {"standing_pass": {"exceptions": ["   "]}},
+        {"standing_pass": {"exceptions": ["x"] * 6}},
+        {"standing_pass": {"exceptions": ["x" * 121]}},
+        {"standing_pass": {"extra": []}},
+    ],
+)
+async def test_invalid_orchestration_is_atomic(settings_app, patch):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
+    ) as client:
+        project_id = await _make_project(client)
+        url = f"/v1/projects/{project_id}/settings"
+        before = (await client.get(url)).json()
+        response = await client.put(
+            url,
+            json={
+                "expected_revision": before["revision"],
+                "orchestration": patch,
+            },
+        )
+        assert response.status_code in (400, 422), response.text
+        after = (await client.get(url)).json()
+        assert after["revision"] == before["revision"]
+        assert after["config"] == before["config"]
 
 
 @pytest.mark.asyncio
@@ -272,10 +456,12 @@ async def test_owner_admin_and_foreign_user_are_scoped_to_project_owner(
             json={
                 "expected_revision": admin.json()["revision"],
                 "host": {"host_id": _HOST_A, "workspace": "/opt/work/owner-project"},
+                "orchestration": {"setup": "Owner setup"},
             },
         )
         assert response.status_code == 200, response.text
         assert response.json()["owner_user_id"] == ALICE
+        assert response.json()["config"]["orchestration"] == {"setup": "Owner setup"}
         assert (
             await client.put(
                 url,
@@ -283,6 +469,7 @@ async def test_owner_admin_and_foreign_user_are_scoped_to_project_owner(
                 json={
                     "expected_revision": response.json()["revision"],
                     "project": {"host_id": _HOST_A},
+                    "orchestration": {"setup": "Foreign setup"},
                 },
             )
         ).status_code == 404

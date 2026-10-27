@@ -72,6 +72,11 @@ export interface ProjectConfig {
    * falls through the resolution chain to the user's master table.
    */
   calling_defaults?: Record<string, ProjectCallingDefaultsHost>;
+  orchestration?: {
+    child_cap?: number | "none";
+    setup?: string;
+    standing_pass?: { remove?: string[]; exceptions?: string[] };
+  };
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

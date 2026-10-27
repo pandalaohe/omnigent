@@ -105,6 +105,14 @@ _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
 _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
     _ASK_ON_ADD_POLICY_SPEC,
     _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC,
+    FunctionPolicySpec(
+        name="__ask_on_standing_pass_grant",
+        on=None,
+        function=FunctionRef(
+            path="omnigent.policies.builtins.safety.ask_on_standing_pass_grant",
+            arguments=None,
+        ),
+    ),
 )
 
 _INSTRUCTION_UPDATE_APPROVAL_SPEC = FunctionPolicySpec(
@@ -467,7 +475,12 @@ def any_policies_apply(
     # or the scheduled-task mutation tools.
     if phase == Phase.TOOL_CALL and (
         tool_name
-        in {"sys_add_policy", "sys_instruction_layer_update", "sys_project_settings_update"}
+        in {
+            "sys_add_policy",
+            "sys_instruction_layer_update",
+            "sys_project_settings_update",
+            "sys_standing_pass",
+        }
         or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
     ):
         return True

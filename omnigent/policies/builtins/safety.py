@@ -372,6 +372,23 @@ def ask_on_instruction_layer_update(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+def ask_on_standing_pass_grant(event: PolicyEvent) -> PolicyResponse:
+    """Ask for the exact delta before an agent widens its mother's pass."""
+    if event.get("type") != "tool_call" or event.get("target") != "sys_standing_pass":
+        return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    if not isinstance(args, dict) or args.get("op") != "grant":
+        return _ALLOW
+    return {
+        "result": "ASK",
+        "reason": (
+            "Grant these standing pass kinds for this mother session: "
+            f"{_json.dumps(args.get('kinds', []))}. Approve?"
+        ),
+    }
+
+
 def ask_on_project_settings_update(event: PolicyEvent) -> PolicyResponse:
     """Ask before an agent changes project defaults for future sessions."""
     if event.get("type") != "tool_call" or event.get("target") != "sys_project_settings_update":
@@ -929,6 +946,13 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "description": "Asks before changing Global Instructions. Enabled by default even without "
         "a stored policy. Add this default policy in Settings, then disable it to allow "
         "updates without this approval; admin authorization and revision checks still apply.",
+        "params_schema": None,
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.ask_on_standing_pass_grant",
+        "kind": "callable",
+        "name": "Standing Pass Grant Approval",
+        "description": "Requires approval of the exact standing pass kinds being granted.",
         "params_schema": None,
     },
     {

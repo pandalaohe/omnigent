@@ -24,6 +24,7 @@ export interface SessionCollabPreferences {
   childKeepWarmCodexIntervalSeconds: number;
   childKeepWarmMaxSeconds: number;
   childCap: number | null;
+  standingPassDefault: string[];
   quotaTightBelowPct: number;
   quotaLowBelowPct: number;
   quotaFloorPct: number | null;
@@ -82,6 +83,7 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   childKeepWarmCodexIntervalSeconds: 1500,
   childKeepWarmMaxSeconds: 28800,
   childCap: null,
+  standingPassDefault: [],
   quotaTightBelowPct: 50,
   quotaLowBelowPct: 20,
   quotaFloorPct: null,
@@ -171,6 +173,19 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
       typeof raw.childCap === "number" && Number.isSafeInteger(raw.childCap) && raw.childCap >= 1
         ? raw.childCap
         : null,
+    standingPassDefault:
+      Array.isArray(raw.standingPassDefault) &&
+      raw.standingPassDefault.length <= 32 &&
+      raw.standingPassDefault.every(
+        (kind: unknown) =>
+          typeof kind === "string" && kind.trim().length > 0 && [...kind].length <= 120,
+      )
+        ? [
+            ...new Set(
+              (raw.standingPassDefault as string[]).map((kind) => kind.trim().replace(/\s+/g, " ")),
+            ),
+          ]
+        : [],
     quotaTightBelowPct: validThresholds ? tight : SESSION_COLLAB_DEFAULTS.quotaTightBelowPct,
     quotaLowBelowPct: validThresholds ? low : SESSION_COLLAB_DEFAULTS.quotaLowBelowPct,
     quotaFloorPct: normalizePercentage(raw.quotaFloorPct, 0, 100),
@@ -182,9 +197,11 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
 export function isSessionCollabPreferencesDefault(preferences: SessionCollabPreferences): boolean {
   return (Object.keys(SESSION_COLLAB_DEFAULTS) as (keyof SessionCollabPreferences)[]).every(
     (key) =>
-      key === "quotaPeriods"
-        ? Object.keys(preferences.quotaPeriods).length === 0
-        : preferences[key] === SESSION_COLLAB_DEFAULTS[key],
+      key === "standingPassDefault"
+        ? preferences.standingPassDefault.length === 0
+        : key === "quotaPeriods"
+          ? Object.keys(preferences.quotaPeriods).length === 0
+          : preferences[key] === SESSION_COLLAB_DEFAULTS[key],
   );
 }
 

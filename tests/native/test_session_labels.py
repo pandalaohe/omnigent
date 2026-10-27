@@ -28,6 +28,8 @@ from omnigent.server.routes._sessions.helpers import (
         "omnigent.side_chat.source_id",
         "omnigent.git.worktree_root_sha256",
         "omnigent.turn_actor",
+        "omnigent.standing_pass",
+        "omnigent.standing_pass.0",
         "omnigent.archive_locked",
         "omnigent.archived_at",
         "omnigent.archive_stop_when_idle",

@@ -1753,7 +1753,21 @@ def create_app(
     agent_quota_service = AgentQuotaService(
         conversation_store, permission_store, user_preferences_store, host_registry, host_store
     )
+    from omnigent.server.standing_pass import StandingPassService
+
+    standing_pass_service = StandingPassService(
+        conversation_store, permission_store, user_preferences_store, project_store
+    )
     from omnigent.entities import Conversation
+    from omnigent.server.instruction_layers import project_setup_line
+
+    project_setup_resolver = partial(
+        project_setup_line,
+        project_store=project_store,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        prefs_store=user_preferences_store,
+    )
     from omnigent.server.startup_admission import active_startup_attempt
     from omnigent.startup_protocol import StartupAttemptRef
 
@@ -1766,6 +1780,8 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
         quota_resolver=agent_quota_service.line,
+        setup_resolver=project_setup_resolver,
+        standing_pass_resolver=standing_pass_service.line,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -2253,6 +2269,7 @@ def create_app(
     app.state.archive_close_coordinator = archive_close_coordinator
     app.state.cli_release_intent_store = cli_release_intent_store
     app.state.runner_session_initializer = runner_session_initializer
+    app.state.project_setup_resolver = project_setup_resolver
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     from omnigent.server.startup_inputs import ManagedStartupInputs, StartupDispatch
@@ -2309,6 +2326,7 @@ def create_app(
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
     app.state.user_preferences_store = user_preferences_store
+    app.state.standing_pass_service = standing_pass_service
     app.state.agent_quota_service = agent_quota_service
     app.include_router(
         create_agent_quota_router(

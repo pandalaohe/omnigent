@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.conversation_store import ConversationStore
     from omnigent.stores.permission_store import PermissionStore
+    from omnigent.stores.project_store import ProjectStore
 
 CHILD_CAP_LABEL_KEY = "omnigent.child_cap"
 _T = TypeVar("_T")
@@ -48,14 +49,28 @@ def child_cap_for(
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
     prefs_store: SqlAlchemyUserPreferencesStore | None,
-) -> tuple[int | None, Literal["session", "user", "none"]]:
-    """Resolve the parent's explicit limit before its root owner's preference."""
+    project_store: ProjectStore | None = None,
+) -> tuple[int | None, Literal["session", "project", "user", "none"]]:
+    """Resolve the session override, project setting, then root owner's preference."""
     label = parent.labels.get(CHILD_CAP_LABEL_KEY)
     if label == "none":
         return None, "session"
     if label is not None and label.isdecimal() and int(label) > 0:
         return int(label), "session"
     owner = collab_owner_for(parent, conversation_store, permission_store)
+    if project_store is not None and parent.project_id is not None:
+        from omnigent.server.routes.sessions.routes_peer import effective_owner_id
+
+        project = project_store.get(
+            parent.project_id,
+            user_id=effective_owner_id(parent, conversation_store, permission_store),
+        )
+        orchestration = project.config.get("orchestration") if project is not None else None
+        cap = orchestration.get("child_cap") if isinstance(orchestration, dict) else None
+        if cap == "none":
+            return None, "project"
+        if type(cap) is int and cap > 0:
+            return cap, "project"
     cap = read_collab_settings(prefs_store, owner).child_cap
     if type(cap) is int and cap > 0:
         return cap, "user"

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import StatementError
 
@@ -21,6 +24,46 @@ from omnigent.runtime.instruction_layers import (
 )
 from omnigent.spec import AgentSpec
 from omnigent.stores.global_instructions_store import GlobalInstructionsStore
+
+if TYPE_CHECKING:
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+    from omnigent.stores.conversation_store import ConversationStore
+    from omnigent.stores.permission_store import PermissionStore
+    from omnigent.stores.project_store import ProjectStore
+
+
+def project_setup_line(
+    conversation: Conversation,
+    *,
+    project_store: ProjectStore | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    prefs_store: SqlAlchemyUserPreferencesStore | None,
+) -> str:
+    """Quote saved project setup as one runtime line, scoped to the session owner."""
+    from omnigent.server.child_cap import child_cap_for
+    from omnigent.server.routes.sessions.routes_peer import effective_owner_id
+
+    if project_store is None or conversation.project_id is None:
+        return ""
+    project = project_store.get(
+        conversation.project_id,
+        user_id=effective_owner_id(conversation, conversation_store, permission_store),
+    )
+    orchestration = project.config.get("orchestration") if project is not None else None
+    setup = orchestration.get("setup") if isinstance(orchestration, dict) else None
+    if project is None or not isinstance(setup, str) or not setup.strip():
+        return ""
+    cap, _ = child_cap_for(
+        conversation, conversation_store, permission_store, prefs_store, project_store
+    )
+    date = datetime.fromtimestamp(project.updated_at or project.created_at, UTC).date()
+    quoted = json.dumps(" ".join(setup.split()), ensure_ascii=False)
+    return (
+        f"Saved setup for this project ({date}): {quoted}; child cap "
+        f"{cap if cap is not None else 'none'}. State it in your first reply; "
+        "change it only on the user's word."
+    )
 
 
 @dataclass(frozen=True)
@@ -93,6 +136,7 @@ def route_session_text(
     has_parent: bool,
     quota_line: str = "",
     quota_resolver: Callable[[], str] | None = None,
+    setup_line: str = "",
 ) -> str | None:
     """Compose user layers and the exclusive role without changing the runner envelope."""
     role = "child" if has_parent else "mother" if route.spawn else None
@@ -113,6 +157,8 @@ def route_session_text(
         child_text=role_text if role == "child" else "",
         quota_line=quota_line,
     )
+    if role == "mother" and setup_line:
+        result = f"{result}\n\n{setup_line}" if result else setup_line
     return result or None
 
 
@@ -120,17 +166,36 @@ async def session_instructions_text(
     conversation: Conversation,
     *,
     quota_resolver: Callable[[Conversation], str] | None = None,
+    setup_resolver: Callable[[Conversation], str] | None = None,
+    standing_pass_resolver: Callable[[Conversation], str] | None = None,
 ) -> str | None:
     """Return the newly initialized session's route text, or no injection if disabled."""
     store = get_global_instructions_store()
-    if store is None:
-        return None
-    route = await resolve_instruction_route(conversation)
-
-    return await asyncio.to_thread(
-        route_session_text,
-        store,
-        route,
-        has_parent=conversation.parent_conversation_id is not None,
-        quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
+    text = None
+    if store is not None or setup_resolver is not None:
+        route = await resolve_instruction_route(conversation)
+        setup_line = (
+            await asyncio.to_thread(setup_resolver, conversation)
+            if setup_resolver is not None
+            and route.spawn
+            and conversation.parent_conversation_id is None
+            else ""
+        )
+        text = (
+            await asyncio.to_thread(
+                route_session_text,
+                store,
+                route,
+                has_parent=conversation.parent_conversation_id is not None,
+                quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
+                setup_line=setup_line,
+            )
+            if store is not None
+            else setup_line or None
+        )
+    pass_line = (
+        await asyncio.to_thread(standing_pass_resolver, conversation)
+        if standing_pass_resolver is not None
+        else ""
     )
+    return "\n\n".join(part for part in (text, pass_line) if part) or None

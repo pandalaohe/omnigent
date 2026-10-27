@@ -16,7 +16,8 @@ class SysProjectSettingsReadTool(Tool):
             "Read one project's saved and effective session defaults, their sources, revision, "
             "available host/harness/model/mode choices, and catalog freshness. Use this before "
             "setting up project defaults. Reads do not run entry templates or setup hooks. "
-            "Defaults apply to future sessions; existing sessions keep their current settings."
+            "Calling defaults apply to future sessions. The config also includes saved project "
+            "orchestration: child cap, mother setup, and standing-pass removals and exceptions."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -50,11 +51,16 @@ class SysProjectSettingsUpdateTool(Tool):
             "Set one project's future-session defaults after sys_project_settings_read. Pass its "
             "revision as expected_revision. Name leaves to change: project host_id, agent_id, "
             "model; or a host's workspace, agent_id and harness model, effort, speed, permission. "
+            "Orchestration leaves: child_cap (positive integer or 'none'), setup (up to 400 "
+            "characters), standing_pass.remove (up to 32 kinds) and standing_pass.exceptions "
+            "(up to five exceptions), each a nonblank string of at most 120 characters. "
+            "Setup applies at mother initialization; child caps are "
+            "read on subsequent child creates. "
             "Null removes only that override. A new entry may initialize its Agent from the "
             "owner's template; an online entry change runs the setup hook after saving. Hook "
             "failure is a persisted-settings warning; unchanged entries do not rerun hooks. "
-            "Requires owner or admin access and user approval by default. Existing sessions "
-            "are unchanged; permission defaults cannot change this call's approval."
+            "Requires owner or admin access and user approval by default. Calling defaults "
+            "leave existing sessions unchanged; they cannot change this call's approval."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -74,6 +80,46 @@ class SysProjectSettingsUpdateTool(Tool):
                     "properties": {
                         "project_id": {"type": "string"},
                         "expected_revision": {"type": "string"},
+                        "orchestration": {
+                            "type": "object",
+                            "properties": {
+                                "child_cap": {
+                                    "anyOf": [
+                                        {"type": "integer", "minimum": 1},
+                                        {"type": "string", "enum": ["none"]},
+                                        {"type": "null"},
+                                    ]
+                                },
+                                "setup": {"type": ["string", "null"], "maxLength": 400},
+                                "standing_pass": {
+                                    "type": "object",
+                                    "properties": {
+                                        "remove": {
+                                            "type": ["array", "null"],
+                                            "maxItems": 32,
+                                            "items": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 120,
+                                                "pattern": r"\S",
+                                            },
+                                        },
+                                        "exceptions": {
+                                            "type": ["array", "null"],
+                                            "maxItems": 5,
+                                            "items": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 120,
+                                                "pattern": r"\S",
+                                            },
+                                        },
+                                    },
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
                         "project": {
                             "type": "object",
                             "properties": {

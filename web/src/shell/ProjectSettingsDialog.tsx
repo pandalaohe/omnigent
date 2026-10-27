@@ -7,6 +7,7 @@ import { ChevronDownIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
+import { ProjectOrchestrationView } from "@/components/ProjectOrchestrationView";
 import { PickerShell } from "@/components/PickerShell";
 import { SelectionList, type PickerItem } from "@/components/SelectionList";
 import { resolveMulti, summarizeMulti, type MultiValue } from "@/lib/multiSelection";
@@ -2684,6 +2685,9 @@ export function ProjectSettingsDialog({
           </div>
 
           {!isRealProject && worktreeFields}
+          {isRealProject && !isLoading && !loadFailed && (
+            <ProjectOrchestrationView orchestration={stored?.orchestration} />
+          )}
         </form>
         {projectId !== null && (
           <div

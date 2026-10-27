@@ -48,6 +48,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     ROTATE_REQUESTED_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
+    SUCCEEDS_LABEL_KEY,
     ConversationStore,
     SuccessionRefusedError,
 )
@@ -84,7 +85,9 @@ def _fresh_pi_launch_args(args: list[str] | None) -> list[str] | None:
     return kept
 
 
-def _successor_labels(source: Conversation, harness: str, tier: PermissionTier) -> dict[str, str]:
+def _successor_labels(
+    source: Conversation, harness: str, tier: PermissionTier | None
+) -> dict[str, str]:
     """Copy configuration labels only; mint fresh permission authority."""
     retained = {
         key: value
@@ -94,7 +97,18 @@ def _successor_labels(source: Conversation, harness: str, tier: PermissionTier) 
         or key.startswith(MCP_SELECTION_PREFIX)
         or not key.startswith(("omnigent.", "omnigent:", "cost_control."))
     }
-    retained.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
+    if harness in {"codex-native", "claude-native"}:
+        from omnigent.native._native_session_labels import replacement_session_labels
+
+        retained = replacement_session_labels(source.labels)
+        bridge_key = (
+            "omnigent.codex_native.bridge_id"
+            if harness == "codex-native"
+            else "omnigent.claude_native.bridge_id"
+        )
+        retained[bridge_key] = source.labels.get(bridge_key, source.id)
+    if tier is not None:
+        retained.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
     return retained
 
 
@@ -131,7 +145,7 @@ def register_succession_routes(
 
     @router.post("/sessions/{session_id}/successor", status_code=200, response_model=None)
     async def create_session_successor(request: Request, session_id: str) -> dict[str, str]:
-        """Create or recover one server-configured successor for a Pi session."""
+        """Create or recover a successor before its runner can initialize it."""
         user_id = _get_user_id(request, auth_provider)
         source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if source is None:
@@ -149,22 +163,34 @@ def register_succession_routes(
                 code=ErrorCode.CONFLICT,
             )
         harness = await asyncio.to_thread(_resolve_harness, source, agent_store=agent_store)
-        if harness not in {"pi", "pi-native"}:
-            raise OmnigentError("Successor requires a Pi session", code=ErrorCode.CONFLICT)
-        try:
-            permission = read_permission_state(source.labels, harness=harness)
-        except ValueError as exc:
+        if harness is None or harness not in _ROTATION_NATIVE_HARNESSES:
             raise OmnigentError(
-                f"Source permission state requires recovery: {exc}", code=ErrorCode.CONFLICT
-            ) from exc
-        if permission.status != "ready":
-            raise OmnigentError("Source permission state is not ready", code=ErrorCode.CONFLICT)
+                "Harness does not support session succession", code=ErrorCode.CONFLICT
+            )
+        tier = None
+        if harness in {"pi", "pi-native"}:
+            try:
+                permission = read_permission_state(source.labels, harness=harness)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"Source permission state requires recovery: {exc}", code=ErrorCode.CONFLICT
+                ) from exc
+            if permission.status != "ready":
+                raise OmnigentError(
+                    "Source permission state is not ready", code=ErrorCode.CONFLICT
+                )
+            tier = permission.tier
+        await asyncio.to_thread(request.app.state.standing_pass_service.resolve, source)
         try:
             successor = await asyncio.to_thread(
                 conversation_store.create_session_successor,
                 source,
-                initial_labels=_successor_labels(source, harness, permission.tier),
-                terminal_launch_args=_fresh_pi_launch_args(source.terminal_launch_args),
+                initial_labels=_successor_labels(source, harness, tier),
+                terminal_launch_args=(
+                    _fresh_pi_launch_args(source.terminal_launch_args)
+                    if harness in {"pi", "pi-native"}
+                    else None
+                ),
             )
         except SuccessionRefusedError as exc:
             raise OmnigentError(f"Successor refused: {exc}", code=ErrorCode.CONFLICT) from exc
@@ -289,7 +315,8 @@ def register_succession_routes(
 
         The caller must hold edit access on both sessions. A session without
         a parent and without live children is a ``noop``, unless ``allow_empty``
-        requests retirement. Undo is the same call reversed: when the
+        requests retirement or the server already prepared this successor.
+        Undo is the same call reversed: when the
         target still points back at the caller via ``omnigent.succeeded_by``,
         the move transaction clears the forward pair and writes the inverse.
         """
@@ -336,7 +363,10 @@ def register_succession_routes(
                     target_id,
                     receipt_id,
                     reverse_of=reverse_of,
-                    allow_empty=body.allow_empty,
+                    allow_empty=(
+                        body.allow_empty
+                        or target_conversation.labels.get(SUCCEEDS_LABEL_KEY) == session_id
+                    ),
                 )
             except SuccessionRefusedError as exc:
                 if exc.code == "already_succeeded":

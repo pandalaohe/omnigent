@@ -24,7 +24,110 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import build_agent_bundle, create_test_agent
+from tests.server.routes.test_project_collaboration_routes import _build_app
+
+
+async def test_project_cap_at_create_boundary(runtime_init, db_uri, tmp_path):
+    app = _build_app(db_uri, tmp_path, preferences=True)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _exercise_project_cap(client, db_uri)
+
+
+async def _exercise_project_cap(client, db_uri):
+    agent = await create_test_agent(client)
+    parent_id = agent["_session_id"]
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(
+        "a" * 32, "Project cap", None, config={"orchestration": {"child_cap": 4}}
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_conversation_project(parent_id, project.id)
+    path = f"/v1/sessions/{parent_id}/child-cap"
+    assert (await client.get(path)).json() == {"cap": 4, "source": "project", "open_children": 0}
+    prefs.patch_namespace(RESERVED_USER_LOCAL, "session_collab", {"childCap": 2})
+    assert (await client.get(path)).json()["cap"] == 4
+    body = {"agent_id": agent["id"], "parent_session_id": parent_id}
+    headers = {CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+    for _ in range(4):
+        response = await client.post("/v1/sessions", json=body, headers=headers)
+        assert response.status_code == 201, response.text
+    refused = await client.post("/v1/sessions", json=body, headers=headers)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "child_cap"
+    store.set_labels(parent_id, {CHILD_CAP_LABEL_KEY: "5"})
+    assert (await client.get(path)).json()["source"] == "session"
+    assert (await client.get(path)).json()["cap"] == 5
+    store.set_labels(parent_id, {CHILD_CAP_LABEL_KEY: "none"})
+    assert (await client.get(path)).json()["cap"] is None
+    store.delete_label(parent_id, CHILD_CAP_LABEL_KEY)
+    projects.update(project.id, user_id=None, config={"orchestration": {"child_cap": "none"}})
+    unlimited = (await client.get(path)).json()
+    assert (unlimited["cap"], unlimited["source"]) == (None, "project")
+    projects.update(project.id, user_id=None, config={})
+    inherited = (await client.get(path)).json()
+    assert (inherited["cap"], inherited["source"]) == (2, "user")
+
+
+def test_project_orchestration_reads_only_the_session_owners_project(db_uri):
+    from omnigent.server.child_cap import child_cap_for
+    from omnigent.server.instruction_layers import project_setup_line
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(
+        "a" * 32,
+        "Private setup",
+        "alice@example.test",
+        config={"orchestration": {"child_cap": 2, "setup": "Alice setup"}},
+    )
+    parent = conversations.create_conversation(project_id=project.id)
+    permissions.grant("alice@example.test", parent.id, LEVEL_OWNER)
+    assert child_cap_for(parent, conversations, permissions, None, projects) == (2, "project")
+    assert "Alice setup" in project_setup_line(
+        parent,
+        project_store=projects,
+        conversation_store=conversations,
+        permission_store=permissions,
+        prefs_store=None,
+    )
+    permissions.revoke("alice@example.test", parent.id)
+    permissions.grant("bob@example.test", parent.id, LEVEL_OWNER)
+    assert child_cap_for(parent, conversations, permissions, None, projects) == (None, "none")
+    assert (
+        project_setup_line(
+            parent,
+            project_store=projects,
+            conversation_store=conversations,
+            permission_store=permissions,
+            prefs_store=None,
+        )
+        == ""
+    )
+    permissions.revoke("bob@example.test", parent.id)
+    local_project = projects.create(
+        "b" * 32,
+        "Local setup",
+        None,
+        config={"orchestration": {"child_cap": 3, "setup": "Local setup"}},
+    )
+    conversations.set_conversation_project(parent.id, local_project.id)
+    parent = conversations.get_conversation(parent.id)
+    assert child_cap_for(parent, conversations, permissions, None, projects) == (3, "project")
+    assert "Local setup" in project_setup_line(
+        parent,
+        project_store=projects,
+        conversation_store=conversations,
+        permission_store=permissions,
+        prefs_store=None,
+    )
 
 
 async def test_cap_precedence_validation_and_user_exemption(

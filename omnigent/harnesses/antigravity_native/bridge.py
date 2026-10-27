@@ -371,6 +371,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_policy_registry",
     "sys_project_settings_read",
     "sys_project_settings_update",
+    "sys_standing_pass",
     "sys_read_inbox",
     "sys_scheduled_task_create",
     "sys_scheduled_task_delete",

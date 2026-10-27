@@ -62,8 +62,17 @@ async def test_project_update_approval_default_can_be_changed_only_by_admin_poli
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "orchestration",
+    [
+        {"setup": "Saved"},
+        {"child_cap": None},
+        {"standing_pass": {"remove": None}},
+        {"standing_pass": {"exceptions": ["production release"]}},
+    ],
+)
 async def test_child_and_session_disabled_policy_cannot_remove_default_ask(
-    conversation_store, db_uri
+    conversation_store, db_uri, orchestration
 ):
     root = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
@@ -83,7 +92,7 @@ async def test_child_and_session_disabled_policy_cannot_remove_default_ask(
             tool_name="sys_project_settings_update",
             content={
                 "name": "different_transformed_name",
-                "arguments": {"project_id": "project-a"},
+                "arguments": {"project_id": "project-a", "orchestration": orchestration},
             },
         )
     )

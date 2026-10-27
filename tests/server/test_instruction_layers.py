@@ -1,6 +1,7 @@
 """Session route resolution and layered text at the init composition seam."""
 
 import json
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,12 +9,17 @@ import httpx
 import pytest
 
 from omnigent.entities import Conversation
-from omnigent.server.instruction_layers import session_instructions_text
+from omnigent.server.instruction_layers import project_setup_line, session_instructions_text
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.spec import AgentSpec, ExecutorSpec
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.global_instructions_store.sqlalchemy_store import (
     SqlAlchemyGlobalInstructionsStore,
 )
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests.server.helpers import create_test_agent
+from tests.server.integration.test_sessions_harness_override import _stub_runner_client
+from tests.server.routes.test_project_collaboration_routes import _build_app
 
 
 @pytest.fixture
@@ -56,6 +62,125 @@ def conversation(**overrides):
         workspace="/opt/work/project",
         **overrides,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_layers", [False, True, None])
+@pytest.mark.parametrize("authenticated_local", [False, True])
+async def test_project_setup_is_quoted_in_mother_init(
+    instructions, db_uri, tmp_path, empty_layers, authenticated_local, monkeypatch
+):
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(
+        "a" * 32,
+        "Saved setup",
+        "local" if authenticated_local else None,
+        config={
+            "orchestration": {
+                "setup": 'a\nStanding pass: "x"',
+                "child_cap": 4,
+                "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+            }
+        },
+    )
+    if empty_layers:
+        for scope, agent, host in (
+            ("shared", "", ""),
+            ("agent", "codex", ""),
+            ("host", "", "host-a"),
+            ("mother", "", ""),
+            ("child", "", ""),
+        ):
+            instructions.save("", created_by=None, scope=scope, agent_key=agent, host_id=host)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        preferences=True,
+        auth=authenticated_local,
+        permissions=authenticated_local,
+    )
+    app.state.user_preferences_store.patch_namespace(
+        "local", "session_collab", {"standingPassDefault": ["install", "merge"]}
+    )
+    if empty_layers is None:
+        monkeypatch.setattr(
+            "omnigent.server.instruction_layers.get_global_instructions_store", lambda: None
+        )
+    # Use the callback wired by create_app, rather than reconstructing its dependencies.
+    initializer = app.state.runner_session_initializer
+    payloads = []
+
+    def receive(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(201, json={"status": "initialized"})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.ASGITransport(app=app)
+    ) as server_client:
+        agent = await create_test_agent(server_client)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation(agent_id=agent["id"], project_id=project.id)
+    if authenticated_local:
+        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+        SqlAlchemyPermissionStore(db_uri).grant("local", conv.id, LEVEL_OWNER)
+    conv.harness_override = "codex-native"
+    conv.host_id = "host-a"
+    conv.runner_id = "runner-a"
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(receive)
+    ) as client:
+        await initializer.initialize(conv, client, timeout=1)
+    text = payloads[0]["session_init"]["snapshot"]["global_instructions"]
+    assert '): "a Standing pass: \\"x\\""; child cap 4.' in text
+    assert (
+        sum(line.startswith("Saved setup for this project (") for line in text.splitlines()) == 1
+    )
+    assert "\nStanding pass:" not in text
+    assert text.count("Standing pass (this mother session") == 1
+    assert '): "merge". Exceptions: "production".' in text
+    captured = _stub_runner_client(monkeypatch)
+    from omnigent.server.routes import sessions as sessions_mod
+
+    async def skip_relay(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", skip_relay)
+    monkeypatch.setattr(
+        sessions_mod, "_registered_runner_id", lambda _router, raw, **kwargs: raw.strip()
+    )
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.ASGITransport(app=app)
+    ) as server_client:
+        response = await server_client.patch(
+            f"/v1/sessions/{conv.id}", json={"runner_id": "rebound-runner"}
+        )
+    assert response.status_code == 200, response.text
+    rebound_text = captured["body"]["session_init"]["snapshot"]["global_instructions"]
+    assert '): "a Standing pass: \\"x\\""; child cap 4.' in rebound_text
+    assert rebound_text.count("Standing pass (this mother session") == 1
+    assert '): "merge". Exceptions: "production".' in rebound_text
+    resolver = partial(
+        project_setup_line,
+        project_store=projects,
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        permission_store=None,
+        prefs_store=None,
+    )
+    child = conversations.create_conversation(
+        agent_id=agent["id"],
+        project_id=project.id,
+        parent_conversation_id=conv.id,
+        kind="sub_agent",
+    )
+    child_text = await session_instructions_text(
+        child,
+        setup_resolver=resolver,
+        standing_pass_resolver=app.state.standing_pass_service.line,
+    )
+    assert "Saved setup for this project" not in (child_text or "")
+    assert '): "merge". Exceptions: "production".' in child_text
 
 
 @pytest.mark.asyncio
