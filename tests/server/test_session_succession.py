@@ -1135,6 +1135,41 @@ async def test_child_only_runner_failure_does_not_block_opening(
     assert any(url.endswith("/succession/release") for url, _ in runner.posts)
 
 
+@pytest.mark.parametrize("status", ["running", "waiting", "idle", "offline", "unbound"])
+async def test_opening_lists_each_child_state(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    old = _create(store, title="mother")
+    new = _create(store, title="successor")
+    if status == "unbound":
+        child = store.create_conversation(parent_conversation_id=old, title="worker").id
+    else:
+        child = _create(store, parent=old, title="worker", runner_id=RUNNER_ID_B)
+        store.set_session_live_status(child, status if status != "offline" else "running")
+
+    async def resolve(_id: str, _router: Any, *, conversation: Any) -> Any:
+        if conversation.id == child and status in {"offline", "unbound"}:
+            return None
+        return runner
+
+    monkeypatch.setattr(succession_module, "_get_runner_client", resolve)
+    response = await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+    assert response.json()["status"] == "done", response.text
+    text = store.get_succession(old, new).opening["text"]
+    expected = (
+        "runner offline — send a message to restart it"
+        if status in {"offline", "unbound"}
+        else "running"
+        if status == "waiting"
+        else status
+    )
+    assert f"- {child}: worker ({expected})" in text
+
+
 @pytest.mark.parametrize("shared_owner", [False, True])
 async def test_non_successor_runner_409_or_shared_owner_is_never_deferred(
     client: httpx.AsyncClient,

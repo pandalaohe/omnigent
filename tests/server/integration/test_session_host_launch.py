@@ -1143,7 +1143,11 @@ async def test_inline_launch_rejects_bad_workspace(
 
 
 async def _inline_launch_session(
-    client: httpx.AsyncClient, comm: ApplicationCommunicator, *, harness: str | None = None
+    client: httpx.AsyncClient,
+    comm: ApplicationCommunicator,
+    *,
+    harness: str | None = None,
+    parent_session_id: str | None = None,
 ) -> dict[str, str]:
     """Inline-launch a host-bound session and return its id + runner_id.
 
@@ -1155,6 +1159,7 @@ async def _inline_launch_session(
     :param client: Test HTTP client bound to the host-wired app.
     :param comm: Connected host communicator.
     :param harness: Optional native harness for the uploaded agent.
+    :param parent_session_id: Optional mother for an independent child session.
     :returns: ``{"id": <session id>, "runner_id": <token-bound id>}``.
     """
     executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
@@ -1162,7 +1167,12 @@ async def _inline_launch_session(
     launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     create_resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            **({"parent_session_id": parent_session_id} if parent_session_id else {}),
+        },
     )
     await launch_responder
     assert create_resp.status_code == 201, create_resp.text
@@ -2470,11 +2480,13 @@ async def test_host_reports_runner_unknown_skips_connect_grace(
     assert launch_frame.binding_token, "relaunch frame should carry a fresh binding token"
 
 
+@pytest.mark.parametrize("as_child", [False, True])
 async def test_host_session_message_relaunches_offline_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    as_child: bool,
 ) -> None:
     """A message to a host session whose runner is offline (but NOT
     deliberately stopped) asks the host to launch a fresh runner.
@@ -2500,7 +2512,8 @@ async def test_host_session_message_relaunches_offline_runner(
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
 
     comm = await _connect_host(app)
-    session = await _inline_launch_session(client, comm)
+    parent_id = SqlAlchemyConversationStore(db_uri).create_conversation().id if as_child else None
+    session = await _inline_launch_session(client, comm, parent_session_id=parent_id)
     session_id = session["id"]
     original_runner_id = session["runner_id"]
 
@@ -2524,6 +2537,9 @@ async def test_host_session_message_relaunches_offline_runner(
         # route's 30s wait-for-runner loop, so a small budget suffices;
         # None means no relaunch fired.
         launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
+        if launch_frame is None and post_task.done():
+            response = post_task.result()
+            pytest.fail(f"No host launch; send returned {response.status_code}: {response.text}")
     finally:
         # We never connect a runner, so the route would otherwise block
         # ~30s in its wait loop. Cancel now that we've observed (or missed)
