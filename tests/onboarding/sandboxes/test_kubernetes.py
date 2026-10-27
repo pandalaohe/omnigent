@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import types
@@ -119,12 +120,16 @@ def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> No
     assert init[0]["name"] == "workspace-prep"
     script = init[0]["command"][2]
     assert "mkdir -p /home/omnigent/workspace" in script
-    assert "git clone --branch main --single-branch -- " in script
+    assert (
+        "python3 -I -m omnigent.git_commands -- clone --branch main --single-branch -- " in script
+    )
     assert "https://github.com/org/repo.git /home/omnigent/workspace/repo" in script
     # The per-user broker is wired before the clone, and the init container gets
     # the launch token (secretKeyRef) so it can reach the broker.
     assert "configure_clone_credentials" in script
-    assert script.index("configure_clone_credentials") < script.index("git clone")
+    assert script.index("configure_clone_credentials") < script.index(
+        "python3 -I -m omnigent.git_commands -- clone"
+    )
     init_env = init[0]["env"]
     assert any(
         e["name"] == "OMNIGENT_HOST_TOKEN" and "secretKeyRef" in e.get("valueFrom", {})
@@ -227,6 +232,20 @@ import sys
 args = sys.argv[1:]
 with Path(os.environ["ARGV_LOG"]).open("a") as handle:
     handle.write(json.dumps(args) + "\\n")
+if args[:1] == ["--no-pager"]:
+    args = args[1:]
+if "--get-regexp" in args:
+    if "--global" not in args:
+        raise SystemExit(1)
+    path = Path(os.environ.get("GIT_CONFIG_GLOBAL", Path(os.environ["HOME"]) / ".gitconfig"))
+    records = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            config_args = json.loads(line)
+            if len(config_args) >= 3:
+                records.append(config_args[1] + "\\n" + config_args[-1] + "\\0")
+    sys.stdout.write("".join(records))
+    raise SystemExit(0 if records else 1)
 if args[:3] == ["config", "--global", "--get-all"]:
     path = Path(os.environ["GIT_CONFIG_GLOBAL"])
     key = args[3]
@@ -329,7 +348,7 @@ PY
         capture_output=True,
         text=True,
         env=os.environ.copy(),
-        cwd=cwd,
+        cwd=cwd or tmp_path,
     )
     argv = [
         json.loads(line)
@@ -462,12 +481,50 @@ def test_credential_python_ignores_pythonpath_package_shadow(
     assert not marker.exists()
 
 
+def _install_clone_git_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep config/discovery real while replacing network clone with an empty repo."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fake_bin = tmp_path / "clone-bin"
+    fake_bin.mkdir()
+    executable = fake_bin / "git"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        + "import os, subprocess, sys\nfrom pathlib import Path\n"
+        + f"real_git = {real_git!r}\n"
+        + "args = sys.argv[1:]\n"
+        + 'if args[:1] != ["clone"]:\n'
+        + "    os.execv(real_git, [real_git, *args])\n"
+        + 'if os.environ.get("CLONE_LOG"):\n'
+        + '    with Path(os.environ["CLONE_LOG"]).open("a") as handle:\n'
+        + '        handle.write(" ".join(args) + "\\n")\n'
+        + "target = Path(args[-1])\n"
+        + "clean_env = {k: v for k, v in os.environ.items() if k not in "
+        + '{"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"}}\n'
+        + 'subprocess.run([real_git, "init", "-b", "main", str(target)], '
+        + "check=True, env=clean_env)\n"
+        + 'if os.environ.get("RACE_TARGET"):\n'
+        + '    foreign = Path(os.environ["RACE_TARGET"]) / ".git"\n'
+        + "    foreign.mkdir(parents=True)\n"
+        + '    (foreign / "HEAD").write_text("foreign\\n")\n'
+    )
+    executable.chmod(0o755)
+    # The generated module entry must use this checkout's installed package.
+    python = fake_bin / "python3"
+    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    python.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 def _run_workspace_clone(
     workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
     """Run the real renderer with Git probing intact and clone side effects faked."""
     target = workspace / "repo"
     clone_log = workspace.parent / f"{workspace.name}-clone-log"
+    _install_clone_git_stub(workspace.parent, monkeypatch)
     command = k8s._render_workspace_prep_command(
         str(workspace),
         [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
@@ -475,20 +532,17 @@ def _run_workspace_clone(
         "host-test",
     )
     script = (
-        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n'
-        "git() {\n"
-        '  if [ "$1" = "-C" ]; then command git "$@"; return; fi\n'
-        '  printf "%s\\n" "$*" >> "$CLONE_LOG"\n'
-        '  clone_dir="${@: -1}"\n'
-        '  mkdir -p "$clone_dir/.git"\n'
-        '  printf "ref: refs/heads/main\\n" > "$clone_dir/.git/HEAD"\n'
-        "}\n" + command[2]
+        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n' + command[2]
     )
     monkeypatch.setenv("CLONE_LOG", str(clone_log))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     result = subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, env=os.environ.copy()
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+        cwd=workspace.parent,
     )
     clones = clone_log.read_text().splitlines() if clone_log.exists() else []
     return result, target, clones
@@ -698,6 +752,7 @@ def test_workspace_prep_refuses_concurrent_target_writer(
     workspace = tmp_path / "workspace"
     target = workspace / "repo"
     monkeypatch.setenv("RACE_TARGET", str(target))
+    _install_clone_git_stub(tmp_path, monkeypatch)
     command = k8s._render_workspace_prep_command(
         str(workspace),
         [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
@@ -705,16 +760,9 @@ def test_workspace_prep_refuses_concurrent_target_writer(
         "host-test",
     )
     script = (
-        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n'
-        "git() {\n"
-        '  if [ "$1" = "-C" ]; then return 128; fi\n'
-        '  clone_dir="${@: -1}"\n'
-        '  mkdir -p "$clone_dir/.git" "$RACE_TARGET/.git"\n'
-        '  printf "ref: refs/heads/main\\n" > "$clone_dir/.git/HEAD"\n'
-        '  printf "foreign\\n" > "$RACE_TARGET/.git/HEAD"\n'
-        "}\n" + command[2]
+        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n' + command[2]
     )
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, cwd=tmp_path)
     assert result.returncode != 0
     assert (target / ".git" / "HEAD").read_text() == "foreign\n"
     assert not (target / "clone").exists()
@@ -772,7 +820,7 @@ def test_build_job_manifest_without_repo_has_no_clone() -> None:
     init = _pod_spec(manifest)["initContainers"][0]
     script = init["command"][2]
     assert "mkdir -p /home/omnigent/workspace" in script
-    assert "git clone" not in script
+    assert "python3 -I -m omnigent.git_commands -- clone" not in script
     # No repo → no broker wiring, and the launch token is NOT exposed to the
     # workspace-less init container.
     assert "configure_clone_credentials" not in script
@@ -792,7 +840,11 @@ def test_build_job_manifest_host_config_is_written_by_init_container() -> None:
     script = spec["initContainers"][0]["command"][2]
     write_command = render_host_config_write_command(_HOST_CONFIG)
     assert write_command in script
-    assert script.index("mkdir -p") < script.index("git clone") < script.index(write_command)
+    assert (
+        script.index("mkdir -p")
+        < script.index("python3 -I -m omnigent.git_commands -- clone")
+        < script.index(write_command)
+    )
     assert write_command not in spec["containers"][0]["command"][2]
 
 
@@ -1213,7 +1265,7 @@ def test_render_workspace_prep_command(
     )
     script = command[2]
     assert "mkdir -p /ws" in script
-    assert ("git clone" in script) is expect_clone
+    assert ("python3 -I -m omnigent.git_commands -- clone" in script) is expect_clone
     assert ("--branch release-1.2 --single-branch" in script) is expect_branch
     # The per-user broker is wired (connected-gated at runtime) only when cloning.
     assert ("configure_clone_credentials" in script) is expect_clone

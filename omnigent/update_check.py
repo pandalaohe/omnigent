@@ -50,6 +50,8 @@ from typing import TYPE_CHECKING
 
 import tomllib
 
+from omnigent.git_commands import run_git
+
 if TYPE_CHECKING:
     # Imported only for type hints; the heavy/optional imports remain lazy
     # at runtime so importing this module stays cheap.
@@ -825,7 +827,7 @@ def _fetch_and_count(repo_root: Path, branch: str) -> int | None:
         any failure (timeout, missing remote, missing branch).
     """
     try:
-        subprocess.run(
+        run_git(
             ["git", "-C", str(repo_root), "fetch", "origin", branch, "--quiet"],
             timeout=_GIT_TIMEOUT_SECONDS,
             capture_output=True,
@@ -835,7 +837,7 @@ def _fetch_and_count(repo_root: Path, branch: str) -> int | None:
         return None
 
     try:
-        result = subprocess.run(
+        result = run_git(
             [
                 "git",
                 "-C",
@@ -861,7 +863,7 @@ def _get_head_sha(repo_root: Path) -> str | None:
     :returns: The full SHA-1 hex string, or ``None``.
     """
     try:
-        result = subprocess.run(
+        result = run_git(
             ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
             timeout=_GIT_TIMEOUT_SECONDS,
             capture_output=True,
@@ -884,7 +886,7 @@ def _local_rev_list_count(repo_root: Path) -> int | None:
     """
     for branch in ("main", "master"):
         try:
-            result = subprocess.run(
+            result = run_git(
                 [
                     "git",
                     "-C",
@@ -1679,7 +1681,7 @@ def _latest_nightly_version(repo_url: str = _NIGHTLY_REPO_URL) -> str | None:
     :returns: e.g. ``"0.8.0.dev20260804"``, or ``None``.
     """
     try:
-        result = subprocess.run(
+        result = run_git(
             ["git", "ls-remote", "--tags", repo_url, "refs/tags/v*.dev*"],
             capture_output=True,
             text=True,
@@ -1742,18 +1744,18 @@ def _prepare_uv_git_install(
     fragment = source.partition("#")[2]
     options = parse_qs(fragment)
     repo = directory / "source"
-    subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=env)
-    subprocess.run(
+    run_git(["git", "init", "--quiet", str(repo)], check=True, env=env)
+    run_git(
         ["git", "-C", str(repo), "fetch", "--quiet", "--depth=1", "--", url, revision or "HEAD"],
         check=True,
         env=env,
     )
-    subprocess.run(
+    run_git(
         ["git", "-C", str(repo), "checkout", "--quiet", "--detach", "FETCH_HEAD"],
         check=True,
         env=env,
     )
-    sha = subprocess.run(
+    sha = run_git(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
@@ -2005,7 +2007,7 @@ def _remote_git_head(vcs_url: str) -> str | None:
     if not url:
         return None
     try:
-        result = subprocess.run(
+        result = run_git(
             ["git", "ls-remote", url, ref or "HEAD"],
             capture_output=True,
             text=True,

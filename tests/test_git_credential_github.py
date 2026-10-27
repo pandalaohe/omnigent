@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 from collections.abc import Callable
 
@@ -15,10 +16,16 @@ from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
 
 @pytest.fixture(autouse=True)
-def _force_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+def _force_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     # The broker host integrations are sandbox-only; default every test to the
     # in-sandbox path. The not-in-sandbox no-op test clears IS_SANDBOX explicitly.
     monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.chdir(tmp_path)
+    for name in list(os.environ):
+        if name.upper().startswith("GIT_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 
 
 def test_get_prints_credentials_for_github(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,7 +71,11 @@ def test_configure_host_git_resets_then_adds_broker_helper(
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     monkeypatch.setenv("GIT_TOKEN", "shared-test-token")
     calls: list[list[str]] = []
-    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or h.subprocess.CompletedProcess(args, 0, b"", b""),
+    )
     cred = {"connected": True, "owner": "alice@example.com", "login": "octo"}
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
     h.configure_host_git("http://srv", "host1")
@@ -107,7 +118,11 @@ def test_configure_host_git_clears_stale_broker_when_not_connected(
     # unset that restores the ambient/shared helper; no --add, no identity.
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     calls: list[list[str]] = []
-    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or h.subprocess.CompletedProcess(args, 0, b"", b""),
+    )
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
     h.configure_host_git("http://srv", "host1")
     key = "credential.https://github.com.helper"
@@ -152,7 +167,11 @@ def test_configure_clone_credentials_wires_broker_when_connected(
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     monkeypatch.setenv("GIT_TOKEN", "shared-test-token")
     calls: list[list[str]] = []
-    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or h.subprocess.CompletedProcess(args, 0, b"", b""),
+    )
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": True, "owner": "a@b.com"})
     assert h.configure_clone_credentials("http://srv", "host1") is True
     key = "credential.https://github.com.helper"
@@ -175,7 +194,11 @@ def test_configure_clone_credentials_noop_when_not_connected(
     # Not connected → leave the ambient (image GIT_TOKEN) helper intact; no git config.
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     calls: list[list[str]] = []
-    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or h.subprocess.CompletedProcess(args, 0, b"", b""),
+    )
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
     assert h.configure_clone_credentials("http://srv", "host1") is False
     assert calls == []
@@ -198,7 +221,11 @@ def test_configure_clone_credentials_fails_closed_when_probe_fails(
     # linked owner. Only a *successful* ``connected: false`` keeps the fallback.
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     calls: list[list[str]] = []
-    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or h.subprocess.CompletedProcess(args, 0, b"", b""),
+    )
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: None)
     assert h.configure_clone_credentials("http://srv", "host1") is True
     key = "credential.https://github.com.helper"
@@ -257,7 +284,11 @@ def test_configure_clone_credentials_keeps_shared_helper_on_provider_404(
 ) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     calls: list[list[str]] = []
-    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or h.subprocess.CompletedProcess(args, 0, b"", b""),
+    )
     response = httpx.Response(404, json={"detail": "unknown credential provider"})
     monkeypatch.setattr(h.httpx, "get", lambda *a, **k: response)
     assert h.configure_clone_credentials("http://srv", "host1") is False
@@ -269,7 +300,11 @@ def test_configure_host_git_clears_stale_broker_on_provider_404(
 ) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     calls: list[list[str]] = []
-    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(
+        h.subprocess,
+        "run",
+        lambda args, **k: calls.append(args) or h.subprocess.CompletedProcess(args, 0, b"", b""),
+    )
     response = httpx.Response(404, json={"detail": "unknown credential provider"})
     monkeypatch.setattr(h.httpx, "get", lambda *a, **k: response)
     h.configure_host_git("http://srv", "host1")

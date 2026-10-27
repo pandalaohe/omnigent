@@ -67,6 +67,7 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
+from omnigent.git_commands import run_git
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import local_git
 from omnigent.runner.session_prs import PullRequestRef
@@ -130,7 +131,8 @@ def _run(
     """
     started = time.monotonic()
     try:
-        result = subprocess.run(
+        runner = run_git if argv[0] == "git" else subprocess.run
+        result = runner(
             argv,
             cwd=cwd,
             capture_output=True,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import os
 import shutil
 import tarfile
 from pathlib import Path
@@ -345,9 +346,12 @@ def test_clone_github_source_is_hardened(monkeypatch: pytest.MonkeyPatch, tmp_pa
     with pytest.raises(click.ClickException, match=r"Could not clone .*: fatal: not found"):
         cli_mod._clone_github_source("https://github.com/a/b.git", "v1", tmp_path / "r")
     cmd, env = seen[0]
-    assert {"core.hooksPath=/dev/null", "protocol.allow=never", "--no-recurse-submodules"} <= set(
-        cmd
-    )
+    assert {"protocol.allow=never", "--no-recurse-submodules"} <= set(cmd)
+    config = {
+        env[f"GIT_CONFIG_KEY_{index}"]: env[f"GIT_CONFIG_VALUE_{index}"]
+        for index in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert config["core.hooksPath"] == os.devnull
     assert cmd[cmd.index("--branch") + 1] == "v1" and cmd[-3] == "--"
     assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GIT_LFS_SKIP_SMUDGE"] == "1"
     # A hex-looking name can be a real branch or tag, so git decides; a failure hints at SHAs.

@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import shlex
-import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
@@ -21,6 +20,7 @@ import tomlkit
 from tomlkit.exceptions import ParseError, TOMLKitError
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.git_commands import run_git
 from omnigent.runtime.filesystem_registry import (
     _anchored_git_env,
     _git_common_dir,
@@ -567,7 +567,7 @@ def codex_stance_is_workspace_write(
 
 def _git_profile_config_is_safe(top: Path, opened: Sequence[Path]) -> bool:
     def read_config(*args: str, missing_ok: bool = False) -> str:
-        result = subprocess.run(
+        result = run_git(
             ["git", "-C", str(top), "config", *args],
             capture_output=True,
             env=_anchored_git_env(),
@@ -702,7 +702,7 @@ def codex_workspace_profile(
         if windows:
             if (top / ".gitmodules").exists() or (common / "modules").exists():
                 return decline("repository has submodules")
-            result = subprocess.run(
+            result = run_git(
                 [
                     "git",
                     "config",

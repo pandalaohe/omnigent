@@ -11,6 +11,7 @@ import subprocess
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
+from omnigent.git_commands import run_git
 from omnigent.git_providers import EnvInstances, ParsedRemote, provider_display
 from omnigent.git_providers.gitlab import GitLabProvider
 from omnigent.runner.git_providers import (
@@ -44,7 +45,7 @@ def _object(value: object) -> dict[str, Any]:
 
 def _git(root: str, args: list[str]) -> tuple[int | None, str]:
     try:
-        result = subprocess.run(
+        result = run_git(
             ["git", *args],
             cwd=root,
             stdin=subprocess.DEVNULL,

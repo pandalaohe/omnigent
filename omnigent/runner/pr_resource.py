@@ -21,6 +21,7 @@ from typing import Any
 
 from filelock import Timeout as FileLockTimeout
 
+from omnigent.git_commands import run_git
 from omnigent.git_providers import (
     host_of,
     load_facet,
@@ -77,7 +78,7 @@ class ProviderResolution:
 def _git_output(argv: list[str], *, cwd: str) -> tuple[int | None, str]:
     """Run a read-only ``git`` command; the return code is ``None`` when git cannot run."""
     try:
-        result = subprocess.run(
+        result = run_git(
             ["git", *argv], cwd=cwd, capture_output=True, timeout=_git_timeout_seconds()
         )
     except (OSError, subprocess.TimeoutExpired):

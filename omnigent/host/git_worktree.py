@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, overload
 
+from omnigent.git_commands import run_git
 from omnigent.git_urls import redact_remote_url
 
 _logger = logging.getLogger(__name__)
@@ -156,7 +157,7 @@ def _run_git(
         exceeds ``timeout``.
     """
     try:
-        return subprocess.run(
+        return run_git(
             ["git", *args],
             cwd=cwd,
             # Keep failure diagnostics stable for repository classification.
@@ -166,10 +167,16 @@ def _run_git(
             timeout=timeout,
             check=False,
         )
-    except FileNotFoundError as exc:
-        raise WorktreeError("git is not installed on the host") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise WorktreeError(f"git command timed out after {timeout:.0f}s") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if isinstance(exc, FileNotFoundError):
+            message = "git is not installed on the host"
+        elif isinstance(exc, subprocess.TimeoutExpired):
+            message = f"git command timed out after {timeout:.0f}s"
+        else:
+            message = f"git command could not start: {exc}"
+        if notes := getattr(exc, "__notes__", None):
+            message += "; " + "; ".join(notes)
+        raise WorktreeError(message) from exc
 
 
 def _git_error(label: str, result: subprocess.CompletedProcess[str]) -> WorktreeError:
