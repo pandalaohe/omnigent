@@ -43,7 +43,6 @@ from omnigent.harnesses.codex_native.app_server import (
     client_for_transport,
 )
 from omnigent.harnesses.codex_native.bridge import (
-    CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
     CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
     MCP_STARTUP_STARTING,
     MCP_STARTUP_STATES,
@@ -87,7 +86,6 @@ from omnigent.native._native_post_delivery import (
     post_session_succession,
     replay_dead_letters,
 )
-from omnigent.native._native_session_labels import replacement_session_labels
 from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.runtime.tool_output import cap_tool_output
@@ -3148,33 +3146,8 @@ async def _create_thread_replacement_session(
     if not isinstance(agent_id, str) or not agent_id:
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
     runner_id = old.get("runner_id")
-    labels_value = old.get("labels")
-    labels = (
-        replacement_session_labels({str(key): str(value) for key, value in labels_value.items()})
-        if isinstance(labels_value, dict)
-        else {}
-    )
     state = read_bridge_state(bridge_dir)
-    if CODEX_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
-        labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
-
-    create_body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
-    if (title := old.get("title")) is not None:
-        create_body["title"] = title
-    project_id = old.get("project_id")
-    if isinstance(project_id, str):
-        create_body.update({"project_id": project_id, "workspace": None, "git": None})
-    create_resp = await client.post("/v1/sessions", json=create_body)
-    if isinstance(project_id, str) and create_resp.status_code == 404:
-        error = create_resp.json().get("error")
-        if isinstance(error, dict) and error.get("code") == "not_found":
-            _logger.info(
-                "Project %s was removed before thread replacement; retrying unfiled", project_id
-            )
-            create_body.pop("project_id")
-            create_body.pop("workspace")
-            create_body.pop("git")
-            create_resp = await client.post("/v1/sessions", json=create_body)
+    create_resp = await client.post(f"/v1/sessions/{url_component(old_session_id)}/successor")
     create_resp.raise_for_status()
     created = create_resp.json()
     new_session_id = created.get("id")

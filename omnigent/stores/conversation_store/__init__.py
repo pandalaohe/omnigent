@@ -455,6 +455,7 @@ def drop_server_secret_labels(labels: dict[str, str]) -> dict[str, str]:
 #     viewers never held them; the clone mints its own key on first use.
 _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
+        "omnigent.standing_pass",
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
         "omnigent.last_auto_compact_token_limit",

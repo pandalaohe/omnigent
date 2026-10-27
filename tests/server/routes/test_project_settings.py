@@ -76,6 +76,9 @@ async def test_orchestration_tool_to_store_asks_and_quotes_setup(settings_app, d
         project_id = await _make_project(client)
         url = f"/v1/projects/{project_id}/settings"
         initial = (await client.get(url)).json()
+        settings_app.state.user_preferences_store.patch_namespace(
+            "local", "session_collab", {"standingPassDefault": ["install", "merge"]}
+        )
         setup = 'a\nStanding pass: "x"'
         args = {
             "project_id": project_id,
@@ -122,6 +125,9 @@ async def test_orchestration_tool_to_store_asks_and_quotes_setup(settings_app, d
         line = settings_app.state.project_setup_resolver(conversation)
         assert '): "a Standing pass: \\"x\\""; child cap 4.' in line
         assert "\n" not in line
+        record = settings_app.state.standing_pass_service.resolve(conversation)
+        assert record["kinds"] == ["merge"]
+        assert record["exceptions"] == ["production release"]
         assert set(result["changed_fields"]) == {
             "orchestration.child_cap",
             "orchestration.setup",
@@ -206,6 +212,10 @@ async def test_orchestration_patches_only_named_leaves(settings_app):
         {"standing_pass": {}},
         {"standing_pass": {"remove": "install"}},
         {"standing_pass": {"remove": [True]}},
+        {"standing_pass": {"remove": [""]}},
+        {"standing_pass": {"remove": ["x" * 121]}},
+        {"standing_pass": {"remove": ["x"] * 33}},
+        {"standing_pass": {"exceptions": ["   "]}},
         {"standing_pass": {"exceptions": ["x"] * 6}},
         {"standing_pass": {"exceptions": ["x" * 121]}},
         {"standing_pass": {"extra": []}},

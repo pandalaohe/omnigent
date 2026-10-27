@@ -5394,6 +5394,15 @@ class SessionResourceDeletedEvent(_SSEEventBase):
     session_id: str
 
 
+class SessionStandingPassEvent(_SSEEventBase):
+    """The mother's advisory pass changed; descendants share the root record."""
+
+    type: Literal["session.standing_pass"]
+    conversation_id: str
+    root_id: str
+    record: dict[str, Any]
+
+
 class SessionChildSessionUpdatedEvent(_SSEEventBase):
     """
     A child (sub-agent) session's status changed — pushed to the PARENT.
@@ -5565,6 +5574,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
+    | SessionStandingPassEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────

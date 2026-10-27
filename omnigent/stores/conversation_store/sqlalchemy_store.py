@@ -1471,11 +1471,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         initial_labels: dict[str, str],
         terminal_launch_args: list[str] | None,
     ) -> Conversation:
-        """Create a Pi successor once, then finish any interrupted metadata phase."""
+        """Create a successor once, then finish any interrupted metadata phase."""
         from omnigent.server.permission_tiers import (
             PERMISSION_CAPABILITY_LABEL_KEY,
             PERMISSION_RUNTIME_ID_LABEL_KEY,
             PERMISSION_STATE_LABEL_KEY,
+            TIER_HARNESSES,
             tier_label_key,
         )
 
@@ -1505,8 +1506,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 PERMISSION_STATE_LABEL_KEY,
                 PERMISSION_CAPABILITY_LABEL_KEY,
                 PERMISSION_RUNTIME_ID_LABEL_KEY,
-                tier_label_key(source.harness_override or "pi"),
             )
+            permission_harness = source.harness_override or "pi"
+            if permission_harness in TIER_HARNESSES:
+                permission_keys += (tier_label_key(permission_harness),)
             if any(source_labels.get(key) != source.labels.get(key) for key in permission_keys):
                 raise SuccessionRefusedError("source_changed", "Source permission state changed")
             if not current.archived and current.archive_revision != source.archive_revision:
@@ -1519,9 +1522,38 @@ class SqlAlchemyConversationStore(ConversationStore):
             successor_id = hashlib.sha256(
                 f"session_successor:{source.id}:{revision}".encode()
             ).hexdigest()[:32]
+            prepared_raw = source_labels.get(ROTATION_SUCCESSOR_LABEL_KEY)
+            if prepared_raw:
+                try:
+                    prepared = json.loads(prepared_raw)
+                    if prepared["revision"] == revision:
+                        successor_id = prepared["id"]
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise SuccessionRefusedError(
+                        "source_changed", "Source successor preparation is invalid"
+                    ) from exc
             if current.archived and source_labels.get(SUCCEEDED_BY_LABEL_KEY) != successor_id:
                 raise SuccessionRefusedError("archived", "Source session is archived")
             successor = session.get(SqlConversation, (current_workspace_id(), successor_id))
+            if successor is not None and successor.archived and not current.archived:
+                receipt = session.scalar(
+                    select(SqlSessionSuccession.id).where(
+                        SqlSessionSuccession.workspace_id == current_workspace_id(),
+                        SqlSessionSuccession.old_id == source.id,
+                        SqlSessionSuccession.new_id == successor_id,
+                    )
+                )
+                if receipt is not None:
+                    raise SuccessionRefusedError(
+                        "target_archived", "An archived successor already owns the succession"
+                    )
+                # Keep a retired candidate archived. A new preparation is stable
+                # across retries of this source incarnation and failed candidate.
+                successor_id = hashlib.sha256(
+                    f"session_successor:{source.id}:{revision}:{successor.id}:"
+                    f"{successor.archive_revision}".encode()
+                ).hexdigest()[:32]
+                successor = session.get(SqlConversation, (current_workspace_id(), successor_id))
             if successor is None:
                 if current.archived:
                     raise SuccessionRefusedError("archived", "Archived source has no successor")
@@ -1542,6 +1574,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 session.add(successor)
                 _upsert_prepared_labels(session, successor_id, prepared_labels, now)
+            _upsert_prepared_labels(session, successor_id, {SUCCEEDS_LABEL_KEY: source.id}, now)
             _upsert_prepared_labels(
                 session,
                 source.id,
@@ -9241,6 +9274,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
                 and not key.startswith(CHECKIN_LABEL_PREFIX)
+                and not key.startswith("omnigent.standing_pass.")
                 and key != PROJECT_ARCHIVE_LABEL_KEY
                 and not key.startswith(f"{PROJECT_ARCHIVE_LABEL_KEY}.")
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))

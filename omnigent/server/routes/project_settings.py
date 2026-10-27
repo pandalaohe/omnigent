@@ -68,12 +68,13 @@ class _HostPatch(BaseModel):
     harnesses: dict[str, _HarnessPatch] | None = None
 
 
+_PassString = Annotated[StrictStr, Field(min_length=1, max_length=120, pattern=r"\S")]
+
+
 class _ProjectStandingPassPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    remove: list[StrictStr] | None = None
-    exceptions: (
-        Annotated[list[Annotated[StrictStr, Field(max_length=120)]], Field(max_length=5)] | None
-    ) = None
+    remove: Annotated[list[_PassString], Field(max_length=32)] | None = None
+    exceptions: Annotated[list[_PassString], Field(max_length=5)] | None = None
 
 
 class _OrchestrationPatch(BaseModel):

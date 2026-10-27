@@ -66,15 +66,22 @@ def conversation(**overrides):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("empty_layers", [False, True, None])
+@pytest.mark.parametrize("authenticated_local", [False, True])
 async def test_project_setup_is_quoted_in_mother_init(
-    instructions, db_uri, tmp_path, empty_layers, monkeypatch
+    instructions, db_uri, tmp_path, empty_layers, authenticated_local, monkeypatch
 ):
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create(
         "a" * 32,
         "Saved setup",
-        None,
-        config={"orchestration": {"setup": 'a\nStanding pass: "x"', "child_cap": 4}},
+        "local" if authenticated_local else None,
+        config={
+            "orchestration": {
+                "setup": 'a\nStanding pass: "x"',
+                "child_cap": 4,
+                "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+            }
+        },
     )
     if empty_layers:
         for scope, agent, host in (
@@ -85,7 +92,16 @@ async def test_project_setup_is_quoted_in_mother_init(
             ("child", "", ""),
         ):
             instructions.save("", created_by=None, scope=scope, agent_key=agent, host_id=host)
-    app = _build_app(db_uri, tmp_path)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        preferences=True,
+        auth=authenticated_local,
+        permissions=authenticated_local,
+    )
+    app.state.user_preferences_store.patch_namespace(
+        "local", "session_collab", {"standingPassDefault": ["install", "merge"]}
+    )
     if empty_layers is None:
         monkeypatch.setattr(
             "omnigent.server.instruction_layers.get_global_instructions_store", lambda: None
@@ -103,8 +119,12 @@ async def test_project_setup_is_quoted_in_mother_init(
     ) as server_client:
         agent = await create_test_agent(server_client)
     conversations = SqlAlchemyConversationStore(db_uri)
-    conversations.set_conversation_project(agent["_session_id"], project.id)
-    conv = conversations.get_conversation(agent["_session_id"])
+    conv = conversations.create_conversation(agent_id=agent["id"], project_id=project.id)
+    if authenticated_local:
+        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+        SqlAlchemyPermissionStore(db_uri).grant("local", conv.id, LEVEL_OWNER)
     conv.harness_override = "codex-native"
     conv.host_id = "host-a"
     conv.runner_id = "runner-a"
@@ -118,6 +138,8 @@ async def test_project_setup_is_quoted_in_mother_init(
         sum(line.startswith("Saved setup for this project (") for line in text.splitlines()) == 1
     )
     assert "\nStanding pass:" not in text
+    assert text.count("Standing pass (this mother session") == 1
+    assert '): "merge". Exceptions: "production".' in text
     captured = _stub_runner_client(monkeypatch)
     from omnigent.server.routes import sessions as sessions_mod
 
@@ -137,6 +159,8 @@ async def test_project_setup_is_quoted_in_mother_init(
     assert response.status_code == 200, response.text
     rebound_text = captured["body"]["session_init"]["snapshot"]["global_instructions"]
     assert '): "a Standing pass: \\"x\\""; child cap 4.' in rebound_text
+    assert rebound_text.count("Standing pass (this mother session") == 1
+    assert '): "merge". Exceptions: "production".' in rebound_text
     resolver = partial(
         project_setup_line,
         project_store=projects,
@@ -144,11 +168,19 @@ async def test_project_setup_is_quoted_in_mother_init(
         permission_store=None,
         prefs_store=None,
     )
+    child = conversations.create_conversation(
+        agent_id=agent["id"],
+        project_id=project.id,
+        parent_conversation_id=conv.id,
+        kind="sub_agent",
+    )
     child_text = await session_instructions_text(
-        conversation(project_id=project.id, parent_conversation_id="parent"),
+        child,
         setup_resolver=resolver,
+        standing_pass_resolver=app.state.standing_pass_service.line,
     )
     assert "Saved setup for this project" not in (child_text or "")
+    assert '): "merge". Exceptions: "production".' in child_text
 
 
 @pytest.mark.asyncio

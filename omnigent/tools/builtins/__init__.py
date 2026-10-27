@@ -283,6 +283,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "sys_instruction_layer_update": None,
     "sys_project_settings_read": None,
     "sys_project_settings_update": None,
+    "sys_standing_pass": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
     # and intercepted by name in the runner's tool dispatch — reserved

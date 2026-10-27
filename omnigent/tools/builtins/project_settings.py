@@ -52,8 +52,9 @@ class SysProjectSettingsUpdateTool(Tool):
             "revision as expected_revision. Name leaves to change: project host_id, agent_id, "
             "model; or a host's workspace, agent_id and harness model, effort, speed, permission. "
             "Orchestration leaves: child_cap (positive integer or 'none'), setup (up to 400 "
-            "characters), standing_pass.remove and standing_pass.exceptions (up to five "
-            "120-character strings). Setup applies at mother initialization; child caps are "
+            "characters), standing_pass.remove (up to 32 kinds) and standing_pass.exceptions "
+            "(up to five exceptions), each a nonblank string of at most 120 characters. "
+            "Setup applies at mother initialization; child caps are "
             "read on subsequent child creates. "
             "Null removes only that override. A new entry may initialize its Agent from the "
             "owner's template; an online entry change runs the setup hook after saving. Hook "
@@ -95,12 +96,23 @@ class SysProjectSettingsUpdateTool(Tool):
                                     "properties": {
                                         "remove": {
                                             "type": ["array", "null"],
-                                            "items": {"type": "string"},
+                                            "maxItems": 32,
+                                            "items": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 120,
+                                                "pattern": r"\S",
+                                            },
                                         },
                                         "exceptions": {
                                             "type": ["array", "null"],
                                             "maxItems": 5,
-                                            "items": {"type": "string", "maxLength": 120},
+                                            "items": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 120,
+                                                "pattern": r"\S",
+                                            },
                                         },
                                     },
                                     "additionalProperties": False,

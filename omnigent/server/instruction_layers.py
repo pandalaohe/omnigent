@@ -167,27 +167,35 @@ async def session_instructions_text(
     *,
     quota_resolver: Callable[[Conversation], str] | None = None,
     setup_resolver: Callable[[Conversation], str] | None = None,
+    standing_pass_resolver: Callable[[Conversation], str] | None = None,
 ) -> str | None:
     """Return the newly initialized session's route text, or no injection if disabled."""
     store = get_global_instructions_store()
-    if store is None and setup_resolver is None:
-        return None
-    route = await resolve_instruction_route(conversation)
-    setup_line = (
-        await asyncio.to_thread(setup_resolver, conversation)
-        if setup_resolver is not None
-        and route.spawn
-        and conversation.parent_conversation_id is None
+    text = None
+    if store is not None or setup_resolver is not None:
+        route = await resolve_instruction_route(conversation)
+        setup_line = (
+            await asyncio.to_thread(setup_resolver, conversation)
+            if setup_resolver is not None
+            and route.spawn
+            and conversation.parent_conversation_id is None
+            else ""
+        )
+        text = (
+            await asyncio.to_thread(
+                route_session_text,
+                store,
+                route,
+                has_parent=conversation.parent_conversation_id is not None,
+                quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
+                setup_line=setup_line,
+            )
+            if store is not None
+            else setup_line or None
+        )
+    pass_line = (
+        await asyncio.to_thread(standing_pass_resolver, conversation)
+        if standing_pass_resolver is not None
         else ""
     )
-    if store is None:
-        return setup_line or None
-
-    return await asyncio.to_thread(
-        route_session_text,
-        store,
-        route,
-        has_parent=conversation.parent_conversation_id is not None,
-        quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
-        setup_line=setup_line,
-    )
+    return "\n\n".join(part for part in (text, pass_line) if part) or None

@@ -513,6 +513,7 @@ class CollabSettings:
     keep_warm_codex_interval_s: int = 1500
     keep_warm_max_s: int = 28800
     child_cap: int | None = None
+    standing_pass_default: list[str] = field(default_factory=list)
     quota_tight_below_pct: float = 50
     quota_low_below_pct: float = 20
     quota_floor_pct: float | None = None
@@ -602,6 +603,12 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     if not isinstance(value, dict):
         return CollabSettings()
     resolved: dict[str, Any] = {}
+    from omnigent.server.standing_pass import pass_strings
+
+    try:
+        resolved["standing_pass_default"] = pass_strings(value.get("standingPassDefault", []))
+    except ValueError:
+        resolved["standing_pass_default"] = []
     mode = value.get("sessionRestrictions")
     if isinstance(mode, str) and mode in {"off", "subagents", "all"}:
         resolved["session_restrictions"] = mode

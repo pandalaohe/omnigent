@@ -205,6 +205,7 @@ class RunnerSessionInitializer:
         ) = None,
         quota_resolver: Callable[[Conversation], str] | None = None,
         setup_resolver: Callable[[Conversation], str] | None = None,
+        standing_pass_resolver: Callable[[Conversation], str] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
@@ -220,6 +221,7 @@ class RunnerSessionInitializer:
         self._startup_recovery_resolver = startup_recovery_resolver
         self._quota_resolver = quota_resolver
         self._setup_resolver = setup_resolver
+        self._standing_pass_resolver = standing_pass_resolver
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._agent_store = agent_store
@@ -728,18 +730,11 @@ class RunnerSessionInitializer:
             # and awaiting between the single-flight lookup and the task
             # registration would let a second caller start its own init.
             async with store_slots or nullcontext():
-                global_instructions = (
-                    await session_instructions_text(
-                        conversation,
-                        quota_resolver=self._quota_resolver,
-                        **(
-                            {"setup_resolver": self._setup_resolver}
-                            if self._setup_resolver
-                            else {}
-                        ),
-                    )
-                    if self._quota_resolver is not None or self._setup_resolver is not None
-                    else await session_instructions_text(conversation)
+                global_instructions = await session_instructions_text(
+                    conversation,
+                    quota_resolver=self._quota_resolver,
+                    setup_resolver=self._setup_resolver,
+                    standing_pass_resolver=self._standing_pass_resolver,
                 )
                 project_code = await self.resolve_project_code(conversation)
             payload = build_runner_session_init_payload(
