@@ -170,8 +170,15 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("InstructionsPage", () => {
-  it("saves the Mother grid's Codex column with its role key", async () => {
+  it("saves the Mother grid's Codex row with its role key", async () => {
     page();
+    const table = screen.getByRole("table", { name: "Instruction layers by host and agent" });
+    expect(within(table).getByRole("columnheader", { name: /^Laptop/ })).toBeVisible();
+    expect(within(table).getByRole("rowheader", { name: /^Codex/ })).toBeVisible();
+    expect(
+      table.compareDocumentPosition(screen.getByRole("heading", { name: "Child sessions" })) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     await userEvent.click(screen.getByRole("tab", { name: "Mother" }));
     expect(screen.getByTestId("location")).toHaveTextContent("role=mother");
     fireEvent.click(within(screen.getByRole("table")).getByRole("button", { name: "Edit Codex" }));
@@ -740,7 +747,7 @@ describe("InstructionsPage", () => {
   });
 });
 
-it("persists an added ACP column while a blank latest layer alone stays hidden", async () => {
+it("persists an added ACP row while a blank latest layer alone stays hidden", async () => {
   mocks.layers!.agents.push({
     key: "acp:plugin",
     display_name: "Plugin",
@@ -770,7 +777,7 @@ it("starts with Shared and the axis pickers when no layers hold text", () => {
   expect(within(table).queryByRole("button", { name: /^Make / })).not.toBeInTheDocument();
   expect(
     screen.getByText(
-      "Add an agent column or a host row to give one agent or one host its own text.",
+      "Add an agent row or a host column to give one agent or one host its own text.",
     ),
   ).toBeInTheDocument();
   expect(
@@ -780,7 +787,7 @@ it("starts with Shared and the axis pickers when no layers hold text", () => {
   ).toEqual([2, 2]);
 });
 
-it("adds and removes an empty host row without saving and persists the removal", async () => {
+it("adds and removes an empty host column without saving and persists the removal", async () => {
   mocks.admin = false;
   const view = page();
   fireEvent.click(screen.getByRole("button", { name: "Add host" }));
@@ -789,11 +796,11 @@ it("adds and removes an empty host row without saving and persists the removal",
   ).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: /Cloud.*offline/ }));
   expect(screen.getByRole("button", { name: "Edit Cloud" })).toBeInTheDocument();
-  expect(screen.getAllByRole("row").map((row) => row.children.length)).toEqual([3, 3, 3, 3]);
+  expect(screen.getAllByRole("row").map((row) => row.children.length)).toEqual([4, 4, 4]);
   view.unmount();
   const remounted = page();
   expect(screen.getByRole("button", { name: "Edit Cloud" })).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Remove Cloud row" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove Cloud column" }));
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Edit Cloud" })).not.toBeInTheDocument();
   expect(mocks.save).not.toHaveBeenCalled();
@@ -802,7 +809,7 @@ it("adds and removes an empty host row without saving and persists the removal",
   expect(screen.queryByRole("button", { name: "Edit Cloud" })).not.toBeInTheDocument();
 });
 
-it("confirms every held layer in a column and clears only those keys sequentially", async () => {
+it("confirms every held layer in a row and clears only those keys sequentially", async () => {
   mocks.layers!.data.push(layer("independent", "Independent text", "codex", "host-a"), {
     ...layer("independent", "Retained", "codex", "removed"),
     host_removed: true,
@@ -815,7 +822,7 @@ it("confirms every held layer in a column and clears only those keys sequentiall
   expect(screen.getByRole("button", { name: "Edit Laptop / Codex" })).toHaveTextContent(
     "Independent16 chars",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Remove Codex column" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove Codex row" }));
   const dialog = screen.getByRole("dialog");
   expect(within(dialog).getByRole("heading", { name: "Remove Codex?" })).toBeInTheDocument();
   expect(
@@ -836,7 +843,7 @@ it("confirms every held layer in a column and clears only those keys sequentiall
         finish = resolve;
       }),
   );
-  fireEvent.click(screen.getByRole("button", { name: "Remove Codex column" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove Codex row" }));
   fireEvent.click(screen.getByRole("button", { name: "Clear text and remove" }));
   expect(mocks.save).toHaveBeenCalledTimes(1);
   expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
@@ -868,12 +875,12 @@ it("keeps only failed layers in the removal dialog and retries them with their r
     .mockResolvedValueOnce({ over_budget_routes: [] })
     .mockRejectedValueOnce(new Error("Save failed"));
   page();
-  fireEvent.click(screen.getByRole("button", { name: "Remove Codex column" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove Codex row" }));
   fireEvent.click(screen.getByRole("button", { name: "Clear text and remove" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("Save failed");
   expect(screen.getByRole("dialog")).toBeInTheDocument();
   expect(
-    screen.getByRole("button", { name: "Remove Codex column", hidden: true }),
+    screen.getByRole("button", { name: "Remove Codex row", hidden: true }),
   ).toBeInTheDocument();
   expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual(layout);
   expect(
@@ -903,8 +910,8 @@ it("keeps only failed layers in the removal dialog and retries them with their r
 });
 
 it.each([
-  { axis: "hosts", button: "Remove Laptop row", remaining: ["host-cloud"] },
-  { axis: "agents", button: "Remove Codex column", remaining: ["agent-b"] },
+  { axis: "hosts", button: "Remove Laptop column", remaining: ["host-cloud"] },
+  { axis: "agents", button: "Remove Codex row", remaining: ["agent-b"] },
 ])(
   "preserves layout additions while clearing a $axis axis",
   async ({ axis, button, remaining }) => {
@@ -954,12 +961,12 @@ it.each([
 });
 
 it.each(["host", "mother", "child"] as const)(
-  "disables removing a row held by %s text for readers",
+  "disables removing a column held by %s text for readers",
   (scope) => {
     mocks.admin = false;
     mocks.layers!.data = [layer(scope, "Held host text", "", "host-a")];
     page();
-    const remove = screen.getByRole("button", { name: "Remove Laptop row" });
+    const remove = screen.getByRole("button", { name: "Remove Laptop column" });
     expect(remove).toBeDisabled();
     expect(remove).toHaveAttribute("title", "Only administrators can clear saved text.");
   },
@@ -1002,7 +1009,7 @@ it.each(["hosts", "agents"] as const)(
     page("/settings/instructions?role=mother");
     fireEvent.click(
       screen.getByRole("button", {
-        name: axis === "hosts" ? "Remove Laptop row" : "Remove Codex column",
+        name: axis === "hosts" ? "Remove Laptop column" : "Remove Codex row",
       }),
     );
     const dialog = screen.getByRole("dialog");

@@ -207,36 +207,7 @@ function InstalledAgentsSettingsSection() {
           Search filters loaded agents. Load more to include older agents.
         </p>
       )}
-      <section className="mb-8" aria-label="Built-in agents">
-        <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Built-in &amp; server agents
-        </h2>
-        <div className="grid gap-3 @lg:grid-cols-2">
-          {builtins.map((agent) => (
-            <Link
-              key={agent.id}
-              to={agentPath(agent.id)}
-              componentId="settings.custom_agents.review_server"
-              className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
-            >
-              <span className="flex items-center gap-3 font-medium">
-                <BotIcon className="size-5 shrink-0" aria-hidden />
-                {agent.name}
-              </span>
-              <span className="text-ui text-muted-foreground">
-                {agent.description || "Server-provided agent"}
-              </span>
-            </Link>
-          ))}
-        </div>
-        <ListStatus
-          query={servers}
-          scope="server"
-          empty={builtins.length === 0}
-          emptyText={search ? "No matching server agents." : "No server agents."}
-        />
-      </section>
-      <section aria-label="Your agents">
+      <section className="mb-8" aria-label="Your agents">
         <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
           Yours
         </h2>
@@ -303,6 +274,35 @@ function InstalledAgentsSettingsSection() {
               ? "No matching agents in the loaded results."
               : "No custom agents yet. Create an agent to keep it available for new sessions."
           }
+        />
+      </section>
+      <section aria-label="Built-in agents">
+        <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Built-in &amp; server agents
+        </h2>
+        <div className="grid gap-3 @lg:grid-cols-2">
+          {builtins.map((agent) => (
+            <Link
+              key={agent.id}
+              to={agentPath(agent.id)}
+              componentId="settings.custom_agents.review_server"
+              className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
+            >
+              <span className="flex items-center gap-3 font-medium">
+                <BotIcon className="size-5 shrink-0" aria-hidden />
+                {agent.name}
+              </span>
+              <span className="text-ui text-muted-foreground">
+                {agent.description || "Server-provided agent"}
+              </span>
+            </Link>
+          ))}
+        </div>
+        <ListStatus
+          query={servers}
+          scope="server"
+          empty={builtins.length === 0}
+          emptyText={search ? "No matching server agents." : "No server agents."}
         />
       </section>
     </div>

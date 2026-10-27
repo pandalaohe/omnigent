@@ -1816,15 +1816,39 @@ function AppearanceSection() {
               <ModeControl />
             )}
             <div className="mt-4 border-t border-border pt-4">
-              <TerminalThemeControl />
+              <ColorThemeControl />
             </div>
             <div className="mt-4 border-t border-border pt-4">
-              <ColorThemeControl />
+              <TerminalThemeControl />
+            </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
+            <UiFontSizeControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <UiFontFamilyControl />
+            </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Code typography" testId="settings-group-code-type">
+            <UiCodeFontSizeControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <UiCodeFontFamilyControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <UiCodeFontWeightControl />
             </div>
           </SettingsGroup>
 
           <SettingsGroup title="Session defaults" testId="settings-group-chat">
             <TranscriptViewDefaultControl />
+          </SettingsGroup>
+
+          <SettingsGroup title="Workspace" testId="settings-group-workspace">
+            <WorkspacePanelDefaultControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <WorkspaceTabsControl />
+            </div>
           </SettingsGroup>
 
           <SettingsGroup title="Workspace layout" testId="settings-group-workspace-layout">
@@ -1849,30 +1873,6 @@ function AppearanceSection() {
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <HostColorsSettings />
-            </div>
-          </SettingsGroup>
-
-          <SettingsGroup title="Workspace" testId="settings-group-workspace">
-            <WorkspacePanelDefaultControl />
-            <div className="mt-4 border-t border-border pt-4">
-              <WorkspaceTabsControl />
-            </div>
-          </SettingsGroup>
-
-          <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
-            <UiFontSizeControl />
-            <div className="mt-4 border-t border-border pt-4">
-              <UiFontFamilyControl />
-            </div>
-          </SettingsGroup>
-
-          <SettingsGroup title="Code typography" testId="settings-group-code-type">
-            <UiCodeFontSizeControl />
-            <div className="mt-4 border-t border-border pt-4">
-              <UiCodeFontFamilyControl />
-            </div>
-            <div className="mt-4 border-t border-border pt-4">
-              <UiCodeFontWeightControl />
             </div>
           </SettingsGroup>
         </div>
@@ -2802,6 +2802,28 @@ function GeneralSection() {
             <AlwaysSteerControl />
           </div>
         </SettingsGroup>
+        <SettingsGroup title="Approvals & Questions" testId="settings-group-approvals">
+          <ApprovalTimeoutSettings />
+        </SettingsGroup>
+        <SettingsGroup title="Sound alerts" testId="settings-group-sound-alerts">
+          <SoundAlertSettings />
+        </SettingsGroup>
+        <SettingsGroup title="Terminal" testId="settings-group-terminal">
+          <TerminalClipboardControl />
+        </SettingsGroup>
+        <SettingsGroup title="Links" testId="settings-group-links">
+          <ArtifactSharingSettings />
+          {supportsBrowser() && (
+            <div className="mt-4 border-t border-border pt-4">
+              <OpenLinksInAppControl />
+            </div>
+          )}
+        </SettingsGroup>
+        {browserLoginBridge() && (
+          <SettingsGroup title="In-app browser" testId="settings-group-browser-login">
+            <BrowserLoginControl />
+          </SettingsGroup>
+        )}
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
           <ExpandableSettings
@@ -2841,24 +2863,6 @@ function GeneralSection() {
             <CliRetentionSettings />
           </ExpandableSettings>
         </SettingsGroup>
-        <SettingsGroup title="Approvals & Questions" testId="settings-group-approvals">
-          <ApprovalTimeoutSettings />
-        </SettingsGroup>
-        <SettingsGroup title="Sound alerts" testId="settings-group-sound-alerts">
-          <SoundAlertSettings />
-        </SettingsGroup>
-        <SettingsGroup title="Terminal" testId="settings-group-terminal">
-          <TerminalClipboardControl />
-        </SettingsGroup>
-        <SettingsGroup title="Links" testId="settings-group-links">
-          <ArtifactSharingSettings />
-          {supportsBrowser() && <OpenLinksInAppControl />}
-        </SettingsGroup>
-        {browserLoginBridge() && (
-          <SettingsGroup title="In-app browser" testId="settings-group-browser-login">
-            <BrowserLoginControl />
-          </SettingsGroup>
-        )}
       </div>
     </Section>
   );
@@ -3654,6 +3658,19 @@ function UpdatesSection() {
         </SettingsGroup>
       ) : (
         <div className="flex max-w-2xl flex-col gap-6">
+          <SettingsGroup title="Actions" testId="settings-group-update-actions">
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                onClick={() => void onCheck()}
+                loading={checking}
+                componentId="settings.updates.check_now"
+              >
+                Check for updates now
+              </Button>
+              {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
+            </div>
+          </SettingsGroup>
+
           <SettingsGroup title="Preferences" testId="settings-group-update-preferences">
             <label className="flex flex-col gap-2">
               <span className="text-ui font-normal md:font-medium">Update mode</span>
@@ -3689,19 +3706,6 @@ function UpdatesSection() {
                 aria-label="Install downloaded updates on next quit"
                 componentId="settings.updates.auto_install"
               />
-            </div>
-          </SettingsGroup>
-
-          <SettingsGroup title="Actions" testId="settings-group-update-actions">
-            <div className="flex flex-wrap items-center gap-3">
-              <Button
-                onClick={() => void onCheck()}
-                loading={checking}
-                componentId="settings.updates.check_now"
-              >
-                Check for updates now
-              </Button>
-              {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
             </div>
           </SettingsGroup>
 
@@ -3817,6 +3821,10 @@ function AccountSection() {
             (Admin group), so entering them keeps the settings surface put
             instead of navigating away from /settings. */}
 
+        {connectedAppsAvailable && (
+          <ConnectedAppsSettings pairingAvailable={browserAnnotationsAvailable} />
+        )}
+
         <div className="flex flex-col gap-1">
           {/* Change password is accounts-only — an OIDC identity's password
               lives with the IdP, so there's nothing to change here. */}
@@ -3842,9 +3850,6 @@ function AccountSection() {
             <LogOutIcon className="size-4" /> Sign out
           </Button>
         </div>
-        {connectedAppsAvailable && (
-          <ConnectedAppsSettings pairingAvailable={browserAnnotationsAvailable} />
-        )}
       </div>
 
       <Dialog
@@ -4521,99 +4526,6 @@ function ArchivedListPane({
         onChange={updateView}
       />
 
-      <div className="flex min-h-10 flex-wrap items-center gap-2 border-b px-2 py-1.5 text-xs text-muted-foreground">
-        <label htmlFor="archived-retention">Mark as expired after</label>
-        <Select
-          value={retentionDaysToSelectValue(retentionDays)}
-          onValueChange={(value) => {
-            const days = selectValueToRetentionDays(value);
-            setRetentionDays(days);
-            writeRetentionDays(days);
-          }}
-        >
-          <SelectTrigger
-            id="archived-retention"
-            aria-label="Mark archived sessions as expired after"
-            data-testid="archived-retention"
-            className="h-8 w-32 text-xs"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent position="popper" align="start">
-            {RETENTION_OPTIONS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        {expiredSessions.length > 0 && (
-          <span className="ml-auto flex items-center gap-1 text-destructive">
-            <ClockIcon className="size-3.5" />
-            {expiredSessions.length} expired on this page
-          </span>
-        )}
-        {deletableExpiredSessions.length > 0 && (
-          <Button
-            type="button"
-            variant="destructive"
-            size="sm"
-            data-testid="delete-expired"
-            disabled={bulkDelete.isPending}
-            onClick={() => setDeleteExpiredOpen(true)}
-          >
-            Delete expired
-          </Button>
-        )}
-      </div>
-
-      <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete expired sessions?</DialogTitle>
-            <DialogDescription>
-              {deletableExpiredSessions.length === 1
-                ? "1 owned archived session"
-                : deletableExpiredSessions.length + " owned archived sessions"}{" "}
-              older than {retentionDays} days on this page will be permanently deleted. Locked and
-              shared sessions are skipped. This cannot be undone.
-              {listQuery.data?.has_more && (
-                <span className="mt-2 block text-sm">
-                  More matching archived sessions exist on later pages; review those pages
-                  separately.
-                </span>
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteExpiredOpen(false)}
-              disabled={bulkDelete.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              disabled={bulkDelete.isPending}
-              onClick={() => {
-                bulkDelete.mutate({
-                  ids: deletableExpiredSessions.map((conversation) => conversation.id),
-                });
-                setDeleteExpiredOpen(false);
-              }}
-            >
-              Delete{" "}
-              {deletableExpiredSessions.length === 1
-                ? "1 session"
-                : deletableExpiredSessions.length + " sessions"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
       {selectionMode && (
         <div className="px-2 pt-2">
           <ArchivedBulkActionBar
@@ -4693,6 +4605,101 @@ function ArchivedListPane({
           )}
         </>
       )}
+      <details className="border-t px-2 py-3">
+        <summary className="cursor-pointer text-sm font-medium">Expiry &amp; deletion</summary>
+        <div className="flex min-h-10 flex-wrap items-center gap-2 border-b px-2 py-1.5 text-xs text-muted-foreground">
+          <label htmlFor="archived-retention">Mark as expired after</label>
+          <Select
+            value={retentionDaysToSelectValue(retentionDays)}
+            onValueChange={(value) => {
+              const days = selectValueToRetentionDays(value);
+              setRetentionDays(days);
+              writeRetentionDays(days);
+            }}
+          >
+            <SelectTrigger
+              id="archived-retention"
+              aria-label="Mark archived sessions as expired after"
+              data-testid="archived-retention"
+              className="h-8 w-32 text-xs"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              {RETENTION_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {expiredSessions.length > 0 && (
+            <span className="ml-auto flex items-center gap-1 text-destructive">
+              <ClockIcon className="size-3.5" />
+              {expiredSessions.length} expired on this page
+            </span>
+          )}
+          {deletableExpiredSessions.length > 0 && (
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              data-testid="delete-expired"
+              disabled={bulkDelete.isPending}
+              onClick={() => setDeleteExpiredOpen(true)}
+            >
+              Delete expired
+            </Button>
+          )}
+        </div>
+      </details>
+
+      <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete expired sessions?</DialogTitle>
+            <DialogDescription>
+              {deletableExpiredSessions.length === 1
+                ? "1 owned archived session"
+                : deletableExpiredSessions.length + " owned archived sessions"}{" "}
+              older than {retentionDays} days on this page will be permanently deleted. Locked and
+              shared sessions are skipped. This cannot be undone.
+              {listQuery.data?.has_more && (
+                <span className="mt-2 block text-sm">
+                  More matching archived sessions exist on later pages; review those pages
+                  separately.
+                </span>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setDeleteExpiredOpen(false)}
+              disabled={bulkDelete.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={bulkDelete.isPending}
+              onClick={() => {
+                bulkDelete.mutate({
+                  ids: deletableExpiredSessions.map((conversation) => conversation.id),
+                });
+                setDeleteExpiredOpen(false);
+              }}
+            >
+              Delete{" "}
+              {deletableExpiredSessions.length === 1
+                ? "1 session"
+                : deletableExpiredSessions.length + " sessions"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

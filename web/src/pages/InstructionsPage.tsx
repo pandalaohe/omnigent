@@ -204,7 +204,6 @@ export function InstructionsPage() {
             add specific guidance, or make one route independent.
           </p>
         </header>
-        <ChildSessionsPanel />
         {data.isError && (
           <p role="alert" className="text-sm text-destructive">
             {data.error.message}
@@ -406,6 +405,7 @@ export function InstructionsPage() {
           they next reconnect to the server.
           {!canEdit ? " Only administrators can edit these layers." : ""}
         </p>
+        <ChildSessionsPanel />
         {removal && (
           <RemoveAxisDialog
             name={removal.name}

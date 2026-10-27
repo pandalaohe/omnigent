@@ -217,7 +217,7 @@ describe("KeepWarmSettings table", () => {
   it("keeps the sticky corner above scrolling headers in one table layer", async () => {
     await mount();
     const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
-    const corner = within(table).getByRole("columnheader", { name: "Host / Agent" });
+    const corner = within(table).getByRole("columnheader", { name: "Agent / Host" });
     const headers = within(table)
       .getAllByRole("columnheader")
       .filter((header) => header !== corner);
@@ -234,23 +234,21 @@ describe("KeepWarmSettings table", () => {
     }
   });
 
-  it("distinguishes same-name harness columns and keeps editor targets consistent", async () => {
+  it("distinguishes same-name harness rows and keeps editor targets consistent", async () => {
     state.preview.columns = ["harness:pi", "harness:pi-native"];
     state.preview.cells = {
       h1: { "harness:pi": { child: true }, "harness:pi-native": { main: false, child: false } },
     };
     await mount();
     const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
-    const sdkHeader = within(table).getByRole("columnheader", { name: /^Pi · pi(?: |$)/ });
-    const nativeHeader = within(table).getByRole("columnheader", {
+    const sdkHeader = within(table).getByRole("rowheader", { name: /^Pi · pi(?: |$)/ });
+    const nativeHeader = within(table).getByRole("rowheader", {
       name: /^Pi · pi-native(?: |$)/,
     });
     expect(within(sdkHeader).getByText("Pi · pi", { exact: true })).toBeVisible();
     expect(within(nativeHeader).getByText("Pi · pi-native", { exact: true })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Remove Pi · pi column" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Remove Pi · pi-native column" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove Pi · pi row" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove Pi · pi-native row" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Pi · pi-native" }));
     expect(screen.getByRole("dialog", { name: "Hawk / Pi · pi-native" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
@@ -262,10 +260,8 @@ describe("KeepWarmSettings table", () => {
     expect(screen.getByRole("dialog", { name: "Hawk / Pi · pi" })).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Keep children warm" })).toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    fireEvent.click(screen.getByRole("button", { name: "Remove Pi · pi-native column" }));
-    expect(
-      screen.getByRole("dialog", { name: "Remove Pi · pi-native column?" }),
-    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Pi · pi-native row" }));
+    expect(screen.getByRole("dialog", { name: "Remove Pi · pi-native row?" })).toBeInTheDocument();
   });
 
   it("previews the authoritative payload without writing, retaining off columns and unknown hosts", async () => {
@@ -275,6 +271,13 @@ describe("KeepWarmSettings table", () => {
     };
     state.preview.columns.push("harness:claude-sdk");
     await mount();
+    const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
+    expect(
+      within(table)
+        .getAllByRole("columnheader")
+        .map((header) => header.textContent),
+    ).toEqual(["Agent / Host", "Server", "Hawkonline", "Owloffline", "removedUnavailable host"]);
+    expect(within(table).getByRole("rowheader", { name: "Claude Code Remove" })).toBeVisible();
     expect(
       screen.getByText("Converted from your previous settings · saved when you first edit"),
     ).toBeInTheDocument();
@@ -403,12 +406,12 @@ describe("KeepWarmSettings table", () => {
     view.unmount();
   });
 
-  it("fills only one host row and clamps each destination family's interval", async () => {
+  it("fills only one host column and clamps each destination family's interval", async () => {
     state.preview.cells = { h2: { ca_codex: { child: true, coldAfterSeconds: 0 } } };
     await mount();
     fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
     fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.click(screen.getByRole("button", { name: "Fill host row" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fill host column" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(latestCells()).toEqual({
       h2: { ca_codex: { child: true, coldAfterSeconds: 0 } },
@@ -420,7 +423,7 @@ describe("KeepWarmSettings table", () => {
     });
   });
 
-  it("fills only one agent column and clears Cold after Auto cleanly", async () => {
+  it("fills only one agent row and clears Cold after Auto cleanly", async () => {
     state.preview.cells = {
       h1: { "harness:claude-native": { coldAfterSeconds: 0 }, ca_codex: { child: true } },
     };
@@ -430,7 +433,7 @@ describe("KeepWarmSettings table", () => {
     fireEvent.change(screen.getByRole("spinbutton", { name: "Cold after in minutes" }), {
       target: { value: "" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Fill agent column" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fill agent row" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(latestCells()).toEqual({
       "": { "harness:claude-native": { main: true } },
@@ -452,11 +455,11 @@ describe("KeepWarmSettings table", () => {
     expect(screen.getByRole("button", { name: "Edit Hawk / Direct Claude" })).toHaveTextContent(
       "Main off",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Remove Direct Claude column" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Direct Claude row" }));
     expect(screen.getByRole("dialog")).toHaveTextContent(
       "Sessions may then follow matching harness cells",
     );
-    fireEvent.click(screen.getByRole("button", { name: /^Remove column$/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Remove row$/ }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(latestCells().h1).toEqual({ "harness:claude-native": { main: true } });
     expect(

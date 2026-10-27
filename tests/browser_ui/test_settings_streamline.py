@@ -231,6 +231,7 @@ def test_quota_default_and_registry_product_exception_persist(
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{appearance_url}/settings/instructions")
     section = page.locator('section[aria-labelledby="child-sessions-heading"]')
+    section.locator("summary").click()
     expect(section.get_by_role("textbox", name="All products")).to_have_value("")
     expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
     section.get_by_role("textbox", name="All products").fill("5h")
@@ -252,6 +253,7 @@ def test_quota_default_and_registry_product_exception_persist(
     assert saved["quotaPeriodDefault"] == "5h"
     assert saved["quotaPeriods"] == {"codex": "7d", "kite": "month"}
     page.reload()
+    section.locator("summary").click()
     expect(section.get_by_role("textbox", name="All products")).to_have_value("5h")
     expect(section.get_by_role("button", name="Edit Kite")).to_be_visible()
     expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()

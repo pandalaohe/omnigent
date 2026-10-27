@@ -248,10 +248,10 @@ export function ChildSessionsPanel() {
   return (
     <section
       aria-labelledby="child-sessions-heading"
-      className="rounded-xl border border-border bg-card p-4 sm:p-5"
+      className="rounded-lg border border-border p-4"
     >
       <div className="flex items-center gap-1.5">
-        <h2 id="child-sessions-heading" className="text-lg font-semibold">
+        <h2 id="child-sessions-heading" className="text-base font-semibold">
           Child sessions
         </h2>
         <HelpTip label="About child-session quota">
@@ -263,7 +263,7 @@ export function ChildSessionsPanel() {
         Set your child-session limit and choose which quota window guides new child sessions.
       </p>
       <StandingPassDefaults />
-      <div className="mt-4 grid gap-4 sm:grid-cols-2">
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <label className="block text-sm font-medium">
           Child session limit
           <Input
@@ -325,7 +325,8 @@ export function ChildSessionsPanel() {
           id="checkin-instructions"
           aria-describedby="checkin-instructions-help checkin-instructions-count"
           aria-invalid={Boolean(instructionsError)}
-          className="min-h-48 max-h-96 resize-y overflow-y-auto"
+          className="h-28 min-h-24 max-h-64 resize-y overflow-y-auto field-sizing-fixed"
+          rows={4}
           value={instructionsText}
           disabled={instructions === null && defaultInstructions === null}
           placeholder={
@@ -372,15 +373,23 @@ export function ChildSessionsPanel() {
           </p>
         )}
       </div>
-      <div className="mt-5 rounded-lg border border-border p-3">
-        <div className="flex items-center gap-1.5 text-sm font-medium">
+      <details className="mt-4 border-t border-border pt-3">
+        <summary className="cursor-pointer text-sm font-medium">
           Deciding period
+          <span className="ml-2 text-xs font-normal text-muted-foreground">
+            {draft.quotaPeriodDefault || "Automatic"}
+            {Object.keys(draft.quotaPeriods).length > 0 &&
+              ` · ${Object.keys(draft.quotaPeriods).length} exceptions`}
+          </span>
+        </summary>
+        <div className="mt-3 flex items-center gap-1.5 text-sm font-medium">
+          Quota window
           <HelpTip label="About deciding periods">
             Automatic uses the source-pinned window, or the tightest window when none is pinned.
             Period names can be 5h, 7d or month. An exception takes precedence for its product.
           </HelpTip>
         </div>
-        <label className="mt-3 block text-sm font-medium">
+        <label className="mt-3 block max-w-sm text-sm font-medium">
           All products
           <Input
             className="mt-1"
@@ -432,7 +441,7 @@ export function ChildSessionsPanel() {
             onRetry={registry.retry}
           />
         </div>
-      </div>
+      </details>
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <Button type="button" onClick={save}>
           Save child settings

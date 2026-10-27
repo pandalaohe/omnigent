@@ -762,11 +762,11 @@ describe("SettingsPage", () => {
     expect(await screen.findByRole("tooltip")).toHaveTextContent("System");
   });
 
-  it("renders Terminal theme before Color theme", () => {
+  it("renders Color theme before Terminal theme", () => {
     renderPage("/settings/appearance");
     const terminal = screen.getByText("Terminal theme");
     const color = screen.getByText("Color theme");
-    expect(terminal.compareDocumentPosition(color) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(color.compareDocumentPosition(terminal) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("persists dark and light terminal theme choices on card click", () => {
@@ -1829,6 +1829,9 @@ describe("SettingsPage", () => {
     renderPage("/settings/archived");
 
     expect(screen.getAllByText("Expired")).toHaveLength(3);
+    expect(screen.getByTestId("archived-retention")).not.toBeVisible();
+    fireEvent.click(screen.getByText("Expiry & deletion"));
+    expect(screen.getByTestId("archived-retention")).toBeVisible();
     expect(screen.getByText("3 expired on this page")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("delete-expired"));
     fireEvent.click(screen.getByRole("button", { name: "Delete 1 session" }));
