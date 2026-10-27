@@ -716,8 +716,8 @@ def test_git_list_changed_files_honors_env_timeout(tmp_path: Path, monkeypatch) 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     reg.list_changed_files("any-conv", limit=100)
 
-    assert seen["timeout"] == pytest.approx(42.0), (
-        f"Expected the env-overridden 42s timeout, got {seen['timeout']!r}."
+    assert seen["timeout"] is not None and 40 < seen["timeout"] <= 42, (
+        f"Expected remaining budget after callback snapshots, got {seen['timeout']!r}."
     )
 
 

@@ -65,6 +65,7 @@ from omnigent.config import (
     load_local_config,
     resolve_effective_config,
 )
+from omnigent.git_commands import run_git
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
     DAEMON_CONFIG_SIG_ENV_VAR,
@@ -9677,7 +9678,7 @@ def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[s
         git_missing = False
         for _attempt in range(_CUSTOM_HOST_LOOKUP_ATTEMPTS):
             try:
-                result = subprocess.run(
+                result = run_git(
                     ["git", "ls-remote", repo_url, label],
                     capture_output=True,
                     text=True,
@@ -12977,13 +12978,13 @@ def _bundle_untrusted_dir(source: Path) -> bytes:
 
 def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts."""
-    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
+    cmd = ["git", "-c", "protocol.allow=never",
            "-c", "protocol.https.allow=always", "clone", "--depth", "1",
            "--no-recurse-submodules", "--quiet"]  # fmt: skip
     if ref:
         cmd += ["--branch", ref]
     try:
-        proc = subprocess.run(
+        proc = run_git(
             [*cmd, "--", clone_url, str(dest)],
             capture_output=True,
             text=True,

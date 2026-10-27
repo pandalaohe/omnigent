@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.git_commands import git_shell_argv
 from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_SIGTERM_EXIT_CODE
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes import types as _sandbox_types
@@ -1093,7 +1094,9 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             on_stage("cloning")
         clone_dir = f"{workspace}/{repo_name}"
         command = shlex.join(
-            ["git", "clone", *git_clone.clone_args(repo_branch), "--", repo_url, clone_dir]
+            git_shell_argv(
+                ["clone", *git_clone.clone_args(repo_branch), "--", repo_url, clone_dir]
+            )
         )
         try:
             self.run(

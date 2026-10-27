@@ -1185,7 +1185,10 @@ def test_list_worktrees_non_git_path_fails(tmp_path: Path) -> None:
 def test_list_worktrees_preserves_invalid_config_error(git_repo: Path) -> None:
     """A broken config is not evidence that an existing repository is non-Git."""
     (git_repo / ".git" / "config").write_text("[broken\n")
-    with pytest.raises(WorktreeError, match=r"git worktree list failed.*bad config line"):
+    with pytest.raises(
+        WorktreeError,
+        match=r"git command could not start: Git callback configuration snapshot failed",
+    ):
         list_worktrees(repo_path=str(git_repo))
 
 

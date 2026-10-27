@@ -98,7 +98,11 @@ async def test_policy_reaches_launch_relaunch_and_missing_workspace_wake(db_uri:
     await relaunch_managed_host(host=host, config=config, host_store=store, repos=repos)
     store.set_offline(launch.host_id)
     await resume_managed_host(launch.host_id, store, config, repos=repos)
-    clones = [cmd for cmd in fake.commands if cmd.startswith("git clone")]
+    clones = [
+        cmd
+        for cmd in fake.commands
+        if cmd.startswith("python3 -I -m omnigent.git_commands -- clone")
+    ]
     assert len(clones) == 3
     assert all(
         "--branch main --single-branch --depth 50 --filter=blob:none --no-tags --" in cmd

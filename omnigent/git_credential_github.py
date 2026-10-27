@@ -53,6 +53,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from omnigent.git_commands import run_git
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 
@@ -128,7 +129,7 @@ def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, 
 def _git_config(*args: str) -> None:
     """Run ``git config --global`` best-effort (never raises; git may be absent)."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(
+        run_git(
             ["git", "config", "--global", *args],
             check=False,
             capture_output=True,

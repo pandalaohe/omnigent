@@ -55,9 +55,13 @@ def test_exec_and_kubernetes_quote_identical_clone_options() -> None:
         server_url="https://example.test",
         repos=[repo],
     )
-    clone = next(command for command in launcher.commands if command.startswith("git clone"))
+    clone = next(
+        command
+        for command in launcher.commands
+        if command.startswith("python3 -I -m omnigent.git_commands -- clone")
+    )
     args = shlex.split(clone)
-    assert args[2:-2] == [
+    assert args[6:-2] == [
         "--branch",
         "release;literal",
         "--no-single-branch",

@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import click
 
+from omnigent.git_commands import git_shell_argv
 from omnigent.host.identity import (
     HOST_ID_ENV_VAR,
     HOST_NAME_ENV_VAR,
@@ -511,13 +512,14 @@ def _render_workspace_prep_command(
         expected_helpers = ["", helper]
         wire = (
             "import os,subprocess,sys; import omnigent.git_credential_github as g; "
+            "from omnigent.git_commands import run_git; "
             "cfg=g._git_config; _=g._install_broker_helper; "
             "g._install_broker_helper=lambda *_:("
             f"cfg('--replace-all',{helper_key!r},''),"
             f"cfg('--add',{helper_key!r},{helper!r})); "
             f"token=(os.environ.get({HOST_TOKEN_ENV_VAR!r}) or '').strip(); "
             f"wired=g.configure_clone_credentials({server_url!r},{host_id!r}); "
-            "helpers=(subprocess.run(['git','config','--global','--get-all',"
+            "helpers=(run_git(['git','config','--global','--get-all',"
             f"{helper_key!r}],check=True,capture_output=True,text=True).stdout.splitlines() "
             "if wired is True else []); "
             f"verified=(bool(token) and wired is True and helpers=={expected_helpers!r}); "
@@ -586,14 +588,15 @@ def _render_workspace_prep_command(
             clone_dir = f"{workspace}/{dirname}"
             staging_dir = f"{workspace}/{staging}"
             clone = shlex.join(
-                [
-                    "git",
-                    "clone",
-                    *repo.git_clone.clone_args(repo.branch),
-                    "--",
-                    repo.url,
-                    f"{staging_dir}/clone",
-                ]
+                git_shell_argv(
+                    [
+                        "clone",
+                        *repo.git_clone.clone_args(repo.branch),
+                        "--",
+                        repo.url,
+                        f"{staging_dir}/clone",
+                    ]
+                )
             )
             target = shlex.quote(clone_dir)
             gitfile = shlex.quote(f"{clone_dir}/.git")
@@ -607,14 +610,17 @@ def _render_workspace_prep_command(
             staging_error = shlex.quote(
                 f"Staging path {staging_dir} is not owned by workspace prep; refusing to remove it"
             )
+            guarded_git = shlex.join(git_shell_argv([]))
             script += (
                 f"if ! {{ [ ! -f {gitfile} ] || "
                 f"awk 'END {{ exit (NR == 1 ? 0 : 1) }}' {gitfile}; }} ||\n"
                 f"   ! {{ [ -e {gitfile} ] && ( unset GIT_DIR GIT_WORK_TREE; "
                 f"target_dir=$(cd -P -- {target} && pwd) || exit 1; "
-                f"git_dir=$(git -C {target} rev-parse --absolute-git-dir 2>/dev/null) || exit 1; "
+                f"git_dir=$({guarded_git} -C {target} rev-parse --absolute-git-dir "
+                "2>/dev/null) || exit 1; "
                 'case "$git_dir" in "$target_dir"/*) ;; *) exit 1;; esac; '
-                f"prefix=$(git -C {target} rev-parse --show-prefix 2>/dev/null) || exit 1; "
+                f"prefix=$({guarded_git} -C {target} rev-parse --show-prefix "
+                "2>/dev/null) || exit 1; "
                 '[ -z "$prefix" ] ); }; then\n'
             )
             script += f"  if [ -e {target} ] || [ -L {target} ]; then\n"

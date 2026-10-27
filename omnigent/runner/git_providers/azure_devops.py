@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 from urllib.parse import quote
 
+from omnigent.git_commands import run_git
 from omnigent.git_providers.azure_devops import (
     AzureRepo,
     canonical_pr_url,
@@ -108,7 +109,7 @@ def _git(
 ) -> subprocess.CompletedProcess[bytes] | None:
     """Run ``git -C root``, or return ``None`` when git cannot start or times out."""
     try:
-        return subprocess.run(
+        return run_git(
             ["git", "-C", root, *args],
             stdin=subprocess.DEVNULL,
             capture_output=True,

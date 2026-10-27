@@ -36,6 +36,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from omnigent.git_commands import run_git
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows has no flock.
@@ -973,7 +975,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """Return whether the shared repository config already enables the cache."""
         started_at = time.perf_counter()
         try:
-            result = subprocess.run(
+            result = run_git(
                 ["git", "config", "--bool", "--get", "core.untrackedCache"],
                 cwd=str(self._git_root),
                 capture_output=True,
@@ -999,10 +1001,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """Probe filesystem support and enable the optional Git index extension."""
         probe_started_at = time.perf_counter()
         try:
-            probe = subprocess.run(
-                # A hook-based fsmonitor would run here with this process's
-                # privileges; the probe does not need it.
-                ["git", "-c", "core.fsmonitor=false", "update-index", "--test-untracked-cache"],
+            probe = run_git(
+                ["git", "update-index", "--test-untracked-cache"],
                 cwd=str(self._git_root),
                 env=_anchored_git_env(),
                 capture_output=True,
@@ -1026,7 +1026,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         config_started_at = time.perf_counter()
         try:
-            config = subprocess.run(
+            config = run_git(
                 ["git", "config", "core.untrackedCache", "true"],
                 cwd=str(self._git_root),
                 capture_output=True,
@@ -1073,11 +1073,11 @@ class GitFilesystemRegistry(FilesystemRegistry):
             # Outside the repository, or unresolvable (a symlink loop raises
             # RuntimeError on Python 3.12 and OSError on later versions).
             return None
-        argv = ["git", "-C", str(self._git_root), "-c", "core.fsmonitor=false", "ls-files", "-z"]
+        argv = ["git", "-C", str(self._git_root), "ls-files", "-z"]
         if pathspec != ".":
             argv += ["--", f":(literal){pathspec}"]
         try:
-            result = subprocess.run(
+            result = run_git(
                 argv,
                 capture_output=True,
                 timeout=_git_timeout_seconds(),
@@ -1130,7 +1130,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
         try:
-            result = subprocess.run(
+            result = run_git(
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
@@ -1228,7 +1228,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         argv = ["git", "status", "--porcelain", "--", git_path]
         started = time.monotonic()
         try:
-            result = subprocess.run(
+            result = run_git(
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
@@ -1296,7 +1296,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             return None
 
         try:
-            result = subprocess.run(
+            result = run_git(
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
@@ -1400,7 +1400,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
         try:
-            result = subprocess.run(
+            result = run_git(
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,

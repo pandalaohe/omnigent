@@ -705,6 +705,10 @@ def test_github_file_diff_partial_blob_fetch_failure(repo: Path) -> None:
     assert added["after"] == "new content"
 
     _run(["git", "remote", "set-url", "origin", repo.as_uri()], clone)
+    with pytest.raises(OmnigentError, match="partial clone"):
+        github_file_diff(str(clone), "main", "fileA.py")
+    # Internal reads do not fetch; the user's explicit Git still can retrieve the blob.
+    _run(["git", "show", "origin/main:fileA.py"], clone)
     diff = github_file_diff(str(clone), "main", "fileA.py")
     assert diff["before"] == "A base"
     assert diff["after"] == "A changed"

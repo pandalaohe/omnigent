@@ -3417,7 +3417,7 @@ class _CodexAppServerSession:
         codex_version = None
         try:
             if router_bridge_dir is not None or (
-                os.name == "posix"
+                os.name in {"posix", "nt"}
                 and await asyncio.to_thread(
                     lambda: detect_git_root(Path(self._cwd or os.getcwd()).resolve()) is not None
                 )
@@ -3427,6 +3427,11 @@ class _CodexAppServerSession:
                     if CODEX_RUNTIME_BIN_ENV in self._env
                     else await _codex_cli_version(self._codex_path)
                 )
+                if os.name == "nt" and codex_version is None:
+                    logger.warning(
+                        "Codex Windows workspace permission profile disabled: "
+                        "Codex version is unavailable"
+                    )
         except Exception:  # noqa: BLE001 - profile discovery keeps the legacy launch.
             logger.warning("Failed to probe Codex permission profile support", exc_info=True)
         if router_bridge_dir is not None:
@@ -3478,7 +3483,7 @@ class _CodexAppServerSession:
             )
         self._workspace_profile = None
         self._workspace_profile_cwd = None
-        if os.name == "posix" and codex_version is not None:
+        if os.name in {"posix", "nt"} and codex_version is not None:
             config_path = self._codex_home_dir / "config.toml"
 
             def build_profile() -> tuple[Path, CodexWorkspaceProfile | None]:
@@ -3492,6 +3497,7 @@ class _CodexAppServerSession:
                     server_overrides=self._codex_config_overrides,
                     launch_args=(),
                     codex_version=codex_version,
+                    windows_sdk=os.name == "nt",
                     workspace_write_stance=(
                         _sandbox_mode(self._os_env_spec) == "workspace-write"
                         or any(
