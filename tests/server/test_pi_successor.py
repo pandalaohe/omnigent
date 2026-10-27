@@ -31,6 +31,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -131,6 +132,52 @@ async def test_successor_is_stable_and_copies_only_configuration(
         <= target.labels.items()
     )
     assert PERMISSION_CAPABILITY_LABEL_KEY not in target.labels
+
+
+@pytest.mark.parametrize("deleted_project", [False, True])
+@pytest.mark.parametrize("title", ["Saved name", None])
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi", "pi-native"])
+async def test_native_successor_preserves_project_and_title(
+    app: FastAPI,
+    store: SqlAlchemyConversationStore,
+    db_uri: str,
+    deleted_project: bool,
+    title: str | None,
+    harness: str,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create("c" * 32, "Native project", user_id=None)
+    labels = (
+        {
+            **ConfirmedPermissionState("ask", 2, "ready").labels(harness),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        }
+        if harness in {"pi", "pi-native"}
+        else {}
+    )
+    source = store.create_conversation(
+        agent_id=AGENT_ID,
+        runner_id=RUNNER_ID,
+        harness_override=harness,
+        project_id=project.id,
+        title=title,
+        workspace="/opt/work/project",
+        labels=labels,
+    )
+    if deleted_project:
+        assert projects.delete(project.id, user_id=None)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/v1/sessions/{source.id}/successor")
+
+    assert response.status_code == 200, response.text
+    target = store.get_conversation(response.json()["id"])
+    assert target is not None
+    assert target.title == title
+    assert target.workspace == "/opt/work/project"
+    assert target.project_id == (None if deleted_project else project.id)
 
 
 async def test_metadata_failure_resumes_same_successor(

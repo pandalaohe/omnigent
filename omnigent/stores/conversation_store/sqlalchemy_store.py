@@ -1632,6 +1632,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), successor_id)
             )
             if target_meta is None:
+                project_id = source_meta.project_id
+                if (
+                    project_id is not None
+                    and session.get(SqlProject, (current_workspace_id(), project_id)) is None
+                ):
+                    project_id = None
                 session.add(
                     _new_session_metadata_row(
                         successor_id,
@@ -1640,7 +1646,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         worktree=source_meta.worktree,
                         git_branch=source_meta.git_branch,
                         terminal_launch_args=terminal_launch_args,
-                        project_id=source_meta.project_id,
+                        project_id=project_id,
                         host_id=source_meta.host_id,
                         inference_snapshot=source_meta.inference_snapshot,
                     )
