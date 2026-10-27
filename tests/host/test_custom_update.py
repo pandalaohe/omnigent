@@ -326,7 +326,7 @@ def test_custom_update_rollback_does_not_fall_back_to_second_source(
     assert drained == []
     assert paused == []
     assert len(calls) == 2
-    assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
+    assert [call[3] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
 
 
 @pytest.mark.parametrize("is_windows", [False, True])
@@ -792,6 +792,7 @@ def test_custom_host_channel_lookup_falls_back_after_failed_source(
     assert calls[0] == [
         "git",
         "ls-remote",
+        "--upload-pack=git-upload-pack",
         "ssh://git@fn.example.invalid/srv/git/omnigent.git",
         "local/host-custom",
     ]
@@ -830,7 +831,7 @@ def test_custom_host_channel_lookup_without_fallback_tries_only_first_source(
     assert first in message
     assert second not in message
     assert len(calls) == 2
-    assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
+    assert [call[3] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
 
 
 def test_custom_host_channel_lookup_falls_back_when_branch_missing(
