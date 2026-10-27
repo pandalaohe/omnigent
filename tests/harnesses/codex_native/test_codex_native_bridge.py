@@ -1343,6 +1343,12 @@ def _make_unmarked_bridge(root: Path, *, inactive_since: float) -> tuple[Path, P
         "scan-error",
         "replaced-lock",
         "staging-symlink",
+        "unrelated-mount",
+        "own-mount",
+        "mixed-warnings",
+        "two-mounts",
+        "invalid-device",
+        "nested-mount",
     ],
 )
 def test_prune_orphan_plugin_bundle(
@@ -1405,6 +1411,32 @@ def test_prune_orphan_plugin_bundle(
         external = tmp_path / "external"
         external.mkdir()
         (bridge_dir / "codex-home" / "tmp").symlink_to(external, target_is_directory=True)
+    if guard == "nested-mount":
+        nested = plugins / "mounted"
+        nested.mkdir()
+        for path in (plugins, nested):
+            os.utime(path, (aged, aged))
+        lstat = Path.lstat
+
+        def mounted_stat(path: Path) -> os.stat_result:
+            info = lstat(path)
+            if path == nested:
+                fields = list(info)
+                fields[2] = 0x36000113
+                return os.stat_result(fields)
+            return info
+
+        monkeypatch.setattr(Path, "lstat", mounted_stat)
+    mount_cases = {
+        "unrelated-mount",
+        "own-mount",
+        "mixed-warnings",
+        "two-mounts",
+        "invalid-device",
+        "nested-mount",
+    }
+    if guard in mount_cases:
+        monkeypatch.setattr(codex_native_bridge.sys, "platform", "darwin")
     fresh_path = {"fresh": plugin, "fresh-sha": sha, "fresh-lock": lock, "fresh-dir": plugins}.get(
         guard
     )
@@ -1440,6 +1472,26 @@ def test_prune_orphan_plugin_bundle(
             result = subprocess.CompletedProcess(
                 [], 1, output, "warning" if guard == "probe-error" else ""
             )
+            if guard in mount_cases:
+                device = 0x36000113  # Captured Time Machine mount-table device ID.
+                if guard == "own-mount":
+                    device = lock.stat().st_dev & 0xFFFFFFFF
+                else:
+                    assert device != lock.stat().st_dev & 0xFFFFFFFF
+                # Captured macOS lsof 4.91 warning, with a neutral mount path.
+                result.stderr = (
+                    "lsof: WARNING: can't stat() smbfs file system /mnt/backup\n"
+                    "      Output information may be incomplete.\n"
+                    f'      assuming "dev={device:x}" from mount table\n'
+                )
+                if guard == "mixed-warnings":
+                    result.stderr += "lsof: unexpected inspection warning\n"
+                if guard == "two-mounts":
+                    result.stderr += result.stderr.replace(
+                        f"dev={device:x}", f"dev={lock.stat().st_dev & 0xFFFFFFFF:x}"
+                    )
+                if guard == "invalid-device":
+                    result.stderr = result.stderr.replace(f"dev={device:x}", "dev=100000000")
             with patch.object(codex_native_bridge.subprocess, "run", return_value=result):
                 return probe(paths, lock_fd)
 
@@ -1449,7 +1501,9 @@ def test_prune_orphan_plugin_bundle(
             if path == lock and guard == "missing-lock":
                 assert not path.exists()
                 continue
-            removed = guard == "none" or (guard == "partial-delete" and path == plugins)
+            removed = guard in {"none", "unrelated-mount"} or (
+                guard == "partial-delete" and path == plugins
+            )
             assert path.exists() != removed
         if guard == "partial-delete":
             assert list((bridge_dir / "codex-home" / "tmp").glob("plugins-trim-*/plugins/.git"))

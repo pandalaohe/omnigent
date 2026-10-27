@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -406,16 +407,43 @@ def _plugin_bundle_expired(paths: list[Path]) -> bool:
 
     try:
         for path in paths:
-            if path.lstat().st_mtime > cutoff:
+            root_stat = path.lstat()
+            if root_stat.st_mtime > cutoff:
                 return False
             if path.is_dir():
                 for directory, dirs, files in os.walk(path, onerror=scan_error, followlinks=False):
                     for name in dirs + files:
-                        if (Path(directory) / name).lstat().st_mtime > cutoff:
+                        info = (Path(directory) / name).lstat()
+                        # lsof +D does not inspect nested filesystems by default.
+                        if info.st_dev != root_stat.st_dev or info.st_mtime > cutoff:
                             return False
     except OSError:
         return False
     return True
+
+
+def _plugin_bundle_warnings_relevant(warnings: str, paths: list[Path]) -> bool:
+    """Only ignore Darwin mount warnings proven to name other devices."""
+    if not warnings:
+        return False
+    if sys.platform != "darwin":
+        return True
+    try:
+        devices = {path.stat().st_dev & 0xFFFFFFFF for path in paths}
+    except OSError:
+        return True
+    # Darwin lsof prints its mount-table fallback st_dev with C's unsigned %x.
+    pattern = (
+        r"lsof: WARNING: can't stat\(\) \S+ file system /[^\n]+\n"
+        r"      Output information may be incomplete\.\n"
+        r'      assuming "dev=([0-9a-fA-F]{1,8})" from mount table\n'
+    )
+    consumed = 0
+    for warning in re.finditer(pattern, warnings):
+        if warning.start() != consumed or int(warning[1], 16) in devices:
+            return True
+        consumed = warning.end()
+    return consumed != len(warnings)
 
 
 def _plugin_bundle_in_use(paths: list[Path], lock_fd: int) -> bool:
@@ -429,7 +457,7 @@ def _plugin_bundle_in_use(paths: list[Path], lock_fd: int) -> bool:
         result = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return True
-    if result.stderr or result.returncode not in {0, 1}:
+    if result.returncode not in {0, 1} or _plugin_bundle_warnings_relevant(result.stderr, paths):
         return True
     # Unmatched bundle members make lsof return 1 even with our lock listed.
     pid = ""
