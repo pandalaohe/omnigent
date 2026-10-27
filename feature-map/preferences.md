@@ -22,6 +22,11 @@ available through the CLI or UI yet.
   supported setting in an existing session; keep the two composers distinct.
 - `shared-scopes`: foundation only; requested values and their sources remain
   distinct across shared, machine, project, and session scopes.
+- `standing-pass`: choose defaults for new parent sessions, inspect the current
+  pass in a session header, revoke a kind, and grant it back after approval.
+  Children inherit the parent's current pass and show read-only controls.
+- `project-orchestration`: inspect a project's child limit, setup, removed pass
+  kinds and exceptions without changing them through the generic defaults form.
 
 ## How to get to it (user POV)
 
@@ -47,6 +52,17 @@ tab shows inventory; both are covered in [Native harnesses](./native-harnesses.m
 preferences, saving shared or machine defaults, removing a machine override,
 resolving conflicts, or continuing with temporary defaults. Add the actual
 routes and their journey tests here as those controls are implemented.
+
+**Standing pass:** Settings → Instructions → Child sessions → Default standing
+pass controls the defaults for new parent sessions. In an existing session,
+open the shield chip in the header to inspect active and revoked kinds and
+exceptions. Parent sessions offer Revoke and Grant back; Grant back waits for an
+approval in that conversation. The same chip in a child session is read-only.
+The desktop and phone headers both expose the chip.
+
+**Project orchestration:** project folder actions → Project settings → Session
+defaults → Session orchestration shows the project's stored overrides. Changes
+through the agent's project settings tool retain their approval requirement.
 
 ## Driving it with the repro environment
 
@@ -108,7 +124,25 @@ persistence/reload and affected consumers where implemented. Identify the mapped
 entry points exercised, any mocked services, and remaining gaps. Supplying layers
 directly to the resolver does not verify the live path.
 
+**Standing pass and project orchestration:** component coverage lives in
+`web/src/components/StandingPassDefaults.test.tsx`,
+`web/src/components/StandingPassChip.test.tsx`,
+`web/src/components/ProjectOrchestrationView.test.tsx`, and
+`web/src/lib/sessionEvents.test.ts`. Server approval and descendant-event
+coverage lives in `tests/server/test_standing_pass.py`.
+For a browser drive, choose Install in defaults, create a fresh parent and child,
+and open both chips. Revoke Install on the parent: the child's chip must update
+without a reload and offer no mutation buttons. Grant it back, confirm it stays
+revoked while the approval is pending, then approve in the conversation and
+confirm both chips update. Repeat at desktop and phone width. Open project
+settings and compare Session orchestration with the stored project config.
+
 ## Gotchas
+
+- Standing pass defaults are snapshotted for a new parent; preference edits do
+  not alter an existing parent's pass. Project exceptions and actions requiring
+  explicit approval continue to apply. A chip describes advisory permissions,
+  not a permission-policy bypass.
 
 - `--global` means this machine's user YAML, not a shared workspace write.
   Reading or editing YAML does not opt into shared preferences.

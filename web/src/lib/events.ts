@@ -1046,7 +1046,13 @@ export interface ArtifactOpenRequestEvent {
 
 // ── Union type for all events ────────────────────────────
 
+export interface SessionStandingPassEvent {
+  type: "session_standing_pass";
+  conversationId: string;
+}
+
 export type StreamEvent =
+  | SessionStandingPassEvent
   | ResponseCreated
   | ResponseQueued
   | ResponseInProgress

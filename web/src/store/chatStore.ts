@@ -8216,6 +8216,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
   };
 
   switch (event.type) {
+    case "session_standing_pass":
+      if (event.conversationId === sourceConversationId) {
+        void queryClient?.invalidateQueries({ queryKey: ["standing-pass", event.conversationId] });
+      }
+      return;
     case "response_completed":
     case "response_failed":
       // Prefer contextTokens (last sub-call total) for the context ring — on

@@ -43,6 +43,20 @@ function parse(event: string, data: Record<string, unknown>): StreamEvent[] {
   return [...parseEventLines([JSON.stringify({ event, data })])];
 }
 
+describe("session.standing_pass", () => {
+  it("identifies the session to refresh and rejects malformed events", () => {
+    expect(
+      parse("session.standing_pass", {
+        conversation_id: "child",
+        root_id: "mother",
+        record: { kinds: [] },
+      }),
+    ).toEqual([{ type: "session_standing_pass", conversationId: "child" }]);
+    expect(parse("session.standing_pass", {})).toEqual([]);
+    expect(parse("session.standing_pass", { conversation_id: 4 })).toEqual([]);
+  });
+});
+
 describe("session.status (FLAT envelope)", () => {
   it("lifts conversation_id and status", () => {
     const out = parse("session.status", {

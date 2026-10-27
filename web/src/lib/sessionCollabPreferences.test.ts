@@ -16,6 +16,23 @@ afterEach(() => {
 });
 
 describe("session collab preferences", () => {
+  it("normalizes standing pass kinds and preserves them on unrelated writes", () => {
+    writeSessionCollabPreferences({
+      ...SESSION_COLLAB_DEFAULTS,
+      standingPassDefault: ["install", " local   preview ", "install"],
+    });
+    expect(readSessionCollabPreferences().standingPassDefault).toEqual([
+      "install",
+      "local preview",
+    ]);
+    writeSessionCollabPreferences({ ...readSessionCollabPreferences(), childCap: 2 });
+    expect(readSessionCollabPreferences().standingPassDefault).toEqual([
+      "install",
+      "local preview",
+    ]);
+    localStorage.setItem(SESSION_COLLAB_STORAGE_KEY, JSON.stringify({ standingPassDefault: [""] }));
+    expect(readSessionCollabPreferences().standingPassDefault).toEqual([]);
+  });
   it("defaults to the server defaults with nothing stored", () => {
     expect(SESSION_COLLAB_DEFAULTS.openRateCount).toBe(10);
     expect(SESSION_COLLAB_DEFAULTS.childKeepWarmEnabled).toBe(false);

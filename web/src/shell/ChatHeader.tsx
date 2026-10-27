@@ -53,6 +53,8 @@ import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { StandingPassChip } from "@/components/StandingPassChip";
+import { isEditorLevel } from "@/lib/permissionsApi";
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -657,6 +659,13 @@ export function ChatHeader({
       </div>
 
       <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
+        {!pending && conversationId && (
+          <StandingPassChip
+            key={conversationId}
+            sessionId={conversationId}
+            readOnly={isChildSession || archived || !isEditorLevel(permissionLevel ?? null)}
+          />
+        )}
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
