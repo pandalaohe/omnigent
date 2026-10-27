@@ -1840,7 +1840,8 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("queue_mode", [False, True])
+async def test_end_to_end_against_fake_acp_agent(tmp_path: Path, queue_mode) -> None:
     agent_path = tmp_path / "fake_acp_agent.py"
     agent_path.write_text(_FAKE_ACP_AGENT)
     command = shlex.join([sys.executable, str(agent_path)])
@@ -1854,10 +1855,31 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
 
     ex._elicitation_handler = elicit  # type: ignore[assignment]
 
+    from omnigent.startup_evidence import startup_evidence_scope
+    from omnigent.startup_protocol import StartupAttemptRef
+
+    ref = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="runtime",
+        host_generation="generation",
+        mode="startup_only",
+    )
+    observed, claims = [], []
+
+    async def claim(attempt, boundary):
+        assert ex._proc is None
+        claims.append((attempt, boundary))
+        return True
+
     events = []
     try:
-        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], "you are a bot"):
-            events.append(ev)
+        with startup_evidence_scope(ref if queue_mode else None, observed.append, claim):
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], "you are a bot"):
+                events.append(ev)
+        assert claims == ([(ref, "executor_prepare")] if queue_mode else [])
+        assert [item.phase for item in observed] == (["opening_settled"] if queue_mode else [])
     finally:
         await ex.close()
 

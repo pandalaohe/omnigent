@@ -1,8 +1,9 @@
 """Runner cache reconciliation accepts only current, owned startup observations."""
 
+import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx
@@ -28,7 +29,7 @@ from omnigent.stores.session_startup_store import SessionStartupStore
 from tests.server.test_host_registry import FakeWebSocket
 
 
-def _startup(app, db_uri, *, owner=None, source="codex"):
+def _startup(app, db_uri, *, owner=None, source="codex", mode="guarded", empty=False):
     conversations = SqlAlchemyConversationStore(db_uri)
     startups = SessionStartupStore(db_uri)
     hosts = app.state.host_registry
@@ -45,7 +46,11 @@ def _startup(app, db_uri, *, owner=None, source="codex"):
                 frame_protocol_version=1,
                 name="sample-host",
                 connection_id="generation",
-                capabilities=["startup_admission_v1", f"startup_receipts:{source}"],
+                capabilities=(
+                    ["startup_queue_v1"]
+                    if mode == "startup_only"
+                    else ["startup_admission_v1", f"startup_receipts:{source}"]
+                ),
             ),
             owner=owner,
         )
@@ -53,25 +58,34 @@ def _startup(app, db_uri, *, owner=None, source="codex"):
     conversations.set_host_id(conversation.id, host_id, "/opt/work/project")
     runner_id = token_bound_runner_id("sample-binding")
     conversations.set_runner_id(conversation.id, runner_id)
-    [item] = conversations.append(
-        conversation.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id=PENDING_INPUT_RESPONSE_ID,
-                status="in_progress",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": "work"}]),
-            )
-        ],
+    item = None
+    if not empty:
+        [item] = conversations.append(
+            conversation.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=PENDING_INPUT_RESPONSE_ID,
+                    status="in_progress",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "work"}]
+                    ),
+                )
+            ],
+        )
+    startups.configure(
+        host_id,
+        mode=mode,
+        host_resident_limit=2 if mode == "guarded" else None,
+        deployment_resident_limit=2 if mode == "guarded" else None,
     )
-    startups.configure(host_id, host_resident_limit=2, deployment_resident_limit=2)
     startups.register_host_generation(host_id, conn.startup_generation)
     queued = startups.enqueue(
         owner_user_id="owner",
         host_id=host_id,
         session_id=conversation.id,
         operation_key="create",
-        input_id=item.id,
+        input_id=item.id if item is not None else None,
     )
     attempt = startups.reserve(host_id)
     assert startups.claim_boundary(
@@ -85,9 +99,11 @@ def _startup(app, db_uri, *, owner=None, source="codex"):
     ref = StartupAttemptRef(
         startup_id=queued.id,
         attempt_id=attempt.attempt_id,
-        input_id=item.id,
+        input_id=item.id if item is not None else None,
         runtime_id="runtime",
         host_generation=conn.startup_generation,
+        mode=mode,
+        policy_revision=attempt.policy_revision if mode == "startup_only" else 0,
     )
     app.state.startup_store = startups
     return conversations, startups, hosts, conn, conversation, item, ref, runner_id
@@ -101,6 +117,239 @@ def _observation(ref, phase, *, source="codex"):
         vendor_session_id="thread" if source in ("codex", "claude-sdk") else None,
         vendor_turn_id="turn" if source in ("codex", "claude-sdk") else None,
     )
+
+
+@pytest.mark.asyncio
+async def test_exemption_keeps_authenticated_runner_during_rebinding(
+    app, client, db_uri, monkeypatch
+):
+    from omnigent.server.startup_observations import accept_observation
+
+    conversations, startups, hosts, _, conv, _, ref, runner_id = _startup(
+        app, db_uri, mode="startup_only"
+    )
+    admission = StartupAdmission(
+        startups, conversations, hosts, StartupAdmissionPolicy(None, None, 2, "startup_only")
+    )
+    admission.bind(app)
+    assert await accept_observation(
+        app,
+        conversations,
+        conv.id,
+        runner_id,
+        StartupObservation(attempt=ref, phase="opening_settled", source="runner"),
+    )
+    original = admission.recreate_exempt
+
+    async def rebind(conn, session_id, **kwargs):
+        conversations.replace_runner_id(
+            session_id, "different-runner", expected_runner_id=runner_id
+        )
+        return await original(conn, session_id, **kwargs)
+
+    monkeypatch.setattr(admission, "recreate_exempt", rebind)
+    response = await client.post(
+        f"/v1/sessions/{conv.id}/startup/recreate-exemption",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "sample-binding"},
+    )
+    assert response.json() == {"exempt": False}
+    await admission.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "policy", "mode", "connection", "cancel"])
+async def test_queue_completion_requires_exact_authority_without_vendor_work(
+    app, client, db_uri, fault
+):
+    from omnigent.server.startup_observations import accept_observation
+
+    conversations, startups, hosts, conn, conv, item, ref, runner_id = _startup(
+        app, db_uri, mode="startup_only"
+    )
+    if fault == "policy":
+        ref = ref.model_copy(update={"policy_revision": ref.policy_revision + 1})
+    if fault == "mode":
+        ref = ref.model_copy(update={"mode": "guarded"})
+        assert not await accept_observation(
+            app,
+            conversations,
+            conv.id,
+            runner_id,
+            _observation(ref, "runtime_ready", source="runner"),
+        )
+        assert startups.get(ref.startup_id).occupied
+        return
+    if fault == "connection":
+        replacement = hosts.register(conn.host_id, FakeWebSocket(), conn.hello, owner=None)
+        startups.register_host_generation(conn.host_id, replacement.startup_generation)
+    if fault == "cancel":
+        startups.cancel(ref.startup_id)
+    observation = StartupObservation(attempt=ref, phase="opening_settled", source="runner")
+    assert await accept_observation(app, conversations, conv.id, runner_id, observation) == (
+        fault is None
+    )
+    current = startups.get(ref.startup_id)
+    assert current.occupied == (fault is not None)
+    assert not current.input_accepted and current.proof_source is None
+    assert conversations.get_item(conv.id, item.id).status == "in_progress"
+    if fault is None:
+        assert current.state == "opened"
+        assert await accept_observation(app, conversations, conv.id, runner_id, observation)
+
+        from omnigent.server.startup_inputs import ManagedStartupInputs
+
+        inputs = ManagedStartupInputs(conversations, hosts)
+        app.state.startup_inputs = inputs
+        admission = StartupAdmission(
+            startups, conversations, hosts, StartupAdmissionPolicy(None, None, 2, "startup_only")
+        )
+        admission.bind(app)
+        inputs._deliver = AsyncMock(return_value="submitted")
+        live = conversations.get_conversation(conv.id)
+        assert await inputs.accepts(live, app)
+        assert not await inputs._recover_session(app, conv.id, conn)
+        inputs._deliver.assert_not_awaited()
+        conversations.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type=item.type,
+                    response_id="turn",
+                    status="completed",
+                    stable_id=item.id,
+                    replaces_pending_id=item.id,
+                    data=item.data,
+                )
+            ],
+        )
+        assert not await inputs.accepts(conversations.get_conversation(conv.id), app)
+        conversations.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=PENDING_INPUT_RESPONSE_ID,
+                    status="in_progress",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "next"}]
+                    ),
+                )
+            ],
+        )
+        assert await inputs._recover_session(app, conv.id, conn)
+        await asyncio.sleep(0)
+        inputs._deliver.assert_awaited_once()
+        assert inputs._deliver.await_args.kwargs == {}
+        await admission.shutdown()
+        await inputs.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_lost_lazy_empty_completion_reconciles_waiting_input_from_exact_runner_cache(
+    app, client, db_uri, monkeypatch
+):
+    from omnigent.runner.startup_admission import StartupAdmission as RunnerAdmission
+
+    conversations, startups, hosts, _conn, conv, _, ref, runner_id = _startup(
+        app, db_uri, mode="startup_only", empty=True
+    )
+    async with httpx.AsyncClient(
+        base_url="http://server.test",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(503)),
+    ) as server:
+        runner = RunnerAdmission(server, root_session_id=conv.id, root_attempt=ref)
+        assert not await runner.opening_settled(conv.id, ref, waiting_input=True)
+        cached = runner.observations_for(conv.id, ref)
+        assert cached[0].reason == "waiting_input"
+    async with httpx.AsyncClient(
+        base_url="http://runner.test",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, json={"observations": [x.model_dump() for x in cached]}
+            )
+        ),
+    ) as routed:
+        monkeypatch.setattr(
+            app.state.runner_router,
+            "client_for_existing_conversation",
+            lambda _: SimpleNamespace(runner_id=runner_id, client=routed),
+        )
+        assert await reconcile_startup_observations(
+            app, conversations, hosts, startups, startups.get(ref.startup_id)
+        )
+    current = startups.get(ref.startup_id)
+    assert current.state == "waiting_input" and not current.occupied and not current.resident
+    admission = StartupAdmission(
+        startups, conversations, hosts, StartupAdmissionPolicy(None, None, 2, "startup_only")
+    )
+    assert not await admission.recreate_exempt(_conn, conv.id)
+    await admission.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_recreate_is_exempt_only_for_latest_settled_without_mutating_its_row(
+    app, client, db_uri
+):
+    from omnigent.server.startup_observations import accept_observation
+
+    conversations, startups, _hosts, conn, conv, _, ref, runner_id = _startup(
+        app, db_uri, mode="startup_only"
+    )
+    admission = StartupAdmission(
+        startups,
+        conversations,
+        app.state.host_registry,
+        StartupAdmissionPolicy(None, None, 2, "startup_only"),
+    )
+    admission.bind(app)
+    assert not await admission.recreate_exempt(conn, conv.id)
+    assert await accept_observation(
+        app,
+        conversations,
+        conv.id,
+        runner_id,
+        StartupObservation(attempt=ref, phase="opening_settled", source="runner"),
+    )
+    settled = startups.get(ref.startup_id)
+    route = f"/v1/sessions/{conv.id}/startup/recreate-exemption"
+    assert (await client.post(route)).status_code == 403
+    headers = {RUNNER_TUNNEL_TOKEN_HEADER: "sample-binding"}
+    assert (await client.post(route, headers=headers)).json() == {"exempt": True}
+    assert await admission.recreate_exempt(conn, conv.id)
+    assert await admission.admit_launch(conn, conv.id) is None
+    assert not startups.claim_boundary(
+        ref.startup_id,
+        ref.attempt_id,
+        runtime_id=ref.runtime_id,
+        host_generation=ref.host_generation,
+        boundary="native_prepare",
+        claim_id="old-permit",
+    )
+    assert startups.get(ref.startup_id) == settled
+    for _ in range(3):
+        startups.enqueue(
+            owner_user_id="owner",
+            host_id=conn.host_id,
+            session_id=uuid4().hex,
+            operation_key=uuid4().hex,
+            input_id=None,
+        )
+    assert startups.reserve(conn.host_id) is not None
+    assert startups.reserve(conn.host_id) is not None
+    assert startups.reserve(conn.host_id) is None
+    assert await admission.recreate_exempt(conn, conv.id)
+    assert startups.get(ref.startup_id) == settled
+    startups.enqueue(
+        owner_user_id="owner",
+        host_id=conn.host_id,
+        session_id=conv.id,
+        operation_key="new-first-input",
+        input_id=None,
+        runtime_generation=2,
+    )
+    assert not await admission.recreate_exempt(conn, conv.id)
+    assert startups.get(ref.startup_id) == settled
+    await admission.shutdown()
 
 
 @pytest.mark.asyncio

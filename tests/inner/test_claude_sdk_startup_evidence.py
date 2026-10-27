@@ -134,7 +134,7 @@ async def test_claude_startup_requires_vendor_prompt_then_main_work():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider_work", [False, True])
+@pytest.mark.parametrize("provider_work", [False, True, "queue"])
 @pytest.mark.parametrize("replacement", ["permission", "keep_warm", "receipt_warm"])
 async def test_claude_executor_claims_before_connect_and_ignores_enqueue_only(
     provider_work, replacement
@@ -173,7 +173,7 @@ async def test_claude_executor_claims_before_connect_and_ignores_enqueue_only(
                 order.append("query")
 
             async def receive_response(self):
-                if provider_work:
+                if provider_work is True:
                     for matcher in self.options.hooks["UserPromptSubmit"]:
                         for hook in matcher.hooks:
                             await hook(
@@ -209,7 +209,10 @@ async def test_claude_executor_claims_before_connect_and_ignores_enqueue_only(
 
     executor = ClaudeSDKExecutor()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=FakeSDK):
-        with startup_evidence_scope(_attempt(), emitted.append, claim):
+        ref = _attempt()
+        if provider_work == "queue":
+            ref = ref.model_copy(update={"mode": "startup_only", "policy_revision": 1})
+        with startup_evidence_scope(ref, emitted.append, claim):
             events = [
                 event
                 async for event in executor.run_turn(
@@ -218,6 +221,12 @@ async def test_claude_executor_claims_before_connect_and_ignores_enqueue_only(
                     "",
                 )
             ]
+        if provider_work == "queue":
+            assert [item.phase for item in emitted] == ["opening_settled"]
+            assert emitted[0].source == "runner" and emitted[0].attempt == ref
+            assert order == ["claim", "connect", "query"]
+            assert any(isinstance(event, TurnComplete) for event in events)
+            return
         with startup_evidence_scope(None, emitted.append, claim, required=True):
             followup = [
                 event

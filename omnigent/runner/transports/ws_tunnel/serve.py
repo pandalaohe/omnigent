@@ -1494,7 +1494,7 @@ async def _send_hello(
         CAP_PATH_ATTACHMENTS,
     )
     from omnigent.startup_observation import registered_observation_capabilities
-    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2, STARTUP_QUEUE_V1
 
     await send_text(
         encode_frame(
@@ -1502,6 +1502,7 @@ async def _send_hello(
                 runner_version=runner_version,
                 frame_protocol_version=1,
                 capabilities=[
+                    STARTUP_QUEUE_V1,
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_PATH_ATTACHMENTS,
                     SDK_PEER_CAPABILITY,

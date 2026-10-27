@@ -2,16 +2,19 @@ import { Clock3Icon } from "lucide-react";
 import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { SessionStartupStatus } from "@/lib/types";
+import { StartupReleaseDialog } from "./StartupReleaseDialog";
 
 const LABELS: Partial<Record<SessionStartupStatus["state"], string>> = {
   queued: "Waiting to start on this host",
-  starting: "Starting session",
-  verifying: "Checking session readiness",
-  uncertain: "Startup confirmation delayed",
+  starting: "Opening session",
+  verifying: "Confirming session opened",
+  uncertain: "Startup is stuck — opening not confirmed",
   blocked: "Startup needs attention",
   cancelling: "Stopping startup",
   ready_empty: "Session ready — waiting for your first message",
   waiting_input: "Waiting for your first message",
+  opened: "Session opened",
+  operator_released: "Startup slot released",
 };
 
 const REASONS: Record<string, string> = {
@@ -28,6 +31,10 @@ const REASONS: Record<string, string> = {
   host_launch_unconfirmed: "Host startup could not be confirmed.",
   input_dispatch_unconfirmed: "Delivery of your first message could not be confirmed.",
   admission_origin_unknown: "Host startup time could not be confirmed.",
+  opening_unconfirmed:
+    "Opening has not been confirmed after 180 seconds. Nothing is released automatically.",
+  delivery_unconfirmed:
+    "Message delivery is unconfirmed. Saved input will not be sent again automatically.",
 };
 
 /** Keep an unconfirmed startup distinct from a positively observed working turn. */
@@ -35,10 +42,14 @@ export function SessionStartupIndicator({
   startup,
   onCancel,
   readOnly = false,
+  hostId,
+  onReleased,
 }: {
   startup: SessionStartupStatus;
   onCancel: (id: string, attemptId: string | null) => Promise<void>;
   readOnly?: boolean;
+  hostId?: string | null;
+  onReleased?: () => Promise<void>;
 }) {
   const [stopping, setStopping] = useState(false);
   const [stopFailed, setStopFailed] = useState(false);
@@ -78,7 +89,7 @@ export function SessionStartupIndicator({
           {Math.floor(startup.elapsedSeconds)}s since request
         </span>
         {startup.admittedElapsedSeconds != null && (
-          <span>{startup.admittedElapsedSeconds}s since host admission</span>
+          <span>{startup.admittedElapsedSeconds}s since opening began</span>
         )}
         {startup.inputElapsedSeconds != null && (
           <span>{startup.inputElapsedSeconds}s since first message</span>
@@ -97,9 +108,29 @@ export function SessionStartupIndicator({
         </p>
       )}
       {startup.state === "queued" && (startup.unconfirmedStartups ?? 0) >= 2 && (
-        <p>Host startups are paused until earlier unconfirmed startups are reconciled.</p>
+        <p>
+          Earlier starts are stuck. Keep waiting or review their startup slots to let queued
+          sessions start.
+        </p>
+      )}
+      {startup.state === "operator_released" && (
+        <p>
+          Other queued sessions can start. Old work may still be running; releasing did not stop it
+          or resend input.
+        </p>
       )}
       {startup.reason !== null && REASONS[startup.reason] && <p>{REASONS[startup.reason]}</p>}
+      {!readOnly &&
+        (startup.hostId || hostId) &&
+        onReleased &&
+        (startup.state === "uncertain" ||
+          (startup.state === "queued" && (startup.unconfirmedStartups ?? 0) > 0)) && (
+          <StartupReleaseDialog
+            key={startup.hostId || hostId}
+            hostId={(startup.hostId || hostId)!}
+            onReleased={onReleased}
+          />
+        )}
       {stopFailed && <p>Stop could not be confirmed. Try again; startup remains tracked.</p>}
       <details>
         <summary className="cursor-pointer">Inspect startup</summary>

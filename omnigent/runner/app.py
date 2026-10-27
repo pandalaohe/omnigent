@@ -261,7 +261,11 @@ from omnigent.server.schemas import (
 from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
 from omnigent.spec.skill_sources import resolve_session_skills, session_skill_roots
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
-from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef
+from omnigent.startup_protocol import (
+    QUEUE_STARTUP_SOURCES,
+    SDK_STARTUP_SOURCES,
+    StartupAttemptRef,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -909,10 +913,14 @@ async def _relay_startup_proof(
     except ValueError:
         return False
     observation = proof.observation
-    if (
-        observation.attempt != expected
-        or observation.source not in SDK_STARTUP_SOURCES
-        or observation.source != expected_source
+    if observation.attempt != expected or not (
+        (observation.source in SDK_STARTUP_SOURCES and observation.source == expected_source)
+        or (
+            expected.mode == "startup_only"
+            and observation.phase == "opening_settled"
+            and observation.source == "runner"
+            and expected_source in QUEUE_STARTUP_SOURCES
+        )
     ):
         return False
     if admission is not None and not admission.record_observation(session_id, observation):
@@ -4047,6 +4055,7 @@ def create_runner_app(
                 rebind_bridge=_rebind_claude_bridge,
                 startup_required=startup_admission.required(session_id),
                 admit_cold=startup_admission.native_admitter(session_id),
+                settle_empty=startup_admission.empty_settler(session_id),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -4421,7 +4430,7 @@ def create_runner_app(
         # the message, and re-process it once the recovery turn finishes —
         # causing the first message to be silently ignored (sandbox/lakebox
         # wake) or processed twice (managed relaunch).
-        _suppress_recovery = (
+        _suppress_recovery = startup_admission.suppress_initialization_recovery(session_id) or (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
         recovery_usage_admission = None
@@ -4613,6 +4622,12 @@ def create_runner_app(
                 last_item_type=history[-1].get("type") if history else None,
             ),
         )
+        if harness_name in (*SDK_STARTUP_SOURCES, "acp"):
+            raw_attempt = body.get("startup_attempt")
+            if isinstance(raw_attempt, dict):
+                await startup_admission.opening_settled(
+                    session_id, StartupAttemptRef.model_validate(raw_attempt), waiting_input=True
+                )
         return JSONResponse(
             status_code=201,
             content={
@@ -8087,7 +8102,7 @@ def create_runner_app(
         }
         if startup_admission.required(conv):
             harness_body["startup_required"] = True
-        if harness_name in SDK_STARTUP_SOURCES and isinstance(
+        if harness_name in QUEUE_STARTUP_SOURCES and isinstance(
             msg_body.get("startup_attempt"), dict
         ):
             with contextlib.suppress(ValueError):
@@ -8601,6 +8616,7 @@ def create_runner_app(
                         global_instructions=_session_global_instructions.get(conv_id),
                         startup_required=startup_admission.required(conv_id),
                         admit_cold=startup_admission.native_admitter(conv_id),
+                        settle_empty=startup_admission.empty_settler(conv_id),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -8762,7 +8778,7 @@ def create_runner_app(
 
             turn_input_stable_id = _input_stable_id(body)
             startup_ref = None
-            if harness_name in SDK_STARTUP_SOURCES and isinstance(
+            if harness_name in QUEUE_STARTUP_SOURCES and isinstance(
                 body.get("startup_attempt"), dict
             ):
                 with contextlib.suppress(ValueError):
@@ -8882,6 +8898,8 @@ def create_runner_app(
                 )
             if startup_admission.required(conv_id):
                 event_body["startup_required"] = True
+            else:
+                event_body.pop("startup_required", None)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _dispatch_tasks: list[_asyncio.Task[object]] = []
             _dispatch_cancelled = (
@@ -9553,6 +9571,8 @@ def create_runner_app(
         body_type = body.get("type") if isinstance(body, dict) else None
         if isinstance(body, dict) and body_type in ("message", None):
             _register_startup_control(conversation_id, body)
+            if body.get("startup_attempt") is None:
+                await startup_admission.refresh_exemption(conversation_id)
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
             "model_override=%s",

@@ -34,5 +34,7 @@ def _build_hermes_native_executor() -> Executor:
 
 def create_app() -> FastAPI:
     """Build the hermes-native harness's FastAPI app (required entry point)."""
-    adapter = ExecutorAdapter(executor_factory=_build_hermes_native_executor)
+    adapter = ExecutorAdapter(
+        executor_factory=_build_hermes_native_executor, startup_source="native"
+    )
     return adapter.build()

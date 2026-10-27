@@ -18,7 +18,12 @@ from omnigent.server.startup_registration import (
     STARTUP_REGISTRATION_LABEL_KEY,
     STARTUP_REGISTRATION_PENDING,
 )
-from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef
+from omnigent.startup_protocol import (
+    QUEUE_STARTUP_SOURCES,
+    SDK_STARTUP_SOURCES,
+    STARTUP_QUEUE_V1,
+    StartupAttemptRef,
+)
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore, StartupSnapshot
 
@@ -125,6 +130,7 @@ class StartupAdmission:
             )
             if parent is None or parent.state not in (
                 "working",
+                "opened",
                 "ready_empty",
                 "command_completed",
             ):
@@ -140,6 +146,20 @@ class StartupAdmission:
         if conn is None:
             return False
         capabilities = conn.hello.capabilities
+        if self.policy.mode == "startup_only":
+            harness = await self.resolve_harness(startup)
+            if (
+                STARTUP_QUEUE_V1 not in capabilities
+                or harness not in QUEUE_STARTUP_SOURCES
+                or self.hosts.get(startup.host_id) is not conn
+            ):
+                return False
+            if conv.runner_id is not None:
+                registry = getattr(getattr(self._app, "state", None), "tunnel_registry", None)
+                runner = registry.get(conv.runner_id) if registry is not None else None
+                if runner is not None and STARTUP_QUEUE_V1 not in runner.hello.capabilities:
+                    return False
+            return True
         if "startup_admission_v1" not in capabilities:
             return False
         if not await self.inventory_ready(conn, startup.session_id):
@@ -173,6 +193,14 @@ class StartupAdmission:
             == STARTUP_CREATE_PREPARATION_PENDING
         ):
             raise StartupQueued(None)
+        await asyncio.to_thread(
+            self.startups.configure,
+            conn.host_id,
+            host_resident_limit=self.policy.host_resident_limit,
+            deployment_resident_limit=self.policy.deployment_resident_limit,
+            startup_limit=self.policy.startup_limit,
+            mode=self.policy.mode,
+        )
         current = await asyncio.to_thread(self.startups.for_session, session_id)
         pending = await self._generic_pending(session_id)
         head = next((item for item in pending if item.status != "failed"), None)
@@ -204,13 +232,6 @@ class StartupAdmission:
         if head is not None and head.status != "in_progress":
             # A submitted input predates admission. Reconcile it instead of replaying.
             raise StartupQueued(None)
-        await asyncio.to_thread(
-            self.startups.configure,
-            conn.host_id,
-            host_resident_limit=self.policy.host_resident_limit,
-            deployment_resident_limit=self.policy.deployment_resident_limit,
-            startup_limit=self.policy.startup_limit,
-        )
         return await self.coordinator.enqueue(
             session_id,
             input_id=head.id if head else None,
@@ -269,6 +290,7 @@ class StartupAdmission:
             host_resident_limit=self.policy.host_resident_limit,
             deployment_resident_limit=self.policy.deployment_resident_limit,
             startup_limit=self.policy.startup_limit,
+            mode=self.policy.mode,
         )
         generation = current.runtime_generation + 1 if current else 1
         return await asyncio.to_thread(
@@ -285,6 +307,41 @@ class StartupAdmission:
     def dispatching(self, session_id: str) -> bool:
         scope = _dispatch.get()
         return scope is not None and scope[0] == session_id
+
+    async def recreate_exempt(
+        self, conn: HostConnection, session_id: str, *, expected_runner_id: str | None = None
+    ) -> bool:
+        from omnigent.db.account_authority import AccountAuthority
+
+        if self.policy.mode != "startup_only" or self.hosts.get(conn.host_id) is not conn:
+            return False
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None or conv.archived or conv.host_id != conn.host_id:
+            return False
+        if expected_runner_id is not None and conv.runner_id != expected_runner_id:
+            return False
+        await self.hosts.authorize_launch(conn, session_id)
+        account = (
+            AccountAuthority(conn.owner, conn.account_generation, conn.workspace_id)
+            if conn.owner is not None
+            else None
+        )
+        allowed = await asyncio.to_thread(
+            self.startups.recreate_exempt,
+            session_id,
+            host_id=conn.host_id,
+            runner_id=conv.runner_id,
+            host_generation=conn.startup_generation,
+            account=account,
+        )
+        live = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        return (
+            allowed
+            and self.hosts.get(conn.host_id) is conn
+            and live is not None
+            and not live.archived
+            and (live.host_id, live.runner_id) == (conn.host_id, conv.runner_id)
+        )
 
     async def _runner_available(self, session_id: str) -> bool:
         router = getattr(self._app.state, "runner_router", None)
@@ -325,6 +382,10 @@ class StartupAdmission:
             input_id=current.input_id,
             runtime_id=current.runtime_id,
             host_generation=conn.startup_generation,
+            mode=current.admission_mode,
+            policy_revision=current.policy_revision
+            if current.admission_mode == "startup_only"
+            else 0,
         )
         token = _dispatch.set((current.session_id, ref))
         try:
@@ -342,7 +403,9 @@ class StartupAdmission:
         finally:
             _dispatch.reset(token)
 
-    async def admit_launch(self, conn: HostConnection, session_id: str) -> StartupAttemptRef:
+    async def admit_launch(
+        self, conn: HostConnection, session_id: str
+    ) -> StartupAttemptRef | None:
         scope = _dispatch.get()
         if scope is not None and scope[0] == session_id:
             ref = scope[1]
@@ -360,6 +423,8 @@ class StartupAdmission:
             raise StartupQueued(ref.startup_id)
         if self.hosts.get(conn.host_id) is not conn:
             raise StartupQueued(None)
+        if await self.recreate_exempt(conn, session_id):
+            return None
         startup = await self.queue_session(conn, session_id)
         raise StartupQueued(startup.id)
 
@@ -388,6 +453,10 @@ class StartupAdmission:
             input_id=startup.input_id,
             runtime_id=startup.runtime_id or startup.attempt_id,
             host_generation=generation,
+            mode=startup.admission_mode,
+            policy_revision=startup.policy_revision
+            if startup.admission_mode == "startup_only"
+            else 0,
         )
         if not await asyncio.to_thread(
             self.startups.claim, startup.id, startup.attempt_id, runtime_id=ref.runtime_id
@@ -449,12 +518,17 @@ class StartupAdmission:
 
     async def recover_session(self, session_id: str, conn: HostConnection) -> bool:
         current = await asyncio.to_thread(self.startups.for_session, session_id)
-        if current is not None and current.state in ("starting", "verifying", "uncertain"):
+        if current is not None and (
+            current.release_receipt is not None
+            or current.state in ("starting", "verifying", "uncertain")
+        ):
             from omnigent.server.startup_observations import reconcile_startup_observations
 
             await reconcile_startup_observations(
                 self._app, self.conversations, self.hosts, self.startups, current
             )
+        if current is not None and current.release_receipt is not None:
+            return False
         await self.queue_session(conn, session_id)
         await self.advance(conn.host_id)
         current = await asyncio.to_thread(self.startups.for_session, session_id)
@@ -488,6 +562,7 @@ class StartupAdmission:
             current is not None
             and current.preparation is not None
             and current.input_id is not None
+            and current.reason != "opening_unconfirmed"
         ):
             return await self._resume_prepared_input(current, conn)
         # Receipt waiting has no pending command. The host worker wakes on
@@ -500,7 +575,7 @@ class StartupAdmission:
         if (
             current is None
             or current.state
-            not in ("starting", "verifying", "uncertain", "working", "ready_empty")
+            not in ("starting", "verifying", "uncertain", "working", "opened", "ready_empty")
             or current.attempt_id is None
             or current.runtime_id is None
             or current.host_generation is None
@@ -513,7 +588,10 @@ class StartupAdmission:
         live = await asyncio.to_thread(self.conversations.get_conversation, conversation.id)
         if (
             conn is None
-            or conn.startup_generation != current.host_generation
+            or (
+                conn.startup_generation != current.host_generation
+                and not await self.recreate_exempt(conn, conversation.id)
+            )
             or self.hosts.get(current.host_id) is not conn
             or live is None
             or live.archived
@@ -525,7 +603,11 @@ class StartupAdmission:
             attempt_id=current.attempt_id,
             input_id=current.input_id,
             runtime_id=current.runtime_id,
-            host_generation=current.host_generation,
+            host_generation=conn.startup_generation,
+            mode=current.admission_mode,
+            policy_revision=current.policy_revision
+            if current.admission_mode == "startup_only"
+            else 0,
         )
 
     async def advance(self, host_id: str) -> None:

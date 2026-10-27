@@ -11050,6 +11050,17 @@
           "evidence": {
             "$ref": "#/components/schemas/StartupEvidence"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -11113,6 +11124,8 @@
               "ready_empty",
               "waiting_input",
               "working",
+              "opened",
+              "operator_released",
               "cancelled",
               "stopped",
               "command_completed"
@@ -12073,6 +12086,228 @@
           }
         },
         "title": "StartupInputOptions",
+        "type": "object"
+      },
+      "StartupReleasePreview": {
+        "properties": {
+          "current_host_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Host Generation"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/StartupReleasePreviewItem"
+            },
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current_host_generation",
+          "targets"
+        ],
+        "title": "StartupReleasePreview",
+        "type": "object"
+      },
+      "StartupReleasePreviewItem": {
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/StartupReleaseTarget"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "work_hint": {
+            "default": "unknown",
+            "enum": [
+              "working",
+              "unknown"
+            ],
+            "title": "Work Hint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "title"
+        ],
+        "title": "StartupReleasePreviewItem",
+        "type": "object"
+      },
+      "StartupReleaseReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "actor_account_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Account Generation"
+          },
+          "actor_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor User Id"
+          },
+          "current_host_generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Host Generation",
+            "type": "string"
+          },
+          "released_at": {
+            "format": "int64",
+            "title": "Released At",
+            "type": "integer"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/StartupReleaseTarget"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current_host_generation",
+          "targets",
+          "actor_user_id",
+          "actor_account_generation",
+          "released_at"
+        ],
+        "title": "StartupReleaseReceipt",
+        "type": "object"
+      },
+      "StartupReleaseRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "current_host_generation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Host Generation",
+            "type": "string"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/StartupReleaseTarget"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current_host_generation",
+          "targets"
+        ],
+        "title": "StartupReleaseRequest",
+        "type": "object"
+      },
+      "StartupReleaseTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Attempt Id",
+            "type": "string"
+          },
+          "host_generation": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Generation"
+          },
+          "input_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Id"
+          },
+          "runner_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Id"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "session_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "startup_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Startup Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "startup_id",
+          "session_id",
+          "attempt_id",
+          "input_id",
+          "runtime_id",
+          "host_generation",
+          "runner_id"
+        ],
+        "title": "StartupReleaseTarget",
         "type": "object"
       },
       "StoreHarnessCredentialRequest": {
@@ -16498,6 +16733,98 @@
         "summary": "Launch Runner",
         "tags": [
           "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/startup-releases": {
+      "get": {
+        "operationId": "preview_startup_releases_v1_hosts__host_id__startup_releases_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupReleasePreview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Startup Releases",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "post": {
+        "operationId": "release_startups_v1_hosts__host_id__startup_releases_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartupReleaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupReleaseReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Startups",
+        "tags": [
+          "sessions"
         ]
       }
     },

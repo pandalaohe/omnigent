@@ -10,6 +10,8 @@ const STATES = new Set([
   "ready_empty",
   "waiting_input",
   "working",
+  "opened",
+  "operator_released",
   "cancelled",
   "stopped",
   "command_completed",
@@ -42,6 +44,7 @@ export function sessionStartupFromWire(value: unknown): SessionStartupStatus | n
     !evidence ||
     typeof raw.id !== "string" ||
     !raw.id ||
+    (raw.host_id !== undefined && !nullableString(raw.host_id)) ||
     typeof raw.state !== "string" ||
     !STATES.has(raw.state) ||
     !nullableString(raw.attempt_id) ||
@@ -65,6 +68,7 @@ export function sessionStartupFromWire(value: unknown): SessionStartupStatus | n
     return null;
   return {
     id: raw.id,
+    hostId: raw.host_id ?? null,
     attemptId: raw.attempt_id,
     inputId: raw.input_id,
     state: raw.state as SessionStartupStatus["state"],

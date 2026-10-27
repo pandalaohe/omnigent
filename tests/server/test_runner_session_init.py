@@ -236,24 +236,24 @@ async def test_initializer_reposts_when_startup_attempt_changes() -> None:
 
     control[0] = (True, None)
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
-    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
-    assert client.calls[1]["startup_required"] is True
-    assert "startup_attempt" not in client.calls[1]
-    assert len(client.calls) == 2
+    refused = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert refused.status_code == 503
+    assert refused.json() == {"error": "startup_not_admitted"}
+    assert len(client.calls) == 1
 
     control[0] = (True, attempt)
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
-    assert client.calls[2]["startup_required"] is True
-    assert client.calls[2]["startup_attempt"] == attempt.model_dump()
+    assert client.calls[1]["startup_required"] is True
+    assert client.calls[1]["startup_attempt"] == attempt.model_dump()
     await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
-    assert len(client.calls) == 3
+    assert len(client.calls) == 2
 
     next_attempt = attempt.model_copy(update={"attempt_id": "c" * 32})
     control[0] = (True, next_attempt)
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
-    assert client.calls[3]["startup_attempt"] == next_attempt.model_dump()
+    assert client.calls[2]["startup_attempt"] == next_attempt.model_dump()
 
 
 @pytest.mark.asyncio

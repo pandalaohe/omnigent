@@ -808,17 +808,22 @@ async def test_launch_native_terminal_creates_when_absent(
         called["session_id"] = ctx.session_id
         return object()
 
+    async def settle():
+        assert called["session_id"] == "conv_create"
+        called["settled"] = True
+
     monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
     locks: dict[str, Any] = {}
     result = await _launch_native_terminal(
         "pi-native",
-        _launch_ctx(session_id="conv_create"),
+        _launch_ctx(session_id="conv_create", settle_empty=settle),
         ensure_locks=locks,
     )
 
     assert result is True
     assert called["session_id"] == "conv_create"
     assert "conv_create" in locks
+    assert called["settled"] is True
 
 
 @pytest.mark.asyncio

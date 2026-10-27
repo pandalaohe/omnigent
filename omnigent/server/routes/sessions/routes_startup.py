@@ -4,16 +4,26 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException, Request
 
-from omnigent.db.account_authority import AccountAuthority
-from omnigent.entities.session_startup import SessionStartupStatus
+from omnigent.db.account_authority import AccountAuthority, account_generation
+from omnigent.entities.session_startup import (
+    SessionStartupStatus,
+    StartupReleasePreview,
+    StartupReleasePreviewItem,
+    StartupReleaseReceipt,
+    StartupReleaseRequest,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import session_stream
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
+from omnigent.server.routes._auth_helpers import (
+    get_user_id,
+    require_access_and_level,
+    require_user,
+)
 from omnigent.server.schemas import CancelStartupRequest, SessionStartupEvent
 from omnigent.server.startup_observations import accept_observation
-from omnigent.startup_protocol import StartupBoundaryClaim, StartupObservation
+from omnigent.startup_protocol import STARTUP_QUEUE_V1, StartupBoundaryClaim, StartupObservation
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_startup_store import SessionStartupStore
@@ -26,6 +36,133 @@ def register_startup_routes(
     permission_store: PermissionStore | None,
     auth_provider: AuthProvider | None,
 ) -> None:
+    @router.get("/hosts/{host_id}/startup-releases", response_model=StartupReleasePreview)
+    async def preview_startup_releases(request: Request, host_id: str) -> StartupReleasePreview:
+        user_id = require_user(request, auth_provider)
+        admission = getattr(request.app.state, "startup_admission", None)
+        store = getattr(request.app.state, "startup_store", None)
+        if admission is None or store is None or admission.policy.mode != "startup_only":
+            raise HTTPException(409, "Startup-only queue is not enabled")
+        generation, targets = await asyncio.to_thread(
+            store.release_candidates,
+            host_id,
+            actor_user_id=user_id,
+            actor_account_generation=account_generation(user_id) if user_id is not None else None,
+        )
+        from omnigent.server.resident_inventory import read_host_session_work_inventory_v2
+
+        hosts = request.app.state.host_registry
+        conn = hosts.get(host_id)
+        inventory = (
+            await read_host_session_work_inventory_v2(
+                hosts,
+                conn,
+                conversation_store,
+                getattr(request.app.state, "runner_router", None),
+                getattr(request.app.state, "runner_session_initializer", None),
+            )
+            if conn is not None and targets
+            else None
+        )
+        working = set()
+        if inventory is not None:
+            for session in inventory.sessions:
+                if session.runner is not None and any(
+                    row.live_turn
+                    or row.live_tool
+                    or row.background_job
+                    or row.protected_interaction
+                    for row in session.runner.inventory.observations
+                ):
+                    working.add(session.session_id)
+        # Re-read ownership after the optional, bounded observation; POST still checks exact targets.
+        current_generation, current_targets = await asyncio.to_thread(
+            store.release_candidates,
+            host_id,
+            actor_user_id=user_id,
+            actor_account_generation=account_generation(user_id) if user_id is not None else None,
+        )
+        items = []
+        for target in targets if generation == current_generation else []:
+            if target not in current_targets:
+                continue
+            conversation = await asyncio.to_thread(
+                conversation_store.get_conversation, target.session_id
+            )
+            if conversation is None or conversation.archived:
+                continue
+            items.append(
+                StartupReleasePreviewItem(
+                    target=target,
+                    title=conversation.title,
+                    work_hint="working" if target.session_id in working else "unknown",
+                )
+            )
+        return StartupReleasePreview(current_host_generation=current_generation, targets=items)
+
+    @router.post("/hosts/{host_id}/startup-releases", response_model=StartupReleaseReceipt)
+    async def release_startups(
+        request: Request, host_id: str, body: StartupReleaseRequest
+    ) -> StartupReleaseReceipt:
+        user_id = get_user_id(request, auth_provider)
+        for target in body.targets:
+            await require_access_and_level(
+                user_id, target.session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            conversation = await asyncio.to_thread(
+                conversation_store.get_conversation, target.session_id
+            )
+            if conversation is None:
+                raise HTTPException(404, "Session not found")
+            if conversation.archived:
+                raise HTTPException(409, "Session is archived; refresh before release")
+        admission = getattr(request.app.state, "startup_admission", None)
+        store = getattr(request.app.state, "startup_store", None)
+        if admission is None or store is None or admission.policy.mode != "startup_only":
+            raise HTTPException(409, "Startup-only queue is not enabled")
+        receipt = await asyncio.to_thread(
+            store.release_startups,
+            host_id,
+            body,
+            actor_user_id=user_id,
+            actor_account_generation=account_generation(user_id) if user_id is not None else None,
+        )
+        for target in receipt.targets:
+            status = await asyncio.to_thread(store.presentation, target.session_id)
+            session_stream.publish(
+                target.session_id,
+                SessionStartupEvent(
+                    type="session.startup", conversation_id=target.session_id, startup=status
+                ).model_dump(),
+            )
+        await admission.advance(host_id)
+        return receipt
+
+    @router.post("/sessions/{session_id}/startup/recreate-exemption", include_in_schema=False)
+    async def recreate_exemption(request: Request, session_id: str) -> dict[str, bool]:
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if (
+            not token
+            or conv is None
+            or not conv.runner_id
+            or token_bound_runner_id(token) != conv.runner_id
+        ):
+            raise HTTPException(403, "Recreate exemption requires the bound runner")
+        admission = getattr(request.app.state, "startup_admission", None)
+        hosts = getattr(request.app.state, "host_registry", None)
+        conn = hosts.get(conv.host_id) if hosts is not None and conv.host_id else None
+        if admission is None or conn is None:
+            return {"exempt": False}
+        try:
+            return {
+                "exempt": await admission.recreate_exempt(
+                    conn, session_id, expected_runner_id=token_bound_runner_id(token)
+                )
+            }
+        except OmnigentError:
+            return {"exempt": False}
+
     @router.post("/sessions/{session_id}/startup/claims", include_in_schema=False)
     async def claim_startup_boundary(
         request: Request, session_id: str, body: StartupBoundaryClaim
@@ -55,7 +192,17 @@ def register_startup_routes(
             or current.runtime_id != body.attempt.runtime_id
             or current.input_id != body.attempt.input_id
             or conn.startup_generation != body.attempt.host_generation
-            or "startup_admission_v1" not in conn.hello.capabilities
+            or current.admission_mode != body.attempt.mode
+            or (
+                body.attempt.mode == "startup_only"
+                and current.policy_revision != body.attempt.policy_revision
+            )
+            or (
+                STARTUP_QUEUE_V1
+                if current.admission_mode == "startup_only"
+                else "startup_admission_v1"
+            )
+            not in conn.hello.capabilities
             or hosts.launch_authorizer is None
         ):
             return {"granted": False}

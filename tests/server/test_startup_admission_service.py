@@ -26,6 +26,35 @@ def isolated_resident_accounting(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("capability", [False, True])
+async def test_queue_eligibility_uses_enforcement_capability_without_inventory(db_uri, capability):
+    conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
+    registry, host = HostRegistry(), uuid4().hex
+    conn = registry.register(
+        host,
+        FakeWebSocket(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="sample-host",
+            capabilities=["startup_queue_v1"] if capability else ["startup_admission_v1"],
+        ),
+        owner=None,
+    )
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, host, "/opt/work/project")
+    admission = StartupAdmission(
+        startups, conversations, registry, StartupAdmissionPolicy(None, None, 2, "startup_only")
+    )
+    admission.inventory_ready = AsyncMock(side_effect=AssertionError("no inventory gate"))
+    admission.resolve_harness = AsyncMock(return_value="codex-native")
+    queued = await admission.queue_session(conn, conv.id)
+    assert await admission._eligible(queued) is capability
+    admission.inventory_ready.assert_not_awaited()
+    await admission.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["codex", "claude-sdk"])
 async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_uri, source):
     conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
@@ -432,7 +461,8 @@ async def test_missing_dispatcher_releases_only_an_ungranted_attempt(db_uri, phy
 
 
 @pytest.mark.asyncio
-async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
+@pytest.mark.parametrize("first_input_mode", ["guarded", "startup_only"])
+async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri, first_input_mode):
     conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
     registry, host = HostRegistry(), uuid4().hex
     conn = registry.register(
@@ -474,6 +504,11 @@ async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
                 phase=phase,
             )
         )
+    old = startups.get(empty.id)
+    if first_input_mode == "startup_only":
+        admission.policy = StartupAdmissionPolicy(None, None, 2, mode="startup_only")
+        conn.hello.capabilities.append("startup_queue_v1")
+        admission.resolve_harness = AsyncMock(return_value="codex")
     item = await inputs.enqueue(
         conv.id,
         SessionEventInput(type="message", data={"role": "user", "content": []}),
@@ -482,6 +517,9 @@ async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
     )
     first = await admission.queue_session(conn, conv.id)
     assert first.id != empty.id and first.input_id == item.id
+    assert first.admission_mode == first_input_mode
+    assert first.policy_revision == old.policy_revision + int(first_input_mode == "startup_only")
+    assert startups.get(empty.id) == old
     assert (await admission.queue_session(conn, conv.id)).id == first.id
     delivered = []
 
@@ -490,6 +528,14 @@ async def test_first_saved_input_rearms_empty_context_without_relaunch(db_uri):
         assert ref.runtime_id == "existing-context"
         assert ref.input_id == item.id
         assert await context.claim(conversations, session_id)
+        assert startups.claim_boundary(
+            ref.startup_id,
+            ref.attempt_id,
+            runtime_id=ref.runtime_id,
+            host_generation=ref.host_generation,
+            boundary="executor_construct",
+            claim_id="first-executor",
+        ) is (first_input_mode == "startup_only")
         delivered.append(ref)
         return {"pending_id": "pending"}
 

@@ -33,7 +33,7 @@ from omnigent.server.permission_tiers import (
     legacy_permission_tier,
 )
 from omnigent.server.project_placement import project_code_locations
-from omnigent.startup_protocol import StartupAttemptRef
+from omnigent.startup_protocol import STARTUP_QUEUE_V1, StartupAttemptRef
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import RunnerGenerationGuard, TunnelRegistry
@@ -964,6 +964,12 @@ class RunnerSessionInitializer:
                 required, attempt = self._startup_control(conversation)
                 if required and attempt is None and self._startup_recovery_resolver is not None:
                     attempt = await self._startup_recovery_resolver(conversation)
+                if required and attempt is None:
+                    return httpx.Response(503, json={"error": "startup_not_admitted"})
+                if attempt is not None and attempt.mode == "startup_only":
+                    connection = self._registry.get(runner_id)
+                    if connection is None or STARTUP_QUEUE_V1 not in connection.hello.capabilities:
+                        return httpx.Response(503, json={"error": "startup_host_update_required"})
                 if required:
                     payload["startup_required"] = True
                     if attempt is not None:

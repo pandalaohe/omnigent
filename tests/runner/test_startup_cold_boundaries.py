@@ -127,6 +127,42 @@ def _attempt() -> StartupAttemptRef:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["new", "same", "forget", "refresh"])
+async def test_late_exemption_cannot_cross_a_new_control_registration(change):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def respond(_request):
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"exempt": True})
+
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(respond)
+    ) as client:
+        ref = _attempt().model_copy(update={"mode": "startup_only"})
+        admission = StartupAdmission(client, root_session_id="root", root_attempt=ref)
+        pending = asyncio.create_task(admission.native_admitter("root")())
+        await entered.wait()
+        if change == "forget":
+            admission.forget("root")
+        elif change == "refresh":
+            newer = asyncio.create_task(admission.refresh_exemption("root"))
+            await asyncio.sleep(0)
+        else:
+            admission.register(
+                "root",
+                ref if change == "same" else ref.model_copy(update={"attempt_id": "d" * 32}),
+            )
+        release.set()
+        with pytest.raises(RuntimeError, match="control changed"):
+            await pending
+        if change == "refresh":
+            assert await newer
+        else:
+            assert not admission.recreate_is_exempt("root")
+
+
+@pytest.mark.asyncio
 async def test_bound_harness_claim_requires_explicit_server_grant():
     requests = []
 
@@ -152,6 +188,63 @@ async def test_bound_harness_claim_requires_explicit_server_grant():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["native", "codex", "claude-sdk", "acp"])
+async def test_settled_recreate_exemption_precedes_cold_claim_and_is_session_local(harness):
+    requests = []
+
+    def respond(request):
+        requests.append(request.url.path)
+        return httpx.Response(
+            200, json={"exempt": request.url.path.startswith("/v1/sessions/old/")}
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(respond)
+    ) as client:
+        ref = _attempt().model_copy(update={"mode": "startup_only"})
+        admission = StartupAdmission(client, root_session_id="old", root_attempt=ref)
+        if harness == "native":
+            await admission.native_admitter("old")()
+        else:
+            await admission.admit_harness("old", harness)
+        assert not admission.required("old")
+        assert not await admission.opening_settled("old", ref)
+        with pytest.raises(RuntimeError):
+            await admission.admit_harness("new", "codex")
+    assert requests[0].endswith("/startup/recreate-exemption")
+    assert not any(path == "/v1/sessions/old/startup/claims" for path in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["native", "acp", "codex", "claude-sdk"])
+async def test_queue_mode_claims_real_cold_boundary_and_keeps_missing_child_closed(harness):
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"granted": True})
+
+    ref = _attempt().model_copy(update={"mode": "startup_only", "policy_revision": 3})
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(respond)
+    ) as client:
+        admission = StartupAdmission(client, root_session_id="root", root_attempt=ref)
+        if harness == "native":
+            await admission.native_admitter("root")()
+            with pytest.raises(RuntimeError):
+                await admission.native_admitter("child")()
+        else:
+            await admission.admit_harness("root", harness)
+            with pytest.raises(RuntimeError):
+                await admission.admit_harness("child", harness)
+    assert len(requests) == 1
+    assert requests[0]["boundary"] == (
+        "native_prepare" if harness == "native" else "harness_prepare"
+    )
+    assert requests[0]["attempt"] == ref.model_dump()
+
+
+@pytest.mark.asyncio
 async def test_protected_runner_refuses_unregistered_side_contexts():
     async with httpx.AsyncClient() as client:
         admission = StartupAdmission(client)
@@ -169,12 +262,21 @@ async def test_protected_runner_refuses_unregistered_side_contexts():
 
 
 @pytest.mark.asyncio
-async def test_enabling_cold_protection_keeps_warm_non_codex_messages_working():
+@pytest.mark.parametrize("recreated", [False, True])
+async def test_enabling_cold_protection_keeps_warm_non_codex_messages_working(recreated):
+    class Server(NullServerClient):
+        async def post(self, url, **kwargs):
+            if url.endswith("/startup/recreate-exemption"):
+                return httpx.Response(200, json={"exempt": recreated})
+            return await super().post(url, **kwargs)
+
+    session_id = "warm-recreated" if recreated else "warm-existing"
     executor = MockExecutor()
     executor.enqueue_response("first")
     executor.enqueue_response("followup")
-    harness = ExecutorAdapter(lambda: executor).build()
-    harness.state.conversation_id = "warm"
+    adapter = ExecutorAdapter(lambda: executor)
+    harness = adapter.build()
+    harness.state.conversation_id = session_id
     spec = AgentSpec(
         spec_version=1,
         name="agent",
@@ -184,27 +286,43 @@ async def test_enabling_cold_protection_keeps_warm_non_codex_messages_working():
         app = create_runner_app(
             process_manager=_FakeProcessManager(harness_client),
             spec_resolver=AsyncMock(return_value=spec),
-            server_client=NullServerClient(),
+            server_client=Server(),
         )
         async with _runner_client(app) as client:
             assert (
-                await client.post("/v1/sessions", json={"session_id": "warm", "agent_id": "agent"})
+                await client.post(
+                    "/v1/sessions", json={"session_id": session_id, "agent_id": "agent"}
+                )
             ).status_code == 201
             for turn in range(2):
                 if turn:
-                    app.state.startup_admission.register("root", _attempt())
+                    ref = (
+                        _attempt().model_copy(update={"mode": "startup_only"})
+                        if recreated
+                        else _attempt()
+                    )
+                    app.state.startup_admission.register("root", ref)
+                    if recreated:
+                        adapter._executor = None  # The old local executor was reaped.
+                        app.state.startup_admission.register(session_id, None)
                 response = await client.post(
-                    "/v1/sessions/warm/events",
-                    json={"type": "message", "role": "user", "model": "agent", "content": []},
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "model": "agent",
+                        "content": [],
+                        **({"startup_required": True} if recreated and turn else {}),
+                    },
                 )
                 assert response.status_code == 202
 
                 async def settled():
-                    while "warm" in app.state.active_turns:
+                    while session_id in app.state.active_turns:
                         await asyncio.sleep(0.01)
 
                 await asyncio.wait_for(settled(), 3)
-            events = list(app.state.session_event_queues["warm"]._queue)
+            events = list(app.state.session_event_queues[session_id]._queue)
             assert sum(event.get("type") == "response.completed" for event in events) == 2
             assert all(event.get("type") != "response.failed" for event in events)
 
@@ -300,6 +418,53 @@ async def test_native_primary_terminal_generic_route_refuses_before_launch(
             )
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "startup_proof_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_native_resource_ensure_reports_empty_ready_after_local_adapter(
+    tmp_path, monkeypatch
+):
+    server = []
+    order = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        server.append((request.url.path, body))
+        return httpx.Response(
+            200,
+            json={"granted": True} if request.url.path.endswith("claims") else {"accepted": True},
+        )
+
+    async def launch(_ctx):
+        order.append("ready")
+        return _terminal_view("native")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", launch)
+    ref = _attempt().model_copy(update={"mode": "startup_only", "input_id": None})
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(respond)
+    ) as client:
+        app = create_runner_app(
+            server_client=client,
+            process_manager=HarnessProcessManager(tmp_parent=tmp_path),
+            root_startup_session_id="root",
+            root_startup_attempt=ref,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner.test"
+        ) as runner:
+            response = await runner.post(
+                "/v1/sessions/root/resources/terminals",
+                json={
+                    "terminal": "pi",
+                    "session_key": "main",
+                    "ensure_native_terminal": True,
+                },
+            )
+    assert response.status_code == 200, response.text
+    assert order == ["ready"]
+    assert [path.rsplit("/", 1)[-1] for path, _ in server] == ["claims", "receipts"]
+    assert server[-1][1]["phase"] == "opening_settled"
 
 
 @pytest.mark.asyncio

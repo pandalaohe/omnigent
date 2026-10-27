@@ -574,6 +574,7 @@ def register_resource_routes(
                 rebind_bridge=_rebind_claude_bridge,
                 startup_required=startup_admission.required(session_id),
                 admit_cold=startup_admission.native_admitter(session_id),
+                settle_empty=startup_admission.empty_settler(session_id),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None

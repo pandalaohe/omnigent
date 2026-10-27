@@ -26,6 +26,95 @@ SESSION = "49ed0bd1f0cae058f05f48057e9f98cf"
 AGENT = "880b5afda28ad55ff74cbeb9b5fc67fb"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["codex", "claude-sdk", "acp"])
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize(
+    ("warm_harness", "registered"), [(False, True), (True, True), (True, False)]
+)
+async def test_shared_runner_initialization_only_suppresses_registered_recovery(
+    source, resume, warm_harness, registered
+):
+    from uuid import uuid4
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+    from tests.runner.test_app_sessions_native_workflow_messages import _FakeServerClient
+
+    class Server(_FakeServerClient, NullServerClient):
+        async def post(self, url, **kwargs):
+            if url.endswith("/startup/recreate-exemption"):
+                return _Accepted({"exempt": True})
+            return await NullServerClient.post(self, url, **kwargs)
+
+    class Manager(_FakeProcessManager):
+        def set_startup_admitter(self, admitter):
+            self.admitter = admitter
+
+        async def get_client(self, session_id, harness, **kwargs):
+            if not warm_harness:
+                await self.admitter(session_id, harness)
+            return await super().get_client(session_id, harness, **kwargs)
+
+    session_id = uuid4().hex
+    ref = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="old-runtime",
+        host_generation="generation",
+        mode="startup_only",
+    )
+    history = [
+        {
+            "id": ref.input_id,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "old first input"}],
+        }
+    ]
+    server = Server(history)
+    stream_finished = asyncio.Event()
+    harness = _ScriptedHarnessClient([], stream_finished=stream_finished)
+    spec = AgentSpec(
+        spec_version=1, name="agent", executor=ExecutorSpec(config={"harness": source})
+    )
+    app = create_runner_app(
+        process_manager=Manager(harness),
+        server_client=server,
+        spec_resolver=AsyncMock(return_value=spec),
+        root_startup_session_id=session_id if registered else uuid4().hex,
+        root_startup_attempt=ref,
+    )
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=session_id,
+        agent_id=AGENT,
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=1, updated_at=1, workspace="/opt/work/project"
+        ),
+        resume_interrupted_turn=resume,
+        recovery_id="old-recovery" if resume else None,
+    )
+    body = {"session_id": session_id, "agent_id": AGENT, "session_init": envelope.model_dump()}
+    async with _runner_client(app, permission_harness=source) as client:
+        result = await client.post("/v1/sessions", json=body)
+        assert result.status_code == 201, result.text
+        if registered:
+            await asyncio.sleep(0)
+            assert session_id not in app.state.active_turns
+            assert not any(item.get("type") == "message" for item in harness.posted_bodies)
+        else:
+            assert result.json()["status"] == "running"
+            await asyncio.wait_for(stream_finished.wait(), timeout=3)
+            assert len(harness.posted_bodies) == 1
+            assert harness.posted_bodies[0]["type"] == "message"
+
+
 class _RecordingServer(NullServerClient):
     def __init__(self) -> None:
         self.claims: list[dict[str, Any]] = []

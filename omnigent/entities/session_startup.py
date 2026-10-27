@@ -14,6 +14,8 @@ StartupState = Literal[
     "ready_empty",
     "waiting_input",
     "working",
+    "opened",
+    "operator_released",
     "cancelled",
     "stopped",
     "command_completed",
@@ -31,6 +33,7 @@ class SessionStartupStatus(BaseModel):
     """Permission-filtered presentation carries no provider identity or input payload."""
 
     id: str
+    host_id: str | None = None
     attempt_id: str | None
     input_id: str | None
     state: StartupState
@@ -54,6 +57,7 @@ class StartupReceipt(BaseModel):
     input_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     runtime_id: str = Field(min_length=1, max_length=128)
     phase: Literal[
+        "opening_settled",
         "runtime_ready",
         "tools_ready",
         "input_accepted",
@@ -67,3 +71,39 @@ class StartupReceipt(BaseModel):
     vendor_session_id: str | None = Field(default=None, max_length=256)
     vendor_turn_id: str | None = Field(default=None, max_length=256)
     reason: str | None = Field(default=None, max_length=128)
+
+
+class StartupReleaseTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    startup_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    attempt_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    input_id: str | None = Field(pattern=r"^[0-9a-f]{32}$")
+    runtime_id: str | None = Field(max_length=128)
+    host_generation: str | None = Field(max_length=128)
+    runner_id: str | None = Field(max_length=128)
+
+
+class StartupReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    current_host_generation: str = Field(min_length=1, max_length=128)
+    targets: list[StartupReleaseTarget] = Field(min_length=1, max_length=2)
+
+
+class StartupReleaseReceipt(StartupReleaseRequest):
+    actor_user_id: str | None
+    actor_account_generation: str | None
+    released_at: int
+
+
+class StartupReleasePreviewItem(BaseModel):
+    target: StartupReleaseTarget
+    title: str | None
+    work_hint: Literal["working", "unknown"] = "unknown"
+
+
+class StartupReleasePreview(BaseModel):
+    current_host_generation: str | None
+    targets: list[StartupReleasePreviewItem]

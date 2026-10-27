@@ -34,7 +34,7 @@ describe("SessionStartupIndicator", () => {
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent("Waiting for your first message");
-    expect(screen.getByRole("status")).toHaveTextContent("8s since host admission");
+    expect(screen.getByRole("status")).toHaveTextContent("8s since opening began");
     expect(screen.getByRole("status")).not.toHaveTextContent("since first message");
     expect(screen.getByText("Waiting for your first message")).not.toHaveTextContent("ready");
   });
@@ -54,7 +54,7 @@ describe("SessionStartupIndicator", () => {
     );
     const status = screen.getByRole("status");
     expect(status).toHaveTextContent("400s since request");
-    expect(status).toHaveTextContent("185s since host admission");
+    expect(status).toHaveTextContent("185s since opening began");
     expect(status).toHaveTextContent("121s since first message");
   });
 
@@ -94,7 +94,7 @@ describe("SessionStartupIndicator", () => {
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Host startups are paused until earlier unconfirmed startups are reconciled.",
+      "Earlier starts are stuck. Keep waiting or review their startup slots to let queued sessions start.",
     );
     rerender(
       <SessionStartupIndicator
@@ -172,5 +172,39 @@ describe("SessionStartupIndicator", () => {
       <SessionStartupIndicator startup={{ ...queued, state: "working" }} onCancel={vi.fn()} />,
     );
     expect(screen.queryByRole("status")).toBeNull();
+  });
+  it("distinguishes an opened session from work and a released slot from stopped work", () => {
+    const { rerender } = render(
+      <SessionStartupIndicator startup={{ ...queued, state: "opened" }} onCancel={vi.fn()} />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Session opened");
+    expect(screen.getByRole("status")).not.toHaveTextContent("Working");
+    rerender(
+      <SessionStartupIndicator
+        startup={{
+          ...queued,
+          state: "operator_released",
+          canCancel: false,
+          reason: "delivery_unconfirmed",
+        }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Startup slot released");
+    expect(screen.getByRole("status")).toHaveTextContent("Old work may still be running");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Saved input will not be sent again automatically",
+    );
+  });
+  it("shows review only for writable stuck or blocked-queue sessions", () => {
+    const props = { onCancel: vi.fn(), onReleased: vi.fn(), hostId: "host" };
+    const { rerender } = render(
+      <SessionStartupIndicator {...props} startup={{ ...queued, state: "uncertain" }} />,
+    );
+    expect(screen.getByRole("button", { name: "Review stuck starts" })).toBeEnabled();
+    rerender(
+      <SessionStartupIndicator {...props} startup={{ ...queued, state: "uncertain" }} readOnly />,
+    );
+    expect(screen.queryByRole("button", { name: "Review stuck starts" })).toBeNull();
   });
 });

@@ -20,6 +20,56 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_attempt", [False, True])
+async def test_native_forward_transports_only_its_owned_startup_reference(db_uri, with_attempt):
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.update_conversation(conv.id, harness_override="codex-native")
+    conv = store.get_conversation(conv.id)
+    ref = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="runtime",
+        host_generation="generation",
+        mode="startup_only",
+    )
+    context = StartupInputContext(
+        app=None,
+        headers=Headers(),
+        user_id=None,
+        input_id=ref.input_id,
+        startup=ref if with_attempt else None,
+    )
+    received = []
+
+    def receive(request):
+        event = MessageEvent.model_validate(json.loads(request.content)).to_create_request()
+        received.append(event)
+        return httpx.Response(202)
+
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "new input"}],
+            "startup_attempt": {"forged": True},
+            "startup_required": True,
+        },
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner.test", transport=httpx.MockTransport(receive)
+    ) as runner:
+        await orchestration._forward_native_terminal_message(
+            runner, conv.id, conv, body, startup_context=context
+        )
+    assert received[0].startup_attempt == (ref if with_attempt else None)
+    assert received[0].startup_required is with_attempt
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lost_reply", [False, True])
 async def test_forward_keeps_one_pending_owner_until_vendor_accepts(
     db_uri, monkeypatch, lost_reply

@@ -38,6 +38,8 @@ async def authorize_host_startup_claim(
         or conv.archived
         or (current.session_id, current.host_id, current.input_id, current.attempt_id)
         != (frame.session_id, conn.host_id, ref.input_id, ref.attempt_id)
+        or current.admission_mode != ref.mode
+        or (ref.mode == "startup_only" and current.policy_revision != ref.policy_revision)
         or conv.host_id != conn.host_id
         or conv.runner_id != frame.runner_id
     ):

@@ -45,6 +45,15 @@ def test_populated_startup_migrations_round_trip(db_uri):
         assert row.cold_claims == {}
         assert row.state == "uncertain" and row.occupied and row.resident
         assert row.admitted_at is None and row.first_dispatch_at is None
+        assert row.admission_mode == "guarded" and row.policy_revision == 0
+        assert row.release_receipt is None
+    assert "session_startup_releases" not in sa.inspect(engine).get_table_names()
+    release_column = next(
+        item
+        for item in sa.inspect(engine).get_columns("session_startups")
+        if item["name"] == "release_receipt"
+    )
+    assert release_column["nullable"]
     column = next(
         item
         for item in sa.inspect(engine).get_columns("session_startups")
@@ -82,6 +91,7 @@ def test_inventory_veto_migration_backfills_and_downgrades(db_uri):
         row = connection.execute(sa.select(budgets).where(budgets.c.scope == "legacy-host")).one()
         assert row.resident_inventory_unknown in (False, 0)
         assert row.resident_limit == 7 and row.next_sequence == 5
+        assert row.admission_mode == "guarded" and row.policy_revision == 0
         connection.execute(
             budgets.update()
             .where(budgets.c.scope == "legacy-host")

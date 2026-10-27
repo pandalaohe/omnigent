@@ -14,7 +14,12 @@ from omnigent.runtime import session_stream
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.schemas import SessionStartupEvent
 from omnigent.server.startup_inputs import reconcile_accepted_startup_input
-from omnigent.startup_protocol import SDK_STARTUP_SOURCES, StartupAttemptRef, StartupObservation
+from omnigent.startup_protocol import (
+    SDK_STARTUP_SOURCES,
+    STARTUP_QUEUE_V1,
+    StartupAttemptRef,
+    StartupObservation,
+)
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore, StartupSnapshot
 
@@ -47,9 +52,13 @@ async def _current_binding(
         or current.input_id != ref.input_id
         or current.host_generation != ref.host_generation
         or conn.startup_generation != ref.host_generation
-        or "startup_admission_v1" not in conn.hello.capabilities
+        or current.admission_mode != ref.mode
+        or (ref.mode == "startup_only" and current.policy_revision != ref.policy_revision)
+        or (STARTUP_QUEUE_V1 if ref.mode == "startup_only" else "startup_admission_v1")
+        not in conn.hello.capabilities
         or (
-            observation.source != "runner"
+            current.admission_mode != "startup_only"
+            and observation.source != "runner"
             and f"startup_receipts:{observation.source}" not in conn.hello.capabilities
         )
     ):
@@ -177,10 +186,18 @@ async def reconcile_startup_observations(
     if (
         conn is None
         or conn.startup_generation != startup.host_generation
-        or "startup_admission_v1" not in conn.hello.capabilities
-        or not any(
-            f"startup_receipts:{source}" in conn.hello.capabilities
-            for source in SDK_STARTUP_SOURCES
+        or (
+            STARTUP_QUEUE_V1
+            if startup.admission_mode == "startup_only"
+            else "startup_admission_v1"
+        )
+        not in conn.hello.capabilities
+        or (
+            startup.admission_mode != "startup_only"
+            and not any(
+                f"startup_receipts:{source}" in conn.hello.capabilities
+                for source in SDK_STARTUP_SOURCES
+            )
         )
     ):
         return False
@@ -205,6 +222,8 @@ async def reconcile_startup_observations(
         input_id=startup.input_id,
         runtime_id=startup.runtime_id,
         host_generation=startup.host_generation,
+        mode=startup.admission_mode,
+        policy_revision=startup.policy_revision if startup.admission_mode == "startup_only" else 0,
     )
     try:
         response = await routed.client.post(
@@ -236,7 +255,7 @@ async def reconcile_startup_observations(
     ):
         return False
     raw = result.get("observations") if isinstance(result, dict) else None
-    if not isinstance(raw, list) or len(raw) > 7:
+    if not isinstance(raw, list) or len(raw) > 8:
         return False
     observations: list[StartupObservation] = []
     seen_phases: set[str] = set()
@@ -247,9 +266,26 @@ async def reconcile_startup_observations(
             return False
         if (
             observation.attempt != ref
-            or observation.source not in SDK_STARTUP_SOURCES
-            or f"startup_receipts:{observation.source}" not in conn.hello.capabilities
-            or (observations and observation.source != observations[0].source)
+            or not (
+                (
+                    observation.source == "runner"
+                    and observation.phase == "opening_settled"
+                    and ref.mode == "startup_only"
+                )
+                or (
+                    observation.source in SDK_STARTUP_SOURCES
+                    and (
+                        ref.mode == "startup_only"
+                        or f"startup_receipts:{observation.source}" in conn.hello.capabilities
+                    )
+                )
+            )
+            or any(
+                previous.source != observation.source
+                and previous.phase != "opening_settled"
+                and observation.phase != "opening_settled"
+                for previous in observations
+            )
             or observation.phase in seen_phases
         ):
             return False

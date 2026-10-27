@@ -134,6 +134,31 @@ async def reconcile_accepted_startup_input(
     _publish_input_consumed(startup.session_id, consumed)
 
 
+async def _startup_allows_delivery(
+    app: Any, conversations: ConversationStore, session_id: str, input_id: str | None
+) -> bool:
+    startups = getattr(getattr(app, "state", None), "startup_store", None)
+    current = await asyncio.to_thread(startups.for_session, session_id) if startups else None
+    policy_disabled = getattr(getattr(app, "state", None), "startup_admission", None) is None
+    if current is None or (not policy_disabled and current.release_receipt is None):
+        return True
+    pending = await asyncio.to_thread(conversations.list_pending_inputs, session_id)
+    if policy_disabled and (
+        current.state in ("queued", "starting", "verifying", "uncertain", "blocked", "cancelling")
+        or any(item.id == current.input_id for item in pending)
+    ):
+        return False
+    if current.release_receipt is None:
+        return True
+    head = next((item for item in pending if item.status != "failed"), None)
+    return (
+        current.input_accepted
+        and current.input_id != input_id
+        and head is not None
+        and head.id == input_id
+    )
+
+
 @dataclass
 class StartupInputContext:
     """The accepted sender's identity, independent of the browser's lifetime."""
@@ -185,6 +210,11 @@ class StartupInputContext:
                 account=account,
             ):
                 return False
+        if not await _startup_allows_delivery(self.app, store, session_id, self.input_id):
+            return False
+        live = await asyncio.to_thread(store.get_conversation, session_id)
+        if live is None or live.archived:
+            return False
         self.submitted = await asyncio.to_thread(
             store.transition_pending_input,
             session_id,
@@ -408,8 +438,18 @@ class ManagedStartupInputs:
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
         admission = getattr(app.state, "startup_admission", None)
+        startups = getattr(app.state, "startup_store", None)
+        current = await asyncio.to_thread(startups.for_session, conv.id) if startups else None
+        if current is not None and current.release_receipt is not None:
+            pending = await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
+            return not current.input_accepted or any(
+                item.id == current.input_id for item in pending
+            )
+        if admission is None and not await _startup_allows_delivery(
+            app, self.conversations, conv.id, None
+        ):
+            return True
         if admission is not None:
-            current = await asyncio.to_thread(admission.startups.for_session, conv.id)
             if current is not None and current.state in ("cancelled", "stopped", "cancelling"):
                 raise OmnigentError(
                     "Startup is stopped or still stopping; "
@@ -417,9 +457,13 @@ class ManagedStartupInputs:
                     code=ErrorCode.CONFLICT,
                 )
             if (conv.host_id is not None or current is not None) and (
-                current is None or current.state not in ("working", "command_completed")
+                current is None or current.state not in ("working", "opened", "command_completed")
             ):
                 return True
+            if current is not None and current.state == "opened" and current.input_id is not None:
+                pending = await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
+                if any(item.id == current.input_id for item in pending):
+                    return True
         state = conv.labels.get(STARTUP_LABEL)
         if state not in ("pending", "ready"):
             return False
@@ -520,7 +564,7 @@ class ManagedStartupInputs:
     ) -> bool:
         """Advance one session's startup here; return whether work is in flight."""
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-        if conv is None or conv.host_id != connection.host_id:
+        if conv is None or conv.archived or conv.host_id != connection.host_id:
             return False
         from omnigent.server.host_load_queue import held_host
 
@@ -596,12 +640,27 @@ class ManagedStartupInputs:
                     task.add_done_callback(clear_annotation_delivery)
                 return False
         admission = getattr(app.state, "startup_admission", None)
+        startups = getattr(app.state, "startup_store", None)
+        current = await asyncio.to_thread(startups.for_session, session_id) if startups else None
+        released = current is not None and current.release_receipt is not None
+        if (
+            current is not None
+            and released
+            and (not current.input_accepted or (head is not None and head.id == current.input_id))
+        ):
+            if admission is not None:
+                await admission.recover_session(session_id, connection)
+            return False
+        if admission is None and not await _startup_allows_delivery(
+            app, self.conversations, session_id, head.id if head is not None else None
+        ):
+            return False
         if admission is not None:
-            current = await asyncio.to_thread(admission.startups.for_session, session_id)
-            if (
+            if not released and (
                 (
                     current is not None
-                    and current.state not in ("working", "command_completed", "ready_empty")
+                    and current.state
+                    not in ("working", "opened", "command_completed", "ready_empty")
                 )
                 or (head is not None and (current is None or current.state == "ready_empty"))
                 or (state == "pending" and conv.runner_id is None)
@@ -612,6 +671,13 @@ class ManagedStartupInputs:
                     return await admission.recover_session(session_id, connection)
                 except StartupQueued:
                     return False
+            if (
+                current is not None
+                and current.state == "opened"
+                and head is not None
+                and head.id == current.input_id
+            ):
+                return False
         if head is not None:
             # Delivered even without the label: a message saved while the label
             # was being cleared still belongs to this session's startup.
@@ -677,12 +743,15 @@ class ManagedStartupInputs:
 
             if (
                 conv is None
+                or conv.archived
                 or not start_allowed(conv)
                 or conv.labels.get(STARTUP_LABEL) == "cancelled"
                 or current is None
                 or current.response_id != PENDING_INPUT_RESPONSE_ID
                 or current.status != "in_progress"
             ):
+                return "not_dispatched"
+            if not await _startup_allows_delivery(app, self.conversations, session_id, item.id):
                 return "not_dispatched"
             options = (
                 item.data.startup_options
@@ -708,6 +777,9 @@ class ManagedStartupInputs:
                 model_override=options.model_override if options else None,
                 tools=options.tools if options else None,
             )
+            live = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+            if live is None or live.archived:
+                return "not_dispatched"
             response = await self.dispatch(context, session_id, event)
             if response.get("denied"):
                 if annotation:

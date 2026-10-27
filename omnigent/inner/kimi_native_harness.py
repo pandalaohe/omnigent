@@ -39,5 +39,7 @@ def _build_kimi_native_executor() -> Executor:
 
 def create_app() -> FastAPI:
     """Build the kimi-native harness's FastAPI app (required entry point)."""
-    adapter = ExecutorAdapter(executor_factory=_build_kimi_native_executor)
+    adapter = ExecutorAdapter(
+        executor_factory=_build_kimi_native_executor, startup_source="native"
+    )
     return adapter.build()

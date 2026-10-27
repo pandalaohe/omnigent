@@ -217,7 +217,7 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
         executor = _build_acp_executor(extension)
         return executor
 
-    adapter = ExecutorAdapter(executor_factory=factory, harness_label=label)
+    adapter = ExecutorAdapter(executor_factory=factory, harness_label=label, startup_source="acp")
     app = adapter.build()
 
     @app.get("/v1/model-options")

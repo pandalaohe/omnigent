@@ -129,7 +129,8 @@ def test_codex_dispatch_receipt_requires_owned_turn_and_input():
         "dynamicToolCall",
     ],
 )
-async def test_actual_codex_executor_reports_only_its_own_vendor_turn(work):
+@pytest.mark.parametrize("queue_mode", [False, True])
+async def test_actual_codex_executor_reports_only_its_own_vendor_turn(work, queue_mode):
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd="/opt/work/project",
@@ -148,6 +149,8 @@ async def test_actual_codex_executor_reports_only_its_own_vendor_turn(work):
         runtime_id="context",
         host_generation="generation",
     )
+    if queue_mode:
+        ref = ref.model_copy(update={"mode": "startup_only", "policy_revision": 1})
     base = {"threadId": "thread", "turnId": "turn"}
     activities = {
         "reasoning": [("item/reasoning/textDelta", {**base, "delta": "work"})],
@@ -217,6 +220,7 @@ async def test_actual_codex_executor_reports_only_its_own_vendor_turn(work):
         "input_dispatched",
         "runtime_ready",
         "tools_ready",
+        *(["opening_settled"] if queue_mode else []),
         "input_accepted",
         "work_started",
     ]
@@ -378,7 +382,7 @@ async def test_startup_receipt_retries_only_transient_responses(
 
 
 @pytest.mark.asyncio
-async def test_codex_cold_executor_claim_precedes_creation_and_warm_turn_skips_it():
+async def test_codex_cold_executor_claim_precedes_creation_and_warm_turn_skips_it(db_uri):
     class FakeAppSession:
         _started = False
         _closing = False
@@ -406,11 +410,26 @@ async def test_codex_cold_executor_claim_precedes_creation_and_warm_turn_skips_i
         model="gpt-5.4",
         app_session_factory=factory,
     )
+    from uuid import uuid4
+
+    from omnigent.stores.session_startup_store import SessionStartupStore
+
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, host_resident_limit=4, deployment_resident_limit=8)
+    queued = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=uuid4().hex,
+        operation_key="codex-cold",
+        input_id=uuid4().hex,
+    )
+    reserved = store.reserve(host)
+    assert store.claim(queued.id, reserved.attempt_id, runtime_id="runtime")
     ref = StartupAttemptRef(
-        startup_id="a" * 32,
-        attempt_id="b" * 32,
-        input_id="c" * 32,
-        runtime_id="context",
+        startup_id=queued.id,
+        attempt_id=reserved.attempt_id,
+        input_id=queued.input_id,
+        runtime_id="runtime",
         host_generation="generation",
     )
     messages = [{"role": "user", "content": "work", "session_id": "session"}]
@@ -428,32 +447,40 @@ async def test_codex_cold_executor_claim_precedes_creation_and_warm_turn_skips_i
 
     async def grant(attempt, boundary):
         claims.append(boundary)
-        return True
+        return store.claim_boundary(
+            attempt.startup_id,
+            attempt.attempt_id,
+            runtime_id=attempt.runtime_id,
+            host_generation=attempt.host_generation,
+            boundary=boundary,
+            claim_id=uuid4().hex,
+        )
 
     with startup_evidence_scope(ref, lambda _: None, grant):
         async for _ in executor.run_turn(messages, [], "", ExecutorConfig()):
             pass
-        # Cold work claims both package preparation and session construction.
-        assert claims == ["executor_prepare"] * 3
+        # One owned cold operation covers package preparation and session construction.
+        assert claims == ["executor_prepare"] * 2
         assert len(created) == 1
         async for _ in executor.run_turn(messages, [], "", ExecutorConfig()):
             pass
-        assert claims == ["executor_prepare"] * 3
+        assert claims == ["executor_prepare"] * 2
         assert len(created) == 1
-        async for _ in executor.run_turn(messages, [], "", ExecutorConfig(model="gpt-5.5")):
-            pass
-    assert claims == ["executor_prepare"] * 4
-    assert len(created) == 2
+        with pytest.raises(RuntimeError, match="Startup permission unavailable"):
+            async for _ in executor.run_turn(messages, [], "", ExecutorConfig(model="gpt-5.5")):
+                pass
+    assert claims == ["executor_prepare"] * 3
+    assert len(created) == 1
 
     # A warm follow-up has no new attempt; a later signature change or crash
     # must discover cold work and refuse it before making a replacement client.
     with startup_evidence_scope(None, lambda _: None, required=True):
-        async for _ in executor.run_turn(messages, [], "", ExecutorConfig(model="gpt-5.5")):
+        async for _ in executor.run_turn(messages, [], "", ExecutorConfig(model="gpt-5.4")):
             pass
         with pytest.raises(RuntimeError, match="Startup permission unavailable"):
             async for _ in executor.run_turn(messages, [], "", ExecutorConfig(model="gpt-5.6")):
                 pass
-    assert len(created) == 2
+    assert len(created) == 1
 
 
 @pytest.mark.asyncio

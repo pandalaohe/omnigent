@@ -599,7 +599,7 @@ class HostRegistry:
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
         self.startup_admitter: (
-            Callable[[HostConnection, str], Awaitable[StartupAttemptRef]] | None
+            Callable[[HostConnection, str], Awaitable[StartupAttemptRef | None]] | None
         ) = None
 
     @asynccontextmanager
