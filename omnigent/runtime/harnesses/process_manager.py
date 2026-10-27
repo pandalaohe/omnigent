@@ -32,7 +32,7 @@ import sys
 import time
 import uuid
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -44,7 +44,7 @@ from pydantic import TypeAdapter
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_retention import cli_family_for_resident_harness
 from omnigent.debug_logging import debug_event
-from omnigent.harness_plugins import missing_install_packages
+from omnigent.harness_plugins import loaded_harness_manifest, missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
@@ -65,6 +65,7 @@ from omnigent.startup_protocol import (
     CONTEXT_INVENTORY_MAX_BYTES,
     CONTEXT_INVENTORY_V2,
     ContextEvidenceV2,
+    UnresolvedContextV2,
     decode_context_evidence_v2,
     executor_context_scope_v2,
     harness_context_authority_v2,
@@ -126,6 +127,8 @@ _SOCKET_MODE = 0o600
 # NOT depend on a specific value.
 _DEFAULT_IDLE_TIMEOUT_S = 60 * 60  # 1 hour
 RETENTION_LEASE_S = 1200
+# Diagnostic candidates are bounded independently of resident capacity policy.
+_MAX_RETIRED_OWNER_CANDIDATES = 1000
 
 # How often the idle reaper wakes up to check for stale entries.
 # Picking 1/30th of the timeout keeps reaping reasonably prompt
@@ -247,6 +250,13 @@ def _socket_path(instance_dir: Path, conversation_id: str) -> Path:
     return instance_dir / f"conv-{conversation_id}.sock"
 
 
+def _registered_module_path(harness: str, modules: Mapping[str, str]) -> str | None:
+    module = modules.get(harness)
+    if module is None and harness.startswith("acp:"):
+        return modules.get("acp")
+    return module
+
+
 def _resolve_module_path(harness: str) -> str:
     """
     Look up the harness name in :data:`_HARNESS_MODULES`.
@@ -267,15 +277,9 @@ def _resolve_module_path(harness: str) -> str:
         registry is empty — common during Phase 1 step 2 before
         wraps land in step 4).
     """
-    module_path = _HARNESS_MODULES.get(harness)
+    module_path = _registered_module_path(harness, _HARNESS_MODULES)
     if module_path is not None:
         return module_path
-    # Generic-ACP ids (``acp:<slug>``) all resolve to the base ``acp`` module;
-    # the slug selecting the concrete agent is read from the spec at spawn.
-    if harness.startswith("acp:"):
-        acp_module = _HARNESS_MODULES.get("acp")
-        if acp_module is not None:
-            return acp_module
     package = missing_install_packages().get(harness)
     if package:
         raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")
@@ -661,6 +665,7 @@ class HarnessProcessManager:
         self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
         self._closing_entries: dict[str, tuple[str, _SubprocessEntry]] = {}
+        self._retired_owners: dict[str, HarnessResidentSnapshot] = {}
         self._spawning_sessions: set[str] = set()
         self._exit_coverage_complete = True
         # Per-conversation in-flight harness response_id. The runner's
@@ -782,6 +787,12 @@ class HarnessProcessManager:
                 )
                 for session_id, entry, closing in entries
             )
+            current_incarnations = {snapshot.incarnation_id for snapshot in snapshots}
+            retired = tuple(
+                owner
+                for incarnation, owner in self._retired_owners.items()
+                if incarnation not in current_incarnations
+            )
             contexts = None
             if context_reads is not None:
                 reads = {
@@ -807,9 +818,9 @@ class HarnessProcessManager:
                     for snapshot, (session_id, entry, closing) in zip(
                         snapshots, entries, strict=True
                     )
-                )
+                ) + (None,) * len(retired)
             return HarnessInventorySnapshot(
-                snapshots,
+                snapshots + retired,
                 self._exit_coverage_complete and not self._spawning_sessions,
                 contexts,
             )
@@ -844,6 +855,8 @@ class HarnessProcessManager:
 
         if not 0 < timeout_s <= 5.0:
             return lambda: unknown("invalid_read_budget")
+        module_manifest = tuple(sorted(_HARNESS_MODULES.copy().items()))
+        contribution_manifest = loaded_harness_manifest()
         try:
             async with asyncio.timeout_at(started + timeout_s):
                 selection = await self._select_resident_inventory_owner(owner)
@@ -882,7 +895,57 @@ class HarnessProcessManager:
         def reconcile() -> HarnessContextEvidenceSnapshotV2:
             if not still_current():
                 return unknown("owner_changed")
+            current_modules = tuple(sorted(_HARNESS_MODULES.copy().items()))
+            current_contributions = loaded_harness_manifest()
+            reason = None
+            modules = dict(current_modules)
+            if (
+                current_modules != module_manifest
+                or current_contributions != contribution_manifest
+            ):
+                reason = "harness_source_manifest_changed"
+            elif current_contributions is None:
+                reason = "harness_source_manifest_unavailable"
+            elif current_contributions.load_errors:
+                reason = "harness_plugin_load_errors"
+            elif any(
+                modules.get(name) != module for name, module in current_contributions.modules
+            ):
+                reason = "harness_registry_manifest_mismatch"
+            elif not _registered_module_path(owner.harness, modules):
+                reason = "harness_source_unregistered"
+            elif _registered_module_path(
+                owner.harness, dict(current_contributions.modules)
+            ) != _registered_module_path(owner.harness, modules):
+                reason = "harness_registry_manifest_mismatch"
             elapsed = time.monotonic() - started
+            sources = evidence.sources
+            if reason is not None:
+                sources = tuple(
+                    source.model_copy(
+                        update={
+                            "coverage": "unsupported"
+                            if source.coverage == "unsupported"
+                            else "partial",
+                            "unresolved": (
+                                *source.unresolved[:999],
+                                UnresolvedContextV2(
+                                    candidate=None,
+                                    reason=reason
+                                    if len(source.unresolved) < 1000
+                                    else "harness_manifest_reason_budget",
+                                ),
+                            ),
+                            "membership_revision": None,
+                            "context_revision": None,
+                            "work_revision": None,
+                            "revision_authority": "observation_only",
+                            "age_upper_bound_s": None,
+                            "work_bindings": None,
+                        }
+                    )
+                    for source in sources
+                )
             aged = evidence.model_copy(
                 update={
                     "sources": tuple(
@@ -895,7 +958,7 @@ class HarnessProcessManager:
                                 ),
                             }
                         )
-                        for source in evidence.sources
+                        for source in sources
                     ),
                 }
             )
@@ -1116,12 +1179,7 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
-                    if (
-                        not released.exit_confirmed
-                        and self._entries.get(conversation_id) is not released
-                    ):
-                        self._exit_coverage_complete = False
-                    self._closing_entries.pop(released.incarnation_id, None)
+                    self._finish_closing_entry(conversation_id, released)
                 raise
             if closed:
                 self._closing_entries.pop(released.incarnation_id, None)
@@ -1463,12 +1521,7 @@ class HarnessProcessManager:
                         if not await self._close_entry(entry):
                             self._entries[conversation_id] = entry
                     finally:
-                        if (
-                            not entry.exit_confirmed
-                            and self._entries.get(conversation_id) is not entry
-                        ):
-                            self._exit_coverage_complete = False
-                        self._closing_entries.pop(entry.incarnation_id, None)
+                        self._finish_closing_entry(conversation_id, entry)
                     raise RuntimeError(
                         "HarnessProcessManager shut down during spawn for "
                         f"conversation {conversation_id!r}"
@@ -1764,12 +1817,7 @@ class HarnessProcessManager:
                                     saved_expiry,
                                     self._retention_managed.get(conversation_id, saved_expiry),
                                 )
-                    if (
-                        not entry.exit_confirmed
-                        and self._entries.get(conversation_id) is not entry
-                    ):
-                        self._exit_coverage_complete = False
-                    self._closing_entries.pop(entry.incarnation_id, None)
+                    self._finish_closing_entry(conversation_id, entry)
                 raise
             if closed:
                 self._closing_entries.pop(entry.incarnation_id, None)
@@ -2051,6 +2099,23 @@ class HarnessProcessManager:
             stderr=None,
             env=effective_env,
         )
+
+    def _finish_closing_entry(self, session_id: str, entry: _SubprocessEntry) -> None:
+        if not entry.exit_confirmed and self._entries.get(session_id) is not entry:
+            self._exit_coverage_complete = False
+            if len(self._retired_owners) < _MAX_RETIRED_OWNER_CANDIDATES:
+                self._retired_owners.setdefault(
+                    entry.incarnation_id,
+                    HarnessResidentSnapshot(
+                        entry.incarnation_id,
+                        session_id,
+                        entry.harness,
+                        closing=True,
+                        wrapper_exited=entry.process.returncode is not None,
+                        exit_confirmed=False,
+                    ),
+                )
+        self._closing_entries.pop(entry.incarnation_id, None)
 
     async def _close_entry(self, entry: _SubprocessEntry) -> bool:
         """

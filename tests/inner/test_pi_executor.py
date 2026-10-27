@@ -337,6 +337,215 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+@pytest.fixture
+async def context_v2_pi(monkeypatch):
+    from omnigent.inner import pi_executor as module
+
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: None)
+    executor = PiExecutor(pi_path="/opt/work/bin/pi")
+    monkeypatch.setattr(executor, "_ensure_tool_server", AsyncMock(return_value=None))
+    monkeypatch.setattr(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        executor, "_build_env_and_dir", lambda *a, **kw: PiSubprocessConfig({}, None, [])
+    )
+    for name in ("remember_process_group", "terminate_tree", "kill_tree"):
+        monkeypatch.setattr(module._proc, name, lambda *_: None)
+    processes = []
+
+    async def create(*args, **kwargs):
+        process = _FakeProcess()
+        process.pid = 2**22 + 1
+        process.stdout = asyncio.StreamReader()
+        close = process.stdin.close
+
+        def eof():
+            close()
+            if not process.stdout.at_eof():
+                process.stdout.feed_eof()
+
+        process.stdin.close = eof
+        processes.append(process)
+        return process
+
+    spawn = AsyncMock(side_effect=create)
+    monkeypatch.setattr(module, "_create_subprocess_exec", spawn)
+    try:
+        yield executor, spawn, create, processes
+    finally:
+        await executor.close()
+
+
+async def test_context_v2_pi_primary_reuse_replacement_and_close(context_v2_pi):
+    executor, spawn, _, processes = context_v2_pi
+    read = await executor.prepare_context_inventory_v2("outer", "read")
+    rpc = await executor._ensure_rpc("sdk-key", "system", None, [])
+    (starting,) = read().sources[0].contexts
+    assert starting.key.context_incarnation == rpc.context_incarnation
+    assert starting.lifecycle == "starting" and starting.vendor_id is None
+    assert starting.execution_keys == ("sdk-key",) and starting.operation.action == "create"
+    processes[0].stdout.feed_data(b'{"type":"agent_start"}\n')
+    await rpc.read_line(timeout=1)
+    assert read().sources[0].contexts[0].lifecycle == "live"
+    assert await executor._ensure_rpc("sdk-key", "system", None, []) is rpc
+    spawn.assert_awaited_once()
+    replacement = await executor._ensure_rpc("sdk-key", "changed", None, [])
+    old, new = read().sources[0].contexts
+    assert old.key == starting.key and old.lifecycle == "unknown"
+    assert new.key.context_incarnation == replacement.context_incarnation and new.key != old.key
+    assert new.execution_keys == old.execution_keys and new.vendor_id is None
+    await executor.close_session("sdk-key")
+    source = read().sources[0]
+    assert all(
+        row.lifecycle == "unknown" and row.stop_proof is row.continuity_proof is None
+        for row in source.contexts
+    )
+    assert source.coverage == "partial" and source.revision_authority == "observation_only"
+    assert "pi_vendor_session_unconfirmed" in {r.reason for r in source.unresolved}
+    assert all(process.stdin.data == [] for process in processes)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failed", "cancel", "owner-removed"])
+async def test_context_v2_pi_start_is_visible_before_await_and_cannot_rebind(
+    context_v2_pi, outcome
+):
+    executor, spawn, create, _ = context_v2_pi
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def pending(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        if outcome == "failed":
+            raise OSError("spawn failed")
+        return await create(*args, **kwargs)
+
+    spawn.side_effect = pending
+    read = await executor.prepare_context_inventory_v2("outer", "read")
+    task = asyncio.create_task(executor._ensure_rpc("sdk-key", "system", None, []))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (before,) = read().sources[0].contexts
+        assert before.lifecycle == "starting" and before.vendor_id is None
+        if outcome == "owner-removed":
+            await executor.close_session("sdk-key")
+            assert read().sources[0].contexts[0].lifecycle == "unknown"
+        if outcome == "cancel":
+            task.cancel()
+        release.set()
+        if outcome == "success":
+            await task
+        else:
+            with pytest.raises(
+                {
+                    "failed": OSError,
+                    "cancel": asyncio.CancelledError,
+                    "owner-removed": RuntimeError,
+                }[outcome]
+            ):
+                await task
+            assert read().sources[0].contexts[0].lifecycle == "unknown"
+        assert read().sources[0].contexts[0].key == before.key
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("evict", [False, True])
+async def test_context_v2_pi_close_and_eviction_retain_occupied_metadata(
+    context_v2_pi, monkeypatch, evict
+):
+    executor, _, _, _ = context_v2_pi
+    rpc = await executor._ensure_rpc("sdk-key", "system", None, [])
+    read = await executor.prepare_context_inventory_v2("outer", "read")
+    entered, release = asyncio.Event(), asyncio.Event()
+    close = rpc._close_unobserved
+
+    async def pending():
+        entered.set()
+        await release.wait()
+        await close()
+
+    monkeypatch.setattr(rpc, "_close_unobserved", pending)
+    task = asyncio.create_task(
+        executor._evict_rpc("sdk-key", rpc) if evict else executor.close_session("sdk-key")
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (record,) = read().sources[0].contexts
+        assert record.lifecycle == "closing"
+    finally:
+        release.set()
+        await task
+    assert executor._session_states == {}
+    rpc._context_observer(1, "live")
+    assert read().sources[0].contexts[0].lifecycle == "unknown"
+    assert read().sources[0].contexts[0].key == record.key
+
+
+async def test_context_v2_pi_eof_detach_and_history_budget_are_unknown(context_v2_pi):
+    from omnigent.inner.pi_executor import _PiSessionState
+
+    executor, _, _, processes = context_v2_pi
+    rpc = await executor._ensure_rpc("sdk-key", "system", None, [])
+    read = await executor.prepare_context_inventory_v2("outer", "read")
+    processes[0].stdout.feed_data(b'{"type":"agent_start"}\n')
+    await rpc.read_line(timeout=1)
+    state = executor._session_states.pop("sdk-key")
+    assert read().sources[0].contexts[0].lifecycle == "unknown"
+    executor._session_states["sdk-key"] = state
+    processes[0].stdout.feed_eof()
+    await rpc._read_task
+    assert read().sources[0].contexts[0].lifecycle == "unknown"
+    for _ in range(1000):
+        executor._register_rpc_context("another", _PiSessionState(), _PiRpcSession())
+    source = read().sources[0]
+    assert source.contexts == () and source.coverage == "partial"
+    assert source.unresolved[0].reason == "context_history_budget"
+
+
+async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage_token(
+    context_v2_pi, monkeypatch
+):
+    executor, spawn, create, _ = context_v2_pi
+    executor._tool_server = _ToolServer()
+    monkeypatch.setattr(executor, "_ensure_tool_server", AsyncMock(return_value=12345))
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def pending(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return await create(*args, **kwargs)
+
+    spawn.side_effect = pending
+    read = await executor.prepare_context_inventory_v2("outer", "read")
+    old = asyncio.create_task(executor._ensure_rpc("same-key", "system", None, []))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        old_key = read().sources[0].contexts[0].key
+        await executor.close_session("same-key")
+        assert read().sources[0].contexts[0].lifecycle == "unknown"
+        replacement = await executor._ensure_rpc("same-key", "system", None, [])
+        token = executor._tool_server._pi_usage_tokens["same-key"]
+        source = read().sources[0]
+        assert source.contexts[0].key == old_key and source.contexts[0].lifecycle == "unknown"
+        assert source.contexts[1].key != old_key
+        assert "pi_rpc_owner_unregistered" in {u.reason for u in source.unresolved}
+        release.set()
+        with pytest.raises(RuntimeError, match="owner changed"):
+            await old
+        assert executor._session_states["same-key"].rpc is replacement
+        assert executor._tool_server._pi_usage_token_ok("same-key", token)
+        assert read().sources[0].contexts[0].lifecycle == "unknown"
+    finally:
+        release.set()
+        old.cancel()
+        await asyncio.gather(old, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_rpc_close_stops_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -4396,6 +4396,12 @@ async def test_codex_forwarder_client_close_keeps_backend_visible_on_second_canc
     assert closed == ["client", "backend"]
     assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
     assert not orchestration._CLOSING_NATIVE_BACKENDS
+    assert any(
+        owner.incarnation_id == backend.resident_incarnation_id
+        and owner.closing
+        and not owner.exit_confirmed
+        for owner in orchestration.native_backend_resident_inventory().owners
+    )
 
 
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(

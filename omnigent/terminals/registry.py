@@ -123,6 +123,9 @@ class TerminalRegistrationSnapshot:
     observed_running: bool
 
 
+_MAX_UNCERTAIN_TERMINAL_OWNERS = 1000
+
+
 class TerminalExitedDuringLaunch(RuntimeError):
     """Retain a dead launch's captured evidence after its private server is closed."""
 
@@ -234,6 +237,8 @@ class TerminalRegistry:
         # Per-conversation maps make ``cleanup_conversation`` cheap
         # (one pop) and ``list_for_conversation`` direct.
         self._by_conversation: dict[str, dict[tuple[str, str], TerminalInstance]] = {}
+        self._uncertain_owners: dict[tuple[str, str], TerminalRegistrationSnapshot] = {}
+        self._owner_history_overflow = False
         # Per-instance locks keyed by the full (conv_id, name, session_key)
         # triple. Created at launch, removed at close /
         # cleanup_conversation. Sender / reader / closer tools acquire
@@ -352,6 +357,10 @@ class TerminalRegistry:
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
+        with self._lock:
+            self._remember_uncertain_owner(
+                conversation_id, terminal_name, session_key, created.instance
+            )
         stage = "terminal_spawn"
         try:
             created.instance.program_status_app = program_status_app
@@ -545,6 +554,37 @@ class TerminalRegistry:
                 for (name, key), instance in slot.items()
             )
 
+    def _remember_uncertain_owner(
+        self, conversation_id: str, name: str, key: str, instance: TerminalInstance
+    ) -> None:
+        # Called under the registry lock at lifecycle boundaries, never by a read.
+        identity = (conversation_id, instance.diagnostic_id)
+        if identity not in self._uncertain_owners:
+            if len(self._uncertain_owners) >= _MAX_UNCERTAIN_TERMINAL_OWNERS:
+                self._owner_history_overflow = True
+                return
+            self._uncertain_owners[identity] = TerminalRegistrationSnapshot(
+                conversation_id, name, key, instance.diagnostic_id, instance.running
+            )
+
+    def owner_uncertainty_snapshot(
+        self,
+    ) -> tuple[tuple[TerminalRegistrationSnapshot, ...], bool]:
+        """Copy current/retained metadata; the bool means overflow, never proven absence."""
+        with self._lock:
+            rows = dict(self._uncertain_owners)
+            for conversation_id, slot in self._by_conversation.items():
+                for (name, key), instance in slot.items():
+                    identity = (conversation_id, instance.diagnostic_id)
+                    if identity in rows:
+                        continue
+                    if len(rows) >= _MAX_UNCERTAIN_TERMINAL_OWNERS:
+                        return tuple(rows.values()), True
+                    rows[identity] = TerminalRegistrationSnapshot(
+                        conversation_id, name, key, instance.diagnostic_id, instance.running
+                    )
+            return tuple(rows.values()), self._owner_history_overflow
+
     def native_panes(self) -> list[tuple[str, str, Path]]:
         """Return live native-harness CLI panes as ``(conversation_id, name, socket_path)``.
 
@@ -610,10 +650,16 @@ class TerminalRegistry:
                     f"conversation {target_conversation_id!r}"
                 )
 
+            self._remember_uncertain_owner(
+                source_conversation_id, terminal_name, session_key, instance
+            )
             source_slot.pop(key)
             if not source_slot:
                 self._by_conversation.pop(source_conversation_id, None)
             target_slot[key] = instance
+            self._remember_uncertain_owner(
+                target_conversation_id, terminal_name, session_key, instance
+            )
             instance.lifecycle_trace.transfer_session(target_conversation_id)
 
             lock = self._instance_locks.pop(source_lock_key, None)
@@ -659,6 +705,10 @@ class TerminalRegistry:
             if expected is not None and slot.get(key) is not expected:
                 return False
             instance = slot.pop(key, None)
+            if instance is not None:
+                self._remember_uncertain_owner(
+                    conversation_id, terminal_name, session_key, instance
+                )
             if not slot:
                 # Drop the empty per-conversation dict so memory
                 # doesn't grow with stale conversation ids.
@@ -730,7 +780,8 @@ class TerminalRegistry:
             # Iterate over `slot` (the just-popped per-conv map) for the
             # canonical (name, key) pairs.
             if slot:
-                for name, sess in slot:
+                for (name, sess), instance in slot.items():
+                    self._remember_uncertain_owner(conversation_id, name, sess, instance)
                     self._instance_locks.pop((conversation_id, name, sess), None)
         if not slot:
             return
@@ -764,6 +815,9 @@ class TerminalRegistry:
         """
         with self._lock:
             slots = list(self._by_conversation.items())
+            for conversation_id, slot in slots:
+                for (name, key), instance in slot.items():
+                    self._remember_uncertain_owner(conversation_id, name, key, instance)
             self._by_conversation.clear()
             # AP-shutdown clears all instance locks too — every
             # conversation's terminals are being torn down.

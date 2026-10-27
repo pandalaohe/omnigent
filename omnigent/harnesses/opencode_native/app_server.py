@@ -33,8 +33,11 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 import uuid
-from collections.abc import Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from functools import partial
+from math import isfinite
 from pathlib import Path
 
 import httpx
@@ -53,8 +56,21 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
+    OpenCodeEvent,
+    OpenCodeSession,
 )
+from omnigent.host.recovery import RuntimeObservation
 from omnigent.inner import _proc
+from omnigent.startup_protocol import (
+    ContextKeyV2,
+    ContextOperationV2,
+    ContextRecordV2,
+    ContextWorkBindingV2,
+    SourceEvidenceV2,
+    UnresolvedContextV2,
+    VendorContextIdV2,
+    native_context_scope_v2,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -435,6 +451,16 @@ class OpenCodeNativeServer:
         self._resident_spawned = False
         self._lifecycle_lock = asyncio.Lock()
         self._start_generation = 0
+        self._context_records: dict[ContextKeyV2, ContextRecordV2] = {}
+        self._context_overflow = False
+        self._context_closing = False
+        self._context_forwarder: bool | None = None
+        self._context_generations: dict[ContextKeyV2, int] = {}
+        self._work_identity: tuple[str, int] | None = None
+        self._active_work: dict[ContextKeyV2, set[object]] = {}
+        self._terminal_work: dict[ContextKeyV2, set[str]] = {}
+        self._work_gaps: set[str] = set()
+        self._work_overflow = False
 
     @property
     def base_url(self) -> str:
@@ -481,6 +507,8 @@ class OpenCodeNativeServer:
             if (self._resident_spawned or self.process is not None) and not self.exit_confirmed:
                 raise RuntimeError("Previous OpenCode server exit is not confirmed")
             self._start_generation += 1
+            self._context_closing = False
+            self._context_forwarder = None
             await self._start()
 
     async def _start(self) -> None:
@@ -567,14 +595,309 @@ class OpenCodeNativeServer:
         :param directory: Optional workspace directory routing header.
         :returns: A new client (caller owns closing it).
         """
+        self._work_identity = (self.resident_incarnation_id, self._start_generation)
         return OpenCodeClient(
             self.base_url,
             headers=self.auth_headers,
             directory=directory or str(self.workspace),
+            context_observer=partial(
+                self._begin_context, self.resident_incarnation_id, self._start_generation
+            ),
+            forwarder_observer=partial(
+                self._observe_forwarder, self.resident_incarnation_id, self._start_generation
+            ),
+            work_observer=partial(
+                self._begin_work, self.resident_incarnation_id, self._start_generation
+            ),
+            event_observer=partial(
+                self._observe_work_event, self.resident_incarnation_id, self._start_generation
+            ),
+        )
+
+    def _begin_context(
+        self, incarnation: str, generation: int, action: str, session_id: str | None
+    ) -> Callable[[OpenCodeSession | None], None]:
+        """Retain the operation before its REST request; a lost reply remains unknown."""
+        parents = [
+            record
+            for record in self._context_records.values()
+            if record.key.source_owner_incarnation == incarnation
+            and record.vendor_id is not None
+            and record.vendor_id.value == session_id
+        ]
+        parent = parents[0] if len(parents) == 1 else None
+        operation = ContextOperationV2(
+            operation_id=uuid.uuid4().hex,
+            action="resume" if action == "resume" else "fork" if action == "fork" else "create",
+            parent=parent.key if action == "fork" and parent is not None else None,
+        )
+        key = (
+            parent.key
+            if action == "resume" and parent is not None
+            else ContextKeyV2(
+                source_owner_incarnation=incarnation, context_incarnation=uuid.uuid4().hex
+            )
+        )
+        record = ContextRecordV2(
+            key=key,
+            vendor_id=(
+                parent.vendor_id
+                if parent
+                else VendorContextIdV2(namespace="opencode", value=session_id)
+            )
+            if action == "resume" and session_id and len(session_id) <= 256
+            else None,
+            operation=parent.operation
+            if action == "resume" and parent is not None and parent.operation.action == "fork"
+            else operation,
+            execution_keys=parent.execution_keys if action == "resume" and parent else (),
+            provenance=parent.provenance
+            if action == "resume" and parent is not None
+            else "managed_side_chat"
+            if operation.parent is not None
+            else "unknown"
+            if action == "fork"
+            else "primary",
+            lifecycle="starting",
+            aliases=(),
+            revision=parent.revision + 1 if parent is not None and key == parent.key else 0,
+            stop_proof=None,
+            continuity_proof=None,
+        )
+        if key not in self._context_records and len(self._context_records) >= 1000:
+            self._context_overflow = True
+            return lambda _result: None
+        self._context_records[key] = record
+        self._context_generations[key] = generation
+
+        def finish(result: OpenCodeSession | None) -> None:
+            current = self._context_records[key]
+            if current.revision != record.revision:
+                return
+            # A client is tied to the backend generation that created it, not its URL.
+            live = (
+                self.resident_incarnation_id == incarnation
+                and self._start_generation == generation
+                and not self._context_closing
+                and not self.process_exit_confirmed
+                and self.process is not None
+                and self.process.returncode is None
+                and result is not None
+                and (action != "resume" or result.id == session_id)
+                and (action != "fork" or result.id != session_id)
+            )
+            try:
+                self._context_records[key] = current.model_copy(
+                    update={
+                        "vendor_id": VendorContextIdV2(namespace="opencode", value=result.id)
+                        if live and result
+                        else current.vendor_id,
+                        "execution_keys": (result.id,)
+                        if live and result
+                        else current.execution_keys,
+                        "lifecycle": "live" if live else "unknown",
+                        "revision": current.revision + 1,
+                    }
+                )
+            except ValueError:
+                self._context_records[key] = current.model_copy(update={"lifecycle": "unknown"})
+
+        return finish
+
+    def _work_current(self, incarnation: str, generation: int) -> bool:
+        return (
+            self._work_identity == (incarnation, generation)
+            and (incarnation, generation) == (self.resident_incarnation_id, self._start_generation)
+            and not self._context_closing
+            and not self.process_exit_confirmed
+            and self.process is not None
+            and self.process.returncode is None
+        )
+
+    def _work_context(self, session_id: object) -> ContextKeyV2 | None:
+        matches = [
+            key
+            for key, record in self._context_records.items()
+            if key.source_owner_incarnation == self.resident_incarnation_id
+            and self._context_generations.get(key) == self._start_generation
+            and record.vendor_id is not None
+            and record.vendor_id.value == session_id
+        ]
+        if len(matches) != 1:
+            self._work_gaps.add("opencode_work_context_ambiguous_or_unobserved")
+            return None
+        return matches[0]
+
+    def _work_budget_available(self) -> bool:
+        if (
+            sum(map(len, self._active_work.values())) + sum(map(len, self._terminal_work.values()))
+            >= 1000
+        ):
+            self._work_overflow = True
+            self._work_gaps.add("opencode_work_history_budget")
+        return not self._work_overflow
+
+    def _begin_work(
+        self, incarnation: str, generation: int, session_id: str, operation: str
+    ) -> Callable[[bool], None]:
+        if not self._work_current(incarnation, generation):
+            return lambda _success: None
+        key = self._work_context(session_id)
+        if key is None or not self._work_budget_available():
+            return lambda _success: None
+        active = self._active_work.setdefault(key, set())
+        pending = object()
+        active.add(pending)
+
+        def finish(success: bool) -> None:
+            if not success or not self._work_current(incarnation, generation):
+                self._work_gaps.add("opencode_work_outcome_unconfirmed")
+                return
+            active.discard(pending)
+            if operation != "prompt":
+                self._work_gaps.add("opencode_async_work_outcome_unconfirmed")
+
+        return finish
+
+    def _observe_work_event(self, incarnation: str, generation: int, event: OpenCodeEvent) -> None:
+        if not self._work_current(incarnation, generation):
+            return
+        if event.type != "message.updated":
+            return
+        info = event.properties.get("info")
+        if not isinstance(info, Mapping) or info.get("role") != "assistant":
+            return
+        key = self._work_context(info.get("sessionID"))
+        message_id = info.get("id")
+        if key is None or not isinstance(message_id, str) or not 0 < len(message_id) <= 256:
+            self._work_gaps.add("opencode_work_event_unbound")
+            return
+        if not self._work_budget_available():
+            return
+        active = self._active_work.setdefault(key, set())
+        terminal = self._terminal_work.setdefault(key, set())
+        times = info.get("time")
+        completed = times.get("completed") if isinstance(times, Mapping) else None
+        if (
+            isinstance(completed, (int, float))
+            and not isinstance(completed, bool)
+            and completed > 0
+            and (not isinstance(completed, float) or isfinite(completed))
+        ):
+            terminal.add(message_id)
+            active.discard(message_id)
+        elif message_id not in terminal:
+            active.add(message_id)
+
+    def context_work_snapshot_v2(self, session_id: str):
+        source = self.context_source_v2(session_id)
+        row = None
+        if self._work_current(self.resident_incarnation_id, self._start_generation) and not (
+            self._context_overflow or self._work_overflow
+        ):
+            row = RuntimeObservation(
+                runtime_id=self.resident_incarnation_id,
+                generation=str(self._start_generation),
+                observed_at=time.time(),
+                live_turn=any(
+                    active
+                    for key, active in self._active_work.items()
+                    if key.source_owner_incarnation == self.resident_incarnation_id
+                    and self._context_generations.get(key) == self._start_generation
+                ),
+            )
+        return source, row
+
+    def _observe_forwarder(self, incarnation: str, generation: int, active: bool) -> None:
+        if (incarnation, generation) == (self.resident_incarnation_id, self._start_generation):
+            self._context_forwarder = active
+            if not active:
+                self._mark_contexts("unknown")
+
+    def _mark_contexts(self, lifecycle: str) -> None:
+        for key, record in self._context_records.items():
+            if key.source_owner_incarnation == self.resident_incarnation_id:
+                self._context_records[key] = record.model_copy(
+                    update={
+                        "lifecycle": lifecycle,
+                        "revision": record.revision + 1,
+                    }
+                )
+
+    def context_source_v2(self, session_id: str) -> SourceEvidenceV2:
+        """Pure partial evidence: attached TUI/bridge operations are not exhaustively owned."""
+        records, unresolved = (
+            [],
+            [
+                UnresolvedContextV2(
+                    candidate=None, reason="unobserved_bridge_and_native_contexts"
+                ),
+                UnresolvedContextV2(
+                    candidate=None, reason="readonly_alias_provenance_unavailable"
+                ),
+            ],
+        )
+        for key, record in self._context_records.items():
+            if key.source_owner_incarnation == self.resident_incarnation_id:
+                records.append(record)
+            else:
+                unresolved.append(
+                    UnresolvedContextV2(
+                        candidate=key.context_incarnation, reason="old_backend_generation"
+                    )
+                )
+        if self._context_overflow or len(unresolved) > 997:
+            records = []
+            unresolved = [UnresolvedContextV2(candidate=None, reason="context_history_budget")]
+        elif self._context_forwarder is not True:
+            unresolved.append(
+                UnresolvedContextV2(candidate=None, reason="forwarder_not_observed_live")
+            )
+        unresolved.extend(
+            UnresolvedContextV2(candidate=None, reason=reason)
+            for reason in sorted(self._work_gaps | {"opencode_owned_work_scope_incomplete"})
+        )
+        bindings = None
+        if (
+            self._work_current(self.resident_incarnation_id, self._start_generation)
+            and not self._context_overflow
+            and not self._work_overflow
+        ):
+            bindings = tuple(
+                ContextWorkBindingV2(
+                    context=record.key,
+                    runtime_id=self.resident_incarnation_id,
+                    generation=str(self._start_generation),
+                )
+                for record in records
+                if record.lifecycle == "live"
+                and self._context_generations.get(record.key) == self._start_generation
+                and record.vendor_id is not None
+                and sum(other.vendor_id == record.vendor_id for other in records) == 1
+            )
+        if len(unresolved) > 1000:
+            unresolved = [
+                *unresolved[:999],
+                UnresolvedContextV2(candidate=None, reason="opencode_work_reason_budget"),
+            ]
+        return SourceEvidenceV2(
+            scope=native_context_scope_v2(session_id),
+            producer_incarnation=self.resident_incarnation_id,
+            coverage="partial",
+            contexts=tuple(records),
+            unresolved=tuple(unresolved),
+            membership_revision=None,
+            context_revision=None,
+            work_revision=None,
+            revision_authority="observation_only",
+            age_upper_bound_s=0.0 if bindings is not None else None,
+            work_bindings=bindings,
         )
 
     def close(self) -> Coroutine[None, None, None]:
         """Bind teardown to this start attempt before a caller defers awaiting it."""
+        self._context_closing = True
+        self._mark_contexts("closing")
         return self._close_generation(self._start_generation)
 
     async def _close_generation(self, start_generation: int) -> None:
@@ -584,6 +907,8 @@ class OpenCodeNativeServer:
 
     async def _close_locked(self) -> None:
         """Terminate the server subprocess if running."""
+        self._context_closing = True
+        self._mark_contexts("closing")
         process = self.process
         if process is None:
             return
@@ -597,6 +922,7 @@ class OpenCodeNativeServer:
         self.process_exit_confirmed = True
         if self.process is process:
             self.process = None
+        self._mark_contexts("unknown")
 
 
 def client_for_state(

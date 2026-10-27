@@ -51,8 +51,10 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, TypeAlias
 
+from omnigent.inner.sdk_context_inventory import SdkContextSource
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.spec.types import RetryPolicy
+from omnigent.startup_protocol import ContextEvidenceV2, ContextKeyV2
 
 from .executor import (
     Executor,
@@ -308,6 +310,8 @@ class _AntigravitySessionState:
         consumer suppresses a trailing :class:`TurnComplete` after cancel.
     """
 
+    context_key: ContextKeyV2 | None = None
+    retired: bool = False
     agent: SDKAgent = None
     conversation: SDKConversation = None
     agent_signature: tuple[str | None, str, str] | None = field(default=None)
@@ -354,12 +358,24 @@ class AntigravityExecutor(Executor):
         self._location = location
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._session_states: dict[str, _AntigravitySessionState] = {}
+        self._context_source = SdkContextSource(
+            lambda: {
+                state.context_key
+                for state in self._session_states.values()
+                if state.context_key is not None and state.agent is not None
+            }
+        )
         # Set by the harness ExecutorAdapter when unset; the SDK tools route
         # invocations through this to reach Omnigent's tools under policy.
         self._tool_executor: ToolExecutor | None = None
 
     def supports_streaming(self) -> bool:
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        return await self._context_source.prepare(session_id, read_id, timeout_s=timeout_s)
 
     def supports_tool_calling(self) -> bool:
         return True
@@ -409,15 +425,20 @@ class AntigravityExecutor(Executor):
         :param session_key: The Omnigent session id whose agent to release.
         """
         state = self._session_states.pop(session_key, None)
-        if state is not None and state.agent is not None:
-            await self._close_agent(state.agent)
+        if state is not None:
+            state.retired = True
+            key, state.context_key = state.context_key, None
+            self._context_source.mark(key, "closing")
+            try:
+                if state.agent is not None:
+                    await self._close_agent(state.agent)
+            finally:
+                self._context_source.mark(key, "unknown")
 
     async def close(self) -> None:
         """Close every live SDK agent and clear all session state."""
-        for state in list(self._session_states.values()):
-            if state.agent is not None:
-                await self._close_agent(state.agent)
-        self._session_states.clear()
+        for key in list(self._session_states):
+            await self.close_session(key)
 
     async def interrupt_session(self, session_key: str) -> bool:
         """Interrupt the in-flight turn for *session_key* via the SDK.
@@ -454,6 +475,7 @@ class AntigravityExecutor(Executor):
         if state is None or state.conversation is None:
             return False
         state.interrupt_requested = True
+        self._context_source.mark(state.context_key, "unknown")
         with contextlib.suppress(Exception):
             await state.conversation.cancel()
         # Drop the cached signature (not the agent itself — _ensure_agent needs
@@ -795,42 +817,62 @@ class AntigravityExecutor(Executor):
         """
         signature = (model, system_prompt, self._tool_signature(tools))
         state = self._session_states.get(session_key)
+        registered_new = state is None
         if state is None:
-            # A brand-new session's state is NOT registered until the agent is
-            # fully built below, so a construction failure (bad creds, a host
-            # without the SDK's required glibc, SDK drift) leaves no dead,
-            # agent-less entry accumulating in ``_session_states`` turn after
-            # turn. A reused session is already registered.
+            # Pending startup must be visible to close_session. A failed build
+            # removes only this exact state, preserving a same-key successor.
             state = _AntigravitySessionState()
+            self._session_states[session_key] = state
 
         if state.agent is not None and state.agent_signature == signature:
             return state, False
 
         if state.agent is not None:
-            await self._close_agent(state.agent)
+            old_key = state.context_key
+            self._context_source.mark(old_key, "closing")
+            try:
+                await self._close_agent(state.agent)
+            finally:
+                self._context_source.mark(old_key, "unknown")
+            if (
+                state.retired
+                or state.context_key != old_key
+                or (self._session_states.get(session_key) is not state)
+            ):
+                raise RuntimeError("Antigravity state retired during rebuild")
             state.agent = None
             state.conversation = None
 
-        agent = await self._open_agent(
-            state, model=model, system_prompt=system_prompt, tools=tools
-        )
-        # Record the opened agent on the state BEFORE the (failure-prone)
-        # conversation access: ``_open_agent`` has already entered the agent's
-        # async context, which spawns the native ``localharness`` subprocess, so
-        # if anything after this point raises, the agent must still be reachable
-        # by ``close()`` / ``close_session()`` for teardown — otherwise that
-        # subprocess orphans. If wiring the conversation fails, reap it here.
-        state.agent = agent
+        key = self._context_source.begin((session_key,))
+        state.context_key = key
+        agent = None
         try:
-            state.conversation = agent.conversation
-        except Exception:
-            await self._close_agent(agent)
-            state.agent = None
-            state.conversation = None
+            agent = await self._open_agent(
+                state, model=model, system_prompt=system_prompt, tools=tools
+            )
+            if (
+                state.retired
+                or state.context_key != key
+                or (self._session_states.get(session_key) is not state)
+            ):
+                raise RuntimeError("Antigravity state retired during startup")
+            conversation = agent.conversation
+        except BaseException:
+            self._context_source.mark(key, "closing")
+            try:
+                if agent is not None:
+                    await self._close_agent(agent)
+            finally:
+                self._context_source.mark(key, "unknown")
+                if state.context_key == key and self._session_states.get(session_key) is state:
+                    state.agent = state.conversation = None
+                    if registered_new:
+                        self._session_states.pop(session_key)
             raise
+        state.agent = agent
+        state.conversation = conversation
         state.agent_signature = signature
-        # Register only once the agent is fully built (see the no-state branch).
-        self._session_states[session_key] = state
+        self._context_source.mark(key, "live")
         return state, True
 
     async def _open_agent(
@@ -867,7 +909,11 @@ class AntigravityExecutor(Executor):
         agent = antigravity.Agent(config)
         # Agent is documented as an async context manager; enter it if so.
         if hasattr(agent, "__aenter__"):
-            agent = await agent.__aenter__()
+            try:
+                agent = await agent.__aenter__()
+            except BaseException:
+                await self._close_agent(agent)
+                raise
         return agent
 
     def _build_post_tool_hook(

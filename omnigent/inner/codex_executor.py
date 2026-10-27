@@ -35,7 +35,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast
 from uuid import uuid4
 
 import psutil
@@ -56,6 +56,7 @@ from omnigent.harnesses.codex_egress import (
     is_connection_failure_text,
     is_connection_retry,
 )
+from omnigent.harnesses.codex_native.context_inventory import CodexContextInventory
 from omnigent.harnesses.codex_native.keep_warm import (
     KeepWarmPingResult,
     drive_keep_warm_ping,
@@ -88,6 +89,12 @@ from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
 from omnigent.session_default_modes import codex_service_tier, valid_speed_tier
 from omnigent.spec.types import RetryPolicy
 from omnigent.startup_evidence import CodexTurnEvidence, claim_startup_boundary
+from omnigent.startup_protocol import (
+    ContextEvidenceV2,
+    executor_context_scope_v2,
+    harness_context_authority_v2,
+    unknown_context_evidence_v2,
+)
 from omnigent.util.codex_inventory import read_loaded_codex_thread_ids
 from omnigent.util.reasoning_effort import (
     CODEX_EFFORTS,
@@ -3174,6 +3181,7 @@ class _CodexAppServerSession:
         self._codex_path = codex_path
         self._launch_prepared = False
         self._resident_incarnation_id = uuid4().hex
+        self._context_inventory: CodexContextInventory | None = None
         self._cwd = cwd
         self._env = env
         self._usage_session_id: str | None = None
@@ -3658,6 +3666,7 @@ class _CodexAppServerSession:
             raise
 
     async def close(self) -> None:
+        self._mark_contexts("closing")
         self._resident_connection_generation += 1
         self._resident_established_connection = None
         self._resident_thread_started_revision = None
@@ -3665,6 +3674,7 @@ class _CodexAppServerSession:
         current_loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not current_loop:
             self._close_cross_loop()
+            self._mark_contexts("unknown")
             return
 
         task = self._cleanup_task
@@ -3686,6 +3696,7 @@ class _CodexAppServerSession:
             # Propagate a cleanup bug to the caller; resource-specific expected
             # failures are handled inside _close_same_loop so siblings still run.
             task.result()
+        self._mark_contexts("unknown")
         if cancelled:
             raise asyncio.CancelledError
 
@@ -4299,7 +4310,21 @@ class _CodexAppServerSession:
         approval_mode: str | None = None,
         service_tier: str | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
-        await self.start()
+        if self.thread_id is None and self._context_inventory is not None:
+            self._context_inventory.begin(
+                "thread/start",
+                {},
+                domain=self.resident_incarnation_id,
+                current=lambda: False,
+                execution_keys=(self._usage_session_id,) if self._usage_session_id else (),
+                provenance="primary",
+                reserved=True,
+            )
+        try:
+            await self.start()
+        except BaseException:
+            self._mark_contexts("unknown")
+            raise
         assert self._proc is not None
         if self._containment_confirmed:
             sandbox = "danger-full-access"
@@ -5192,6 +5217,37 @@ class _CodexAppServerSession:
         *,
         transport_guard: Callable[[], bool] | None = None,
     ) -> CodexMessage:
+        finish = (
+            self._context_inventory.begin(
+                method,
+                params,
+                domain=self.resident_incarnation_id,
+                current=self._resident_transport_guard(),
+                execution_keys=(self._usage_session_id,)
+                if self._usage_session_id and method != "thread/fork"
+                else (),
+                provenance="primary" if method in {"thread/start", "thread/resume"} else None,
+            )
+            if self._context_inventory is not None
+            else lambda _response: None
+        )
+        try:
+            response = await self._request_unobserved(
+                method, params, transport_guard=transport_guard
+            )
+        except BaseException:
+            finish(None)
+            raise
+        finish(response)
+        return response
+
+    async def _request_unobserved(
+        self,
+        method: str,
+        params: CodexParams,
+        *,
+        transport_guard: Callable[[], bool] | None = None,
+    ) -> CodexMessage:
         if self._transport_error is not None:
             raise self._transport_error
         request_id = self._next_id
@@ -5315,6 +5371,7 @@ class _CodexAppServerSession:
         self._native_progress_observed = True
 
     def _note_transport_closed(self, detail: str, *, clean_eof: bool) -> None:
+        self._mark_contexts("unknown")
         if self._closing or self._transport_error is not None:
             return
         error = HarnessTransportClosedError(
@@ -5326,6 +5383,10 @@ class _CodexAppServerSession:
                 future.set_exception(error)
         # Buffered terminal/output events must be consumed before EOF.
         self._events.put_nowait(error)
+
+    def _mark_contexts(self, lifecycle: Literal["closing", "unknown"]) -> None:
+        if self._context_inventory is not None:
+            self._context_inventory.mark(self.resident_incarnation_id, lifecycle)
 
     def _keep_warm_fork_id_for(self, message: CodexMessage) -> str | None:
         """
@@ -5441,6 +5502,10 @@ class _CodexAppServerSession:
             )
         finally:
             self._resident_maintenance_current = None
+            if self._context_inventory is not None:
+                self._context_inventory.mark(
+                    self.resident_incarnation_id, "unknown", provenance="maintenance"
+                )
             retired_ids = set(fork_id_holder)
             retired_ids.update(
                 fork_id for fork_id in self._keep_warm_queues if fork_id not in registered_before
@@ -5933,6 +5998,7 @@ class CodexExecutor(Executor):
         self._tool_executor: CodexToolExecutor | None = None
         self._raw_elicitation_handler: CodexElicitationHandler | None = None
         self._session_states: dict[str, _CodexSessionState] = {}
+        self._context_inventory = CodexContextInventory()
         self._app_session_factory: _AppSessionFactory
         if app_session_factory is not None:
             self._app_session_factory = app_session_factory
@@ -6049,6 +6115,44 @@ class CodexExecutor(Executor):
             logger.exception("codex: keep-warm ping failed")
             return keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
         return keep_warm_result_receipt(attempt_id, result)
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+
+        def reconcile() -> ContextEvidenceV2:
+            reasons = []
+            for key, state in self._session_states.items():
+                app = state.app_session
+                if app is not None and (
+                    not isinstance(app, _CodexAppServerSession)
+                    or app._context_inventory is not self._context_inventory
+                    or app._usage_session_id != key
+                ):
+                    reasons.append("unbound_executor_context_owner")
+                elif isinstance(app, _CodexAppServerSession) and app._resident_maintenance_unknown:
+                    reasons.append("maintenance_association_unknown")
+            try:
+                return ContextEvidenceV2(
+                    wire_version=2,
+                    read_id=read_id,
+                    authority=harness_context_authority_v2(session_id),
+                    expected_scopes=(executor_context_scope_v2(session_id),),
+                    sources=(
+                        self._context_inventory.source(
+                            executor_context_scope_v2(session_id),
+                            *reasons,
+                        ),
+                    ),
+                )
+            except ValueError:
+                return unknown_context_evidence_v2(
+                    session_id, read_id, "context_identity_conflict"
+                )
+
+        return reconcile
 
     def resident_inventory(self) -> ExecutorResidentInventory | None:
         """Copy registered app-session owners, including unconfirmed closing owners.
@@ -6253,6 +6357,8 @@ class CodexExecutor(Executor):
             return None
         if state.close_task is None:
             state.closing = True
+            if isinstance(app_session, _CodexAppServerSession):
+                app_session._mark_contexts("closing")
             state.close_task = asyncio.create_task(app_session.close())
         close_task = state.close_task
         try:
@@ -6261,6 +6367,9 @@ class CodexExecutor(Executor):
             if state.close_task is close_task:
                 state.close_task = None
             raise
+        finally:
+            if isinstance(app_session, _CodexAppServerSession):
+                app_session._mark_contexts("unknown")
         if state.close_task is close_task:
             state.close_task = None
         return app_session
@@ -6312,6 +6421,7 @@ class CodexExecutor(Executor):
         )
         if isinstance(app_session, _CodexAppServerSession):
             app_session._usage_session_id = session_key
+            app_session._context_inventory = self._context_inventory
             app_session._launch_prepared = state.codex_path is not None
         state.app_session = app_session
         state.signature = signature

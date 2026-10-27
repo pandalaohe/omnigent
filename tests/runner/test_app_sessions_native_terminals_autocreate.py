@@ -6391,7 +6391,15 @@ async def test_native_inventory_keeps_opencode_start_and_unknown_unwind(
         assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
         orchestration._AUTO_OPENCODE_SERVERS.clear()
         final = orchestration.native_backend_resident_inventory()
-        assert final.owners == () and not final.exit_coverage_complete
+        (retired,) = final.owners
+        assert retired.incarnation_id == backends[0].resident_incarnation_id
+        assert retired.session_ids == (
+            ("known-association", "opencode-launch-session")
+            if outcome == "alias"
+            else ("opencode-launch-session",)
+        )
+        assert retired.closing and not retired.registered and not retired.exit_confirmed
+        assert not final.exit_coverage_complete
     finally:
         release.set()
         if not launch.done():

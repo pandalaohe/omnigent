@@ -2594,11 +2594,28 @@ async def test_inventory_records_unknown_exit_without_retaining_the_wrapper(
                 expected_activity_token=manager._retention_activity_token("conv_wrapper", entry),
             )
     snapshot = await manager.resident_inventory()
-    assert snapshot.owners == ()
+    (retired,) = snapshot.owners
+    assert retired.incarnation_id == entry.incarnation_id
+    assert retired.session_id == "conv_wrapper"
+    assert retired.closing and retired.wrapper_exited and not retired.exit_confirmed
     assert not snapshot.exit_coverage_complete
     assert not manager._closing_entries
     assert await close(entry)
-    assert (await manager.resident_inventory()).owners == ()
+    # A wrapper-only late close cannot establish the vendor/descendant lifetime.
+    assert (await manager.resident_inventory()).owners == (retired,)
+    replacement = _SubprocessEntry(
+        process=SimpleNamespace(returncode=None),
+        client=_NoopHarnessClient(),  # type: ignore[arg-type]
+        endpoint=_CleanupCountingEndpoint(),  # type: ignore[arg-type]
+        harness="codex",
+    )
+    manager._entries["conv_wrapper"] = replacement
+    current = await manager.resident_inventory(context_reads=())
+    assert {owner.incarnation_id for owner in current.owners} == {
+        retired.incarnation_id,
+        replacement.incarnation_id,
+    }
+    assert current.contexts == (None, None)
     assert not (await manager.resident_inventory()).exit_coverage_complete
 
 
@@ -2933,9 +2950,41 @@ async def test_shutdown_spawn_close_remains_in_inventory(
         with pytest.raises(asyncio.CancelledError if outcome == "cancelled" else RuntimeError):
             await task
     snapshot = await manager.resident_inventory()
-    assert snapshot.owners == ()
+    assert [owner.incarnation_id for owner in snapshot.owners] == (
+        [] if outcome == "confirmed" else [entry.incarnation_id]
+    )
+    assert all(owner.closing and not owner.exit_confirmed for owner in snapshot.owners)
     assert snapshot.exit_coverage_complete is (outcome == "confirmed")
     assert not manager._closing_entries
+
+
+async def test_retired_owner_candidate_budget_never_becomes_empty_proof(
+    short_tmp_parent, monkeypatch
+):
+    from omnigent.runtime.harnesses import process_manager
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    monkeypatch.setattr(process_manager, "_MAX_RETIRED_OWNER_CANDIDATES", 1)
+
+    async def failed_close(entry):
+        entry.process.returncode = 0
+        raise RuntimeError("owned exit unconfirmed")
+
+    monkeypatch.setattr(manager, "_close_entry", failed_close)
+    for session in ("first", "second"):
+        manager._entries[session] = _SubprocessEntry(
+            SimpleNamespace(returncode=None),
+            _NoopHarnessClient(),  # type: ignore[arg-type]
+            _CleanupCountingEndpoint(),  # type: ignore[arg-type]
+            "codex",
+        )
+        with pytest.raises(RuntimeError, match="owned exit unconfirmed"):
+            await manager.release(session)
+    snapshot = await manager.resident_inventory(context_reads=())
+    assert len(snapshot.owners) == 1 and snapshot.owners[0].session_id == "first"
+    assert snapshot.contexts == (None,)
+    assert not snapshot.exit_coverage_complete
+    assert not manager._entries and not manager._closing_entries
 
 
 async def test_shutdown_during_spawn_leaves_no_live_process(
@@ -3018,9 +3067,18 @@ async def test_shutdown_during_spawn_leaves_no_live_process(
 
 @pytest.fixture
 async def resident_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import omnigent.harness_plugins as hp
     from omnigent.inner.executor import Executor, ExecutorResidentInventory, ExecutorResidentOwner
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses.process_manager import _HarnessEndpoint
+
+    # This fixture's registry is already loaded; individual cases may replace it.
+    contribution = hp.HarnessContribution(
+        name="fixture-registry",
+        valid_harnesses=frozenset(_HARNESS_MODULES),
+        harness_modules=dict(_HARNESS_MODULES),
+    )
+    monkeypatch.setattr(hp, "_state", hp.HarnessPluginState((contribution,), {}))
 
     class Owner(Executor):
         inventory = ExecutorResidentInventory(
@@ -3462,6 +3520,194 @@ def test_context_inventory_v2_rejects_conflicting_identity_and_proofs(
         ]
     with pytest.raises(ValueError):
         ContextEvidenceV2.model_validate_json(json.dumps(raw), strict=True)
+
+
+@pytest.fixture
+def authoritative_resident_context_reader(
+    resident_reader, context_wire_v2, context_record_v2, monkeypatch
+):
+    import copy
+    import json
+
+    from omnigent.startup_protocol import ContextEvidenceV2
+
+    manager, entry, owner, app, requests = resident_reader
+
+    async def prepare(session_id, read_id, *, timeout_s=5.0):
+        raw = copy.deepcopy(context_wire_v2)
+        raw["read_id"] = read_id
+        raw["sources"][0].update(
+            producer_incarnation="owner",
+            coverage="partial",
+            contexts=[context_record_v2],
+            unresolved=[{"candidate": None, "reason": "owned_scope_incomplete"}],
+            membership_revision=1,
+            context_revision=1,
+            revision_authority="authoritative_membership",
+            age_upper_bound_s=0.0,
+            work_revision=2,
+            work_bindings=[
+                {
+                    "context": context_record_v2["key"],
+                    "runtime_id": "fixture-runtime",
+                    "generation": "fixture-work-generation",
+                }
+            ],
+        )
+        evidence = ContextEvidenceV2.model_validate_json(json.dumps(raw), strict=True)
+        return lambda: evidence
+
+    monkeypatch.setattr(owner, "prepare_context_inventory_v2", prepare)
+    return manager, entry, owner, app, requests
+
+
+async def test_context_inventory_v2_plugin_error_cannot_clear_source_denominator(
+    authoritative_resident_context_reader, monkeypatch
+):
+    import omnigent.harness_plugins as hp
+
+    manager, entry, _owner, _app, requests = authoritative_resident_context_reader
+    monkeypatch.setattr(
+        hp, "_state", hp.HarnessPluginState((), {"broken-plugin": "not disclosed"})
+    )
+    selected = (await manager.resident_inventory()).owners[0]
+    source = (await manager.prepare_context_inventory_v2(selected))().evidence.sources[0]
+    assert source.coverage == "partial"
+    assert source.contexts[0].vendor_id.value == "literal:shared/id"
+    assert source.revision_authority == "observation_only"
+    assert source.membership_revision is source.context_revision is source.work_bindings is None
+    assert "harness_plugin_load_errors" in {gap.reason for gap in source.unresolved}
+    assert requests == [("GET", "/v2/sessions/conversation/resident-context-inventory")]
+    assert entry.last_used_at == 0.0
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "known",
+        "registered_alias",
+        "generic_acp",
+        "missing",
+        "unloaded",
+        "declared_missing",
+        "declaration_removed",
+        "declarations_empty",
+        "module_change",
+        "contribution_change",
+    ],
+)
+async def test_context_inventory_v2_reconciles_loaded_manifest_without_losing_contexts(
+    authoritative_resident_context_reader, monkeypatch, case
+):
+    import omnigent.harness_plugins as hp
+
+    manager, entry, _owner, _app, requests = authoritative_resident_context_reader
+    expected = None
+    if case == "registered_alias":
+        monkeypatch.setitem(_HARNESS_MODULES, "fixture-alias", _HARNESS_MODULES["codex"])
+        contribution = hp.HarnessContribution(
+            name="fixture-registry",
+            harness_modules=dict(_HARNESS_MODULES),
+            aliases={"fixture-alias": "codex"},
+        )
+        monkeypatch.setattr(hp, "_state", hp.HarnessPluginState((contribution,), {}))
+        entry.harness = "fixture-alias"
+    elif case == "generic_acp":
+        entry.harness = "acp:fixture"
+    elif case == "missing":
+        entry.harness = "missing-fixture-harness"
+        expected = "harness_source_unregistered"
+    elif case == "unloaded":
+        monkeypatch.setattr(hp, "_state", None)
+        expected = "harness_source_manifest_unavailable"
+    elif case == "declared_missing":
+        contribution = hp.HarnessContribution(
+            name="fixture-plugin",
+            valid_harnesses=frozenset({"fixture"}),
+            harness_modules={"fixture": "omnigent.community.fixture"},
+        )
+        monkeypatch.setattr(hp, "_state", hp.HarnessPluginState((contribution,), {}))
+        expected = "harness_registry_manifest_mismatch"
+    elif case in {"declaration_removed", "declarations_empty"}:
+        modules = dict(_HARNESS_MODULES)
+        modules.pop("codex")
+        contributions = (
+            (hp.HarnessContribution(name="fixture-registry", harness_modules=modules),)
+            if case == "declaration_removed"
+            else ()
+        )
+        monkeypatch.setattr(hp, "_state", hp.HarnessPluginState(contributions, {}))
+        expected = "harness_registry_manifest_mismatch"
+    selected = (await manager.resident_inventory()).owners[0]
+    reconcile = await manager.prepare_context_inventory_v2(selected)
+    if case == "module_change":
+        monkeypatch.setitem(_HARNESS_MODULES, "new-fixture", "omnigent.community.fixture")
+        expected = "harness_source_manifest_changed"
+    elif case == "contribution_change":
+        monkeypatch.setattr(
+            hp,
+            "_state",
+            hp.HarnessPluginState(
+                (
+                    hp.HarnessContribution(
+                        name="new-fixture-plugin", valid_harnesses=frozenset({"new"})
+                    ),
+                ),
+                {},
+            ),
+        )
+        expected = "harness_source_manifest_changed"
+    source = reconcile().evidence.sources[0]
+    assert source.coverage == "partial" and len(source.contexts) == 1
+    assert source.contexts[0].vendor_id.value == "literal:shared/id"
+    if expected is None:
+        assert source.revision_authority == "authoritative_membership"
+        assert source.membership_revision == source.context_revision == 1
+        assert source.age_upper_bound_s is not None
+        assert source.work_revision == 2
+        assert source.work_bindings[0].runtime_id == "fixture-runtime"
+        assert [gap.reason for gap in source.unresolved] == ["owned_scope_incomplete"]
+    else:
+        assert source.revision_authority == "observation_only"
+        assert (
+            source.membership_revision is source.context_revision is source.work_bindings is None
+        )
+        assert source.age_upper_bound_s is None
+        assert source.work_revision is None
+        assert source.unresolved[-1].reason == expected
+    assert requests == [("GET", "/v2/sessions/conversation/resident-context-inventory")]
+    assert manager._retention_managed == {"conversation": 0.0}
+
+
+async def test_context_inventory_v2_manifest_gap_keeps_bounded_diagnostics(
+    authoritative_resident_context_reader, monkeypatch
+):
+    import omnigent.harness_plugins as hp
+    from omnigent.startup_protocol import UnresolvedContextV2
+
+    manager, _entry, owner, _app, _requests = authoritative_resident_context_reader
+    original = owner.prepare_context_inventory_v2
+
+    async def prepare(*args, **kwargs):
+        read = await original(*args, **kwargs)
+        evidence = read()
+        source = evidence.sources[0].model_copy(
+            update={
+                "unresolved": tuple(
+                    UnresolvedContextV2(candidate=f"candidate-{i}", reason="unresolved")
+                    for i in range(1000)
+                )
+            }
+        )
+        return lambda: evidence.model_copy(update={"sources": (source,)})
+
+    monkeypatch.setattr(owner, "prepare_context_inventory_v2", prepare)
+    monkeypatch.setattr(hp, "_state", hp.HarnessPluginState((), {"broken": "not disclosed"}))
+    selected = (await manager.resident_inventory()).owners[0]
+    source = (await manager.prepare_context_inventory_v2(selected))().evidence.sources[0]
+    assert len(source.unresolved) == 1000 and len(source.contexts) == 1
+    assert source.unresolved[-1].reason == "harness_manifest_reason_budget"
+    assert source.coverage == "partial" and source.revision_authority == "observation_only"
 
 
 async def test_context_inventory_v2_real_channel_is_truthful_and_read_only(resident_reader):

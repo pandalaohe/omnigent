@@ -60,6 +60,8 @@ class KimiNativeExecutor(Executor):
         :data:`BRIDGE_DIR_ENV_VAR` from the harness spawn env.
     """
 
+    _context_inventory_unsupported_reason = "kimi_native_workdir_context_liveness_unsupported"
+
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         # Serializes writes to the shared tmux pane: run_turn (initiating

@@ -63,6 +63,7 @@ from typing import Any, Protocol, TypeAlias
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.acp_context_inventory import AcpContextAttempt, AcpProcessContextSource
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -93,6 +94,7 @@ from omnigent.models.model_catalog_store import (
     write_catalog,
 )
 from omnigent.process_logging import current_process_log_path, display_log_path
+from omnigent.startup_protocol import ContextEvidenceV2
 
 logger = logging.getLogger(__name__)
 
@@ -509,6 +511,7 @@ class AcpExecutor(Executor):
             raise ValueError("AcpAgentConfig.command is empty")
 
         self._proc: asyncio.subprocess.Process | None = None
+        self._context_source = AcpProcessContextSource("acp", lambda: self._proc)
         self._queue: asyncio.Queue[_AcpJsonObject] = asyncio.Queue()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -575,6 +578,16 @@ class AcpExecutor(Executor):
     # ------------------------------------------------------------------
 
     async def _start_process(self) -> None:
+        attempt = self._context_source.begin_process()
+        try:
+            await self._start_process_unobserved()
+        except BaseException:
+            self._context_source.failed(attempt)
+            raise
+        finally:
+            self._context_source.process_started()
+
+    async def _start_process_unobserved(self) -> None:
         """Start the configured ACP agent as an asyncio subprocess.
 
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
@@ -594,6 +607,7 @@ class AcpExecutor(Executor):
         self._image_supported = False
         self._authenticated = False
         self._auth_advertisement = {}
+        self._reset_session_state()
         self._effort_option = None
         self._effort_defaults.clear()
         self._effort_overridden = False
@@ -715,6 +729,13 @@ class AcpExecutor(Executor):
             logger.debug("acp[%s] stderr reader stopped: %s", self._config.name, exc)
 
     async def _read_stdout(self) -> None:
+        process, generation = self._proc, self._context_source.generation
+        try:
+            await self._read_stdout_unobserved()
+        finally:
+            self._context_source.transport_ended(process, generation)
+
+    async def _read_stdout_unobserved(self) -> None:
         """Continuously read NDJSON lines from the agent's stdout.
 
         Responses (``id`` + no ``method``) resolve the matching ``_pending``
@@ -944,6 +965,16 @@ class AcpExecutor(Executor):
         )
 
     async def _ensure_session(self) -> str:
+        if self._session_id is not None:
+            return self._session_id
+        attempt = self._context_source.begin_session()
+        try:
+            return await self._ensure_session_unobserved(attempt)
+        except BaseException:
+            self._context_source.failed(attempt)
+            raise
+
+    async def _ensure_session_unobserved(self, attempt: AcpContextAttempt) -> str:
         """Create (or reuse) an ACP session, returning the session id.
 
         In ``server`` mode we send only ``cwd`` + ``mcpServers`` and adopt the id
@@ -983,6 +1014,9 @@ class AcpExecutor(Executor):
             raise RuntimeError(
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
+        if not self._context_source.accepts_reply(attempt):
+            raise RuntimeError("ACP session/new crossed process generation")
+        self._context_source.bind(attempt, server_session_id)
         self._session_id = session_id
         # Capture the agent's advertised model from session/new's config options, so a
         # turn's usage can name it. Agents that report the model here (e.g. jcode) would
@@ -1582,6 +1616,7 @@ class AcpExecutor(Executor):
 
     def _reset_session_state(self) -> None:
         """Forget state that is only valid for the current ACP session."""
+        self._context_source.reset_session()
         self._session_id = None
         self._initial_model = None
         self._active_model = None
@@ -2331,8 +2366,22 @@ class AcpExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""
+        del session_key
+        self._context_source.per_key_close()
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        return await self._context_source.prepare(session_id, read_id, timeout_s=timeout_s)
 
     async def close(self) -> None:
+        keys = self._context_source.begin_close()
+        try:
+            await self._close_unobserved()
+        finally:
+            self._context_source.end_close(keys)
+
+    async def _close_unobserved(self) -> None:
         """Terminate the agent subprocess and clean up."""
         self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.

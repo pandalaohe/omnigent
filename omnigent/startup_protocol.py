@@ -1,16 +1,28 @@
 """Startup permission travels on control channels, never inside model input."""
 
 import json
+from dataclasses import fields
+from math import isfinite
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.entities.session_startup import StartupReceipt
+from omnigent.host.recovery import RecoveryAssessment, RecoveryInventory, RuntimeObservation
 
 SDK_STARTUP_SOURCES = frozenset({"codex", "claude-sdk"})
 CONTEXT_INVENTORY_V2 = "resident_context_inventory_v2"
 CONTEXT_INVENTORY_CONTRACT_HEADER = "Omnigent-Context-Inventory-Contract"
 CONTEXT_INVENTORY_MAX_BYTES = 1024 * 1024
+CONTEXT_WORK_INVENTORY_V2 = "resident_context_work_inventory_v2"
 
 OpaqueIdV2 = Annotated[str, Field(min_length=1, max_length=256)]
 RevisionV2 = Annotated[int, Field(strict=True, ge=0)]
@@ -215,6 +227,96 @@ class ContextEvidenceV2(_ContextValueV2):
         return self
 
 
+class ContextWorkEvidenceV2(_ContextValueV2):
+    """Provisional runner-only observation, never recovery or capacity permission."""
+
+    context: ContextEvidenceV2
+    inventory: RecoveryInventory
+    assessment: RecoveryAssessment
+
+    @field_validator("inventory", "assessment", mode="before")
+    @classmethod
+    def _closed_work_values(cls, value: object, info: ValidationInfo) -> object:
+        if isinstance(value, dict):
+            kind = RecoveryInventory if info.field_name == "inventory" else RecoveryAssessment
+            if value.keys() - {field.name for field in fields(kind)}:
+                raise ValueError("unexpected recovery observation field")
+            if kind is RecoveryInventory:
+                rows = value.get("observations")
+                if isinstance(rows, (tuple, list)):
+                    if len(rows) > 1000:
+                        raise ValueError("work observation count budget")
+                    allowed = {field.name for field in fields(RuntimeObservation)}
+                    if any(isinstance(row, dict) and row.keys() - allowed for row in rows):
+                        raise ValueError("unexpected runtime observation field")
+            # Keep JSON array semantics when validating existing strict dataclasses.
+            return TypeAdapter(kind).validate_json(json.dumps(value), strict=True)
+        return value
+
+    @model_validator(mode="after")
+    def _partial_observation(self) -> Self:
+        inventory = self.inventory
+        rows = inventory.observations
+        members = {(row.runtime_id, row.generation) for row in rows}
+        if (
+            len(rows) > 1000
+            or len(members) != len(rows)
+            or inventory.local_members != members
+            or inventory.server_members
+            or inventory.unresolved_startups
+            or inventory.server_complete
+            or inventory.local_complete
+            or inventory.execution_fence
+            or inventory.host_fault_confirmed
+            or inventory.supervisor is not None
+            or inventory.host_generation
+            or inventory.process_identity
+            or self.assessment.allowed
+        ):
+            raise ValueError("runner work observation cannot authorize recovery")
+        for row in rows:
+            if (
+                not row.runtime_id
+                or len(row.runtime_id) > 256
+                or not row.generation
+                or len(row.generation) > 256
+                or not isfinite(row.observed_at)
+                or row.no_live_work_confirmed
+                or row.no_owned_descendants
+                or row.previous_no_live_work_confirmed
+                or row.previous_no_owned_descendants
+                or row.exited
+                or row.previous_observed_at is not None
+                or row.nonworking_since is not None
+                or row.failed_probe_times
+            ):
+                raise ValueError("runner work observation has unsupported negative proof")
+        for source in self.context.sources:
+            if source.scope.namespace == "native" and any(
+                binding.runtime_id != binding.context.source_owner_incarnation
+                for binding in source.work_bindings or ()
+            ):
+                raise ValueError("native work binding belongs to another source owner")
+            if (
+                source.coverage == "complete"
+                or source.revision_authority != "observation_only"
+                or any(
+                    value is not None
+                    for value in (
+                        source.membership_revision,
+                        source.context_revision,
+                        source.work_revision,
+                    )
+                )
+                or any(
+                    (binding.runtime_id, binding.generation) not in members
+                    for binding in source.work_bindings or ()
+                )
+            ):
+                raise ValueError("context work observation is incomplete or unbound")
+        return self
+
+
 def executor_context_scope_v2(session_id: str) -> ScopeKeyV2:
     return ScopeKeyV2(namespace="harness", owner_id=session_id, population="executor_contexts")
 
@@ -288,6 +390,13 @@ def decode_context_evidence_v2(
     expected_scopes: tuple[ScopeKeyV2, ...],
 ) -> ContextEvidenceV2:
     """Strict bounded wire decode, correlated to this read and consumer-owned manifest."""
+    _check_context_wire(payload)
+    evidence = ContextEvidenceV2.model_validate_json(payload, strict=True)
+    _check_context_read(evidence, read_id, authority, expected_scopes)
+    return evidence
+
+
+def _check_context_wire(payload: bytes) -> None:
     if len(payload) > CONTEXT_INVENTORY_MAX_BYTES:
         raise ValueError("context evidence exceeds byte budget")
 
@@ -301,13 +410,33 @@ def decode_context_evidence_v2(
         json.loads(payload, object_pairs_hook=unique_object)
     except RecursionError as error:
         raise ValueError("context evidence exceeds nesting budget") from error
-    evidence = ContextEvidenceV2.model_validate_json(payload, strict=True)
+
+
+def _check_context_read(
+    evidence: ContextEvidenceV2,
+    read_id: str,
+    authority: ContextAuthorityV2,
+    expected_scopes: tuple[ScopeKeyV2, ...],
+) -> None:
     if (
         evidence.read_id != read_id
         or evidence.authority != authority
         or set(evidence.expected_scopes) != set(expected_scopes)
     ):
         raise ValueError("context evidence read, authority or manifest mismatch")
+
+
+def decode_context_work_evidence_v2(
+    payload: bytes,
+    *,
+    read_id: str,
+    authority: ContextAuthorityV2,
+    expected_scopes: tuple[ScopeKeyV2, ...],
+) -> ContextWorkEvidenceV2:
+    """A missing/404 work endpoint is unsupported; v1 is not a substitute."""
+    _check_context_wire(payload)
+    evidence = ContextWorkEvidenceV2.model_validate_json(payload, strict=True)
+    _check_context_read(evidence.context, read_id, authority, expected_scopes)
     return evidence
 
 

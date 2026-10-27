@@ -7,9 +7,11 @@ from dataclasses import dataclass, replace
 
 import httpx
 
+from omnigent.host.recovery import RecoveryInventory, assess_recovery
 from omnigent.runner.native.orchestration import (
     NativeBackendInventorySnapshot,
     native_backend_resident_inventory,
+    native_context_work_snapshot_v2,
     prepare_native_backend_thread_inventory,
 )
 from omnigent.runner.resource_registry import (
@@ -23,6 +25,7 @@ from omnigent.runtime.harnesses.process_manager import (
 )
 from omnigent.startup_protocol import (
     ContextEvidenceV2,
+    ContextWorkEvidenceV2,
     SourceEvidenceV2,
     UnresolvedContextV2,
     harness_context_authority_v2,
@@ -148,16 +151,80 @@ async def _harness_context_source_v2(
         ),
         None,
     )
-    if owner is None:
-        return _unknown_context_source(scope, "no_resident_harness")
-    reconcile = await process_manager.prepare_context_inventory_v2(owner, timeout_s=timeout_s)
-    snapshot = reconcile()
-    sources = snapshot.evidence.sources
-    if snapshot.evidence.authority != harness_context_authority_v2(session_id):
-        return _unknown_context_source(scope, "foreign_session")
-    if len(sources) != 1 or sources[0].scope != scope:
-        return _unknown_context_source(scope, "invalid_harness_evidence")
-    return sources[0]
+    source = _unknown_context_source(scope, "no_resident_harness")
+    reconcile = None
+    if owner is not None:
+        reconcile = await process_manager.prepare_context_inventory_v2(owner, timeout_s=timeout_s)
+    current = await process_manager.resident_inventory()
+    if reconcile is not None:
+        snapshot = reconcile()
+        sources = snapshot.evidence.sources
+        if snapshot.evidence.authority != harness_context_authority_v2(session_id):
+            source = _unknown_context_source(scope, "foreign_session")
+        elif len(sources) != 1 or sources[0].scope != scope:
+            source = _unknown_context_source(scope, "invalid_harness_evidence")
+        else:
+            source = sources[0]
+    current_live = {
+        candidate.incarnation_id
+        for candidate in current.owners
+        if not candidate.closing and not candidate.wrapper_exited and not candidate.exit_confirmed
+    }
+    predecessors = {
+        candidate.incarnation_id
+        for candidate in (*selected.owners, *current.owners)
+        if candidate.session_id == session_id
+        and not candidate.exit_confirmed
+        and candidate.incarnation_id not in current_live
+    }
+    gaps = tuple(
+        UnresolvedContextV2(candidate=incarnation, reason="harness_predecessor_exit_unconfirmed")
+        for incarnation in sorted(predecessors)
+    )
+    if not selected.exit_coverage_complete or not current.exit_coverage_complete:
+        gaps += (UnresolvedContextV2(candidate=None, reason="harness_exit_coverage_incomplete"),)
+    if not gaps:
+        return source
+    unresolved = (*source.unresolved, *gaps)
+    if len(unresolved) > 1000:
+        unresolved = (
+            *unresolved[:999],
+            UnresolvedContextV2(candidate=None, reason="harness_predecessor_reason_budget"),
+        )
+    return source.model_copy(
+        update={
+            "coverage": "unsupported" if source.coverage == "unsupported" else "partial",
+            "unresolved": unresolved,
+            "membership_revision": None,
+            "context_revision": None,
+            "work_revision": None,
+            "revision_authority": "observation_only",
+            "age_upper_bound_s": None,
+            "work_bindings": None,
+        }
+    )
+
+
+def _terminal_context_source_v2(session_id: str, scope, resources: SessionResourceRegistry):
+    source = _unknown_context_source(scope, "terminal_context_source_unimplemented")
+    terminals = resources.terminal_registry
+    if terminals is None:
+        return source
+    rows, overflow = terminals.owner_uncertainty_snapshot()
+    unresolved = (
+        *source.unresolved,
+        *(
+            UnresolvedContextV2(candidate=row.instance_id, reason="terminal_lifetime_unconfirmed")
+            for row in rows
+            if row.conversation_id == session_id
+        ),
+    )
+    if overflow or len(unresolved) > 1000:
+        unresolved = (
+            *unresolved[:999],
+            UnresolvedContextV2(candidate=None, reason="terminal_owner_history_budget"),
+        )
+    return source.model_copy(update={"unresolved": unresolved})
 
 
 async def session_context_evidence_v2(
@@ -165,13 +232,31 @@ async def session_context_evidence_v2(
     read_id: str,
     *,
     process_manager: HarnessProcessManager | None,
+    resources: SessionResourceRegistry,
     timeout_s: float = _OWNER_INVENTORY_TIMEOUT_S,
 ) -> ContextEvidenceV2:
+    snapshot = await session_context_work_evidence_v2(
+        session_id,
+        read_id,
+        process_manager=process_manager,
+        resources=resources,
+        timeout_s=timeout_s,
+    )
+    return snapshot.context
+
+
+async def session_context_work_evidence_v2(
+    session_id: str,
+    read_id: str,
+    *,
+    process_manager: HarnessProcessManager | None,
+    resources: SessionResourceRegistry,
+    timeout_s: float = _OWNER_INVENTORY_TIMEOUT_S,
+) -> ContextWorkEvidenceV2:
     """Compose the runner's three session scopes into one v2 envelope.
 
-    Only the harness owner can produce context records today; native backends and
-    terminal roles keep explicit unsupported sources rather than empty-but-complete
-    claims. The whole read stays bounded and answers unknown instead of raising.
+    Native OpenCode owners retain partial operation evidence; other native sources
+    and terminal roles remain unsupported. Reads neither construct nor probe owners.
     """
     scopes = session_context_scopes_v2(session_id)
     started = time.monotonic()
@@ -186,14 +271,33 @@ async def session_context_evidence_v2(
             harness = _unknown_context_source(scopes[0], "read_timeout")
         except (httpx.HTTPError, RuntimeError, ValueError):
             harness = _unknown_context_source(scopes[0], "invalid_or_failed_read")
-    return ContextEvidenceV2(
+    native, observations = native_context_work_snapshot_v2(session_id)
+    context = ContextEvidenceV2(
         wire_version=2,
         read_id=read_id,
         authority=harness_context_authority_v2(session_id),
         expected_scopes=scopes,
         sources=(
             harness,
-            _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
-            _unknown_context_source(scopes[2], "terminal_context_source_unimplemented"),
+            native or _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
+            _terminal_context_source_v2(session_id, scopes[2], resources),
         ),
+    )
+    inventory = RecoveryInventory(
+        host_generation="",
+        process_identity="",
+        supervisor=None,
+        server_members=frozenset(),
+        local_members=frozenset((row.runtime_id, row.generation) for row in observations),
+        unresolved_startups=frozenset(),
+        server_complete=False,
+        local_complete=False,
+        execution_fence=False,
+        host_fault_confirmed=False,
+        observations=observations,
+    )
+    return ContextWorkEvidenceV2(
+        context=context,
+        inventory=inventory,
+        assessment=assess_recovery(inventory, now=time.time()),
     )

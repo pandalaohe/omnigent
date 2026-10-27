@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -149,6 +149,24 @@ class SessionStartupStore:
             _, host = self._budgets(db, host_id)
             host.current_generation = generation
             host.work_revision = (host.work_revision or 0) + 1
+            predecessor = db.scalar(
+                select(SqlSessionStartup.id)
+                .where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == host_id,
+                    SqlSessionStartup.runtime_id.is_not(None),
+                    or_(
+                        SqlSessionStartup.resident.is_(True), SqlSessionStartup.occupied.is_(True)
+                    ),
+                    or_(
+                        SqlSessionStartup.host_generation.is_(None),
+                        SqlSessionStartup.host_generation != generation,
+                    ),
+                )
+                .limit(1)
+            )
+            if predecessor is not None:
+                host.resident_inventory_unknown = True
 
         run_write_transaction(self._session, "register_host_startup_generation", write)
 

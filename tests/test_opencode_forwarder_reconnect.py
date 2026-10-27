@@ -31,6 +31,9 @@ class _RecordingServerClient:
 class _FakeOpenCodeClient:
     """Fake OpenCode client for reconnect tests."""
 
+    def observe_forwarder(self, active: bool) -> None:
+        pass
+
     def __init__(self) -> None:
         self.messages: list[dict[str, Any]] = []
         self.message_snapshots: list[list[dict[str, Any]]] = []

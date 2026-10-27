@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from omnigent.harnesses.opencode_native import app_server as appsrv
@@ -156,6 +158,261 @@ def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeSe
     )
 
 
+@pytest.fixture
+async def context_server(monkeypatch, tmp_path):
+    """The real server/client owner with scripted REST, no CLI or provider process."""
+    server = _server(monkeypatch, tmp_path)
+    server.process = SimpleNamespace(returncode=None)
+    requests = []
+
+    async def respond(request):
+        requests.append((request.method, request.url.path))
+        return await responses[0](request)
+
+    async def default(request):
+        if request.url.path.endswith("/fork"):
+            return httpx.Response(200, json={"id": "fork", "parentID": "primary"})
+        if request.url.path.endswith("/message"):
+            return httpx.Response(200, json=[])
+        if request.url.path == "/event":
+            return httpx.Response(200, text="", headers={"content-type": "text/event-stream"})
+        if request.method == "GET" and request.url.path.startswith("/session/"):
+            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[1]})
+        return httpx.Response(200, json={"id": "primary"})
+
+    responses = [default]
+    async with httpx.AsyncClient(
+        base_url="http://opencode.test", transport=httpx.MockTransport(respond)
+    ) as http:
+        constructor = appsrv.OpenCodeClient
+        monkeypatch.setattr(
+            appsrv, "OpenCodeClient", lambda *a, **kw: constructor(*a, client=http, **kw)
+        )
+        yield server, server.client(), responses, requests
+
+
+async def test_context_v2_primary_resume_and_owned_fork(context_server):
+    server, client, _, requests = context_server
+    primary = await client.create_session()
+    (created,) = server.context_source_v2("conversation").contexts
+    assert created.vendor_id.value == primary.id
+    assert created.key.source_owner_incarnation == server.resident_incarnation_id
+    assert created.operation.action == "create" and created.provenance == "primary"
+    assert created.execution_keys == ("primary",) and created.lifecycle == "live"
+    assert await client.get_session("primary") is not None
+    (resumed,) = server.context_source_v2("conversation").contexts
+    assert resumed.key == created.key and resumed.operation.action == "resume"
+    assert resumed.operation.operation_id != created.operation.operation_id
+    await client.fork("primary")
+    source = server.context_source_v2("conversation")
+    parent, fork = source.contexts
+    assert fork.operation.parent == parent.key and fork.operation.action == "fork"
+    assert fork.provenance == "managed_side_chat" and fork.execution_keys == ("fork",)
+    await client.get_session("fork")
+    observed = server.context_source_v2("conversation").contexts[1]
+    assert observed.key == fork.key and observed.operation == fork.operation
+    assert observed.provenance == "managed_side_chat"
+    assert not parent.aliases and not fork.aliases
+    assert source.coverage == "partial" and source.revision_authority == "observation_only"
+    assert {u.reason for u in source.unresolved} >= {
+        "readonly_alias_provenance_unavailable",
+        "unobserved_bridge_and_native_contexts",
+    }
+    assert all(row.stop_proof is row.continuity_proof is None for row in source.contexts)
+    assert requests == [
+        ("POST", "/session"),
+        ("GET", "/session/primary"),
+        ("POST", "/session/primary/fork"),
+        ("GET", "/session/fork"),
+    ]
+
+
+async def test_context_v2_concurrent_resume_and_failure_retry_keep_one_identity(context_server):
+    server, client, responses, _ = context_server
+    await client.create_session()
+    key = server.context_source_v2("conversation").contexts[0].key
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def interleaved(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        else:
+            raise httpx.ReadTimeout("newest reply lost")
+        return httpx.Response(200, json={"id": "primary"})
+
+    responses[0] = interleaved
+    old = asyncio.create_task(client.get_session("primary"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        with pytest.raises(httpx.ReadTimeout):
+            await client.get_session("primary")
+        assert len(server.context_source_v2("conversation").contexts) == 1
+        assert server.context_source_v2("conversation").contexts[0].lifecycle == "unknown"
+        release.set()
+        await old
+        assert server.context_source_v2("conversation").contexts[0].lifecycle == "unknown"
+        responses[0] = lambda r: asyncio.sleep(
+            0, result=httpx.Response(200, json={"id": "primary"})
+        )
+        await client.get_session("primary")
+        (resumed,) = server.context_source_v2("conversation").contexts
+        assert resumed.key == key and resumed.lifecycle == "live"
+    finally:
+        release.set()
+        old.cancel()
+        await asyncio.gather(old, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "outcome", ["success", "lost", "cancel", "close", "generation", "incarnation"]
+)
+async def test_context_v2_pending_reply_cannot_bind_replacement(context_server, outcome):
+    server, client, responses, _ = context_server
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def pending(request):
+        entered.set()
+        await finish.wait()
+        if outcome == "lost":
+            raise httpx.ReadTimeout("reply lost")
+        return httpx.Response(200, json={"id": "late"})
+
+    responses[0] = pending
+    task = asyncio.create_task(client.create_session())
+    close = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (before,) = server.context_source_v2("conversation").contexts
+        assert before.lifecycle == "starting" and before.vendor_id is None
+        assert before.operation.action == "create" and before.execution_keys == ()
+        if outcome == "close":
+            close = server.close()
+            assert server.context_source_v2("conversation").contexts[0].lifecycle == "closing"
+        elif outcome == "generation":
+            server._start_generation += 1
+        elif outcome == "incarnation":
+            server.resident_incarnation_id = "replacement"
+        if outcome == "cancel":
+            task.cancel()
+        finish.set()
+        if outcome in {"lost", "cancel"}:
+            with pytest.raises(httpx.ReadTimeout if outcome == "lost" else asyncio.CancelledError):
+                await task
+        else:
+            await task
+        source = server.context_source_v2("conversation")
+        if outcome == "incarnation":
+            assert source.contexts == ()
+            assert before.key.context_incarnation in {u.candidate for u in source.unresolved}
+        else:
+            (after,) = source.contexts
+            assert after.key == before.key
+            assert after.lifecycle == (
+                "live" if outcome == "success" else "closing" if outcome == "close" else "unknown"
+            )
+            assert (after.vendor_id is not None) is (outcome == "success")
+    finally:
+        finish.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if close is not None:
+            close.close()
+
+
+async def test_context_v2_forwarder_retirement_is_not_context_absence(context_server):
+    from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
+
+    server, client, _, _ = context_server
+    await client.create_session()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200))
+    ) as sink:
+        forwarder = OpenCodeNativeForwarder(
+            session_id="conversation",
+            opencode_session_id="primary",
+            opencode_client=client,
+            server_client=sink,
+        )
+        await forwarder.run(max_reconnects=0)
+    source = server.context_source_v2("conversation")
+    assert source.contexts[0].lifecycle == "unknown"
+    assert source.contexts[0].vendor_id.value == "primary"
+    assert "forwarder_not_observed_live" in {row.reason for row in source.unresolved}
+    server._start_generation += 1
+    client.observe_forwarder(True)
+    assert server._context_forwarder is False
+
+
+async def test_context_v2_close_retains_runner_tombstone(context_server, monkeypatch):
+    from omnigent.runner.native import orchestration
+
+    server, client, _, _ = context_server
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
+    await client.create_session()
+    key = server.context_source_v2("conversation").contexts[0].key
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def close():
+        entered.set()
+        await release.wait()
+        server.process = None
+        server.process_exit_confirmed = True
+        server._mark_contexts("unknown")
+
+    monkeypatch.setattr(server, "_close_locked", close)
+    task = asyncio.create_task(
+        orchestration._close_native_backend("conversation", "opencode-native", server)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert (
+            orchestration.native_context_source_v2("conversation").contexts[0].lifecycle
+            == "closing"
+        )
+    finally:
+        release.set()
+        await task
+    source = orchestration.native_context_source_v2("conversation")
+    assert source.contexts[0].key == key and source.contexts[0].lifecycle == "unknown"
+    assert source.contexts[0].stop_proof is None and source.coverage == "partial"
+
+
+async def test_context_v2_retired_gap_survives_backend_replacement(context_server, monkeypatch):
+    from omnigent.runner.native import orchestration
+    from omnigent.startup_protocol import UnresolvedContextV2
+
+    server, _, _, _ = context_server
+    old = server.context_source_v2("conversation").model_copy(
+        update={
+            "producer_incarnation": "old-owner",
+            "contexts": (),
+            "unresolved": (UnresolvedContextV2(candidate=None, reason="context_history_budget"),),
+        }
+    )
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [old])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
+    source = orchestration.native_context_source_v2("conversation")
+    assert "context_history_budget" in {u.reason for u in source.unresolved}
+    assert source.coverage == "partial"
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [old] * 1000)
+    source = orchestration.native_context_source_v2("conversation")
+    assert source.contexts == () and source.unresolved[0].reason == "context_history_budget"
+
+
 def test_build_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     server = _server(monkeypatch, tmp_path)
     replacement = _server(monkeypatch, tmp_path)
@@ -244,6 +501,7 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
     started: dict[str, object] = {}
 
     class _FakeProc:
@@ -284,14 +542,16 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert server.process_exit_confirmed
     assert not server.exit_confirmed
     closing = orchestration.native_backend_resident_inventory()
-    assert closing.owners == ()
+    (retired,) = closing.owners
+    assert retired.incarnation_id == incarnation_id
+    assert retired.closing and retired.process_exit_confirmed and not retired.exit_confirmed
     assert not closing.exit_coverage_complete
     with pytest.raises(RuntimeError, match="exit is not confirmed"):
         await server.start()
     # A future lifecycle owner can supply authoritative descendant-exit proof.
     server.exit_confirmed = True
     await orchestration._close_native_backend("owned", "opencode-native", server)
-    assert (orchestration.native_backend_resident_inventory()).owners == ()
+    assert (orchestration.native_backend_resident_inventory()).owners == closing.owners
     assert not orchestration.native_backend_resident_inventory().exit_coverage_complete
     await server.start()
     assert server.resident_incarnation_id != incarnation_id

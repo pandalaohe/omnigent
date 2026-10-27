@@ -65,8 +65,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.inner.sdk_context_inventory import SdkContextSource
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.startup_protocol import ContextEvidenceV2, ContextKeyV2
 from omnigent.util.reasoning_effort import COPILOT_EFFORTS, validate_effort
 
 from .datamodel import OSEnvSpec
@@ -291,6 +293,8 @@ class _CopilotSession(Protocol):
 class _CopilotSessionState:
     """Per-Omnigent-conversation SDK session state."""
 
+    context_key: ContextKeyV2 | None = None
+    retired: bool = False
     client: object | None = None
     session: _CopilotSession | None = None
     system_prompt: str | None = None
@@ -347,6 +351,13 @@ class CopilotExecutor(Executor):
         self._agent_name = agent_name
         self._skills_filter = skills_filter
         self._session_states: dict[str, _CopilotSessionState] = {}
+        self._context_source = SdkContextSource(
+            lambda: {
+                state.context_key
+                for state in self._session_states.values()
+                if state.context_key is not None and state.session is not None
+            }
+        )
         # Installed by the runtime adapter; routes a bridged-tool call back into
         # Omnigent's session (policy gating, sub-agent dispatch, logging).
         self._tool_executor: ToolExecutor | None = None
@@ -363,6 +374,11 @@ class CopilotExecutor(Executor):
 
     def supports_streaming(self) -> bool:
         return True
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        return await self._context_source.prepare(session_id, read_id, timeout_s=timeout_s)
 
     def supports_tool_calling(self) -> bool:
         return True
@@ -521,6 +537,8 @@ class CopilotExecutor(Executor):
         propagating, so a bad token / launch error can't orphan the bundled
         CLI subprocess.
         """
+        if state.retired:
+            raise RuntimeError("Copilot state retired during startup")
         if state.session is not None:
             return
         try:
@@ -548,18 +566,35 @@ class CopilotExecutor(Executor):
             os.environ[COPILOT_HOST_ENV_VAR] = self._github_host
         else:
             os.environ.pop(COPILOT_HOST_ENV_VAR, None)
-        client = CopilotClient(
-            github_token=self._github_token,
-            working_directory=cwd,
-            log_level="error",
+        execution_keys = tuple(
+            k for k, current in self._session_states.items() if current is state
         )
+        key = self._context_source.begin(execution_keys)
+        state.context_key = key
+
+        def current() -> bool:
+            return (
+                not state.retired
+                and state.context_key == key
+                and all(self._session_states.get(k) is state for k in execution_keys)
+            )
+
+        client = None
+        session = None
         try:
+            client = CopilotClient(
+                github_token=self._github_token,
+                working_directory=cwd,
+                log_level="error",
+            )
             # ``start()`` is inside the try: it spawns the bundled Copilot CLI
             # subprocess *before* connecting/verifying, and the SDK's own error
             # path re-raises without terminating that subprocess — only
             # ``client.stop()`` reaps it. So a start failure (bad token, version
             # skew) must still hit ``_safe_stop`` below, or it orphans the CLI.
             await client.start()
+            if not current():
+                raise RuntimeError("Copilot state retired during startup")
             # ``append`` keeps Copilot's own operating instructions (how to use
             # its built-in tools) and layers the Omnigent agent's system prompt
             # on top — a ``replace`` would strip the tool-use guidance the model
@@ -576,11 +611,21 @@ class CopilotExecutor(Executor):
                 working_directory=cwd,
                 reasoning_effort=reasoning_effort or None,
             )
+            if not current():
+                raise RuntimeError("Copilot state retired during startup")
         except BaseException:
-            await _safe_stop(client)
+            self._context_source.mark(key, "closing")
+            try:
+                if session is not None:
+                    await _safe_stop(session)
+                if client is not None:
+                    await _safe_stop(client)
+            finally:
+                self._context_source.mark(key, "unknown")
             raise
         state.client = client
         state.session = session
+        self._context_source.mark(key, "live")
 
     async def run_turn(
         self,
@@ -606,6 +651,9 @@ class CopilotExecutor(Executor):
             or state.tools_fingerprint != tools_fp
         ):
             await self._close_state(state)
+            if self._session_states.get(session_key) is not state:
+                yield ExecutorError(message="Copilot state retired during rebuild")
+                return
             state = _CopilotSessionState()
             self._session_states[session_key] = state
         is_first_turn = not state.has_sent_prompt
@@ -617,7 +665,7 @@ class CopilotExecutor(Executor):
         try:
             await self._ensure_session(state, model, tools, system_prompt, reasoning_effort)
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             yield ExecutorError(message=f"Failed to start copilot-sdk session: {exc}")
             return
 
@@ -780,7 +828,7 @@ class CopilotExecutor(Executor):
             raise
         except Exception as exc:
             logger.exception("copilot-sdk turn failed mid-stream")
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             yield ExecutorError(message=f"copilot-sdk turn failed: {exc}", retryable=True)
             return
         finally:
@@ -796,7 +844,7 @@ class CopilotExecutor(Executor):
         # ASSISTANT_MESSAGE (``final_event`` set) means the SDK completed the turn,
         # so a stray earlier event is not treated as fatal.
         if turn_error and final_event is None:
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             yield ExecutorError(message=f"copilot-sdk run error: {turn_error}", retryable=True)
             return
 
@@ -826,6 +874,15 @@ class CopilotExecutor(Executor):
         yield TurnComplete(response=final, usage=usage)
 
     async def _close_state(self, state: _CopilotSessionState) -> None:
+        state.retired = True
+        key, state.context_key = state.context_key, None
+        self._context_source.mark(key, "closing")
+        try:
+            await self._close_state_unobserved(state)
+        finally:
+            self._context_source.mark(key, "unknown")
+
+    async def _close_state_unobserved(self, state: _CopilotSessionState) -> None:
         if state.session is not None:
             await _safe_stop(state.session)
             state.session = None
@@ -838,6 +895,11 @@ class CopilotExecutor(Executor):
         state = self._session_states.pop(session_key, None)
         if state is not None:
             await self._close_state(state)
+
+    async def _close_session_state(self, session_key: str, state: _CopilotSessionState) -> None:
+        if self._session_states.get(session_key) is state:
+            self._session_states.pop(session_key)
+        await self._close_state(state)
 
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
@@ -860,7 +922,7 @@ class CopilotExecutor(Executor):
         # abandoned request; a fresh session replays full history (marker
         # included). See ``claude_sdk_executor.interrupt_session`` for the rationale.
         try:
-            await self.close_session(session_key)
+            await self._close_session_state(session_key, state)
             return True
         except Exception as exc:  # noqa: BLE001 — close failures surface as False
             logger.debug("CopilotExecutor: close after interrupt failed: %s", exc)

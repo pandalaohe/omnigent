@@ -7,6 +7,7 @@ import dataclasses
 import logging
 import mimetypes
 import os
+import time
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
@@ -238,11 +239,53 @@ def register_resource_routes(
         if len(request.query_params.getlist("read_id")) != 1:
             raise HTTPException(status_code=422, detail="exactly one read_id is required")
         evidence = await session_context_evidence_v2(
-            session_id, read_id, process_manager=process_manager
+            session_id, read_id, process_manager=process_manager, resources=resource_registry
         )
         return JSONResponse(
             evidence.model_dump(mode="json"),
             headers={CONTEXT_INVENTORY_CONTRACT_HEADER: CONTEXT_INVENTORY_V2},
+        )
+
+    @app.get("/v2/startup/context-work-inventory", include_in_schema=False)
+    async def read_context_work_inventory_v2(
+        request: Request,
+        read_id: str = Query(min_length=1, max_length=128),
+        session_id: str = Query(min_length=1, max_length=256),
+    ) -> Response:
+        """Provisional runner-auth observation; never a host recovery command."""
+        from omnigent.runner.resident_inventory import session_context_work_evidence_v2
+        from omnigent.startup_protocol import (
+            CONTEXT_INVENTORY_CONTRACT_HEADER,
+            CONTEXT_INVENTORY_MAX_BYTES,
+            CONTEXT_WORK_INVENTORY_V2,
+        )
+
+        if any(len(request.query_params.getlist(key)) != 1 for key in ("read_id", "session_id")):
+            raise HTTPException(
+                status_code=422, detail="exactly one read_id and session_id required"
+            )
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(5.0):
+                evidence = await session_context_work_evidence_v2(
+                    session_id,
+                    read_id,
+                    process_manager=process_manager,
+                    resources=resource_registry,
+                )
+        except TimeoutError as exc:
+            raise HTTPException(status_code=503, detail="context work read timed out") from exc
+        payload = evidence.model_dump_json().encode()
+        if len(payload) > CONTEXT_INVENTORY_MAX_BYTES:
+            raise HTTPException(
+                status_code=413, detail="context work evidence exceeds byte budget"
+            )
+        if time.monotonic() - started > 5.0:
+            raise HTTPException(status_code=503, detail="context work read timed out")
+        return Response(
+            payload,
+            media_type="application/json",
+            headers={CONTEXT_INVENTORY_CONTRACT_HEADER: CONTEXT_WORK_INVENTORY_V2},
         )
 
     async def _resolve_conversation_id(response_id: str) -> str | None:

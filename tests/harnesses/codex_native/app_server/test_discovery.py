@@ -148,6 +148,11 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
         )
 
         def _killpg(pgid: int, sig: int) -> None:
+            if sig == 0:
+                assert pgid == 456789
+                if process.returncode is not None:
+                    raise ProcessLookupError
+                return
             assert (pgid, sig) == (456789, signal.SIGTERM)
             signals.append(sig)
             process.terminate()

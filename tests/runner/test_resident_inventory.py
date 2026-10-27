@@ -20,8 +20,439 @@ from omnigent.runtime.harnesses.process_manager import (
 )
 from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 from omnigent.terminals import TerminalRegistry
+from tests.harnesses.codex_native.test_codex_native_app_server_rpc import (
+    context_v2_native as context_v2_native,
+)
+from tests.inner.test_native_context_inventory import NATIVE_CONTEXT_CASES
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
+from tests.test_opencode_native_app_server import context_server as context_server
+
+
+@pytest.mark.parametrize("operation", ["prompt", "prompt_async", "summarize", "bridge"])
+async def test_opencode_work_read_uses_owned_requests_and_exact_message_events(
+    context_server, monkeypatch, operation
+):
+    import json
+
+    from omnigent.startup_protocol import (
+        decode_context_work_evidence_v2,
+        harness_context_authority_v2,
+        session_context_scopes_v2,
+    )
+
+    server, native, responses, _requests = context_server
+    await native.create_session()
+    await native.fork("primary")
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def pending(_request):
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={})
+
+    responses[0] = pending
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    async with _runner_client(app) as client:
+
+        async def read():
+            response = await client.get(
+                "/v2/startup/context-work-inventory",
+                params={"session_id": "conversation", "read_id": "read-opencode"},
+                headers={"Authorization": "Bearer test-auth"},
+            )
+            assert response.status_code == 200
+            return decode_context_work_evidence_v2(
+                response.content,
+                read_id="read-opencode",
+                authority=harness_context_authority_v2("conversation"),
+                expected_scopes=session_context_scopes_v2("conversation"),
+            )
+
+        if operation == "bridge":
+            from omnigent.harnesses.opencode_native.bridge import (
+                OpenCodeNativeBridgeState,
+                write_bridge_state,
+            )
+            from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+            from omnigent.native.native_server_transport import NativePrompt
+
+            write_bridge_state(
+                server.bridge_dir,
+                OpenCodeNativeBridgeState(
+                    session_id="conversation",
+                    server_base_url=server.base_url,
+                    opencode_session_id="primary",
+                    workspace="/opt/work/repo",
+                ),
+            )
+            action = OpenCodeHttpTransport(bridge_dir=server.bridge_dir).send_prompt(
+                "primary", NativePrompt(text="work")
+            )
+        else:
+            action = (
+                native.summarize("primary", provider_id="test", model_id="test")
+                if operation == "summarize"
+                else getattr(native, operation)("primary", {"parts": []})
+            )
+        task = asyncio.create_task(action)
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            evidence = await read()
+            (row,) = evidence.inventory.observations
+            source = evidence.context.sources[1]
+            assert row.runtime_id == server.resident_incarnation_id
+            assert row.live_turn == (operation != "bridge")
+            assert row.generation == str(server._start_generation)
+            assert len(source.contexts) == len(source.work_bindings) == 2
+            assert all(b.runtime_id == row.runtime_id for b in source.work_bindings)
+            assert source.contexts[0].key != source.contexts[1].key
+            assert evidence.assessment.reason == (
+                "inventory_incomplete" if operation == "bridge" else "other_session_working"
+            )
+            release.set()
+            await task
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        evidence = await read()
+        assert not evidence.inventory.observations[0].live_turn
+        assert evidence.assessment.reason == "inventory_incomplete"
+        if operation in {"prompt_async", "summarize"}:
+            assert "opencode_async_work_outcome_unconfirmed" in {
+                u.reason for u in evidence.context.sources[1].unresolved
+            }
+
+        async def events(*entries):
+            async def stream(_request):
+                return httpx.Response(
+                    200,
+                    text="".join("data: " + json.dumps(e) + "\n\n" for e in entries),
+                    headers={"content-type": "text/event-stream"},
+                )
+
+            responses[0] = stream
+            observed = [event async for event in native.events()]
+            assert len(observed) == len(entries)
+
+        def message(identifier, *, completed=False):
+            return {
+                "type": "message.updated",
+                "properties": {
+                    "info": {
+                        "id": identifier,
+                        "sessionID": "primary",
+                        "role": "assistant",
+                        "time": {"completed": 10} if completed else {"created": 1},
+                    }
+                },
+            }
+
+        await events(message("old"), message("new"), message("old", completed=True))
+        assert (await read()).inventory.observations[0].live_turn
+        malformed = message("new")
+        malformed["properties"]["info"]["time"] = {"completed": True}
+        await events(malformed)
+        assert (await read()).inventory.observations[0].live_turn
+        await events({"type": "session.idle", "properties": {"sessionID": "primary"}})
+        assert (await read()).inventory.observations[0].live_turn
+        await events(message("new", completed=True), message("old"))
+        final = await read()
+        assert not final.inventory.observations[0].live_turn
+        assert not final.inventory.local_complete and not final.inventory.execution_fence
+        assert not final.inventory.observations[0].no_live_work_confirmed
+        assert not final.inventory.observations[0].no_owned_descendants
+        assert all(s.coverage != "complete" for s in final.context.sources)
+
+
+@pytest.mark.parametrize("loss", ["cancel", "generation", "closing", "registry", "ambiguous"])
+async def test_opencode_work_links_retain_uncertain_lifetimes(context_server, monkeypatch, loss):
+    from omnigent.runner.resident_inventory import session_context_work_evidence_v2
+
+    server, native, responses, _requests = context_server
+    await native.create_session()
+    if loss == "ambiguous":
+        await native.create_session()  # Same literal vendor id, distinct owning operations.
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    entered = asyncio.Event()
+
+    async def pending(_request):
+        entered.set()
+        await asyncio.Event().wait()
+
+    responses[0] = pending
+    task = asyncio.create_task(native.prompt_async("primary", {"parts": []}))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    if loss == "generation":
+        server._start_generation += 1
+    elif loss == "closing":
+        close = server.close()
+        close.close()  # Inspect the synchronous close boundary without terminating a fake process.
+    elif loss == "registry":
+        orchestration._AUTO_OPENCODE_SERVERS.clear()
+        orchestration._STARTING_NATIVE_BACKENDS[object()] = (
+            "conversation",
+            "opencode-native",
+            server,
+        )
+    evidence = await session_context_work_evidence_v2(
+        "conversation", "loss", process_manager=None, resources=SessionResourceRegistry()
+    )
+    source = evidence.context.sources[1]
+    assert source.contexts and not evidence.assessment.allowed
+    if loss == "cancel":
+        assert evidence.inventory.observations[0].live_turn
+        assert "opencode_work_outcome_unconfirmed" in {u.reason for u in source.unresolved}
+    elif loss == "ambiguous":
+        assert not source.work_bindings
+        assert "opencode_work_context_ambiguous_or_unobserved" in {
+            u.reason for u in source.unresolved
+        }
+    else:
+        assert source.work_bindings is None and not evidence.inventory.observations
+    if loss != "cancel":
+        assert "context_work_association_unconfirmed" in {u.reason for u in source.unresolved}
+
+
+@pytest.mark.parametrize("boundary", ["history_budget", "old_client"])
+async def test_opencode_work_events_are_bounded_and_do_not_cross_owner(context_server, boundary):
+    import json
+
+    server, native, responses, _requests = context_server
+    await native.create_session()
+
+    async def stream(*identifiers):
+        async def reply(_request):
+            return httpx.Response(
+                200,
+                text="".join(
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "message.updated",
+                            "properties": {
+                                "info": {
+                                    "id": identifier,
+                                    "sessionID": "primary",
+                                    "role": "assistant",
+                                }
+                            },
+                        }
+                    )
+                    + "\n\n"
+                    for identifier in identifiers
+                ),
+            )
+
+        responses[0] = reply
+        return [event async for event in native.events()]
+
+    await stream("old-message")
+    assert server.context_work_snapshot_v2("conversation")[1].live_turn
+    if boundary == "history_budget":
+        delivered = await stream(*(f"message-{i}" for i in range(1000)))
+        assert len(delivered) == 1000  # Observer exhaustion does not suppress SSE delivery.
+        source, row = server.context_work_snapshot_v2("conversation")
+        assert row is None and source.work_bindings is None and source.contexts
+        assert "opencode_work_history_budget" in {u.reason for u in source.unresolved}
+    else:
+        server._start_generation += 1
+        server.resident_incarnation_id = "replacement-owner"
+        replacement = server.client()
+
+        async def created(_request):
+            return httpx.Response(200, json={"id": "primary"})
+
+        responses[0] = created
+        await replacement.create_session()
+        await stream("stale-from-old-client")
+        source, row = server.context_work_snapshot_v2("conversation")
+        assert row.runtime_id == "replacement-owner" and not row.live_turn
+        assert len(source.contexts) == len(source.work_bindings) == 1
+        assert source.contexts[0].key.source_owner_incarnation == "replacement-owner"
+        assert "old_backend_generation" in {u.reason for u in source.unresolved}
+        await replacement.aclose()
+
+
+async def test_context_work_read_is_authenticated_partial_and_read_only(monkeypatch):
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    async with _runner_client(app) as client:
+        url = "/v2/startup/context-work-inventory?read_id=read-one&session_id=conversation"
+        assert (await client.get(url)).status_code == 401
+        response = await client.get(url, headers={"Authorization": "Bearer test-auth"})
+        assert response.status_code == 200
+        from omnigent.startup_protocol import (
+            decode_context_work_evidence_v2,
+            harness_context_authority_v2,
+            session_context_scopes_v2,
+        )
+
+        evidence = decode_context_work_evidence_v2(
+            response.content,
+            read_id="read-one",
+            authority=harness_context_authority_v2("conversation"),
+            expected_scopes=session_context_scopes_v2("conversation"),
+        )
+        assert evidence.inventory.observations == ()
+        assert evidence.inventory.local_members == frozenset()
+        assert not evidence.inventory.server_complete and not evidence.inventory.local_complete
+        assert not evidence.inventory.execution_fence and evidence.inventory.supervisor is None
+        assert not evidence.assessment.allowed
+        assert evidence.assessment.reason == "inventory_incomplete"
+        assert all(s.coverage != "complete" for s in evidence.context.sources)
+        for query in (
+            "read_id=one&read_id=two&session_id=conversation",
+            "read_id=one&session_id=conversation&session_id=other",
+        ):
+            rejected = await client.get(
+                "/v2/startup/context-work-inventory?" + query,
+                headers={"Authorization": "Bearer test-auth"},
+            )
+            assert rejected.status_code == 422
+
+
+async def test_context_work_read_consumes_production_owner_and_rejects_forgery(
+    context_v2_native, monkeypatch
+):
+    import json
+
+    from omnigent.startup_protocol import (
+        decode_context_work_evidence_v2,
+        harness_context_authority_v2,
+        session_context_scopes_v2,
+    )
+
+    backend, native_client, websocket = context_v2_native
+    methods = []
+
+    async def respond(raw):
+        message = json.loads(raw)
+        methods.append(message["method"])
+        result = (
+            {"thread": {"id": "primary"}}
+            if message["method"] == "thread/start"
+            else {"turn": {"id": "turn-one"}}
+        )
+        native_client._pending_requests[message["id"]].set_result({"result": result})
+
+    websocket.send.side_effect = respond
+    await native_client.request("thread/start", {})
+    await native_client.request("turn/start", {"threadId": "primary", "input": []})
+    backend.start = Mock(side_effect=AssertionError("read must not start"))
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    args = {
+        "read_id": "read-work",
+        "authority": harness_context_authority_v2("conversation"),
+        "expected_scopes": session_context_scopes_v2("conversation"),
+    }
+    async with _runner_client(app) as client:
+        response = await client.get(
+            "/v2/startup/context-work-inventory",
+            params={"session_id": "conversation", "read_id": "read-work"},
+            headers={"Authorization": "Bearer test-auth"},
+        )
+        assert response.status_code == 200
+        evidence = decode_context_work_evidence_v2(response.content, **args)
+        (row,) = evidence.inventory.observations
+        assert row.runtime_id == backend.resident_incarnation_id and row.live_turn
+        source = next(s for s in evidence.context.sources if s.scope.namespace == "native")
+        assert source.work_bindings[0].runtime_id == row.runtime_id
+        assert source.work_bindings[0].generation == row.generation
+        assert not evidence.assessment.allowed
+        assert evidence.assessment.reason == "other_session_working"
+        assert not row.no_live_work_confirmed and not row.no_owned_descendants
+        assert methods == ["thread/start", "turn/start"]
+        assert "/v2/startup/context-work-inventory" not in app.openapi()["paths"]
+        malformed = response.json()
+        native_source = next(
+            s for s in malformed["context"]["sources"] if s["scope"]["namespace"] == "native"
+        )
+        native_source["work_bindings"][0]["runtime_id"] = "different-backend-owner"
+        malformed["inventory"]["observations"][0]["runtime_id"] = "different-backend-owner"
+        malformed["inventory"]["local_members"] = [["different-backend-owner", row.generation]]
+        with pytest.raises(ValueError):
+            decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        for section, field, value in (
+            ("inventory", "execution_fence", True),
+            ("inventory", "extra", True),
+            ("assessment", "allowed", True),
+        ):
+            malformed = response.json()
+            malformed[section][field] = value
+            with pytest.raises(ValueError):
+                decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        malformed = response.json()
+        malformed["inventory"]["observations"][0]["no_live_work_confirmed"] = True
+        with pytest.raises(ValueError):
+            decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        for authority, revision in (
+            ("authoritative_work", "work_revision"),
+            ("authoritative_membership", "membership_revision"),
+            ("observation_only", "context_revision"),
+        ):
+            malformed = response.json()
+            malformed["context"]["sources"][0]["revision_authority"] = authority
+            malformed["context"]["sources"][0][revision] = 1
+            with pytest.raises(ValueError):
+                decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        malformed = response.json()
+        malformed["inventory"]["observations"] *= 1001
+        with pytest.raises(ValueError, match="count budget"):
+            decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        with pytest.raises(ValueError, match="duplicate"):
+            decode_context_work_evidence_v2(
+                response.content.replace(b'"allowed":false', b'"allowed":false,"allowed":false'),
+                **args,
+            )
+
+
+@pytest.mark.parametrize("limit, expected", [("bytes", 413), ("deadline", 503)])
+async def test_context_work_read_enforces_response_limits(monkeypatch, limit, expected):
+    from omnigent.runner import resource_routes
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_MAX_BYTES, ContextWorkEvidenceV2
+
+    if limit == "bytes":
+        monkeypatch.setattr(
+            ContextWorkEvidenceV2,
+            "model_dump_json",
+            lambda self: " " * (CONTEXT_INVENTORY_MAX_BYTES + 1),
+        )
+    else:
+        ticks = iter((0.0, 6.0))
+        monkeypatch.setattr(
+            resource_routes, "time", SimpleNamespace(monotonic=lambda: next(ticks))
+        )
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    async with _runner_client(app) as client:
+        response = await client.get(
+            "/v2/startup/context-work-inventory?session_id=missing&read_id=read-limit",
+            headers={"Authorization": "Bearer test-auth"},
+        )
+        assert response.status_code == expected
 
 
 @pytest.mark.asyncio
@@ -240,6 +671,7 @@ def native_thread_inventory(monkeypatch):
         "_STARTING_NATIVE_BACKENDS",
         "_CLOSING_NATIVE_BACKENDS",
         "_CODEX_INVENTORY_CLIENTS",
+        "_RETIRED_NATIVE_OWNERS",
     ):
         monkeypatch.setattr(orchestration, name, {})
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
@@ -267,6 +699,102 @@ def native_thread_inventory(monkeypatch):
         return backend, client
 
     return add
+
+
+@pytest.mark.parametrize("outcome", ["returned", "raised", "cancelled"])
+async def test_native_retired_owner_remains_after_unconfirmed_close(
+    native_thread_inventory, outcome
+):
+    backend, _client = native_thread_inventory("main", bind=False)
+    orchestration._AUTO_CODEX_APP_SERVERS.pop("main")
+    failure = {
+        "returned": None,
+        "raised": RuntimeError("close unconfirmed"),
+        "cancelled": asyncio.CancelledError(),
+    }[outcome]
+    backend.close = AsyncMock(side_effect=failure)
+    if failure is None:
+        await orchestration._close_native_backend("main", "codex-native", backend)
+    else:
+        with pytest.raises(type(failure)):
+            await orchestration._close_native_backend("main", "codex-native", backend)
+    (owner,) = orchestration.native_backend_resident_inventory().owners
+    assert owner.incarnation_id == "backend-main"
+    assert owner.session_ids == ("main",)
+    assert owner.closing and not owner.registered and not owner.exit_confirmed
+    assert owner.transport_generation is None
+    assert not orchestration._CLOSING_NATIVE_BACKENDS
+    backend.close.assert_awaited_once()
+
+
+async def test_native_retired_owner_does_not_borrow_successor_exit_proof(
+    harness_inventory_reader, native_thread_inventory
+):
+    _manager, _add, client, requests = harness_inventory_reader
+    backend, _ = native_thread_inventory("main", bind=False)
+    orchestration._AUTO_CODEX_APP_SERVERS.pop("main")
+    orchestration._AUTO_CODEX_APP_SERVERS["alias"] = backend
+    backend.close = AsyncMock()
+
+    async def replace_during_client_close():
+        backend.resident_incarnation_id = "successor-main"
+        backend.process_exit_confirmed = backend.exit_confirmed = True
+
+    await orchestration._close_native_backend(
+        "main", "codex-native", backend, close_client=replace_during_client_close
+    )
+    (old,) = [
+        owner
+        for owner in orchestration.native_backend_resident_inventory().owners
+        if not owner.registered
+    ]
+    assert old.incarnation_id == "backend-main"
+    assert old.session_ids == ("alias", "main")
+    assert not old.process_exit_confirmed and not old.exit_confirmed
+    backend.close.assert_not_awaited()
+    backend.process_exit_confirmed = backend.exit_confirmed = False
+    orchestration._AUTO_CODEX_APP_SERVERS["main"] = backend
+    inventory = orchestration.native_backend_resident_inventory()
+    assert {owner.incarnation_id for owner in inventory.owners} == {
+        "backend-main",
+        "successor-main",
+    }
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "alias"},
+    )
+    native = _v2_evidence(response.content, session_id="alias").sources[1]
+    assert native.coverage == "unsupported" and native.contexts == ()
+    assert any(
+        gap.candidate == "backend-main" and gap.reason == "native_predecessor_exit_unconfirmed"
+        for gap in native.unresolved
+    )
+    assert native.revision_authority == "observation_only"
+    assert native.membership_revision is native.age_upper_bound_s is native.work_bindings is None
+    assert requests == []
+
+
+async def test_native_retired_owner_budget_keeps_missing_candidates_unknown(
+    harness_inventory_reader, native_thread_inventory, monkeypatch
+):
+    _manager, _add, client, requests = harness_inventory_reader
+    monkeypatch.setattr(orchestration, "_MAX_RETIRED_NATIVE_OWNERS", 1)
+    for session in ("first", "second"):
+        backend, _ = native_thread_inventory(session, bind=False)
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(session)
+        backend.close = AsyncMock()
+        await orchestration._close_native_backend(session, "codex-native", backend)
+    inventory = orchestration.native_backend_resident_inventory()
+    assert len(inventory.owners) == 1 and inventory.owners[0].session_ids == ("first",)
+    assert not inventory.exit_coverage_complete
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "second"},
+    )
+    native = _v2_evidence(response.content, session_id="second").sources[1]
+    assert native.coverage == "unsupported" and native.contexts == ()
+    assert "native_owner_exit_coverage_incomplete" in {gap.reason for gap in native.unresolved}
+    assert requests == []
 
 
 @pytest.mark.parametrize(
@@ -577,6 +1105,8 @@ async def harness_inventory_reader(monkeypatch, tmp_path):
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
     monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
     monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
     manager = HarnessProcessManager(tmp_parent=tmp_path)
     manager._started = True
@@ -1182,6 +1712,189 @@ def _v2_evidence(payload, *, session_id: str):
     )
 
 
+@pytest.mark.parametrize("state", ["failed_cleanup", "transfer", "overflow"])
+async def test_runner_v2_preserves_terminal_candidate_after_failed_cleanup(
+    tmp_path, monkeypatch, state
+):
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals import registry as terminal_owners
+
+    terminals = TerminalRegistry()
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "term.sock",
+        private_dir=tmp_path / "term",
+        running=True,
+    )
+    terminals._by_conversation["one"] = {("codex", "main"): instance}
+    target = "one"
+    if state == "failed_cleanup":
+        monkeypatch.setattr(
+            instance, "close", AsyncMock(side_effect=RuntimeError("unconfirmed close"))
+        )
+        await terminals.cleanup_conversation("one")
+        assert terminals.registration_snapshot() == ()
+    else:
+        if state == "overflow":
+            monkeypatch.setattr(terminal_owners, "_MAX_UNCERTAIN_TERMINAL_OWNERS", 1)
+            target = "two"
+        assert terminals.transfer("one", "two", "codex", "main")
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    app = create_runner_app(
+        server_client=NullServerClient(), resource_registry=resources, auth_token="fixture-auth"
+    )
+    async with _runner_client(app) as client:
+        response = await client.get(
+            "/v2/startup/context-inventory",
+            params={"read_id": "v2-read", "session_id": target},
+            headers={"Authorization": "Bearer fixture-auth"},
+        )
+    terminal = _v2_evidence(response.content, session_id=target).sources[2]
+    assert terminal.coverage == "unsupported" and terminal.contexts == ()
+    if state == "overflow":
+        assert "terminal_owner_history_budget" in {gap.reason for gap in terminal.unresolved}
+    else:
+        assert any(gap.candidate == instance.diagnostic_id for gap in terminal.unresolved)
+    assert terminal.revision_authority == "observation_only"
+    assert (
+        terminal.membership_revision
+        is terminal.age_upper_bound_s
+        is terminal.work_bindings
+        is None
+    )
+
+
+@pytest.mark.parametrize("successor", [False, True])
+async def test_runner_preserves_unconfirmed_predecessor_after_registry_replacement(
+    harness_inventory_reader, monkeypatch, tmp_path, successor
+):
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+
+    manager, add, client, requests = harness_inventory_reader
+    retired, _ = await add("one", ExecutorResidentInventory(owners=()))
+
+    async def failed_close(entry):
+        entry.process.returncode = 0
+        raise RuntimeError("owned exit unconfirmed")
+
+    monkeypatch.setattr(manager, "_close_entry", failed_close)
+    with monkeypatch.context() as setup:
+        setup.setattr(
+            manager, "_retention_expiry", HarnessProcessManager._retention_expiry.__get__(manager)
+        )
+        with pytest.raises(RuntimeError, match="owned exit unconfirmed"):
+            await manager.release("one")
+    if successor:
+        executor = AcpExecutor(AcpAgentConfig(command="fake-acp"), cwd=str(tmp_path))
+        executor._proc = SimpleNamespace(returncode=None)
+        monkeypatch.setattr(executor._mcp, "session_new_servers", lambda **_: [])
+        executor._rpc = AsyncMock(return_value={"result": {"sessionId": "new-primary"}})
+        await executor._ensure_session()
+        current, _ = await add("one", None, executor=executor, harness_family="acp")
+        current.incarnation_id = "successor-one"
+        executor._rpc.side_effect = AssertionError("read must not query a vendor")
+    response = await client.get("/v1/startup/owner-inventory?read_id=predecessor")
+    body = response.json()["harnesses"]
+    assert {owner["incarnation_id"] for owner in body["owners"]} == (
+        {"harness-one", "successor-one"} if successor else {"harness-one"}
+    )
+    assert len(body["contexts"]) == len(body["owners"])
+    assert body["contexts"][-1] is None
+    assert not body["exit_coverage_complete"]
+    requests.clear()
+    source = _v2_evidence(
+        (
+            await client.get(
+                "/v2/startup/context-inventory",
+                params={"read_id": "v2-read", "session_id": "one"},
+            )
+        ).content,
+        session_id="one",
+    ).sources[0]
+    assert any(
+        gap.candidate == retired.incarnation_id
+        and gap.reason == "harness_predecessor_exit_unconfirmed"
+        for gap in source.unresolved
+    )
+    assert source.coverage == ("partial" if successor else "unsupported")
+    assert [record.vendor_id.value for record in source.contexts] == (
+        ["new-primary"] if successor else []
+    )
+    assert source.revision_authority == "observation_only"
+    assert source.age_upper_bound_s is source.work_revision is source.work_bindings is None
+    assert requests == (
+        [("one", "/v2/sessions/one/resident-context-inventory")] if successor else []
+    )
+
+
+async def test_runner_v2_rechecks_owner_after_final_registry_wait(
+    harness_inventory_reader, monkeypatch
+):
+    manager, add, client, requests = harness_inventory_reader
+    retired, _ = await add("one", ExecutorResidentInventory(owners=()))
+    original = manager.resident_inventory
+    entered, resume = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def inventory(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            await resume.wait()
+        return await original(**kwargs)
+
+    monkeypatch.setattr(manager, "resident_inventory", inventory)
+    task = asyncio.create_task(
+        client.get(
+            "/v2/startup/context-inventory",
+            params={"read_id": "v2-read", "session_id": "one"},
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        replacement, _ = await add("one", ExecutorResidentInventory(owners=()))
+        replacement.incarnation_id = "replacement-one"
+        resume.set()
+        source = _v2_evidence((await asyncio.wait_for(task, 2)).content, session_id="one").sources[
+            0
+        ]
+        assert "owner_changed" in {gap.reason for gap in source.unresolved}
+        assert any(gap.candidate == retired.incarnation_id for gap in source.unresolved)
+        assert source.contexts == () and source.revision_authority == "observation_only"
+        assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+    finally:
+        resume.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_runner_v2_retired_owner_reason_budget_stays_unknown(harness_inventory_reader):
+    from omnigent.runtime.harnesses.process_manager import HarnessResidentSnapshot
+
+    manager, _add, client, requests = harness_inventory_reader
+    manager._retired_owners = {
+        f"retired-{index}": HarnessResidentSnapshot(
+            f"retired-{index}", "one", "codex", True, True, False
+        )
+        for index in range(1000)
+    }
+    manager._exit_coverage_complete = False
+    response = await client.get(
+        "/v2/startup/context-inventory",
+        params={"read_id": "v2-read", "session_id": "one"},
+    )
+    source = _v2_evidence(response.content, session_id="one").sources[0]
+    assert len(source.unresolved) == 1000
+    assert source.unresolved[-1].reason == "harness_predecessor_reason_budget"
+    assert source.coverage == "unsupported" and source.contexts == ()
+    assert source.revision_authority == "observation_only"
+    assert source.membership_revision is source.age_upper_bound_s is None
+    assert requests == []
+
+
 async def test_runner_context_inventory_v2_binds_session_scopes(harness_inventory_reader):
     _manager, add, client, requests = harness_inventory_reader
     await add("one", ExecutorResidentInventory(owners=()))
@@ -1246,6 +1959,328 @@ async def test_runner_context_inventory_v2_preserves_real_claude_primary(
         assert native.coverage == terminal.coverage == "unsupported"
     factory.assert_called_once()
     assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+async def test_runner_context_v2_preserves_codex_sdk_key_without_vendor_reads(
+    harness_inventory_reader,
+):
+    import asyncio
+
+    from omnigent.inner.codex_executor import (
+        CodexExecutor,
+        _CodexAppServerSession,
+        _CodexSessionState,
+    )
+
+    app = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd=None, env={}, tool_executor=None
+    )
+    executor = CodexExecutor(
+        codex_path="/opt/work/bin/codex", app_session_factory=lambda **kw: app
+    )
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    state = _CodexSessionState()
+    executor._session_states[adapter._session_key] = state
+    await executor._ensure_app_session(
+        adapter._session_key,
+        state,
+        signature=(None, "cwd", "model", "sandbox"),
+        effective_cwd="/opt/work/project",
+    )
+    app._proc = SimpleNamespace(returncode=None, stdin=object())
+    app._started, app._cleaned = True, False
+    app._loop = asyncio.get_running_loop()
+    reader = asyncio.create_task(asyncio.Event().wait())
+    app._reader_task = reader
+    app._resident_established_connection = (0, app._proc, app._proc.stdin, reader, app._loop)
+
+    async def send(message):
+        app._pending_requests[message["id"]].set_result({"result": {"thread": {"id": "primary"}}})
+
+    app._send_message = AsyncMock(side_effect=send)
+    try:
+        await app._request("thread/start", {})
+        _manager, add, client, requests = harness_inventory_reader
+        await add("one", None, executor=executor, adapter=adapter, harness_family="codex")
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.vendor_id.value == "primary" and record.execution_keys == (
+            adapter._session_key,
+        )
+        assert record.provenance == "primary" and record.lifecycle == "live"
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+        assert record.stop_proof is record.continuity_proof is None
+        app._send_message.assert_awaited_once()
+        assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+    finally:
+        app._closing = True
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.parametrize("family", ["acp", "goose", "qwen"])
+async def test_runner_context_v2_preserves_partial_acp_process_scope(
+    harness_inventory_reader, monkeypatch, tmp_path, family
+):
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.inner.qwen_executor import QwenExecutor
+
+    if family == "acp":
+        executor = AcpExecutor(AcpAgentConfig(command="fake-acp"), cwd=str(tmp_path))
+    elif family == "goose":
+        executor = GooseExecutor(cwd=str(tmp_path))
+    else:
+        executor = QwenExecutor(cwd=str(tmp_path))
+    executor._proc = SimpleNamespace(returncode=None)
+    monkeypatch.setattr(executor._mcp, "session_new_servers", lambda **_: [])
+    executor._rpc = AsyncMock(return_value={"result": {"sessionId": "primary"}})
+    await executor._ensure_session()
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    executor._rpc.side_effect = AssertionError("inventory must not query a vendor")
+    for retired in (False, True):
+        if retired:
+            await executor.close_session(adapter._session_key)
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.vendor_id.value == "primary"
+        assert record.execution_keys == record.aliases == ()
+        assert record.lifecycle == ("unknown" if retired else "live")
+        assert record.stop_proof is record.continuity_proof is None
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+        assert "independent_sdk_key_mapping_unsupported" in {r.reason for r in source.unresolved}
+    executor._rpc.assert_awaited_once()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+@pytest.mark.parametrize("family", ["copilot", "cursor", "antigravity"])
+async def test_runner_context_v2_reads_persistent_sdk_state_without_construction(
+    harness_inventory_reader, monkeypatch, tmp_path, family
+):
+    from omnigent.inner.antigravity_executor import AntigravityExecutor
+    from omnigent.inner.copilot_executor import CopilotExecutor, _CopilotSessionState
+    from omnigent.inner.cursor_executor import CursorExecutor, _CursorSessionState
+    from tests.inner.test_antigravity_executor import _install_fake_sdk as install_antigravity
+    from tests.inner.test_copilot_executor import _install_fake_copilot as install_copilot
+    from tests.inner.test_cursor_executor import _install_fake_sdk as install_cursor
+
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    key = adapter._session_key
+    if family == "copilot":
+        captured = install_copilot(monkeypatch)
+        executor = CopilotExecutor(
+            cwd=str(tmp_path), github_host="example.test", github_token="fixture-token"
+        )
+        state = _CopilotSessionState()
+        executor._session_states[key] = state
+        await executor._ensure_session(state, None, [], "")
+        creates = captured["create_kwargs"]
+    elif family == "cursor":
+        captured = install_cursor(monkeypatch)
+        executor = CursorExecutor(cwd=str(tmp_path), api_key="fixture-key")
+        state = _CursorSessionState()
+        executor._session_states[key] = state
+        await executor._ensure_session(state, "auto-smart", [])
+        creates = captured["create_models"]
+    else:
+        captured = install_antigravity(monkeypatch, scripts=[])
+        executor = AntigravityExecutor(api_key="fixture-key")
+        await executor._ensure_agent(key, model=None, system_prompt="", tools=[])
+        creates = captured["agents"]
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    for retired in (False, True):
+        if retired:
+            await executor.close_session(key)
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.execution_keys == (key,) and record.vendor_id is None
+        assert record.lifecycle == ("unknown" if retired else "live")
+        assert record.provenance == "primary" and record.operation.action == "create"
+        assert record.aliases == () and record.stop_proof is record.continuity_proof is None
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+    assert len(creates) == 1
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+@pytest.mark.parametrize("family", ["agents", "responses", "databricks"])
+async def test_runner_context_v2_keeps_history_and_stream_sources_unsupported(
+    harness_inventory_reader, family
+):
+    from omnigent.inner.databricks_executor import DatabricksExecutor
+    from omnigent.inner.open_responses_sdk import OpenResponsesExecutor
+    from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+    from omnigent.startup_protocol import executor_context_scope_v2
+
+    factories = {
+        "agents": OpenAIAgentsSDKExecutor,
+        "responses": OpenResponsesExecutor,
+        "databricks": DatabricksExecutor,
+    }
+    executor = factories[family](client=object())
+    executor.run_turn = Mock(side_effect=AssertionError("inventory must not start work"))
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("inventory must not construct")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    response = await client.get(
+        "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+    )
+    evidence = _v2_evidence(response.content, session_id="one")
+    source = next(s for s in evidence.sources if s.scope == executor_context_scope_v2("one"))
+    assert all(s.coverage != "complete" for s in evidence.sources)
+    assert source.coverage == "unsupported" and source.contexts == ()
+    assert source.unresolved[0].reason.startswith(family + "_")
+    assert source.producer_incarnation is source.work_bindings is None
+    assert source.revision_authority == "observation_only"
+    executor.run_turn.assert_not_called()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")]
+
+
+@pytest.mark.parametrize("family", ["hermes", "kimi"])
+async def test_runner_context_v2_keeps_cli_resume_history_unsupported(
+    harness_inventory_reader, monkeypatch, family
+):
+    from omnigent.inner.hermes_executor import HermesExecutor
+    from omnigent.inner.kimi_executor import KimiExecutor
+    from omnigent.startup_protocol import executor_context_scope_v2
+
+    monkeypatch.setattr(HermesExecutor, "_setup_hermes_home", lambda _: None)
+    if family == "hermes":
+        executor = HermesExecutor(hermes_path="/opt/bin/hermes")
+        executor._session_map["execution"] = "history-id"
+    else:
+        executor = KimiExecutor(binary_path="/opt/bin/kimi")
+        executor._session_id = "history-id"
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("no construction")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    for retired in (False, True):
+        if retired:
+            await executor.close_session("execution")
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        evidence = _v2_evidence(response.content, session_id="one")
+        source = next(s for s in evidence.sources if s.scope == executor_context_scope_v2("one"))
+        assert source.coverage == "unsupported" and source.contexts == ()
+        assert source.unresolved[0].reason.startswith(family + "_")
+        assert all(s.coverage != "complete" for s in evidence.sources)
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+@pytest.mark.parametrize("family, factory, reason", NATIVE_CONTEXT_CASES)
+async def test_runner_native_context_reason_survives_authenticated_consumer(
+    harness_inventory_reader, tmp_path, family, factory, reason
+):
+    from omnigent.startup_protocol import executor_context_scope_v2
+
+    executor = factory(bridge_dir=tmp_path)
+    executor._bridge_dir = object()
+    executor.run_turn = Mock(side_effect=AssertionError("read must not inject"))
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family=family)
+    for retired in (False, True):
+        if retired:
+            adapter._shutting_down.set()
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        evidence = _v2_evidence(response.content, session_id="one")
+        source = next(s for s in evidence.sources if s.scope == executor_context_scope_v2("one"))
+        assert source.contexts == () and source.coverage != "complete" and source.unresolved
+        if not retired:
+            assert source.coverage == "unsupported" and source.unresolved[0].reason == reason
+        assert all(s.coverage != "complete" and s.work_bindings is None for s in evidence.sources)
+    executor.run_turn.assert_not_called()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+async def test_runner_context_v2_preserves_pi_rpc_pending_and_retired_owner(
+    harness_inventory_reader, monkeypatch
+):
+    from omnigent.inner.pi_executor import PiExecutor, PiSubprocessConfig, _PiRpcSession
+
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: None)
+    executor = PiExecutor(pi_path="/opt/work/bin/pi")
+    monkeypatch.setattr(executor, "_ensure_tool_server", AsyncMock(return_value=None))
+    monkeypatch.setattr(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        executor, "_build_env_and_dir", lambda *a, **kw: PiSubprocessConfig({}, None, [])
+    )
+
+    async def start(rpc, *_args, **_kwargs):
+        rpc._start_generation += 1
+        rpc.process = SimpleNamespace(returncode=None)
+
+    monkeypatch.setattr(_PiRpcSession, "start", start)
+    monkeypatch.setattr(_PiRpcSession, "_close_unobserved", AsyncMock())
+    adapter = ExecutorAdapter(Mock(side_effect=AssertionError("read must not construct")))
+    await executor._ensure_rpc(adapter._session_key, "system", None, [])
+    _manager, add, client, requests = harness_inventory_reader
+    await add("one", None, executor=executor, adapter=adapter, harness_family="pi")
+    for retired in (False, True):
+        if retired:
+            await executor.close_session(adapter._session_key)
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        source = _v2_evidence(response.content, session_id="one").sources[0]
+        (record,) = source.contexts
+        assert record.execution_keys == (adapter._session_key,) and record.vendor_id is None
+        assert record.provenance == "primary" and record.operation.action == "create"
+        assert record.lifecycle == ("unknown" if retired else "starting")
+        assert record.stop_proof is record.continuity_proof is None
+        assert source.coverage == "partial" and source.revision_authority == "observation_only"
+    executor._ensure_tool_server.assert_awaited_once()
+    assert requests == [("one", "/v2/sessions/one/resident-context-inventory")] * 2
+
+
+async def test_runner_opencode_context_v2_reads_existing_owner_without_probes(
+    harness_inventory_reader, monkeypatch, tmp_path
+):
+    from omnigent.harnesses.opencode_native import app_server
+
+    monkeypatch.setattr(app_server, "find_opencode_cli", lambda _path: "/opt/bin/opencode")
+    server = app_server.OpenCodeNativeServer(
+        bridge_dir=tmp_path, workspace=tmp_path, port=49231, verify_version=False
+    )
+    server.process = SimpleNamespace(returncode=None)
+    _, _, client, requests = harness_inventory_reader
+    native = server.client()
+    try:
+        native._client.request = AsyncMock(
+            return_value=httpx.Response(200, json={"id": "primary"})
+        )
+        await native.create_session()
+        native._client.request.side_effect = AssertionError("inventory cannot query a vendor")
+        orchestration._AUTO_OPENCODE_SERVERS["one"] = server
+        response = await client.get(
+            "/v2/startup/context-inventory", params={"read_id": "v2-read", "session_id": "one"}
+        )
+        evidence = _v2_evidence(response.content, session_id="one")
+        source = evidence.sources[1]
+        assert source.coverage == "partial" and source.scope.namespace == "native"
+        assert source.contexts[0].vendor_id.value == "primary"
+        assert source.contexts[0].key.source_owner_incarnation == server.resident_incarnation_id
+        assert source.contexts[0].execution_keys == ("primary",)
+        assert source.revision_authority == "observation_only"
+        assert not source.contexts[0].aliases and source.unresolved
+        native._client.request.assert_awaited_once()
+        assert requests == []
+    finally:
+        await native.aclose()
 
 
 async def test_runner_context_inventory_v2_keeps_an_unresident_session_unknown(

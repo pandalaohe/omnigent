@@ -54,8 +54,9 @@ from builtins import ExceptionGroup
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib.resources import files
-from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
+from typing import Any, Literal, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
+from uuid import uuid4
 
 from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
 from omnigent.harnesses.pi_cli import pi_cli_argv
@@ -95,6 +96,17 @@ from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
+from omnigent.startup_protocol import (
+    ContextEvidenceV2,
+    ContextKeyV2,
+    ContextOperationV2,
+    ContextRecordV2,
+    SourceEvidenceV2,
+    UnresolvedContextV2,
+    executor_context_scope_v2,
+    harness_context_authority_v2,
+    unknown_context_evidence_v2,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.json_types import JsonValue
 from omnigent.util.reasoning_effort import (
@@ -609,8 +621,12 @@ class _ToolServer:
         self._pi_usage_tokens[session_id] = token
         return token
 
-    def revoke_pi_usage_token(self, session_id: str) -> None:
-        self._pi_usage_tokens.pop(session_id, None)
+    def revoke_pi_usage_token(self, session_id: str, *, expected_token: str | None = None) -> None:
+        current = self._pi_usage_tokens.get(session_id)
+        if expected_token is None or (
+            current is not None and hmac.compare_digest(current, expected_token)
+        ):
+            self._pi_usage_tokens.pop(session_id, None)
 
     def _pi_usage_token_ok(self, session_id: JsonValue, presented: JsonValue) -> bool:
         if not isinstance(session_id, str) or not isinstance(presented, str):
@@ -1910,6 +1926,9 @@ def _clean_pi_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+PiContextLifecycle: TypeAlias = Literal["starting", "live", "closing", "unknown"]
+
+
 @dataclass
 class _PiRpcSession:
     """Manages a single Pi subprocess in RPC mode."""
@@ -1927,6 +1946,13 @@ class _PiRpcSession:
     extension_ui_handler: Callable[[CodexEvent], Awaitable[None]] | None = None
     _extension_ui_tasks: set[asyncio.Future[None]] = field(default_factory=set)
     _pending_warm_usage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    context_incarnation: str = field(default_factory=lambda: uuid4().hex)
+    _start_generation: int = 0
+    _context_observer: Callable[[int, PiContextLifecycle], None] | None = None
+
+    def _observe_context(self, lifecycle: PiContextLifecycle) -> None:
+        if self._context_observer is not None:
+            self._context_observer(self._start_generation, lifecycle)
 
     async def start(
         self,
@@ -1995,15 +2021,21 @@ class _PiRpcSession:
             args.extend(extra_args)
 
         logger.debug("PiExecutor: spawning %s", " ".join(_redact_argv_for_log(args)))
-        self.process = await _create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=env,
-            **_proc.spawn_kwargs(),
-        )
+        self._start_generation += 1
+        self._observe_context("starting")
+        try:
+            self.process = await _create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+                **_proc.spawn_kwargs(),
+            )
+        except BaseException:
+            self._observe_context("unknown")
+            raise
         _proc.remember_process_group(self.process)
         self._read_task = asyncio.create_task(self._reader())
         self._stderr_task = asyncio.create_task(self._stderr_reader())
@@ -2011,6 +2043,7 @@ class _PiRpcSession:
     async def _reader(self) -> None:
         """Read RPC output, capturing emitted warm usage even between turns."""
         assert self.process is not None and self.process.stdout is not None
+        process, generation = self.process, self._start_generation
         try:
             async for raw_line in self._iter_stream_lines(self.process.stdout):
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
@@ -2019,6 +2052,13 @@ class _PiRpcSession:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         event = None
+                    if (
+                        self.process is process
+                        and self._start_generation == generation
+                        and isinstance(event, dict)
+                        and event.get("type") in {"agent_start", "message_start", "agent_settled"}
+                    ):
+                        self._observe_context("live")
                     if isinstance(event, dict) and event.get("type") == "extension_ui_request":
                         if self.extension_ui_handler is not None:
                             task = asyncio.ensure_future(self.extension_ui_handler(event))
@@ -2038,6 +2078,8 @@ class _PiRpcSession:
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error
             logger.debug("PiExecutor reader error: %s", exc)
         finally:
+            if self.process is process and self._start_generation == generation:
+                self._observe_context("unknown")
             await self._cancel_extension_ui()
             self._line_queue.put_nowait(None)
 
@@ -2208,6 +2250,14 @@ class _PiRpcSession:
         return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
+        self._observe_context("closing")
+        self._start_generation += 1
+        try:
+            await self._close_unobserved()
+        finally:
+            self._observe_context("unknown")
+
+    async def _close_unobserved(self) -> None:
         await self._cancel_extension_ui()
         if self.process is not None:
             # Pi's RPC loop treats stdin EOF as shutdown and flushes stdout.
@@ -2269,6 +2319,7 @@ class _PiSessionState:
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
     _has_sent_prompt: bool = False
+    owner_incarnation: str = field(default_factory=lambda: uuid4().hex)
 
 
 @dataclass(frozen=True)
@@ -2977,6 +3028,10 @@ class PiExecutor(Executor):
         self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
+        self._context_incarnation = uuid4().hex
+        self._context_records: dict[str, ContextRecordV2] = {}
+        self._context_bindings: dict[str, tuple[str, int]] = {}
+        self._context_history_overflow = False
         self._tool_server: _ToolServer | None = None
         # Installed by the runner adapter. Must remain callable between turns
         # so Pi's own idle cache refresh can report its result and ask for a
@@ -3024,13 +3079,148 @@ class PiExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         state = self._session_states.get(session_key)
+        rpc = state.rpc if state is not None else None
+        tool_server = self._tool_server
+        usage_token = (
+            tool_server._pi_usage_tokens.get(session_key) if tool_server is not None else None
+        )
         try:
             if state is not None and state.rpc is not None:
                 await state.rpc.close()
         finally:
-            if self._tool_server is not None:
-                self._tool_server.revoke_pi_usage_token(session_key)
-        self._session_states.pop(session_key, None)
+            if tool_server is not None and usage_token is not None:
+                tool_server.revoke_pi_usage_token(session_key, expected_token=usage_token)
+        if (
+            self._session_states.get(session_key) is state
+            and state is not None
+            and state.rpc is rpc
+        ):
+            self._session_states.pop(session_key, None)
+
+    def _register_rpc_context(
+        self, session_key: str, state: _PiSessionState, rpc: _PiRpcSession
+    ) -> None:
+        if len(self._context_records) >= 1000 or rpc.context_incarnation in self._context_records:
+            self._context_history_overflow = True
+            return
+        try:
+            record = ContextRecordV2(
+                key=ContextKeyV2(
+                    source_owner_incarnation=self._context_incarnation,
+                    context_incarnation=rpc.context_incarnation,
+                ),
+                vendor_id=None,
+                operation=ContextOperationV2(
+                    operation_id=uuid4().hex, action="create", parent=None
+                ),
+                execution_keys=(session_key,),
+                provenance="primary",
+                lifecycle="starting",
+                aliases=(),
+                revision=0,
+                stop_proof=None,
+                continuity_proof=None,
+            )
+        except ValueError:
+            self._context_history_overflow = True
+            return
+        self._context_records[rpc.context_incarnation] = record
+        generation = rpc._start_generation + 1
+        self._context_bindings[rpc.context_incarnation] = (state.owner_incarnation, generation)
+
+        def observe(observed_generation: int, lifecycle: PiContextLifecycle) -> None:
+            current = self._context_records[rpc.context_incarnation]
+            if lifecycle in {"starting", "live"}:
+                if current.lifecycle in {"closing", "unknown"}:
+                    return
+                if (
+                    observed_generation != generation
+                    or self._session_states.get(session_key) is not state
+                ):
+                    lifecycle = "unknown"
+            self._context_records[rpc.context_incarnation] = current.model_copy(
+                update={
+                    "lifecycle": lifecycle,
+                    "revision": current.revision + 1,
+                }
+            )
+
+        rpc._context_observer = observe
+
+    async def prepare_context_inventory_v2(
+        self, session_id: str, read_id: str, *, timeout_s: float = 5.0
+    ) -> Callable[[], ContextEvidenceV2]:
+        if not 0 < timeout_s <= 5.0:
+            return lambda: unknown_context_evidence_v2(session_id, read_id, "invalid_read_budget")
+
+        def reconcile() -> ContextEvidenceV2:
+            if self._context_history_overflow:
+                return unknown_context_evidence_v2(session_id, read_id, "context_history_budget")
+            records, reasons = (
+                [],
+                {
+                    "pi_vendor_session_unconfirmed",
+                    "pi_internal_contexts_unobserved",
+                    "readonly_alias_provenance_unavailable",
+                },
+            )
+            for state in self._session_states.values():
+                if state.rpc is not None and (
+                    not isinstance(state.rpc, _PiRpcSession)
+                    or state.rpc.context_incarnation not in self._context_records
+                ):
+                    reasons.add("pi_rpc_operation_unobserved")
+            for record in self._context_records.values():
+                state = self._session_states.get(record.execution_keys[0])
+                rpc = state.rpc if state is not None else None
+                binding = self._context_bindings.get(record.key.context_incarnation)
+                owner_missing = (
+                    state is None or binding is None or binding[0] != state.owner_incarnation
+                )
+                if owner_missing:
+                    reasons.add("pi_rpc_owner_unregistered")
+                if record.lifecycle in {"starting", "live"} and (
+                    owner_missing
+                    or (
+                        record.lifecycle == "live"
+                        and (
+                            not isinstance(rpc, _PiRpcSession)
+                            or rpc.context_incarnation != record.key.context_incarnation
+                            or binding is None
+                            or rpc._start_generation != binding[1]
+                            or rpc.process is None
+                            or rpc.process.returncode is not None
+                        )
+                    )
+                ):
+                    record = record.model_copy(update={"lifecycle": "unknown"})
+                    reasons.add("pi_rpc_owner_unregistered")
+                records.append(record)
+            return ContextEvidenceV2(
+                wire_version=2,
+                read_id=read_id,
+                authority=harness_context_authority_v2(session_id),
+                expected_scopes=(executor_context_scope_v2(session_id),),
+                sources=(
+                    SourceEvidenceV2(
+                        scope=executor_context_scope_v2(session_id),
+                        producer_incarnation=self._context_incarnation,
+                        coverage="partial",
+                        contexts=tuple(records),
+                        unresolved=tuple(
+                            UnresolvedContextV2(candidate=None, reason=r) for r in sorted(reasons)
+                        ),
+                        membership_revision=None,
+                        context_revision=None,
+                        work_revision=None,
+                        revision_authority="observation_only",
+                        age_upper_bound_s=None,
+                        work_bindings=None,
+                    ),
+                ),
+            )
+
+        return reconcile
 
     async def _evict_rpc(self, session_key: str, rpc: _PiRpcSession) -> None:
         """Drop *rpc* mid-turn so frames it still emits can't reach the next turn."""
@@ -3743,6 +3933,7 @@ class PiExecutor(Executor):
                 await self._await_permission_installation(session_key)
             return state.rpc
 
+        previous_rpc = state.rpc
         wire_catalog = await self._load_gateway_model_wire_apis()
         models_json = None
         if self._gateway:
@@ -3759,15 +3950,14 @@ class PiExecutor(Executor):
                 provider_reasoning=self._provider_reasoning,
             )
 
-        if state.rpc is not None:
-            await state.rpc.close()
+        if previous_rpc is not None:
+            await previous_rpc.close()
 
         tool_server_port = await self._ensure_tool_server(tools)
-        tool_server_token = self._tool_server.token if self._tool_server is not None else None
+        tool_server = self._tool_server
+        tool_server_token = tool_server.token if tool_server is not None else None
         usage_token = (
-            self._tool_server.issue_pi_usage_token(session_key)
-            if self._tool_server is not None
-            else None
+            tool_server.issue_pi_usage_token(session_key) if tool_server is not None else None
         )
         try:
             subprocess_config = self._build_env_and_dir(
@@ -3780,8 +3970,8 @@ class PiExecutor(Executor):
                 usage_token=usage_token,
             )
         except Exception:
-            if self._tool_server is not None:
-                self._tool_server.revoke_pi_usage_token(session_key)
+            if tool_server is not None and usage_token is not None:
+                tool_server.revoke_pi_usage_token(session_key, expected_token=usage_token)
             raise
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -3790,6 +3980,7 @@ class PiExecutor(Executor):
         rpc = _PiRpcSession(usage_session_id=session_key)
         rpc._tmp_dir = tmp_dir
         rpc.extension_ui_handler = lambda event: self._handle_extension_ui(rpc, event)
+        self._register_rpc_context(session_key, state, rpc)
 
         # For Databricks models, prefix with the provider name so Pi resolves
         # the model from our custom provider in models.json.
@@ -3820,9 +4011,11 @@ class PiExecutor(Executor):
             )
             if self._permission_controlled:
                 await self._await_permission_installation(session_key)
-        except Exception:
-            if self._tool_server is not None:
-                self._tool_server.revoke_pi_usage_token(session_key)
+            if self._session_states.get(session_key) is not state or state.rpc is not previous_rpc:
+                raise RuntimeError("Pi RPC owner changed during startup")
+        except BaseException:
+            if tool_server is not None and usage_token is not None:
+                tool_server.revoke_pi_usage_token(session_key, expected_token=usage_token)
             await rpc.close()
             raise
         state.rpc = rpc

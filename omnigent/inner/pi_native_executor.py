@@ -44,6 +44,8 @@ class PiNativeExecutor(Executor):
     the Claude Code native hook uses.
     """
 
+    _context_inventory_unsupported_reason = "pi_native_terminal_generation_binding_unsupported"
+
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()

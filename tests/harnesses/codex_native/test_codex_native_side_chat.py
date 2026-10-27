@@ -31,7 +31,7 @@ class _FakeCodexClient:
         self.responses = responses
         self.calls: list[tuple[str, _JsonObject]] = []
 
-    async def request(self, method: str, params: _JsonObject) -> _JsonObject:
+    async def request(self, method: str, params: _JsonObject, **kwargs) -> _JsonObject:
         self.calls.append((method, params))
         return self.responses.get(method, {"result": {}})
 

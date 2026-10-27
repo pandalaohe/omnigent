@@ -111,6 +111,10 @@ class AntigravityNativeExecutor(Executor):
         reads :data:`ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR`.
     """
 
+    _context_inventory_unsupported_reason = (
+        "antigravity_native_conversation_owner_lifecycle_unsupported"
+    )
+
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()

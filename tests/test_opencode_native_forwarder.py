@@ -32,6 +32,9 @@ class _RecordingServerClient:
 class _FakeOpenCodeClient:
     """Fake OpenCode client recording permission and question replies + history."""
 
+    def observe_forwarder(self, active: bool) -> None:
+        pass
+
     def __init__(self) -> None:
         self.replies: list[tuple[str, dict[str, Any]]] = []
         self.messages: list[dict[str, Any]] = []
