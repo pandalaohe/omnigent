@@ -9,7 +9,7 @@ import pytest
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.server_config import StartupAdmissionPolicy
 from omnigent.server.startup_admission import StartupAdmission
-from omnigent.server.startup_inputs import ManagedStartupInputs
+from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
 from omnigent.server.startup_observations import accept_observation
 from omnigent.startup_protocol import StartupObservation
 from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
@@ -19,6 +19,63 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from omnigent.stores.session_startup_store import SessionStartupStore
 from tests.server.test_startup_observations import _startup
 from tests.stores.test_startup_operator_release import opening, release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["operator_released", "queued", "uncertain", "opened"])
+async def test_disabled_queue_preserves_unconfirmed_old_input(app, db_uri, monkeypatch, state):
+    from starlette.datastructures import Headers
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    startups, conv, item, attempt, body = opening(conversations)
+    monkeypatch.setattr(
+        "omnigent.stores.session_startup_store.now_epoch", lambda: attempt.admitted_at + 180
+    )
+    if state == "operator_released":
+        release(startups, conv.host_id, body)
+    elif state == "opened":
+        from omnigent.entities.session_startup import StartupReceipt
+
+        assert startups.observe(
+            StartupReceipt(
+                startup_id=attempt.id,
+                attempt_id=attempt.attempt_id,
+                input_id=item.id,
+                runtime_id=attempt.runtime_id,
+                phase="opening_settled",
+                source="runner",
+            )
+        )
+    else:
+        from omnigent.db.db_models import current_workspace_id
+        from omnigent.db.session_startup import SqlSessionStartup
+
+        with startups._session("seed_disabled_startup_state") as db:
+            row = db.get(SqlSessionStartup, (current_workspace_id(), attempt.id))
+            row.state = state
+            if state == "queued":
+                row.occupied = row.resident = False
+                row.attempt_id = row.runtime_id = None
+                row.admitted_at = row.first_dispatch_at = None
+                row.host_generation = None
+                row.cold_claims = {}
+    assert app.state.startup_admission is None
+    context = StartupInputContext(app, Headers({}), None, item.id)
+    assert not await context.claim(conversations, conv.id)
+    assert conversations.get_item(conv.id, item.id).status == "in_progress"
+    assert await app.state.host_load_inputs.accepts(conversations.get_conversation(conv.id), app)
+    inputs = app.state.host_load_inputs
+    dispatch = AsyncMock()
+    original_dispatch = inputs.dispatch
+    inputs.dispatch = dispatch
+    try:
+        assert not await inputs._recover_session(
+            app, conv.id, SimpleNamespace(host_id=conv.host_id)
+        )
+        dispatch.assert_not_awaited()
+        assert not inputs._deliveries
+    finally:
+        inputs.dispatch = original_dispatch
 
 
 @pytest.mark.asyncio

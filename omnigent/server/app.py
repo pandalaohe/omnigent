@@ -2256,10 +2256,12 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     from omnigent.server.startup_inputs import ManagedStartupInputs, StartupDispatch
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     startup_inputs = (
         ManagedStartupInputs(conversation_store, host_registry)
         if startup_policy is not None
+        or isinstance(conversation_store, SqlAlchemyConversationStore)
         or (sandbox_config is not None and sandbox_config.managed_launch_supported)
         or (
             isinstance(auth_provider, UnifiedAuthProvider)
@@ -2286,6 +2288,7 @@ def create_app(
     app.state.startup_store = (
         SessionStartupStore(conversation_store.storage_location)
         if startup_policy is not None
+        or isinstance(conversation_store, SqlAlchemyConversationStore)
         else None
     )
     from omnigent.server.startup_admission import StartupAdmission

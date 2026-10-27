@@ -299,7 +299,10 @@ def test_generated_codex_provider_prices_sessions_like_the_e2e_fixture(monkeypat
     assert pricing.cache_read_per_token == pytest.approx(cache_read_rate / 1_000_000)
 
 
-def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monkeypatch):
+@pytest.mark.parametrize("server_config", [None, "startup-queue.yaml"])
+def test_supervisor_terminates_children_when_relay_cleanup_fails(
+    tmp_path, monkeypatch, server_config
+):
     import time
 
     from dev.repro_env import runtime
@@ -342,7 +345,18 @@ def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monke
     # An ambient value (e.g. pytest started inside an Omnigent terminal) would
     # make the guest-env assertion pass without the runner-env fix.
     monkeypatch.delenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raising=False)
+    if server_config is None:
+        monkeypatch.delenv("OMNIGENT_REPRO_SERVER_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_REPRO_SERVER_CONFIG", str(tmp_path / server_config))
     runtime.supervise(tmp_path)
+    server_call = next(
+        call for call in runtime.subprocess.Popen.call_args_list if "server" in call.args[0]
+    )
+    if server_config is None:
+        assert "--config" not in server_call.args[0]
+    else:
+        assert server_call.args[0][-2:] == ["--config", str(tmp_path / server_config)]
     runner_call = next(
         call
         for call in runtime.subprocess.Popen.call_args_list

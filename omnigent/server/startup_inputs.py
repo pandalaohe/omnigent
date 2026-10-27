@@ -134,14 +134,22 @@ async def reconcile_accepted_startup_input(
     _publish_input_consumed(startup.session_id, consumed)
 
 
-async def _release_allows_delivery(
-    app: Any, conversations: ConversationStore, session_id: str, input_id: str
+async def _startup_allows_delivery(
+    app: Any, conversations: ConversationStore, session_id: str, input_id: str | None
 ) -> bool:
     startups = getattr(getattr(app, "state", None), "startup_store", None)
     current = await asyncio.to_thread(startups.for_session, session_id) if startups else None
-    if current is None or current.release_receipt is None:
+    policy_disabled = getattr(getattr(app, "state", None), "startup_admission", None) is None
+    if current is None or (not policy_disabled and current.release_receipt is None):
         return True
     pending = await asyncio.to_thread(conversations.list_pending_inputs, session_id)
+    if policy_disabled and (
+        current.state in ("queued", "starting", "verifying", "uncertain", "blocked", "cancelling")
+        or any(item.id == current.input_id for item in pending)
+    ):
+        return False
+    if current.release_receipt is None:
+        return True
     head = next((item for item in pending if item.status != "failed"), None)
     return (
         current.input_accepted
@@ -202,7 +210,7 @@ class StartupInputContext:
                 account=account,
             ):
                 return False
-        if not await _release_allows_delivery(self.app, store, session_id, self.input_id):
+        if not await _startup_allows_delivery(self.app, store, session_id, self.input_id):
             return False
         live = await asyncio.to_thread(store.get_conversation, session_id)
         if live is None or live.archived:
@@ -430,13 +438,18 @@ class ManagedStartupInputs:
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
         admission = getattr(app.state, "startup_admission", None)
+        startups = getattr(app.state, "startup_store", None)
+        current = await asyncio.to_thread(startups.for_session, conv.id) if startups else None
+        if current is not None and current.release_receipt is not None:
+            pending = await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
+            return not current.input_accepted or any(
+                item.id == current.input_id for item in pending
+            )
+        if admission is None and not await _startup_allows_delivery(
+            app, self.conversations, conv.id, None
+        ):
+            return True
         if admission is not None:
-            current = await asyncio.to_thread(admission.startups.for_session, conv.id)
-            if current is not None and current.release_receipt is not None:
-                pending = await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
-                return not current.input_accepted or any(
-                    item.id == current.input_id for item in pending
-                )
             if current is not None and current.state in ("cancelled", "stopped", "cancelling"):
                 raise OmnigentError(
                     "Startup is stopped or still stopping; "
@@ -627,14 +640,22 @@ class ManagedStartupInputs:
                     task.add_done_callback(clear_annotation_delivery)
                 return False
         admission = getattr(app.state, "startup_admission", None)
-        if admission is not None:
-            current = await asyncio.to_thread(admission.startups.for_session, session_id)
-            released = current is not None and current.release_receipt is not None
-            if released and (
-                not current.input_accepted or (head is not None and head.id == current.input_id)
-            ):
+        startups = getattr(app.state, "startup_store", None)
+        current = await asyncio.to_thread(startups.for_session, session_id) if startups else None
+        released = current is not None and current.release_receipt is not None
+        if (
+            current is not None
+            and released
+            and (not current.input_accepted or (head is not None and head.id == current.input_id))
+        ):
+            if admission is not None:
                 await admission.recover_session(session_id, connection)
-                return False
+            return False
+        if admission is None and not await _startup_allows_delivery(
+            app, self.conversations, session_id, head.id if head is not None else None
+        ):
+            return False
+        if admission is not None:
             if not released and (
                 (
                     current is not None
@@ -730,7 +751,7 @@ class ManagedStartupInputs:
                 or current.status != "in_progress"
             ):
                 return "not_dispatched"
-            if not await _release_allows_delivery(app, self.conversations, session_id, item.id):
+            if not await _startup_allows_delivery(app, self.conversations, session_id, item.id):
                 return "not_dispatched"
             options = (
                 item.data.startup_options

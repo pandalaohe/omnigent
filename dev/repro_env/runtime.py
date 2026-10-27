@@ -232,6 +232,7 @@ def supervise(output: Path) -> None:
                 OMNIGENT_WEB_UI_DIST=str(root / "omnigent/server/static/web-ui"),
             )
             server_env = {**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": token}
+            server_config = env.get("OMNIGENT_REPRO_SERVER_CONFIG")
             spawn(
                 "server",
                 [
@@ -247,6 +248,7 @@ def supervise(output: Path) -> None:
                     f"sqlite:///{output / 'sessions.db'}",
                     "--artifact-location",
                     str(output / "artifacts"),
+                    *(["--config", server_config] if server_config else []),
                 ],
                 server_env,
             )
