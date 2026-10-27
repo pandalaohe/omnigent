@@ -77,18 +77,23 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                 json={
                     "id": "conv_old",
                     "agent_id": "ag_claude",
+                    "title": "续接状态检查",
                     "runner_id": "runner_one",
                     "project_id": "project_alpha",
                     "workspace": "/opt/work/claude-project",
                     "labels": {
                         "omnigent.ui": "terminal",
                         BRIDGE_ID_LABEL_KEY: "bridge_shared",
+                        "omnigent.codex_native.permission_observation": "old observation",
+                        "omnigent.archived_at": "123",
+                        "omnigent.mcp_service.old": "1",
                     },
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
             assert body == {
                 "agent_id": "ag_claude",
+                "title": "续接状态检查",
                 "project_id": "project_alpha",
                 "workspace": "/opt/work/claude-project",
                 "git": None,
@@ -165,6 +170,7 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             "/v1/sessions",
             {
                 "agent_id": "ag_claude",
+                "title": "续接状态检查",
                 "project_id": "project_alpha",
                 "workspace": "/opt/work/claude-project",
                 "git": None,

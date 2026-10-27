@@ -160,9 +160,11 @@ from omnigent.server.session_collab import session_peer_enabled
 from omnigent.server.user_preferences_store import (
     USER_PREFERENCE_NAMESPACES,
     USER_PREFERENCES_MAX_BYTES,
+    KeepWarmIdentity,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
+    read_keep_warm_settings,
     touch_runner_log_warning_dismissals,
 )
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -1995,6 +1997,10 @@ def create_app(
                     try:
                         server_disk_pct = await asyncio.to_thread(system_status_hub.disk_usage_pct)
                         system_status_hub.tick(time.time(), server_disk_pct=server_disk_pct)
+                        await app_inst.state.host_load_queue.tick(system_status_hub, app_inst)
+                        host_load_notices = getattr(app_inst.state, "host_load_notices", None)
+                        if host_load_notices is not None:
+                            await host_load_notices.tick(system_status_hub, app_inst)
                         ticks += 1
                         if ticks % FLUSH_EVERY_TICKS == 0:
                             await system_status_hub.save_history()
@@ -2184,6 +2190,10 @@ def create_app(
                 system_status_fast_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await system_status_fast_task
+            host_load_notices = getattr(app_inst.state, "host_load_notices", None)
+            if host_load_notices is not None:
+                await host_load_notices.shutdown()
+            await app_inst.state.host_load_queue.shutdown()
             if system_status_hub is not None:
                 await system_status_hub.save_history()
                 system_status_hub.close()
@@ -2245,7 +2255,7 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
-    from omnigent.server.startup_inputs import ManagedStartupInputs
+    from omnigent.server.startup_inputs import ManagedStartupInputs, StartupDispatch
 
     startup_inputs = (
         ManagedStartupInputs(conversation_store, host_registry)
@@ -2260,6 +2270,16 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    from omnigent.server.host_load_queue import HostLoadQueue
+
+    app.state.host_load_inputs = ManagedStartupInputs(conversation_store, host_registry)
+    app.state.host_load_queue = HostLoadQueue(conversation_store)
+
+    def _register_startup_dispatch(handler: StartupDispatch) -> None:
+        app.state.host_load_inputs.dispatch = handler
+        if startup_inputs is not None:
+            startup_inputs.dispatch = handler
+
     from omnigent.stores.session_startup_store import SessionStartupStore
 
     app.state.startup_policy = startup_policy
@@ -2804,7 +2824,7 @@ def create_app(
                     "message": exc.message,
                     **{
                         key: getattr(exc, key)
-                        for key in ("project_id", "project_name", "op_kind")
+                        for key in ("project_id", "project_name", "op_kind", "successor_id")
                         if hasattr(exc, key)
                     },
                 }
@@ -3712,6 +3732,13 @@ def create_app(
             response["preferences"] = preferences
         return response
 
+    @app.get("/v1/child-checkin/defaults")
+    async def child_checkin_defaults(request: Request) -> dict[str, str]:
+        from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
+
+        require_user(request, auth_provider)
+        return {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+
     def _preferences_store() -> SqlAlchemyUserPreferencesStore:
         if user_preferences_store is None:
             raise StarletteHTTPException(
@@ -3906,6 +3933,148 @@ def create_app(
         model_config = ConfigDict(extra="forbid", strict=True)
         delete_safe: bool
 
+    class KeepWarmConversionRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+        dry_run: bool
+
+    def _keep_warm_conversion_snapshot(
+        owner: str,
+    ) -> tuple[set[KeepWarmIdentity], set[str], list[tuple[str, str]]]:
+        from omnigent.db.utils import builtin_agent_id
+        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.harness_plugins import product_agent_harnesses
+        from omnigent.server.session_collab import collab_owners_for
+        from omnigent.server.session_overrides import AGENT_TEMPLATE_ID_LABEL, harness_for_session
+
+        products = product_agent_harnesses()
+        identities = {
+            KeepWarmIdentity(builtin_agent_id(name), harness) for name, harness in products.items()
+        }
+        legacy_native_agents: list[tuple[str, str]] = []
+        bundles: dict[str, Any | None] = {}
+        for user_agents in (False, True):
+            after = None
+            while True:
+                page = (
+                    agent_store.list_user_agents(owner, limit=1000, after=after)
+                    if user_agents
+                    else agent_store.list(limit=1000, after=after)
+                )
+                for agent in page.data:
+                    harness = (
+                        products.get(agent.name)
+                        if agent.id == builtin_agent_id(agent.name)
+                        else None
+                    )
+                    if harness is None:
+                        loaded = agent_cache.load(
+                            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+                        )
+                        bundles[agent.id] = loaded
+                        harness = (
+                            loaded.spec.executor.config.get("harness") or loaded.spec.executor.type
+                        )
+                    harness = (
+                        harness
+                        if harness.startswith("acp:")
+                        else canonicalize_harness(harness) or harness
+                    )
+                    identities.add(KeepWarmIdentity(agent.id, harness))
+                    family = {"claude-native": "claude", "codex-native": "codex"}.get(
+                        canonicalize_harness(harness) or harness
+                    )
+                    if not user_agents and family is not None:
+                        legacy_native_agents.append((agent.id, family))
+                if not page.has_more or page.last_id is None:
+                    break
+                after = page.last_id
+        if custom_agents_store is not None:
+            offset = 0
+            while True:
+                custom = custom_agents_store.list(owner, limit=1000, offset=offset)
+                for agent in custom:
+                    harness = agent["harness"]
+                    harness = (
+                        harness
+                        if harness.startswith("acp:")
+                        else canonicalize_harness(harness) or harness
+                    )
+                    identities.add(KeepWarmIdentity(agent["id"], harness))
+                if len(custom) < 1000:
+                    break
+                offset += len(custom)
+        after = None
+        hosts: set[str] = set()
+        harness_cache: dict[str, str | None] = {}
+        while True:
+            page = conversation_store.list_conversations(
+                limit=1000, after=after, kind=None, include_archived=False
+            )
+            owners = collab_owners_for(page.data, conversation_store, permission_store)
+            for conv in page.data:
+                if owners.get(conv.id) != owner:
+                    continue
+                hosts.add(conv.host_id or "")
+                if conv.agent_id and not conv.harness_override and conv.agent_id not in bundles:
+                    agent = agent_store.get(conv.agent_id)
+                    bundles[conv.agent_id] = (
+                        agent_cache.load(
+                            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+                        )
+                        if agent is not None
+                        else None
+                    )
+                identities.add(
+                    KeepWarmIdentity(
+                        conv.agent_id,
+                        harness_for_session(conv, harness_cache, bundles=bundles),
+                        conv.labels.get(AGENT_TEMPLATE_ID_LABEL),
+                    )
+                )
+            if not page.has_more or page.last_id is None:
+                break
+            after = page.last_id
+        hosts.update(
+            host.host_id
+            for host in (host_store.list_hosts(owner) if host_store else [])
+            if host.sandbox_provider is None
+        )
+        return identities, hosts, legacy_native_agents
+
+    @app.post(
+        "/v1/me/preferences/keep_warm/convert",
+        dependencies=[Depends(require_json_content_type)],
+        responses=_preferences_error_responses,
+    )
+    async def convert_keep_warm(request: Request) -> dict[str, Any]:
+        store = _preferences_store()
+        owner, create_if_missing = _preferences_owner(request)
+        _check_preference_write_rate(owner)
+        body = await _read_preferences_body(request, KeepWarmConversionRequest)
+        assert isinstance(body, KeepWarmConversionRequest)
+        settings = await asyncio.to_thread(read_keep_warm_settings, store, owner)
+        identities, hosts, legacy_native_agents = (
+            await asyncio.to_thread(_keep_warm_conversion_snapshot, owner)
+            if settings.cells is None
+            else (set(), set(), [])
+        )
+        try:
+            return await asyncio.to_thread(
+                store.convert_keep_warm,
+                owner,
+                identities,
+                hosts,
+                dry_run=body.dry_run,
+                create_if_missing=create_if_missing,
+                legacy_native_agents=legacy_native_agents,
+            )
+        except UserPreferencesUserNotFoundError as exc:
+            raise StarletteHTTPException(
+                status_code=401, detail="Account no longer exists"
+            ) from exc
+        except UserPreferencesValidationError as exc:
+            raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post(
         "/v1/me/preferences/worktree_archive/migrate",
         dependencies=[Depends(require_json_content_type)],
@@ -3970,11 +4139,7 @@ def create_app(
             # Lets the native hook routes read the session owner's
             # approval-timeout setting; absent → defaults.
             user_preferences_store=user_preferences_store,
-            register_startup_dispatch=lambda handler: (
-                setattr(startup_inputs, "dispatch", handler)
-                if startup_inputs is not None
-                else None
-            ),
+            register_startup_dispatch=_register_startup_dispatch,
             register_initial_file_upload=lambda handler: setattr(
                 app.state, "initial_file_upload", handler
             ),
@@ -4656,6 +4821,10 @@ def create_app(
             )
 
         def needs_eager_recovery(conv: Conversation) -> bool:
+            from omnigent.server.host_load_queue import held_host
+
+            if held_host(conv):
+                return False
             if conv.archived:
                 return False
             # Idle runtimes are recreated on their next interaction. Unknown,
@@ -4843,6 +5012,9 @@ def create_app(
                         and not conv.archived
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
+                    from omnigent.server.host_load_queue import held_host
+
+                    initialize_runtime = initialize_runtime and not held_host(conv)
                     # Idle trees reinitialize on demand; active trees recover now.
                     if initialize_runtime:
                         async with store_slots:
@@ -5066,6 +5238,7 @@ def create_app(
                     conn_capabilities=list(conn.hello.capabilities),
                     now=time.time(),
                 )
+                system_status.push_load_lines(host_registry, conn.workspace_id, conn.host_id)
             if cli_retention_coordinator is not None:
                 cli_retention_coordinator.trigger(host_id)
             archive_close_coordinator.trigger_pending(host_id=host_id)
@@ -5137,6 +5310,7 @@ def create_app(
                 auth_provider=auth_provider,
                 permission_store=permission_store,
                 host_versions=_bulk_host_versions,
+                host_registry=host_registry,
             ),
             prefix="/v1",
             tags=["system"],

@@ -8,6 +8,7 @@ they live here following the source ↔ test directory mirroring rule.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -1616,6 +1617,8 @@ def test_sdk_seed_is_distinct_and_uses_host_defaults(
     without_spawn = replace(loaded.spec, spawn=False)
     expected_added = {
         "sys_child_cap",
+        "sys_child_checkin",
+        "sys_host_load",
         "sys_session_create",
         "sys_session_send",
         "sys_session_close",
@@ -2094,6 +2097,55 @@ def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyP
         host_store=HostStore(db_uri),
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
     )
+
+
+@pytest.mark.asyncio
+async def test_host_connect_callback_sends_effective_load_lines(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host.frames import CAP_LOAD_LEVEL_V1, CAP_RESOURCE_SNAPSHOT, HostHelloFrame
+    from omnigent.server.routes import host_tunnel
+
+    callbacks = []
+    create_router = host_tunnel.create_host_tunnel_router
+
+    def capture_connect(*args, **kwargs):
+        callbacks.append(kwargs["on_host_connect"])
+        return create_router(*args, **kwargs)
+
+    monkeypatch.setattr(host_tunnel, "create_host_tunnel_router", capture_connect)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    hub = app.state.system_status
+    host_id = "4" * 32
+    hub.put_settings({"load_lines": {"hosts": {host_id: {"heavy": 6, "new_session": 7}}}})
+    registry = app.state.host_registry
+    try:
+        for capabilities in ([CAP_RESOURCE_SNAPSHOT, CAP_LOAD_LEVEL_V1], [CAP_RESOURCE_SNAPSHOT]):
+            conn = registry.register(
+                host_id,
+                _StubWebSocket(),
+                HostHelloFrame(
+                    version="test",
+                    frame_protocol_version=1,
+                    name="laptop",
+                    capabilities=capabilities,
+                ),
+                "local",
+            )
+            await callbacks[0](host_id, "local")
+            if CAP_LOAD_LEVEL_V1 in capabilities:
+                frame = json.loads(conn.outbound_queue.get_nowait().data)
+                assert (frame["kind"], frame["heavy"], frame["new_session"], frame["mem_pct"]) == (
+                    "host.load_lines",
+                    6,
+                    7,
+                    90,
+                )
+            else:
+                assert conn.outbound_queue.empty()
+    finally:
+        hub.close()
 
 
 @pytest.mark.asyncio
@@ -2576,6 +2628,48 @@ async def _reconnect_with_initialize(
     with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
         await captured["callback"](runner_id, connection)  # type: ignore[operator]
     return [r for r in caplog.records if r.name == "omnigent.server.app"]
+
+
+@pytest.mark.asyncio
+async def test_runner_reconnect_skips_held_explicit_host_child_then_initializes_after_release(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.host_load_queue import LABEL
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "44444444444444444444444444444444"
+    [parent_id] = _bind_sessions(db_uri, runner_id)
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.get_conversation(parent_id)
+    assert parent is not None
+    child = store.create_conversation(
+        parent_conversation_id=parent_id,
+        kind="sub_agent",
+        agent_id=parent.agent_id,
+        runner_id=runner_id,
+        host_id="55555555555555555555555555555555",
+        workspace="/opt/work/project",
+        labels={LABEL: "queued@55555555555555555555555555555555"},
+    )
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        app.state.runner_router, "client_for_session_resources", lambda *_a, **_k: routed
+    )
+    initialize = AsyncMock(
+        return_value=httpx.Response(
+            201, request=httpx.Request("POST", "http://runner/v1/sessions")
+        )
+    )
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", initialize)
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+    assert child.id not in [call.args[0].id for call in initialize.await_args_list]
+    store.delete_label(child.id, LABEL)
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+    assert child.id in [call.args[0].id for call in initialize.await_args_list]
 
 
 @pytest.mark.asyncio

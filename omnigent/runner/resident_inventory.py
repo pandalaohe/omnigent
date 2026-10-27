@@ -7,10 +7,11 @@ from dataclasses import dataclass, replace
 
 import httpx
 
+from omnigent.host.recovery import RecoveryInventory, assess_recovery
 from omnigent.runner.native.orchestration import (
     NativeBackendInventorySnapshot,
     native_backend_resident_inventory,
-    native_context_source_v2,
+    native_context_work_snapshot_v2,
     prepare_native_backend_thread_inventory,
 )
 from omnigent.runner.resource_registry import (
@@ -24,6 +25,7 @@ from omnigent.runtime.harnesses.process_manager import (
 )
 from omnigent.startup_protocol import (
     ContextEvidenceV2,
+    ContextWorkEvidenceV2,
     SourceEvidenceV2,
     UnresolvedContextV2,
     harness_context_authority_v2,
@@ -233,6 +235,24 @@ async def session_context_evidence_v2(
     resources: SessionResourceRegistry,
     timeout_s: float = _OWNER_INVENTORY_TIMEOUT_S,
 ) -> ContextEvidenceV2:
+    snapshot = await session_context_work_evidence_v2(
+        session_id,
+        read_id,
+        process_manager=process_manager,
+        resources=resources,
+        timeout_s=timeout_s,
+    )
+    return snapshot.context
+
+
+async def session_context_work_evidence_v2(
+    session_id: str,
+    read_id: str,
+    *,
+    process_manager: HarnessProcessManager | None,
+    resources: SessionResourceRegistry,
+    timeout_s: float = _OWNER_INVENTORY_TIMEOUT_S,
+) -> ContextWorkEvidenceV2:
     """Compose the runner's three session scopes into one v2 envelope.
 
     Native OpenCode owners retain partial operation evidence; other native sources
@@ -251,15 +271,33 @@ async def session_context_evidence_v2(
             harness = _unknown_context_source(scopes[0], "read_timeout")
         except (httpx.HTTPError, RuntimeError, ValueError):
             harness = _unknown_context_source(scopes[0], "invalid_or_failed_read")
-    return ContextEvidenceV2(
+    native, observations = native_context_work_snapshot_v2(session_id)
+    context = ContextEvidenceV2(
         wire_version=2,
         read_id=read_id,
         authority=harness_context_authority_v2(session_id),
         expected_scopes=scopes,
         sources=(
             harness,
-            native_context_source_v2(session_id)
-            or _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
+            native or _unknown_context_source(scopes[1], "native_context_source_unimplemented"),
             _terminal_context_source_v2(session_id, scopes[2], resources),
         ),
+    )
+    inventory = RecoveryInventory(
+        host_generation="",
+        process_identity="",
+        supervisor=None,
+        server_members=frozenset(),
+        local_members=frozenset((row.runtime_id, row.generation) for row in observations),
+        unresolved_startups=frozenset(),
+        server_complete=False,
+        local_complete=False,
+        execution_fence=False,
+        host_fault_confirmed=False,
+        observations=observations,
+    )
+    return ContextWorkEvidenceV2(
+        context=context,
+        inventory=inventory,
+        assessment=assess_recovery(inventory, now=time.time()),
     )

@@ -566,33 +566,35 @@ def mock_llm_server_url(
             sys.executable,
             str(_REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_server.py"),
             str(mock_port),
+            str(os.getpid()),
         ],
         env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
-    base_url = f"http://127.0.0.1:{mock_port}"
-
-    # Wait for the mock server to be ready
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
-            if resp.status_code == 200:
-                break
-        except httpx.ConnectError:
-            # Expected while the mock server is still booting.
-            pass
-        time.sleep(0.1)
-    else:
-        proc.kill()
-        log_handle.close()
-        log_contents = mock_log.read_text() if mock_log.exists() else ""
-        raise RuntimeError(
-            f"Mock LLM server didn't start within 10s.\nLog at {mock_log}:\n{log_contents[-2000:]}"
-        )
-
     try:
+        base_url = f"http://127.0.0.1:{mock_port}"
+
+        # Wait for the mock server to be ready
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                resp = httpx.get(f"{base_url}/stats", timeout=1.0)
+                if resp.status_code == 200:
+                    break
+            except httpx.ConnectError:
+                # Expected while the mock server is still booting.
+                pass
+            time.sleep(0.1)
+        else:
+            proc.kill()
+            log_handle.close()
+            log_contents = mock_log.read_text() if mock_log.exists() else ""
+            raise RuntimeError(
+                f"Mock LLM server didn't start within 10s.\nLog at {mock_log}:\n"
+                f"{log_contents[-2000:]}"
+            )
+
         yield base_url
     finally:
         proc.send_signal(signal.SIGTERM)

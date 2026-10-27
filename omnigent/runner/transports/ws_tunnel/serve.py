@@ -1247,6 +1247,7 @@ async def _serve_tunnel_once(
             direct_attach_token=direct_attach_token,
             connection_id=connection_id,
             event_dispatcher=event_dispatcher,
+            app=app,
         )
         last_progress = loop.time()
         if event_dispatcher is not None:
@@ -1459,6 +1460,7 @@ async def _send_hello(
     direct_attach_token: str | None = None,
     connection_id: str | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
+    app: _ASGIApp | None = None,
 ) -> None:
     """Send the runner's opening hello frame.
 
@@ -1491,6 +1493,7 @@ async def _send_hello(
         CAP_FILESYSTEM_ATTACHMENTS,
         CAP_PATH_ATTACHMENTS,
     )
+    from omnigent.startup_observation import registered_observation_capabilities
     from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 
     await send_text(
@@ -1504,6 +1507,7 @@ async def _send_hello(
                     SDK_PEER_CAPABILITY,
                     *([CLAUDE_SDK_PEER_CAPABILITY] if claude_peer_receipts_supported() else []),
                     CAP_MCP_REGISTRY,
+                    *registered_observation_capabilities(app),
                     # The aggregate route is registered by create_runner_app itself.
                     CONTEXT_INVENTORY_V2,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),

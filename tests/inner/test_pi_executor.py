@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
+import httpx
 import psutil
 import pytest
 
@@ -56,7 +57,7 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMetadata, ModelWireAPI
 from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 from omnigent.server.schemas import ElicitationResult
@@ -598,7 +599,8 @@ def test_find_pi_cli_uses_off_path_install(monkeypatch, tmp_path):
     assert pi_mod._find_pi_cli() == str(binary)
 
 
-def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_path):
+@pytest.mark.parametrize("launcher_kind", ["npm-shim", "permission-launcher"])
+def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_path, launcher_kind):
     import omnigent.harnesses.pi_cli as pi_cli_mod
     import omnigent.inner.pi_executor as pi_mod
 
@@ -609,6 +611,10 @@ def test_rpc_start_bypasses_npm_cmd_and_preserves_arguments(monkeypatch, tmp_pat
     script.write_text("")
     shim = prefix / "pi.CMD"
     shim.write_text('@"%_prog%" "%dp0%\\node_modules\\pi-agent\\cli.js" %*\n')
+    if launcher_kind == "permission-launcher":
+        script = prefix / "omnigent_pi_permissions.cjs"
+        script.write_text("")
+        shim = script
     node = prefix / "node.exe"
     node.write_text("")
     monkeypatch.setattr(pi_cli_mod, "IS_WINDOWS", True)
@@ -653,6 +659,84 @@ def test_rpc_start_keeps_omnigent_identity_without_saving_session(monkeypatch):
     args = spawn.call_args.args
     assert args[args.index("--session-id") + 1] == "conv_one"
     assert "--no-session" in args
+
+
+def test_windows_sandboxed_permission_launcher_preserves_interpreters(monkeypatch, tmp_path):
+    import os
+    import sys
+    from types import SimpleNamespace
+
+    from omnigent.harnesses import pi_cli
+    from omnigent.inner import pi_executor, sandbox
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    script = tmp_path / "omnigent_pi_permissions.cjs"
+    script.write_text("")
+    node = tmp_path / "node.exe"
+    node.touch()
+    policy = sandbox.SandboxPolicy(
+        backend_type="windows_jobobject",
+        active=True,
+        read_roots=[tmp_path],
+        write_roots=[tmp_path],
+        write_files=[],
+        allow_network=False,
+    )
+    monkeypatch.setattr(pi_cli, "IS_WINDOWS", True)
+    monkeypatch.setattr(sandbox, "resolve_sandbox", lambda *_: policy)
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 3, 0))
+    # Exercise the Windows launcher template without changing pathlib's host semantics.
+    windows_os = SimpleNamespace(
+        **{key: getattr(os, key) for key in dir(os) if key not in {"name", "environ"}},
+        name="nt",
+        environ={},
+    )
+    monkeypatch.setattr(sandbox, "os", windows_os)
+    executor = PiExecutor(
+        pi_path=str(script),
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="windows_jobobject")),
+    )
+    spawn = AsyncMock(return_value=_FakeProcess())
+    monkeypatch.setattr(pi_executor, "_create_subprocess_exec", spawn)
+
+    async def run():
+        try:
+            await executor._ensure_rpc("test-session", "", None, [])
+        finally:
+            await executor.close()
+
+    try:
+        _run(run())
+        assert executor._sandboxed
+        assert spawn.call_args.args[:7] == (
+            sys.executable,
+            "-P",
+            executor._pi_launch_path,
+            str(script),
+            "--mode",
+            "rpc",
+            "--no-session",
+        )
+        target_calls = []
+        activated = []
+        monkeypatch.setattr(sandbox, "activate_sandbox", lambda state: activated.append(state))
+        monkeypatch.setattr(
+            sandbox.subprocess,
+            "run",
+            lambda argv: target_calls.append(argv) or SimpleNamespace(returncode=0),
+        )
+        # Run the actual generated Python wrapper up to the OS spawn boundary.
+        launcher = executor._pi_launch_path
+        monkeypatch.setattr(sys, "argv", [launcher, *spawn.call_args.args[3:]])
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        with pytest.raises(SystemExit) as result:
+            exec(compile(Path(launcher).read_text(), launcher, "exec"))
+        assert result.value.code == 0
+        assert activated and activated[0].backend_type == "windows_jobobject"
+        assert target_calls == [[str(node), *spawn.call_args.args[3:]]]
+    finally:
+        Path(executor._pi_launch_path).unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize("failure", ["unknown-shim", "missing-script", "missing-node"])
@@ -5545,6 +5629,87 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
     ):
         executor = PiExecutor(gateway=True, model="databricks-gpt-5-4")
     assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_rpc_launch_carries_gateway_efforts_from_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    mixed: bool,
+) -> None:
+    base = "https://rpc.example/proxy/v1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/proxy/model_group/info"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "model_group": "custom-model",
+                        "supported_reasoning_efforts": ["low", "high", "max"],
+                    }
+                ]
+            },
+        )
+
+    from omnigent.models import model_catalog
+
+    transport = httpx.MockTransport(handler)
+    fetch = model_catalog.fetch_openai_reasoning_metadata
+    monkeypatch.setattr(
+        model_catalog, "fetch_openai_reasoning_metadata", lambda p: fetch(p, transport=transport)
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.pi_executor._fetch_shell_command_token", AsyncMock(return_value="test-key")
+    )
+    monkeypatch.setattr(model_catalog, "fetch_databricks_model_service_entries", lambda *_: ())
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", lambda *_: ())
+    base_urls = {"openai": base}
+    if mixed:
+        base_urls["claude"] = "https://workspace.example.databricks.com/ai-gateway/anthropic"
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://rpc.example",
+        base_urls_override=base_urls,
+        gateway_auth_command="get-test-token",
+    )
+    configs = []
+
+    def build_env(_tools, _port, _token, models, **kwargs):
+        configs.append(models)
+        return PiSubprocessConfig(env={}, tmp_dir="", extra_args=[])
+
+    monkeypatch.setattr(executor, "_build_env_and_dir", build_env)
+    monkeypatch.setattr(executor, "_ensure_tool_server", AsyncMock(return_value=None))
+    monkeypatch.setattr(_PiRpcSession, "start", AsyncMock())
+    _run(executor._ensure_rpc("test-session", "system", "custom-model", []))
+    models = configs[0]["providers"]["databricks-completions"]["models"]
+    assert len(models) == 1 and models[0]["reasoning"] is True
+    assert models[0]["thinkingLevelMap"] == {
+        "off": None,
+        "minimal": None,
+        "low": "low",
+        "medium": None,
+        "high": "high",
+        "xhigh": None,
+        "max": "max",
+    }
+
+
+def test_gateway_efforts_do_not_cross_provider_urls() -> None:
+    config = _build_models_json(
+        "https://example.test",
+        "test-key",
+        {"openai": "https://example.test/served/v1"},
+        model="custom-model",
+        provider_reasoning={
+            "https://example.test/other/v1": {
+                "custom-model": ModelReasoningMetadata(efforts=frozenset({"low", "high"}))
+            }
+        },
+    )
+    assert "thinkingLevelMap" not in config["providers"]["databricks-completions"]["models"][0]
 
 
 def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:

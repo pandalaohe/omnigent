@@ -53,6 +53,7 @@ from omnigent.models.model_metadata import (
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
+    ModelReasoningMetadata,
     ModelWireAPI,
 )
 from omnigent.models.model_override import is_codex_compatible_model, model_family_mismatch
@@ -1895,6 +1896,46 @@ def _fetch_openai_compatible_listing(
         models=tuple(models),
         note=f"models reported by {_models_url(provider.base_url)}",
     )
+
+
+def fetch_openai_reasoning_metadata(
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> dict[str, ModelReasoningMetadata]:
+    """Read optional LiteLLM group capabilities under the provider's own URL prefix."""
+    if not provider.base_url:
+        return {}
+    try:
+        parsed = urlsplit(provider.base_url)
+        path = re.sub(r"/v[0-9]+$", "", parsed.path.rstrip("/"))
+        url = parsed._replace(path=f"{path}/model_group/info", query="", fragment="").geturl()
+        token = _resolve_bearer_token(provider)
+        with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+            response = client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                follow_redirects=False,
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError, OSError, subprocess.SubprocessError):
+        return {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    metadata: dict[str, ModelReasoningMetadata] = {}
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("model_group")
+        levels = item.get("supported_reasoning_efforts")
+        if (
+            isinstance(model_id, str)
+            and isinstance(levels, list)
+            and levels
+            and all(isinstance(level, str) for level in levels)
+        ):
+            metadata[model_id] = ModelReasoningMetadata(efforts=frozenset(levels))
+    return metadata
 
 
 def _fetch_anthropic_listing(

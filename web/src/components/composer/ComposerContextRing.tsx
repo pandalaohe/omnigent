@@ -2,7 +2,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { formatTokenCount } from "@/lib/formatCost";
-import { resolveUsageContextLimits } from "@/lib/usageContextPreferences";
+import {
+  resolveUsageContext,
+  usageContextSourceFromKey,
+  usageContextLevelLabel,
+} from "@/lib/usageContextPreferences";
 import { cn } from "@/lib/utils";
 
 /** Circumference of the progress ring (r=5.5). */
@@ -35,18 +39,21 @@ export function ComposerContextRing({
 }) {
   const mode = useContextIndicatorMode();
   const preferences = useUsageContextPreferences();
-  const limits = resolveUsageContextLimits(
-    preferences,
-    sourceKey,
+  const limits = resolveUsageContext(preferences, sourceKey, {
     contextWindow,
     autoCompactTokenLimit,
-  );
+  });
+  const source = usageContextSourceFromKey(sourceKey);
+  const labels = {
+    hostLabel: source?.hostId || "Server",
+    agentLabel: source?.agentName || source?.harness || "Agent",
+  };
   const compactMode =
     mode === "compact" && limits.autoCompactTokenLimit != null && limits.autoCompactTokenLimit > 0;
-  const denominator = compactMode ? limits.autoCompactTokenLimit : limits.contextWindow;
+  const denominator = compactMode ? limits.autoCompactTokenLimit : limits.contextWindow.value;
   if (
-    limits.contextWindow == null ||
-    limits.contextWindow <= 0 ||
+    limits.contextWindow.value == null ||
+    limits.contextWindow.value <= 0 ||
     denominator == null ||
     denominator <= 0 ||
     tokensUsed == null
@@ -99,6 +106,20 @@ export function ComposerContextRing({
         <p className="tabular-nums text-neutral-400 leading-tight dark:text-muted-foreground">
           {formatTokenCount(tokensUsed)} / {formatTokenCount(denominator)} tokens
         </p>
+        <p className="text-xs text-muted-foreground">
+          Context · {usageContextLevelLabel(limits.contextWindow.level, labels)}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          Buffer {limits.buffer.value?.toLocaleString() ?? "Auto"}
+          {limits.buffer.mode === "percent" && limits.buffer.value != null ? "%" : ""} ·{" "}
+          {usageContextLevelLabel(limits.buffer.level, labels)}
+        </p>
+        {limits.ignored.map((item) => (
+          <p key={item.level} className="text-xs text-muted-foreground">
+            Ignored {usageContextLevelLabel(item.level, labels)}: {item.reason}; using{" "}
+            {usageContextLevelLabel(limits.buffer.level, labels)}.
+          </p>
+        ))}
       </TooltipContent>
     </Tooltip>
   );

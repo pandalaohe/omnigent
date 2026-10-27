@@ -40,6 +40,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostLoadLinesFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -72,6 +73,7 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     ImportLocalSessionChunkAssembler,
     ImportSessionChunkingUnsupportedError,
+    LoadLevelReport,
     ResourceMachine,
     ResourceProcessRow,
     classify_launch_refusal,
@@ -789,7 +791,8 @@ def test_hello_frame_omitted_filesystem_roots_is_legacy_false() -> None:
     assert decoded.filesystem_roots is False
 
 
-def test_launch_runner_frame_round_trip() -> None:
+@pytest.mark.parametrize("retained", [None, [], ["runner_shared"]])
+def test_launch_runner_frame_round_trip(retained: list[str] | None) -> None:
     """
     Verify HostLaunchRunnerFrame survives encode → decode.
 
@@ -799,15 +802,34 @@ def test_launch_runner_frame_round_trip() -> None:
     original = HostLaunchRunnerFrame(
         request_id="req_001",
         binding_token="secret_token_xyz",
-        workspace="/Users/corey/projects/frontend",
+        workspace="/opt/work/app",
         session_id="conv_abc123",
     )
+    if retained is not None:
+        original.retain_runner_ids = retained
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
     assert decoded.request_id == "req_001"
     assert decoded.binding_token == "secret_token_xyz"
-    assert decoded.workspace == "/Users/corey/projects/frontend"
+    assert decoded.workspace == "/opt/work/app"
     assert decoded.session_id == "conv_abc123"
+    assert getattr(decoded, "retain_runner_ids", None) == retained
+
+
+@pytest.mark.parametrize("retained", ["runner_shared", [1], {"runner": "shared"}])
+def test_launch_runner_rejects_malformed_retained_runners(retained: object) -> None:
+    with pytest.raises(ValueError, match="retain_runner_ids"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.launch_runner",
+                    "request_id": "req",
+                    "binding_token": "test-token",
+                    "workspace": "/opt/work/app",
+                    "retain_runner_ids": retained,
+                }
+            )
+        )
 
 
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
@@ -1392,6 +1414,12 @@ def test_resource_snapshot_frame_round_trip() -> None:
             disk_used=100,
             disk_total=200,
             load1=1.25,
+            cpu_count=24,
+            load_per_core=0.5,
+            swap_used=10,
+            swap_total=20,
+            load_equiv=12.0,
+            estimate=True,
         ),
         processes=[
             ResourceProcessRow(
@@ -1427,6 +1455,7 @@ def test_resource_snapshot_frame_round_trip() -> None:
         runner_count=1,
         sampler_cpu_ms=0.5,
         monitor_rss_delta=4096,
+        load_level=LoadLevelReport("normal", None, "2026-10-25T00:00:00+00:00", 4, 5, None),
     )
 
     decoded = decode_host_frame(encode_host_frame(original))
@@ -3189,4 +3218,13 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                     "had_connected": invalid,
                 }
             )
+        )
+
+
+def test_load_lines_frame_round_trip_and_validation() -> None:
+    frame = HostLoadLinesFrame(4, 5, 90, 2)
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            '{"kind":"host.load_lines","heavy":5,"new_session":4,"mem_pct":90,"revision":1}'
         )

@@ -319,6 +319,8 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 _CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
+_CHILD_CHECKIN_TOOLS = frozenset({"sys_child_checkin"})
+_HOST_LOAD_TOOLS = frozenset({"sys_host_load"})
 
 # Both sys_session_create create shapes (JSON and config_path multipart)
 # carry the agent-origin marker: the server charges the owner's open-rate
@@ -402,6 +404,7 @@ _SESSION_QUERY_TOOLS = frozenset(
         "sys_session_list",
         "sys_session_close",
         "sys_session_get_info",
+        "sys_session_get_startup_observation_v1",
         "sys_session_share",
     }
 )
@@ -602,6 +605,8 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
+    | _CHILD_CHECKIN_TOOLS
+    | _HOST_LOAD_TOOLS
     | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -707,6 +712,7 @@ def build_native_relay_tool_schemas(
     from omnigent.tools.builtins.spawn import (
         SysSessionGetHistoryTool,
         SysSessionGetInfoTool,
+        SysSessionGetStartupObservationV1Tool,
         SysSessionListTool,
     )
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
@@ -752,6 +758,7 @@ def build_native_relay_tool_schemas(
             SysSessionListTool,
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
+            SysSessionGetStartupObservationV1Tool,
             SysSessionRenameTool,
             SysSessionHandoverTool,
             SysAgentGetTool,
@@ -1076,6 +1083,8 @@ _ALL_LOCAL_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _CHILD_CAP_TOOLS
+    | _CHILD_CHECKIN_TOOLS
+    | _HOST_LOAD_TOOLS
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -5633,8 +5642,16 @@ async def _complete_created_session(
                     "detail": post_error,
                 }
             else:
-                initial_message = {"status": "sent"}
-                if remote:
+                startup = _string_object_dict(data.get("startup"))
+                held = (
+                    startup is not None
+                    and startup.get("reason") == "host_load"
+                    and startup.get("status") == "queued"
+                )
+                initial_message = (
+                    {"status": "queued", "reason": "host_load"} if held else {"status": "sent"}
+                )
+                if remote and not held:
                     _subagent_work.mark_subagent_work_started(child_id)
     else:
         registration_error = await clear_registration_barrier()
@@ -5670,6 +5687,8 @@ async def _complete_created_session(
             "git_branch": _optional_string(meta.get("git_branch")) if meta is not None else None,
             "harness": _optional_string(meta.get("harness")) if meta is not None else None,
             **({"initial_message": initial_message} if initial_message is not None else {}),
+            **({"host_load": data["host_load"]} if "host_load" in data else {}),
+            **({"startup": data["startup"]} if "startup" in data else {}),
         }
     )
 
@@ -7728,11 +7747,101 @@ async def _execute_session_query_tool(
         )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
+    if tool_name == "sys_session_get_startup_observation_v1":
+        return await _session_startup_observation_v1_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_share":
         return await _session_share_via_rest(args, conversation_id, server_client, agent_spec)
     return await _session_close_via_rest(args, conversation_id, server_client)
+
+
+async def _session_startup_observation_v1_via_rest(
+    args: _JsonObject,
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """Negotiate the exact registered path before any diagnostic GET; no ordinary fallback."""
+    from urllib.parse import quote
+
+    target = args.get("session_id", conversation_id)
+    if set(args) - {"session_id"} or not isinstance(target, str) or not target:
+        return json.dumps({"error": "startup observation v1 accepts only a non-empty session_id"})
+    path = f"/v1/sessions/{quote(target, safe='')}/startup-observation/v1"
+
+    def unknown(reason: str) -> str:
+        return json.dumps(
+            {
+                "session_id": target,
+                "startup_observation": {
+                    "schema_version": 1,
+                    "status": "unknown",
+                    "reason": reason,
+                    "admission": "not_evaluated",
+                },
+            }
+        )
+
+    headers = {"X-Omnigent-Permission-Tiers": "1"}
+    try:
+        async with asyncio.timeout(2.0):
+            negotiation = await server_client.options(
+                path,
+                headers=headers,
+                follow_redirects=False,
+                timeout=2.0,
+            )
+    except (TimeoutError, httpx.RequestError):
+        return unknown("server_support_unknown")
+    if negotiation.status_code in (401, 403):
+        return json.dumps({"session_id": target, "error": "access_denied"})
+    if negotiation.status_code == 404:
+        # May be an old route table OR owner-scoped concealment: do not infer which.
+        return unknown("server_support_unknown")
+    if (
+        negotiation.status_code != 200
+        or negotiation.headers.get("X-Omnigent-Startup-Observation") != "1"
+    ):
+        return unknown("server_support_unknown")
+    try:
+        contract = negotiation.json()
+    except ValueError:
+        return unknown("server_support_unknown")
+    if (
+        not isinstance(contract, dict)
+        or type(contract.get("version")) is not int
+        or contract != {"protocol": "permission_startup_observation", "version": 1}
+    ):
+        return unknown("server_support_unknown")
+    try:
+        async with asyncio.timeout(2.0):
+            response = await server_client.get(
+                path,
+                headers=headers,
+                follow_redirects=False,
+                timeout=2.0,
+            )
+    except (TimeoutError, httpx.RequestError):
+        return unknown("server_observation_unavailable")
+    if response.status_code in (401, 403):
+        return json.dumps({"session_id": target, "error": "access_denied"})
+    if response.status_code != 200:
+        return unknown("server_observation_unavailable")
+    try:
+        payload = response.json()
+    except ValueError:
+        return unknown("server_observation_unavailable")
+    raw = payload.get("startup_observation") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("id") != target
+        or not isinstance(raw, dict)
+        or type(raw.get("schema_version")) is not int
+        or raw.get("schema_version") != 1
+        or raw.get("admission") != "not_evaluated"
+    ):
+        return unknown("server_observation_unsupported")
+    return json.dumps({"session_id": target, "startup_observation": raw})
 
 
 async def _runner_online_or_none(
@@ -8026,6 +8135,7 @@ async def _session_info_item(
     auto_compact_token_limit = snap.get("auto_compact_token_limit")
     item: _JsonObject = {
         **({"initial_message": initial_message} if initial_message is not None else {}),
+        **({"startup_hold": snap["startup_hold"]} if snap.get("startup_hold") else {}),
         "session_id": snap.get("id"),
         "status": snap.get("status"),
         # Persisted conversation activity is distinct from lifecycle
@@ -8754,6 +8864,100 @@ async def _execute_child_cap(
         return json.dumps(response.json())
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_child_cap failed: {exc}"})
+
+
+async def _execute_child_checkin(
+    args: _JsonObject, client: httpx.AsyncClient | None, conversation_id: str | None
+) -> str:
+    from omnigent.tools.builtins.child_checkin import validate_child_checkin_arguments
+
+    if client is None or conversation_id is None:
+        return json.dumps({"error": "sys_child_checkin requires server access and a session id"})
+    try:
+        action = validate_child_checkin_arguments(args)
+        path = f"/v1/sessions/{conversation_id}/child-checkin"
+        body = {key: value for key, value in args.items() if key != "action"}
+        if action == "read":
+            response = await client.get(path, timeout=30)
+        elif action == "set":
+            if "min_gap_minutes" in body:
+                body["min_gap_seconds"] = cast(int, body.pop("min_gap_minutes")) * 60
+            response = await client.patch(path, json=body, timeout=30)
+        elif action == "follow_up_add":
+            response = await client.post(f"{path}/follow-ups", json=body, timeout=30)
+        else:
+            response = await client.delete(f"{path}/follow-ups/{body['id']}", timeout=30)
+        if response.is_error:
+            return json.dumps({"error": response.json(), "status_code": response.status_code})
+        return json.dumps(response.json())
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_child_checkin failed: {exc}"})
+
+
+async def _execute_host_load(args: _JsonObject, client: httpx.AsyncClient | None) -> str:
+    if args:
+        return json.dumps({"error": "sys_host_load takes no arguments"})
+    if client is None:
+        return json.dumps({"error": "sys_host_load requires server access"})
+    advice = {
+        "spare": "Spare capacity: this host can take more work.",
+        "normal": "Heavy work may proceed; check current load before dispatching more work.",
+        "heavy_hold": "Wait before starting new heavy work on this host; recheck for clearance.",
+        "new_session_hold": (
+            "Wait before starting new heavy work or creating new child sessions on this host; "
+            "recheck for clearance."
+        ),
+        "unknown": (
+            "Load telemetry is unavailable, warming up, or stale. No load hold is confirmed; "
+            "verify capacity before starting heavy work."
+        ),
+    }
+    fields = (
+        "name",
+        "host_id",
+        "state",
+        "cpu_count",
+        "load_per_core",
+        "load_equiv",
+        "estimate",
+        "level",
+        "reason",
+        "lines",
+        "lines_source",
+        "mem_pct",
+        "queued_children",
+        "sampled_at",
+        "level_since",
+    )
+    try:
+        response = await client.get("/v1/system/status", timeout=30)
+        response.raise_for_status()
+        payload = _string_object_dict(response.json())
+        raw_hosts = payload.get("hosts") if payload is not None else None
+        hosts = _json_object_list(raw_hosts)
+        if not isinstance(raw_hosts, list) or len(hosts) != len(raw_hosts):
+            return json.dumps({"error": "sys_host_load received an invalid host list"})
+        return json.dumps(
+            {
+                "hosts": [
+                    {
+                        **{field: host.get(field) for field in fields},
+                        "scheduling_advice": (
+                            "Host is not online; confirm connectivity before dispatching work."
+                            if host.get("state") != "online"
+                            else advice.get(
+                                _optional_string(host.get("level")) or "",
+                                "Unrecognized load level; verify capacity "
+                                "before dispatching work.",
+                            )
+                        ),
+                    }
+                    for host in hosts
+                ]
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_host_load failed: {exc}"})
 
 
 async def _agent_list_via_rest(
@@ -10121,6 +10325,10 @@ async def execute_tool(
             output = await _execute_list_models_tool(agent_spec=agent_spec)
         elif tool_name in _CHILD_CAP_TOOLS:
             output = await _execute_child_cap(args, server_client, conversation_id)
+        elif tool_name in _CHILD_CHECKIN_TOOLS:
+            output = await _execute_child_checkin(args, server_client, conversation_id)
+        elif tool_name in _HOST_LOAD_TOOLS:
+            output = await _execute_host_load(args, server_client)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,

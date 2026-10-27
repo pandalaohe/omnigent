@@ -482,7 +482,9 @@ async def test_new_item_forward_after_recovery_turn_starts_a_turn() -> None:
             json=_session_init_payload(suppress_recovery_turn=False),
         )
         assert init_resp.status_code == 201, init_resp.text
-        await asyncio.sleep(0.1)
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
         assert len(harness.posted_bodies) == 1
 
         forward_resp = await client.post(

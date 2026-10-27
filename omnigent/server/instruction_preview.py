@@ -6,7 +6,12 @@ from collections.abc import Sequence
 from typing import Any
 
 from omnigent.harness_aliases import canonicalize_harness, native_terminal_name
-from omnigent.runtime.instruction_layers import compose_route, compose_session_text
+from omnigent.runtime.instruction_layers import (
+    compose_role,
+    compose_route,
+    compose_session_text,
+    select_role_layers,
+)
 from omnigent.runtime.prompt import (
     InstructionPart,
     child_session_question_instruction,
@@ -74,20 +79,19 @@ def preview_instructions(
     candidates = _route_layers(revisions, host_id, agent_key)
     effective = compose_route(candidates)
     role = "child" if has_parent else "mother" if spawn else None
-    role_layer = next((r for r in revisions if r.scope == role), None)
-    sent_layers = list(effective.revisions)
-    if role_layer is not None and role_layer.text.strip():
-        sent_layers.append(role_layer)
+    role_layers = select_role_layers(revisions, role, host_id, agent_key) if role else []
+    role_text = compose_role(role_layers)
+    sent_layers = list(effective.revisions) + role_layers
     global_text = compose_session_text(
         effective.text,
         has_parent=has_parent,
         spawn=spawn,
-        mother_text=role_layer.text if role == "mother" and role_layer else "",
-        child_text=role_layer.text if role == "child" and role_layer else "",
+        mother_text=role_text if role == "mother" else "",
+        child_text=role_text if role == "child" else "",
         quota_line=quota_line,
     )
     sent_user_parts = [_layer_part(r, sent=True) for r in sent_layers]
-    if role == "mother" and role_layer is not None and role_layer.text.strip() and quota_line:
+    if role == "mother" and role_layers and quota_line:
         sent_user_parts.append(_framework_part(InstructionPart("quota_line", quota_line)))
     replaced = [_layer_part(r, sent=False) for r in candidates if r not in sent_layers]
     if spec is None:

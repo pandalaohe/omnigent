@@ -5837,10 +5837,15 @@ async def test_antigravity_elicitation_hook_rejects_non_dict_body(
 # ── Deferred ("deny now, approve later") approvals ──────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("policy_unavailable", "oversized"), [(False, False), (True, False), (False, True)]
+)
 async def test_deferred_bash_approval_returns_at_once_and_mirrors(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    policy_unavailable: bool,
+    oversized: bool,
 ) -> None:
     """
     S5: with async approvals on, a Bash request returns deny + pending at
@@ -5867,6 +5872,16 @@ async def test_deferred_bash_approval_returns_at_once_and_mirrors(
     try:
         payload = await _claude_permission_payload("Bash")
         payload["tool_input"] = {"command": "pnpm vitest"}
+        payload["permission_mode"] = "auto"
+        payload["cwd"] = "/opt/work/app"
+        payload["permission_suggestions"] = [
+            {"type": "addDirectories", "directories": ["/opt/work/shared"]}
+        ]
+        if oversized:
+            payload["tool_input"]["description"] = "x" * 20000
+            payload["permission_suggestions"] = [{"details": "s" * 5000}]
+        if policy_unavailable:
+            payload["_omnigent_approval_origin"] = "omnigent-policy-unavailable"
         resp = await client.post(
             f"/v1/sessions/{child.id}/hooks/permission-request",
             json=payload,
@@ -5886,11 +5901,73 @@ async def test_deferred_bash_approval_returns_at_once_and_mirrors(
         assert params["async_kind"] == "approval"
         assert params["approval_ref"] == aid
         assert params.get("interruptible") is None
+        origin = (
+            "omnigent-policy-unavailable" if policy_unavailable else "claude-permission-prompt"
+        )
+        card = next(c for c in conv_store.list_detached_cards() if c.session_id == child.id)
+        for key, value in {
+            "origin": origin,
+            "permission_mode": "auto",
+            "tool_name": "Bash",
+            "cwd": "/opt/work/app",
+        }.items():
+            assert card.payload[key] == value
+            assert params[key] == value
+        for key, cap in (("tool_input", 16384), ("permission_suggestions", 4096)):
+            value = card.payload[key]
+            assert params[key] == value
+            if oversized:
+                assert value["truncated"] is True
+                assert len(value["preview"]) == cap
+            else:
+                assert value == payload[key]
+        assert origin in decision["message"]
+        assert '"permission_mode": "auto"' in decision["message"]
+        assert '"cwd": "/opt/work/app"' in decision["message"]
 
         mirrored = await _next_elicitation(parent_collector)
         assert mirrored["params"]["async_kind"] == "approval"
         assert mirrored["params"]["approval_ref"] == aid
         assert mirrored["params"]["target_session_id"] == child.id
+
+        second_payload = {**payload, "tool_input": {"command": "echo overloaded"}}
+        second = await client.post(
+            f"/v1/sessions/{child.id}/hooks/permission-request", json=second_payload
+        )
+        assert second.status_code == 200, second.text
+        second_event = await _next_elicitation(child_collector)
+        second_aid = _aid_for(second_event)
+        forwarded: list[dict[str, Any]] = []
+
+        async def _record_completion(
+            *args: Any, **_kwargs: Any
+        ) -> sessions_route._RunnerForwardResult:
+            forwarded.append(args[2])
+            return sessions_route._RunnerForwardResult(status_code=204, body="")
+
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._forward_session_change_to_runner",
+            _record_completion,
+        )
+        completion = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": "Synthetic tool failure"},
+            },
+        )
+        assert completion.status_code == 202, completion.text
+        assert len(forwarded) == 1
+        output = forwarded[0]["data"]["output"]
+        assert output.startswith("Synthetic tool failure\n\nPending deferred approvals:\n")
+        assert output.count("Pending deferred approvals:") == 1
+        assert f"- {aid}:" in output and f"- {second_aid}:" in output
+        assert f"(origin: {origin})" in output
+        snapshot = conv_store.get_conversation(child.id)
+        assert snapshot is not None
+        error = sessions_route._last_task_error_from_labels(snapshot.labels)
+        assert error is not None and error["code"] == "native_turn_error"
+        assert error["message"] == "Synthetic tool failure"
 
         verdict = await _post_approval(
             client,
@@ -6217,6 +6294,7 @@ def _codex_command_payload(
 async def test_codex_command_approval_defers_and_grants(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """
     S10: a Codex command approval declines at once with no interrupt and
@@ -6253,10 +6331,19 @@ async def test_codex_command_approval_defers_and_grants(
         assert params["async_kind"] == "approval"
         assert params["approval_ref"] == aid
         assert params["command"] == "pnpm vitest"
+        card = next(
+            c
+            for c in SqlAlchemyConversationStore(db_uri).list_detached_cards()
+            if c.session_id == session_id
+        )
+        assert card.payload["origin"] == "codex-command-approval"
+        assert card.payload["tool_input"] == payload["params"]
+        assert card.payload["cwd"] == "/repo/app"
         await _wait_until(lambda: bool(delivered.calls))
         pending = delivered.calls[-1][1]
         assert pending.startswith(f"Approval pending (#{aid}): shell(pnpm vitest)")
         assert "has NOT run" in pending
+        assert "codex-command-approval" in pending
 
         accept = await _post_approval(client, session_id, event["elicitation_id"], "accept")
         assert accept.status_code == 202, accept.text

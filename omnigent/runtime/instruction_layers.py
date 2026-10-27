@@ -1,8 +1,9 @@
-"""Pure composition of route layers and exclusive session-role instructions."""
+"""Pure composition of route layers and session-role instructions."""
 
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_capabilities import InstructionDelivery
@@ -131,6 +132,33 @@ def compose_route(layers: Sequence[GlobalInstructionRevision]) -> RouteInstructi
     scopes = ("independent",) if "independent" in by_scope else ("shared", "agent", "host")
     revisions = tuple(by_scope[scope] for scope in scopes if scope in by_scope)
     return RouteInstructions("\n\n".join(layer.text for layer in revisions), revisions)
+
+
+def select_role_layers(
+    revisions: Sequence[GlobalInstructionRevision],
+    role: Literal["mother", "child"],
+    host_id: str | None,
+    agent_key: str | None,
+) -> list[GlobalInstructionRevision]:
+    """Select a role's independent cell, or shared → agent → host revisions."""
+    by_key = {
+        (revision.agent_key, revision.host_id): revision
+        for revision in revisions
+        if revision.scope == role and revision.text.strip()
+    }
+    if agent_key and host_id and (independent := by_key.get((agent_key, host_id))):
+        return [independent]
+    keys = [("", "")]
+    if agent_key:
+        keys.append((agent_key, ""))
+    if host_id:
+        keys.append(("", host_id))
+    return [by_key[key] for key in keys if key in by_key]
+
+
+def compose_role(selected: Sequence[GlobalInstructionRevision]) -> str:
+    """Join selected role revisions without trimming their text."""
+    return "\n\n".join(revision.text for revision in selected)
 
 
 def compose_session_text(

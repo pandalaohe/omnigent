@@ -32,6 +32,7 @@ from omnigent.host.frames import (
     ResourceMachine,
     ResourceProcessRow,
 )
+from omnigent.host.load_level import load_equiv
 from omnigent.runner.owner_file import read_owner_entries
 
 _logger = logging.getLogger(__name__)
@@ -45,6 +46,10 @@ _FOLDED_ROLE = "folded"
 # With no native child list, one process-table walk is at most this frequent
 # even while the server holds a fast-sampling lease.
 _FALLBACK_TREE_INTERVAL_S = 60.0
+
+# Windows load emulation updates every five seconds; allow its first update
+# to finish before treating the initial zero as a measurement.
+_LOADAVG_WARMUP_S = 6.0
 
 _CHILD_BUFFER_SIZE = 1024
 
@@ -160,12 +165,20 @@ class ResourceSampler:
         # from the PREVIOUS sample, so this sample cannot measure its own
         # full cost.
         self.last_cpu_ms = 0.0
+        # The classifier averages raw samples once; display metrics use the
+        # Windows minute CPU mean instead of averaging its prefix means again.
+        self.sample_load_per_core: float | None = None
         self._machine_cpu_baseline: tuple[float, float] | None = None
         self._daemon_rss_baseline: int | None = None
         self._proc_cache: dict[tuple[int, float], _ProcSample] = {}
         self._fresh_proc_cache: dict[tuple[int, float], _ProcSample] = {}
         self._native_supported: bool | None = None
         self._fallback_tree: tuple[float, dict[int, list[int]]] | None = None
+        self._loadavg_started_at: float | None = None
+        self._cpu_minute: int | None = None
+        self._cpu_minute_sum = 0.0
+        self._cpu_minute_count = 0
+        self._cpu_reading_usable = False
 
     def sample(
         self,
@@ -186,6 +199,7 @@ class ResourceSampler:
         :returns: The snapshot frame.
         """
         sampled_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.sample_load_per_core = None
         try:
             machine = self._machine_metrics()
             roots = self._collect_roots(runner_sessions, zygote_pid)
@@ -331,6 +345,26 @@ class ResourceSampler:
 
     def _machine_metrics(self) -> ResourceMachine:
         cpu_pct = self._machine_cpu_pct()
+        minute = int(time.time() // 60)
+        if self._cpu_minute != minute:
+            self._cpu_minute = minute
+            self._cpu_minute_sum = 0.0
+            self._cpu_minute_count = 0
+        if self._cpu_reading_usable:
+            self._cpu_minute_sum += cpu_pct
+            self._cpu_minute_count += 1
+        cpu_minute_pct = (
+            self._cpu_minute_sum / self._cpu_minute_count if self._cpu_minute_count else None
+        )
+        try:
+            cpu_count = psutil.cpu_count(logical=True)
+        except Exception:  # noqa: BLE001 — independent optional metric
+            cpu_count = None
+        try:
+            swap = psutil.swap_memory()
+            swap_used, swap_total = int(swap.used), int(swap.total)
+        except Exception:  # noqa: BLE001
+            swap_used = swap_total = None
         try:
             memory = psutil.virtual_memory()
             mem_total = int(memory.total)
@@ -354,6 +388,24 @@ class ResourceSampler:
             except OSError:
                 _logger.debug("resource sampler could not read load", exc_info=True)
                 load1 = None
+        else:
+            try:
+                load1 = float(psutil.getloadavg()[0])
+                now = time.monotonic()
+                if self._loadavg_started_at is None:
+                    self._loadavg_started_at = now
+                if now - self._loadavg_started_at < _LOADAVG_WARMUP_S:
+                    load1 = None
+            except Exception:  # noqa: BLE001 — one metric must not fail the sample
+                _logger.debug("resource sampler could not read emulated load", exc_info=True)
+                load1 = None
+        equivalent = load_equiv(load1, cpu_minute_pct, cpu_count, windows=not IS_POSIX)
+        sample_equivalent = load_equiv(
+            load1, cpu_pct if self._cpu_reading_usable else None, cpu_count, windows=not IS_POSIX
+        )
+        self.sample_load_per_core = (
+            sample_equivalent / cpu_count if sample_equivalent is not None and cpu_count else None
+        )
         return ResourceMachine(
             cpu_pct=cpu_pct,
             mem_used=mem_used,
@@ -361,9 +413,16 @@ class ResourceSampler:
             disk_used=disk_used,
             disk_total=disk_total,
             load1=load1,
+            cpu_count=cpu_count,
+            load_per_core=equivalent / cpu_count if equivalent is not None and cpu_count else None,
+            swap_used=swap_used,
+            swap_total=swap_total,
+            load_equiv=equivalent,
+            estimate=not IS_POSIX,
         )
 
     def _machine_cpu_pct(self) -> float:
+        self._cpu_reading_usable = False
         try:
             busy, total = _cpu_busy_total(psutil.cpu_times())
         except Exception:  # noqa: BLE001
@@ -377,6 +436,7 @@ class ResourceSampler:
         total_delta = total - previous[1]
         if total_delta <= 0:
             return 0.0
+        self._cpu_reading_usable = True
         return max(0.0, min(100.0, busy_delta / total_delta * 100.0))
 
     def _monitor_rss_delta(self) -> int:

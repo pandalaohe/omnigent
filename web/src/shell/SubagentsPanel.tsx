@@ -294,7 +294,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const [stopTarget, setStopTarget] = useState<StopTarget | null>(null);
   const past = usePastChildSessions(rootSessionId, pastExpanded);
   const toggleCollapsedRow = (id: string) => {
-    setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
+    setCollapsedRows((current) => ({ ...current, [id]: !(current[id] ?? true) }));
   };
   const hostsById = useMemo(
     () => new Map((hosts ?? []).map((host) => [host.host_id, host])),
@@ -1041,7 +1041,7 @@ function SubagentRow({
   /** Whether this row may draw the host-colour bar (ACTIVE zone, real rows). */
   showHostBar: boolean;
 }) {
-  const collapsed = collapsedRows[child.id] ?? false;
+  const collapsed = collapsedRows[child.id] ?? true;
   const status = childStatus(child);
   const search = sessionNavigationSearch(useLocation().search);
   const mirror = isHarnessSubagent(child);

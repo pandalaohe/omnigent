@@ -20,9 +20,166 @@ from omnigent.runtime.harnesses.process_manager import (
 )
 from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 from omnigent.terminals import TerminalRegistry
+from tests.harnesses.codex_native.test_codex_native_app_server_rpc import (
+    context_v2_native as context_v2_native,
+)
 from tests.inner.test_native_context_inventory import NATIVE_CONTEXT_CASES
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
+
+
+async def test_context_work_read_is_authenticated_partial_and_read_only(monkeypatch):
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    async with _runner_client(app) as client:
+        url = "/v2/startup/context-work-inventory?read_id=read-one&session_id=conversation"
+        assert (await client.get(url)).status_code == 401
+        response = await client.get(url, headers={"Authorization": "Bearer test-auth"})
+        assert response.status_code == 200
+        from omnigent.startup_protocol import (
+            decode_context_work_evidence_v2,
+            harness_context_authority_v2,
+            session_context_scopes_v2,
+        )
+
+        evidence = decode_context_work_evidence_v2(
+            response.content,
+            read_id="read-one",
+            authority=harness_context_authority_v2("conversation"),
+            expected_scopes=session_context_scopes_v2("conversation"),
+        )
+        assert evidence.inventory.observations == ()
+        assert evidence.inventory.local_members == frozenset()
+        assert not evidence.inventory.server_complete and not evidence.inventory.local_complete
+        assert not evidence.inventory.execution_fence and evidence.inventory.supervisor is None
+        assert not evidence.assessment.allowed
+        assert evidence.assessment.reason == "inventory_incomplete"
+        assert all(s.coverage != "complete" for s in evidence.context.sources)
+        for query in (
+            "read_id=one&read_id=two&session_id=conversation",
+            "read_id=one&session_id=conversation&session_id=other",
+        ):
+            rejected = await client.get(
+                "/v2/startup/context-work-inventory?" + query,
+                headers={"Authorization": "Bearer test-auth"},
+            )
+            assert rejected.status_code == 422
+
+
+async def test_context_work_read_consumes_production_owner_and_rejects_forgery(
+    context_v2_native, monkeypatch
+):
+    import json
+
+    from omnigent.startup_protocol import (
+        decode_context_work_evidence_v2,
+        harness_context_authority_v2,
+        session_context_scopes_v2,
+    )
+
+    backend, native_client, websocket = context_v2_native
+    methods = []
+
+    async def respond(raw):
+        message = json.loads(raw)
+        methods.append(message["method"])
+        result = (
+            {"thread": {"id": "primary"}}
+            if message["method"] == "thread/start"
+            else {"turn": {"id": "turn-one"}}
+        )
+        native_client._pending_requests[message["id"]].set_result({"result": result})
+
+    websocket.send.side_effect = respond
+    await native_client.request("thread/start", {})
+    await native_client.request("turn/start", {"threadId": "primary", "input": []})
+    backend.start = Mock(side_effect=AssertionError("read must not start"))
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    args = {
+        "read_id": "read-work",
+        "authority": harness_context_authority_v2("conversation"),
+        "expected_scopes": session_context_scopes_v2("conversation"),
+    }
+    async with _runner_client(app) as client:
+        response = await client.get(
+            "/v2/startup/context-work-inventory",
+            params={"session_id": "conversation", "read_id": "read-work"},
+            headers={"Authorization": "Bearer test-auth"},
+        )
+        assert response.status_code == 200
+        evidence = decode_context_work_evidence_v2(response.content, **args)
+        (row,) = evidence.inventory.observations
+        assert row.runtime_id == backend.resident_incarnation_id and row.live_turn
+        source = next(s for s in evidence.context.sources if s.scope.namespace == "native")
+        assert source.work_bindings[0].runtime_id == row.runtime_id
+        assert source.work_bindings[0].generation == row.generation
+        assert not evidence.assessment.allowed
+        assert evidence.assessment.reason == "other_session_working"
+        assert not row.no_live_work_confirmed and not row.no_owned_descendants
+        assert methods == ["thread/start", "turn/start"]
+        assert "/v2/startup/context-work-inventory" not in app.openapi()["paths"]
+        for section, field, value in (
+            ("inventory", "execution_fence", True),
+            ("inventory", "extra", True),
+            ("assessment", "allowed", True),
+        ):
+            malformed = response.json()
+            malformed[section][field] = value
+            with pytest.raises(ValueError):
+                decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        malformed = response.json()
+        malformed["inventory"]["observations"][0]["no_live_work_confirmed"] = True
+        with pytest.raises(ValueError):
+            decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        for authority, revision in (
+            ("authoritative_work", "work_revision"),
+            ("authoritative_membership", "membership_revision"),
+            ("observation_only", "context_revision"),
+        ):
+            malformed = response.json()
+            malformed["context"]["sources"][0]["revision_authority"] = authority
+            malformed["context"]["sources"][0][revision] = 1
+            with pytest.raises(ValueError):
+                decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        malformed = response.json()
+        malformed["inventory"]["observations"] *= 1001
+        with pytest.raises(ValueError, match="count budget"):
+            decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
+        with pytest.raises(ValueError, match="duplicate"):
+            decode_context_work_evidence_v2(
+                response.content.replace(b'"allowed":false', b'"allowed":false,"allowed":false'),
+                **args,
+            )
+
+
+@pytest.mark.parametrize("limit, expected", [("bytes", 413), ("deadline", 503)])
+async def test_context_work_read_enforces_response_limits(monkeypatch, limit, expected):
+    from omnigent.runner import resource_routes
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_MAX_BYTES, ContextWorkEvidenceV2
+
+    if limit == "bytes":
+        monkeypatch.setattr(
+            ContextWorkEvidenceV2,
+            "model_dump_json",
+            lambda self: " " * (CONTEXT_INVENTORY_MAX_BYTES + 1),
+        )
+    else:
+        ticks = iter((0.0, 6.0))
+        monkeypatch.setattr(
+            resource_routes, "time", SimpleNamespace(monotonic=lambda: next(ticks))
+        )
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    async with _runner_client(app) as client:
+        response = await client.get(
+            "/v2/startup/context-work-inventory?session_id=missing&read_id=read-limit",
+            headers={"Authorization": "Bearer test-auth"},
+        )
+        assert response.status_code == expected
 
 
 @pytest.mark.asyncio

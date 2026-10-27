@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
 import click
 import httpx
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
@@ -70,6 +71,7 @@ from omnigent.errors import (
 )
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.host.recovery import RuntimeObservation
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
@@ -459,6 +461,13 @@ _MAX_RETIRED_NATIVE_OWNERS = 1000
 
 
 def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
+    return native_context_work_snapshot_v2(session_id)[0]
+
+
+def native_context_work_snapshot_v2(
+    session_id: str,
+) -> tuple[SourceEvidenceV2 | None, tuple[RuntimeObservation, ...]]:
+    """Sample backend work members, not startup reservations or capacity units."""
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.startup_protocol import UnresolvedContextV2, native_context_scope_v2
@@ -480,13 +489,25 @@ def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
         for row in _CLOSING_NATIVE_BACKENDS.values()
         if row.session_id == session_id and row.harness in {"opencode-native", "codex-native"}
     )
-    sources = [
-        backend.context_source_v2(session_id)
-        for backend in {id(b): b for b in backends}.values()
-        if isinstance(backend, (OpenCodeNativeServer, CodexNativeAppServer))
-    ]
+    sources = []
+    observations = []
+    for backend in {id(b): b for b in backends}.values():
+        if isinstance(backend, CodexNativeAppServer):
+            source, row = backend.context_work_snapshot_v2(session_id)
+            if _AUTO_CODEX_APP_SERVERS.get(session_id) is not backend:
+                source = source.model_copy(
+                    update={"work_bindings": None, "age_upper_bound_s": None}
+                )
+                row = None
+            if row is not None:
+                observations.append(row)
+            sources.append(source)
+        elif isinstance(backend, OpenCodeNativeServer):
+            sources.append(backend.context_source_v2(session_id))
     sources.extend(
-        source for source in _RETIRED_NATIVE_CONTEXTS if source.scope.owner_id == session_id
+        source.model_copy(update={"work_bindings": None, "age_upper_bound_s": None})
+        for source in _RETIRED_NATIVE_CONTEXTS
+        if source.scope.owner_id == session_id
     )
     gaps = [
         UnresolvedContextV2(
@@ -500,7 +521,7 @@ def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
             UnresolvedContextV2(candidate=None, reason="native_owner_exit_coverage_incomplete")
         )
     if not sources and not gaps:
-        return None
+        return None, ()
     current = (
         sources[0]
         if sources
@@ -524,11 +545,13 @@ def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
             return current.model_copy(
                 update={
                     "contexts": (),
+                    "work_bindings": None,
+                    "age_upper_bound_s": None,
                     "unresolved": (
                         UnresolvedContextV2(candidate=None, reason="context_history_budget"),
                     ),
                 }
-            )
+            ), ()
         unresolved.extend(source.unresolved)
         unresolved.extend(
             UnresolvedContextV2(
@@ -540,12 +563,14 @@ def native_context_source_v2(session_id: str) -> SourceEvidenceV2 | None:
         return current.model_copy(
             update={
                 "contexts": (),
+                "work_bindings": None,
+                "age_upper_bound_s": None,
                 "unresolved": (
                     UnresolvedContextV2(candidate=None, reason="context_history_budget"),
                 ),
             }
-        )
-    return current.model_copy(update={"unresolved": tuple(unresolved)})
+        ), ()
+    return current.model_copy(update={"unresolved": tuple(unresolved)}), tuple(observations)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -10593,7 +10618,8 @@ async def _claude_native_bridge_id_for_session(
         ``None`` selects the legacy labels callback.
     :returns: Opaque bridge id from
         ``omnigent.harnesses.claude_native.main.bridge_id`` when present, otherwise
-        *session_id* for legacy single-session bridges.
+        *session_id* after a successful label read for legacy single-session bridges.
+    :raises HTTPException: Labels are unavailable, so no bridge identity is known.
     """
     from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 
@@ -10603,6 +10629,7 @@ async def _claude_native_bridge_id_for_session(
         else await _session_labels_for_runner_spawn(
             server_client=server_client,
             session_id=session_id,
+            required=True,
         )
     )
     bridge_id = labels.get(BRIDGE_ID_LABEL_KEY)
@@ -10645,6 +10672,7 @@ async def _resolve_native_spawn_env(
     *,
     server_client: httpx.AsyncClient,
     optional_labels: Mapping[str, str] | None,
+    existing_bridge_dir: Path | None = None,
 ) -> dict[str, str] | None:
     """Build the spawn env for a native harness through the provider seam.
 
@@ -10663,6 +10691,8 @@ async def _resolve_native_spawn_env(
     :param server_client: Runner's client to the Omnigent server, for label reads.
     :param optional_labels: Envelope labels already in hand, preferred over a
         fresh fetch for every label-backed native provider, or ``None``.
+    :param existing_bridge_dir: Known live Claude relay directory to retain
+        when the labels endpoint is unavailable.
     :returns: The spawn env mapping, or ``None`` when *harness_name* is not a
         native harness with a registered spawn-env builder (caller keeps its
         existing ``spawn_env``).
@@ -10678,11 +10708,20 @@ async def _resolve_native_spawn_env(
         return None
 
     if agent.key == "claude":
-        bridge_id = await _claude_native_bridge_id_with_optional_labels(
-            server_client=server_client,
-            session_id=session_id,
-            session_labels=optional_labels,
-        )
+        try:
+            bridge_id = await _claude_native_bridge_id_with_optional_labels(
+                server_client=server_client,
+                session_id=session_id,
+                session_labels=optional_labels,
+            )
+        except HTTPException:
+            if existing_bridge_dir is None:
+                raise
+            from omnigent.harnesses.claude_native.bridge import BRIDGE_DIR_ENV_VAR
+
+            env = _typed_spawn_env(builder(session_id))
+            env[BRIDGE_DIR_ENV_VAR] = str(existing_bridge_dir)
+            return env
         return _typed_spawn_env(builder(session_id, bridge_id=bridge_id))
 
     if agent.key == "hermes":
@@ -10702,6 +10741,7 @@ async def _resolve_native_spawn_env(
             else await _session_labels_for_runner_spawn(
                 server_client=server_client,
                 session_id=session_id,
+                required=agent.key != "codex",
             )
         )
         env = _typed_spawn_env(
@@ -11413,6 +11453,7 @@ async def _antigravity_native_terminal_arrives_via_transfer(
     labels = await _session_labels_for_runner_spawn(
         server_client=server_client,
         session_id=session_id,
+        required=True,
     )
     bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
     state = read_bridge_state(bridge_dir_for_bridge_id(bridge_id))
@@ -11474,6 +11515,7 @@ async def _codex_native_terminal_arrives_via_transfer(
         labels = await _session_labels_for_runner_spawn(
             server_client=server_client,
             session_id=session_id,
+            required=True,
         )
     else:
         return False
@@ -11486,12 +11528,14 @@ async def _codex_native_terminal_arrives_via_transfer(
 
 
 _SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS = 1.0
+_REQUIRED_SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS = 10.0
 
 
 async def _session_labels_for_runner_spawn(
     *,
     server_client: httpx.AsyncClient,
     session_id: str,
+    required: bool = False,
 ) -> dict[str, str]:
     """
     Fetch session labels for harness spawn-env construction.
@@ -11500,15 +11544,30 @@ async def _session_labels_for_runner_spawn(
         labels endpoint.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``.
-    :returns: String label mapping. Empty on lookup failure.
+    :param required: Raise when labels cannot be trusted, rather than
+        treating an unavailable bridge identity as a legacy session-id bridge.
+        Required reads allow ten seconds; advisory metadata is capped at one.
+    :returns: String label mapping. Optional lookups return empty on failure.
     """
     from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def unavailable() -> dict[str, str]:
+        if required:
+            raise HTTPException(
+                status_code=503,
+                detail="Session labels are unavailable; retry once the server responds.",
+            )
+        return {}
 
     path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
     try:
         resp = await server_client.get(
             path,
-            timeout=_SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS,
+            timeout=(
+                _REQUIRED_SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS
+                if required
+                else _SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS
+            ),
         )
     except httpx.TimeoutException as exc:
         _logger.debug(
@@ -11517,17 +11576,17 @@ async def _session_labels_for_runner_spawn(
             type(exc).__name__,
             extra={"session_id": session_id},
         )
-        return {}
+        return unavailable()
     except (httpx.HTTPError, DatabricksAuthError) as exc:
         # DatabricksAuthError: the host credential service couldn't sign the
-        # request. Like any other lookup failure, that must not fail the turn.
+        # request. Optional metadata can still use its caller's fallback.
         _logger.warning(
             "Failed to resolve session labels; session=%s error=%s",
             session_id,
             type(exc).__name__,
             extra={"session_id": session_id},
         )
-        return {}
+        return unavailable()
     if resp.status_code != 200:
         _logger.warning(
             "Failed to resolve session labels; session=%s status=%s",
@@ -11535,24 +11594,24 @@ async def _session_labels_for_runner_spawn(
             resp.status_code,
             extra={"session_id": session_id},
         )
-        return {}
+        return unavailable()
     try:
-        labels = resp.json().get("labels")
+        payload = resp.json()
     except ValueError:
         # A 200 with a non-JSON body (e.g. an empty response from the
         # Databricks Apps proxy when the server event loop is starved,
         # or an HTML login page on an auth edge) must not abort the
-        # turn. Labels are a best-effort spawn hint; recover by using
-        # the session id, exactly as the timeout / non-200 paths do.
+        # turn when the caller has a safe metadata fallback.
         _logger.warning(
             "Session labels response was not valid JSON; session=%s status=%s",
             session_id,
             resp.status_code,
             extra={"session_id": session_id},
         )
-        return {}
+        return unavailable()
+    labels = payload.get("labels") if isinstance(payload, dict) else None
     if not isinstance(labels, dict):
-        return {}
+        return unavailable()
     return {str(key): str(value) for key, value in labels.items()}
 
 

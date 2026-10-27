@@ -9,6 +9,7 @@
 // catch — please add an SSE-parser test when you touch this.
 
 import { readSubagentActivity } from "./subagentActivity";
+import { codexPermissionObservationFromEvent } from "./codexApprovalMode";
 import { sessionStartupFromWire } from "./sessionStartup";
 import type {
   ArtifactOpenRequestEvent,
@@ -747,11 +748,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
     const approvalMode = data.approval_mode;
-    if (typeof approvalMode !== "string" || !approvalMode) return null;
+    if (typeof approvalMode !== "string") return null;
     return {
       type: "session_codex_approval_mode",
       conversationId,
       approvalMode,
+      permissionObservation: codexPermissionObservationFromEvent(
+        data.permission_observation,
+        data.permission_observation_c1,
+        approvalMode,
+        // Own-key presence survives to the selector: `undefined` is a value, not absence.
+        Object.hasOwn(data, "permission_observation_c1"),
+      ),
     } satisfies SessionCodexApprovalModeEvent;
   }
   if (eventType === "session.speed_tier") {

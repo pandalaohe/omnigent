@@ -1,7 +1,8 @@
 // The admin "System status" settings section: loads the server thresholds,
-// saves an edit via PUT, surfaces a server validation error inline, and (in
-// the health-check sub-form) resolves the ops default agent, lists resolve
-// problems and stores a reset prompt in the shipped-default form.
+// saves an edit via PUT, surfaces a server validation error inline, edits the
+// workspace's default load lines and queue switch, and (in the health-check
+// sub-form) resolves the ops default agent, lists resolve problems and stores
+// a reset prompt in the shipped-default form.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -36,6 +37,11 @@ const SETTINGS = {
   disk_pct: 90,
   server_5xx_pct: 5,
   health_check: { project_id: null, host_id: null, prompt: null },
+  load_lines: {
+    default: { heavy: 4, new_session: 5 },
+    hosts: { host_1: { heavy: 3, new_session: 6 } },
+    queue_enabled: true,
+  },
   default_health_check_prompt: "Default prompt.",
 };
 
@@ -165,6 +171,87 @@ describe("SystemStatusSettingsSection thresholds", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "system-status setting 'cpu_pct' must be in (0, 100]",
     );
+  });
+});
+
+describe("LoadLinesSettingsForm", () => {
+  it("loads the workspace default lines and the queue switch", async () => {
+    renderSection();
+
+    const form = await screen.findByTestId("load-lines-form");
+    expect(within(form).getByLabelText("Heavy-work line (per core)")).toHaveValue(4);
+    expect(within(form).getByLabelText("New-session line (per core)")).toHaveValue(5);
+    expect(within(form).getByRole("switch", { name: "Queue new child sessions" })).toBeChecked();
+    expect(within(form).getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
+  it("saves the default pair and the queue switch without touching host overrides", async () => {
+    renderSection();
+
+    const form = await screen.findByTestId("load-lines-form");
+    fireEvent.change(within(form).getByLabelText("Heavy-work line (per core)"), {
+      target: { value: "3" },
+    });
+    fireEvent.change(within(form).getByLabelText("New-session line (per core)"), {
+      target: { value: "4.5" },
+    });
+    fireEvent.click(within(form).getByRole("switch", { name: "Queue new child sessions" }));
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(settingsPutCall()).toBeDefined());
+    const putInit = settingsPutCall()?.[1] as RequestInit;
+    expect(JSON.parse(String(putInit.body))).toEqual({
+      load_lines: { default: { heavy: 3, new_session: 4.5 }, queue_enabled: false },
+    });
+  });
+
+  it.each([
+    ["5", "5", "The heavy-work line must be below the new-session line."],
+    ["6", "5", "The heavy-work line must be below the new-session line."],
+    ["0", "5", "The heavy-work line must be above 0."],
+    ["", "5", "Enter both lines as numbers."],
+  ])("refuses heavy %s / new-session %s before sending", async (heavy, newSession, message) => {
+    renderSection();
+
+    const form = await screen.findByTestId("load-lines-form");
+    fireEvent.change(within(form).getByLabelText("Heavy-work line (per core)"), {
+      target: { value: heavy },
+    });
+    fireEvent.change(within(form).getByLabelText("New-session line (per core)"), {
+      target: { value: newSession },
+    });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+
+    expect(await within(form).findByRole("alert")).toHaveTextContent(message);
+    expect(settingsPutCall()).toBeUndefined();
+  });
+
+  it("leaves the form out when the server predates load lines", async () => {
+    const { load_lines: _omitted, ...olderServer } = SETTINGS;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input) === "/v1/system/settings"
+        ? mockResponse(olderServer)
+        : defaultFetch(input, init),
+    );
+    renderSection();
+
+    expect(await screen.findByLabelText(/CPU threshold/)).toHaveValue(85);
+    expect(screen.queryByTestId("load-lines-form")).toBeNull();
+  });
+
+  it("lets the field's own limit refuse a new-session line above 64", async () => {
+    renderSection();
+
+    const form = await screen.findByTestId("load-lines-form");
+    const newSession = within(form).getByLabelText("New-session line (per core)");
+    expect(newSession).toHaveAttribute("max", "64");
+    fireEvent.change(newSession, { target: { value: "65" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(settingsPutCall()).toBeUndefined();
   });
 });
 

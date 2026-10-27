@@ -167,9 +167,32 @@ class ChildIdleSettings:
     enabled: bool = False
     idle_threshold_s: int = 3600
     merge_window_s: int = 1800
-    repeat_s: int = 14400
+    repeat_s: int = 0
     agents: dict[str, ChildFreezeSettings] = field(default_factory=dict)
     freeze_default: ChildFreezeSettings = field(default_factory=ChildFreezeSettings)
+    min_gap_s: int = 3600
+    coverage: Literal["changed", "summary"] = "summary"
+    checkin_instructions: str | None = None
+    checkin_configured_fields: frozenset[str] = field(default_factory=frozenset, compare=False)
+
+
+def normalize_checkin_instructions(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions must be a string or null"
+        )
+    value = value.replace("\x00", "")
+    if len(value) > 4000:
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions must be at most 4000 characters"
+        )
+    if value and not value.strip():
+        raise UserPreferencesValidationError(
+            "child_idle.checkinInstructions cannot contain only whitespace"
+        )
+    return value
 
 
 def _parse_child_freeze_row(value: Any, path: str) -> ChildFreezeSettings:
@@ -200,7 +223,8 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
     for key, default, minimum, maximum in (
         ("idleThresholdSeconds", 3600, 60, 604800),
         ("mergeWindowSeconds", 1800, 0, 86400),
-        ("repeatSeconds", 14400, 0, 604800),
+        ("repeatSeconds", 0, 0, 604800),
+        ("minGapSeconds", 3600, 0, 86400),
     ):
         number = value.get(key, default)
         if type(number) is not int or not minimum <= number <= maximum:
@@ -212,6 +236,9 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
                 "child_idle.repeatSeconds must be 0 or at least 60"
             )
         numbers.append(number)
+    coverage = value.get("coverage", "summary")
+    if coverage not in ("changed", "summary"):
+        raise UserPreferencesValidationError("child_idle.coverage must be changed or summary")
     raw_agents = value.get("agents", {})
     if not isinstance(raw_agents, dict):
         raise UserPreferencesValidationError("child_idle.agents must be an object")
@@ -223,7 +250,18 @@ def parse_child_idle_settings(value: Any) -> ChildIdleSettings:
     freeze_default = _parse_child_freeze_row(
         value.get("freezeDefault", {}), "child_idle.freezeDefault"
     )
-    return ChildIdleSettings(enabled, numbers[0], numbers[1], numbers[2], agents, freeze_default)
+    return ChildIdleSettings(
+        enabled,
+        numbers[0],
+        numbers[1],
+        numbers[2],
+        agents,
+        freeze_default,
+        numbers[3],
+        coverage,
+        normalize_checkin_instructions(value.get("checkinInstructions")),
+        frozenset(value.keys() & {"minGapSeconds", "coverage"}),
+    )
 
 
 def read_child_idle_settings(
@@ -684,6 +722,9 @@ class KeepWarmSettings:
         migration, or ``None`` when it never ran.
     :param present: Whether the ``keep_warm`` namespace exists in the stored
         envelope; the legacy migration runs only when it does not.
+    :param cells: Host-keyed whitelist, or ``None`` to use legacy rows.
+        An empty dictionary disables warming everywhere.
+    :param migrated_to_cells_at: Unix time when the whitelist was persisted.
     """
 
     agents: dict[str, AgentKeepWarm]
@@ -691,6 +732,17 @@ class KeepWarmSettings:
     migrated_from_legacy_at: int | None
     present: bool
     default: AgentKeepWarm = field(default_factory=_default_keep_warm_row)
+    cells: dict[str, dict[str, AgentKeepWarm]] | None = None
+    migrated_to_cells_at: int | None = None
+
+
+@dataclass(frozen=True)
+class KeepWarmIdentity:
+    """One authoritative agent route included in the conversion snapshot."""
+
+    agent_id: str | None
+    harness: str | None
+    template_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -787,6 +839,11 @@ def read_keep_warm_settings(
     if KEEP_WARM_NAMESPACE not in settings:
         return _default_keep_warm_settings()
     value = settings[KEEP_WARM_NAMESPACE]
+    return _parse_keep_warm_settings(value)
+
+
+def _parse_keep_warm_settings(value: Any) -> KeepWarmSettings:
+    """Parse one namespace, including an explicitly empty whitelist."""
     if not isinstance(value, dict):
         return _default_keep_warm_settings(present=True)
     agents: dict[str, AgentKeepWarm] = {}
@@ -813,12 +870,45 @@ def read_keep_warm_settings(
         if isinstance(raw_migrated, int) and not isinstance(raw_migrated, bool)
         else None
     )
+    raw_cells = value.get("cells")
+    cells = None
+    if isinstance(raw_cells, dict):
+        cells = {
+            host_id: {
+                key: _parse_keep_warm_row(row)
+                for key, row in rows.items()
+                if isinstance(row, dict)
+            }
+            for host_id, rows in raw_cells.items()
+            if isinstance(rows, dict)
+        }
+    raw_cells_at = value.get("migratedToCellsAt")
     return KeepWarmSettings(
         agents=agents,
         host_offline_archive_s=host_offline_archive_s,
         migrated_from_legacy_at=migrated_from_legacy_at,
         present=True,
         default=default,
+        cells=cells,
+        migrated_to_cells_at=raw_cells_at if type(raw_cells_at) is int else None,
+    )
+
+
+def keep_warm_row(
+    settings: KeepWarmSettings,
+    *,
+    host_id: str | None = None,
+    template_id: str | None = None,
+    agent_id: str | None = None,
+    harness: str | None = None,
+) -> AgentKeepWarm:
+    """Select the host's whitelist cell, or retain the legacy override order."""
+    from omnigent.server.session_overrides import resolve_override
+
+    rows = settings.agents if settings.cells is None else settings.cells.get(host_id or "", {})
+    default = settings.default if settings.cells is None else _default_keep_warm_row()
+    return resolve_override(
+        rows, default, template_id=template_id, agent_id=agent_id, harness=harness
     )
 
 
@@ -829,12 +919,13 @@ def keep_warm_for_agent(
     *,
     template_id: str | None = None,
     harness: str | None = None,
+    host_id: str | None = None,
 ) -> ResolvedAgentKeepWarm:
     """
-    Resolve one session's keep-warm row, falling through to the owner default.
+    Resolve one session's selected whitelist cell or legacy owner row.
 
-    An absent exception takes the default (off unless enabled). A stored
-    interval of ``None`` takes the family default; the interval clamps to the
+    A missing whitelist cell is off. A stored interval of ``None``
+    takes the family default; the interval clamps to the
     family bounds and the cap to the shared keep-warm bounds.
 
     :param settings: The owner's resolved keep-warm settings.
@@ -842,11 +933,9 @@ def keep_warm_for_agent(
     :param family: Model family, selecting the default and interval bounds.
     :returns: The resolved row; its main/child switch may be off.
     """
-    from omnigent.server.session_overrides import resolve_override
-
-    row = resolve_override(
-        settings.agents,
-        settings.default,
+    row = keep_warm_row(
+        settings,
+        host_id=host_id,
         template_id=template_id,
         agent_id=agent_id,
         harness=harness,
@@ -926,27 +1015,10 @@ def migrate_legacy_keep_warm(
         collab = _parse_collab_settings(settings.get(SESSION_COLLAB_NAMESPACE))
         if not (collab.enabled and collab.keep_warm_enabled):
             return False
-        agents: dict[str, Any] = {}
-        for agent_id, family in native_agents:
-            interval = (
-                collab.keep_warm_claude_interval_s
-                if family == "claude"
-                else collab.keep_warm_codex_interval_s
-            )
-            agents[agent_id] = {
-                "main": False,
-                "child": True,
-                "intervalSeconds": interval,
-                "maxSeconds": KEEP_WARM_DEFAULT_MAX_S,
-            }
         store.patch_namespace(
             owner,
             KEEP_WARM_NAMESPACE,
-            {
-                "agents": agents,
-                "hostOfflineArchiveSeconds": KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_S,
-                "migratedFromLegacyAt": now,
-            },
+            _legacy_keep_warm_namespace(collab, native_agents, now),
         )
     except (
         SQLAlchemyError,
@@ -956,6 +1028,154 @@ def migrate_legacy_keep_warm(
         logger.warning("Failed to migrate legacy keep-warm settings for %s", owner, exc_info=True)
         return False
     return True
+
+
+def _legacy_keep_warm_namespace(
+    collab: CollabSettings, native_agents: Iterable[tuple[str, str]], now: int
+) -> dict[str, Any]:
+    return {
+        "agents": {
+            agent_id: {
+                "main": False,
+                "child": True,
+                "intervalSeconds": (
+                    collab.keep_warm_claude_interval_s
+                    if family == "claude"
+                    else collab.keep_warm_codex_interval_s
+                ),
+                "maxSeconds": KEEP_WARM_DEFAULT_MAX_S,
+            }
+            for agent_id, family in native_agents
+        },
+        "hostOfflineArchiveSeconds": KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_S,
+        "migratedFromLegacyAt": now,
+    }
+
+
+def _effective_keep_warm(row: AgentKeepWarm, family: str | None) -> tuple[Any, ...]:
+    """Compare meaningful switches and clamped runtime durations."""
+    resolved = keep_warm_for_agent(
+        KeepWarmSettings({}, 0, None, True, default=row),
+        None,
+        "claude" if family == "claude" else "codex",
+    )
+    return (
+        row.main if family else False,
+        row.child if family else False,
+        resolved.interval_s if family in ("claude", "codex") else None,
+        min(resolved.max_s, 1800) if family == "pi" else resolved.max_s,
+        row.cold_after_s,
+    )
+
+
+def _encode_keep_warm_cell(row: AgentKeepWarm, family: str | None) -> dict[str, Any]:
+    """Omit built-ins; the caller retains off masks needed by a fallback."""
+    value: dict[str, Any] = {}
+    if family:
+        if row.main:
+            value["main"] = True
+        if row.child:
+            value["child"] = True
+        default_interval = (
+            KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S
+            if family == "claude"
+            else KEEP_WARM_CODEX_DEFAULT_INTERVAL_S
+        )
+        if family != "pi" and row.interval_s is not None and row.interval_s != default_interval:
+            value["intervalSeconds"] = row.interval_s
+    if family != "pi" and row.max_s != KEEP_WARM_DEFAULT_MAX_S:
+        value["maxSeconds"] = row.max_s
+    if row.cold_after_s is not None:
+        value["coldAfterSeconds"] = row.cold_after_s
+    return value
+
+
+def _convert_keep_warm_cells(
+    settings: KeepWarmSettings, identities: Iterable[KeepWarmIdentity], hosts: Iterable[str]
+) -> dict[str, dict[str, dict[str, Any]]]:
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_plugins import harness_capabilities, product_agent_harnesses
+
+    families = {
+        harness: caps.keep_warm_family
+        for harness, caps in harness_capabilities().items()
+        if caps.keep_warm_family in ("claude", "codex", "pi")
+    }
+    identities = sorted(
+        set(identities),
+        key=lambda item: (
+            bool(item.template_id),
+            item.template_id or "",
+            item.agent_id or "",
+            item.harness or "",
+        ),
+    )
+    cells: dict[str, dict[str, dict[str, Any]]] = {}
+    products = {
+        harness: builtin_agent_id(name) for name, harness in product_agent_harnesses().items()
+    }
+    host_ids = sorted(set(hosts) | {""})
+    for host in host_ids:
+        rows: dict[str, AgentKeepWarm] = {}
+        encoded: dict[str, dict[str, Any]] = {}
+        for harness, family in sorted(families.items()):
+            row = keep_warm_row(settings, harness=harness)
+            # Fold a direct product row only when no explicit harness row exists.
+            if f"harness:{harness}" not in settings.agents:
+                row = settings.agents.get(products.get(harness, ""), row)
+            if _effective_keep_warm(row, family) != _effective_keep_warm(
+                _default_keep_warm_row(), family
+            ):
+                key = f"harness:{harness}"
+                rows[key] = row
+                encoded[key] = _encode_keep_warm_cell(row, family)
+        cell_settings = KeepWarmSettings({}, 0, None, True, cells={host: rows})
+        for identity in identities:
+            family = families.get(identity.harness or "")
+            today = keep_warm_row(
+                settings,
+                template_id=identity.template_id,
+                agent_id=identity.agent_id,
+                harness=identity.harness,
+            )
+            after = keep_warm_row(
+                cell_settings,
+                host_id=host,
+                template_id=identity.template_id,
+                agent_id=identity.agent_id,
+                harness=identity.harness,
+            )
+            if _effective_keep_warm(today, family) == _effective_keep_warm(after, family):
+                continue
+            key = (
+                identity.template_id
+                if identity.template_id in settings.agents
+                else identity.agent_id or identity.template_id
+            )
+            if key is None:
+                continue
+            rows[key] = today
+            encoded[key] = _encode_keep_warm_cell(today, family) or {"main": False, "child": False}
+        converted = _parse_keep_warm_settings({"cells": {host: encoded}})
+        for identity in identities:
+            family = families.get(identity.harness or "")
+            route = {
+                "host_id": host,
+                "template_id": identity.template_id,
+                "agent_id": identity.agent_id,
+                "harness": identity.harness,
+            }
+            if _effective_keep_warm(keep_warm_row(settings, **route), family) != (
+                _effective_keep_warm(keep_warm_row(converted, **route), family)
+            ):
+                key = identity.template_id or identity.agent_id or identity.harness
+                raise UserPreferencesValidationError(
+                    f"Keep-warm conversion cannot preserve conflicting routes for {key!r}: "
+                    f"{len(host_ids)} hosts, {len(identities)} identities"
+                )
+        if encoded:
+            cells[host] = encoded
+    return cells
 
 
 WORKTREE_LOCATION_NAMESPACE = "worktree_location"
@@ -1097,6 +1317,11 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         "version": USER_PREFERENCE_VERSION,
         "settings": deepcopy(settings),
     }
+    child_idle = copied["settings"].get(CHILD_IDLE_NAMESPACE)
+    if isinstance(child_idle, dict) and "checkinInstructions" in child_idle:
+        child_idle["checkinInstructions"] = normalize_checkin_instructions(
+            child_idle["checkinInstructions"]
+        )
     try:
         serialized = json.dumps(
             copied,
@@ -1358,7 +1583,19 @@ class SqlAlchemyUserPreferencesStore:
             )
             settings, _initialized = _read_settings(session, user_id)
             if value is None:
-                settings.pop(namespace, None)
+                existing = settings.get(namespace)
+                if (
+                    namespace == KEEP_WARM_NAMESPACE
+                    and isinstance(existing, dict)
+                    and isinstance(existing.get("cells"), dict)
+                ):
+                    settings[namespace] = {
+                        key: item
+                        for key, item in existing.items()
+                        if key not in ("default", "agents")
+                    }
+                else:
+                    settings.pop(namespace, None)
             else:
                 existing = settings.get(namespace)
                 if (
@@ -1397,6 +1634,97 @@ class SqlAlchemyUserPreferencesStore:
         return run_write_transaction(
             self._write_session, "patch_user_preferences_namespace", write
         )
+
+    def convert_keep_warm(
+        self,
+        user_id: str,
+        identities: Iterable[KeepWarmIdentity],
+        hosts: Iterable[str],
+        *,
+        dry_run: bool,
+        create_if_missing: bool = True,
+        legacy_native_agents: Iterable[tuple[str, str]] = (),
+    ) -> dict[str, Any]:
+        """Convert one snapshot under the preference lock without losing legacy values."""
+        if type(dry_run) is not bool:
+            raise UserPreferencesValidationError("dry_run must be a boolean")
+        identities = tuple(identities)
+        hosts = tuple(hosts)
+        legacy_native_agents = tuple(legacy_native_agents)
+
+        def write(session: Session) -> dict[str, Any]:
+            _require_user_row(session, user_id, create_if_missing)
+            if not dry_run:
+                self._upsert_row(
+                    session,
+                    user_id=user_id,
+                    key=_ENVELOPE_VERSION_KEY,
+                    value=_encode_value(USER_PREFERENCE_VERSION),
+                )
+            namespaces, _ = _read_settings(session, user_id)
+            _assemble_envelope(namespaces)
+            namespace = namespaces.get(KEEP_WARM_NAMESPACE)
+            if not isinstance(namespace, dict):
+                namespace = {}
+            if KEEP_WARM_NAMESPACE not in namespaces:
+                collab = _parse_collab_settings(namespaces.get(SESSION_COLLAB_NAMESPACE))
+                if collab.enabled and collab.keep_warm_enabled:
+                    namespace = _legacy_keep_warm_namespace(
+                        collab, legacy_native_agents, int(time.time())
+                    )
+            settings = _parse_keep_warm_settings(namespace)
+            already = settings.cells is not None
+            if already:
+                cells = namespace["cells"]
+            else:
+                cells = _convert_keep_warm_cells(settings, identities, hosts)
+                namespace = {**namespace, "cells": cells, "migratedToCellsAt": int(time.time())}
+            namespaces[KEEP_WARM_NAMESPACE] = namespace
+            column_keys = {
+                key for rows in cells.values() if isinstance(rows, dict) for key in rows
+            }
+            if not already:
+                from omnigent.db.utils import builtin_agent_id
+                from omnigent.harness_plugins import product_agent_harnesses
+
+                products = {
+                    builtin_agent_id(name): harness
+                    for name, harness in product_agent_harnesses().items()
+                }
+                column_keys.update(
+                    f"harness:{products[key]}" if key in products else key
+                    for key in settings.agents
+                )
+            columns = sorted(column_keys)
+            cell_count = sum(len(rows) for rows in cells.values() if isinstance(rows, dict))
+            try:
+                _assemble_envelope(namespaces)
+            except UserPreferencesValidationError as exc:
+                raise UserPreferencesValidationError(
+                    f"Keep-warm conversion exceeds the 64 KiB envelope: "
+                    f"{len(set(hosts) | {''})} hosts, {len(columns)} columns, "
+                    f"{cell_count} cells; {exc}"
+                ) from exc
+            if not dry_run and not already:
+                self._upsert_row(
+                    session,
+                    user_id=user_id,
+                    key=_settings_key(KEEP_WARM_NAMESPACE),
+                    value=_encode_value(namespace),
+                )
+            return {
+                "cells": cells,
+                "columns": columns,
+                "already": already,
+                "banner": (
+                    "Converted from your previous settings · saved when you first edit. "
+                    "New hosts start off; new agents start off unless their harness has a column."
+                ),
+                "bytes": len(_encode_value(namespace).encode("utf-8")),
+                "migratedToCellsAt": namespace.get("migratedToCellsAt"),
+            }
+
+        return run_write_transaction(self._write_session, "convert_keep_warm", write)
 
     def migrate_worktree_archive(
         self, user_id: str, delete_safe: bool, *, create_if_missing: bool = True

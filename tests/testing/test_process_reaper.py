@@ -8,6 +8,7 @@ no server, no daemon.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -20,6 +21,7 @@ import psutil
 import pytest
 from execnet.gateway_io import popen_bootstrapline
 
+from omnigent.inner import _proc
 from omnigent.testing.process_reaper import (
     OWNER_MARKER_NAME,
     find_leaked_omnigent_processes,
@@ -27,6 +29,7 @@ from omnigent.testing.process_reaper import (
     sweep_dead_owner_dirs,
     write_owner_marker,
 )
+from tests._helpers.polling import poll_until
 
 # A child that lives until reaped. The argv embeds marker tokens so the
 # matcher can attribute it by command line.
@@ -55,7 +58,13 @@ def _spawn(code: str, *argv_markers: str, env: dict[str, str] | None = None) -> 
     :returns: The child process handle.
     """
     return subprocess.Popen(
-        [sys.executable, "-c", code, *argv_markers],
+        [
+            sys.executable,
+            "-c",
+            "from omnigent.testing.process_reaper import exit_when_parent_dies; "
+            f"exit_when_parent_dies({os.getpid()})\n" + code,
+            *argv_markers,
+        ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -211,6 +220,84 @@ def test_blank_data_dir_matches_nothing() -> None:
     """A degenerate attribution key must not sweep the whole machine."""
     assert find_leaked_omnigent_processes("") == []
     assert find_leaked_omnigent_processes("/") == []
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("helper", ["sleeper", "mock-server"])
+def test_helper_exits_when_pytest_is_killed(tmp_path: Path, helper: str) -> None:
+    """Exercise the real helper entry points when no fixture finalizer can run."""
+    ready = tmp_path / "ready"
+    if helper == "sleeper":
+        setup = (
+            "from tests.testing.test_process_reaper import _spawn, _SLEEP_CHILD\n"
+            "child = _spawn(_SLEEP_CHILD, 'omnigent-leak')\n"
+        )
+    else:
+        setup = (
+            "from tests.e2e.conftest import _mock_llm_server_process\n"
+            "journey = _mock_llm_server_process(Path(sys.argv[1]).parent)\n"
+            "next(journey)\n"
+            "child = psutil.Process().children()[0]\n"
+        )
+    code = (
+        "import os, psutil, sys, time\nfrom pathlib import Path\n"
+        + setup
+        + "Path(sys.argv[1]).write_text(str(child.pid))\ntime.sleep(60)\n"
+    )
+    parent = subprocess.Popen([sys.executable, "-c", code, str(ready)])
+    child = None
+    try:
+        poll_until(lambda: ready.exists(), timeout_s=15, interval_s=0.05)
+        child = psutil.Process(int(ready.read_text()))
+        assert child.is_running()
+        parent.kill()
+        parent.wait(timeout=5)
+        poll_until(lambda: not _proc.process_alive(child.pid), timeout_s=5, interval_s=0.05)
+    finally:
+        _kill_quietly(parent)
+        if child is not None:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                child.kill()
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("detached", [False, True], ids=["fork", "fork-setsid"])
+def test_forked_helper_watches_the_original_owner(tmp_path: Path, detached: bool) -> None:
+    ready = tmp_path / "ready"
+    helper_code = (
+        "import json, os, sys, time\nfrom pathlib import Path\n"
+        "from omnigent.testing.process_reaper import exit_when_parent_dies\n"
+        "exit_when_parent_dies(int(sys.argv[1]))\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        + (" os.setsid()\n" if detached else "")
+        + " Path(sys.argv[2]).write_text(json.dumps([os.getppid(), os.getpid()]))\n"
+        "time.sleep(60)\n"
+    )
+    owner_code = (
+        "import os, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {helper_code!r}, "
+        "str(os.getpid()), sys.argv[1]])\n"
+        "time.sleep(60)\n"
+    )
+    owner = subprocess.Popen([sys.executable, "-c", owner_code, str(ready)])
+    tree: list[psutil.Process] = []
+    try:
+        poll_until(ready.exists, timeout_s=10, interval_s=0.05)
+        tree = [psutil.Process(pid) for pid in json.loads(ready.read_text())]
+        assert all(proc.is_running() for proc in tree)
+        owner.kill()
+        owner.wait(timeout=5)
+        poll_until(
+            lambda: all(not _proc.process_alive(proc.pid) for proc in tree),
+            timeout_s=5,
+            interval_s=0.05,
+        )
+    finally:
+        _kill_quietly(owner)
+        for proc in tree:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                proc.kill()
 
 
 def test_reap_terminates_leaked_process(data_dir: Path) -> None:

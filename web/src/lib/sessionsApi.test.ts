@@ -95,6 +95,21 @@ afterEach(() => {
 });
 
 describe("apiErrorFromResponse", () => {
+  it("preserves superseded session targets", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        {
+          error: {
+            code: "session_superseded",
+            message: "Session replaced",
+            successor_id: "conv_next",
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+    expect(err).toMatchObject({ code: "session_superseded", successorId: "conv_next" });
+  });
   it("reads the AP `error` envelope (message + code)", async () => {
     const err = await apiErrorFromResponse(
       mockJsonResponse(
@@ -205,6 +220,7 @@ describe("createSession", () => {
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
+      startupHold: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
@@ -213,6 +229,24 @@ describe("createSession", () => {
       effectiveHostId: null,
       effectiveCwd: null,
       effectiveGitBranch: null,
+    });
+  });
+
+  it("maps a startup hold while the session waits for its host", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_held",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        startup_hold: { reason: "host_load", host_id: "host_1", since: 1704067200 },
+      }),
+    );
+    const session = await createSession("agent_xyz");
+    expect(session.startupHold).toEqual({
+      reason: "host_load",
+      host_id: "host_1",
+      since: 1704067200,
     });
   });
 
@@ -1788,6 +1822,12 @@ describe("fetchSessionItemsWindow", () => {
 });
 
 describe("postEvent", () => {
+  it("preserves a forwarded message's final successor", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, redirected_to: "conv_next" }));
+    expect(await postEvent("conv_old", { type: "message", data: {} })).toMatchObject({
+      redirectedTo: "conv_next",
+    });
+  });
   it("POSTs the event body verbatim and returns {queued, itemId}", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_123" }));
     const event = {

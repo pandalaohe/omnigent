@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
 
 from omnigent.entities import ConversationItem, MessageData, PagedList
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.orchestration import (
     TERMINAL_STATUS_FALLBACK_OUTPUTS,
+    _append_pending_deferred_approvals,
     _enrich_terminal_status_with_subagent_output,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationStore, DetachedCard
 
 # Fork mod: a failed/stopped/killed terminal edge always carries an output.
 # Where upstream leaves the key absent, this fork substitutes a status-shaped
@@ -38,12 +41,138 @@ def _message(role: str, text: str, response_id: str, *, is_meta: bool = False) -
     )
 
 
-async def _enrich(data: dict, items: list[ConversationItem]) -> dict:
+async def _enrich(
+    data: dict, items: list[ConversationItem], *, cards: tuple[DetachedCard, ...] = ()
+) -> dict:
     store = Mock(spec=ConversationStore)
     store.list_items.return_value = PagedList(data=items)
-    return await _enrich_terminal_status_with_subagent_output(
+    store.list_detached_cards.return_value = list(cards)
+    enriched = await _enrich_terminal_status_with_subagent_output(
         data, data["status"], "conv_test", store
     )
+    return await _append_pending_deferred_approvals(enriched, "conv_test", store)
+
+
+@pytest.fixture
+def approval_card() -> DetachedCard:
+    return DetachedCard(
+        elicitation_id="elicit_first",
+        session_id="conv_test",
+        kind="approval",
+        state="pending",
+        mirror=True,
+        params={},
+        payload={
+            "aid": "a111111",
+            "action": "Bash(pnpm test)",
+            "origin": "claude-permission-prompt",
+        },
+        grant_key=None,
+        verdict=None,
+        delivery_text=None,
+        created_at=100,
+        expires_at=300,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["idle", "completed", "failed", "stopped", "killed"])
+@pytest.mark.parametrize("source", ["forwarder", "store"])
+async def test_terminal_delivery_appends_one_pending_approval_list(
+    status: str, source: str, approval_card: DetachedCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestration, "now_epoch", lambda: 200)
+    data = {"status": status}
+    if source == "forwarder":
+        data["output"] = "Child result"
+    result = await _enrich(
+        data,
+        [_message("assistant", "Child result" if source == "store" else "Old reply", "resp")],
+        cards=(
+            approval_card,
+            replace(
+                approval_card,
+                elicitation_id="elicit_second",
+                payload={
+                    "aid": "a222222",
+                    "action": "Edit(file.py)",
+                    "origin": "omnigent-policy-unavailable",
+                },
+            ),
+        ),
+    )
+    assert result["output"] == (
+        "Child result\n\nPending deferred approvals:\n"
+        "- a111111: Bash(pnpm test) (origin: claude-permission-prompt)\n"
+        "- a222222: Edit(file.py) (origin: omnigent-policy-unavailable)"
+    )
+    if status == "failed":
+        assert result["failure_context"]["detail_source"] == (
+            "external_status_output" if source == "forwarder" else "assistant_output_fallback"
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_filters_cards_and_labels_legacy_origin(
+    approval_card: DetachedCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestration, "now_epoch", lambda: 200)
+    result = await _enrich(
+        {"status": "completed", "output": "Child result"},
+        [],
+        cards=(
+            replace(approval_card, state="answered"),
+            replace(approval_card, state="settled"),
+            replace(approval_card, expires_at=200),
+            replace(approval_card, session_id="conv_other"),
+            replace(approval_card, kind="question"),
+            replace(approval_card, payload={"aid": "alegacy", "action": "Bash(pnpm lint)"}),
+        ),
+    )
+    assert result["output"] == (
+        "Child result\n\nPending deferred approvals:\n- alegacy: Bash(pnpm lint) (origin: unknown)"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["forwarder", "store", "none"])
+async def test_terminal_delivery_without_cards_keeps_output_unchanged(source: str) -> None:
+    data = {"status": "idle"}
+    if source == "forwarder":
+        data["output"] = " Child result "
+    items = [_message("assistant", "Child result", "resp")] if source == "store" else []
+    result = await _enrich(data, items)
+    assert result == ({**data, "output": "Child result"} if source == "store" else data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("database unavailable"), ValueError("bad JSON")])
+async def test_pending_approval_lookup_failure_keeps_terminal_output(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = Mock(spec=ConversationStore)
+    store.list_detached_cards.side_effect = error
+    data = {"status": "failed", "output": "Original failure"}
+    assert await _append_pending_deferred_approvals(data, "conv_test", store) == data
+    assert "Could not read pending approvals" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["output", "failure_detail"])
+async def test_pending_approvals_preserve_wire_failure_precedence(
+    source: str, approval_card: DetachedCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestration, "now_epoch", lambda: 200)
+    result = await _enrich(
+        {"status": "failed", source: "Actual failure"},
+        [_message("assistant", "Old reply", "resp")],
+        cards=(approval_card,),
+    )
+    assert result["output"] == (
+        "Actual failure\n\nPending deferred approvals:\n"
+        "- a111111: Bash(pnpm test) (origin: claude-permission-prompt)"
+    )
+    assert result["failure_context"]["detail_source"] == f"external_status_{source}"
 
 
 @pytest.mark.asyncio

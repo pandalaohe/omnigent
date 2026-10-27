@@ -31,6 +31,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  SessionStartupHold,
   SessionStartupStatus,
 } from "./types";
 
@@ -77,6 +78,7 @@ export interface ElicitResult {
 
 /** Response body of `POST /v1/sessions/{id}/events` (202 Accepted). */
 export interface PostEventResponse {
+  redirectedTo?: string;
   /** True for item-typed events (persisted); false for interrupt / approval. */
   queued: boolean;
   /**
@@ -319,6 +321,8 @@ interface SessionResponseWire {
    */
   sandbox_status?: SandboxStatus | null;
   startup?: unknown;
+  /** Present while the session waits for its host to drop below its new-session line. */
+  startup_hold?: SessionStartupHold | null;
   mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
@@ -448,6 +452,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
     startup: sessionStartupFromWire(wire.startup),
+    startupHold: wire.startup_hold ?? null,
     mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
@@ -472,11 +477,20 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | null;
-  constructor(message: string, status: number, code: string | null) {
+  readonly successorId?: string;
+  readonly redirectedTo?: string;
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    targets: { successorId?: string; redirectedTo?: string } = {},
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.successorId = targets.successorId;
+    this.redirectedTo = targets.redirectedTo;
   }
 }
 
@@ -499,9 +513,13 @@ export class ApiError extends Error {
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
   let code: string | null = null;
+  let successorId: string | undefined;
+  let redirectedTo: string | undefined;
   try {
     const body = (await res.json()) as {
-      error?: { code?: string; message?: string };
+      error?: { code?: string; message?: string; successor_id?: unknown; redirected_to?: unknown };
+      successor_id?: unknown;
+      redirected_to?: unknown;
       detail?: unknown;
       message?: unknown;
       error_code?: unknown;
@@ -527,13 +545,22 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
     )
       code = body.detail.code;
     else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
+    const detail =
+      body.detail && typeof body.detail === "object"
+        ? (body.detail as Record<string, unknown>)
+        : undefined;
+    const successor = body.error?.successor_id ?? detail?.successor_id ?? body.successor_id;
+    const redirected = body.error?.redirected_to ?? detail?.redirected_to ?? body.redirected_to;
+    if (typeof successor === "string" && successor) successorId = successor;
+    if (typeof redirected === "string" && redirected) redirectedTo = redirected;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
-  return new ApiError(message, res.status, code);
+  return new ApiError(message, res.status, code, { successorId, redirectedTo });
 }
 
 function postEventResponseFromWire(wire: {
+  redirected_to?: string;
   queued: boolean;
   item_id?: string;
   denied?: boolean;
@@ -550,6 +577,7 @@ function postEventResponseFromWire(wire: {
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
+    ...(wire.redirected_to ? { redirectedTo: wire.redirected_to } : {}),
   };
 }
 
@@ -1760,6 +1788,7 @@ export async function postEvent(
   if (!res.ok) throw await apiErrorFromResponse(res);
   const result = postEventResponseFromWire(
     (await res.json()) as {
+      redirected_to?: string;
       queued: boolean;
       item_id?: string;
       denied?: boolean;

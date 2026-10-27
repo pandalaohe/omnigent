@@ -56,6 +56,8 @@ from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
     pi_model_json_entry,
+    pi_model_with_reasoning_metadata,
+    pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import (
@@ -159,9 +161,6 @@ class _PiProviderCompat(TypedDict, total=False):
     supportsStrictMode: bool
     supportsReasoningEffort: bool
     supportsUsageInStreaming: bool
-    # Pi 0.84.2+: send thinking.type.adaptive + output_config.effort instead
-    # of thinking.type.enabled + budget_tokens. Required for claude-4+ / claude-5
-    # models which no longer accept thinking.type.enabled.
     forceAdaptiveThinking: bool
 
 
@@ -385,12 +384,10 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
-        # Claude 4+ / Claude 5 models require thinking.type.adaptive (not
-        # thinking.type.enabled). Pi 0.84.2+ sends adaptive when forceAdaptiveThinking
-        # is set in the compat block; reasoning:true on the model entry enables Pi's
-        # thinking level controls.
         if self.api == "anthropic-messages":
+            # Preserve the native default for unlisted models; model-level flags win.
             provider["compat"] = {"forceAdaptiveThinking": True}
+            provider["models"] = [pi_model_with_thinking_defaults(entry) for entry in models]
         providers = {self.provider_id: provider}
         providers.update(additional)
         for payload in providers.values():
@@ -1912,6 +1909,14 @@ def pi_native_provider_launch(
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
     rendered = provider.to_models_config()
+    if provider.listing_provider is not None:
+        reasoning = model_catalog.fetch_openai_reasoning_metadata(provider.listing_provider)
+        for payload in rendered["providers"].values():
+            if payload["baseUrl"] == provider.listing_provider.base_url:
+                payload["models"] = [
+                    pi_model_with_reasoning_metadata(entry, reasoning.get(entry["id"]))
+                    for entry in payload["models"]
+                ]
     # Resolve which provider the selected model lives in. Non-Claude models
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.

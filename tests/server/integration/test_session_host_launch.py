@@ -870,6 +870,11 @@ async def test_inline_create_harness_not_configured_stays_lenient(
     contract regressed.
     """
     comm = await _connect_host(app)
+    store = SqlAlchemyConversationStore(db_uri)
+    for title in ("shared-a", "shared-b"):
+        store.create_conversation(
+            title=title, runner_id="1" * 32, host_id=_HOST_ID, workspace=_WORKSPACE
+        )
     agent = await create_test_agent(
         client,
         executor={"type": "omnigent", "config": {"harness": "codex"}},
@@ -888,6 +893,8 @@ async def test_inline_create_harness_not_configured_stays_lenient(
         json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
     )
     launch_frame = await responder
+
+    assert launch_frame.retain_runner_ids == ["1" * 32]
 
     # The create-time launch carries the agent's canonical harness so the
     # host can run its check; the refusal is just handled leniently.
@@ -3953,6 +3960,57 @@ async def test_relaunch_stops_the_superseded_runner(
         f"the stop must target the SUPERSEDED runner {original_runner_id!r}, "
         f"got {stop_frame.runner_id!r}"
     )
+
+
+@pytest.mark.parametrize("archived", [False, True])
+async def test_relaunch_preserves_a_runner_still_bound_to_a_live_child(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    archived: bool,
+) -> None:
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    stop = AsyncMock()
+    monkeypatch.setattr(helpers, "_stop_session_host_runner", stop)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        parent_conversation_id=session["id"],
+        runner_id=session["runner_id"],
+        title="child",
+    )
+    if archived:
+        store.update_conversation(child.id, archived=True)
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+    )
+    try:
+        frame = await _wait_for_launch(comm, budget_s=budget(5.0))
+        await asyncio.gather(*list(helpers._detached_supersede_stops))
+        if archived:
+            stop.assert_awaited_once()
+        else:
+            stop.assert_not_awaited()
+        assert getattr(frame, "retain_runner_ids", None) == (
+            [] if archived else [session["runner_id"]]
+        )
+    finally:
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
 
 
 async def test_concurrent_relaunches_are_single_flight(

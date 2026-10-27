@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 from itertools import pairwise
 from pathlib import Path
 
@@ -44,6 +45,50 @@ _REAP_TIMEOUT_S = 10.0
 # short bound keeps total teardown near the TERM grace, not double it.
 _KILL_WAIT_S = 5.0
 _EXECNET_BOOTSTRAP = "import sys;exec(eval(sys.stdin.readline()))"
+
+
+class ProcessScanUnavailable(RuntimeError):
+    """The OS denied the process-table enumeration this module needs.
+
+    ``psutil.pids()`` reads the whole table through ``sysctl(KERN_PROC)``;
+    macOS returns EPERM for that read when the calling process sits under a
+    sandbox that denies it (observed shape: ``PermissionError: [Errno 1]``
+    with ``originated from sysctl() malloc 1/3``). The denial says nothing
+    about leaks, so callers must report the leak state as *unverified* — never
+    as "no leaks" — and must not narrow or bypass the identity checks below.
+    """
+
+
+def exit_when_parent_dies(parent_pid: int) -> None:
+    """Bound a standalone test helper to its spawning pytest process.
+
+    Fixture finalizers do not run after SIGKILL or pytest-timeout's hard exit.
+    Keep the parent's creation identity so a reused PID cannot retain a helper.
+    """
+    try:
+        parent = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        os._exit(1)
+
+    def watch() -> None:
+        interval = threading.Event()
+        while True:
+            try:
+                if not parent.is_running() or parent.status() == psutil.STATUS_ZOMBIE:
+                    os._exit(1)
+            except psutil.NoSuchProcess:
+                os._exit(1)
+            except psutil.AccessDenied:
+                pass
+            interval.wait(0.1)
+
+    def start_watch() -> None:
+        threading.Thread(target=watch, name="test-helper-parent-watch", daemon=True).start()
+
+    # Fork drops every thread except the caller; descendants retain this owner.
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=start_watch)
+    start_watch()
 
 
 def _proc_argv(proc: psutil.Process) -> list[str]:
@@ -131,19 +176,25 @@ def find_leaked_omnigent_processes(data_dir: Path | str) -> list[psutil.Process]
         return []
     me = os.getpid()
     leaked: list[psutil.Process] = []
-    for proc in psutil.process_iter():
-        if proc.pid == me:
-            continue
-        argv = _proc_argv(proc)
-        cmdline = " ".join(argv)
-        if "omnigent" not in cmdline or _is_pytest_process(argv):
-            continue
-        env = _proc_environ(proc)
-        if env.get("OMNIGENT_DATA_DIR", "").rstrip(os.sep) != needle and not (
-            _cmdline_references_dir(argv, needle)
-        ):
-            continue
-        leaked.append(proc)
+    try:
+        processes = psutil.process_iter()
+        for proc in processes:
+            if proc.pid == me:
+                continue
+            argv = _proc_argv(proc)
+            cmdline = " ".join(argv)
+            if "omnigent" not in cmdline or _is_pytest_process(argv):
+                continue
+            env = _proc_environ(proc)
+            if env.get("OMNIGENT_DATA_DIR", "").rstrip(os.sep) != needle and not (
+                _cmdline_references_dir(argv, needle)
+            ):
+                continue
+            leaked.append(proc)
+    except (psutil.AccessDenied, PermissionError) as error:
+        # The loop body only reads through guarded helpers, so an escaping
+        # permission error comes from the enumeration itself.
+        raise ProcessScanUnavailable(f"process table enumeration denied: {error}") from error
     return leaked
 
 

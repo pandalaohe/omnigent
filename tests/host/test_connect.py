@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import click
@@ -2141,6 +2142,7 @@ class _FakeResourceSampler:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.last_cpu_ms = 0.0
+        self.sample_load_per_core: float | None = None
 
     def sample(
         self,
@@ -2184,9 +2186,13 @@ class _FakeResourceSampler:
         )
 
 
-async def test_resource_snapshot_loop_sends_a_decodable_frame() -> None:
+async def test_resource_snapshot_loop_sends_a_decodable_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The loop copies runner state, samples off-loop, and sends one frame."""
     host = _make_host_process()
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     fake_sampler = _FakeResourceSampler()
     host._resource_sampler = fake_sampler
     runner_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -2201,11 +2207,14 @@ async def test_resource_snapshot_loop_sends_a_decodable_frame() -> None:
     # immediate so the test does not wait 60 s.
     host._resource_wake.set()
 
+    publisher = asyncio.create_task(host._resource_publisher_loop())
     task = asyncio.create_task(host._resource_snapshot_loop(ws))
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
         await _cancel(task)
+        await _cancel(publisher)
+        host._resource_executor_for().shutdown(wait=True)
         _cleanup_host(host)
 
     assert fake_sampler.calls[0]["runner_sessions"] == {runner_proc.pid: "conv_x"}
@@ -9330,10 +9339,12 @@ async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
     assert "the server rejected the host tunnel request" in str(err)
 
 
+@pytest.mark.parametrize("retain_previous", [False, True])
 async def test_handle_launch_supersedes_previous_runner_for_same_session(
     tmp_path: Path,
+    retain_previous: bool,
 ) -> None:
-    """A relaunch for a session tears down that session's previous runner.
+    """A listed shared runner survives; older frames retain legacy supersession.
 
     The server rotates the binding token on every relaunch, so without
     this the host accumulates one live runner per attempt — each with a
@@ -9366,33 +9377,37 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
             )
         )
         first_handle = host._runners[first.runner_id]
-        second = await host._handle_launch(
-            HostLaunchRunnerFrame(
-                request_id="req_b",
-                binding_token="tok_b",
-                workspace=str(workspace),
-                session_id="conv_super",
-            )
+        next_launch = HostLaunchRunnerFrame(
+            request_id="req_b",
+            binding_token="tok_b",
+            workspace=str(workspace),
+            session_id="conv_super",
         )
+        if retain_previous:
+            next_launch.retain_runner_ids = [first.runner_id]
+        second = await host._handle_launch(next_launch)
 
-    assert first.status == "launched" and second.status == "launched"
-    # The superseded runner is untracked at once; its termination runs
-    # detached, so poll-wait briefly for the process to go down.
-    assert first.runner_id not in host._runners
-    for _ in range(70):
-        if first_handle.proc.poll() is not None:
-            break
-        await asyncio.sleep(0.1)
-    assert first_handle.proc.poll() is not None, (
-        "the previous runner for the session must be terminated on relaunch"
-    )
-    for _ in range(50):
-        if maintenance_reasons:
-            break
-        await asyncio.sleep(0.01)
-    assert maintenance_reasons == ["runner_superseded"]
-    assert second.runner_id in host._runners
-    _cleanup_host(host)
+    try:
+        assert first.status == "launched" and second.status == "launched"
+        if retain_previous:
+            assert first.runner_id in host._runners
+            assert first_handle.proc.poll() is None
+            assert maintenance_reasons == []
+        else:
+            assert first.runner_id not in host._runners
+            for _ in range(70):
+                if first_handle.proc.poll() is not None:
+                    break
+                await asyncio.sleep(0.1)
+            assert first_handle.proc.poll() is not None
+            for _ in range(50):
+                if maintenance_reasons:
+                    break
+                await asyncio.sleep(0.01)
+            assert maintenance_reasons == ["runner_superseded"]
+        assert second.runner_id in host._runners
+    finally:
+        _cleanup_host(host)
 
 
 async def test_handle_launch_leaves_other_sessions_runners_alone(
@@ -10687,3 +10702,78 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     assert host._origin_workspace_id == "1965859176160743"
     assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "1965859176160743"
+
+
+async def test_load_publisher_keeps_writing_without_a_tunnel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.host import connect as connect_mod
+    from omnigent.util.atomic_json import atomic_write_json
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    host = _make_host_process()
+    sampler = _FakeResourceSampler()
+    host._resource_sampler = sampler
+    clock = SimpleNamespace(value=0.0)
+    monkeypatch.setattr(
+        connect_mod,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.value,
+            time=lambda: clock.value,
+            thread_time=time.thread_time,
+        ),
+    )
+    original_sample = sampler.sample
+
+    def sample(**kwargs: Any) -> HostResourceSnapshotFrame:
+        frame = original_sample(**kwargs)
+        clock.value += 60
+        frame.machine.cpu_count = 24
+        frame.machine.load_per_core = 2.0
+        frame.machine.load_equiv = 48.0
+        frame.machine.estimate = True
+        sampler.sample_load_per_core = 0.5
+        return frame
+
+    monkeypatch.setattr(sampler, "sample", sample)
+    writes: list[dict[str, Any]] = []
+    complete = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def write(path: Path, payload: dict[str, Any]) -> None:
+        atomic_write_json(path, payload)
+        writes.append(payload)
+        if len(writes) == 11:
+            loop.call_soon_threadsafe(complete.set)
+
+    monkeypatch.setattr(connect_mod, "atomic_write_json", write)
+    task = asyncio.create_task(host._resource_publisher_loop())
+    try:
+        await asyncio.wait_for(complete.wait(), timeout=3)
+    finally:
+        await _cancel(task)
+        host._resource_executor_for().shutdown(wait=True)
+        _cleanup_host(host)
+    assert len(writes) >= 11
+    instants = [datetime.fromisoformat(str(p["sampled_at"])).timestamp() for p in writes[:11]]
+    assert instants == list(range(60, 721, 60))[:11]
+    payload = json.loads((tmp_path / "run" / "host-load.json").read_text())
+    assert payload["level"] == "spare"
+    assert payload["reading_at"] == payload["sampled_at"]
+
+
+async def test_load_lines_handler_updates_effective_lines() -> None:
+    from omnigent.host.frames import HostLoadLinesFrame
+
+    host = _make_host_process()
+    try:
+        await host._dispatch_host_frame(_RecordingWS(), HostLoadLinesFrame(3, 4, 88, 2))
+        await host._dispatch_host_frame(_RecordingWS(), HostLoadLinesFrame(2, 3, 88, 1))
+        assert host._load_lines.heavy == 3
+        assert host._load_lines.new_session == 4
+        assert host._load_lines.mem_pct == 88
+        assert host._load_lines_synced_at is not None
+    finally:
+        _cleanup_host(host)

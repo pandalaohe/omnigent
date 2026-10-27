@@ -22,6 +22,8 @@ least four call sites. Centralizing them here lets us:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 # Label key stamped on every wrapper-owned conversation. Reserved
 # for the ``omnigent.*`` namespace; never reused for guardrails /
 # policy labels.
@@ -90,3 +92,17 @@ DEVIN_NATIVE_WRAPPER_VALUE = "devin-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
+
+
+def is_parent_owned_subagent_labels(labels: Mapping[str, str]) -> bool:
+    """Identify mirrors whose runtime is owned by their parent conversation."""
+    from omnigent.harness_plugins import native_agents
+
+    wrapper = labels.get(WRAPPER_LABEL_KEY)
+    return bool(labels.get(ACP_SUBAGENT_ID_LABEL_KEY)) or (
+        wrapper is not None
+        and (
+            wrapper == ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE
+            or any(wrapper == agent.subagent_wrapper_label for agent in native_agents())
+        )
+    )

@@ -125,6 +125,7 @@ def test_plan_visible_tools_only_include_registered_known_safe_names() -> None:
         "sys_terminal_read",
         "sys_terminal_list",
         "sys_child_cap",
+        "sys_host_load",
     ],
 )
 def test_framework_reads_allow_every_tier_and_are_plan_visible(name: str) -> None:
@@ -274,6 +275,27 @@ def test_child_cap_changes_use_operational_tiers(cap: object) -> None:
 def test_malformed_child_cap_never_falls_back_to_read(cap: object) -> None:
     for tier in PERMISSION_TIERS:
         assert decision(tier, "sys_child_cap", {"cap": cap}).action == Verdict.DENY
+
+
+def test_checkin_read_and_writes_use_distinct_tiers() -> None:
+    assert plan_visible_tool_names(("sys_child_checkin",)) == ("sys_child_checkin",)
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "sys_child_checkin", {"action": "read"}).action == Verdict.ALLOW
+        assert (
+            decision(tier, "sys_child_checkin", {"action": "read", "reset": True}).action
+            == Verdict.DENY
+        )
+    for action in ("set", "follow_up_add", "follow_up_remove"):
+        args: dict[str, object] = {"action": action}
+        if action == "follow_up_add":
+            args.update(text="Recheck", after_minutes=15)
+        elif action == "follow_up_remove":
+            args["id"] = "1234abcd"
+        assert decision("ask", "sys_child_checkin", args).action == Verdict.ASK
+        assert decision("plan", "sys_child_checkin", args).action == Verdict.DENY
+        assert decision("accept-edits", "sys_child_checkin", args).action == Verdict.ASK
+        assert decision("auto", "sys_child_checkin", args).action == Verdict.ALLOW
+        assert decision("full", "sys_child_checkin", args).action == Verdict.ALLOW
 
 
 @pytest.mark.parametrize("encode_arguments", [False, True], ids=["object", "json"])
@@ -453,6 +475,24 @@ def test_shell_continued_write_target_does_not_bind_as_workspace_file() -> None:
     "command",
     [
         "cd build && echo x > report.log",
+        "cd $D && echo x > out.log",
+        "cd ~/project && echo x > out.log",
+        "cd /opt/work/* && echo x > out.log",
+        "cd - && echo x > out.log",
+        "pushd /opt/work/project && echo x > out.log",
+        "popd && echo x > out.log",
+        "cd /a; echo x > o",
+        "cd /a || echo x > o",
+        "cd /a | tee out.log",
+        "cd /a & echo x > o",
+        "(cd /a && echo x > o)",
+        "echo x > out.log && cd /a",
+        "cd /opt/work/project && echo x > out.log && cd /a",
+        "cd /opt/work/project && echo x > out.log; echo x > other.log",
+        "cd /opt/work/project && tee $OUTPUT",
+        "cd /opt/work/project && echo x > `printf /usr/local/r`",
+        "cd /opt/work/project && printf x | tee `printf /usr/local/r`",
+        "echo x > `printf /usr/local/r`",
         'echo x > "$OUTPUT"',
         "echo x > " + "\\\n" + "report.log",
     ],
@@ -461,7 +501,12 @@ def test_legal_unbound_shell_writes_retain_approval_and_full_tiers(command: str)
     assert decision("ask", "bash", {"command": command}).action == Verdict.ASK
     assert decision("plan", "bash", {"command": command}).action == Verdict.DENY
     assert decision("accept-edits", "bash", {"command": command}).action == Verdict.ASK
-    assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
+    result = decision("auto", "bash", {"command": command})
+    assert result.action == Verdict.DENY
+    assert result.reason.endswith(
+        "write with absolute literal paths: no cd except a literal absolute "
+        "cd /dir && prefix, no tee / redirect to $ targets"
+    )
     assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
 
     def failed_resolution(path: str) -> ResolvedPath:
@@ -476,8 +521,15 @@ def test_legal_unbound_shell_writes_retain_approval_and_full_tiers(command: str)
         )
 
 
-def test_unbound_shell_writes_preserve_common_control_and_ares_checks() -> None:
-    control = "cd build && echo x > /opt/work/control/tier"
+@pytest.mark.parametrize(
+    "control",
+    [
+        "cd build && echo x > /opt/work/control/tier",
+        "cd /opt/work && echo x > control/tier",
+        "cd /opt/work && printf x | tee control/tier",
+    ],
+)
+def test_unbound_shell_writes_preserve_common_control_and_ares_checks(control: str) -> None:
     for tier in NON_FULL_TIERS:
         assert decision(tier, "bash", {"command": control}).rule_id == "control-path"
     dangerous = "cd build && echo x > report.log; mkfs.ext4 /dev/disk4"
@@ -487,6 +539,17 @@ def test_unbound_shell_writes_preserve_common_control_and_ares_checks() -> None:
 @pytest.mark.parametrize(
     "command",
     [
+        "cmd 2>/dev/null",
+        "cmd >/dev/null",
+        "cmd >>/dev/null",
+        "cmd &>/dev/null",
+        "cmd &>>/dev/null",
+        "cmd 2>&1 >/dev/null",
+        "cd /opt/work/project && grep x a.py 2>/dev/null",
+        "cd /opt/work/project && echo x > /opt/work/project/out.log",
+        "cd /opt/work/project && echo x > out.log",
+        "cd /opt/work/project && pytest -q | tee /opt/work/project/tmp/log.txt",
+        "cd /opt/work && cd /opt/work/project && echo x > out.log",
         ".venv/bin/python script.py 2>&1",
         ".venv/bin/python script.py > report.log 2>&1",
         "/opt/homebrew/bin/python script.py > report.log",
@@ -535,6 +598,15 @@ def test_shell_reads_and_workspace_writes_do_not_mutate_protected_locations(comm
         ("rm /usr/local/report", "/usr/local/report"),
         ("sed -i '' 's/a/b/' /usr/local/report", "/usr/local/report"),
         ("tee /usr/local/report", "/usr/local/report"),
+        ("tee -a /usr/local/report", "/usr/local/report"),
+        ("cd /opt/work/project && echo x > /usr/local/r", "/usr/local/r"),
+        ("cd /usr/local && echo x > r", "/usr/local/r"),
+        ("cd /usr/local && pytest -q | tee -a r", "/usr/local/r"),
+        ("env -C /usr/local tee report", "/usr/local"),
+        ("env --chdir=/usr/local tee report", "/usr/local"),
+        ("cd /opt/work/project && env -C /usr/local tee report", "/usr/local"),
+        ("cd /opt/work/project && env --chdir=/usr/local tee report", "/usr/local"),
+        ("pwsh -Command 'tee -FilePath:/usr/local/report'", "/usr/local/report"),
         ("chmod 600 ~/.ssh/config", "/opt/home/.ssh/config"),
         ("chmod 700 /usr*", "/usr*"),
         ("echo x > ../../../../usr/local/report", "/usr/local/report"),
@@ -554,6 +626,50 @@ def test_shell_protected_write_denials_name_the_bound_destination(
     assert result.action == Verdict.DENY
     assert result.rule_id == "protected-path"
     assert destination in result.reason
+
+
+@pytest.mark.parametrize(
+    ("command", "destinations"),
+    [
+        ("cmd 2>/dev/null", ()),
+        ("cmd >/dev/null 2>&1", ()),
+        ("cd /opt/work/project && grep x a.py 2>/dev/null", ()),
+        ("echo x >/dev/null > out.log", ("/opt/work/project/out.log",)),
+        ("echo x > /dev/null-other", ("/dev/null-other",)),
+        ("cd /opt/work/other && echo x > out.log", ("/opt/work/other/out.log",)),
+        (
+            "cd '/opt/work/project with spaces' && echo x > out.log",
+            ("/opt/work/project with spaces/out.log",),
+        ),
+        (
+            "cd /opt/work/other && echo x > /opt/work/project/out.log",
+            ("/opt/work/project/out.log",),
+        ),
+        (
+            "cd /opt/work && cd /opt/work/project && echo x > out.log && echo y > next.log",
+            ("/opt/work/project/out.log", "/opt/work/project/next.log"),
+        ),
+        (
+            "cd /opt/work/other && pytest -q | tee -a --output-error=warn log.txt",
+            ("/opt/work/other/log.txt",),
+        ),
+        (
+            "cd /opt/work/other && pytest -q | tee -- /opt/work/project/tmp/log.txt",
+            ("/opt/work/project/tmp/log.txt",),
+        ),
+        (
+            "cd /opt/work/other && sh -c 'echo x > out.log'",
+            ("/opt/work/other/out.log",),
+        ),
+    ],
+)
+def test_shell_write_destinations_bind_without_sink_commands_or_options(
+    command: str, destinations: tuple[str, ...]
+) -> None:
+    intent = adapt_tool_call("sys_os_shell", {"command": command}, posix_host())
+    assert intent.status == "ok"
+    assert intent.command_write_paths == destinations
+    assert decide_tier("auto", intent, RULES).action == Verdict.ALLOW
 
 
 @pytest.mark.parametrize("command", ["cp", "mv", "install", "ln"])
@@ -839,6 +955,7 @@ def test_supported_shell_wrappers_bind_inner_control_paths(command: str) -> None
         (r"Set-Content -Path:C:\Windows\report x", Verdict.DENY),
         (r"Copy-Item source -Destination:C:\Windows\report", Verdict.DENY),
         (r"Remove-Item -LiteralPath:C:\Windows\probe", Verdict.DENY),
+        (r"tee -FilePath:C:\Windows\report", Verdict.DENY),
         (r"Set-Content -Value x C:\work\project\report", Verdict.ALLOW),
         (r"Set-Content -Path:C:\work\project\report x", Verdict.ALLOW),
         (r"Copy-Item source -Destination:C:\Windows-old\report", Verdict.ALLOW),

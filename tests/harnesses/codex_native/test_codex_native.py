@@ -2194,7 +2194,32 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    assert [
+        (request.method, request.url.path, json.loads(request.content)) for request in ap_requests
+    ] == [
+        (
+            "POST",
+            "/v1/sessions/conv_123/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "approval_mode": "unknown",
+                    "permission_observation": {
+                        "version": 1,
+                        "source": "native-settings",
+                        "origin": "resume",
+                        "mode": "unknown",
+                        "approval": None,
+                        "reviewer": None,
+                        "sandbox": None,
+                        "profile": None,
+                        "uncertainty": "no-settings",
+                        "requested_mode": None,
+                    },
+                },
+            },
+        )
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -2826,6 +2851,103 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     ] == ["after clear"]
 
 
+def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
+    tmp_path: Path,
+) -> None:
+    """
+    A native Codex ``/clear`` tells the old session where its terminal went.
+
+    Without the notice and ``external_session_superseded`` event, a browser
+    on the old session keeps showing the cleared conversation while the
+    replacement only appears as a new sidebar entry.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_old",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_old",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    old_session_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve Omnigent calls made during Codex session rotation.
+
+        :param request: HTTP request from the forwarder.
+        :returns: Fake Omnigent response.
+        """
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_codex",
+                    "runner_id": "runner_123",
+                    "labels": {"omnigent.wrapper": "codex-native-ui"},
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "PATCH" and path in {
+            "/v1/sessions/conv_new",
+            "/v1/sessions/conv_old",
+        }:
+            return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1]})
+        if request.method == "POST" and path.endswith("/transfer"):
+            return httpx.Response(200, json={"id": "terminal_codex_main"})
+        if request.method == "POST" and path == "/v1/sessions/conv_old/succession":
+            return httpx.Response(200, json={"status": "done"})
+        if request.method == "POST" and path == "/v1/sessions/conv_old/events":
+            old_session_events.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(500, json={"error": f"unexpected {request.method} {path}"})
+
+    async def run() -> bool:
+        """
+        Rotate onto a new native thread.
+
+        :returns: Whether the forwarder rotated.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as ap_client:
+            target = codex_native_forwarder._ForwarderTarget(
+                session_id="conv_old",
+                thread_id="thread_old",
+                delta_coalescer=codex_native_forwarder._OutputTextDeltaCoalescer(
+                    ap_client, "conv_old"
+                ),
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                    ap_client, "conv_old"
+                ),
+                elicitation_tracker=_elicitation_tracker(),
+            )
+            return await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+                ap_client=ap_client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url="ws://127.0.0.1:9876",
+                event=_thread_started_event("thread_new"),
+            )
+
+    assert asyncio.run(run())
+    assert [event["type"] for event in old_session_events] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    assert old_session_events[0]["data"] == {"status": "idle"}
+    notice = old_session_events[1]["data"]["item_data"]
+    assert notice["agent"] == "codex-native-ui"
+    assert "(/c/conv_new)" in notice["content"][0]["text"]
+    assert old_session_events[2]["data"] == {"target_conversation_id": "conv_new"}
+
+
 def test_forwarder_rotation_failure_preserves_old_target(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2842,6 +2964,12 @@ def test_forwarder_rotation_failure_preserves_old_target(
     :param tmp_path: Temporary bridge directory.
     :returns: None.
     """
+
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        codex_native_forwarder, "_fetch_session_snapshot", AsyncMock(return_value={"labels": {}})
+    )
 
     class _FakeCoalescer:
         """
@@ -5925,11 +6053,40 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
     old_events = [event for event in session_events if event.session_id == "conv_old"]
-    assert len(old_events) == 1
-    assert old_events[0].body["type"] == "external_native_subagent_snapshot"
-    assert old_events[0].body["data"]["children"] == []
-    assert old_events[0].body["data"]["complete"] is True
-    assert old_events[0].body["data"]["retired"] is True
+    notice_types = {
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    }
+    assert [event.body["type"] for event in old_events if event.body["type"] in notice_types] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    old_events = [event for event in old_events if event.body["type"] not in notice_types]
+    assert len(old_events) == 2
+    assert old_events[0].body == {
+        "type": "external_codex_approval_mode_change",
+        "data": {
+            "approval_mode": "unknown",
+            "permission_observation": {
+                "version": 1,
+                "source": "native-settings",
+                "origin": "resume",
+                "mode": "unknown",
+                "approval": None,
+                "reviewer": None,
+                "sandbox": None,
+                "profile": None,
+                "uncertainty": "no-settings",
+                "requested_mode": None,
+            },
+        },
+    }
+    assert old_events[1].body["type"] == "external_native_subagent_snapshot"
+    assert old_events[1].body["data"]["children"] == []
+    assert old_events[1].body["data"]["complete"] is True
+    assert old_events[1].body["data"]["retired"] is True
     assert hook_posts == []
     assert fake_client.responses == []
 
@@ -6852,8 +7009,8 @@ def test_forwarder_surfaces_failed_command_exit_code() -> None:
     # The exit code (3, from the replayed item above) must appear appended
     # to the captured stderr/stdout. If the suffix were missing the output
     # would be just "boom\n" — a failed command indistinguishable from a
-    # successful one in the UI.
-    assert outputs == ["boom\n\n[exit code: 3]"]
+    # successful one in the UI. The prefix also preserves the terminal status.
+    assert outputs == ["[command status: failed]\nboom\n\n[exit code: 3]"]
 
 
 def test_forwarder_posts_codex_file_change_tool_call() -> None:

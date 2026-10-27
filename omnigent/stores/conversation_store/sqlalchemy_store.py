@@ -38,7 +38,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
-from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
+from omnigent._wrapper_labels import (
+    UI_MODE_LABEL_KEY,
+    WRAPPER_LABEL_KEY,
+    is_parent_owned_subagent_labels,
+)
+from omnigent.child_checkin import (
+    CHECKIN_LABEL_PREFIX,
+    FOLLOWUP_NEXT_KEY,
+    FOLLOWUP_PREFIX,
+    INSTRUCTIONS_PREFIX,
+    LAST_KEY,
+    next_followup_due,
+)
 from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
@@ -156,6 +168,7 @@ from omnigent.stores.conversation_store import (
     DailyCostState,
     DeletionClaimResult,
     DetachedCard,
+    LabelGroupChange,
     NativeRecoveryItemSkipped,
     NativeReplayConflictError,
     NativeSubagentReconcileFingerprint,
@@ -451,6 +464,7 @@ def _to_session_succession(row: SqlSessionSuccession) -> SessionSuccession:
         opening_item_id=row.opening_item_id,
         dropped=json.loads(row.dropped) if row.dropped is not None else None,
         questions=json.loads(row.questions) if row.questions is not None else None,
+        deferred_runners=json.loads(row.deferred_runners) if row.deferred_runners else None,
         error=row.error,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -813,6 +827,56 @@ def _fetch_labels(
             .all()
         )
     return dict(rows)
+
+
+def _transfer_checkin_labels(session: Session, old_id: str, new_id: str, stamp: int) -> None:
+    """Move durable check-in state while preserving the successor's overrides."""
+    source = {
+        key: value
+        for key, value in _fetch_labels(session, old_id).items()
+        if key.startswith(CHECKIN_LABEL_PREFIX) and key != LAST_KEY
+    }
+    target = {
+        key: value
+        for key, value in _fetch_labels(session, new_id).items()
+        if key.startswith(CHECKIN_LABEL_PREFIX)
+    }
+    has_instructions = any(key.startswith(INSTRUCTIONS_PREFIX) for key in target)
+    reserved_keys = source.keys() | target.keys()
+    updates: dict[str, str] = {}
+    for key, value in source.items():
+        if key == FOLLOWUP_NEXT_KEY or (has_instructions and key.startswith(INSTRUCTIONS_PREFIX)):
+            continue
+        if key.startswith(FOLLOWUP_PREFIX):
+            if key in target:
+                while (key := f"{FOLLOWUP_PREFIX}{uuid4().hex[:8]}") in reserved_keys:
+                    pass
+                reserved_keys.add(key)
+        elif key in target:
+            continue
+        updates[key] = value
+
+    due = next_followup_due(target | updates)
+    if due is not None:
+        updates[FOLLOWUP_NEXT_KEY] = str(due)
+    else:
+        session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == new_id,
+                SqlConversationLabel.key == FOLLOWUP_NEXT_KEY,
+            )
+        )
+    if updates:
+        _upsert_prepared_labels(session, new_id, updates, stamp)
+    if source:
+        session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == old_id,
+                SqlConversationLabel.key.in_(source),
+            )
+        )
 
 
 def _assert_conversation_restore_admits(
@@ -2257,6 +2321,69 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             run_write_transaction(self._conv_session_immediate, "set_labels", write)
 
+    def mutate_label_group(
+        self,
+        conversation_id: str,
+        prefix: str,
+        change: Callable[[dict[str, str]], LabelGroupChange],
+    ) -> dict[str, str]:
+        """Serialize a label group's read, validation and writes on its owner."""
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> dict[str, str]:
+            statement = select(SqlConversation.id).where(
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                statement = statement.with_for_update()
+            if session.scalar(statement) is None:
+                raise ConversationNotFoundError(f"conversation not found: {conversation_id!r}")
+            conditions = (
+                SqlConversationLabel.workspace_id == workspace_id,
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key.startswith(prefix, autoescape=True),
+            )
+            current = dict(
+                session.execute(
+                    select(SqlConversationLabel.key, SqlConversationLabel.value).where(*conditions)
+                )
+                .tuples()
+                .all()
+            )
+            changes = change(dict(current))
+            if any(not key.startswith(prefix) for key in changes.upserts.keys() | changes.deletes):
+                raise ValueError("label group change contains a key outside its prefix")
+            if any(len(value) > LABEL_VALUE_MAX_LEN for value in changes.upserts.values()):
+                raise ValueError("label value exceeds its storage limit")
+            if changes.deletes:
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        *conditions, SqlConversationLabel.key.in_(changes.deletes)
+                    )
+                )
+            if changes.upserts:
+                _upsert_prepared_labels(session, conversation_id, changes.upserts, now_epoch())
+            return {
+                key: value for key, value in current.items() if key not in changes.deletes
+            } | changes.upserts
+
+        return run_write_transaction(self._conv_session_immediate, "mutate_label_group", write)
+
+    def list_label_values(self, key: str) -> dict[str, str]:
+        """Read one discovery key without hydrating conversations or other labels."""
+        with self._conv_session("list_label_values") as session:
+            return dict(
+                session.execute(
+                    select(SqlConversationLabel.conversation_id, SqlConversationLabel.value).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.key == key,
+                    )
+                )
+                .tuples()
+                .all()
+            )
+
     def compare_and_set_label(
         self, conversation_id: str, key: str, expected: str, value: str | None
     ) -> bool:
@@ -2265,6 +2392,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise ValueError("label value exceeds its storage limit")
 
         def write(session: Session) -> bool:
+            try:
+                self._lock_conversation(session, conversation_id)
+            except ConversationNotFoundError:
+                return False
             conditions = (
                 SqlConversationLabel.workspace_id == current_workspace_id(),
                 SqlConversationLabel.conversation_id == conversation_id,
@@ -4580,6 +4711,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         conversation_id: str,
         items: list[NewConversationItem],
+        *,
+        while_label: str | None = None,
     ) -> list[ConversationItem]:
         """
         Append items to a conversation.
@@ -4657,6 +4790,19 @@ class SqlAlchemyConversationStore(ConversationStore):
             # On PostgreSQL this is a row-level FOR UPDATE lock; on
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
+
+            if while_label is not None:
+                from omnigent.stores.conversation_store import ConversationLabelConditionFailed
+
+                present = session.scalar(
+                    select(SqlConversationLabel.key).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key == while_label,
+                    )
+                )
+                if present is None:
+                    raise ConversationLabelConditionFailed
 
             stable_ids = [item.stable_id for item in items if item.stable_id is not None]
             replaced_ids = {item.replaces_pending_id for item in items}
@@ -6994,8 +7140,8 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> tuple[list[str], list[str]]:
         """Move old's still-unarchived direct children and their subtrees under new.
 
-        Everything — locks, re-reads, reparenting, root rewrite, labels and
-        the receipt — commits in one AP transaction, so a crash leaves either
+        Everything — locks, re-reads, reparenting, root rewrite, check-in state,
+        succession labels and the receipt — commits in one AP transaction, so a crash leaves either
         the whole move or none of it. A child archived concurrently before its
         lock is simply left behind; when that leaves nothing to move, nothing
         at all is written unless ``allow_empty`` requests a receipt.
@@ -7019,8 +7165,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         def move(ap_sess: Session) -> tuple[list[str], list[str]]:
             if old_id == new_id:
                 raise SuccessionRefusedError("same_session", "a session cannot succeed itself")
-            self._lock_conversation(ap_sess, new_id)
-            self._lock_conversation(ap_sess, old_id)
+            for session_id in sorted((old_id, new_id)):
+                self._lock_conversation(ap_sess, session_id)
             new_row = ap_sess.get(SqlConversation, (workspace_id, new_id))
             if new_row is None:
                 raise SuccessionRefusedError(
@@ -7030,6 +7176,35 @@ class SqlAlchemyConversationStore(ConversationStore):
             if old_row is None:
                 raise SuccessionRefusedError(
                     "not_found", f"conversation {old_id!r} does not exist"
+                )
+            existing = ap_sess.scalar(
+                select(SqlSessionSuccession).where(
+                    SqlSessionSuccession.workspace_id == workspace_id,
+                    SqlSessionSuccession.old_id == old_id,
+                    SqlSessionSuccession.new_id == new_id,
+                )
+            )
+            if existing is not None:
+                return json.loads(existing.direct_ids), json.loads(existing.moved_ids)
+            successor_id = _fetch_labels(ap_sess, old_id).get(SUCCEEDED_BY_LABEL_KEY)
+            competing = ap_sess.scalar(
+                select(SqlSessionSuccession.new_id)
+                .where(
+                    SqlSessionSuccession.workspace_id == workspace_id,
+                    SqlSessionSuccession.old_id == old_id,
+                    SqlSessionSuccession.new_id != new_id,
+                    SqlSessionSuccession.phase.not_in(("done", "void")),
+                )
+                .limit(1)
+            )
+            if (successor_id and successor_id != new_id) or competing:
+                successor_id = (
+                    successor_id if successor_id and successor_id != new_id else competing
+                )
+                raise SuccessionRefusedError(
+                    "already_succeeded",
+                    f"session already succeeded by {successor_id!r}",
+                    successor_id=successor_id,
                 )
             if (
                 new_row.parent_conversation_id is not None
@@ -7060,7 +7235,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # re-read then sees whatever that transition committed.
                 self._lock_conversation(ap_sess, candidate.id)
                 ap_sess.refresh(candidate)
-                if not candidate.archived:
+                if not candidate.archived and not is_parent_owned_subagent_labels(
+                    _fetch_labels(ap_sess, candidate.id)
+                ):
                     kept.append(candidate)
             if not kept and not allow_empty:
                 return ([], [])
@@ -7122,6 +7299,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # Undo: drop the forward pair only now, when the inverse move
                 # has passed every refusal; a refused move must keep it.
                 ap_sess.execute(
+                    update(SqlSessionSuccession)
+                    .where(
+                        SqlSessionSuccession.workspace_id == workspace_id,
+                        SqlSessionSuccession.old_id == new_id,
+                        SqlSessionSuccession.new_id == old_id,
+                    )
+                    .values(
+                        phase="void",
+                        deferred_runners=None,
+                        error="succession reversed",
+                        updated_at=now,
+                    )
+                )
+                ap_sess.execute(
                     delete(SqlConversationLabel).where(
                         SqlConversationLabel.workspace_id == workspace_id,
                         SqlConversationLabel.conversation_id == new_id,
@@ -7139,6 +7330,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             _upsert_labels(ap_sess, old_id, {SUCCEEDED_BY_LABEL_KEY: new_id}, now)
             _upsert_labels(ap_sess, new_id, {SUCCEEDS_LABEL_KEY: old_id}, now)
+            _transfer_checkin_labels(ap_sess, old_id, new_id, now)
             ap_sess.add(
                 SqlSessionSuccession(
                     id=receipt_id,
@@ -7178,16 +7370,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             return _to_session_succession(row) if row is not None else None
 
     def list_unfinished_successions(self, limit: int = 100) -> list[SessionSuccession]:
-        """Return receipts whose phase is not ``done``, oldest first."""
+        """Return nonterminal receipts, oldest first."""
         with self._conv_session("list_unfinished_successions") as session:
             rows = session.scalars(
                 select(SqlSessionSuccession)
                 .where(
                     SqlSessionSuccession.workspace_id == current_workspace_id(),
-                    SqlSessionSuccession.phase != "done",
+                    SqlSessionSuccession.phase.not_in(("done", "void")),
                 )
                 .order_by(SqlSessionSuccession.created_at, SqlSessionSuccession.id)
                 .limit(limit)
+            )
+            return [_to_session_succession(row) for row in rows]
+
+    def list_deferred_successions(self) -> list[SessionSuccession]:
+        """Include finished rotations with runner work still outstanding."""
+        with self._conv_session("list_deferred_successions") as session:
+            rows = session.scalars(
+                select(SqlSessionSuccession)
+                .where(
+                    SqlSessionSuccession.workspace_id == current_workspace_id(),
+                    SqlSessionSuccession.phase != "void",
+                    SqlSessionSuccession.deferred_runners.is_not(None),
+                )
+                .order_by(SqlSessionSuccession.created_at, SqlSessionSuccession.id)
             )
             return [_to_session_succession(row) for row in rows]
 
@@ -7206,7 +7412,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         serialized here; ``updated_at`` is always refreshed.
         """
         values: dict[str, Any] = dict(fields)
-        for key in ("opening", "dropped", "questions"):
+        for key in ("opening", "dropped", "questions", "deferred_runners"):
             if key in values and values[key] is not None:
                 values[key] = json.dumps(values[key])
         values["updated_at"] = now_epoch()
@@ -9034,6 +9240,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{TOUCHED_LABEL_KEY}.")
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
+                and not key.startswith(CHECKIN_LABEL_PREFIX)
                 and key != PROJECT_ARCHIVE_LABEL_KEY
                 and not key.startswith(f"{PROJECT_ARCHIVE_LABEL_KEY}.")
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))

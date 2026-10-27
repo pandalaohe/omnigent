@@ -34,6 +34,14 @@ _logger = logging.getLogger("omnigent.runner.app")
 
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped", "killed"})
 
+# Origin of a codex-native child thread. ``delegated`` is a thread Codex spawn
+# tooling created for work the mother asked for; ``unknown`` is anything the
+# child's labels cannot prove — a ``/side`` side chat the user is reading, or a
+# thread whose spawn label is missing. Only ``delegated`` may wake a Codex
+# parent, so an unresolved origin keeps the thread silent (fail-closed).
+CODEX_NATIVE_ORIGIN_DELEGATED = "delegated"
+CODEX_NATIVE_ORIGIN_UNKNOWN = "unknown"
+
 
 # Bound how long a sub-agent dispatch can wait for a start acknowledgment.
 # A timeout reports uncertain launch status, not proof that the process is dead.
@@ -154,6 +162,9 @@ class _SubagentWorkEntry:
     :param registered_by: The surface that registered the entry, e.g.
         ``"sys_session_create"`` or ``"sys_session_send"``. ``None`` for a
         recovery/forwarder-registered entry (a codex-internal thread).
+    :param native_origin: Provenance of a codex-native child thread, from
+        :func:`codex_native_origin_from_labels`; see
+        :data:`CODEX_NATIVE_ORIGIN_UNKNOWN`.
     :param started_monotonic: Runner-local monotonic instant this dispatch
         was registered, used by the remote-member liveness interval.
     :param last_remote_check_monotonic: Runner-local monotonic instant of the
@@ -188,6 +199,7 @@ class _SubagentWorkEntry:
     recovery_result: tuple[str, str | None, str | None] | None = None
     recovery_turn_started: bool = False
     registered_by: str | None = None
+    native_origin: str = CODEX_NATIVE_ORIGIN_UNKNOWN
     started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     last_remote_check_monotonic: float | None = None
     launch_timed_out: bool = False
@@ -356,6 +368,7 @@ def register_subagent_work(
     host_id: str | None = None,
     placement_label: str | None = None,
     registered_by: str | None = None,
+    native_origin: str | None = None,
     flow_neutral: bool = False,
     recovered: bool = False,
     prior_result_key: str | None = None,
@@ -387,6 +400,11 @@ def register_subagent_work(
     :param registered_by: The surface that registered the entry, e.g.
         ``"sys_session_create"`` or ``"sys_session_send"``; see
         :attr:`_SubagentWorkEntry.registered_by`.
+    :param native_origin: A codex-native child's provenance, from
+        :func:`codex_native_origin_from_labels`; see
+        :attr:`_SubagentWorkEntry.native_origin`. An unknown value keeps an
+        origin a previous entry already proved, so a later re-registration
+        never downgrades it.
     :param flow_neutral: When ``True``, a fresh entry does not join the
         parent's running flow. Recovery registers turns the mother did not
         dispatch this way, so an undispatched result is held only when the
@@ -414,6 +432,13 @@ def register_subagent_work(
         else _drained_delivered_subagent_results.get(child_session_id)
     )
 
+    # A re-registration that carries no provable origin keeps the one an
+    # earlier registration (or a late label read) already established.
+    resolved_native_origin = (
+        native_origin
+        if native_origin not in (None, CODEX_NATIVE_ORIGIN_UNKNOWN)
+        else (prior.native_origin if prior is not None else CODEX_NATIVE_ORIGIN_UNKNOWN)
+    )
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
         child_session_id=child_session_id,
@@ -428,6 +453,7 @@ def register_subagent_work(
         delivered_result_key=previous_result_key,
         prior_result_key=prior_result_key,
         registered_by=registered_by,
+        native_origin=resolved_native_origin,
         recovered=recovered,
     )
     _drained_delivered_subagent_results.pop(child_session_id, None)
@@ -728,27 +754,94 @@ def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
     return agent is not None and wrapper_label == agent.subagent_wrapper_label
 
 
+# Label the Codex forwarder stamps from the spawn item that registered a
+# child thread (``collabAgentToolCall`` or ``subAgentActivity``): that item's
+# id, sent as ``tool_call_id`` on ``external_codex_subagent_start``. A
+# ``/side`` side chat is registered with a displayed nickname only, so the
+# label's presence is the evidence that Codex delegated work.
+CODEX_NATIVE_TOOL_CALL_ID_LABEL_KEY = "omnigent.codex_native.collab_tool_call_id"
+
+
+def codex_native_origin_from_labels(labels: object) -> str:
+    """
+    Derive a codex-native child's origin from its session labels.
+
+    Only the spawn item's id is conclusive: the forwarder writes it on the
+    registration POST that creates the child row, before the runner can see the
+    child's id, and it is absent for a user ``/side`` fork. Nickname and role
+    labels are deliberately not used — a forked side chat can inherit thread
+    metadata, so they cannot prove a delegation and leave the origin unknown.
+
+    :param labels: A child session's labels as the server returns them, e.g.
+        ``{"omnigent.codex_native.collab_tool_call_id": "call_7f"}``; ``None``
+        or a non-mapping is treated as unlabelled.
+    :returns: ``"delegated"`` when the labels prove a Codex spawn, otherwise
+        ``"unknown"``.
+    """
+    if not isinstance(labels, Mapping):
+        return CODEX_NATIVE_ORIGIN_UNKNOWN
+    tool_call_id = labels.get(CODEX_NATIVE_TOOL_CALL_ID_LABEL_KEY)
+    if isinstance(tool_call_id, str) and tool_call_id:
+        return CODEX_NATIVE_ORIGIN_DELEGATED
+    return CODEX_NATIVE_ORIGIN_UNKNOWN
+
+
+def entry_owes_parent_wake(entry: _SubagentWorkEntry, parent_harness: str | None) -> bool:
+    """
+    Whether a child's terminal result owes its parent an inbox wake.
+
+    This is the only wake-ownership policy: the wake path and the stranded-wake
+    rescue both call it, so neither can hold a divergent filter. A Codex
+    internal thread (a ``/side`` side chat, or one Codex spawned) is normally
+    consumed inside the parent's own app-server, so waking the parent would
+    inject a notice into a chat the user is reading; an entry an Omnigent tool
+    registered still wakes it (D12).
+
+    A Codex thread whose labels prove a delegated job is the one internal case
+    that owes a wake: the mother asked for that work and waits on its result,
+    like an Omnigent dispatch. A side chat, and any child whose origin the
+    labels cannot prove, keeps the pre-existing suppression.
+
+    :param entry: Candidate work entry, e.g. one registered by recovery.
+    :param parent_harness: The parent's resolved harness, e.g.
+        ``"codex-native"``, or ``None`` when its spec is not cached yet.
+    :returns: ``True`` when the entry owes the parent a wake.
+    """
+    codex_internal = is_codex_native_subagent_wrapper(entry.wrapper_label) or (
+        parent_harness == _CODEX_NATIVE_HARNESS
+    )
+    if not codex_internal or entry.registered_by is not None:
+        return True
+    # A native wrapper already proves the child belongs to a Codex app-server,
+    # so an unresolved parent harness stays admitted; a parent recorded as a
+    # different harness keeps its thread suppressed, as before.
+    return (
+        is_codex_native_subagent_wrapper(entry.wrapper_label)
+        and entry.native_origin == CODEX_NATIVE_ORIGIN_DELEGATED
+        and parent_harness in (None, _CODEX_NATIVE_HARNESS)
+    )
+
+
 def latest_wake_eligible_subagent_work(
     entries: list[_SubagentWorkEntry],
+    parent_harness: str | None = None,
 ) -> _SubagentWorkEntry | None:
     """
     The most recently completed entry that still owes the parent an inbox wake.
 
     Stranded-wake recovery nudges an idle parent to drain its inbox, so it must
-    skip codex-native sub-agents: a suppressed thread completing after an
+    skip threads that owe no wake: a suppressed thread completing after an
     independent child would otherwise shadow the child's stranded wake, which
-    the ownership guard then drops.
+    the ownership guard then drops. Eligibility is :func:`entry_owes_parent_wake`
+    and nothing else, so a delegated Codex job the wake path admits is not
+    filtered out here.
 
     :param entries: Candidate work entries for one parent.
-    :returns: The latest wake-eligible entry, or ``None`` when every entry is a
-        codex-native sub-agent.
+    :param parent_harness: The parent's resolved harness, e.g.
+        ``"codex-native"``; see :func:`entry_owes_parent_wake`.
+    :returns: The latest wake-eligible entry, or ``None`` when no entry owes one.
     """
-    eligible = [
-        entry
-        for entry in entries
-        if not is_codex_native_subagent_wrapper(entry.wrapper_label)
-        or entry.registered_by is not None
-    ]
+    eligible = [entry for entry in entries if entry_owes_parent_wake(entry, parent_harness)]
     if not eligible:
         return None
     return max(
@@ -1058,6 +1151,7 @@ async def _recover_subagent_results_from_server(
             # entry may wake a Codex mother even after a restart wiped the
             # origin map.
             registered_by=_subagent_work_origins.get(child_id) or "recovery",
+            native_origin=codex_native_origin_from_labels(label_map),
         )
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.

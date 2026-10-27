@@ -17,7 +17,7 @@ import secrets
 import time
 import urllib.parse
 import weakref
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -42,8 +42,16 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from omnigent.calling_defaults import resolve_calling
-from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
-from omnigent.db.utils import generate_task_id
+from omnigent.codex_approval_modes import (
+    CODEX_NATIVE_PERMISSION_VALUES,
+    CodexPermissionObservation,
+    codex_permission_observation_from_payload,
+    codex_permission_observation_with_metadata,
+    decode_codex_permission_observation,
+    encode_codex_permission_observation,
+)
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+from omnigent.db.utils import generate_task_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
@@ -340,6 +348,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
+    CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
     PINNED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -348,6 +357,7 @@ from omnigent.stores.conversation_store import (
     NameAlreadyExistsError,
     drop_server_secret_labels,
     is_artifact_link_key,
+    is_codex_permission_observation_label_key,
     is_touched_label_key,
     touched_label_key,
 )
@@ -413,20 +423,38 @@ def _publish_permission_mode(session_id: str, mode: str) -> None:
     session_stream.publish(session_id, event.model_dump())
 
 
-def _publish_codex_approval_mode(session_id: str, mode: str) -> None:
+_CODEX_OBSERVATION_PROJECTION_KEYS = ("permission_observation", "permission_observation_c1")
+
+
+def _publish_codex_approval_mode(
+    session_id: str, mode: str, observation: CodexPermissionObservation | None = None
+) -> None:
     """
-    Publish the live codex-native approval/sandbox mode for a session.
+    Publish readback without changing the legacy scalar event shape.
+
+    An observation travels as both its readable object and the exact ``c1`` text the
+    receiver already stored, so a live frame and the saved label name the same
+    observation. Without one, both projections are absent rather than null.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param mode: The active approval mode, e.g. ``"read-only"``.
+    :param observation: The bounded receiver report, or ``None`` for legacy scalars.
     :returns: None.
     """
     event = SessionCodexApprovalModeEvent(
         type="session.codex_approval_mode",
         conversation_id=session_id,
         approval_mode=mode,
+        permission_observation=observation,
+        permission_observation_c1=(
+            None if observation is None else encode_codex_permission_observation(observation)
+        ),
     )
-    session_stream.publish(session_id, event.model_dump())
+    payload = event.model_dump()
+    if observation is None:
+        for key in _CODEX_OBSERVATION_PROJECTION_KEYS:
+            payload.pop(key)
+    session_stream.publish(session_id, payload)
 
 
 def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
@@ -1929,6 +1957,75 @@ def effective_host_id(
     return None
 
 
+def runner_is_exclusive(
+    runner_id: str,
+    session_id: str,
+    conversations: Iterable[Conversation],
+) -> bool:
+    """Whether no other unarchived session is bound to this runner."""
+    return not any(
+        row.runner_id == runner_id and row.id != session_id and not row.archived
+        for row in conversations
+    )
+
+
+def retained_runner_ids(
+    conversation_store: ConversationStore,
+    host_id: str,
+    session_id: str,
+) -> list[str]:
+    """Find runners on this host that another live session still needs."""
+    conversations: list[Conversation] = []
+    after = None
+    while True:
+        page = conversation_store.list_conversations(
+            limit=1000,
+            after=after,
+            kind=None,
+            include_search_match=False,
+        )
+        conversations.extend(page.data)
+        if not page.has_more or not page.data:
+            break
+        after = page.data[-1].id
+    by_id: dict[str, Conversation | None] = {row.id: row for row in conversations}
+    children: dict[str, list[str]] = defaultdict(list)
+    groups: dict[str, list[Conversation]] = defaultdict(list)
+    hosts: dict[str, str | None] = {}
+    for row in conversations:
+        if row.runner_id:
+            groups[row.runner_id].append(row)
+    pending = deque(conversations)
+    while pending:
+        row = pending.popleft()
+        parent_id = row.parent_conversation_id
+        if parent_id is not None:
+            children[parent_id].append(row.id)
+        if row.host_id is not None or parent_id is None:
+            hosts[row.id] = row.host_id
+        elif parent_id not in by_id:
+            parent = conversation_store.get_conversation(parent_id)
+            by_id[parent_id] = parent
+            if parent is None:
+                hosts[parent_id] = None
+            else:
+                pending.append(parent)
+    # Propagate inherited hosts once per edge, including hostless subtrees.
+    frontier = deque(hosts)
+    while frontier:
+        parent_id = frontier.popleft()
+        for child_id in children[parent_id]:
+            if child_id not in hosts:
+                hosts[child_id] = hosts[parent_id]
+                frontier.append(child_id)
+    return sorted(
+        runner_id
+        for runner_id, bound in groups.items()
+        if any(hosts.get(row.id) == host_id for row in bound)
+        and not runner_is_exclusive(runner_id, session_id, bound)
+    )
+
+
 def _publish_elicitation_request_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
@@ -3184,26 +3281,61 @@ async def _persist_external_permission_mode_change(
     _publish_permission_mode(session_id, mode)
 
 
+def _codex_permission_observation_labels(
+    observed: CodexPermissionObservation, conv: Conversation
+) -> tuple[dict[str, str], CodexPermissionObservation]:
+    """Bind a validated report to receiving context before any persistence."""
+    observed = codex_permission_observation_with_metadata(
+        observed, received_at=now_epoch(), runner_id=conv.runner_id
+    )
+    encoded = encode_codex_permission_observation(observed)
+    if len(encoded) > LABEL_VALUE_MAX_LEN:
+        raise ValueError("permission observation exceeds label storage capacity")
+    return {
+        _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY: observed.mode,
+        CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY: encoded,
+    }, decode_codex_permission_observation(encoded)
+
+
 async def _persist_external_codex_approval_mode_change(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
 ) -> None:
-    """Persist a Codex-observed approval change (from a TUI ``/permissions`` switch).
-
-    The forwarder posts two things it saw in ``thread/settings/updated``:
-    ``terminal_launch_args`` (the create/fork/resume vocabulary, merged into the
-    row) and ``approval_mode`` (the runtime ``/permissions`` preset, stamped on
-    the read-back label + published live so the web picker tracks the TUI). Both
-    are optional but at least one must be present.
-    """
+    """Keep producer readback separate from legacy explicit control fields."""
+    if "permission_observation" in body.data:
+        try:
+            if set(body.data) != {"approval_mode", "permission_observation"}:
+                raise ValueError("observation packets cannot include control or extra fields")
+            observed = codex_permission_observation_from_payload(
+                body.data["permission_observation"]
+            )
+            if body.data["approval_mode"] != observed.mode:
+                raise ValueError("approval_mode disagrees with the observation")
+            labels, observed = _codex_permission_observation_labels(observed, conv)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if any(conv.labels.get(key) != value for key, value in labels.items()):
+            await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
+        # A prior attempt may have persisted before its publish failed.
+        _publish_codex_approval_mode(session_id, observed.mode, observed)
+        return
     raw_args = body.data.get("terminal_launch_args")
     raw_mode = body.data.get("approval_mode")
     if raw_args is None and raw_mode is None:
         raise OmnigentError(
             "external_codex_approval_mode_change requires data.terminal_launch_args "
             "or data.approval_mode",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Validate the entire legacy request before its first control write.
+    if raw_mode is not None and (
+        not isinstance(raw_mode, str) or raw_mode not in CODEX_NATIVE_PERMISSION_VALUES
+    ):
+        raise OmnigentError(
+            "external_codex_approval_mode_change data.approval_mode must be one of "
+            f"{sorted(CODEX_NATIVE_PERMISSION_VALUES)}",
             code=ErrorCode.INVALID_INPUT,
         )
     if raw_args is not None:
@@ -3232,18 +3364,16 @@ async def _persist_external_codex_approval_mode_change(
             )
     if raw_mode is None:
         return
-    if raw_mode not in CODEX_NATIVE_PERMISSION_VALUES:
-        raise OmnigentError(
-            "external_codex_approval_mode_change data.approval_mode must be one of "
-            f"{sorted(CODEX_NATIVE_PERMISSION_VALUES)}; got {raw_mode!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY) == raw_mode:
+    labels = {
+        _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY: raw_mode,
+        CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY: "",
+    }
+    if all(conv.labels.get(key) == value for key, value in labels.items()):
         return
     await asyncio.to_thread(
         conversation_store.set_labels,
         session_id,
-        {_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY: raw_mode},
+        labels,
     )
     _publish_codex_approval_mode(session_id, raw_mode)
 
@@ -5410,12 +5540,10 @@ def _require_codex_approval_mode_forward(
     runner_result: _RunnerForwardResult | None,
 ) -> None:
     """
-    Fail when a live codex approval-mode switch wasn't applied by the runner.
+    Require the existing runner response for a live Codex control request.
 
-    The runner applies the mode by driving Codex's own ``/permissions`` popup
-    and only returns 2xx once it confirms Codex echoed the switch. Persisting the
-    label without a confirmed forward would let the picker claim a mode the TUI
-    isn't in, so an explicit switch requires a reachable runner that confirmed it.
+    The popup echo matcher is not bound to this request. A successful response
+    therefore supports an application receipt, not fresh native confirmation.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param mode: Requested approval mode, e.g. ``"read-only"``.
@@ -6734,14 +6862,13 @@ def _spawn_superseded_runner_stop(
     host_id: str,
     runner_id: str,
     host_registry: HostRegistry,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Stop a relaunch's superseded runner as a retained background task.
 
-    The relaunch has already rotated the session's binding, so the old
-    runner serves nothing — but left alive it idles forever (tunnel still
-    authenticating, transcript forwarder still tailing the session): one
-    leaked generation per relaunch, each holding a native pane. Detached so
+    The relaunch has already rotated the session's binding. Stop its old
+    runner only if no other live session still needs it. Detached so
     the relaunch's latency never waits out the stop's ack timeout; the host
     connection is live by construction here (the launch frame just went
     over it), so delivery is the overwhelmingly common case, and the
@@ -6752,10 +6879,16 @@ def _spawn_superseded_runner_stop(
     :param host_id: The session's owning host.
     :param runner_id: The superseded runner's id.
     :param host_registry: Registry holding the live host tunnel.
+    :param conversation_store: Store holding the current runner bindings.
     """
 
     async def _stop_and_log() -> None:
         try:
+            bound = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+            if not runner_is_exclusive(runner_id, session_id, bound):
+                return
             await _stop_session_host_runner(
                 session_id,
                 host_id,
@@ -6811,6 +6944,9 @@ async def _launch_runner_on_host_impl(
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
+    from omnigent.server.host_load_queue import require_start_allowed
+
+    require_start_allowed(conv)
     lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
     async with lock:
         # Re-read under the lock: a binding that moved past the caller's
@@ -6855,6 +6991,9 @@ async def _launch_runner_on_host_locked(
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
+    retained = await asyncio.to_thread(
+        retained_runner_ids, conversation_store, host_conn.host_id, conv.id
+    )
     startup = await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
@@ -6885,7 +7024,7 @@ async def _launch_runner_on_host_locked(
             # doesn't idle on the host forever (tunnel still authenticating,
             # forwarder still tailing this session).
             _spawn_superseded_runner_stop(
-                conv.id, conv.host_id, superseded_runner_id, host_registry
+                conv.id, conv.host_id, superseded_runner_id, host_registry, conversation_store
             )
 
         # Pull workspace from the session row — populated and validated
@@ -6927,6 +7066,7 @@ async def _launch_runner_on_host_locked(
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),
+                retain_runner_ids=retained,
             )
         )
         try:
@@ -8374,7 +8514,7 @@ async def _dispatch_skill_slash_command_to_runner(
     created_by: str | None,
     legacy_skill_names: Mapping[str, str] | None = None,
     startup_input: StartupInputContext | None = None,
-) -> str:
+) -> _SessionEventDispatchResult:
     """
     Persist a skill slash command and forward hidden skill context.
 
@@ -8410,7 +8550,7 @@ async def _dispatch_skill_slash_command_to_runner(
     :param legacy_skill_names: Frontmatter names of the agent's bundled
         skills keyed by command, e.g. ``{"review": "code-review"}``, for
         runners that predate directory-name invocation.
-    :returns: The persisted visible ``slash_command`` item id.
+    :returns: The visible item id and whether the runner accepted the input.
     :raises OmnigentError: If the skill is not exposed for the
         session, or the runner is unreachable while resolving it.
     """
@@ -8435,7 +8575,9 @@ async def _dispatch_skill_slash_command_to_runner(
         legacy_name=(legacy_skill_names or {}).get(skill_name),
     )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
-        return startup_input.input_id
+        return _SessionEventDispatchResult(
+            item_id=startup_input.input_id, pending_id=None, forwarded=False
+        )
     startup_input_id = startup_input.input_id if startup_input is not None else None
 
     response_id = f"turn_{uuid.uuid4().hex}"
@@ -8521,11 +8663,15 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
-        await runner_client.post(
+        response = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
         )
+        if response.status_code >= 400:
+            return _SessionEventDispatchResult(
+                item_id=visible.id, pending_id=None, forwarded=False
+            )
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -8540,7 +8686,7 @@ async def _dispatch_skill_slash_command_to_runner(
             "The runner may be restarting — retry or spawn a new session.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
-    return visible.id
+    return _SessionEventDispatchResult(item_id=visible.id, pending_id=None)
 
 
 def _title_content_from_item(
@@ -10327,7 +10473,14 @@ async def _stream_live_events(
                             )
                         }
                     )
-                yield _format_sse(event_type, validated.model_dump())
+                payload = validated.model_dump()
+                if isinstance(validated, SessionCodexApprovalModeEvent):
+                    # The typed model re-materializes absent optional fields as null;
+                    # only the published keys decide presence on the wire.
+                    for key in _CODEX_OBSERVATION_PROJECTION_KEYS:
+                        if key not in event:
+                            payload.pop(key)
+                yield _format_sse(event_type, payload)
     except session_stream.SubscriberOverflowError:
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
@@ -11660,6 +11813,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    if any(is_codex_permission_observation_label_key(key) for key in labels):
+        raise OmnigentError(
+            "permission observation labels are server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     from omnigent.server.startup_registration import (
         STARTUP_CREATE_PREPARATION_LABEL_KEY,
         STARTUP_REGISTRATION_LABEL_KEY,
@@ -11668,7 +11826,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     reserved_startup_key = next(
         (
             key
-            for key in (STARTUP_REGISTRATION_LABEL_KEY, STARTUP_CREATE_PREPARATION_LABEL_KEY)
+            for key in (
+                STARTUP_REGISTRATION_LABEL_KEY,
+                STARTUP_CREATE_PREPARATION_LABEL_KEY,
+                "omnigent.startup.host_load",
+            )
             if key in labels
         ),
         None,
@@ -11686,7 +11848,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {permission_key!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
-    handoff_key = next((key for key in labels if key.startswith("omnigent.handoff.")), None)
+    from omnigent.child_checkin import CHECKIN_LABEL_PREFIX
+    from omnigent.stores.conversation_store import _may_collate_to
+
+    handoff_key = next(
+        (
+            key
+            for key in labels
+            if key.startswith("omnigent.handoff.")
+            or _may_collate_to(key, CHECKIN_LABEL_PREFIX, prefix=True)
+        ),
+        None,
+    )
     if handoff_key is not None:
         raise OmnigentError(
             f"label {handoff_key!r} is server-internal and cannot be set by clients",

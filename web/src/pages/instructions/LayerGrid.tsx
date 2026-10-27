@@ -5,11 +5,14 @@ import type { Host } from "@/hooks/useHosts";
 import {
   hasInstructionText,
   layerId,
+  layerShape,
   type InstructionLayers,
+  type InstructionRole,
   type LayerKey,
 } from "@/hooks/useInstructionLayers";
 
 export function LayerGrid({
+  role,
   data,
   hosts,
   agents,
@@ -23,6 +26,7 @@ export function LayerGrid({
   onEdit,
   onRoute,
 }: {
+  role: InstructionRole;
   data: InstructionLayers;
   hosts: Host[];
   allHosts: Host[];
@@ -37,6 +41,13 @@ export function LayerGrid({
   onRoute: (host: string, agent: string) => void;
 }) {
   const layers = new Map(data.data.map((layer) => [layerId(layer), layer]));
+  const removedLayers = data.data.filter(
+    (layer) =>
+      layer.host_removed &&
+      (role === "route"
+        ? layer.scope !== "mother" && layer.scope !== "child"
+        : layer.scope === role),
+  );
   const cell = (key: LayerKey, title: string) => {
     const layer = layers.get(layerId(key));
     return (
@@ -48,7 +59,7 @@ export function LayerGrid({
         aria-label={`Edit ${title}`}
       >
         <span className="block text-sm font-medium">
-          {key.scope === "independent" ? "Independent" : title}
+          {layerShape(key) === "independent" ? "Independent" : title}
         </span>
         <span className="text-xs text-muted-foreground">
           {layer && hasInstructionText(layer.text)
@@ -76,31 +87,33 @@ export function LayerGrid({
   };
   return (
     <div className="space-y-5">
-      <div className="grid gap-3 sm:grid-cols-2">
-        {(["mother", "child"] as const).map((scope) => (
-          <div className="rounded-lg border" key={scope}>
-            {cell(
-              { scope, agent_key: "", host_id: "" },
-              scope === "mother" ? "Mother block" : "Child block",
-            )}
-          </div>
-        ))}
-      </div>
       <p className="text-sm text-muted-foreground">
-        Shared → Agent → Host. An independent cell replaces all three on its route. Mother and child
-        blocks apply afterwards.
+        Shared → Agent → Host.{" "}
+        {role === "route"
+          ? "An independent cell replaces all three on its route. Mother and child instructions apply afterwards."
+          : `An independent cell replaces only these ${role} instructions. Shared instructions still apply.`}
       </p>
       <div className="overflow-x-auto rounded-lg border">
         <table className="w-full border-collapse text-left">
-          <caption className="sr-only">Instruction layers by host and agent</caption>
+          <caption className="sr-only">
+            {role === "route"
+              ? "Instruction layers by host and agent"
+              : `${role === "mother" ? "Mother" : "Child"} instruction layers by host and agent`}
+          </caption>
           <thead>
             <tr className="border-b bg-muted/40">
               <th className="min-w-40 p-2">
-                {cell({ scope: "shared", agent_key: "", host_id: "" }, "Shared")}
+                {cell(
+                  { scope: role === "route" ? "shared" : role, agent_key: "", host_id: "" },
+                  "Shared",
+                )}
               </th>
               {agents.map((agent) => (
                 <th key={agent.key} className="min-w-44 border-l p-2">
-                  {cell({ scope: "agent", agent_key: agent.key, host_id: "" }, agent.display_name)}
+                  {cell(
+                    { scope: role === "route" ? "agent" : role, agent_key: agent.key, host_id: "" },
+                    agent.display_name,
+                  )}
                   {remove("agents", agent.key, agent.display_name)}
                 </th>
               ))}
@@ -111,7 +124,14 @@ export function LayerGrid({
             {hosts.map((host) => (
               <tr className="border-b last:border-b-0" key={host.host_id}>
                 <th className="p-2 font-normal">
-                  {cell({ scope: "host", agent_key: "", host_id: host.host_id }, host.name)}
+                  {cell(
+                    {
+                      scope: role === "route" ? "host" : role,
+                      agent_key: "",
+                      host_id: host.host_id,
+                    },
+                    host.name,
+                  )}
                   {remove("hosts", host.host_id, host.name)}
                 </th>
                 {agents.map((agent) => {
@@ -119,7 +139,7 @@ export function LayerGrid({
                     (route) => route.host_id === host.host_id && route.agent_key === agent.key,
                   );
                   const independentKey: LayerKey = {
-                    scope: "independent",
+                    scope: role === "route" ? "independent" : role,
                     agent_key: agent.key,
                     host_id: host.host_id,
                   };
@@ -129,10 +149,7 @@ export function LayerGrid({
                       {independent &&
                       !independent.host_removed &&
                       hasInstructionText(independent.text) ? (
-                        cell(
-                          { scope: "independent", agent_key: agent.key, host_id: host.host_id },
-                          `${host.name} / ${agent.display_name}`,
-                        )
+                        cell(independentKey, `${host.name} / ${agent.display_name}`)
                       ) : (
                         <div className="px-3 py-2">
                           <span className="block text-sm font-medium">Stacked</span>
@@ -142,14 +159,7 @@ export function LayerGrid({
                               variant="ghost"
                               aria-label={`Make ${host.name} / ${agent.display_name} independent`}
                               onClick={() =>
-                                onEdit(
-                                  {
-                                    scope: "independent",
-                                    agent_key: agent.key,
-                                    host_id: host.host_id,
-                                  },
-                                  `${host.name} / ${agent.display_name}`,
-                                )
+                                onEdit(independentKey, `${host.name} / ${agent.display_name}`)
                               }
                             >
                               Make independent
@@ -210,20 +220,18 @@ export function LayerGrid({
           Connect a host to view routes. Shared, Agent and Role layers can still be edited.
         </p>
       )}
-      {data.data.some((layer) => layer.host_removed) && (
+      {removedLayers.length > 0 && (
         <section>
           <h3 className="mb-2 text-sm font-medium">Removed hosts</h3>
           <p className="text-xs text-muted-foreground">
             Their saved layers and history are retained.
           </p>
-          {data.data
-            .filter((layer) => layer.host_removed)
-            .map((layer) => (
-              <p className="mt-1 break-all text-sm" key={layerId(layer)}>
-                {layer.host_id} · {layer.agent_key || "All agents"} · {layer.chars.toLocaleString()}{" "}
-                chars
-              </p>
-            ))}
+          {removedLayers.map((layer) => (
+            <p className="mt-1 break-all text-sm" key={layerId(layer)}>
+              {layer.host_id} · {layer.agent_key || "All agents"} · {layer.chars.toLocaleString()}{" "}
+              chars
+            </p>
+          ))}
         </section>
       )}
     </div>

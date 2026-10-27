@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import tomllib
 
 from omnigent.inner.codex_executor import _CodexAppServerSession, _populate_codex_home_config
 from omnigent.inner.codex_worker import CodexWorkerLaunch
@@ -247,9 +248,11 @@ async def test_signer_exit_during_worker_spawn_tears_worker_down(
     assert session._worker_launch is None
 
 
+@pytest.mark.parametrize("wrapper", [False, True])
 async def test_signer_backed_home_excludes_host_credential_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    wrapper: bool,
 ) -> None:
     signer = _Signer([])
     process = _Process()
@@ -265,11 +268,16 @@ async def test_signer_backed_home_excludes_host_credential_files(
     )
     session = _session(tmp_path, signer)
     session._request = AsyncMock(return_value={"result": {}})
+    runtime = "/opt/work/omnigent/runtime/bin/codex"
+    if wrapper:
+        session._launch_prepared = True
+        session._env["OMNIGENT_CODEX_RUNTIME_BIN"] = runtime
 
     await session.start()
 
     assert populate.call_args.kwargs["include_credentials"] is False
     assert populate.call_args.kwargs["minimal_config"] is True
+    assert populate.call_args.kwargs["runtime_bin"] == (runtime if wrapper else None)
     probe_path, probe_cwd, probe_os_env = populate.call_args.kwargs["required_brokered_probe"]
     assert probe_path == "/bin/echo"
     assert probe_cwd == tmp_path
@@ -385,7 +393,7 @@ def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> 
     assert not (target / "auth.json").exists()
     assert not (target / ".credentials.json").exists()
     assert not (target / "memories_1.sqlite").exists()
-    assert not (target / "config.toml").exists()
+    assert tomllib.loads((target / "config.toml").read_text()) == {}
 
 
 async def test_signer_preflight_failure_never_creates_codex_home_or_worker(

@@ -11,6 +11,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Iterator
@@ -162,6 +163,9 @@ def _git_probe_workspace(
 ) -> tuple[Path, Path, list[str]]:
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
+    child_home = sibling_repo / "child-home"
+    child_home.mkdir()
+    monkeypatch.setenv("HOME", str(child_home))
     monkeypatch.setenv("CODEX_HOME", str(source_home))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "global.gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
@@ -194,6 +198,13 @@ def _git_probe_workspace(
         commands[2] = f"echo x > {common / 'hooks' / 'probe'}"
         commands[3] = f"git config --file {common / 'config'} omniprobe.flag 1"
         commands.append(f"echo x > {common / 'worktrees' / 'linked-workspace' / 'commondir'}")
+    if sys.platform == "darwin":
+        cache = Path.home() / "Library" / "Caches" / "ms-playwright"
+        cache.parent.mkdir(parents=True)
+        commands.insert(
+            2,
+            f"mkdir -p {shlex.quote(str(cache))} && echo x > {shlex.quote(str(cache / 'probe'))}",
+        )
     subprocess.run(["git", "-C", str(sibling_repo), "init"], check=True, capture_output=True)
     commands.append(f"echo x > {shlex.quote(str(sibling_repo / '.git' / 'probe'))}")
     return workspace, common, commands
@@ -213,7 +224,7 @@ async def test_native_codex_git_write_profile(
     codex_path = shutil.which("codex")
     assert codex_path is not None
     workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked, sibling_repo)
-    successful_probes = 2
+    successful_probes = 2 + int(sys.platform == "darwin")
     if broad_root:
         (tmp_path / "source-codex-home" / "config.toml").write_text(
             f"[sandbox_workspace_write]\nwritable_roots = [{json.dumps(str(common.parent))}]\n"
@@ -234,8 +245,7 @@ async def test_native_codex_git_write_profile(
             commands.append(f"echo x > {shlex.quote(str(target))}")
     child_tmp = tmp_path / "child-tmp"
     child_tmp.mkdir()
-    child_home = tmp_path / "child-home"
-    child_home.mkdir()
+    child_home = Path.home()
     provider = _ScriptedProvider(["git commit --allow-empty -m control", None, *commands, None])
     provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
     provider_thread.start()
@@ -326,8 +336,7 @@ async def test_sdk_codex_git_write_profile(
     if version is None or version < (0, 139, 0):
         pytest.skip("SDK Git profile requires Codex >= 0.139.0")
     workspace, common, commands = _git_probe_workspace(tmp_path, monkeypatch, linked, sibling_repo)
-    child_home = tmp_path / "child-home"
-    child_home.mkdir()
+    child_home = Path.home()
     child_tmp = tmp_path / "child-tmp"
     child_tmp.mkdir()
     provider = _ScriptedProvider(["git commit --allow-empty -m control", None, *commands, None])
@@ -360,8 +369,9 @@ async def test_sdk_codex_git_write_profile(
         assert session is not None and session._workspace_profile is not None, version
         exits = _probe_exit_codes(provider, [0, *range(2, len(commands) + 2)])
         assert exits[0] != 0, exits
-        assert exits[1:3] == [0, 0], exits
-        assert all(code != 0 for code in exits[3:]), exits
+        successful_probes = 2 + int(sys.platform == "darwin")
+        assert exits[1 : successful_probes + 1] == [0] * successful_probes, exits
+        assert all(code != 0 for code in exits[successful_probes + 1 :]), exits
         assert not (common / "hooks" / "probe").exists()
         assert not (sibling_repo / ".git" / "probe").exists()
         configured = subprocess.run(

@@ -4,6 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   readUsageContextPreferences,
   usageContextSourceKey,
+  usageContextLevelKey,
+  DEFAULT_USAGE_CONTEXT_PREFERENCES,
+  writeUsageContextPreferences,
   USAGE_CONTEXT_STORAGE_KEY,
 } from "@/lib/usageContextPreferences";
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
@@ -101,7 +104,7 @@ describe("ContextUsageSettings", () => {
   it("shows friendly source names and keeps overrides scoped to the exact source", async () => {
     const { rerender } = render(<ContextUsageSettings />);
 
-    expect(screen.getByText("Office MacBook")).toBeInTheDocument();
+    expect(screen.getAllByText("Office MacBook")).toHaveLength(2);
     expect(screen.getByText("Pi")).toBeInTheDocument();
     expect(screen.queryByText("host-friendly")).not.toBeInTheDocument();
     expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("No data");
@@ -158,8 +161,8 @@ describe("ContextUsageSettings", () => {
       });
     });
     expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("Saved sources");
-    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-a");
-    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-b");
+    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("2 model overrides");
+    expect(screen.getByTestId("saved-context-sources")).not.toHaveTextContent("model-a");
     expect(screen.getByText(/2 sources saved/)).toBeInTheDocument();
     expect(screen.getByText(/Manual values change only this indicator/)).toBeInTheDocument();
   });
@@ -175,16 +178,22 @@ describe("ContextUsageSettings", () => {
     fireEvent.blur(bufferInput);
 
     await waitFor(() =>
-      expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-a"),
+      expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("1 model override"),
     );
+    fireEvent.click(screen.getByRole("button", { name: "Manage saved sources" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Delete Office MacBook polly model-a" }));
     const dialog = screen.getByRole("dialog", { name: "Delete saved source?" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "Manage saved sources" })).getByRole("button", {
+        name: "Close",
+      }),
+    );
 
     await waitFor(() => expect(contextInput).toHaveValue(null));
     expect(bufferInput).toHaveValue(null);
-    expect(screen.queryByTestId("saved-context-sources")).not.toBeInTheDocument();
+    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("0 model overrides");
   });
 
   it("shows the reported Compact buffer as the input placeholder", () => {
@@ -320,4 +329,117 @@ describe("ContextUsageSettings", () => {
       expect.stringContaining("No usage limits received"),
     );
   });
+
+  it("edits only the selected level and logical field while showing inherited provenance", () => {
+    const source = { hostId: "host-friendly", agentName: "polly", harness: "pi", model: "model-a" };
+    const key = usageContextSourceKey(source);
+    const cell = usageContextLevelKey(source, "cell");
+    const column = usageContextLevelKey(source, "column");
+    writeUsageContextPreferences({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: {
+        [cell]: { contextWindowTokens: 400_000, autoCompactBufferTokens: 20_000 },
+        [column]: { contextWindowTokens: 500_000, autoCompactBufferTokens: 30_000 },
+      },
+    });
+    render(<ContextUsageSettings />);
+    const context = screen.getByLabelText("Context window override in tokens");
+    expect(context).toHaveValue(null);
+    expect(screen.getByLabelText("Automatic Compact buffer in tokens")).toHaveValue(null);
+    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
+      "Context 400,000 · Office MacBook × polly",
+    );
+    fireEvent.change(context, { target: { value: "300000" } });
+    fireEvent.blur(context);
+    expect(readUsageContextPreferences().overrides[key]).toEqual({
+      contextWindowTokens: 300_000,
+      autoCompactBufferTokens: null,
+    });
+    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
+      "Context 300,000 · model override",
+    );
+    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
+      "Buffer 20,000 · Office MacBook × polly",
+    );
+    fireEvent.click(screen.getByRole("combobox", { name: "Edit source level" }));
+    fireEvent.click(screen.getByRole("option", { name: "polly · all hosts" }));
+    expect(context).toHaveValue(500000);
+    fireEvent.change(context, { target: { value: "600000" } });
+    fireEvent.blur(context);
+    expect(readUsageContextPreferences().overrides[column]).toEqual({
+      contextWindowTokens: 600_000,
+      autoCompactBufferTokens: 30_000,
+    });
+    expect(readUsageContextPreferences().overrides[cell]?.contextWindowTokens).toBe(400_000);
+    expect(readUsageContextPreferences().overrides[key]?.contextWindowTokens).toBe(300_000);
+  });
+
+  it("shows ignored inherited buffer levels and the reported fallback", () => {
+    const source = { hostId: "host-friendly", agentName: "polly", harness: "pi", model: "model-a" };
+    writeUsageContextPreferences({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: {
+        [usageContextLevelKey(source, "column")]: {
+          contextWindowTokens: null,
+          autoCompactBufferTokens: 150_000,
+        },
+      },
+    });
+    mocks.autoCompactTokenLimit = 300_000;
+    render(<ContextUsageSettings />);
+    const context = screen.getByLabelText("Context window override in tokens");
+    fireEvent.change(context, { target: { value: "100000" } });
+    fireEvent.blur(context);
+    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
+      "Buffer 30,000 · reported",
+    );
+    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
+      "Ignored polly · all hosts: buffer ≥ context; using reported.",
+    );
+  });
+
+  it.each([true, false])(
+    "copies the exact model through Use current source while editing a column (column saved: %s)",
+    (hasColumn) => {
+      const source = {
+        hostId: "host-friendly",
+        agentName: "polly",
+        harness: "pi",
+        model: "model-a",
+      };
+      const exact = usageContextSourceKey(source);
+      const target = usageContextSourceKey({ ...source, model: "model-b" });
+      const column = usageContextLevelKey(source, "column");
+      const exactOverride = { contextWindowTokens: 300_000, autoCompactBufferTokens: 10_000 };
+      const columnOverride = { contextWindowTokens: 500_000, autoCompactBufferTokens: 20_000 };
+      writeUsageContextPreferences({
+        ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+        overrides: {
+          [exact]: exactOverride,
+          [target]: { contextWindowTokens: 200_000, autoCompactBufferTokens: 5_000 },
+          ...(hasColumn ? { [column]: columnOverride } : {}),
+        },
+      });
+      render(<ContextUsageSettings />);
+      fireEvent.click(screen.getByRole("combobox", { name: "Edit source level" }));
+      fireEvent.click(screen.getByRole("option", { name: "polly · all hosts" }));
+      expect(screen.getByLabelText("Context window override in tokens")).toHaveValue(
+        hasColumn ? 500_000 : null,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Manage saved sources" }));
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: "Select Office MacBook polly model-b" }),
+      );
+      const useCurrent = screen.getByRole("button", { name: "Use current source" });
+      expect(useCurrent).toBeEnabled();
+      fireEvent.click(useCurrent);
+      expect(screen.getByLabelText("Context total")).toHaveValue(300_000);
+      expect(screen.getByLabelText("Compact buffer")).toHaveValue(10_000);
+      fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+      const saved = readUsageContextPreferences().overrides;
+      expect(saved[target]).toEqual(exactOverride);
+      expect(saved[exact]).toEqual(exactOverride);
+      expect(saved[column]).toEqual(hasColumn ? columnOverride : undefined);
+    },
+  );
 });

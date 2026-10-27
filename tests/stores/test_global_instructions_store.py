@@ -13,7 +13,7 @@ from threading import Barrier
 import pytest
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.runtime.instruction_layers import compose_route
+from omnigent.runtime.instruction_layers import compose_role, compose_route, select_role_layers
 from omnigent.stores.global_instructions_store import InstructionRevisionConflict
 from omnigent.stores.global_instructions_store.sqlalchemy_store import (
     SqlAlchemyGlobalInstructionsStore,
@@ -89,7 +89,13 @@ def test_list_revisions_newest_first_with_limit(
         ("host", "", "host-a"),
         ("independent", "codex", "host-a"),
         ("mother", "", ""),
+        ("mother", "codex", ""),
+        ("mother", "", "host-a"),
+        ("mother", "codex", "host-a"),
         ("child", "", ""),
+        ("child", "codex", ""),
+        ("child", "", "host-a"),
+        ("child", "codex", "host-a"),
     ],
 )
 def test_layer_history_and_blank_latest_are_isolated(store, scope, agent, host):
@@ -123,6 +129,52 @@ def test_routes_skip_missing_keys_and_restore_stack_after_clearing_independent(s
     assert compose_route(store.latest_layers(None, "codex")).text == "shared\n\nagent"
     assert compose_route(store.latest_layers("host-a", None)).text == "shared\n\nhost"
     assert compose_route(store.latest_layers(None, None)).text == "shared"
+
+
+@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("route_independent", [False, True])
+def test_latest_layers_reads_route_and_all_role_keys_in_one_session(
+    store, monkeypatch, role, route_independent
+):
+    from unittest.mock import Mock
+
+    store.save("Route", created_by=None)
+    if route_independent:
+        store.save(
+            "Own route", created_by=None, scope="independent", agent_key="codex", host_id="host-a"
+        )
+    expected = [
+        store.save(text, created_by=None, scope=role, agent_key=agent, host_id=host)
+        for text, agent, host in [
+            ("Shared", "", ""),
+            ("Agent", "codex", ""),
+            ("Host", "", "host-a"),
+            ("Cell", "codex", "host-a"),
+        ]
+    ]
+    store.save("Other agent", created_by=None, scope=role, agent_key="claude")
+    store.save("Other host", created_by=None, scope=role, host_id="host-b")
+    session = Mock(wraps=store._session)
+    monkeypatch.setattr(store, "_session", session)
+    layers = store.latest_layers("host-a", "codex", role=role)
+    assert session.call_count == 1
+    assert [r for r in layers if r.scope == role] == expected
+    assert compose_route(layers).text == ("Own route" if route_independent else "Route")
+    assert select_role_layers(layers, role, "host-a", "codex") == [expected[-1]]
+    store.save(" \n", created_by=None, scope=role, agent_key="codex", host_id="host-a")
+    layers = store.latest_layers("host-a", "codex", role=role)
+    assert (
+        compose_role(select_role_layers(layers, role, "host-a", "codex"))
+        == "Shared\n\nAgent\n\nHost"
+    )
+    assert (
+        compose_role(
+            select_role_layers(store.latest_layers(None, "codex", role=role), role, None, "codex")
+        )
+        == "Shared\n\nAgent"
+    )
+    with workspace_scope(22):
+        assert store.latest_layers("host-a", "codex", role=role) == []
 
 
 def test_layer_reads_and_writes_are_workspace_scoped(store):
@@ -159,8 +211,10 @@ def test_layer_reads_and_writes_are_workspace_scoped(store):
         ("host", "codex", "host-a"),
         ("independent", "codex", ""),
         ("independent", "", "host-a"),
-        ("mother", "codex", ""),
-        ("child", "", "host-a"),
+        ("mother", " codex", ""),
+        ("child", "", "host-a "),
+        ("mother", "a" * 65, ""),
+        ("child", "", "h" * 65),
         ("agent", "  codex", ""),
         ("host", "", " "),
         ("agent", "a" * 65, ""),

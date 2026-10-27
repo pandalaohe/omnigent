@@ -7,10 +7,13 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import HTTPException
+from starlette.datastructures import Headers
 
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes._sessions.helpers import _dispatch_skill_slash_command_to_runner
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.startup_inputs import StartupInputContext
 from omnigent.startup_protocol import StartupAttemptRef
 from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -98,3 +101,36 @@ async def test_forward_keeps_one_pending_owner_until_vendor_accepts(
     assert forwarded[0]["startup_attempt"] == attempt.model_dump(mode="json")
     assert forwarded[0]["startup_required"] is True
     consumed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_skill_reports_not_forwarded(db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Session")
+    context = StartupInputContext(app=None, headers=Headers(), user_id=None, input_id=uuid4().hex)
+    requests = []
+
+    def resolve(request):
+        requests.append(request.url.path)
+        return httpx.Response(200, json={"meta_text": "skill content"})
+
+    body = SessionEventInput(
+        type="slash_command", data={"kind": "skill", "name": "review", "arguments": ""}
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(resolve)
+    ) as runner:
+        result = await _dispatch_skill_slash_command_to_runner(
+            conv.id,
+            conv,
+            body,
+            store,
+            runner,
+            agent=Mock(),
+            has_mcp_servers=False,
+            created_by=None,
+            startup_input=context,
+        )
+    assert result.forwarded is False and result.item_id == context.input_id
+    assert requests == [f"/v1/sessions/{conv.id}/skills/resolve"]
+    assert store.list_items(conv.id).data == []

@@ -64,6 +64,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
+        # Owner/admin startup-observation readback: registered unconditionally
+        # with the read-only session tools, so every test spec carries it.
+        "sys_session_get_startup_observation_v1",
         "sys_session_rename",
         "sys_session_handover",
         # Read-only agent discovery tools are likewise always available
@@ -493,6 +496,7 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     assert "sys_session_send" not in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names
+    assert "sys_child_checkin" not in names
     # Sharing has its OWN dedicated `share:` flag (default `none`), so it
     # is absent here even though this spec also lacks spawn/agents. A
     # regression registering it by default would let any prompt-injected
@@ -520,6 +524,7 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_send" in names
     assert "sys_session_close" in names
     assert "sys_session_create" in names
+    assert "sys_child_checkin" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
     # Intelligent routing advisor stays hidden when routing is disabled.

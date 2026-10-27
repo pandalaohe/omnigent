@@ -6,6 +6,8 @@ import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import {
   readUsageContextPreferences,
   usageContextSourceKey,
+  usageContextSourceFromKey,
+  usageContextLevelKey,
   writeUsageContextPreferences,
   type UsageContextOverride,
   type UsageContextPreferences,
@@ -39,15 +41,21 @@ function renderSources(options: {
   currentOverride?: UsageContextOverride;
   reportedContextWindow?: number | null;
 }) {
-  return render(
+  const result = render(
     <SavedContextSources
       preferences={options.preferences}
-      currentSourceKey={options.currentSourceKey ?? ""}
+      currentSourceKey={options.currentSourceKey ?? sourceKey("host-a", "polly", "pi", "model-a")}
       hosts={HOSTS}
       currentOverride={options.currentOverride ?? override(null, null)}
       reportedContextWindow={options.reportedContextWindow}
     />,
   );
+  openManager();
+  return result;
+}
+
+function openManager() {
+  fireEvent.click(screen.getByRole("button", { name: "Manage Alpha × polly · Pi" }));
 }
 
 function LiveSources() {
@@ -55,16 +63,17 @@ function LiveSources() {
   return (
     <SavedContextSources
       preferences={preferences}
-      currentSourceKey=""
+      currentSourceKey={sourceKey("host-a", "polly", "pi", "model-a")}
       hosts={HOSTS}
       currentOverride={override(null, null)}
     />
   );
 }
 
-function chooseFilter(name: "Computer" | "Agent", option: string) {
-  fireEvent.click(screen.getByRole("combobox", { name }));
-  fireEvent.click(screen.getByRole("option", { name: option }));
+function renderLiveSources() {
+  const result = render(<LiveSources />);
+  openManager();
+  return result;
 }
 
 beforeEach(() => {
@@ -75,49 +84,22 @@ afterEach(cleanup);
 
 describe("SavedContextSources", () => {
   const polly = sourceKey("host-a", "polly", "pi", "model-a");
-  const claude = sourceKey("host-a", "claude", "claude-sdk", "opus");
+  const claude = sourceKey("host-a", "polly", "pi", "model-b");
 
-  it("renders nothing without saved sources", () => {
-    renderSources({ preferences: preferencesWith({}) });
-
-    expect(screen.queryByTestId("saved-context-sources")).not.toBeInTheDocument();
-  });
-
-  it("hides each filter until the saved rows hold two distinct values", () => {
-    const otherAgent = sourceKey("host-a", "claude", "claude-sdk", "opus");
-    const otherHost = sourceKey("host-b", "polly", "pi", "model-a");
-
-    renderSources({ preferences: preferencesWith({ [polly]: override(1, null) }) });
+  it("keeps the count grid bounded and model names in the manager", () => {
+    const longModel = "model-with-a-long-identical-prefix-but-a-distinct-suffix";
+    renderSources({
+      preferences: preferencesWith({
+        [polly]: override(100_000, null),
+        [sourceKey("host-a", "polly", "pi", longModel)]: override(200_000, null),
+      }),
+    });
+    expect(screen.getByText(longModel)).toHaveClass("break-all");
     expect(screen.queryByRole("combobox", { name: "Computer" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("combobox", { name: "Agent" })).not.toBeInTheDocument();
-
-    cleanup();
-    renderSources({
-      preferences: preferencesWith({ [polly]: override(1, null), [otherAgent]: override(2, null) }),
-    });
-    expect(screen.queryByRole("combobox", { name: "Computer" })).not.toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "Agent" })).toBeInTheDocument();
-
-    cleanup();
-    renderSources({
-      preferences: preferencesWith({ [polly]: override(1, null), [otherHost]: override(2, null) }),
-    });
-    expect(screen.getByRole("combobox", { name: "Computer" })).toBeInTheDocument();
-    expect(screen.queryByRole("combobox", { name: "Agent" })).not.toBeInTheDocument();
-  });
-
-  it("counts the shown rows and resets active filters", () => {
-    renderSources({
-      preferences: preferencesWith({ [polly]: override(1, null), [claude]: override(2, null) }),
-    });
-
-    expect(screen.getByText("Showing 2 of 2")).toBeInTheDocument();
-
-    chooseFilter("Agent", "polly");
-    expect(screen.getByText("Showing 1 of 2")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Reset filters" }));
-    expect(screen.getByText("Showing 2 of 2")).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Saved source computers" })).toHaveTextContent(
+      "Alpha",
+    );
+    expect(screen.getByText("All models")).toBeInTheDocument();
   });
 
   it("applies a batch to the visible selection, keeping each row's context", () => {
@@ -128,8 +110,7 @@ describe("SavedContextSources", () => {
       }),
     });
 
-    chooseFilter("Agent", "polly");
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select all shown" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
     expect(screen.getByText("1 selected")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Compact buffer"), { target: { value: "33000" } });
@@ -158,23 +139,27 @@ describe("SavedContextSources", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
     expect(header).toHaveAttribute("aria-checked", "mixed");
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-b" }));
     expect(header).toHaveAttribute("aria-checked", "true");
 
     fireEvent.click(header);
     expect(header).toHaveAttribute("aria-checked", "false");
   });
 
-  it("drops hidden rows from the selection when the filter changes", () => {
+  it("clears selection when another host is chosen in the tree", () => {
     renderSources({
-      preferences: preferencesWith({ [polly]: override(1, null), [claude]: override(2, null) }),
+      preferences: preferencesWith({
+        [polly]: override(100_000, null),
+        [claude]: override(200_000, null),
+      }),
     });
-
     fireEvent.click(screen.getByRole("checkbox", { name: "Select all shown" }));
     expect(screen.getByText("2 selected")).toBeInTheDocument();
-
-    chooseFilter("Agent", "polly");
-    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    const navigation = screen.getByRole("navigation");
+    const beta = within(navigation).getByText("Beta").parentElement!;
+    fireEvent.click(within(beta).getByRole("button", { name: "polly · Pi" }));
+    expect(screen.queryByText("2 selected")).not.toBeInTheDocument();
+    expect(screen.queryByText("model-a")).not.toBeInTheDocument();
   });
 
   it("fills the batch fields from the current source without applying them", () => {
@@ -242,7 +227,7 @@ describe("SavedContextSources", () => {
     expect(screen.queryByLabelText("Edit context total")).not.toBeInTheDocument();
     expect(readUsageContextPreferences().overrides).toEqual({});
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit Alpha claude opus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit Alpha polly model-b" }));
     expect(screen.getAllByLabelText("Edit context total")).toHaveLength(1);
     expect(screen.getByLabelText("Edit context total")).toHaveValue(200000);
 
@@ -366,7 +351,7 @@ describe("SavedContextSources", () => {
         [claude]: override(200_000, 30_000),
       }),
     );
-    render(<LiveSources />);
+    renderLiveSources();
     fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
     fireEvent.click(
       within(screen.getByRole("group", { name: "Selected buffer unit" })).getByRole("button", {
@@ -376,7 +361,7 @@ describe("SavedContextSources", () => {
     fireEvent.change(screen.getByLabelText("Compact buffer percent"), { target: { value: "10" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-b" }));
     fireEvent.change(screen.getByLabelText("Compact buffer percent"), { target: { value: "5" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
     expect(readUsageContextPreferences().overrides[claude]).toMatchObject({
@@ -397,12 +382,12 @@ describe("SavedContextSources", () => {
         },
       }),
     );
-    render(<LiveSources />);
+    renderLiveSources();
     fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
     fireEvent.change(screen.getByLabelText("Compact buffer"), { target: { value: "10000" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-b" }));
     fireEvent.change(screen.getByLabelText("Compact buffer"), { target: { value: "4000" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
     expect(readUsageContextPreferences().overrides[claude]).toMatchObject({
@@ -419,7 +404,7 @@ describe("SavedContextSources", () => {
         [claude]: override(200_000, 30_000),
       }),
     );
-    render(<LiveSources />);
+    renderLiveSources();
     fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
     fireEvent.click(
       within(screen.getByRole("group", { name: "Selected buffer unit" })).getByRole("button", {
@@ -429,7 +414,7 @@ describe("SavedContextSources", () => {
     fireEvent.change(screen.getByLabelText("Compact buffer percent"), { target: { value: "10" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-b" }));
     fireEvent.click(screen.getByRole("button", { name: "Auto compact buffer" }));
     fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
     expect(readUsageContextPreferences().overrides[claude]).toEqual({
@@ -471,7 +456,7 @@ describe("SavedContextSources", () => {
         [claude]: override(200_000, 20_000),
       }),
     );
-    render(<LiveSources />);
+    renderLiveSources();
 
     fireEvent.click(screen.getByRole("button", { name: "Edit Alpha polly model-a" }));
     expect(screen.getByLabelText("Edit context total")).toHaveValue(100000);
@@ -530,7 +515,7 @@ describe("SavedContextSources", () => {
   });
 
   it("deletes only the selected sources after batch confirmation", () => {
-    const untouched = sourceKey("host-b", "claude", "claude-sdk", "sonnet");
+    const untouched = sourceKey("host-b", "polly", "pi", "model-b");
     renderSources({
       preferences: preferencesWith({
         [polly]: override(100_000, 10_000),
@@ -540,12 +525,12 @@ describe("SavedContextSources", () => {
     });
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-b" }));
     fireEvent.click(screen.getByRole("button", { name: "Delete selected" }));
 
     const dialog = screen.getByRole("dialog", { name: "Delete 2 saved sources?" });
-    expect(within(dialog).getByText("Alpha · Pi · model-a")).toBeInTheDocument();
-    expect(within(dialog).getByText("Alpha · Claude SDK · opus")).toBeInTheDocument();
+    expect(within(dialog).getByText("Alpha · Pi · model-a (Current)")).toBeInTheDocument();
+    expect(within(dialog).getByText("Alpha · Pi · model-b")).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete 2" }));
 
     const saved = readUsageContextPreferences().overrides;
@@ -556,5 +541,106 @@ describe("SavedContextSources", () => {
       autoCompactBufferTokens: 30_000,
     });
     expect(screen.queryByText("2 selected")).not.toBeInTheDocument();
+  });
+
+  it("edits cell and column records without materializing an inherited buffer", () => {
+    const source = usageContextSourceFromKey(polly)!;
+    const cell = usageContextLevelKey(source, "cell");
+    const column = usageContextLevelKey(source, "column");
+    renderSources({
+      preferences: preferencesWith({
+        [column]: override(400_000, 20_000),
+        [polly]: override(300_000, null),
+      }),
+    });
+    expect(
+      screen.getByText("polly · all hosts: 400,000 context · 20,000 buffer"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Alpha polly All models" }));
+    expect(screen.getByLabelText("Edit compact buffer")).toHaveValue(null);
+    fireEvent.change(screen.getByLabelText("Edit context total"), { target: { value: "350000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(readUsageContextPreferences().overrides[cell]).toEqual(override(350_000, null));
+    expect(readUsageContextPreferences().overrides[polly]).toEqual(override(300_000, null));
+    fireEvent.click(screen.getByRole("button", { name: "Edit column values" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit Server polly All hosts" }));
+    fireEvent.change(screen.getByLabelText("Edit context total"), { target: { value: "500000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(readUsageContextPreferences().overrides[column]).toEqual(override(500_000, 20_000));
+  });
+
+  it("shows the header editor, counts and a fixed row count independently of model count", () => {
+    const many = Object.fromEntries(
+      Array.from({ length: 20 }, (_, index) => [
+        sourceKey("host-a", "polly", "pi", `model-${index}`),
+        override(400_000 + index, null),
+      ]),
+    );
+    render(
+      <SavedContextSources
+        preferences={preferencesWith(many)}
+        currentSourceKey={polly}
+        hosts={HOSTS}
+        currentOverride={override(null, null)}
+      />,
+    );
+    const table = screen.getByRole("table");
+    expect(within(table).getAllByRole("row")).toHaveLength(4);
+    expect(table).toHaveTextContent("20 model overrides");
+    expect(table).not.toHaveTextContent("model-19");
+    fireEvent.click(screen.getByRole("button", { name: "Edit polly · Pi · all hosts" }));
+    expect(screen.getByRole("button", { name: "Edit Server polly All hosts" })).toBeInTheDocument();
+  });
+
+  it("shows invalid buffer notes with effective provenance in the manager", () => {
+    const column = usageContextLevelKey(usageContextSourceFromKey(polly)!, "column");
+    renderSources({
+      preferences: preferencesWith({
+        [polly]: override(100_000, null),
+        [column]: override(null, 150_000),
+      }),
+    });
+    expect(
+      screen.getByText("Ignored polly · all hosts: buffer ≥ context; using reported."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Buffer Auto · reported")).toBeInTheDocument();
+  });
+
+  it("keeps the nine records until Merge and collapses only the seven identical model records", () => {
+    const overrides = Object.fromEntries([
+      ...["model-a", "model-b", "model-c", "model-d", "model-e"].map((model) => [
+        sourceKey("host-a", "polly", "pi", model),
+        override(550_000, 32_000),
+      ]),
+      ...["gpt-a", "gpt-b"].map((model) => [
+        sourceKey("host-a", "codex", "codex-native", model),
+        override(400_000, 0),
+      ]),
+      [sourceKey("host-a", "opencode", "opencode", ""), override(200_000, null)],
+      [sourceKey("host-b", "codex", "codex", "gpt-a"), override(300_000, null)],
+    ]);
+    writeUsageContextPreferences(preferencesWith(overrides));
+    renderLiveSources();
+    expect(
+      screen.getByText("7 model records with identical values can be merged into 2 cell values."),
+    ).toBeInTheDocument();
+    expect(readUsageContextPreferences().overrides).toEqual(overrides);
+    fireEvent.click(screen.getByRole("button", { name: "Keep" }));
+    expect(readUsageContextPreferences().overrides).toEqual(overrides);
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "Manage saved sources" })).getByRole("button", {
+        name: "Close",
+      }),
+    );
+    openManager();
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    const saved = readUsageContextPreferences().overrides;
+    expect(Object.keys(saved)).toHaveLength(4);
+    expect(saved[usageContextLevelKey(usageContextSourceFromKey(polly)!, "cell")]).toEqual(
+      override(550_000, 32_000),
+    );
+    expect(screen.queryByRole("button", { name: "Merge" })).not.toBeInTheDocument();
+    expect(screen.queryByText("model-a")).not.toBeInTheDocument();
+    expect(screen.getByText("All models")).toBeInTheDocument();
   });
 });

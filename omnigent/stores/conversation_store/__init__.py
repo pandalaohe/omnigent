@@ -6,7 +6,7 @@ import math
 import time
 import unicodedata
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -82,6 +82,9 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Receiver-owned readback, scoped to one native session instance.
+CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY = "omnigent.codex_native.permission_observation"
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other
@@ -93,6 +96,15 @@ ARCHIVE_LOCK_LABEL_KEY = "omnigent.archive_locked"
 DELETION_CLAIM_STALE_AFTER_S = 15 * 60
 DELETION_CLAIM_HEARTBEAT_INTERVAL_S = 60
 ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S = 15 * 60
+
+
+@dataclass(frozen=True)
+class LabelGroupChange:
+    """Label updates and removals computed from one locked group snapshot."""
+
+    upserts: dict[str, str]
+    deletes: set[str]
+
 
 DeletionClaimResult = Literal["claimed", "locked", "busy", "not_found"]
 ArchiveLockWriteResult = Literal["updated", "busy", "not_found"]
@@ -370,6 +382,11 @@ def _may_collate_to(key: str, target: str, *, prefix: bool) -> bool:
     return len(target) in positions
 
 
+def is_codex_permission_observation_label_key(key: str) -> bool:
+    """Return whether a key can collate to the server-owned Codex observation."""
+    return _may_collate_to(key, CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY, prefix=False)
+
+
 def is_touched_label_key(key: str) -> bool:
     """
     Return whether ``key`` belongs to the per-user ``omnigent.touched`` family.
@@ -451,6 +468,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_provider_usage_limits",
         "omnigent.startup",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
         ARTIFACT_LINK_KEY_LABEL,
         ROTATION_SUCCESSOR_LABEL_KEY,
     }
@@ -595,6 +613,8 @@ class SessionSuccession:
     created_at: int
     updated_at: int
 
+    deferred_runners: list[dict[str, Any]] | None = None
+
 
 @dataclass(frozen=True)
 class DetachedCard:
@@ -674,6 +694,10 @@ class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
 
 
+class ConversationLabelConditionFailed(Exception):
+    """A conditional append lost its required label before acquiring the row lock."""
+
+
 class ConversationArchiveClosingError(Exception):
     """Raised when a child create loses to its root archive-close transition."""
 
@@ -700,9 +724,10 @@ class SuccessionRefusedError(ValueError):
     caller can map it without parsing the message.
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, successor_id: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.successor_id = successor_id
 
 
 def _is_addable_usage_increment(value: Any) -> bool:
@@ -1178,6 +1203,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         items: list[NewConversationItem],
+        *,
+        while_label: str | None = None,
     ) -> list[ConversationItem]:
         """
         Append items to a conversation. Assigns a globally unique
@@ -1193,6 +1220,8 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
             to persist.
+        :param while_label: Require this label in the append transaction, or
+            raise ConversationLabelConditionFailed without saving any item.
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
         :raises NativeRecoveryItemSkipped: One historical reasoning item was
@@ -1532,8 +1561,9 @@ class ConversationStore(ABC):
         One write transaction: lock ``new`` then ``old``, re-read each direct
         child of ``old`` under its own lock and keep only the unarchived ones,
         reparent them to ``new``, rewrite ``root_conversation_id`` across
-        their subtrees, write the succession labels and the receipt with
-        phase ``moved``. Unless ``allow_empty``, no child kept means nothing is written and
+        their subtrees, move durable check-in labels (keeping each session's
+        own delivery timestamp), and write the succession labels and receipt
+        with phase ``moved``. Unless ``allow_empty``, no child kept means nothing is written and
         ``([], [])`` is returned; refusals raise before any write.
 
         :param old_id: Top-level session whose children move.
@@ -1565,7 +1595,12 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def list_unfinished_successions(self, limit: int = 100) -> list[SessionSuccession]:
-        """Return receipts whose phase is not ``done``, oldest first."""
+        """Return nonterminal receipts, oldest first."""
+        ...
+
+    @abstractmethod
+    def list_deferred_successions(self) -> list[SessionSuccession]:
+        """Return non-void receipts still owing runner re-key/release, including done."""
         ...
 
     @abstractmethod
@@ -1902,6 +1937,28 @@ class ConversationStore(ABC):
             rather than wall-clock drift between evaluate()
             and the actual DB write.
         """
+        ...
+
+    @abstractmethod
+    def mutate_label_group(
+        self,
+        conversation_id: str,
+        prefix: str,
+        change: Callable[[dict[str, str]], LabelGroupChange],
+    ) -> dict[str, str]:
+        """Read and mutate a label prefix atomically, returning its final values.
+
+        The callback may run again after a transaction retry. Every changed
+        key must start with ``prefix`` and values must fit the label column;
+        invalid changes raise ``ValueError`` without persisting any changes.
+        Upserts take precedence over deletions of the same key.
+        Missing conversations raise ``ConversationNotFoundError``.
+        """
+        ...
+
+    @abstractmethod
+    def list_label_values(self, key: str) -> dict[str, str]:
+        """Return conversation ids and values for one key in this workspace."""
         ...
 
     @abstractmethod

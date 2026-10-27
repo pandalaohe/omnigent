@@ -142,10 +142,38 @@ async def test_legacy_conversation_id_fork_request_is_skipped(tmp_path: Path) ->
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    # The legacy fork request never parked an elicitation card: the parent's
-    # status is the only conversation traffic.
-    assert len(posted) == 1
-    assert posted[0][1]["type"] == "external_session_status"
+    # Only the parent's resume observation and running status may surface.
+    assert len(posted) == 2
+    assert posted == [
+        (
+            "/v1/sessions/conv_parent/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "approval_mode": "unknown",
+                    "permission_observation": {
+                        "version": 1,
+                        "source": "native-settings",
+                        "origin": "resume",
+                        "mode": "unknown",
+                        "approval": None,
+                        "reviewer": None,
+                        "sandbox": None,
+                        "profile": None,
+                        "uncertainty": "no-settings",
+                        "requested_mode": None,
+                    },
+                },
+            },
+        ),
+        (
+            "/v1/sessions/conv_parent/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "codex_turn_parent"},
+            },
+        ),
+    ]
     assert client.responses == []
 
 
@@ -351,11 +379,40 @@ async def test_keep_warm_fork_stream_is_invisible_and_a_parent_event_still_lands
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    # The parent's status is the only conversation traffic and it goes to the
-    # parent session: nothing from the fork surfaced (no owner message,
-    # elicitation, usage or child session).
-    assert len(posted) == 1
-    path, body = posted[0]
+    # Only the parent's resume observation and running status may surface:
+    # nothing from the fork (owner message, elicitation, usage or child session).
+    assert len(posted) == 2
+    assert posted == [
+        (
+            "/v1/sessions/conv_parent/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "approval_mode": "unknown",
+                    "permission_observation": {
+                        "version": 1,
+                        "source": "native-settings",
+                        "origin": "resume",
+                        "mode": "unknown",
+                        "approval": None,
+                        "reviewer": None,
+                        "sandbox": None,
+                        "profile": None,
+                        "uncertainty": "no-settings",
+                        "requested_mode": None,
+                    },
+                },
+            },
+        ),
+        (
+            "/v1/sessions/conv_parent/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "codex_turn_parent"},
+            },
+        ),
+    ]
+    path, body = posted[1]
     assert path == "/v1/sessions/conv_parent/events"
     assert body["type"] == "external_session_status"
     # The loop never answered the fork's approval request itself.

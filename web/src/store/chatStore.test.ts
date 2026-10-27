@@ -17,7 +17,17 @@
 
 import type * as IdentityModule from "@/lib/identity";
 
-import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
+import {
+  type InfiniteData,
+  QueryClient,
+  QueryClientProvider,
+  QueryObserver,
+  useQuery,
+} from "@tanstack/react-query";
+import { createElement } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { CodexPermissionReadbackChip } from "@/pages/ChatPage";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -36,7 +46,13 @@ import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { sessionStartupFromWire } from "@/lib/sessionStartup";
 import { readCallingLast } from "@/lib/callingDefaults";
-import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
+import { parseEvent, parseSseStream, SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
+import {
+  CODEX_PERMISSION_OBSERVATION_LABEL_KEY,
+  codexPermissionObservationFromSession,
+  codexPermissionReadback,
+} from "@/lib/codexApprovalMode";
+import type { Session } from "@/lib/types";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { clearUnsentSends, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import {
@@ -80,6 +96,7 @@ import {
   isStaleTempConvId,
   isTempConvId,
   initChatStore,
+  invalidateCodexPermissionReadback,
   pumpStreamEvents,
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
@@ -7632,6 +7649,89 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.superseded", () => {
+    it.each([false, true])(
+      "follows a clear refusal only while its chat is active (switched away: %s)",
+      async (switchedAway) => {
+        seedSession("conv_old");
+        await useChatStore.getState().switchTo("conv_old");
+        fetchMock.mockImplementation((input, init) => {
+          if (!String(input).endsWith("/conv_old/events"))
+            return Promise.resolve(defaultFetchHandler(input, init));
+          expect(JSON.parse(init!.body as string)).toEqual({ type: "clear", data: {} });
+          if (switchedAway) useChatStore.setState({ conversationId: "conv_current" });
+          return Promise.resolve(
+            mockResponse(
+              {
+                error: {
+                  code: "session_superseded",
+                  message: "Replaced",
+                  successor_id: "conv_next",
+                },
+              },
+              { ok: false, status: 409 },
+            ),
+          );
+        });
+        await expect(useChatStore.getState().clearContext()).rejects.toThrow("Replaced");
+        expect(useChatStore.getState().redirectToConversationId).toBe(
+          switchedAway ? null : "conv_next",
+        );
+      },
+    );
+
+    it("follows a superseded label on a cold open", async () => {
+      seedSession("conv_old");
+      sessionLabels.set("conv_old", { "omnigent.succeeded_by": "conv_next" });
+      await useChatStore.getState().switchTo("conv_old");
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_next");
+    });
+
+    it.each(["accepted", "refused"])(
+      "follows an active main chat's %s redirect",
+      async (outcome) => {
+        seedSession("conv_old");
+        await useChatStore.getState().switchTo("conv_old");
+        fetchMock.mockImplementation((input, init) => {
+          if (String(input).endsWith("/conv_old/events")) {
+            return Promise.resolve(
+              outcome === "accepted"
+                ? mockResponse({ queued: true, redirected_to: "conv_next" })
+                : mockResponse(
+                    {
+                      error: {
+                        code: "session_superseded",
+                        message: "Replaced",
+                        successor_id: "conv_next",
+                      },
+                    },
+                    { ok: false, status: 409 },
+                  ),
+            );
+          }
+          return Promise.resolve(defaultFetchHandler(input, init));
+        });
+        await useChatStore
+          .getState()
+          .send(outcome === "accepted" ? "hello" : "/clear", "agent_xyz");
+        expect(useChatStore.getState().redirectToConversationId).toBe("conv_next");
+      },
+    );
+
+    it("does not navigate for a background send", async () => {
+      seedSession("conv_old");
+      seedSession("conv_current");
+      await useChatStore.getState().switchTo("conv_old");
+      await useChatStore.getState().switchTo("conv_current");
+      fetchMock.mockImplementation((input, init) =>
+        String(input).endsWith("/conv_old/events")
+          ? Promise.resolve(mockResponse({ queued: true, redirected_to: "conv_next" }))
+          : Promise.resolve(defaultFetchHandler(input, init)),
+      );
+      await useChatStore
+        .getState()
+        .send("hello", "agent_xyz", undefined, { pinnedConversationId: "conv_old" });
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
     it("records the redirect target for the bound conversation", () => {
       useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
       handleSessionEvent({
@@ -12451,6 +12551,7 @@ describe("chatStore — session configuration scope", () => {
   ];
 
   interface SnapshotOverrides {
+    runner_id?: string;
     labels?: Record<string, string>;
     harness?: string;
     reasoning_effort?: string | null;
@@ -12475,6 +12576,7 @@ describe("chatStore — session configuration scope", () => {
           items: [],
           labels: overrides.labels ?? {},
           harness: overrides.harness,
+          runner_id: overrides.runner_id,
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
           cost_control_mode_override: overrides.cost_control_mode_override ?? null,
@@ -12500,6 +12602,645 @@ describe("chatStore — session configuration scope", () => {
         return body ? (JSON.parse(body as string) as Record<string, unknown>) : {};
       });
   }
+
+  describe("native permission observation consumers", () => {
+    const encoded = "c1:0,1,2,1,1,2,2,0,0,1792749199,cnVubmVy";
+    const nativeLabels = {
+      "omnigent.wrapper": "codex-native-ui",
+      "omnigent.codex_native.approval_mode": "ask-for-approval",
+      [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: encoded,
+    };
+    const raw = {
+      version: 1,
+      source: "native-settings",
+      origin: "settings-updated",
+      mode: "custom",
+      approval: "never",
+      reviewer: "auto_review",
+      sandbox: "read-only",
+      profile: "read-only",
+      uncertainty: null,
+      requested_mode: null,
+      received_at: 1792749200,
+      runner_id: "runner",
+    };
+    async function deliver(id: string, mode: string, observation?: unknown, companion?: unknown) {
+      const packet = `event: session.codex_approval_mode\ndata: ${JSON.stringify({ conversation_id: id, approval_mode: mode, ...(observation !== undefined ? { permission_observation: observation } : {}), ...(companion !== undefined ? { permission_observation_c1: companion } : {}) })}\n\n`;
+      for await (const event of parseSseStream(new Response(packet).body!))
+        handleSessionEvent(event, id);
+    }
+    async function open(id: string) {
+      seedSession(id, []);
+      withSnapshot(id, { labels: nativeLabels, harness: "codex-native", runner_id: "runner" });
+      await useChatStore.getState().switchTo(id);
+    }
+    function readback(id: string) {
+      const session = client.getQueryData<Session>(["session", id])!;
+      const report = useChatStore.getState().codexPermissionReadbacks[id];
+      return codexPermissionReadback(
+        session,
+        report ? report.observation : codexPermissionObservationFromSession(session),
+        { stale: report?.stale },
+      );
+    }
+    it("carries a present companion's int63 identity into the readback and clears it on conflict", async () => {
+      const id = "native_companion";
+      await open(id);
+      // Supplemental literals, not captured packets: the readable timestamp is
+      // what a JS JSON round trip of the int63 maximum prints, and the
+      // companion is the exact canonical decimal text.
+      const observation = {
+        version: 1,
+        source: "native-settings",
+        origin: "settings-updated",
+        mode: "ask-for-approval",
+        approval: "on-request",
+        reviewer: "user",
+        sandbox: "workspace-write",
+        profile: "workspace",
+        uncertainty: null,
+        requested_mode: null,
+        received_at: Number("9223372036854775807"),
+        runner_id: "runner",
+      };
+      const companion = "c1:0,1,2,1,1,2,2,0,0,9223372036854775807,cnVubmVy";
+      await deliver(id, "ask-for-approval", observation, companion);
+      expect(useChatStore.getState().codexPermissionReadbacks[id]?.observation?.received_at).toBe(
+        "9223372036854775807",
+      );
+      expect(readback(id).value).toBe("Ask for approval · Reported");
+      expect(readback(id).rows).toContainEqual({
+        label: "Received",
+        value: "9223372036854775807 (epoch seconds)",
+      });
+      expect(
+        client.getQueryData<Session>(["session", id])?.labels?.[
+          CODEX_PERMISSION_OBSERVATION_LABEL_KEY
+        ],
+      ).toBe(companion);
+
+      // A refuted companion clears the confirmed display rather than falling
+      // back to the readable projection still present in the same payload.
+      await deliver(
+        id,
+        "ask-for-approval",
+        observation,
+        "c1:0,1,2,1,1,2,2,0,0,9223372036854775808,cnVubmVy",
+      );
+      expect(useChatStore.getState().codexPermissionReadbacks[id]?.observation ?? null).toBeNull();
+      expect(readback(id).value).toBe("Unconfirmed");
+
+      // Old server, no companion: an unsafe readable stays conservative.
+      await deliver(id, "ask-for-approval", observation);
+      expect(useChatStore.getState().codexPermissionReadbacks[id]?.observation ?? null).toBeNull();
+    });
+    it("clears a trusted report when the companion key is present but undefined", async () => {
+      const id = "native_own_undefined";
+      await open(id);
+      const observation = {
+        version: 1,
+        source: "native-settings",
+        origin: "settings-updated",
+        mode: "ask-for-approval",
+        approval: "on-request",
+        reviewer: "user",
+        sandbox: "workspace-write",
+        profile: "workspace",
+        uncertainty: null,
+        requested_mode: null,
+        received_at: 1792749199,
+        runner_id: "runner",
+      };
+      const companion = "c1:0,1,2,1,1,2,2,0,0,1792749199,cnVubmVy";
+      await deliver(id, "ask-for-approval", observation, companion);
+      expect(readback(id).value).toBe("Ask for approval · Reported");
+
+      // Direct object entry, never a JSON round trip: the own key stays present.
+      const frame = {
+        conversation_id: id,
+        approval_mode: "ask-for-approval",
+        permission_observation: observation,
+      };
+      const ownUndefined = { ...frame, permission_observation_c1: undefined };
+      expect(Object.hasOwn(ownUndefined, "permission_observation_c1")).toBe(true);
+      act(() => {
+        handleSessionEvent(parseEvent("session.codex_approval_mode", ownUndefined)!, id);
+      });
+      expect(useChatStore.getState().codexPermissionReadbacks[id]?.observation ?? null).toBeNull();
+      expect(readback(id).value).toBe("Unconfirmed");
+      expect(
+        client.getQueryData<Session>(["session", id])?.labels?.[
+          CODEX_PERMISSION_OBSERVATION_LABEL_KEY
+        ],
+      ).toBe("");
+
+      // Only a missing key may use the legacy readable route.
+      act(() => {
+        handleSessionEvent(parseEvent("session.codex_approval_mode", frame)!, id);
+      });
+      expect(readback(id).value).toBe("Ask for approval · Reported");
+    });
+    function holdPermissionPatch(id: string) {
+      const serve = fetchMock.getMockImplementation()!;
+      let finish!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          await gate;
+          return mockResponse({
+            id,
+            agent_id: "agent_xyz",
+            harness: "codex-native",
+            status: "idle",
+            created_at: 0,
+            runner_id: "runner",
+            labels: {
+              "omnigent.wrapper": "codex-native-ui",
+              "omnigent.codex_native.approval_mode": "unknown",
+              [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: "c1:1,2,0,0,0,0,0,5,3,-,cnVubmVy",
+            },
+          });
+        }
+        return serve(input, init);
+      });
+      return finish;
+    }
+    it.each(["SSE", "binding", "harness"])(
+      "preserves intervening %s when a delayed native PATCH returns",
+      async (change) => {
+        const id = "native_patch_race";
+        await open(id);
+        const finish = holdPermissionPatch(id);
+        const pending = useChatStore.getState().setCodexApprovalMode("full-access");
+        if (change === "SSE") await deliver(id, "custom", raw);
+        else
+          client.setQueryData<Session>(["session", id], (session) => ({
+            ...session!,
+            ...(change === "binding"
+              ? { runnerId: "replacement" }
+              : { harness: "codex", labels: { "omnigent.codex_sdk.approval_mode": "read-only" } }),
+          }));
+        const current = client.getQueryData<Session>(["session", id]);
+        const report = useChatStore.getState().codexPermissionReadbacks[id];
+        const mode = useChatStore.getState().codexApprovalMode;
+        finish();
+        await pending;
+        expect(client.getQueryData(["session", id])).toBe(current);
+        expect(useChatStore.getState().codexPermissionReadbacks[id]).toBe(report);
+        expect(useChatStore.getState().codexApprovalMode).toBe(mode);
+      },
+    );
+    function renderPermissionDetails(id: string) {
+      function NativePermissionDetails() {
+        const { data: session } = useQuery<Session>({
+          queryKey: ["session", id],
+          enabled: false,
+        });
+        return createElement(CodexPermissionReadbackChip, {
+          session: session ?? null,
+          permissionLevel: 1,
+          offline: false,
+        });
+      }
+      onTestFinished(cleanup);
+      return render(
+        createElement(
+          QueryClientProvider,
+          { client },
+          createElement(TooltipProvider, null, createElement(NativePermissionDetails)),
+        ),
+      );
+    }
+    it.each(
+      ["model-options", "visibility", "sandbox", "effort"].flatMap((entry) =>
+        ["report", "tombstone"].map((kind) => ({ entry, kind })),
+      ),
+    )(
+      "shows the actual $entry GET $kind in picker details after a delayed native PATCH",
+      async ({ entry, kind }) => {
+        const id = "native_get_picker";
+        await open(id);
+        renderPermissionDetails(id);
+        const chip = screen.getByTestId("terminal-permission-chip");
+        expect(chip).toHaveAccessibleName("Permission mode: Ask for approval · Reported");
+        const next = "c1:0,1,1,2,2,1,1,0,0,1792749200,cnVubmVy";
+        withSnapshot(id, {
+          labels: {
+            ...nativeLabels,
+            [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: kind === "report" ? next : "",
+          },
+          harness: "codex-native",
+          runner_id: "runner",
+          model_options: [
+            { id: "gpt-model", model: "gpt-model", displayName: "GPT model", isDefault: true },
+          ],
+        });
+        const finish = holdPermissionPatch(id);
+        const pending = useChatStore.getState().setCodexApprovalMode("full-access");
+        let effortPending: Promise<void> | undefined;
+        if (entry === "model-options")
+          handleSessionEvent({ type: "session_model_options", conversationId: id }, id);
+        else if (entry === "visibility") document.dispatchEvent(new Event("visibilitychange"));
+        else if (entry === "sandbox")
+          handleSessionEvent(
+            {
+              type: "session_sandbox_status",
+              conversationId: id,
+              stage: "connecting",
+              error: null,
+            },
+            id,
+          );
+        else {
+          await client.invalidateQueries({
+            queryKey: ["session", id],
+            exact: true,
+            refetchType: "none",
+          });
+          effortPending = useChatStore.getState().setEffort("high");
+        }
+        await waitFor(() =>
+          expect(
+            client.getQueryData<Session>(["session", id])?.labels?.[
+              CODEX_PERMISSION_OBSERVATION_LABEL_KEY
+            ],
+          ).toBe(kind === "report" ? next : ""),
+        );
+        if (entry === "model-options")
+          expect(useChatStore.getState().codexModelOptions).toHaveLength(1);
+        await act(async () => {
+          finish();
+          await pending;
+          await effortPending;
+        });
+        await waitFor(() =>
+          expect(chip).toHaveAccessibleName(
+            kind === "report" ? "Permission mode: Custom" : "Permission mode: Unconfirmed",
+          ),
+        );
+        fireEvent.keyDown(chip, { key: "Enter" });
+        expect(screen.queryByText("1792749199 (epoch seconds)")).toBeNull();
+        expect(screen.queryByText("on-request")).toBeNull();
+        expect(screen.queryByText("Requested")).toBeNull();
+        if (kind === "report") {
+          expect(screen.getByText("never")).toBeInTheDocument();
+          expect(
+            screen.getByText("auto_review · Current policy does not trigger approval"),
+          ).toBeInTheDocument();
+          expect(screen.getAllByText("read-only")).toHaveLength(2);
+          expect(screen.getByText("native-settings · settings-updated")).toBeInTheDocument();
+          expect(screen.getByText("1792749200 (epoch seconds)")).toBeInTheDocument();
+          expect(screen.getByText("Matches session binding")).toBeInTheDocument();
+        } else {
+          expect(screen.getAllByText("Not reported")).toHaveLength(6);
+          for (const row of screen.getAllByRole("menuitemradio"))
+            expect(row).toHaveAttribute("aria-checked", "false");
+        }
+      },
+    );
+    it.each(["failed", "updated", "SSE", "tombstone"])(
+      "publishes each model-options GET before its retry (%s) settles",
+      async (change) => {
+        const id = "native_get_retry";
+        await open(id);
+        renderPermissionDetails(id);
+        const next = "c1:0,1,1,2,2,1,1,0,0,1792749200,cnVubmVy";
+        withSnapshot(id, {
+          labels: { ...nativeLabels, [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: next },
+          harness: "codex-native",
+          runner_id: "runner",
+        });
+        const finishPatch = holdPermissionPatch(id);
+        const pending = useChatStore.getState().setCodexApprovalMode("full-access");
+        const serve = fetchMock.getMockImplementation()!;
+        let finishGet!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          finishGet = resolve;
+        });
+        let reads = 0;
+        let retryStarted = false;
+        let retryReturned = false;
+        fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (
+            String(input).split("?")[0] === `/v1/sessions/${id}` &&
+            (init?.method ?? "GET") === "GET" &&
+            ++reads === 2
+          ) {
+            retryStarted = true;
+            await gate;
+            retryReturned = true;
+            return change === "failed"
+              ? mockResponse({}, { ok: false, status: 503 })
+              : mockResponse({
+                  id,
+                  agent_id: "agent_xyz",
+                  harness: "codex-native",
+                  runner_id: "runner",
+                  status: "idle",
+                  created_at: 0,
+                  labels: {
+                    ...nativeLabels,
+                    [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: next.replace(
+                      "1792749200",
+                      "1792749300",
+                    ),
+                  },
+                  model_options: [
+                    {
+                      id: "gpt-model",
+                      model: "gpt-model",
+                      displayName: "GPT model",
+                      isDefault: true,
+                    },
+                  ],
+                });
+          }
+          return serve(input, init);
+        });
+        act(() => handleSessionEvent({ type: "session_model_options", conversationId: id }, id));
+        await waitFor(() => expect(retryStarted).toBe(true));
+        await tick();
+        const chip = screen.getByTestId("terminal-permission-chip");
+        const beforeRetry = chip.getAttribute("aria-label");
+        await act(async () => {
+          if (change === "SSE") await deliver(id, "custom", { ...raw, received_at: 1792749400 });
+          else if (change === "tombstone") await deliver(id, "full-access");
+          finishGet();
+        });
+        await waitFor(() => expect(retryReturned).toBe(true));
+        await tick();
+        await act(async () => {
+          finishPatch();
+          await pending;
+        });
+        expect(beforeRetry).toBe("Permission mode: Custom");
+        await waitFor(() =>
+          expect(chip).toHaveAccessibleName(
+            change === "tombstone" ? "Permission mode: Unconfirmed" : "Permission mode: Custom",
+          ),
+        );
+        fireEvent.keyDown(chip, { key: "Enter" });
+        if (change === "tombstone") expect(screen.getAllByText("Not reported")).toHaveLength(6);
+        else
+          expect(
+            screen.getByText(
+              `${change === "failed" ? 1792749200 : change === "SSE" ? 1792749400 : 1792749300} (epoch seconds)`,
+            ),
+          ).toBeInTheDocument();
+        expect(screen.queryByText("1792749199 (epoch seconds)")).toBeNull();
+      },
+    );
+    it.each(["report", "tombstone", "stale", "binding"])(
+      "preserves intervening %s in the actual picker while a model-options GET waits",
+      async (change) => {
+        const id = "native_get_race";
+        await open(id);
+        renderPermissionDetails(id);
+        withSnapshot(id, {
+          labels: nativeLabels,
+          harness: "codex-native",
+          runner_id: "runner",
+          model_options: [
+            { id: "gpt-model", model: "gpt-model", displayName: "GPT model", isDefault: true },
+          ],
+        });
+        const serve = fetchMock.getMockImplementation()!;
+        let finish!: () => void;
+        let started = false;
+        const gate = new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const response = await serve(input, init);
+          if (
+            String(input).split("?")[0] === `/v1/sessions/${id}` &&
+            (init?.method ?? "GET") === "GET"
+          ) {
+            started = true;
+            await gate;
+          }
+          return response;
+        });
+        act(() => handleSessionEvent({ type: "session_model_options", conversationId: id }, id));
+        await waitFor(() => expect(started).toBe(true));
+        await act(async () => {
+          if (change === "report") await deliver(id, "custom", raw);
+          else if (change === "tombstone") await deliver(id, "full-access");
+          else if (change === "stale") invalidateCodexPermissionReadback(id);
+          else
+            client.setQueryData<Session>(["session", id], (session) => ({
+              ...session!,
+              runnerId: "replacement",
+            }));
+        });
+        if (change === "binding")
+          await waitFor(() =>
+            expect(useChatStore.getState().codexPermissionReadbacks[id]?.stale).toBe(true),
+          );
+        const current = useChatStore.getState().codexPermissionReadbacks[id];
+        await act(async () => {
+          finish();
+        });
+        await waitFor(() => expect(useChatStore.getState().codexModelOptions).toHaveLength(1));
+        expect(useChatStore.getState().codexPermissionReadbacks[id]).toBe(current);
+        const chip = screen.getByTestId("terminal-permission-chip");
+        await waitFor(() =>
+          expect(chip).toHaveAccessibleName(
+            change === "report" ? "Permission mode: Custom" : "Permission mode: Unconfirmed",
+          ),
+        );
+        fireEvent.keyDown(chip, { key: "Enter" });
+        if (change === "report") {
+          expect(screen.getByText("never")).toBeInTheDocument();
+          expect(screen.getByText("1792749200 (epoch seconds)")).toBeInTheDocument();
+          expect(screen.queryByText("1792749199 (epoch seconds)")).toBeNull();
+        } else if (change === "tombstone")
+          expect(screen.getAllByText("Not reported")).toHaveLength(6);
+        else expect(screen.getByText("Binding unconfirmed · Last reported")).toBeInTheDocument();
+        if (change !== "report")
+          for (const row of screen.getAllByRole("menuitemradio"))
+            expect(row).toHaveAttribute("aria-checked", "false");
+      },
+    );
+    it("merges only native permission labels after a delayed PATCH, retaining unrelated current metadata", async () => {
+      const id = "native_patch_metadata";
+      await open(id);
+      const finish = holdPermissionPatch(id);
+      const pending = useChatStore.getState().setCodexApprovalMode("full-access");
+      client.setQueryData<Session>(["session", id], (session) => ({
+        ...session!,
+        title: "Current title",
+        labels: { ...session!.labels, "omnigent.speed_tier": "fast" },
+      }));
+      finish();
+      await pending;
+      expect(client.getQueryData<Session>(["session", id])).toMatchObject({
+        title: "Current title",
+        labels: { "omnigent.speed_tier": "fast" },
+      });
+      expect(readback(id)).toMatchObject({
+        value: "Unconfirmed",
+        heading: "Application response received",
+      });
+    });
+    it("carries actual SSE bytes through the store cache and a cold reload without changing fields", async () => {
+      const id = "native_readback";
+      await open(id);
+      await deliver(id, "custom", raw);
+      const session = client.getQueryData<Session>(["session", id])!;
+      expect(codexPermissionObservationFromSession(session)).toEqual({
+        ...raw,
+        received_at: "1792749200",
+      });
+      expect(readback(id)).toMatchObject({ value: "Custom", selectedValue: null });
+      const report = session.labels![CODEX_PERMISSION_OBSERVATION_LABEL_KEY];
+      withSnapshot(id, { labels: session.labels, harness: "codex-native", runner_id: "runner" });
+      releaseConversation(id);
+      client.removeQueries({ queryKey: ["session", id], exact: true });
+      await useChatStore.getState().switchTo("reload-away");
+      await useChatStore.getState().switchTo(id);
+      expect(
+        client.getQueryData<Session>(["session", id])!.labels![
+          CODEX_PERMISSION_OBSERVATION_LABEL_KEY
+        ],
+      ).toBe(report);
+      expect(readback(id).value).toBe("Custom");
+    });
+    it.each([
+      undefined,
+      null,
+      { ...raw, version: 2 },
+      { ...raw, received_at: Number("9223372036854775807") },
+    ])(
+      "clears a cached native report for legacy/tombstone/invalid observation (%j)",
+      async (observation) => {
+        const id = "native_clear";
+        await open(id);
+        await deliver(id, "full-access", observation);
+        expect(
+          client.getQueryData<Session>(["session", id])!.labels![
+            CODEX_PERMISSION_OBSERVATION_LABEL_KEY
+          ],
+        ).toBe("");
+        expect(readback(id)).toMatchObject({ value: "Unconfirmed", selectedValue: null });
+      },
+    );
+    it("keeps background-session reports isolated and SDK scalar semantics unchanged", async () => {
+      await open("native_background");
+      seedSession("sdk_front", []);
+      withSnapshot("sdk_front", {
+        harness: "codex",
+        labels: { "omnigent.codex_sdk.approval_mode": "ask-for-approval" },
+      });
+      await useChatStore.getState().switchTo("sdk_front");
+      await deliver("native_background", "custom", raw);
+      expect(useChatStore.getState().codexApprovalMode).toBe("ask-for-approval");
+      expect(readback("native_background").value).toBe("Custom");
+      await deliver("sdk_front", "full-access");
+      expect(useChatStore.getState().codexApprovalMode).toBe("full-access");
+      expect(client.getQueryData<Session>(["session", "sdk_front"])!.labels).not.toHaveProperty(
+        CODEX_PERMISSION_OBSERVATION_LABEL_KEY,
+      );
+    });
+    it("keeps a known disconnect stale until another observation arrives", async () => {
+      const id = "native_stale";
+      await open(id);
+      expect(readback(id).value).toBe("Ask for approval · Reported");
+      invalidateCodexPermissionReadback(id);
+      expect(readback(id).value).toBe("Unconfirmed");
+      await deliver(id, "custom", raw);
+      expect(readback(id).value).toBe("Custom");
+    });
+    it("preserves a report received while an older binding snapshot was in flight", async () => {
+      const id = "native_snapshot_race";
+      await open(id);
+      const serve = fetchMock.getMockImplementation()!;
+      let finish!: () => void;
+      let started = false;
+      const gate = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const response = await serve(input, init);
+        if (
+          String(input).split("?")[0] === `/v1/sessions/${id}` &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          started = true;
+          await gate;
+        }
+        return response;
+      });
+      handleSessionEvent(
+        {
+          type: "session_agent_changed",
+          conversationId: id,
+          agentId: "agent_xyz",
+          agentName: "Codex",
+        },
+        id,
+      );
+      await vi.waitFor(() => expect(started).toBe(true));
+      await deliver(id, "custom", raw);
+      finish();
+      await vi.waitFor(() =>
+        expect(fetchMock.mock.results.every((result) => result.type === "return")).toBe(true),
+      );
+      await tick();
+      expect(readback(id).value).toBe("Custom");
+      expect(
+        codexPermissionObservationFromSession(client.getQueryData<Session>(["session", id])),
+      ).toMatchObject({ mode: "custom", received_at: "1792749200" });
+    });
+    it("does not substitute an optimistic native selection for readback while PATCH waits, then uses the application receipt", async () => {
+      const id = "native_pending";
+      await open(id);
+      let finish!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === `/v1/sessions/${id}` && init?.method === "PATCH") {
+          await gate;
+          return mockResponse({
+            id,
+            agent_id: "agent_xyz",
+            harness: "codex-native",
+            status: "idle",
+            created_at: 0,
+            labels: {
+              "omnigent.wrapper": "codex-native-ui",
+              "omnigent.codex_native.approval_mode": "unknown",
+              [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: "c1:1,2,0,0,0,0,0,5,3,-,cnVubmVy",
+            },
+            runner_id: "runner",
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const pending = useChatStore.getState().setCodexApprovalMode("full-access");
+      expect(useChatStore.getState().codexApprovalMode).toBe("ask-for-approval");
+      expect(readback(id).value).toBe("Ask for approval · Reported");
+      finish();
+      await pending;
+      expect(readback(id)).toMatchObject({
+        value: "Unconfirmed",
+        selectedValue: null,
+        heading: "Application response received",
+      });
+      expect(
+        codexPermissionObservationFromSession(client.getQueryData<Session>(["session", id])),
+      ).toMatchObject({
+        requested_mode: "full-access",
+        approval: null,
+        reviewer: null,
+        sandbox: null,
+        profile: null,
+      });
+    });
+  });
 
   it("binds an empty native session without PATCHing or retaining prior configuration", async () => {
     seedSession("conv_cn", []);

@@ -1420,6 +1420,72 @@ def test_connection_racing_reservation_keeps_managed_classification(host_store: 
     assert host_store.is_online(_RESERVED_HOST_ID)
 
 
+@pytest.mark.parametrize("same_identity", [True, False])
+def test_connection_missing_host_read_before_reservation_commit(
+    host_store: HostStore, monkeypatch: pytest.MonkeyPatch, same_identity: bool
+) -> None:
+    """Emulate READ COMMITTED seeing a reservation only in the name lookup.
+
+    SQLite serializes writers, so commit the reservation before the connect
+    transaction and inject its earlier missing-row result for the ID lookup.
+    """
+    missing_reads: list[str] = []
+    reserved_id = _RESERVED_HOST_ID if same_identity else uuid.uuid4().hex
+
+    def reserve_before_write(session_maker, operation_name, callback, **kwargs):
+        if operation_name != "upsert_host_on_connect":
+            return run_write_transaction(session_maker, operation_name, callback, **kwargs)
+        assert host_store.get_host(_RESERVED_HOST_ID) is None
+        assert (
+            host_store.reserve_sandbox_host(
+                host_id=reserved_id,
+                name="managed-host",
+                user_id="alice@example.test",
+                provider="modal",
+            )
+            is not None
+        )
+
+        def with_missing_read(session):
+            original_get = session.get
+
+            def get(entity, ident, **get_kwargs):
+                if entity is SqlHost and ident == (current_workspace_id(), _RESERVED_HOST_ID):
+                    assert not missing_reads
+                    missing_reads.append(_RESERVED_HOST_ID)
+                    return None
+                return original_get(entity, ident, **get_kwargs)
+
+            with patch.object(session, "get", side_effect=get):
+                return callback(session)
+
+        return run_write_transaction(session_maker, operation_name, with_missing_read, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", reserve_before_write)
+    with patch.object(host_store, "_rotate_host_id", wraps=host_store._rotate_host_id) as rotate:
+        if same_identity:
+            connected = host_store.upsert_on_connect(
+                _RESERVED_HOST_ID,
+                "managed-host",
+                "alice@example.test",
+                configured_harnesses={"codex": True},
+            )
+            assert connected.sandbox_provider == "modal"
+            assert connected.configured_harnesses == {"codex": True}
+            assert host_store.get_host(_RESERVED_HOST_ID) == connected
+            assert host_store.is_online(_RESERVED_HOST_ID)
+        else:
+            with pytest.raises(OmnigentError, match="Host identity changed"):
+                host_store.upsert_on_connect(
+                    _RESERVED_HOST_ID, "managed-host", "alice@example.test"
+                )
+            assert host_store.get_host(_RESERVED_HOST_ID) is None
+            reserved = host_store.get_host(reserved_id)
+            assert reserved is not None and reserved.status == "offline"
+        rotate.assert_not_called()
+    assert missing_reads == [_RESERVED_HOST_ID]
+
+
 @pytest.mark.parametrize("loser", ["reservation", "connection"])
 def test_insert_conflict_retry_adopts_the_competing_row(
     host_store: HostStore, monkeypatch: pytest.MonkeyPatch, loser: str

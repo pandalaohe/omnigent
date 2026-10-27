@@ -16,10 +16,14 @@ from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import httpx
 
-from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
+from omnigent.codex_approval_modes import (
+    CodexPermissionObservation,
+    codex_permission_observation_from_thread_settings,
+)
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
@@ -83,6 +87,8 @@ from omnigent.native._native_post_delivery import (
     post_session_succession,
     replay_dead_letters,
 )
+from omnigent.native._native_session_labels import replacement_session_labels
+from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -760,8 +766,8 @@ class _CodexForwarderState:
     :param posted_collaboration_mode: Last collaboration mode kind already
         mirrored to Omnigent via
         ``external_codex_collaboration_mode_change``.
-    :param terminal_launch_args: Latest known Codex approval/sandbox launch args.
-    :param posted_terminal_launch_args: Last mirrored permission launch args.
+    :param terminal_launch_args: Saved control args used by existing thread-start paths.
+    :param posted_terminal_launch_args: Saved baseline; passive reports never write args.
     :param parent_session_id: Omnigent parent session id, e.g.
         ``"conv_parent"``. Set by ``supervise_forwarder`` so collab-agent
         helpers can register child sessions without extra parameter
@@ -840,8 +846,10 @@ class _CodexForwarderState:
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
     posted_terminal_launch_args: list[str] | None = None
-    approval_preset: str | None = None
-    posted_approval_preset: str | None = None
+    permission_observation: CodexPermissionObservation | None = None
+    posted_permission_observation: CodexPermissionObservation | None = None
+    posted_permission_session_id: str | None = None
+    permission_observation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     async_question_tracker: _CodexAsyncQuestionTracker = field(
@@ -926,7 +934,7 @@ class _CodexForwarderState:
             return
         self._note_model_fields(result)
         self._note_service_tier(result)
-        self._note_approval_mode_fields(result)
+        self._note_approval_mode_fields(result, origin="resume")
         # Do NOT seed ``posted_model`` here. Omnigent must learn the session's
         # ACTUAL model — including the spawn default — because the cost-budget
         # gate resolves the model as ``conv.model_override or spec.llm.model``,
@@ -1083,6 +1091,9 @@ class _CodexForwarderState:
         if self.snapshot_publisher is not None and self.parent_session_id is not None:
             self.snapshot_publisher.update(self.parent_session_id, {}, retired=True)
         self.parent_session_id = session_id
+        self.permission_observation = None
+        self.posted_permission_observation = None
+        self.posted_permission_session_id = None
         self.publish_child_snapshot()
         self.pending_child_threads.clear()
         self.posted_goal_state = None
@@ -1408,18 +1419,27 @@ class _CodexForwarderState:
         if isinstance(mode, str) and mode:
             self.collaboration_mode = mode
 
-    def _note_approval_mode_fields(self, payload: _JsonObject) -> None:
-        """Record Codex approval/sandbox settings as launch args + a runtime preset."""
-        args = _codex_terminal_launch_args_from_settings(payload)
-        if args is not None:
-            self.terminal_launch_args = args
-        # Also resolve the /permissions preset for the web read-back label. A
-        # payload that maps to no preset (e.g. a custom permission profile) has no
-        # preset value to show, so the last-known one stays put — the picker keeps
-        # its prior value rather than blanking. Known limitation for custom profiles.
-        preset = codex_permission_preset_from_thread_settings(payload)
-        if preset is not None:
-            self.approval_preset = preset
+    def _note_approval_mode_fields(
+        self, payload: _JsonObject, *, origin: str = "settings-updated"
+    ) -> None:
+        """Observe one frame without changing the saved control-argument baseline."""
+        if origin != "resume" and not any(
+            key in payload
+            for key in (
+                "approvalPolicy",
+                "approval_policy",
+                "approvalsReviewer",
+                "approvals_reviewer",
+                "sandboxPolicy",
+                "sandbox_policy",
+                "activePermissionProfile",
+                "active_permission_profile",
+            )
+        ):
+            return
+        self.permission_observation = codex_permission_observation_from_thread_settings(
+            payload, origin=origin
+        )
 
 
 @dataclass(frozen=True)
@@ -2657,7 +2677,8 @@ async def supervise_forwarder(
                     isinstance(arg, str) for arg in launch_args
                 ):
                     forwarder_state.terminal_launch_args = launch_args
-            except Exception:  # noqa: BLE001 - live thread settings can still supply the stance.
+                    forwarder_state.posted_terminal_launch_args = list(launch_args)
+            except Exception:  # noqa: BLE001 - existing thread-start fallback handles missing args.
                 _logger.warning("Failed to read Codex launch stance", exc_info=True)
         snapshots = NativeSubagentSnapshotPublisher(ap_client)
         forwarder_state.snapshot_publisher = snapshots
@@ -3027,6 +3048,23 @@ async def _maybe_rotate_session_on_thread_started(
     await old_usage_coalescer.flush()
     old_elicitation_tracker = target.elicitation_tracker
     old_session_id = target.session_id
+    from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
+
+    allow_empty = False
+    try:
+        old = await _fetch_session_snapshot(ap_client, old_session_id)
+    except (httpx.HTTPError, ValueError, RuntimeError):
+        _logger.warning(
+            "Failed to read Codex rotation intent; retaining empty-session succession gate; "
+            "old_session=%s",
+            old_session_id,
+            exc_info=True,
+        )
+    else:
+        old_labels = old.get("labels")
+        allow_empty = (
+            not isinstance(old_labels, dict) or ROTATE_REQUESTED_LABEL_KEY not in old_labels
+        )
     prepared = read_bridge_state(bridge_dir)
     if (
         prepared is not None
@@ -3067,6 +3105,13 @@ async def _maybe_rotate_session_on_thread_started(
         ap_client,
         old_session_id=old_session_id,
         new_session_id=new_session_id,
+        allow_empty=allow_empty,
+    )
+    await post_clear_supersession(
+        ap_client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
     )
     return True
 
@@ -3105,7 +3150,7 @@ async def _create_thread_replacement_session(
     runner_id = old.get("runner_id")
     labels_value = old.get("labels")
     labels = (
-        {str(key): str(value) for key, value in labels_value.items()}
+        replacement_session_labels({str(key): str(value) for key, value in labels_value.items()})
         if isinstance(labels_value, dict)
         else {}
     )
@@ -3114,6 +3159,8 @@ async def _create_thread_replacement_session(
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
     create_body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
+    if (title := old.get("title")) is not None:
+        create_body["title"] = title
     project_id = old.get("project_id")
     if isinstance(project_id, str):
         create_body.update({"project_id": project_id, "workspace": None, "git": None})
@@ -4505,35 +4552,27 @@ async def _sync_codex_approval_mode_change(
     session_id: str,
     forwarder_state: _CodexForwarderState,
 ) -> None:
-    """Mirror Codex ``/permissions`` changes into session metadata.
-
-    Posts two things the server persists differently: ``terminal_launch_args``
-    (the create/fork/resume vocabulary) and ``approval_mode`` (the runtime
-    ``/permissions`` preset that drives the web read-back label + live picker).
-    """
-    args = forwarder_state.terminal_launch_args
-    preset = forwarder_state.approval_preset
-    args_changed = args is not None and args != forwarder_state.posted_terminal_launch_args
-    preset_changed = preset is not None and preset != forwarder_state.posted_approval_preset
-    if not args_changed and not preset_changed:
-        return
-    data: _JsonObject = {}
-    if args is not None:
-        data["terminal_launch_args"] = args
-    if preset is not None:
-        data["approval_mode"] = preset
-    response = await _post_session_event(
-        client,
-        session_id,
-        event_type="external_codex_approval_mode_change",
-        data=data,
-    )
-    _log_failed_session_event_post("external_codex_approval_mode_change", response)
-    if response is not None and response.status_code < 400:
-        if args is not None:
-            forwarder_state.posted_terminal_launch_args = list(args)
-        if preset is not None:
-            forwarder_state.posted_approval_preset = preset
+    """Post only a frozen readback snapshot; saved argv never rides this channel."""
+    async with forwarder_state.permission_observation_lock:
+        observed = forwarder_state.permission_observation
+        if observed is None or (
+            observed == forwarder_state.posted_permission_observation
+            and session_id == forwarder_state.posted_permission_session_id
+        ):
+            return
+        response = await _post_session_event(
+            client,
+            session_id,
+            event_type="external_codex_approval_mode_change",
+            data={
+                "approval_mode": observed.mode,
+                "permission_observation": cast(_JsonObject, observed.to_payload()),
+            },
+        )
+        _log_failed_session_event_post("external_codex_approval_mode_change", response)
+        if response is not None and response.status_code < 400:
+            forwarder_state.posted_permission_observation = observed
+            forwarder_state.posted_permission_session_id = session_id
 
 
 async def _maybe_fail_turn_on_certificate_failure(
@@ -8176,6 +8215,12 @@ def _command_execution_tool_call(call_id: str, item: _JsonObject) -> _CodexToolC
     if isinstance(exit_code, int) and exit_code != 0:
         suffix = f"[exit code: {exit_code}]"
         output_text = f"{output_text}\n{suffix}" if output_text else suffix
+    # Codex reports these terminal states without requiring an exitCode; put
+    # the marker first so the collapsed card preview still shows it.
+    command_status = item.get("status")
+    if command_status in ("failed", "declined"):
+        marker = f"[command status: {command_status}]"
+        output_text = f"{marker}\n{output_text}" if output_text else marker
     # Turn codex's opaque "sandbox can't start" bwrap failure into actionable
     # recovery guidance; a no-op for any other output.
     output_text = _augment_sandbox_namespace_error(output_text)

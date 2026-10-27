@@ -377,18 +377,94 @@ async def test_layer_routes_keep_independent_clear_and_history(
     assert removed_history.json()["data"][0]["text"] == "Host"
 
 
-@pytest.mark.parametrize("scope", ["shared", "agent", "host", "independent", "mother", "child"])
+@pytest.mark.parametrize("role", ["mother", "child"])
+async def test_role_independent_stale_sources_keep_role_and_route_separate(
+    auth_client, db_uri, store, role, monkeypatch
+):
+    ticks = iter(range(1_000_000, 1_000_100))
+    monkeypatch.setattr(
+        "omnigent.stores.global_instructions_store.sqlalchemy_store.now_epoch_us",
+        lambda: next(ticks),
+    )
+    _make_user(db_uri, "admin@example.test", is_admin=True)
+    HostStore(db_uri).upsert_on_connect(_OWN_HOST, "Laptop", "admin@example.test")
+    headers = _headers("admin@example.test")
+    store.save("Role cell", created_by=None, scope=role, agent_key="codex", host_id=_OWN_HOST)
+    store.save("Wrong agent", created_by=None, scope=role, agent_key="claude")
+    store.save("Wrong role", created_by=None, scope="child" if role == "mother" else "mother")
+    store.save("Route changed", created_by=None)
+
+    async def stale_layers():
+        listing = await auth_client.get("/v1/instruction-layers", headers=headers)
+        assert listing.status_code == 200, listing.text
+        return next(
+            row["stale_layers"]
+            for row in listing.json()["data"]
+            if row["scope"] == role and row["agent_key"] == "codex" and row["host_id"] == _OWN_HOST
+        )
+
+    assert await stale_layers() == []
+    store.save("Shared role changed", created_by=None, scope=role)
+    store.save("Column changed", created_by=None, scope=role, agent_key="codex")
+    store.save("Host cleared", created_by=None, scope=role, host_id=_OWN_HOST)
+    assert await stale_layers() == ["shared", "agent", "host"]
+    store.save(" \n", created_by=None, scope=role, agent_key="codex", host_id=_OWN_HOST)
+    assert await stale_layers() == []
+
+
+@pytest.mark.parametrize("route_independent", [False, True])
+async def test_legacy_spawn_get_composes_role_keys(auth_client, db_uri, store, route_independent):
+    _make_user(db_uri, "admin@example.test", is_admin=True)
+    HostStore(db_uri).upsert_on_connect(_OWN_HOST, "Laptop", "admin@example.test")
+    headers = _headers("admin@example.test")
+    store.save(" Route ", created_by=None)
+    if route_independent:
+        store.save(
+            "Own route", created_by=None, scope="independent", agent_key="codex", host_id=_OWN_HOST
+        )
+    store.save(" Mother ", created_by=None, scope="mother")
+    store.save(" Codex ", created_by=None, scope="mother", agent_key="codex")
+    store.save(" Host ", created_by=None, scope="mother", host_id=_OWN_HOST)
+    store.save("Other agent", created_by=None, scope="mother", agent_key="claude")
+
+    async def text(params):
+        response = await auth_client.get("/v1/global-instructions", headers=headers, params=params)
+        assert response.status_code == 200, response.text
+        return response.json()["text"]
+
+    route = "Own route" if route_independent else " Route "
+    params = {"host_id": _OWN_HOST, "agent": "codex", "spawn": "true"}
+    assert await text(params) == route + "\n\n Mother \n\n Codex \n\n Host "
+    store.save(
+        " Role cell ", created_by=None, scope="mother", agent_key="codex", host_id=_OWN_HOST
+    )
+    assert await text(params) == route + "\n\n Role cell "
+    assert await text({**params, "spawn": "false"}) == route
+    assert await text({"spawn": "true"}) == " Route \n\n Mother "
+    assert await text({}) == " Route "
+
+
+@pytest.mark.parametrize(
+    "scope,agent_key,host_id",
+    [
+        ("shared", "", ""),
+        ("agent", "codex", ""),
+        ("host", "", _OWN_HOST),
+        ("independent", "codex", _OWN_HOST),
+        *[
+            (role, agent, host)
+            for role in ("mother", "child")
+            for agent, host in (("", ""), ("codex", ""), ("", _OWN_HOST), ("codex", _OWN_HOST))
+        ],
+    ],
+)
 async def test_instruction_tools_reuse_layer_api_and_revision_guard(
-    auth_client: httpx.AsyncClient, db_uri: str, scope: str
+    auth_client: httpx.AsyncClient, db_uri: str, scope: str, agent_key: str, host_id: str
 ) -> None:
     _make_user(db_uri, "admin@example.test", is_admin=True)
     auth_client.headers.update(_headers("admin@example.test"))
     HostStore(db_uri).upsert_on_connect(_OWN_HOST, "laptop", "admin@example.test")
-    key = {"scope": scope}
-    if scope in {"agent", "independent"}:
-        key["agent_key"] = "codex"
-    if scope in {"host", "independent"}:
-        key["host_id"] = _OWN_HOST
+    key = {"scope": scope, "agent_key": agent_key, "host_id": host_id}
 
     async def call(name, args):
         return json.loads(
@@ -513,24 +589,44 @@ async def test_layer_scope_and_host_authorization(
     ).status_code == 404
 
 
+@pytest.mark.parametrize("scope", ["shared", "mother", "child"])
 async def test_large_layer_save_warns_only_newly_over_budget_routes(
     auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
     db_uri: str,
+    scope: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _make_user(db_uri, "admin@example.com", is_admin=True)
     HostStore(db_uri).upsert_on_connect(_OWN_HOST, "laptop", "admin@example.com")
     headers = _headers("admin@example.com")
+    key = {"scope": scope, **({"agent_key": "codex"} if scope != "shared" else {})}
+    # Route sizes include mother text only for spawn-capable subjects.
+    if scope == "mother":
+        from types import SimpleNamespace
+
+        from omnigent.spec import AgentSpec
+
+        descriptor = next(a for a in native_agents() if a.key == "codex")
+        SqlAlchemyAgentStore(db_uri).create("d" * 32, descriptor.agent_name, "bundle")
+        monkeypatch.setattr(
+            auth_app.state.agent_cache,
+            "load",
+            lambda *args, **kwargs: SimpleNamespace(spec=AgentSpec(spec_version=1, spawn=True)),
+        )
     first = await auth_client.put(
         "/v1/instruction-layers",
-        json={"scope": "shared", "text": "x" * 10_001},
+        json={**key, "text": "x" * 10_001},
         headers=headers,
     )
     assert first.status_code == 200, first.text
     assert first.json()["over_budget_routes"]
     assert all(r["total_chars"] >= 10_001 for r in first.json()["over_budget_routes"])
+    if scope != "shared":
+        assert {r["agent_key"] for r in first.json()["over_budget_routes"]} == {"codex"}
     second = await auth_client.put(
         "/v1/instruction-layers",
-        json={"scope": "shared", "text": "y" * 10_002},
+        json={**key, "text": "y" * 10_002},
         headers=headers,
     )
     assert second.status_code == 200, second.text

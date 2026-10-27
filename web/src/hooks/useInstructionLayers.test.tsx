@@ -1,4 +1,4 @@
-import type { InstructionLayers } from "./useInstructionLayers";
+import type { InstructionLayers, LayerKey } from "./useInstructionLayers";
 import type { Host } from "@/hooks/useHosts";
 import type { ReactNode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
@@ -9,6 +9,7 @@ import {
   instructionRegistryItems,
   instructionGridAxes,
   hasInstructionText,
+  layerShape,
   useInstructionPreview,
   useInstructionRevisions,
   useSaveInstructionLayer,
@@ -29,6 +30,21 @@ function setup() {
 }
 beforeEach(() => fetch.mockReset());
 afterEach(cleanup);
+
+it.each([
+  ["shared", "", "", "shared"],
+  ["agent", "codex", "", "agent"],
+  ["host", "", "host-a", "host"],
+  ["independent", "codex", "host-a", "independent"],
+  ...["mother", "child"].flatMap((scope) => [
+    [scope, "", "", "shared"],
+    [scope, "codex", "", "agent"],
+    [scope, "", "host-a", "host"],
+    [scope, "codex", "host-a", "independent"],
+  ]),
+])("classifies %s / %s / %s as %s", (scope, agent_key, host_id, shape) => {
+  expect(layerShape({ scope, agent_key, host_id } as LayerKey)).toBe(shape);
+});
 
 it.each([undefined, "revision-a", null])(
   "sends the exact scoped text with expected revision %j and invalidates totals and history",
@@ -102,62 +118,70 @@ it("loads revision history for just the selected layer", async () => {
   client.clear();
 });
 
-it("orders explicit axes first, then held axes, skipping unknown and removed hosts", () => {
-  const hosts = ["host-a", "host-b", "host-c"].map((host_id) => ({ host_id })) as Host[];
-  const data = {
-    data: [
-      { scope: "agent", agent_key: "codex", text: "C" },
-      { scope: "independent", agent_key: "claude", host_id: "host-a", text: "I" },
-      {
-        scope: "independent",
-        agent_key: "removed",
-        host_id: "host-b",
-        text: "R",
-        host_removed: true,
-      },
-      { scope: "independent", agent_key: "missing", host_id: "unknown", text: "M" },
-      { scope: "independent", agent_key: "unknown", host_id: "host-c", text: "U" },
-      { scope: "agent", agent_key: "empty", text: "\u0085\u001c" },
-      { scope: "host", host_id: "host-b", text: "Host" },
-      { scope: "host", host_id: "unknown", text: "Missing host" },
-    ],
-    agents: ["codex", "claude", "removed", "missing", "empty", "new"].map((key) => ({
-      key,
-      display_name: key,
-    })),
-  } as InstructionLayers;
-  const axes = instructionGridAxes(data, hosts, {
-    hosts: ["unknown", "host-b"],
-    agents: ["unknown", "new"],
-  });
-  expect(axes.agents.map((agent) => agent.key)).toEqual(["new", "codex", "claude"]);
-  expect(axes.hosts.map((host) => host.host_id)).toEqual(["host-b", "host-a"]);
-  expect(axes.agentLayers.get("claude")).toEqual([data.data[1]]);
-  expect(axes.hostLayers.get("host-b")).toEqual([data.data[6]]);
-  expect(axes.hostLayers.get("host-a")).toEqual([data.data[1]]);
-});
-it("excludes unknown-agent layers from a held host row's clear set", () => {
-  const hostLayer = { scope: "host", host_id: "host-a", text: "Host text" };
-  const unknownLayer = {
-    scope: "independent",
-    host_id: "host-a",
-    agent_key: "unknown",
-    text: "Independent text",
-  };
-  const data = {
-    data: [hostLayer, unknownLayer, { scope: "agent", agent_key: "unknown", text: "Agent text" }],
-    agents: [{ key: "agent-a", display_name: "Agent A" }],
-  } as InstructionLayers;
-  const axes = instructionGridAxes(data, [{ host_id: "host-a" }] as Host[], {
-    hosts: [],
-    agents: [],
-  });
-  expect(axes.hosts.map((host) => host.host_id)).toEqual(["host-a"]);
-  expect(axes.hostLayers.get("host-a")).toEqual([hostLayer]);
-  expect(axes.agentLayers.size).toBe(0);
-  expect(axes.agents).toEqual([]);
-  expect(unknownLayer.text).toBe("Independent text");
-});
+it.each(["route", "mother", "child"] as const)(
+  "orders %s axes first, then held axes, skipping unknown and removed hosts",
+  (role) => {
+    const hosts = ["host-a", "host-b", "host-c"].map((host_id) => ({ host_id })) as Host[];
+    const data = {
+      data: [
+        { scope: "agent", agent_key: "codex", text: "C" },
+        { scope: "independent", agent_key: "claude", host_id: "host-a", text: "I" },
+        {
+          scope: "independent",
+          agent_key: "removed",
+          host_id: "host-b",
+          text: "R",
+          host_removed: true,
+        },
+        { scope: "independent", agent_key: "missing", host_id: "unknown", text: "M" },
+        { scope: "independent", agent_key: "unknown", host_id: "host-c", text: "U" },
+        { scope: "agent", agent_key: "empty", text: "\u0085\u001c" },
+        { scope: "host", host_id: "host-b", text: "Host" },
+        { scope: "host", host_id: "unknown", text: "Missing host" },
+      ],
+      agents: ["codex", "claude", "removed", "missing", "empty", "new"].map((key) => ({
+        key,
+        display_name: key,
+      })),
+    } as InstructionLayers;
+    if (role !== "route") data.data = data.data.map((layer) => ({ ...layer, scope: role }));
+    const axes = instructionGridAxes(data, hosts, {
+      hosts: ["unknown", "host-b"],
+      agents: ["unknown", "new"],
+    });
+    expect(axes.agents.map((agent) => agent.key)).toEqual(["new", "codex", "claude"]);
+    expect(axes.hosts.map((host) => host.host_id)).toEqual(["host-b", "host-a"]);
+    expect(axes.agentLayers.get("claude")).toEqual([data.data[1]]);
+    expect(axes.hostLayers.get("host-b")).toEqual([data.data[6]]);
+    expect(axes.hostLayers.get("host-a")).toEqual([data.data[1]]);
+  },
+);
+it.each(["route", "mother", "child"] as const)(
+  "excludes unknown-agent %s layers from a held host row's clear set",
+  (role) => {
+    const hostLayer = { scope: "host", host_id: "host-a", text: "Host text" };
+    const unknownLayer = {
+      scope: "independent",
+      host_id: "host-a",
+      agent_key: "unknown",
+      text: "Independent text",
+    };
+    const data = {
+      data: [hostLayer, unknownLayer, { scope: "agent", agent_key: "unknown", text: "Agent text" }],
+      agents: [{ key: "agent-a", display_name: "Agent A" }],
+    } as InstructionLayers;
+    if (role !== "route") data.data = data.data.map((layer) => ({ ...layer, scope: role }));
+    const axes = instructionGridAxes(data, [{ host_id: "host-a" }] as Host[], {
+      hosts: [],
+      agents: [],
+    });
+    expect(axes.hosts.map((host) => host.host_id)).toEqual(["host-a"]);
+    expect(axes.hostLayers.get("host-a")).toEqual([data.data[0]]);
+    expect(axes.agentLayers.size).toBe(0);
+    expect(axes.agents).toEqual([]);
+    expect(unknownLayer.text).toBe("Independent text");
+  },
+);
 it.each([
   [null, false],
   ["", false],

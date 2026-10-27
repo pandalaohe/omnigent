@@ -159,6 +159,150 @@ def test_context_v2_native_unbound_reads_allocate_no_registry(tmp_path):
     assert backend._context_inventory is None
 
 
+async def test_context_work_binding_comes_from_real_rpc_and_reader(context_v2_native):
+    backend, old_client, _websocket = context_v2_native
+    await old_client.close()
+    connections = asyncio.Queue()
+
+    async def handle(websocket):
+        await connections.put(websocket)
+        async for raw in websocket:
+            message = json.loads(raw)
+            method = message["method"]
+            if method == "initialized":
+                continue
+            result = (
+                {"thread": {"id": "primary"}}
+                if method == "thread/start"
+                else {"turn": {"id": "turn-one"}}
+                if method == "turn/start"
+                else {}
+            )
+            await websocket.send(json.dumps({"id": message["id"], "result": result}))
+
+    async with serve(handle, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
+        await client.connect()
+        orchestration._bind_codex_inventory_client(
+            "conversation", backend, client, incarnation_id=backend.resident_incarnation_id
+        )
+        peer = await connections.get()
+        try:
+            await client.request("thread/start", {})
+            source = backend.context_source_v2("conversation")
+            assert source.work_bindings is not None
+            (binding,) = source.work_bindings
+            assert binding.context == source.contexts[0].key
+            assert (binding.runtime_id, binding.generation) == (
+                backend.resident_incarnation_id,
+                str(backend._start_generation),
+            )
+            await client.request("turn/start", {"threadId": "primary", "input": []})
+            source, rows = orchestration.native_context_work_snapshot_v2("conversation")
+            assert len(rows) == 1 and rows[0].live_turn
+            assert not rows[0].no_live_work_confirmed and not rows[0].no_owned_descendants
+            for turn_id, active in (("old-turn", True), ("turn-one", False)):
+                await peer.send(
+                    json.dumps(
+                        {
+                            "method": "turn/completed",
+                            "params": {"threadId": "primary", "turn": {"id": turn_id}},
+                        }
+                    )
+                )
+                event = await asyncio.wait_for(anext(client.iter_events()), 2)
+                assert event["method"] == "turn/completed"
+                source, rows = orchestration.native_context_work_snapshot_v2("conversation")
+                assert rows[0].live_turn is active
+                assert not rows[0].no_live_work_confirmed
+            assert source.coverage == "partial" and source.work_revision is None
+            assert source.revision_authority == "observation_only"
+        finally:
+            await client.close()
+        source, rows = orchestration.native_context_work_snapshot_v2("conversation")
+        assert source.work_bindings is None and rows == ()
+        assert source.contexts[0].lifecycle == "unknown"
+
+
+@pytest.mark.parametrize("change", ["cancel", "generation", "closing", "ambiguous"])
+async def test_context_work_pending_and_invalid_lifetimes_stay_unknown(context_v2_native, change):
+    backend, client, websocket = context_v2_native
+
+    async def created(raw):
+        message = json.loads(raw)
+        client._pending_requests[message["id"]].set_result(
+            {"result": {"thread": {"id": "primary"}}}
+        )
+
+    websocket.send.side_effect = created
+    await client.request("thread/start", {})
+    if change == "ambiguous":
+        await client.request("thread/start", {})
+    entered = asyncio.Event()
+
+    async def hold(_raw):
+        entered.set()
+        await asyncio.Event().wait()
+
+    websocket.send.side_effect = hold
+    task = asyncio.create_task(client.request("turn/start", {"threadId": "primary"}))
+    closing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        source, rows = orchestration.native_context_work_snapshot_v2("conversation")
+        assert rows[0].live_turn is (change != "ambiguous")
+        if change == "generation":
+            backend._start_generation += 1
+        elif change == "closing":
+            closing = backend.close()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        source, rows = orchestration.native_context_work_snapshot_v2("conversation")
+        if change in {"generation", "closing"}:
+            assert source.work_bindings is None and rows == ()
+        elif change == "ambiguous":
+            assert source.work_bindings == ()
+            assert "context_work_thread_ambiguous_or_unobserved" in {
+                r.reason for r in source.unresolved
+            }
+        else:
+            assert rows[0].live_turn and not rows[0].no_live_work_confirmed
+        assert source.coverage == "partial"
+        assert all(row.stop_proof is None for row in source.contexts)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if closing is not None:
+            closing.close()
+
+
+async def test_context_work_history_budget_retains_unknown_work(context_v2_native):
+    _backend, client, websocket = context_v2_native
+    turn = 0
+
+    async def respond(raw):
+        nonlocal turn
+        message = json.loads(raw)
+        turn += 1
+        result = (
+            {"thread": {"id": "primary"}}
+            if message["method"] == "thread/start"
+            else {"turn": {"id": f"turn-{turn}"}}
+        )
+        client._pending_requests[message["id"]].set_result({"result": result})
+
+    websocket.send.side_effect = respond
+    await client.request("thread/start", {})
+    for _ in range(1001):
+        await client.request("turn/start", {"threadId": "primary", "input": []})
+    source, rows = orchestration.native_context_work_snapshot_v2("conversation")
+    assert "context_work_history_budget" in {gap.reason for gap in source.unresolved}
+    assert rows[0].live_turn and not rows[0].no_live_work_confirmed
+    assert not rows[0].no_owned_descendants and source.coverage == "partial"
+
+
 def test_context_v2_history_budget_vetoes_instead_of_truncating():
     from omnigent.harnesses.codex_native.context_inventory import CodexContextInventory
     from omnigent.startup_protocol import native_context_scope_v2

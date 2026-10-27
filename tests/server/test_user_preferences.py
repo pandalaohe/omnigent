@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,7 @@ from omnigent.server.auth import (
     AuthProvider,
     UnifiedAuthProvider,
 )
+from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
 from omnigent.server.routes.sessions.routes_hooks import _approval_timeout_owner
 from omnigent.server.schemas import UserPreferenceNamespace
 from omnigent.server.user_preferences_store import (
@@ -36,6 +38,7 @@ from omnigent.server.user_preferences_store import (
     AgentKeepWarm,
     ApprovalTimeout,
     CollabSettings,
+    KeepWarmIdentity,
     KeepWarmSettings,
     ResolvedAgentKeepWarm,
     SqlAlchemyUserPreferencesStore,
@@ -44,6 +47,7 @@ from omnigent.server.user_preferences_store import (
     clamp_host_offline_archive_s,
     clamp_keep_warm,
     keep_warm_for_agent,
+    keep_warm_row,
     migrate_legacy_keep_warm,
     read_approval_timeout,
     read_collab_settings,
@@ -78,7 +82,7 @@ class _AccountsAuthProvider(UnifiedAuthProvider):
         return request.headers.get("x-test-user")
 
 
-def _preferences_app(db_uri: str, tmp_path: Path) -> FastAPI:
+def _preferences_app(db_uri: str, tmp_path: Path, **kwargs: Any) -> FastAPI:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts-preferences"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -91,6 +95,7 @@ def _preferences_app(db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         auth_provider=_HeaderAuthProvider(),
         user_preferences_store=SqlAlchemyUserPreferencesStore(db_uri),
+        **kwargs,
     )
 
 
@@ -627,6 +632,49 @@ async def test_preferences_api_accepts_child_idle_and_project_host_agents(
         )
         assert initialized.status_code == 200, initialized.text
         assert initialized.json() == envelope
+
+
+async def test_checkin_instructions_defaults_validation_and_reset(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    app = _preferences_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (await client.get("/v1/child-checkin/defaults")).status_code == 401
+        headers = {"x-test-user": "alice@example.com"}
+        defaults = await client.get("/v1/child-checkin/defaults", headers=headers)
+        assert defaults.status_code == 200
+        assert defaults.json() == {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+        for value, status in [
+            (None, 200),
+            ("", 200),
+            ("  custom\ntext  ", 200),
+            ("x" * 4000, 200),
+            ("x" * 4001, 422),
+            ("   ", 422),
+            (123, 422),
+            ("\x00" + "x" * 4000, 200),
+            (None, 200),
+        ]:
+            response = await client.patch(
+                "/v1/me/preferences/child_idle",
+                headers=headers,
+                json={"value": {"checkinInstructions": value}},
+            )
+            assert response.status_code == status, response.text
+            if status == 200:
+                expected = value.replace("\x00", "") if isinstance(value, str) else value
+                assert response.json()["settings"]["child_idle"]["checkinInstructions"] == expected
+                synced = await client.get("/v1/me", headers=headers)
+                assert synced.json()["preferences"] == response.json()
+        initialized = await client.put(
+            "/v1/me/preferences",
+            headers={"x-test-user": "bob@example.com"},
+            json={"version": 1, "settings": {"child_idle": {"checkinInstructions": "A\x00B"}}},
+        )
+        assert initialized.status_code == 200
+        assert initialized.json()["settings"]["child_idle"]["checkinInstructions"] == "AB"
 
 
 @pytest.mark.asyncio
@@ -2343,3 +2391,648 @@ async def test_preferences_api_accepts_the_sidebar_layout_namespace(
         synced_me = await client.get("/v1/me", headers=headers)
         assert synced_me.status_code == 200
         assert synced_me.json()["preferences"]["settings"]["sidebar_layout"] == layout
+
+
+def test_keep_warm_cells_parse_host_and_identity_precedence(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "alice",
+        "keep_warm",
+        {
+            "default": {"main": True, "coldAfterSeconds": 0},
+            "agents": {"direct": {"main": True}},
+            "cells": {
+                "h1": {
+                    "harness:codex": {"main": True, "intervalSeconds": 9999},
+                    "direct": {"child": True, "maxSeconds": 1},
+                    "ca_custom": {"coldAfterSeconds": 1},
+                    "invalid": "ignored",
+                },
+                "": {"harness:codex": {"child": True}},
+                "malformed": False,
+            },
+            "migratedToCellsAt": 123,
+        },
+    )
+    settings = read_keep_warm_settings(store, "alice")
+    assert settings.migrated_to_cells_at == 123
+    assert keep_warm_for_agent(settings, "new", "codex", harness="codex", host_id="h1") == (
+        ResolvedAgentKeepWarm(True, False, 1740, 14400)
+    )
+    assert keep_warm_for_agent(settings, "direct", "codex", harness="codex", host_id="h1") == (
+        ResolvedAgentKeepWarm(False, True, 1500, 3600)
+    )
+    assert keep_warm_row(
+        settings, host_id="h1", template_id="ca_custom", agent_id="direct", harness="codex"
+    ) == AgentKeepWarm(False, False, None, 14400, 60)
+    assert keep_warm_row(settings, host_id="new", agent_id="direct", harness="codex") == (
+        AgentKeepWarm(False, False, None, 14400)
+    )
+    assert keep_warm_row(settings, harness="codex").child is True
+    store.patch_namespace("alice", "keep_warm", {"cells": {}})
+    assert read_keep_warm_settings(store, "alice").cells == {}
+    assert keep_warm_row(read_keep_warm_settings(store, "alice"), agent_id="direct").main is False
+
+
+def test_keep_warm_convert_live_shape_preserves_every_route(db_uri: str) -> None:
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_plugins import product_agent_harnesses
+
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    products = product_agent_harnesses()
+    names = {harness: name for name, harness in products.items()}
+    direct = {
+        harness: builtin_agent_id(names[harness])
+        for harness in ("claude-native", "codex-native", "claude-sdk", "codex")
+    }
+    namespace = {
+        "default": {"main": True, "child": True, "maxSeconds": 14400},
+        "agents": {
+            direct["claude-native"]: {"main": True, "child": True, "intervalSeconds": 3300},
+            direct["codex-native"]: {"intervalSeconds": 1680},
+            direct["claude-sdk"]: {"intervalSeconds": 3300},
+            direct["codex"]: {"intervalSeconds": 1500},
+        },
+    }
+    before = store.patch_namespace("alice", "keep_warm", namespace)
+    identities = [
+        KeepWarmIdentity(builtin_agent_id(name), harness) for name, harness in products.items()
+    ] + [
+        KeepWarmIdentity("polly", "claude-sdk"),
+        KeepWarmIdentity("debby", "claude-sdk"),
+        KeepWarmIdentity("session-only", "pi"),
+        KeepWarmIdentity("copy", "claude-sdk", "ca_library"),
+        KeepWarmIdentity("open-code", "opencode-native"),
+    ]
+    old = read_keep_warm_settings(store, "alice")
+    preview = store.convert_keep_warm("alice", identities, ["h1", "h2"], dry_run=True)
+    assert store.get("alice") == before
+    expected = {
+        "harness:claude-native": {"main": True, "child": True},
+        "harness:codex-native": {"intervalSeconds": 1680},
+        "harness:pi-native": {"main": True, "child": True},
+        "harness:pi": {"main": True, "child": True},
+        "polly": {"main": True, "child": True},
+        "debby": {"main": True, "child": True},
+        "copy": {"main": True, "child": True},
+    }
+    assert preview["cells"] == {"": expected, "h1": expected, "h2": expected}
+    expected_columns = sorted({*expected, "harness:claude-sdk", "harness:codex"})
+    assert preview["columns"] == expected_columns
+    result = store.convert_keep_warm("alice", identities, ["h1", "h2"], dry_run=False)
+    assert result["already"] is False
+    assert result["columns"] == expected_columns
+    persisted = store.get("alice")
+    assert persisted is not None
+    assert persisted["settings"]["keep_warm"]["agents"] == namespace["agents"]
+    assert result["bytes"] == len(
+        json.dumps(
+            persisted["settings"]["keep_warm"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    converted = read_keep_warm_settings(store, "alice")
+    for host in ("", "h1", "h2"):
+        for identity in identities:
+            kwargs = {
+                "template_id": identity.template_id,
+                "harness": identity.harness,
+                "host_id": host,
+            }
+            old_row = keep_warm_row(old, agent_id=identity.agent_id, **kwargs)
+            new_row = keep_warm_row(converted, agent_id=identity.agent_id, **kwargs)
+            assert old_row.cold_after_s == new_row.cold_after_s
+            if identity.harness in (
+                "claude-native",
+                "claude-sdk",
+                "codex-native",
+                "codex",
+                "pi",
+                "pi-native",
+            ):
+                family = "claude" if identity.harness.startswith("claude") else "codex"
+                assert keep_warm_for_agent(old, identity.agent_id, family, **kwargs) == (
+                    keep_warm_for_agent(converted, identity.agent_id, family, **kwargs)
+                )
+    assert store.convert_keep_warm("alice", [], [], dry_run=False)["already"] is True
+    assert store.get("alice") == persisted
+
+
+def test_keep_warm_conversion_preserves_product_and_template_off_masks(db_uri: str) -> None:
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_plugins import product_agent_harnesses
+
+    product = next(
+        builtin_agent_id(name)
+        for name, harness in product_agent_harnesses().items()
+        if harness == "codex"
+    )
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "alice",
+        "keep_warm",
+        {
+            "agents": {
+                "harness:codex": {"main": True},
+                product: {},
+                "direct": {"main": True},
+                "ca_off": {},
+            },
+        },
+    )
+    result = store.convert_keep_warm(
+        "alice",
+        [
+            KeepWarmIdentity(product, "codex"),
+            KeepWarmIdentity("direct", "codex"),
+            KeepWarmIdentity("direct", "codex", "ca_off"),
+        ],
+        [],
+        dry_run=False,
+    )
+    assert result["cells"][""] == {
+        "harness:codex": {"main": True},
+        product: {"main": False, "child": False},
+        "ca_off": {"main": False, "child": False},
+    }
+    settings = read_keep_warm_settings(store, "alice")
+    assert keep_warm_row(settings, agent_id=product, harness="codex").main is False
+    assert (
+        keep_warm_row(settings, template_id="ca_off", agent_id="direct", harness="codex").main
+        is False
+    )
+    store.patch_namespace(
+        "bob",
+        "keep_warm",
+        {
+            "agents": {"harness:codex": {}, product: {"main": True}},
+        },
+    )
+    coexist = store.convert_keep_warm(
+        "bob", [KeepWarmIdentity(product, "codex")], [], dry_run=False
+    )
+    assert coexist["cells"] == {"": {product: {"main": True}}}
+
+
+def test_keep_warm_conversion_keeps_direct_exceptions_below_shared_template(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before = store.patch_namespace(
+        "alice",
+        "keep_warm",
+        {
+            "agents": {"direct_on": {"main": True}},
+        },
+    )
+    identities = [
+        KeepWarmIdentity("ca_library", "codex"),
+        KeepWarmIdentity("direct_on", "codex", "ca_library"),
+        KeepWarmIdentity("direct_off", "codex", "ca_library"),
+    ]
+    expected = {"": {"direct_on": {"main": True}}}
+    preview = store.convert_keep_warm("alice", identities, [], dry_run=True)
+    assert preview["cells"] == expected
+    assert store.get("alice") == before
+    saved = store.convert_keep_warm("alice", identities, [], dry_run=False)
+    assert saved["cells"] == expected
+    settings = read_keep_warm_settings(store, "alice")
+    assert (
+        keep_warm_row(
+            settings, template_id="ca_library", agent_id="direct_on", harness="codex"
+        ).main
+        is True
+    )
+    assert (
+        keep_warm_row(
+            settings, template_id="ca_library", agent_id="direct_off", harness="codex"
+        ).main
+        is False
+    )
+
+
+def test_keep_warm_conversion_ignores_stale_pi_interval_and_run_cap(db_uri: str) -> None:
+    from omnigent.server.child_keep_warm import pi_cache_warming_allowed
+
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "alice",
+        "keep_warm",
+        {
+            "agents": {
+                "harness:pi": {"main": True, "intervalSeconds": 99999, "maxSeconds": 172800},
+                "1" * 32: {"main": True, "intervalSeconds": 1, "maxSeconds": 1},
+            },
+        },
+    )
+    legacy = read_keep_warm_settings(store, "alice")
+    result = store.convert_keep_warm(
+        "alice", [KeepWarmIdentity("1" * 32, "pi")], [], dry_run=False
+    )
+    assert result["cells"] == {"": {"harness:pi": {"main": True}}}
+    converted = read_keep_warm_settings(store, "alice")
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id="1" * 32,
+        harness_override="pi",
+        labels={"omnigent.running_since": "1900000000"},
+    )
+    for settings in (legacy, converted):
+        assert pi_cache_warming_allowed(conv, settings, 1900001799) is True
+        assert pi_cache_warming_allowed(conv, settings, 1900001800) is False
+
+
+def test_keep_warm_conversion_preserves_sessions_with_deleted_template(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_plugins import harness_capabilities, product_agent_harnesses
+
+    codex = harness_capabilities()["codex"]
+    monkeypatch.setattr("omnigent.harness_plugins.harness_capabilities", lambda: {"codex": codex})
+
+    product = next(
+        builtin_agent_id(name)
+        for name, harness in product_agent_harnesses().items()
+        if harness == "codex"
+    )
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before = store.patch_namespace(
+        "alice",
+        "keep_warm",
+        {
+            "default": {"main": True},
+            "agents": {product: {}, "direct_off": {}},
+        },
+    )
+    identities = [
+        KeepWarmIdentity(product, "codex"),
+        KeepWarmIdentity("direct_off", "codex", "ca_deleted"),
+        KeepWarmIdentity("default_on", "codex", "ca_deleted"),
+    ]
+    expected = {"": {"default_on": {"main": True}}}
+    preview = store.convert_keep_warm("alice", identities, [], dry_run=True)
+    assert preview["cells"] == expected
+    assert store.get("alice") == before
+    saved = store.convert_keep_warm("alice", identities, [], dry_run=False)
+    assert saved["cells"] == expected
+    settings = read_keep_warm_settings(store, "alice")
+    assert (
+        keep_warm_row(
+            settings, agent_id="direct_off", template_id="ca_deleted", harness="codex"
+        ).main
+        is False
+    )
+    assert (
+        keep_warm_row(
+            settings, agent_id="default_on", template_id="ca_deleted", harness="codex"
+        ).main
+        is True
+    )
+
+
+def test_keep_warm_conversion_refuses_unrepresentable_template_routes(db_uri: str) -> None:
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_plugins import product_agent_harnesses
+
+    product = next(
+        builtin_agent_id(name)
+        for name, harness in product_agent_harnesses().items()
+        if harness == "codex"
+    )
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before = store.patch_namespace(
+        "alice",
+        "keep_warm",
+        {
+            "default": {"main": True},
+            "agents": {product: {}, "direct_off": {}},
+        },
+    )
+    identities = [
+        KeepWarmIdentity("ca_library", "codex"),
+        KeepWarmIdentity("direct_off", "codex", "ca_library"),
+        KeepWarmIdentity("default_on", "codex", "ca_library"),
+    ]
+    for dry_run in (True, False):
+        with pytest.raises(
+            UserPreferencesValidationError,
+            match="conflicting routes for 'ca_library': 1 hosts, 3 identities",
+        ):
+            store.convert_keep_warm("alice", identities, [], dry_run=dry_run)
+        assert store.get("alice") == before
+
+
+def test_keep_warm_convert_legacy_first_cold_only_and_null_guard(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before = store.patch_namespace(
+        "alice",
+        "session_collab",
+        {
+            "childKeepWarmEnabled": True,
+            "childKeepWarmClaudeIntervalSeconds": 3200,
+        },
+    )
+    preview = store.convert_keep_warm(
+        "alice",
+        [KeepWarmIdentity("native", "claude-native")],
+        ["h1"],
+        dry_run=True,
+        legacy_native_agents=[("native", "claude")],
+    )
+    assert preview["cells"]["h1"]["native"] == {"child": True, "intervalSeconds": 3200}
+    assert store.get("alice") == before
+    store.convert_keep_warm(
+        "alice",
+        [KeepWarmIdentity("native", "claude-native")],
+        ["h1"],
+        dry_run=False,
+        legacy_native_agents=[("native", "claude")],
+    )
+    migrated = read_keep_warm_settings(store, "alice")
+    assert migrated.migrated_from_legacy_at is not None
+    assert migrated.migrated_to_cells_at is not None
+    store.patch_namespace(
+        "bob",
+        "keep_warm",
+        {
+            "default": {"coldAfterSeconds": 0},
+            "hostOfflineArchiveSeconds": 7200,
+        },
+    )
+    result = store.convert_keep_warm(
+        "bob", [KeepWarmIdentity("opencode", "opencode-native")], ["h1"], dry_run=False
+    )
+    assert result["cells"]["h1"]["opencode"] == {"coldAfterSeconds": 0}
+    old = store.get("bob")["settings"]["keep_warm"]
+    patched = store.patch_namespace("bob", "keep_warm", None)["settings"]["keep_warm"]
+    assert patched == {
+        key: value for key, value in old.items() if key not in ("default", "agents")
+    }
+    assert patched["hostOfflineArchiveSeconds"] == 7200
+    assert (
+        store.patch_namespace("bob", "keep_warm", {"default": {"main": True}})["settings"][
+            "keep_warm"
+        ]["cells"]
+        == result["cells"]
+    )
+
+
+def test_keep_warm_convert_size_refusal_is_atomic(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before = store.patch_namespace("alice", "keep_warm", {"default": {"coldAfterSeconds": 0}})
+    identities = [
+        KeepWarmIdentity(f"agent_{number:04d}", "opencode-native") for number in range(200)
+    ]
+    for dry_run in (True, False):
+        with pytest.raises(
+            UserPreferencesValidationError, match="31 hosts, 206 columns, 6386 cells"
+        ):
+            store.convert_keep_warm(
+                "alice", identities, [f"host_{number}" for number in range(30)], dry_run=dry_run
+            )
+        assert store.get("alice") == before
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_conversion_api_snapshots_owned_catalog_library_sessions_and_hosts(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.db.db_models import SqlHost
+    from omnigent.server.custom_agents_store import CustomAgentsStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    owner = "alice@example.com"
+    hosts = HostStore(db_uri)
+    for host_id, name, user in (
+        ("1" * 32, "online", owner),
+        ("2" * 32, "offline", owner),
+        ("3" * 32, "other", "bob@example.com"),
+        ("4" * 32, "sandbox", owner),
+        ("6" * 32, "unreferenced", "bob@example.com"),
+    ):
+        hosts.upsert_on_connect(host_id, name, user)
+    hosts.set_offline("2" * 32)
+    with Session(get_or_create_engine(db_uri)) as session:
+        sandbox = session.scalar(select(SqlHost).where(SqlHost.host_id == "4" * 32))
+        assert sandbox is not None
+        sandbox.sandbox_provider = "test"
+        session.commit()
+    library = CustomAgentsStore(db_uri)
+    for agent_id, user in (("ca_library", owner), ("ca_other", "bob@example.com")):
+        library.create(
+            user,
+            {
+                "id": agent_id,
+                "name": "library",
+                "harness": "opencode-native",
+                "bundle_location": "unused",
+            },
+        )
+    agents = SqlAlchemyAgentStore(db_uri)
+    agents.create("a" * 32, "server", "unused")
+    agents.create_user_agent("b" * 32, "owned", f"{'b' * 32}/bundle", owner)
+    agents.create_user_agent("c" * 32, "foreign", f"{'c' * 32}/bundle", "bob@example.com")
+    sessions = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for agent_id, user, level, host_id in (
+        ("d" * 32, owner, LEVEL_OWNER, "1" * 32),
+        ("e" * 32, owner, LEVEL_EDIT, "1" * 32),
+        ("f" * 32, "bob@example.com", LEVEL_OWNER, "1" * 32),
+        ("0" * 32, owner, LEVEL_OWNER, "7" * 32),
+        ("4" * 32, owner, LEVEL_OWNER, "3" * 32),
+        ("5" * 32, owner, LEVEL_OWNER, "4" * 32),
+        ("6" * 32, owner, LEVEL_OWNER, "5" * 32),
+    ):
+        conv = sessions.create_conversation(
+            agent_id=agent_id,
+            harness_override="opencode-native",
+            labels={"omnigent:agent-template-id": f"ca_{agent_id}"},
+            host_id=host_id,
+            workspace="/opt/work/project",
+        )
+        permissions.grant(user, conv.id, level)
+        if agent_id == "0" * 32:
+            sessions.update_conversation(conv.id, archived=True)
+        elif agent_id == "d" * 32:
+            sessions.create_conversation(
+                parent_conversation_id=conv.id,
+                agent_id="9" * 32,
+                harness_override="opencode-native",
+                labels={"omnigent:agent-template-id": "ca_child"},
+            )
+    app = _preferences_app(
+        db_uri,
+        tmp_path,
+        host_store=hosts,
+        custom_agents_store=library,
+        permission_store=permissions,
+    )
+    monkeypatch.setattr(
+        app.state.agent_cache,
+        "load",
+        lambda *args, **kwargs: SimpleNamespace(
+            spec=SimpleNamespace(
+                executor=SimpleNamespace(config={"harness": "opencode-native"}, type="omnigent")
+            )
+        ),
+    )
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before = store.patch_namespace(owner, "keep_warm", {"default": {"coldAfterSeconds": 0}})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        url = "/v1/me/preferences/keep_warm/convert"
+        headers = {"x-test-user": owner}
+        assert (await client.post(url, json={"dry_run": True})).status_code == 401
+        for payload in ({}, {"dry_run": 1}, {"dry_run": True, "extra": True}):
+            assert (await client.post(url, headers=headers, json=payload)).status_code == 422
+        preview = await client.post(url, headers=headers, json={"dry_run": True})
+        assert preview.status_code == 200, preview.text
+        cells = preview.json()["cells"]
+        assert set(cells) == {"", "1" * 32, "2" * 32, "3" * 32, "4" * 32, "5" * 32}
+        for rows in cells.values():
+            assert rows["a" * 32] == {"coldAfterSeconds": 0}
+            assert rows["b" * 32] == {"coldAfterSeconds": 0}
+            assert rows["ca_library"] == {"coldAfterSeconds": 0}
+            assert rows["d" * 32] == {"coldAfterSeconds": 0}
+            assert rows["9" * 32] == {"coldAfterSeconds": 0}
+            for live_id in ("4" * 32, "5" * 32, "6" * 32):
+                assert rows[live_id] == {"coldAfterSeconds": 0}
+            assert "c" * 32 not in rows
+            assert "ca_other" not in rows
+            assert "e" * 32 not in rows
+            assert "f" * 32 not in rows
+            assert "0" * 32 not in rows
+        assert store.get(owner) == before
+        saved = await client.post(url, headers=headers, json={"dry_run": False})
+        assert saved.status_code == 200
+        assert saved.json()["cells"] == cells
+        # An already converted namespace needs no catalog/bundle reads.
+        monkeypatch.setattr(
+            agents.__class__, "list", lambda *args, **kwargs: pytest.fail("catalog read")
+        )
+        repeated = await client.post(url, headers=headers, json={"dry_run": False})
+        assert repeated.status_code == 200 and repeated.json()["already"] is True
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_conversion_api_preserves_acp_slug_for_all_identity_sources(
+    db_uri: str, tmp_path: Path
+) -> None:
+    from omnigent.server.custom_agents_store import CustomAgentsStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from tests._helpers.session import bundle_files
+
+    owner = "alice@example.com"
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts-preferences"))
+    archive = bundle_files(
+        {
+            "config.yaml": b"""spec_version: 1
+name: sample
+executor:
+  type: omnigent
+  config:
+    harness: acp:sample
+instructions: Test agent.
+"""
+        }
+    )
+    agents = SqlAlchemyAgentStore(db_uri)
+    for agent_id in ("a" * 32, "b" * 32, "c" * 32):
+        artifacts.put(f"{agent_id}/bundle", archive)
+    agents.create("a" * 32, "server", f"{'a' * 32}/bundle")
+    agents.create_user_agent("b" * 32, "owned", f"{'b' * 32}/bundle", owner)
+    agents.create_user_agent("c" * 32, "session-agent", f"{'c' * 32}/bundle", "bob@example.com")
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    sessions = SqlAlchemyConversationStore(db_uri)
+    conv = sessions.create_conversation(
+        agent_id="c" * 32, labels={"omnigent:agent-template-id": "ca_live"}
+    )
+    permissions.grant(owner, conv.id, LEVEL_OWNER)
+    library = CustomAgentsStore(db_uri)
+    library.create(
+        owner,
+        {
+            "id": "ca_library",
+            "name": "library",
+            "harness": "acp:sample",
+            "bundle_location": "unused",
+        },
+    )
+    app = _preferences_app(
+        db_uri, tmp_path, permission_store=permissions, custom_agents_store=library
+    )
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    before = prefs.patch_namespace(
+        owner, "keep_warm", {"agents": {"harness:acp:sample": {"coldAfterSeconds": 0}}}
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/me/preferences/keep_warm/convert",
+            headers={"x-test-user": owner},
+            json={"dry_run": True},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["cells"] == {
+            "": {
+                "a" * 32: {"coldAfterSeconds": 0},
+                "b" * 32: {"coldAfterSeconds": 0},
+                "ca_library": {"coldAfterSeconds": 0},
+                "c" * 32: {"coldAfterSeconds": 0},
+            }
+        }
+        assert response.json()["columns"] == [
+            "a" * 32,
+            "b" * 32,
+            "ca_library",
+            "c" * 32,
+            "harness:acp:sample",
+        ]
+        assert prefs.get(owner) == before
+        saved = await client.post(
+            "/v1/me/preferences/keep_warm/convert",
+            headers={"x-test-user": owner},
+            json={"dry_run": False},
+        )
+        assert saved.status_code == 200 and saved.json()["cells"] == response.json()["cells"]
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_conversion_api_reports_size_counts_without_writing(
+    db_uri: str, tmp_path: Path
+) -> None:
+    from omnigent.server.custom_agents_store import CustomAgentsStore
+
+    owner = "alice@example.com"
+    library = CustomAgentsStore(db_uri)
+    for number in range(300):
+        library.create(
+            owner,
+            {
+                "id": f"ca_{number:04d}",
+                "name": f"agent-{number}",
+                "harness": "opencode-native",
+                "bundle_location": "unused",
+            },
+        )
+    hosts = HostStore(db_uri)
+    for number in range(10):
+        hosts.upsert_on_connect(f"{number:032x}", f"host-{number}", owner)
+    app = _preferences_app(db_uri, tmp_path, host_store=hosts, custom_agents_store=library)
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before = store.patch_namespace(owner, "keep_warm", {"default": {"coldAfterSeconds": 0}})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for dry_run in (True, False):
+            response = await client.post(
+                "/v1/me/preferences/keep_warm/convert",
+                headers={"x-test-user": owner},
+                json={"dry_run": dry_run},
+            )
+            assert response.status_code == 422
+            assert "11 hosts" in response.json()["detail"]
+            assert "columns" in response.json()["detail"] and "cells" in response.json()["detail"]
+            assert store.get(owner) == before

@@ -36,6 +36,8 @@ from omnigent._wrapper_labels import (
 from omnigent.calling_defaults import load_master
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
+    codex_permission_application_receipt,
+    decode_codex_permission_observation,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -106,12 +108,26 @@ from omnigent.server.child_cap import (
     child_cap_for,
     complete_child_write,
 )
+from omnigent.server.child_checkin import (
+    ChildCheckinPatch,
+    ChildFollowupAdd,
+    add_checkin_followup,
+    patch_checkin_labels,
+    remove_checkin_followup,
+)
 from omnigent.server.child_keep_warm import (
     keep_warm_family_for_harness,
     keep_warm_family_from_labels,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import Feature
+from omnigent.server.host_load_queue import LABEL as HOST_LOAD_LABEL
+from omnigent.server.host_load_queue import (
+    HostLoadHold,
+    create_presentation,
+    decide_hold,
+    require_start_allowed,
+)
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.instruction_layers import session_instructions_text
 from omnigent.server.permissions import check_session_access
@@ -177,6 +193,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _child_pending_elicitations_by_parent,
+    _codex_permission_observation_labels,
     _codex_plan_mode_enabled,
     _delete_stored_session_bundle_after_failure,
     _discovery_key,
@@ -293,6 +310,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
+    CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY,
     CONTINUED_TO_LABEL_KEY,
     DELETION_CLAIM_STALE_AFTER_S,
     PINNED_LABEL_KEY,
@@ -302,6 +320,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     ConversationUpdateResult,
+    _may_collate_to,
     pinned_label_key,
     runner_seen_is_fresh,
     touched_label_key,
@@ -333,6 +352,7 @@ async def _wake_runner_for_model_change(
     runner_router: RunnerRouter | None,
 ) -> Conversation:
     """Restore a sleeping native session before applying an explicit model pick."""
+    require_start_allowed(conv)
     if await _get_runner_client(conv.id, runner_router) is not None:
         return conv
     runner_client, conv = await ensure_runner_connected(
@@ -858,6 +878,122 @@ def register_core_routes(
             "open_children": open_children,
         }
 
+    async def checkin_session(request: Request, session_id: str, level: int) -> Conversation:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, level, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        return conv
+
+    @router.get("/sessions/{session_id}/child-checkin", include_in_schema=False)
+    async def get_child_checkin(request: Request, session_id: str) -> dict[str, Any]:
+        from omnigent.child_checkin import LAST_KEY
+        from omnigent.server.child_checkin import checkin_followups
+        from omnigent.server.child_idle import effective_checkin_policy
+        from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.user_preferences_store import read_child_idle_settings
+
+        conv = await checkin_session(request, session_id, LEVEL_READ)
+        owner = await asyncio.to_thread(
+            collab_owner_for, conv, conversation_store, permission_store
+        )
+        prefs = getattr(request.app.state, "user_preferences_store", None)
+        settings = await asyncio.to_thread(read_child_idle_settings, prefs, owner)
+        policy = effective_checkin_policy(conv, settings)
+        try:
+            last = int(conv.labels[LAST_KEY])
+            if last < 0:
+                last = None
+        except (KeyError, ValueError):
+            last = None
+        cap, _source = await asyncio.to_thread(
+            child_cap_for, conv, conversation_store, permission_store, prefs
+        )
+        return {
+            "min_gap_seconds": policy.min_gap_s,
+            "coverage": policy.coverage,
+            "instructions_source": policy.instructions_source,
+            "source": policy.min_gap_source,
+            "coverage_source": policy.coverage_source,
+            "delivery": "on" if settings.enabled else "off",
+            "last_delivery": last,
+            "next_allowed": last + policy.min_gap_s if last is not None else None,
+            "follow_ups": [
+                {
+                    "id": item.id,
+                    "due": item.due,
+                    "text": item.text,
+                    "delivery_uncertain": item.uncertain,
+                }
+                for item in sorted(
+                    checkin_followups(conv.labels).values(), key=lambda item: (item.due, item.id)
+                )
+            ],
+            "cap": cap,
+            "open_children": await asyncio.to_thread(
+                conversation_store.count_counted_children, session_id
+            ),
+        }
+
+    @router.patch("/sessions/{session_id}/child-checkin", include_in_schema=False)
+    async def patch_child_checkin(
+        request: Request, session_id: str, body: ChildCheckinPatch
+    ) -> dict[str, str]:
+        await checkin_session(request, session_id, LEVEL_EDIT)
+        try:
+            await asyncio.to_thread(patch_checkin_labels, conversation_store, session_id, body)
+        except ConversationNotFoundError as exc:
+            raise _session_not_found() from exc
+        return {"status": "updated"}
+
+    @router.post(
+        "/sessions/{session_id}/child-checkin/follow-ups", status_code=201, include_in_schema=False
+    )
+    async def add_child_checkin_followup(
+        request: Request, session_id: str, body: ChildFollowupAdd
+    ) -> dict[str, Any]:
+        from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.user_preferences_store import read_child_idle_settings
+
+        conv = await checkin_session(request, session_id, LEVEL_EDIT)
+        try:
+            item = await asyncio.to_thread(
+                add_checkin_followup, conversation_store, session_id, body, int(time.time())
+            )
+        except ConversationNotFoundError as exc:
+            raise _session_not_found() from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        owner = await asyncio.to_thread(
+            collab_owner_for, conv, conversation_store, permission_store
+        )
+        settings = await asyncio.to_thread(
+            read_child_idle_settings,
+            getattr(request.app.state, "user_preferences_store", None),
+            owner,
+        )
+        return {"id": item.id, "due": item.due, "delivery": "on" if settings.enabled else "off"}
+
+    @router.delete(
+        "/sessions/{session_id}/child-checkin/follow-ups/{fid}", include_in_schema=False
+    )
+    async def remove_child_checkin_followup(
+        request: Request, session_id: str, fid: str
+    ) -> dict[str, str]:
+        await checkin_session(request, session_id, LEVEL_EDIT)
+        try:
+            await asyncio.to_thread(remove_checkin_followup, conversation_store, session_id, fid)
+        except ConversationNotFoundError as exc:
+            raise _session_not_found() from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Follow-up not found") from exc
+        return {"id": fid, "status": "removed"}
+
     @router.get("/sessions/{session_id}/model-options")
     async def refresh_session_model_options(
         request: Request,
@@ -1284,7 +1420,12 @@ def register_core_routes(
         """Save a checked first input, deleting the new session if that fails."""
         if event is None:
             return
-        startup = request.app.state.startup_inputs
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        startup = (
+            request.app.state.host_load_inputs
+            if conv and conv.labels.get(HOST_LOAD_LABEL)
+            else request.app.state.startup_inputs
+        )
         try:
             form = (
                 await request.form()
@@ -1586,6 +1727,7 @@ def register_core_routes(
             resolve_host_launch,
             resolve_launch_timeout_s,
         )
+        from omnigent.server.routes._sessions.helpers import retained_runner_ids
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -1602,6 +1744,9 @@ def register_core_routes(
         conn = target.conn
         from omnigent.server.startup_admission import StartupQueued
 
+        retained = await asyncio.to_thread(
+            retained_runner_ids, conversation_store, host_id, session_id
+        )
         try:
             startup = await host_registry.admit_launch(conn, session_id)
         except StartupQueued:
@@ -1660,6 +1805,7 @@ def register_core_routes(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                retain_runner_ids=retained,
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
@@ -1840,7 +1986,8 @@ def register_core_routes(
         user_id: str | None,
         parent_session_id: str | None,
         sub_agent_name: str | None,
-    ) -> AsyncIterator[None]:
+        host_id: str | None = None,
+    ) -> AsyncIterator[HostLoadHold | None]:
         """Hold an agent child's cap check and rate admission through insertion.
 
         An agent's unnamed child create (the runner's ``sys_session_create``
@@ -1858,8 +2005,9 @@ def register_core_routes(
         :param sub_agent_name: Named sub-agent dispatch, or ``None``.
         :raises HTTPException: 429 with the settings refusal text.
         """
+        hold = await decide_hold(request, parent_session_id, host_id, conversation_store)
         if parent_session_id is None or sub_agent_name is not None:
-            yield
+            yield hold
             return
         # Only the runner's sys_session_create POST declares itself as
         # agent-initiated; without the header there is no budget to spend,
@@ -1869,7 +2017,7 @@ def register_core_routes(
             origin.strip().lower() != CREATE_ORIGIN_AGENT
             and RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
         ):
-            yield
+            yield hold
             return
         # Authorize the caller on the parent before charging its owner's
         # window: a forged parent link must not spend the real owner's
@@ -1937,7 +2085,7 @@ def register_core_routes(
             refusal_text = await asyncio.to_thread(admit_open, request.app.state, owner)
             if refusal_text is not None:
                 raise HTTPException(status_code=429, detail=refusal_text)
-            yield
+            yield hold
 
     @router.post(
         "/sessions",
@@ -2045,7 +2193,8 @@ def register_core_routes(
             user_id=user_id,
             parent_session_id=body.parent_session_id,
             sub_agent_name=body.sub_agent_name,
-        ):
+            host_id=body.host_id,
+        ) as hold:
             resp, conv = await _create_session_from_existing_agent(
                 conversation_store,
                 agent_store,
@@ -2060,6 +2209,7 @@ def register_core_routes(
                 artifact_store=artifact_store,
                 background_title_coordinator=background_title_coordinator,
                 project_store=project_store,
+                host_load_hold=hold,
             )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -2078,7 +2228,8 @@ def register_core_routes(
         # from the runner's finally, the relay's resource.created
         # self-heal, or the host-launch-failure path below.
         _terminal_first_create = (
-            conv is not None
+            hold is None
+            and conv is not None
             and body.host_id is not None
             and conv.labels.get(_CLAUDE_NATIVE_UI_LABEL_KEY) == _CLAUDE_NATIVE_UI_LABEL_VALUE
         )
@@ -2092,6 +2243,7 @@ def register_core_routes(
         if (
             _rc is not None
             and conv is not None
+            and hold is None
             and not (
                 getattr(request.app.state, "startup_admission", None) is not None
                 and body.parent_session_id is not None
@@ -2182,7 +2334,7 @@ def register_core_routes(
         # synchronously.
         launch_host_id = resp.host_id
         try:
-            if body.host_type == "managed" and resp.runner_id is None:
+            if hold is None and body.host_type == "managed" and resp.runner_id is None:
                 await _schedule_managed_launch(
                     request,
                     session_id=resp.id,
@@ -2204,7 +2356,7 @@ def register_core_routes(
         # managed) and no runner is bound yet, authorize (caller must
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
-        if launch_host_id is not None and resp.runner_id is None:
+        if hold is None and launch_host_id is not None and resp.runner_id is None:
             if getattr(request.app.state, "startup_admission", None) is not None:
                 assert resp.workspace is not None
                 await _queue_caller_host_preparation(
@@ -2243,7 +2395,7 @@ def register_core_routes(
                         _publish_terminal_pending(resp.id, False)
                     resp.runner_id = runner_id
                     resp.host_id = launch_host_id
-        elif deferred_initial_item is not None and resp.host_id is not None:
+        elif hold is None and deferred_initial_item is not None and resp.host_id is not None:
             request.app.state.startup_inputs.host_changed(request.app, resp.host_id)
 
         # Default-public grant only once every launch step has been accepted, so a
@@ -2259,6 +2411,9 @@ def register_core_routes(
                 host_id=launch_host_id,
             )
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
+        create_presentation(
+            request, resp, hold.host_id if hold else (resp.effective_host_id or resp.host_id)
+        )
         return resp
 
     async def _create_bundled_session_from_multipart(
@@ -2722,7 +2877,17 @@ def register_core_routes(
             user_id=user_id,
             parent_session_id=parsed_metadata.parent_session_id,
             sub_agent_name=None,
-        ):
+            host_id=parsed_metadata.host_id,
+        ) as hold:
+            if hold:
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={
+                        "labels": {
+                            **parsed_metadata.labels,
+                            HOST_LOAD_LABEL: f"queued@{hold.host_id}",
+                        }
+                    }
+                )
             with creation_stage("create_persistence_ms"):
                 result = await complete_child_write(
                     asyncio.to_thread(
@@ -2758,9 +2923,13 @@ def register_core_routes(
             result = result.model_copy(update={"labels": dict(created_conversation.labels or {})})
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
-        if inherited_runner_id is not None and not (
-            getattr(request.app.state, "startup_admission", None) is not None
-            and parsed_metadata.parent_session_id is not None
+        if (
+            hold is None
+            and inherited_runner_id is not None
+            and not (
+                getattr(request.app.state, "startup_admission", None) is not None
+                and parsed_metadata.parent_session_id is not None
+            )
         ):
             # Full session-init envelope, not the legacy id-only body, so the
             # runner stores the global instructions and the rest of the
@@ -2801,7 +2970,7 @@ def register_core_routes(
         # over its tunnel like any session-scoped agent, so no separate
         # bundle delivery is needed. A sub-agent child (inherited runner)
         # is never itself managed — it co-locates on the parent's runner.
-        if parsed_metadata.host_type == "managed" and inherited_runner_id is None:
+        if hold is None and parsed_metadata.host_type == "managed" and inherited_runner_id is None:
             await _schedule_managed_launch(
                 request,
                 session_id=result.session_id,
@@ -2820,7 +2989,7 @@ def register_core_routes(
         # grant above is what resolve_host_launch's session-owner check
         # sees). A sub-agent child (inherited runner) is never launched
         # here — it co-locates on the parent's runner.
-        if parsed_metadata.host_id is not None and inherited_runner_id is None:
+        if hold is None and parsed_metadata.host_id is not None and inherited_runner_id is None:
             from omnigent.harness_aliases import canonicalize_harness
             from omnigent.models.model_catalog import spec_harness
 
@@ -2860,6 +3029,7 @@ def register_core_routes(
                 workspace=parsed_metadata.workspace,
                 host_id=parsed_metadata.host_id,
             )
+        create_presentation(request, result, hold.host_id if hold else parsed_metadata.host_id)
         return result
 
     # ── GET /sessions/projects ────────────────────────────────────
@@ -3043,6 +3213,51 @@ def register_core_routes(
         return Response(status_code=204)
 
     # ── GET /sessions/{session_id} ───────────────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/startup-observation/v1",
+        response_model=None,
+    )
+    @router.options(
+        "/sessions/{session_id}/startup-observation/v1",
+        response_model=None,
+    )
+    async def get_permission_startup_observation_v1(
+        request: Request,
+        response: Response,
+        session_id: str,
+    ) -> dict[str, object]:
+        from omnigent.server.permission_tiers import require_permission_protocol
+
+        response.headers["Cache-Control"] = "no-store"
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        require_permission_protocol(request, harness=None, required=True)
+        if request.method == "OPTIONS":
+            # Actual registered handler, authenticated owner scope; no runner/spec/cache read.
+            response.headers["X-Omnigent-Startup-Observation"] = "1"
+            return {"protocol": "permission_startup_observation", "version": 1}
+        from omnigent.server.startup_observation import read_startup_observation
+
+        observation = await read_startup_observation(
+            conv,
+            harness=conv.harness_override,
+            router=runner_router,
+            registry=getattr(request.app.state, "tunnel_registry", None),
+            store=conversation_store,
+        )
+        return {"id": session_id, "startup_observation": observation}
 
     @router.get(
         "/sessions/{session_id}",
@@ -4734,6 +4949,21 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        labels_to_set = dict(body.labels or {})
+        scalar_keys = [
+            key
+            for key in labels_to_set
+            if _may_collate_to(key, _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY, prefix=False)
+        ]
+        if len(scalar_keys) > 1:
+            raise OmnigentError(
+                "labels contains duplicate Codex approval mode keys",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if scalar_keys:
+            labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = labels_to_set.pop(
+                scalar_keys[0]
+            )
         from omnigent.server.session_collab import (
             AGENT_SESSION_HEADER,
             require_session_action_allowed,
@@ -5208,7 +5438,9 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_approval_mode = body.approval_mode
-        labels_to_set = dict(body.labels or {})
+        if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
+            # A legacy scalar edit cannot retain an earlier settings observation.
+            labels_to_set[CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY] = ""
         requested_speed: str | None = None
         if "speed_tier" in body.model_fields_set:
             speed_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -6037,19 +6269,18 @@ def register_core_routes(
                     "SDK approval mode was not applied by the runner; try again",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            # Raises unless the runner drove the /permissions popup, so the label
-            # can never claim a preset the Codex TUI wasn't switched to. Codex owns
-            # the durable approval state (its own session config); the label is the
-            # web read-back only, so there is no terminal_launch_args coupling here.
+            # Preserve the control response/error handling. A successful response
+            # is an application receipt, not fresh native settings confirmation.
             _require_codex_approval_mode_forward(
                 session_id,
                 requested_codex_approval_mode,
                 _approval_result,
             )
             if not sdk_approval_mode:
-                labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = (
-                    requested_codex_approval_mode
+                receipt_labels, _receipt = _codex_permission_observation_labels(
+                    codex_permission_application_receipt(requested_codex_approval_mode), updated
                 )
+                labels_to_set.update(receipt_labels)
         if requested_codex_approval_mode is not None and sdk_approval_mode and live_forward:
             labels_to_set[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
         if requested_speed is not None:
@@ -6089,8 +6320,6 @@ def register_core_routes(
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if SPEED_TIER_LABEL_KEY in labels_to_set:
             _publish_speed_tier(session_id, labels_to_set[SPEED_TIER_LABEL_KEY])
-        # Only when the switch was forwarded: a silent PATCH writes no label,
-        # and an unconfirmed mode must not reach the picker.
         if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:
             _publish_permission_mode(
                 session_id,
@@ -6102,9 +6331,13 @@ def register_core_routes(
                 labels_to_set[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY],
             )
         if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
+            encoded_observation = labels_to_set.get(CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY)
             _publish_codex_approval_mode(
                 session_id,
                 labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY],
+                decode_codex_permission_observation(encoded_observation)
+                if encoded_observation
+                else None,
             )
         if CODEX_SDK_APPROVAL_MODE_LABEL_KEY in labels_to_set:
             _publish_codex_approval_mode(

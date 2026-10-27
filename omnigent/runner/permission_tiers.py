@@ -208,6 +208,10 @@ class PermissionTierRuntime:
         if not verify_pi_permission_installation(path.parent, tier):
             raise ValueError("Pi permission extension is not installed")
 
+    def observation_harness(self, session_id: str) -> str | None:
+        """Read the already installed state owner; never load an agent/config."""
+        return self._harnesses.get(session_id)
+
     def state(self, session_id: str) -> HostPermissionState | None:
         state = self._states.get(session_id)
         path = self._paths.get(session_id)

@@ -323,7 +323,32 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    assert [
+        (request.method, request.url.path, json.loads(request.content)) for request in ap_requests
+    ] == [
+        (
+            "POST",
+            "/v1/sessions/conv_123/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {
+                    "approval_mode": "unknown",
+                    "permission_observation": {
+                        "version": 1,
+                        "source": "native-settings",
+                        "origin": "resume",
+                        "mode": "unknown",
+                        "approval": None,
+                        "reviewer": None,
+                        "sandbox": None,
+                        "profile": None,
+                        "uncertainty": "no-settings",
+                        "requested_mode": None,
+                    },
+                },
+            },
+        )
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 

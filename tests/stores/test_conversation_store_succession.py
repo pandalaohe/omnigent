@@ -9,7 +9,19 @@ untouched.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
+from omnigent.child_checkin import (
+    CHECKIN_LABEL_PREFIX,
+    FOLLOWUP_NEXT_KEY,
+    FOLLOWUP_PREFIX,
+    INSTRUCTIONS_PREFIX,
+    LAST_KEY,
+    POLICY_KEY,
+    FollowUp,
+    decode_followup,
+    encode_followup,
+)
 from omnigent.stores.conversation_store import (
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
@@ -271,3 +283,190 @@ def test_list_unfinished_successions_omits_done(
 
     unfinished = conversation_store.list_unfinished_successions()
     assert [receipt.id for receipt in unfinished] == ["rcpt-b"]
+
+
+@pytest.mark.parametrize("successor_override", [False, True])
+def test_move_transfers_checkin_state_and_preserves_successor_overrides(
+    conversation_store: SqlAlchemyConversationStore, successor_override: bool
+) -> None:
+    store = conversation_store
+    old = store.create_conversation()
+    new = store.create_conversation()
+    _child(store, old.id, "child")
+    source = {
+        POLICY_KEY: '{"g":0,"c":"summary"}',
+        f"{INSTRUCTIONS_PREFIX}0": "source start",
+        f"{INSTRUCTIONS_PREFIX}1": "source end",
+        f"{FOLLOWUP_PREFIX}11111111": encode_followup(FollowUp("11111111", 10, "old work")),
+        FOLLOWUP_NEXT_KEY: "stale",
+        LAST_KEY: "123",
+        f"{CHECKIN_LABEL_PREFIX}future": "move too",
+        "other": "stay",
+    }
+    store.set_labels(old.id, source)
+    target = {
+        f"{FOLLOWUP_PREFIX}22222222": encode_followup(FollowUp("22222222", 1, "uncertain", True)),
+        LAST_KEY: "456",
+    }
+    if successor_override:
+        target |= {POLICY_KEY: '{"g":3600}', f"{INSTRUCTIONS_PREFIX}0": "target only"}
+    store.set_labels(new.id, target)
+
+    _move(store, old.id, new.id)
+
+    predecessor = store.get_conversation(old.id)
+    successor = store.get_conversation(new.id)
+    assert predecessor is not None and successor is not None
+    assert {key: value for key, value in predecessor.labels.items() if key in source} == {
+        LAST_KEY: "123",
+        "other": "stay",
+    }
+    expected = {
+        key: value for key, value in source.items() if key.startswith(CHECKIN_LABEL_PREFIX)
+    }
+    if successor_override:
+        del expected[f"{INSTRUCTIONS_PREFIX}1"]
+    expected |= target | {FOLLOWUP_NEXT_KEY: "10"}
+    assert {
+        key: value
+        for key, value in successor.labels.items()
+        if key.startswith(CHECKIN_LABEL_PREFIX)
+    } == expected
+
+
+def test_move_merges_followup_collisions_and_keeps_overflow(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    store = conversation_store
+    old = store.create_conversation()
+    new = store.create_conversation()
+    _child(store, old.id, "child")
+    source = {
+        f"{FOLLOWUP_PREFIX}{index:08x}": encode_followup(FollowUp("", 100 + index, f"old {index}"))
+        for index in range(15)
+    }
+    target = {
+        f"{FOLLOWUP_PREFIX}{index:08x}": encode_followup(FollowUp("", 200 + index, f"new {index}"))
+        for index in range(10)
+    }
+    store.set_labels(old.id, source | {LAST_KEY: "123", FOLLOWUP_NEXT_KEY: "wrong"})
+    store.set_labels(new.id, target | {FOLLOWUP_NEXT_KEY: "wrong"})
+
+    _move(store, old.id, new.id)
+
+    predecessor = store.get_conversation(old.id)
+    successor = store.get_conversation(new.id)
+    assert predecessor is not None and successor is not None
+    merged = {
+        key: value for key, value in successor.labels.items() if key.startswith(FOLLOWUP_PREFIX)
+    }
+    assert len(merged) == 25
+    assert len({item.text for raw in merged.values() if (item := decode_followup(raw))}) == 25
+    assert all(merged[key] == value for key, value in target.items())
+    assert all(len(key.removeprefix(FOLLOWUP_PREFIX)) == 8 for key in merged)
+    assert successor.labels[FOLLOWUP_NEXT_KEY] == "100"
+    assert LAST_KEY not in successor.labels
+    assert {
+        key: value
+        for key, value in predecessor.labels.items()
+        if key.startswith(CHECKIN_LABEL_PREFIX)
+    } == {LAST_KEY: "123"}
+
+
+def test_empty_move_clears_stale_followup_hint_without_copying_last(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    store = conversation_store
+    old = store.create_conversation()
+    new = store.create_conversation()
+    source = {
+        f"{FOLLOWUP_PREFIX}11111111": encode_followup(FollowUp("", 1, "uncertain", True)),
+        f"{FOLLOWUP_PREFIX}22222222": "malformed",
+        FOLLOWUP_NEXT_KEY: "1",
+        LAST_KEY: "123",
+    }
+    store.set_labels(old.id, source)
+    store.set_labels(new.id, {FOLLOWUP_NEXT_KEY: "1"})
+    assert store.reassign_live_children(old.id, new.id, "empty", allow_empty=True) == ([], [])
+    successor = store.get_conversation(new.id)
+    assert successor is not None
+    assert FOLLOWUP_NEXT_KEY not in successor.labels
+    assert LAST_KEY not in successor.labels
+    assert successor.labels[f"{FOLLOWUP_PREFIX}22222222"] == "malformed"
+
+
+def test_failed_receipt_rolls_back_checkin_transfer_and_children(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    store = conversation_store
+    first_old = store.create_conversation()
+    first_new = store.create_conversation()
+    _child(store, first_old.id, "first child")
+    _move(store, first_old.id, first_new.id)
+    old = store.create_conversation()
+    new = store.create_conversation()
+    child = _child(store, old.id, "second child")
+    state = {f"{FOLLOWUP_PREFIX}11111111": encode_followup(FollowUp("", 1, "work"))}
+    store.set_labels(old.id, state)
+
+    with pytest.raises(IntegrityError):
+        _move(store, old.id, new.id)
+
+    predecessor = store.get_conversation(old.id)
+    successor = store.get_conversation(new.id)
+    child_row = store.get_conversation(child)
+    assert predecessor is not None and successor is not None and child_row is not None
+    assert predecessor.labels == state
+    assert successor.labels == {}
+    assert child_row.parent_conversation_id == old.id
+    assert store.get_succession(old.id, new.id) is None
+
+
+def test_competing_successors_have_one_winner(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    store = conversation_store
+    old = store.create_conversation(title="old").id
+    child = _child(store, old, "child")
+    targets = [store.create_conversation(title=title).id for title in ("one", "two")]
+    barrier = Barrier(2)
+
+    def compete(target: str) -> str:
+        barrier.wait(timeout=10)
+        try:
+            store.reassign_live_children(old, target, f"receipt-{target}", allow_empty=True)
+            return "won"
+        except SuccessionRefusedError as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(compete, targets))
+    assert sorted(outcomes) == ["already_succeeded", "won"]
+    winner = targets[outcomes.index("won")]
+    assert store.get_conversation(old).labels[SUCCEEDED_BY_LABEL_KEY] == winner
+    assert store.get_conversation(child).parent_conversation_id == winner
+
+
+@pytest.mark.parametrize("wrapper", ["claude-code-native-ui-subagent", "codex-native-ui-subagent"])
+def test_direct_parent_owned_mirror_stays_with_old(
+    conversation_store: SqlAlchemyConversationStore,
+    wrapper: str,
+) -> None:
+    store = conversation_store
+    old = store.create_conversation(title="old").id
+    new = store.create_conversation(title="new").id
+    child = _child(store, old, "child")
+    mirror = _child(store, old, "mirror")
+    nested = _child(store, child, "nested mirror")
+    for session_id in (mirror, nested):
+        store.set_labels(session_id, {"omnigent.wrapper": wrapper})
+    direct, moved = _move(store, old, new)
+    assert direct == [child]
+    assert set(moved) == {child, nested}
+    assert store.get_conversation(mirror).parent_conversation_id == old
+    store.update_conversation(old, archived=True, close_cli_on_archive=False)
+    assert store.get_conversation(mirror).archived
+    assert not store.get_conversation(nested).archived

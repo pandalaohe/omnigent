@@ -84,6 +84,7 @@ from omnigent.server.routes._host_launch import (
     resolve_host_launch,
     resolve_launch_timeout_s,
 )
+from omnigent.server.routes._sessions.helpers import retained_runner_ids
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
@@ -1774,6 +1775,9 @@ def create_hosts_router(
                     raise
 
             try:
+                retained = await asyncio.to_thread(
+                    retained_runner_ids, conversation_store, host_id, body.session_id
+                )
                 bound = await asyncio.to_thread(
                     conversation_store.set_runner_id,
                     body.session_id,
@@ -1883,6 +1887,7 @@ def create_hosts_router(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                retain_runner_ids=retained,
             )
         )
         try:

@@ -38,6 +38,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     HANDOVER_ITEM_LABEL_KEY,
+    ROTATE_REQUESTED_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
 )
@@ -465,6 +466,7 @@ async def test_succession_later_runner_failure_keeps_earlier_dropped_inventory(
     first_runner = runners.for_runner(RUNNER_ID)
     first_runner.dropped = [item]
     second_runner = runners.for_runner(RUNNER_ID_B)
+    _create(store, title="other state on remote runner", runner_id=RUNNER_ID_B)
     second_runner.succession_failures = 1
 
     first = await client.post(
@@ -555,6 +557,105 @@ async def test_succession_can_archive_without_live_children(
     )
     assert retry.json()["status"] == "done"
     assert len(_succession_notices(store, new)) == 1
+
+
+@pytest.mark.parametrize("requested_handover", [False, True])
+@pytest.mark.parametrize("source_failure", [None, "503", "timeout", "nonobject", "invalid-json"])
+async def test_codex_childless_rotation_carries_handover_only_on_user_clear(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    requested_handover: bool,
+    source_failure: str | None,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+        include_llm=False,
+    )
+    old = agent["_session_id"]
+    store.update_conversation(old, title="mother")
+    store.set_runner_id(old, RUNNER_ID)
+    new = store.create_conversation(agent_id=agent["id"], title="mother").id
+    store.set_runner_id(new, RUNNER_ID)
+    handover = store.append(
+        old,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=generate_task_id(),
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Continue the migration."}],
+                ),
+            )
+        ],
+    )[0]
+    labels = {HANDOVER_ITEM_LABEL_KEY: handover.id}
+    if requested_handover:
+        labels[ROTATE_REQUESTED_LABEL_KEY] = "true"
+    store.set_labels(old, labels)
+    # A prepared replacement is the retry path after its terminal was transferred.
+    monkeypatch.setattr(
+        forwarder,
+        "read_bridge_state",
+        lambda _path: SimpleNamespace(
+            permission_profile=None, thread_id="thread_new", session_id=new
+        ),
+    )
+    if source_failure is not None:
+        request = httpx.Request("GET", f"http://test/v1/sessions/{old}")
+        failures = {
+            "503": httpx.HTTPStatusError(
+                "unavailable", request=request, response=httpx.Response(503, request=request)
+            ),
+            "timeout": httpx.ReadTimeout("unavailable", request=request),
+            "nonobject": RuntimeError("Codex session snapshot response was not an object"),
+            "invalid-json": ValueError("invalid JSON"),
+        }
+        monkeypatch.setattr(
+            forwarder, "_fetch_session_snapshot", AsyncMock(side_effect=failures[source_failure])
+        )
+    target = forwarder._ForwarderTarget(
+        session_id=old,
+        thread_id="thread_old",
+        delta_coalescer=forwarder._OutputTextDeltaCoalescer(client, old),
+        usage_coalescer=forwarder._SessionUsageCoalescer(client, old),
+        elicitation_tracker=forwarder._CodexElicitationTaskTracker(),
+    )
+    try:
+        rotated = await forwarder._maybe_rotate_session_on_thread_started(
+            ap_client=client,
+            target=target,
+            bridge_dir=tmp_path,
+            app_server_url="ws://test",
+            event={"method": "thread/started", "params": {"thread": {"id": "thread_new"}}},
+        )
+        assert rotated and target.session_id == new and target.thread_id == "thread_new"
+        receipt = store.get_succession(old, new)
+        if requested_handover or source_failure is not None:
+            assert receipt is None
+            assert not store.get_conversation(old).archived
+            wake.assert_not_awaited()
+        else:
+            assert receipt is not None and receipt.phase == "done"
+            assert receipt.moved_ids == []
+            assert receipt.opening is not None
+            assert "Continue the migration." in receipt.opening["text"]
+            assert len(_succession_notices(store, new)) == 1
+            assert store.get_conversation(old).archived
+            wake.assert_awaited_once()
+            assert "Continue the migration." in wake.await_args.args[1]
+    finally:
+        await target.delta_coalescer.close()
+        await target.usage_coalescer.close()
+        await target.elicitation_tracker.close()
 
 
 async def test_succession_noop_for_child_session(
@@ -994,3 +1095,344 @@ async def test_succession_undelivered_wake_stays_rekeyed_and_keeps_old_cards(
     assert second.json()["status"] == "done"
     assert len(_succession_notices(store, new)) == 1
     assert pending_elicitations.count_for(old) == 0
+
+
+@pytest.mark.parametrize("failure", ["offline", "unreachable", "server_error"])
+async def test_child_only_runner_failure_does_not_block_opening(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    old = _create(store, title="mother")
+    new = _create(store, title="successor")
+    child = _create(store, parent=old, title="offline child", runner_id=RUNNER_ID_B)
+    child_runner = _FakeRunnerClient()
+    child_runner.succession_status = 503
+
+    async def resolve(_id: str, _router: Any, *, conversation: Any) -> Any:
+        if conversation.runner_id == RUNNER_ID:
+            return runner
+        return None if failure == "offline" else child_runner
+
+    if failure == "unreachable":
+        monkeypatch.setattr(
+            child_runner, "post", AsyncMock(side_effect=httpx.ConnectError("gone"))
+        )
+    monkeypatch.setattr(succession_module, "_get_runner_client", resolve)
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+    pending_elicitations.record_publish(old, _question_event())
+
+    response = await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+    assert response.json()["status"] == "done", response.text
+    receipt = store.get_succession(old, new)
+    assert receipt.deferred_runners == [{"runner_id": RUNNER_ID_B, "session_ids": [child]}]
+    assert len(_succession_notices(store, new)) == 1
+    wake.assert_awaited_once()
+    assert store.get_conversation(old).archived
+    assert any(url.endswith("/succession/release") for url, _ in runner.posts)
+
+
+@pytest.mark.parametrize("shared_owner", [False, True])
+async def test_non_successor_runner_409_or_shared_owner_is_never_deferred(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+    shared_owner: bool,
+) -> None:
+    old = _create(store, title="mother")
+    new = _create(store, title="successor")
+    _create(store, parent=old, title="child", runner_id=RUNNER_ID_B)
+    if shared_owner:
+        _create(store, title="unrelated state holder", runner_id=RUNNER_ID_B)
+    child_runner = _FakeRunnerClient()
+    child_runner.succession_status = 503 if shared_owner else 409
+    monkeypatch.setattr(
+        succession_module,
+        "_get_runner_client",
+        AsyncMock(
+            side_effect=lambda _id, _router, *, conversation: (
+                runner if conversation.runner_id == RUNNER_ID else child_runner
+            )
+        ),
+    )
+    retry = Mock()
+    monkeypatch.setattr(succession_module, "_schedule_retry", retry)
+    response = await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+    assert response.json()["phase"] == "moved"
+    assert not getattr(store.get_succession(old, new), "deferred_runners", None)
+    retry.assert_called()
+    assert not _succession_notices(store, new)
+
+
+@pytest.mark.parametrize("trigger", ["connect", "startup"])
+async def test_deferred_runner_rekeys_and_releases_after_done(
+    store: SqlAlchemyConversationStore,
+    runners: _FakeRunnerPool,
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+) -> None:
+    runner = runners.for_runner(RUNNER_ID_B)
+    old = _create(store, title="mother")
+    new = _create(store, title="successor")
+    child = _create(store, parent=old, title="child", runner_id=RUNNER_ID_B)
+    receipt_id = generate_task_id()
+    store.reassign_live_children(old, new, receipt_id)
+    store.update_succession(
+        receipt_id,
+        expected_phase="moved",
+        phase="done",
+        deferred_runners=[{"runner_id": RUNNER_ID_B, "session_ids": [child]}],
+    )
+    dropped = {"kind": "timer", "id": "late-timer"}
+    runner.dropped = [dropped]
+    if trigger == "connect":
+        await succession_module.resume_successions_for_runner(
+            RUNNER_ID_B, conversation_store=store, runner_router=None, peer_message_store=None
+        )
+    else:
+        await succession_module.resume_unfinished_successions(
+            conversation_store=store, runner_router=None, peer_message_store=None
+        )
+    assert [url for url, _ in runner.posts] == [
+        f"/v1/sessions/{old}/succession",
+        f"/v1/sessions/{new}/succession/release",
+    ]
+    assert runner.posts[0][1]["moved_ids"] == [child]
+    assert set(runner.posts[0][1]["archive_states"]) == {child}
+    receipt = store.get_succession_by_id(receipt_id)
+    assert not receipt.deferred_runners
+    assert receipt.dropped == [dropped]
+
+
+@pytest.mark.parametrize(
+    "phase", ["moved", "rekeyed", "opened", "released", "cards_closed", "archived", "done"]
+)
+async def test_stale_receipt_is_retired_without_side_effects(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    phase: str,
+) -> None:
+    old = _create(store, title="mother")
+    new = _create(store, title="first successor")
+    other = _create(store, title="actual successor")
+    _create(store, parent=old, title="child")
+    receipt_id = generate_task_id()
+    store.reassign_live_children(old, new, receipt_id)
+    store.update_succession(receipt_id, expected_phase="moved", phase=phase)
+    store.set_labels(old, {SUCCEEDED_BY_LABEL_KEY: other})
+    response = await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+    assert response.json() == {"status": "retired", "successor_id": other}
+    receipt = store.get_succession_by_id(receipt_id)
+    assert receipt.phase == "void" and other in receipt.error
+    assert not receipt.deferred_runners
+    assert runner.posts == []
+    wake.assert_not_awaited()
+    assert not store.get_conversation(old).archived
+
+
+async def test_second_successor_is_conflict(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+    old = _create(store, title="mother")
+    new = _create(store, title="first successor")
+    other = _create(store, title="second successor")
+    _create(store, parent=old, title="child")
+    runner.succession_status = 409
+    await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+    response = await client.post(
+        f"/v1/sessions/{old}/succession", json={"target_session_id": other, "allow_empty": True}
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "already_succeeded"
+    assert response.json()["error"]["successor_id"] == new
+    assert store.get_conversation(old).labels[SUCCEEDED_BY_LABEL_KEY] == new
+
+
+@pytest.mark.parametrize("change", ["undo", "relaunch", "stale"])
+async def test_deferred_runner_revalidates_before_posting(
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    change: str,
+) -> None:
+    old = _create(store, title="old")
+    new = _create(store, title="new")
+    child = _create(store, parent=old, runner_id=RUNNER_ID_B)
+    store.reassign_live_children(old, new, "forward")
+    store.update_succession(
+        "forward",
+        expected_phase="moved",
+        phase="done",
+        deferred_runners=[{"runner_id": RUNNER_ID_B, "session_ids": [child]}],
+    )
+    if change == "undo":
+        store.reassign_live_children(new, old, "reverse", reverse_of=True)
+    elif change == "relaunch":
+        store.set_runner_id(child, RUNNER_ID)
+    else:
+        store.set_labels(old, {SUCCEEDED_BY_LABEL_KEY: "another-successor"})
+    await succession_module.advance_succession(
+        "forward", conversation_store=store, runner_router=None, peer_message_store=None
+    )
+    assert not store.get_succession_by_id("forward").deferred_runners
+    assert runner.posts == []
+
+
+async def test_deferred_online_retry_keeps_dropped_and_releases(
+    store: SqlAlchemyConversationStore,
+    runners: _FakeRunnerPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = runners.for_runner(RUNNER_ID_B)
+    old = _create(store, title="old")
+    new = _create(store, title="new")
+    child = _create(store, parent=old, runner_id=RUNNER_ID_B)
+    store.reassign_live_children(old, new, "retry-late")
+    store.update_succession(
+        "retry-late",
+        expected_phase="moved",
+        phase="done",
+        deferred_runners=[{"runner_id": RUNNER_ID_B, "session_ids": [child]}],
+    )
+    runner.dropped = [{"kind": "timer", "id": "one-shot"}]
+    runner.release_failures = 1
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", (0.01,))
+    await succession_module.advance_succession(
+        "retry-late", conversation_store=store, runner_router=None, peer_message_store=None
+    )
+    from tests._helpers.polling import poll_until_async
+
+    await poll_until_async(
+        lambda: not store.get_succession_by_id("retry-late").deferred_runners,
+        timeout_s=3,
+        interval_s=0.02,
+    )
+    assert store.get_succession_by_id("retry-late").dropped == runner.dropped
+    assert len(runner.posts) == 4
+
+
+async def test_late_opening_reports_rotation_time(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = _create(store, title="old")
+    new = _create(store, title="new")
+    _create(store, parent=old)
+    store.reassign_live_children(old, new, "late")
+    store.update_succession("late", expected_phase="moved", created_at=0)
+    monkeypatch.setattr(succession_module, "now_epoch", lambda: 601)
+    result = await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+    assert result.json()["status"] == "done"
+    opening = store.get_succession_by_id("late").opening["text"]
+    assert opening.startswith("Delivered late: rotation at 1970-01-01 00:00:00 UTC.")
+
+
+async def test_concurrent_same_pair_resumes_one_receipt(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Barrier, Lock
+
+    old = _create(store, title="old")
+    new = _create(store, title="new")
+    _create(store, parent=old, title="child")
+    read = SqlAlchemyConversationStore.get_succession
+    barrier = Barrier(2)
+    gate = Lock()
+    initial_reads = 0
+
+    def concurrent_read(self: SqlAlchemyConversationStore, old_id: str, new_id: str) -> Any:
+        nonlocal initial_reads
+        result = read(self, old_id, new_id)
+        with gate:
+            wait = (old_id, new_id) == (old, new) and result is None and initial_reads < 2
+            if wait:
+                initial_reads += 1
+        if wait:
+            barrier.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "get_succession", concurrent_read)
+    responses = await asyncio.gather(
+        *[
+            client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+            for _ in range(2)
+        ]
+    )
+    assert [response.status_code for response in responses] == [200, 200]
+    assert all(response.json()["status"] == "done" for response in responses)
+    assert len({response.json()["receipt_id"] for response in responses}) == 1
+    assert len(_succession_notices(store, new)) == 1
+
+
+@pytest.mark.parametrize("trigger", ["connect", "startup"])
+async def test_deferred_recovery_scans_past_offline_backlog(
+    store: SqlAlchemyConversationStore,
+    runners: _FakeRunnerPool,
+    db_uri: str,
+    trigger: str,
+) -> None:
+    import json
+    from uuid import uuid4
+
+    import sqlalchemy as sa
+
+    from omnigent.db.db_models import SqlSessionSuccession
+
+    old = _create(store, title="old")
+    new = _create(store, title="new")
+    child = _create(store, parent=old, runner_id=RUNNER_ID_B)
+    store.reassign_live_children(old, new, "after-backlog")
+    store.update_succession(
+        "after-backlog",
+        expected_phase="moved",
+        phase="done",
+        deferred_runners=[{"runner_id": RUNNER_ID_B, "session_ids": [child]}],
+    )
+    engine = sa.create_engine(db_uri)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                SqlSessionSuccession.__table__.insert(),
+                [
+                    {
+                        "id": f"backlog-{i}",
+                        "old_id": uuid4().hex,
+                        "new_id": uuid4().hex,
+                        "phase": "done",
+                        "direct_ids": "[]",
+                        "moved_ids": "[]",
+                        "created_at": 0,
+                        "updated_at": 0,
+                        "deferred_runners": json.dumps(
+                            [{"runner_id": "offline", "session_ids": [uuid4().hex]}]
+                        ),
+                    }
+                    for i in range(100)
+                ],
+            )
+        if trigger == "connect":
+            await succession_module.resume_successions_for_runner(
+                RUNNER_ID_B, conversation_store=store, runner_router=None, peer_message_store=None
+            )
+        else:
+            await succession_module.resume_unfinished_successions(
+                conversation_store=store, runner_router=None, peer_message_store=None
+            )
+        assert not store.get_succession_by_id("after-backlog").deferred_runners
+        assert len(runners.for_runner(RUNNER_ID_B).posts) == 2
+    finally:
+        engine.dispose()

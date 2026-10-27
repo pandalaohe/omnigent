@@ -28,6 +28,8 @@ from tests.runner.conftest import (
 )
 from tests.runner.helpers import NullServerClient
 
+pytestmark = pytest.mark.usefixtures("_clean_subagent_registry")
+
 
 class _WakeRecordingServerClient(NullServerClient):
     """Records parent wake notices and child label receipts; allows inbox policy."""

@@ -60,7 +60,7 @@ _BACKGROUND_TITLE_MODELS: dict[str, str] = {
 
 _TITLE_WRAPPERS = "'\"“”‘’"
 _TITLE_LABEL = re.compile(
-    r"(?:^|[\s.!?。！？])(?:final |suggested |session )?"
+    r"(?:^|[\s.!?。！？])(?:final |suggested |session |所需|建议|建議|会话|會話)?"
     r"(?:__)?(?:title|标题|標題)(?:__)?\s*[:：]\s*",
     re.IGNORECASE,
 )

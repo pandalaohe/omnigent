@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import json
 import secrets
@@ -21,6 +22,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
+from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
@@ -41,7 +43,7 @@ from omnigent.entities.conversation import (
     MessageData,
     parse_item_data,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -134,6 +136,7 @@ from omnigent.server.routes._errors import session_not_found as _session_not_fou
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
+    _CLEAR_TYPE,
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _COMPACT_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
@@ -265,6 +268,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _append_pending_deferred_approvals,
     _archive_close_in_progress,
     _best_effort_stop,
     _cancel_runner_relays,
@@ -311,7 +315,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.server.session_collab import collab_owner_for
+from omnigent.server.session_collab import AGENT_SESSION_HEADER, collab_owner_for
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -1463,6 +1467,56 @@ def register_events_routes(
             trusted_peer=trusted_peer,
         )
 
+    async def _redirected_message(
+        body: SessionEventInput,
+        old_id: str,
+        new_id: str,
+    ) -> SessionEventInput:
+        content = body.data.get("content")
+        copied = []
+        for block in content if isinstance(content, list) else []:
+            file_id = block.get("file_id") if isinstance(block, dict) else None
+            if isinstance(file_id, str) and file_id and file_store is not None:
+                source = await asyncio.to_thread(file_store.get, file_id, session_id=old_id)
+                if source is None:
+                    raise OmnigentError(
+                        "Attachment not found in the previous session", code=ErrorCode.NOT_FOUND
+                    )
+                new_file_id = hashlib.sha256(
+                    f"succession-file:{file_id}:{new_id}".encode()
+                ).hexdigest()[:32]
+                if await asyncio.to_thread(file_store.get, new_file_id, session_id=new_id) is None:
+                    try:
+                        await asyncio.to_thread(
+                            file_store.create,
+                            filename=source.filename,
+                            bytes=source.bytes,
+                            content_type=source.content_type,
+                            session_id=new_id,
+                            file_id=new_file_id,
+                            blob_key=source.blob_key or source.id,
+                            source_metadata=source.source_metadata,
+                        )
+                    except IntegrityError:
+                        if (
+                            await asyncio.to_thread(file_store.get, new_file_id, session_id=new_id)
+                            is None
+                        ):
+                            raise
+                block = {**block, "file_id": new_file_id}
+            copied.append(block)
+        return body.model_copy(
+            update={
+                "data": {
+                    **body.data,
+                    "content": [
+                        {"type": "input_text", "text": f"[Sent to previous session: /c/{old_id}]"},
+                        *copied,
+                    ],
+                }
+            }
+        )
+
     async def _subagent_wake_successor(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1776,6 +1830,75 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if conv.labels.get(SUCCEEDED_BY_LABEL_KEY):
+            target_id = await asyncio.to_thread(
+                resolve_succeeded_by, conversation_store, session_id
+            )
+            observation = body.type.startswith("external_") or body.type in {
+                _SUBAGENT_STATUS_TYPE,
+                SDK_PEER_RECEIPT_EVENT,
+            }
+            if not observation:
+                content = body.data.get("content")
+                text = _message_text(content) if isinstance(content, list) else ""
+                command = (text or "").strip().split(maxsplit=1)[0] if (text or "").strip() else ""
+                is_message = body.type == "message" and body.data.get("role", "user") == "user"
+                control = command in {
+                    "/clear",
+                    "/new",
+                    "/compact",
+                    "/model",
+                    "/effort",
+                    "/permissions",
+                    "/permission",
+                    "/interrupt",
+                    "/stop",
+                    "/sandbox",
+                    "/approval-mode",
+                    "/speed",
+                    "/plan",
+                    "/resume",
+                    "/fork",
+                }
+                if not is_message or control or target_id == session_id:
+                    raise SessionSupersededError(
+                        target_id
+                        if target_id != session_id
+                        else conv.labels[SUCCEEDED_BY_LABEL_KEY]
+                    )
+                try:
+                    parse_item_data(body.type, {"type": body.type, **body.data})
+                except (ValueError, TypeError) as exc:
+                    raise OmnigentError(
+                        f"Invalid message payload: {exc}", code=ErrorCode.INVALID_INPUT
+                    ) from exc
+                if conv.archived and (
+                    AGENT_SESSION_HEADER in request.headers
+                    or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+                ):
+                    from omnigent.server.session_collab import require_session_action_allowed
+
+                    await asyncio.to_thread(
+                        require_session_action_allowed,
+                        conv,
+                        conversation_store,
+                        permission_store,
+                        getattr(request.app.state, "user_preferences_store", None),
+                        action="send",
+                        target=conv,
+                    )
+                await _authorized_conversation(request, target_id, acting_user_id=acting_user_id)
+                redirected = await _redirected_message(body, session_id, target_id)
+                ack = await _post_event_impl(
+                    request,
+                    target_id,
+                    redirected,
+                    in_flight=in_flight,
+                    acting_user_id=acting_user_id,
+                    require_init_success=require_init_success,
+                    trusted_peer=trusted_peer,
+                )
+                return {**ack, "redirected_to": ack.get("redirected_to") or target_id}
         if body.type in {
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
             _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
@@ -1961,6 +2084,7 @@ def register_events_routes(
             _APPROVAL_TYPE,
             _MCP_ELICITATION_TYPE,
             _COMPACT_TYPE,
+            _CLEAR_TYPE,
             _SLASH_COMMAND_TYPE,
             _STOP_SESSION_TYPE,
             _RETRY_SESSION_TYPE,
@@ -2025,6 +2149,7 @@ def register_events_routes(
         archived_user_work = body.type in {
             _RETRY_SESSION_TYPE,
             _COMPACT_TYPE,
+            _CLEAR_TYPE,
             _SLASH_COMMAND_TYPE,
         } or (body.type == "message" and body.data.get("role") == "user")
         archived_start_work = body.type in {
@@ -2034,7 +2159,6 @@ def register_events_routes(
             _EXTERNAL_SUBAGENT_START_TYPE,
         }
         from omnigent.server.session_collab import (
-            AGENT_SESSION_HEADER,
             require_session_action_allowed,
         )
 
@@ -2067,6 +2191,47 @@ def register_events_routes(
                 "Session is archived. Unarchive it before starting new work.",
                 code=ErrorCode.CONFLICT,
             )
+        from omnigent.server.host_load_queue import LABEL, start_allowed
+        from omnigent.stores.conversation_store import ConversationLabelConditionFailed
+
+        if not start_allowed(conv):
+            if body.type == "message" and body.data.get("role") == "user":
+                try:
+                    saved = await request.app.state.host_load_inputs.enqueue(
+                        session_id,
+                        body,
+                        user_id=created_by,
+                        headers=request.headers,
+                        first=False,
+                        while_label=LABEL,
+                    )
+                except ConversationLabelConditionFailed:
+                    refreshed = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                    if refreshed is None:
+                        raise _session_not_found() from None
+                    conv = refreshed
+                else:
+                    return {
+                        "queued": True,
+                        "pending_id": pending_inputs.make_pending_id(session_id, saved.id),
+                    }
+            elif archived_user_work or archived_start_work:
+                raise OmnigentError(
+                    "This session is queued for host load.", code=ErrorCode.CONFLICT
+                )
+
+        if (
+            not isinstance(request, (StartupInputContext, _RunnerEventContext))
+            and body.type == "message"
+            and body.data.get("role") == "user"
+            and (held_inputs := getattr(request.app.state, "host_load_inputs", None)) is not None
+        ):
+            # A label can disappear while release still drains older saved input.
+            async with held_inputs.session_barrier(session_id):
+                pass
+
         if (
             body.type == _RETRY_SESSION_TYPE
             or (body.type == "message" and body.data.get("role") == "user")
@@ -2890,6 +3055,43 @@ def register_events_routes(
                 "/compact is not available for this session type.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if body.type == _CLEAR_TYPE:
+            # Like /compact, /clear runs in the vendor TUI: the runner types the
+            # harness's own /clear, and the harness rotates the terminal onto a
+            # fresh session that viewers follow via ``session.superseded``.
+            clear_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {"type": _CLEAR_TYPE},
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+            )
+            if clear_result is None and await asyncio.to_thread(_is_native_terminal_session, conv):
+                conv, woke_client = await _wake_bound_runner_for_control(conv)
+                if woke_client is not None:
+                    clear_result = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        {"type": _CLEAR_TYPE},
+                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    )
+                if clear_result is None:
+                    raise OmnigentError(
+                        "Can't clear this session while its runner is offline. "
+                        "Reconnect the session (send a message to wake it), then "
+                        "run /clear again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+            if clear_result is not None and clear_result.status_code == 200:
+                return {"queued": False}
+            if clear_result is not None and clear_result.status_code != 204:
+                raise OmnigentError(
+                    f"Clear failed: runner returned {clear_result.status_code}",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            raise OmnigentError(
+                "/clear is not available for this session type.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if body.type == "compaction":
             import uuid as _uuid
 
@@ -3441,6 +3643,15 @@ def register_events_routes(
                         peer_turn = None
                     if peer_turn is not None:
                         data["peer_turn"] = peer_turn.as_dict()
+            if (
+                conv.kind == "sub_agent"
+                and status in {"idle", "completed", "failed", "stopped", "killed"}
+                and not _is_codex_native_subagent(conv)
+                and not _is_devin_native_subagent(conv)
+            ):
+                data = await _append_pending_deferred_approvals(
+                    data, session_id, conversation_store
+                )
             forward_body = body.model_dump()
             forward_body["data"] = data
             # A cross-host member child's own runner has no parent inbox: the
@@ -3797,7 +4008,7 @@ def register_events_routes(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             try:
-                await runner_client.post(
+                tool_response = await runner_client.post(
                     f"/v1/sessions/{session_id}/events",
                     json={
                         "type": "tool_result",
@@ -3816,7 +4027,11 @@ def register_events_routes(
                     "Failed to deliver the tool result to the session runner.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
-            return {"queued": True, "item_id": body.data["call_id"]}
+            return {
+                "queued": True,
+                "item_id": body.data["call_id"],
+                "forwarded": tool_response.status_code < 400,
+            }
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching
@@ -3930,7 +4145,7 @@ def register_events_routes(
                     created_by=created_by,
                     host_error_code=refusal_code,
                 )
-                return {"queued": True, "item_id": item_id}
+                return {"queued": True, "item_id": item_id, "forwarded": False}
             if runner_client is not None:
                 # The source's runner has never initialized this side chat.
                 _runner_needs_session_init = True
@@ -4496,7 +4711,7 @@ def register_events_routes(
                 )
             if runner_router is not None:
                 await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
-            item_id = await _dispatch_skill_slash_command_to_runner(
+            dispatch = await _dispatch_skill_slash_command_to_runner(
                 session_id,
                 conv,
                 body,
@@ -4510,7 +4725,11 @@ def register_events_routes(
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
-            return {"queued": True, "item_id": item_id}
+            return {
+                "queued": True,
+                "item_id": dispatch.item_id,
+                "forwarded": dispatch.forwarded,
+            }
         comment_ids = body.data.pop("omnigent_comment_ids", None)
         comment_store = None
         if comment_ids is not None:
@@ -4584,7 +4803,7 @@ def register_events_routes(
                     )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
-        response: dict[str, Any] = {"queued": True}
+        response: dict[str, Any] = {"queued": True, "forwarded": dispatch.forwarded}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id
         # Native-terminal web message: hand back the pending-input id. It

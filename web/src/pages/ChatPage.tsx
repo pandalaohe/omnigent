@@ -127,6 +127,7 @@ import {
   type PendingInitialPrompt,
   useChatStore,
   chatQueryClient,
+  invalidateCodexPermissionReadback,
 } from "@/store/chatStore";
 import {
   claudeNativeSubagentLabel,
@@ -343,6 +344,9 @@ import {
 import {
   CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
   codexApprovalModeLabel,
+  codexPermissionReadback,
+  codexPermissionObservationFromSession,
+  CODEX_PERMISSION_OBSERVATION_LABEL_KEY,
 } from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
@@ -736,7 +740,11 @@ export function ChatPage() {
   // Must be declared BEFORE the early-return guards below — otherwise
   // the hook is skipped on renders that hit the loading/error branches,
   // tripping React's "rendered fewer hooks than expected".
-  const { session: activeSession, isLoading: sessionLoading } = useSession(sessionConvId ?? null);
+  const {
+    session: activeSession,
+    isLoading: sessionLoading,
+    error: activeSessionError,
+  } = useSession(sessionConvId ?? null);
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
@@ -1256,6 +1264,9 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
+      nativePermissionSession={
+        !activeSessionError && activeSession?.id === sessionConvId ? activeSession : null
+      }
       hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
@@ -1392,6 +1403,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
+  nativePermissionSession?: Session | null;
   onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
@@ -1588,6 +1600,7 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
+  nativePermissionSession,
   hostId,
   status,
   isWorking,
@@ -1878,7 +1891,20 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           readOnly={entry.readOnly}
         />
         {isShown && (
-          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+          <>
+            {showCodexApprovalMode && (
+              <CodexPermissionReadbackChip
+                session={nativePermissionSession ?? null}
+                permissionLevel={permissionLevel}
+                offline={
+                  runnerOnline === false ||
+                  liveness.kind === "host_offline" ||
+                  liveness.kind === "local_stranded"
+                }
+              />
+            )}
+            <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+          </>
         )}
       </div>
     );
@@ -2197,12 +2223,14 @@ export function buildSlashCommandMap(
   showSide = false,
   skillPrefix: "/" | "$" = "/",
   supportsModelReset = false,
+  showClear = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
+    if (name === "/clear" && !showClear) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2624,6 +2652,71 @@ export function BackgroundTaskPill() {
  * suggestions menu, and the send/stop controls. Exported for direct
  * unit testing of the slash-command keyboard behavior.
  */
+function useCodexPermissionReadback(
+  session: Pick<Session, "id" | "runnerId" | "labels"> | null,
+  sessionId: string | null,
+  canRead: boolean,
+  offline: boolean,
+) {
+  const cached = useChatStore((state) =>
+    sessionId ? state.codexPermissionReadbacks[sessionId] : undefined,
+  );
+  const observation = useMemo(
+    () =>
+      cached !== undefined ? cached.observation : codexPermissionObservationFromSession(session),
+    [cached, session],
+  );
+  useEffect(() => {
+    if (!canRead || !sessionId || session?.id !== sessionId || !observation) return;
+    if (offline || observation.runner_id !== session.runnerId) {
+      invalidateCodexPermissionReadback(
+        sessionId,
+        session.labels?.[CODEX_PERMISSION_OBSERVATION_LABEL_KEY],
+      );
+    }
+  }, [canRead, sessionId, observation, session?.id, session?.runnerId, session?.labels, offline]);
+  return canRead && session?.id === sessionId
+    ? codexPermissionReadback(session, observation, { offline, stale: cached?.stale })
+    : undefined;
+}
+
+/** Readback remains available when the terminal surface replaces the composer. */
+export function CodexPermissionReadbackChip({
+  session,
+  permissionLevel,
+  offline,
+}: {
+  session: Pick<Session, "id" | "runnerId" | "labels" | "harness"> | null;
+  permissionLevel: number | null;
+  offline: boolean;
+}) {
+  const readback = useCodexPermissionReadback(
+    session,
+    session?.id ?? null,
+    !!session &&
+      (session.harness === "codex-native" || isCodexNativeSession(session)) &&
+      (permissionLevel === null || permissionLevel >= 1),
+    offline,
+  );
+  if (!readback) return null;
+  return (
+    <div className="flex shrink-0 items-center px-3 py-1">
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value={readback.value}
+        selectedValue={readback.selectedValue}
+        harness="codex-native"
+        options={CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS}
+        readback={readback}
+        disabled
+        disabledReason="Change permission modes in the Chat view"
+        onSelect={() => {}}
+        testIdPrefix="terminal"
+      />
+    </div>
+  );
+}
+
 function ComposerImpl(
   {
     status,
@@ -2865,7 +2958,7 @@ function ComposerImpl(
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
-  const { session: composerSession } = useSession(composerSessionId);
+  const { session: composerSession, error: composerSessionError } = useSession(composerSessionId);
   useEffect(() => {
     const source = composerSession?.labels?.["omnigent.permission_tier.migrated_from"];
     if (!composerSessionId || !source || typeof sessionStorage === "undefined") return;
@@ -2910,6 +3003,16 @@ function ComposerImpl(
     ? permissionTierSwitchDisabledReason(composerSession)
     : undefined;
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
+  const nativePermissionControl = showCodexApprovalMode && sessionHarness === "codex-native";
+  const nativePermissionOffline = nativePermissionControl && runnerOnline === false;
+  const nativePermissionReadback = useCodexPermissionReadback(
+    composerSession,
+    composerSessionId,
+    nativePermissionControl &&
+      !composerSessionError &&
+      (permissionLevel === null || permissionLevel >= 1),
+    runnerOnline === false || unreachable,
+  );
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
   const speedHarness = sessionHarness === "codex" || sessionHarness === "codex-native";
@@ -3014,9 +3117,17 @@ function ComposerImpl(
     : sdkPermissionControl
       ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
         codexApprovalMode)
-      : codexApprovalModeLabel(codexApprovalMode);
+      : (nativePermissionReadback?.value ?? codexApprovalModeLabel(codexApprovalMode));
   const changePermission = async (mode: string) => {
-    if (isReadOnly || unreachable || tierPickerDisabledReason || configBusyRef.current) return;
+    if (
+      isReadOnly ||
+      unreachable ||
+      nativePermissionOffline ||
+      tierPickerDisabledReason ||
+      configBusyRef.current ||
+      !isOwnerLevel(permissionLevel)
+    )
+      return;
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
@@ -3220,6 +3331,12 @@ function ComposerImpl(
   // for claude-sdk, whose runner sends /compact to the live SDK client to
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
+  // /clear runs the harness's own /clear in the session terminal, which moves
+  // the terminal onto a fresh session the view then follows.
+  const showClear =
+    sessionHarness === "claude-native" ||
+    sessionHarness === "codex-native" ||
+    sessionHarness === "pi-native";
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -3240,6 +3357,7 @@ function ComposerImpl(
         showSide,
         skillPrefix,
         supportsModelReset,
+        showClear,
       ),
     [
       skills,
@@ -3250,6 +3368,7 @@ function ComposerImpl(
       showSide,
       skillPrefix,
       supportsModelReset,
+      showClear,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -3496,6 +3615,27 @@ function ComposerImpl(
         setValue("");
         setCommandError(null);
         onNewSession();
+        return true;
+      }
+      case "/clear": {
+        if (sessionHarness === "pi") return false;
+        if (!showClear) {
+          setCommandError("/clear is not supported for this agent type");
+          return true;
+        }
+        if (arg) {
+          setCommandError("/clear does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        void useChatStore
+          .getState()
+          .clearContext()
+          .catch((err: unknown) => {
+            setCommandError(err instanceof Error ? err.message : "Clear failed");
+          });
         return true;
       }
       case "/compact": {
@@ -4595,54 +4735,61 @@ function ComposerImpl(
                   onReconnect={onShowReconnectHelp}
                 />
               )}
-              {(showClaudePermissionMode || showCodexApprovalMode) && (
-                <ComposerPermissionPicker
-                  label="Permission mode"
-                  value={permissionLabel || "Permission mode"}
-                  harness={sessionHarness}
-                  selectedValue={
-                    showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
-                  }
-                  options={
-                    sessionHarness === "antigravity-native"
-                      ? permissionOptions.map((option) => ({
-                          ...option,
-                          description: `${option.description}. ${
-                            option.value === "full" || claudePermissionMode === "full"
-                              ? "Changing to or from Full access requires a new Antigravity session. "
-                              : ""
-                          }${AGY_RESTRICTED_HOOK_RULE}`,
-                        }))
-                      : permissionOptions
-                  }
-                  disabledOptions={
-                    sessionHarness === "antigravity-native"
-                      ? permissionOptions
-                          .filter((option) =>
-                            claudePermissionMode === "full"
-                              ? option.value !== "full"
-                              : option.value === "full",
-                          )
-                          .map((option) => option.value)
-                      : showCodexApprovalMode && sessionHarness === "codex-native"
-                        ? ["read-only"]
-                        : []
-                  }
-                  disabled={
-                    isReadOnly ||
-                    unreachable ||
-                    configBusy ||
-                    Boolean(tierPickerDisabledReason) ||
-                    !isOwnerLevel(permissionLevel)
-                  }
-                  disabledReason={
-                    !isOwnerLevel(permissionLevel)
-                      ? "Only the session owner can change the permission mode"
-                      : tierPickerDisabledReason
-                  }
-                  onSelect={(mode) => void changePermission(mode)}
-                />
-              )}
+              {(showClaudePermissionMode || showCodexApprovalMode) &&
+                (!nativePermissionControl || nativePermissionReadback) && (
+                  <ComposerPermissionPicker
+                    label="Permission mode"
+                    value={permissionLabel || "Permission mode"}
+                    harness={sessionHarness}
+                    readback={nativePermissionReadback}
+                    selectedValue={
+                      nativePermissionControl
+                        ? nativePermissionReadback?.selectedValue
+                        : showClaudePermissionMode
+                          ? claudePermissionMode
+                          : codexApprovalMode
+                    }
+                    options={
+                      sessionHarness === "antigravity-native"
+                        ? permissionOptions.map((option) => ({
+                            ...option,
+                            description: `${option.description}. ${
+                              option.value === "full" || claudePermissionMode === "full"
+                                ? "Changing to or from Full access requires a new Antigravity session. "
+                                : ""
+                            }${AGY_RESTRICTED_HOOK_RULE}`,
+                          }))
+                        : permissionOptions
+                    }
+                    disabledOptions={
+                      sessionHarness === "antigravity-native"
+                        ? permissionOptions
+                            .filter((option) =>
+                              claudePermissionMode === "full"
+                                ? option.value !== "full"
+                                : option.value === "full",
+                            )
+                            .map((option) => option.value)
+                        : showCodexApprovalMode && sessionHarness === "codex-native"
+                          ? ["read-only"]
+                          : []
+                    }
+                    disabled={
+                      isReadOnly ||
+                      unreachable ||
+                      nativePermissionOffline ||
+                      configBusy ||
+                      Boolean(tierPickerDisabledReason) ||
+                      !isOwnerLevel(permissionLevel)
+                    }
+                    disabledReason={
+                      !isOwnerLevel(permissionLevel)
+                        ? "Only the session owner can change the permission mode"
+                        : tierPickerDisabledReason
+                    }
+                    onSelect={(mode) => void changePermission(mode)}
+                  />
+                )}
             </>
           ),
           trailing: (

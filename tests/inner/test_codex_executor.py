@@ -270,6 +270,47 @@ async def test_context_v2_sdk_primary_and_real_maintenance_retirement(context_v2
     assert calls == ["thread/start", "thread/resume", "thread/fork", "turn/start"]
 
 
+async def test_prepared_session_keeps_context_owner_without_resnapshot(
+    sdk_inventory_stream, monkeypatch
+):
+    app, proc, _reader = sdk_inventory_stream
+    constructor_args = []
+
+    def factory(**kwargs):
+        constructor_args.append(kwargs)
+        return app
+
+    executor = CodexExecutor(codex_path="/opt/work/bin/codex", app_session_factory=factory)
+    state = _CodexSessionState(codex_path="/opt/work/pinned/codex", launch_env={"PINNED": "yes"})
+    executor._session_states["sdk-key"] = state
+    await executor._ensure_app_session(
+        "sdk-key",
+        state,
+        signature=(None, "cwd", "model", "sandbox"),
+        effective_cwd="/opt/work/project",
+    )
+
+    async def respond():
+        message = json.loads(proc.stdin.writes[-1])
+        proc.stdout.feed({"id": message["id"], "result": {"thread": {"id": "primary"}}})
+
+    proc.stdin.drain = respond
+    await app._request("thread/start", {})
+    read = await executor.prepare_context_inventory_v2("conversation", "read")
+    assert read().sources[0].contexts[0].vendor_id.value == "primary"
+    assert constructor_args[0]["codex_path"] == "/opt/work/pinned/codex"
+    assert constructor_args[0]["env"] == {"PINNED": "yes"}
+    snapshot = Mock(side_effect=AssertionError("prepared binary must not be snapshotted twice"))
+    monkeypatch.setattr("omnigent.inner.codex_executor.snapshot_codex_binary", snapshot)
+    app._started = False
+    app._signer_factory = lambda: SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError("stop before worker spawn")), close=AsyncMock()
+    )
+    with pytest.raises(RuntimeError, match="stop before worker spawn"):
+        await app._start_unchecked()
+    snapshot.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "outcome", ["success", "rpc-error", "cancel", "generation", "incarnation", "malformed"]
 )
@@ -5189,6 +5230,300 @@ def test_codex_builtin_command_completion_surfaces_nonzero_exit() -> None:
     assert completion.error == "Command exited with status 3."
 
 
+_OMITTED = object()
+
+
+@pytest.mark.parametrize(
+    ("item_status", "exit_code", "output", "expected_status", "expected_result", "expected_error"),
+    [
+        pytest.param(
+            "failed",
+            _OMITTED,
+            "boom",
+            ToolCallStatus.ERROR,
+            "[command status: failed]\nboom",
+            "Command ended with status failed.",
+            id="failed-no-exit-code",
+        ),
+        pytest.param(
+            "failed",
+            None,
+            None,
+            ToolCallStatus.ERROR,
+            "[command status: failed]",
+            "Command ended with status failed.",
+            id="failed-null-exit-code-empty-output",
+        ),
+        pytest.param(
+            "declined",
+            _OMITTED,
+            "refused",
+            ToolCallStatus.ERROR,
+            "[command status: declined]\nrefused",
+            "Command ended with status declined.",
+            id="declined-no-exit-code",
+        ),
+        pytest.param(
+            "declined",
+            None,
+            "",
+            ToolCallStatus.ERROR,
+            "[command status: declined]",
+            "Command ended with status declined.",
+            id="declined-empty-output",
+        ),
+        pytest.param(
+            "failed",
+            0,
+            "boom",
+            ToolCallStatus.ERROR,
+            "[command status: failed]\nboom",
+            "Command ended with status failed.",
+            id="failed-zero-exit-contradiction",
+        ),
+        pytest.param(
+            "declined",
+            0,
+            None,
+            ToolCallStatus.ERROR,
+            "[command status: declined]",
+            "Command ended with status declined.",
+            id="declined-zero-exit-contradiction",
+        ),
+        pytest.param(
+            "failed",
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "[command status: failed]\nboom\n[exit code: 3]",
+            "Command ended with status failed.",
+            id="failed-nonzero-exit",
+        ),
+        pytest.param(
+            "declined",
+            3,
+            None,
+            ToolCallStatus.ERROR,
+            "[command status: declined]\n[exit code: 3]",
+            "Command ended with status declined.",
+            id="declined-nonzero-exit",
+        ),
+        pytest.param(
+            "completed",
+            0,
+            "ok\n",
+            ToolCallStatus.SUCCESS,
+            "ok\n",
+            None,
+            id="completed-zero-exit",
+        ),
+        pytest.param(
+            "completed",
+            _OMITTED,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="completed-no-exit-code",
+        ),
+        pytest.param(
+            "completed",
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="completed-nonzero-exit",
+        ),
+        pytest.param(
+            _OMITTED,
+            0,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="legacy-absent-status-zero-exit",
+        ),
+        pytest.param(
+            _OMITTED,
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="legacy-absent-status-nonzero-exit",
+        ),
+        pytest.param(
+            None,
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="legacy-null-status-nonzero-exit",
+        ),
+        pytest.param(
+            None,
+            None,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="legacy-null-status-null-exit",
+        ),
+        pytest.param(
+            "inProgress",
+            0,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="unknown-status-zero-exit",
+        ),
+        pytest.param(
+            "inProgress",
+            None,
+            "ok",
+            ToolCallStatus.SUCCESS,
+            "ok",
+            None,
+            id="unknown-status-null-exit",
+        ),
+        pytest.param(
+            "inProgress",
+            3,
+            "boom",
+            ToolCallStatus.ERROR,
+            "boom\n[exit code: 3]",
+            "Command exited with status 3.",
+            id="unknown-status-nonzero-exit",
+        ),
+    ],
+)
+def test_codex_builtin_command_completion_status_matrix(
+    item_status: object,
+    exit_code: object,
+    output: str | None,
+    expected_status: ToolCallStatus,
+    expected_result: str,
+    expected_error: str | None,
+) -> None:
+    """Only documented failed/declined states override the numeric exit rule."""
+
+    item: dict[str, Any] = {
+        "id": "command-status",
+        "type": "commandExecution",
+        "command": "false",
+    }
+    if item_status is not _OMITTED:
+        item["status"] = item_status
+    if exit_code is not _OMITTED:
+        item["exitCode"] = exit_code
+    if output is not None:
+        item["aggregatedOutput"] = output
+
+    completion = _codex_builtin_tool_completion(item)
+
+    assert completion is not None
+    assert completion.status is expected_status
+    assert completion.result == expected_result
+    assert completion.error == expected_error
+
+
+async def test_run_turn_reports_failed_builtin_command_without_redispatch() -> None:
+    """A failed command from the app server is a terminal ERROR, reported once."""
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    turn_started = asyncio.Event()
+
+    async def _start_turn(*_args: object, **_kwargs: object) -> dict[str, object]:
+        turn_started.set()
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=_start_turn)
+
+    command_item = {
+        "id": "command-1",
+        "type": "commandExecution",
+        "command": "false",
+        "cwd": "/tmp/workspace",
+        "commandActions": [],
+    }
+    completed_item = {
+        **command_item,
+        "status": "failed",
+        "aggregatedOutput": "boom\n",
+        "durationMs": 12,
+    }
+
+    async def _produce_live_events() -> None:
+        await turn_started.wait()
+        for event in (
+            {"method": "item/started", "params": {"turnId": "turn-1", "item": command_item}},
+            {
+                "method": "item/completed",
+                "params": {"turnId": "turn-1", "item": completed_item},
+            },
+            {
+                "method": "item/completed",
+                "params": {"turnId": "turn-1", "item": completed_item},
+            },
+            {
+                "method": "turn/completed",
+                "params": {"turnId": "turn-1", "turn": {"id": "turn-1", "status": "failed"}},
+            },
+        ):
+            await session._events.put(event)
+
+    producer = asyncio.create_task(_produce_live_events())
+
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "run it"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    await producer
+
+    tool_events = [
+        event for event in events if isinstance(event, (ToolCallRequest, ToolCallComplete))
+    ]
+    assert [type(event).__name__ for event in tool_events] == [
+        "ToolCallRequest",
+        "ToolCallRequest",
+        "ToolCallComplete",
+    ]
+    assert [event.metadata["call_id"] for event in tool_events] == [
+        "command-1",
+        "command-1",
+        "command-1",
+    ]
+    assert [event.metadata["observed_call_completed"] for event in tool_events[:2]] == [
+        False,
+        True,
+    ]
+    # Observed-only: Codex ran the command itself, so nothing may be redispatched.
+    assert all(event.metadata.get("internally_executed") is True for event in tool_events[:2])
+    completion = tool_events[2]
+    assert completion.status is ToolCallStatus.ERROR
+    assert completion.result == "[command status: failed]\nboom\n"
+    assert completion.error == "Command ended with status failed."
+    assert completion.duration_ms == 12.0
+
+
 async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
     """Adopt fallback must drop a stale final-answer item rather
     than adopt it as the new turn's response.
@@ -7001,7 +7336,11 @@ def test_populate_codex_home_config_windows_sandbox_write_failure_keeps_config(
             fault.setattr(
                 os,
                 "fdopen",
-                lambda fd, *args, **kwargs: PartialWriter(real_fdopen(fd, *args, **kwargs)),
+                lambda fd, mode, *args, **kwargs: (
+                    real_fdopen(fd, mode, *args, **kwargs)
+                    if "r" in mode
+                    else PartialWriter(real_fdopen(fd, mode, *args, **kwargs))
+                ),
             )
         elif failure == "chmod":
             fault.setattr(os, "chmod", Mock(side_effect=OSError("cannot set temp mode")))
@@ -8140,6 +8479,17 @@ async def test_codex_cli_version_returns_none_on_oserror(
     assert await _codex_cli_version("/usr/local/bin/codex") is None
 
 
+async def test_codex_wrapper_version_probe_receives_runtime_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawn = AsyncMock(return_value=_FakeVersionProcess(stdout=b"codex-cli 0.164.0\n"))
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    env = {"OMNIGENT_CODEX_RUNTIME_BIN": "/opt/work/omnigent/runtime/bin/codex"}
+    assert await _codex_cli_version("/opt/work/omnigent/bin/codex-wrapper", env=env) == (0, 164, 0)
+    assert spawn.await_args.args == ("/opt/work/omnigent/bin/codex-wrapper", "--version")
+    assert spawn.await_args.kwargs["env"] == env
+
+
 async def test_codex_cli_version_times_out_and_kills_proc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8240,6 +8590,9 @@ async def test_brokered_version_failure_precedes_signer_session_construction(
     tmp_path: Path,
 ) -> None:
     version_gate = AsyncMock(side_effect=RuntimeError("unsupported Codex wire version"))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.snapshot_codex_binary", lambda path, *, env: path
+    )
     app_session_factory = AsyncMock()
     monkeypatch.setattr(
         "omnigent.inner.codex_executor._require_brokered_codex_version", version_gate
@@ -10300,3 +10653,133 @@ async def test_resident_inventory_maintenance_follows_owned_parent_cleanup(
         await closing
     snapshot = executor.resident_inventory()
     assert snapshot.owners == () and not snapshot.context_coverage_complete
+
+
+@pytest.mark.parametrize("wrapper", [False, True])
+async def test_codex_update_keeps_thread_when_replacement_cannot_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapper: bool
+) -> None:
+    from omnigent.inner import codex_binary
+    from omnigent.inner import codex_executor as module
+
+    vendor = tmp_path / "vendor"
+    binary = vendor / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"\x7fELFold codex")
+    binary.chmod(0o755)
+    binary.with_name("codex-code-mode-host").write_bytes(b"old host")
+    launcher = tmp_path / "wrapper" / "codex"
+    launcher.parent.mkdir()
+    launcher.write_text("#!/usr/bin/env node\n// custom wrapper\n")
+    launcher.chmod(0o755)
+    (vendor / "codex-package.json").write_text(
+        json.dumps(
+            {
+                "layoutVersion": 1,
+                "version": "0.164.0",
+                "target": "fixture-target",
+                "entrypoint": "bin/codex",
+            }
+        )
+    )
+    monkeypatch.setattr(codex_binary, "data_dir", lambda: tmp_path / "data")
+    monkeypatch.setattr(module, "_codex_home_config_source_from_env", lambda: tmp_path)
+    monkeypatch.setattr(module, "codex_home_staging_root", lambda: tmp_path)
+    monkeypatch.setattr(module, "_populate_codex_home_config", lambda *a, **kw: None)
+    monkeypatch.setattr(module, "populate_codex_skills_from_bundle", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.inherit_codex_hook_approvals", AsyncMock()
+    )
+    monkeypatch.setattr(module, "_terminate_process_tree", lambda proc: proc.terminate())
+    monkeypatch.setattr(module, "_kill_process_tree", lambda proc: proc.kill())
+    spawned = []
+    home = None
+    runtime = None
+
+    async def spawn(*args, **kwargs):
+        nonlocal home, runtime
+        if spawned:
+            raise OSError("replacement worker cannot start")
+        spawned.append(args[0])
+        runtime = kwargs["env"].get("OMNIGENT_CODEX_RUNTIME_BIN", args[0])
+        home = Path(kwargs["env"]["CODEX_HOME"])
+        proc = _FakeProcess()
+        proc.stdout = _ScriptedStdoutPipe([])
+        return proc
+
+    monkeypatch.setattr(module, "_create_subprocess_exec", spawn)
+    session = _CodexAppServerSession(
+        codex_path=str(binary), cwd=str(tmp_path), env={}, tool_executor=None
+    )
+    turns = 0
+    methods = []
+
+    async def request(method, params):
+        nonlocal turns
+        methods.append(method)
+        if method == "initialize":
+            return {"result": {}}
+        if method == "thread/start":
+            assert home is not None
+            (home / "thread.jsonl").write_text("remember this thread")
+            return {"result": {"thread": {"id": "thread-kept"}}}
+        assert method == "turn/start"
+        assert params["threadId"] == "thread-kept"
+        turns += 1
+        if turns == 1:
+            binary.write_bytes(b"replacement that cannot execute")
+            binary.with_name("codex-code-mode-host").write_bytes(b"new host")
+        assert Path(runtime).with_name("codex-code-mode-host").read_bytes() == b"old host"
+        turn = {"id": f"turn-{turns}"}
+        asyncio.get_running_loop().call_soon(
+            session._events.put_nowait, {"method": "turn/completed", "params": {"turn": turn}}
+        )
+        return {"result": {"turn": turn}}
+
+    monkeypatch.setattr(session, "_request", request)
+    factory = Mock(side_effect=lambda **kwargs: session)
+
+    def selected_session(**kwargs):
+        session._codex_path = kwargs["codex_path"]
+        session._env = kwargs["env"]
+        return factory(**kwargs)
+
+    async def version_check(path, *, env=None):
+        assert path != str(binary)
+        if wrapper:
+            assert path == str(launcher)
+            path = env["OMNIGENT_CODEX_RUNTIME_BIN"]
+        assert Path(path).read_bytes() == b"\x7fELFold codex"
+
+    gate = AsyncMock(side_effect=version_check)
+    monkeypatch.setattr(module, "_require_brokered_codex_version", gate)
+    executor = CodexExecutor(
+        codex_path=str(launcher if wrapper else binary),
+        cwd=str(tmp_path),
+        app_session_factory=selected_session,
+    )
+    executor._env["PATH"] = os.pathsep.join([str(launcher.parent), str(binary.parent)])
+    executor._signer_backed = True
+    try:
+        for text in ("first", "retry after update"):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    messages=[{"role": "user", "content": text}],
+                    tools=[],
+                    system_prompt="",
+                )
+            ]
+            assert isinstance(events[-1], TurnComplete)
+        assert len(spawned) == 1 and spawned[0] != str(binary)
+        assert methods.count("thread/start") == 1
+        factory.assert_called_once()
+        if wrapper:
+            assert spawned[0] == str(launcher)
+            gate.assert_awaited_once_with(spawned[0], env=session._env)
+        else:
+            gate.assert_awaited_once_with(spawned[0])
+        assert session.thread_id == "thread-kept"
+        assert home is not None and (home / "thread.jsonl").read_text() == "remember this thread"
+    finally:
+        await executor.close()

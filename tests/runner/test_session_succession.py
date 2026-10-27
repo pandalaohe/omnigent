@@ -17,8 +17,11 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
+from omnigent.db.utils import generate_task_id
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app, subagent_work
+from omnigent.server import session_succession
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -328,6 +331,60 @@ async def test_held_completion_is_delivered_once_by_release(
             if url.endswith(f"/{NEW_SESSION_ID}/events")
         ]
         assert len(wake_posts) == 1, "a second release woke the successor again"
+
+
+@pytest.mark.asyncio
+async def test_engine_releases_pre_rotation_work_with_offline_child_runner(
+    _clean_succession_state: None,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    old = store.create_conversation(title="old", runner_id="parent-runner").id
+    new = store.create_conversation(title="new", runner_id="parent-runner").id
+    child = store.create_conversation(
+        parent_conversation_id=old, runner_id="offline-child-runner", title="review"
+    ).id
+    receipt_id = generate_task_id()
+    store.reassign_live_children(old, new, receipt_id)
+    runner_app._session_inboxes_ref[old] = asyncio.Queue()
+    new_inbox = asyncio.Queue()
+    runner_app._session_inboxes_ref[new] = new_inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=old, child_session_id=child, agent="reviewer", title="review"
+    )
+    app, server = _build_runner()
+    real_open = session_succession._phase_open
+    async with _runner_client(app) as client:
+
+        async def resolve(_id: str, _router: Any, *, conversation: Any) -> Any:
+            return None if conversation.runner_id == "offline-child-runner" else client
+
+        async def complete_after_open(*args: Any, **kwargs: Any) -> Any:
+            receipt = await real_open(*args, **kwargs)
+            completion = await client.post(
+                f"/v1/sessions/{child}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "LGTM"},
+                },
+            )
+            assert completion.status_code == 204
+            assert new_inbox.empty()
+            assert len(subagent_work._held_successions[new]) == 1
+            return receipt
+
+        monkeypatch.setattr(session_succession, "_get_runner_client", resolve)
+        monkeypatch.setattr(session_succession, "_phase_open", complete_after_open)
+        result = await session_succession.advance_succession(
+            receipt_id, conversation_store=store, runner_router=None, peer_message_store=None
+        )
+    assert result.phase == "done"
+    assert result.deferred_runners == [
+        {"runner_id": "offline-child-runner", "session_ids": [child]}
+    ]
+    assert new_inbox.get_nowait()["conversation_id"] == child
+    assert len([url for url, _ in server.posts if url.endswith(f"/{new}/events")]) == 1
 
 
 @pytest.mark.asyncio

@@ -2734,6 +2734,60 @@ async def test_cold_after_for_reads_the_agent_row(harness: _Harness) -> None:
     assert harness.sweeper.cold_after_for(main, _RaisingPrefs()) is None
 
 
+async def test_cells_drive_ping_receipt_bulk_cold_after_and_scan_window(harness: _Harness) -> None:
+    touched = harness.now - 3301
+    main = _main(harness, running_since=touched, labels={KEEP_WARM_LABEL: _warm_label(t=touched)})
+    harness.store.set_host_id(main.id, _HOST_ID, workspace="/opt/work/project")
+    other = _main(harness)
+    harness.prefs.keep_warm = {
+        "default": {"main": True, "coldAfterSeconds": 0},
+        "agents": {_CLAUDE_AGENT: {"coldAfterSeconds": 0}},
+        "cells": {
+            _HOST_ID: {
+                "harness:claude-native": {
+                    "main": True,
+                    "coldAfterSeconds": 172800,
+                    "maxSeconds": 172800,
+                },
+            },
+        },
+    }
+    main = harness.store.get_conversation(main.id)
+    assert main is not None
+    assert harness.sweeper.cold_after_for_many([main, other], harness.prefs) == {
+        main.id: 172800,
+        other.id: None,
+    }
+    await _tick(harness)
+    assert [ping["session_id"] for ping in harness.forward.pings()] == [main.id]
+    assert harness.sweeper._scan_window_s == 173100
+    await _settle(harness, main.id)
+    settled = _read_label(harness, main.id)
+    assert settled is not None and settled.s == "w" and settled.why is None
+    assert settled.w == harness.now + 3600
+
+
+async def test_cells_pi_gate_uses_host_template_and_no_server_ping(harness: _Harness) -> None:
+    main = _main(harness, harness_override="pi", running_since=harness.now - 100)
+    main = replace(main, host_id=_HOST_ID)
+    harness.prefs.keep_warm = {
+        "default": {"main": True},
+        "cells": {_HOST_ID: {"harness:pi": {"main": True}, "ca_off": {}}},
+    }
+    settings = read_keep_warm_settings(harness.prefs, RESERVED_USER_LOCAL)
+    assert child_keep_warm.pi_cache_warming_allowed(main, settings, harness.now)
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        replace(main, host_id="other"), settings, harness.now
+    )
+    assert not child_keep_warm.pi_cache_warming_allowed(
+        replace(main, labels={**main.labels, AGENT_TEMPLATE_ID_LABEL: "ca_off"}),
+        settings,
+        harness.now,
+    )
+    await _tick(harness)
+    assert harness.forward.pings() == []
+
+
 async def test_cold_after_batch_applies_default_and_exception_identity(harness: _Harness) -> None:
     harness.prefs.keep_warm = {
         "default": {"coldAfterSeconds": 0},
@@ -3397,7 +3451,8 @@ async def test_keep_warm_family_helpers_read_harness_and_label() -> None:
         ("codex", "codex"),
     ):
         assert registry[harness_id]["keep_warm_family"] == family
-    assert registry["pi"]["keep_warm_family"] is None
+    assert registry["pi"]["keep_warm_family"] == "pi"
+    assert registry["pi-native"]["keep_warm_family"] == "pi"
     assert child_keep_warm.keep_warm_family_for_harness("claude-native") == "claude"
     assert child_keep_warm.keep_warm_family_for_harness("claude-sdk") == "claude"
     assert child_keep_warm.keep_warm_family_for_harness("codex-native") == "codex"

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -27,15 +28,25 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from omnigent.host.frames import CAP_RESOURCE_SNAPSHOT, HostResourceSnapshotFrame
+from omnigent.host.frames import (
+    CAP_LOAD_LEVEL_V1,
+    CAP_RESOURCE_SNAPSHOT,
+    HostLoadLinesFrame,
+    HostResourceSnapshotFrame,
+    encode_host_frame,
+)
+from omnigent.host.load_level import FACTORY_LINES, MAX_READING_AGE_S, Level, LoadLines
 from omnigent.server.performance_metrics import (
     ServerMetricsSnapshot,
     ServerPerformanceMetrics,
 )
 
 _logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from omnigent.server.host_registry import HostRegistry
 
 HISTORY_TTL_S = 24 * 60 * 60.0
 OFFLINE_RED_AFTER_S = 120.0
@@ -145,6 +156,20 @@ _STATE_OFFLINE = "offline"
 _STATE_NEEDS_UPDATE = "needs_update"
 
 
+@dataclass(frozen=True)
+class LevelChange:
+    """A host-reported transition for the parent-session notifier."""
+
+    workspace_id: int
+    host_id: str
+    old: Level
+    new: Level
+    reason: str | None
+    load_per_core: float | None
+    lines: LoadLines
+    at: float
+
+
 @dataclass
 class _HostEntry:
     """Server-side state for one ``(workspace, host)`` target."""
@@ -155,6 +180,12 @@ class _HostEntry:
     name: str
     state: str
     since: float
+    load_capable: bool | None = None
+    level: Level = "unknown"
+    reason: str | None = None
+    level_since: str | None = None
+    last_received_at: float | None = None
+    last_sampled_at: float | None = None
     last_snapshot: dict[str, Any] | None = None
     last_runner_count: int = 0
     points: list[dict[str, Any]] = field(default_factory=list)
@@ -188,11 +219,14 @@ class SystemStatusHub:
         self.settings_path = self._state_dir / "settings.json"
         self._started_at = time.time()
         self._entries: dict[tuple[int, str], _HostEntry] = {}
+        self._queued_children: dict[tuple[int, str], int] = {}
         self._server_points: list[dict[str, Any]] = []
         self._findings: dict[tuple[int | None, str], dict[str, Any]] = {}
         self._viewer_leases: dict[tuple[int, str], float] = {}
         self._settings = self._read_settings()
         self._revision = 0
+        self._lines_revision = 0
+        self._level_changes: list[LevelChange] = []
         self._hub_cpu_ms = 0.0
         self._last_server_counters: tuple[int, int] | None = None
         # One writer serializes both state files; its thread starts lazily on
@@ -262,10 +296,19 @@ class SystemStatusHub:
                 entry.name = name
             if conn_capabilities is None:
                 self._set_state(entry, _STATE_OFFLINE, now)
-            elif CAP_RESOURCE_SNAPSHOT not in conn_capabilities:
-                self._set_state(entry, _STATE_NEEDS_UPDATE, now)
+                entry.last_received_at = None
+                self._set_level(entry, "unknown", None, None, now)
             else:
-                self._set_state(entry, _STATE_ONLINE, now)
+                entry.load_capable = CAP_LOAD_LEVEL_V1 in conn_capabilities
+                self._set_state(
+                    entry,
+                    _STATE_ONLINE
+                    if entry.load_capable and CAP_RESOURCE_SNAPSHOT in conn_capabilities
+                    else _STATE_NEEDS_UPDATE,
+                    now,
+                )
+                if not entry.load_capable:
+                    self._set_level(entry, "unknown", None, None, now)
         finally:
             self._accumulate_cpu(started)
 
@@ -299,11 +342,36 @@ class SystemStatusHub:
                     since=now,
                 )
                 self._entries[(workspace_id, host_id)] = entry
-            self._set_state(entry, _STATE_ONLINE, now)
+            if entry.load_capable is None:
+                entry.load_capable = frame.load_level is not None
+            self._set_state(
+                entry, _STATE_ONLINE if entry.load_capable else _STATE_NEEDS_UPDATE, now
+            )
             snapshot = asdict(frame)
             entry.last_snapshot = snapshot
+            entry.last_received_at = now
+            try:
+                sampled_at = datetime.fromisoformat(frame.sampled_at)
+                stamp = sampled_at.timestamp() if sampled_at.utcoffset() is not None else None
+                entry.last_sampled_at = (
+                    stamp if stamp is not None and 0 <= now - stamp <= MAX_READING_AGE_S else None
+                )
+            except (ValueError, TypeError, OverflowError):
+                entry.last_sampled_at = None
+            report = (
+                frame.load_level
+                if entry.load_capable and entry.last_sampled_at is not None
+                else None
+            )
+            self._set_level(
+                entry,
+                report.level if report is not None else "unknown",
+                report.reason if report is not None else None,
+                report.since if report is not None else None,
+                now,
+            )
             entry.last_runner_count = int(frame.runner_count)
-            entry.minute_buffer.append({"t": now, "snapshot": snapshot})
+            entry.minute_buffer.append({"t": now, "snapshot": snapshot, "level": entry.level})
             entry.overhead_samples.append(
                 (
                     now,
@@ -332,6 +400,7 @@ class SystemStatusHub:
             if self._metrics is not None and self._metrics.last_snapshot is not None:
                 self._append_server_point(now, self._metrics.last_snapshot, server_disk_pct)
             for entry in self._entries.values():
+                self._expire_load(entry, now)
                 self._close_minute(entry, now)
                 self._prune_overhead(entry, now)
 
@@ -424,6 +493,8 @@ class SystemStatusHub:
                 "mem_total": int(last_machine["mem_total"]),
                 "disk_pct": _machine_disk_pct(last_machine),
                 "load1": last_machine["load1"],
+                "load_per_core": last_machine.get("load_per_core"),
+                "level": buffer[-1]["level"],
                 "top": top,
             }
         )
@@ -695,6 +766,7 @@ class SystemStatusHub:
                     "since": entry.since,
                     "last_snapshot": entry.last_snapshot,
                     "last_runner_count": entry.last_runner_count,
+                    **self.host_load(entry.workspace_id, entry.host_id, now=now),
                 }
                 for entry in visible
             ]
@@ -711,6 +783,7 @@ class SystemStatusHub:
                         "since": None,
                         "last_snapshot": None,
                         "last_runner_count": 0,
+                        **self.host_load(workspace_id, host_id, now=now),
                     }
                 )
 
@@ -924,11 +997,14 @@ class SystemStatusHub:
 
     # ── Settings ─────────────────────────────────────────────────
 
-    def get_settings(self) -> dict[str, Any]:
-        """Return a copy of the effective thresholds and health-check settings."""
-        return dict(self._settings)
+    def get_settings(self, workspace_id: int | None = None) -> dict[str, Any]:
+        """Copy settings; a workspace argument projects only its load-line settings."""
+        settings = copy.deepcopy(self._settings)
+        if workspace_id is not None:
+            settings["load_lines"] = self._workspace_lines(workspace_id)
+        return settings
 
-    def put_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def put_settings(self, payload: dict[str, Any], *, workspace_id: int = 0) -> dict[str, Any]:
         """Validate and store settings, returning the payload to persist.
 
         The caller writes the returned mapping off the event loop; this
@@ -942,25 +1018,186 @@ class SystemStatusHub:
             ``health_check`` a non-object, an unknown sub-key, a wrong type,
             an id outside 1-64 chars, or a prompt over 20 000 chars.
         """
-        settings = dict(self._settings)
+        settings = self.get_settings()
         for key, value in payload.items():
             if key == "health_check":
                 settings[key] = _coerce_health_check(value)
+            elif key == "load_lines":
+                settings[key][str(workspace_id)] = _patch_load_lines(
+                    self._workspace_lines(workspace_id), value
+                )
             else:
                 settings[key] = _coerce_setting(key, value)
+        if settings != self._settings:
+            self._lines_revision += 1
         self._settings = settings
-        return dict(settings)
+        return self.get_settings()
+
+    def _workspace_lines(self, workspace_id: int) -> dict[str, Any]:
+        return copy.deepcopy(
+            self._settings["load_lines"].get(str(workspace_id), _factory_workspace_lines())
+        )
+
+    def effective_load_lines(self, workspace_id: int, host_id: str) -> LoadLines:
+        """Resolve a host override, workspace default, then the factory lines."""
+        workspace = self._workspace_lines(workspace_id)
+        pair = workspace["hosts"].get(host_id, workspace["default"])
+        return LoadLines(pair["heavy"], pair["new_session"], self._settings["mem_pct"])
+
+    def queue_enabled(self, workspace_id: int) -> bool:
+        """Whether agent-created children may be held in this workspace."""
+        return self._workspace_lines(workspace_id)["queue_enabled"]
+
+    def host_load_keys(self) -> list[tuple[int, str]]:
+        return list(self._entries)
+
+    def set_queued_children(self, workspace_id: int, host_id: str, count: int) -> None:
+        self._queued_children[(workspace_id, host_id)] = count
+
+    def load_lines_frames(self) -> dict[tuple[int, str], HostLoadLinesFrame]:
+        """Capture effective frames so a settings patch can target actual changes."""
+        return {
+            key: self.load_lines_frame(*key)
+            for key, entry in self._entries.items()
+            if entry.state != _STATE_OFFLINE and entry.load_capable
+        }
+
+    def load_lines_frame(self, workspace_id: int, host_id: str) -> HostLoadLinesFrame:
+        """Build the server-owned configuration sent on connect or settings change."""
+        lines = self.effective_load_lines(workspace_id, host_id)
+        return HostLoadLinesFrame(
+            lines.heavy, lines.new_session, lines.mem_pct, self._lines_revision
+        )
+
+    def push_load_lines(
+        self,
+        registry: HostRegistry,
+        workspace_id: int,
+        host_id: str,
+    ) -> None:
+        """Send only to a capable live connection in the named workspace."""
+        conn = registry.get(host_id, workspace_id=workspace_id)
+        if conn is None or CAP_LOAD_LEVEL_V1 not in conn.hello.capabilities:
+            return
+        try:
+            registry.send_text(
+                conn, encode_host_frame(self.load_lines_frame(workspace_id, host_id))
+            )
+        except ConnectionError:
+            # A reconnect receives the latest settings through the lifecycle callback.
+            _logger.debug("host disconnected before load lines could be sent")
+
+    def host_name(self, workspace_id: int, host_id: str) -> str:
+        """Resolve a load-notice name without exposing other hosts' telemetry."""
+        entry = self._entries.get((workspace_id, host_id))
+        return entry.name if entry is not None else host_id
+
+    def host_load(
+        self, workspace_id: int, host_id: str, *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Current host-reported load; stale or disconnected telemetry fails open."""
+        entry = self._entries.get((workspace_id, host_id))
+        if entry is not None:
+            self._expire_load(entry, time.time() if now is None else now)
+        machine = (entry.last_snapshot or {}).get("machine", {}) if entry is not None else {}
+        workspace = self._settings["load_lines"].get(str(workspace_id))
+        source = (
+            "host"
+            if workspace and host_id in workspace["hosts"]
+            else "default"
+            if workspace is not None
+            else "factory"
+        )
+        lines = self.effective_load_lines(workspace_id, host_id)
+        return {
+            "load_per_core": machine.get("load_per_core"),
+            "load_equiv": machine.get("load_equiv"),
+            "estimate": machine.get("estimate", False),
+            "cpu_count": machine.get("cpu_count"),
+            "level": entry.level if entry is not None else "unknown",
+            "reason": entry.reason if entry is not None else None,
+            "level_since": entry.level_since if entry is not None else None,
+            "lines": {"heavy": lines.heavy, "new_session": lines.new_session},
+            "lines_source": source,
+            "queued_children": self._queued_children.get((workspace_id, host_id), 0),
+            "mem_pct": _mem_pct(machine) if machine else None,
+            "sampled_at": entry.last_snapshot.get("sampled_at")
+            if entry is not None and entry.last_snapshot
+            else None,
+        }
+
+    def drain_level_changes(self) -> list[LevelChange]:
+        """Transfer pending transitions to the notifier once per tick."""
+        changes, self._level_changes = self._level_changes, []
+        return changes
+
+    def _expire_load(self, entry: _HostEntry, now: float) -> None:
+        if (
+            entry.state != _STATE_ONLINE
+            or entry.last_received_at is None
+            or not 0 <= now - entry.last_received_at <= MAX_READING_AGE_S
+            or entry.last_sampled_at is None
+            or not 0 <= now - entry.last_sampled_at <= MAX_READING_AGE_S
+        ):
+            self._set_level(entry, "unknown", None, None, now)
+
+    def _set_level(
+        self,
+        entry: _HostEntry,
+        level: Level,
+        reason: str | None,
+        since: str | None,
+        now: float,
+    ) -> None:
+        old = entry.level
+        entry.level, entry.reason = level, reason
+        if since is not None:
+            entry.level_since = since
+        elif old != level:
+            entry.level_since = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        if old == level:
+            return
+        machine = (entry.last_snapshot or {}).get("machine", {})
+        self._level_changes.append(
+            LevelChange(
+                entry.workspace_id,
+                entry.host_id,
+                old,
+                level,
+                reason,
+                machine.get("load_per_core"),
+                self.effective_load_lines(entry.workspace_id, entry.host_id),
+                now,
+            )
+        )
+        self._revision += 1
+        self._announce({entry.workspace_id})
 
     def _read_settings(self) -> dict[str, Any]:
         payload = _read_json(self.settings_path)
         settings: dict[str, Any] = dict(_DEFAULT_SETTINGS)
         settings["health_check"] = dict(_DEFAULT_HEALTH_CHECK)
+        settings["load_lines"] = {}
         if not isinstance(payload, dict):
             return settings
         for key, value in payload.items():
             try:
                 if key == "health_check":
                     settings[key] = _coerce_health_check(value)
+                elif key == "load_lines":
+                    if isinstance(value, dict):
+                        for workspace_id, workspace in value.items():
+                            try:
+                                if (
+                                    not isinstance(workspace_id, str)
+                                    or not workspace_id.isdecimal()
+                                ):
+                                    continue
+                                settings[key][workspace_id] = _patch_load_lines(
+                                    _factory_workspace_lines(), workspace
+                                )
+                            except ValueError:
+                                continue
                 else:
                     settings[key] = _coerce_setting(key, value)
             except ValueError:
@@ -1072,6 +1309,16 @@ class SystemStatusHub:
         entry.points = []
         entry.minute_buffer = []
         entry.overhead_samples.clear()
+        entry.last_received_at = None
+        entry.last_sampled_at = None
+        entry.level = "unknown"
+        entry.reason = None
+        entry.level_since = None
+        self._level_changes = [
+            change
+            for change in self._level_changes
+            if (change.workspace_id, change.host_id) != (entry.workspace_id, entry.host_id)
+        ]
 
 
 def write_history(path: Path, payload: dict[str, Any]) -> None:
@@ -1129,6 +1376,54 @@ def _coerce_setting(key: str, value: Any) -> float:
     if not 0.0 < numeric <= 100.0:
         raise ValueError(f"system-status setting {key!r} must be in (0, 100]")
     return numeric
+
+
+def _factory_workspace_lines() -> dict[str, Any]:
+    return {
+        "default": {"heavy": FACTORY_LINES.heavy, "new_session": FACTORY_LINES.new_session},
+        "hosts": {},
+        "queue_enabled": True,
+    }
+
+
+def _coerce_load_pair(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict) or set(value) != {"heavy", "new_session"}:
+        raise ValueError("load lines must contain both heavy and new_session")
+    if any(
+        isinstance(item, bool) or not isinstance(item, (int, float)) for item in value.values()
+    ):
+        raise ValueError("load lines must be numbers")
+    try:
+        lines = LoadLines(
+            float(value["heavy"]), float(value["new_session"]), FACTORY_LINES.mem_pct
+        )
+    except (ValueError, OverflowError) as exc:
+        raise ValueError("load lines require 0 < heavy < new_session <= 64") from exc
+    return {"heavy": lines.heavy, "new_session": lines.new_session}
+
+
+def _patch_load_lines(current: dict[str, Any], patch: Any) -> dict[str, Any]:
+    """Validate the whole patch before the caller publishes any settings."""
+    if not isinstance(patch, dict) or set(patch) - {"default", "hosts", "queue_enabled"}:
+        raise ValueError("load_lines must contain only default, hosts and queue_enabled")
+    result = copy.deepcopy(current)
+    if "default" in patch:
+        result["default"] = _coerce_load_pair(patch["default"])
+    if "queue_enabled" in patch:
+        if not isinstance(patch["queue_enabled"], bool):
+            raise ValueError("load_lines.queue_enabled must be a boolean")
+        result["queue_enabled"] = patch["queue_enabled"]
+    if "hosts" in patch:
+        if not isinstance(patch["hosts"], dict):
+            raise ValueError("load_lines.hosts must be an object")
+        for host_id, pair in patch["hosts"].items():
+            if not isinstance(host_id, str) or not 1 <= len(host_id) <= 64:
+                raise ValueError("load_lines host ids must be 1-64 characters")
+            if pair is None:
+                result["hosts"].pop(host_id, None)
+            else:
+                result["hosts"][host_id] = _coerce_load_pair(pair)
+    return result
 
 
 def _coerce_health_check(value: Any) -> dict[str, str | None]:

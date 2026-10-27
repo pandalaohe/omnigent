@@ -197,6 +197,35 @@ def test_permission_bootstrap_requires_harness_auth() -> None:
     assert response.status_code == 401
 
 
+@pytest.mark.parametrize("sdk_missing", [True, False])
+def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch, sdk_missing):
+    from omnigent.inner.pi_executor import PiExecutor
+    from omnigent.inner.pi_settings import ordered_pi_launch
+
+    executor = PiExecutor(pi_path="/opt/bin/pi", permission_controlled=True)
+
+    async def fail_start(*args, **kwargs):
+        if sdk_missing:
+            ordered_pi_launch("/opt/bin/unsupported-pi", [], extension=tmp_path / "guard.js")
+        raise OSError("private host path and credential must stay in logs")
+
+    monkeypatch.setattr(executor, "_ensure_rpc", fail_start)
+    monkeypatch.setattr(pi_harness, "_build_pi_executor", lambda: executor)
+    app = pi_harness.create_app()
+    app.state.conversation_id = "test-session"
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/permission-tier/bootstrap", json={"session_id": "test-session"}
+        )
+    assert response.status_code == 503
+    body = response.json()
+    assert body["installed"] is False
+    if sdk_missing:
+        assert body["error"] == "pi_sdk_loader_unavailable"
+    else:
+        assert "private host path" not in response.text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bound", [True, False])
 async def test_recreated_pi_adapter_binds_trusted_conversation_before_turn(monkeypatch, bound):

@@ -28,6 +28,64 @@ def _revision(scope: str, text: str, *, agent_key: str = "", host_id: str = ""):
     )
 
 
+def test_codex_mother_column_does_not_leak_into_claude_preview():
+    preview = preview_instructions(
+        [_revision("mother", "Codex only", agent_key="codex")],
+        host_id="host_a",
+        agent_key="claude",
+        spec=None,
+        name="Claude",
+        harness="claude-native",
+        has_parent=False,
+        spawn=True,
+        peer=False,
+        quota_line="Quota",
+    )
+    assert preview["text"] == ""
+    assert preview["parts"] == []
+
+
+@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("independent", [" \n", " Role cell "])
+@pytest.mark.parametrize("route_independent", [False, True])
+def test_preview_role_sources_keep_original_keys(role, independent, route_independent):
+    layers = [
+        _revision("shared", "Route"),
+        _revision(role, " Shared role "),
+        _revision(role, " Column ", agent_key="codex"),
+        _revision(role, " Host ", host_id="host_a"),
+        _revision(role, independent, agent_key="codex", host_id="host_a"),
+        _revision(role, "Other agent", agent_key="claude"),
+        _revision(role, "Other host", host_id="host_b"),
+    ]
+    if route_independent:
+        layers.append(_revision("independent", "Own route", agent_key="codex", host_id="host_a"))
+    preview = preview_instructions(
+        layers,
+        host_id="host_a",
+        agent_key="codex",
+        spec=None,
+        name="Test",
+        harness="codex-native",
+        has_parent=role == "child",
+        spawn=True,
+        peer=False,
+        quota_line="Quota",
+    )
+    selected = [layers[4]] if independent.strip() else layers[1:4]
+    role_parts = [p for p in preview["parts"] if p.get("scope") == role and p["sent"]]
+    assert [(p["agent_key"], p["host_id"], p["revision_id"], p["text"]) for p in role_parts] == [
+        (r.agent_key, r.host_id, r.id, r.text) for r in selected
+    ]
+    expected = "\n\n".join(
+        ["Own route" if route_independent else "Route"] + [r.text for r in selected]
+    )
+    if role == "mother":
+        expected += "\n\nQuota"
+    assert preview["text"] == expected
+    assert preview["total_chars"] == len(expected)
+
+
 @pytest.mark.parametrize("harness", ["codex-native", "claude-sdk", "opencode-native"])
 @pytest.mark.parametrize("quota", ["", "Quota evidence"])
 def test_preview_matches_composer_with_untrimmed_inner_layers(harness: str, quota: str) -> None:

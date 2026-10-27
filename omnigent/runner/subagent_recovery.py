@@ -25,6 +25,7 @@ from omnigent.runner.subagent_work import (
     _subagent_work_origins,
     _SubagentRecoveryReadError,
     _SubagentWorkEntry,
+    codex_native_origin_from_labels,
     get_subagent_work,
     is_codex_native_subagent_wrapper,
     list_subagent_work,
@@ -42,7 +43,9 @@ def _recovered_subagent_origin(snapshot: _SessionSnapshot) -> str | None:
     snapshot whose wrapper label is not the codex-native internal one belongs
     to a child an Omnigent surface dispatched (or an ordinary child), so it is
     allowed to wake even a Codex mother. An unreadable snapshot or a
-    codex-internal thread returns ``None`` and keeps the wake suppressed.
+    codex-internal thread returns ``None`` and keeps the wake suppressed; a
+    delegated Codex thread is admitted by its own labels instead
+    (``native_origin``), not by this dispatch origin.
     """
     if not snapshot.ok:
         return None
@@ -155,6 +158,7 @@ def build_subagent_recovery(
             ),
             registered_by=_subagent_work_origins.get(conv_id)
             or _recovered_subagent_origin(snapshot),
+            native_origin=codex_native_origin_from_labels(snapshot.labels),
             flow_neutral=True,
             recovered=True,
             wrapper_label=snapshot.wrapper_label,

@@ -39,6 +39,7 @@ from omnigent.tools.builtins import (
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
+    SysSessionGetStartupObservationV1Tool,
     SysSessionHandoverTool,
     SysSessionListTool,
     SysSessionOpenTool,
@@ -53,7 +54,9 @@ from omnigent.tools.builtins import (
     get_builtin_tool,
 )
 from omnigent.tools.builtins.child_cap import SysChildCapTool
+from omnigent.tools.builtins.child_checkin import SysChildCheckinTool
 from omnigent.tools.builtins.flow import SysFlowCancelTool, SysFlowListTool, SysFlowStartTool
+from omnigent.tools.builtins.host_load import SysHostLoadTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
 
@@ -523,6 +526,9 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+        self._tools[SysSessionGetStartupObservationV1Tool.name()] = (
+            SysSessionGetStartupObservationV1Tool()
+        )
 
         # Session sharing: opt-in via the dedicated
         # ``agent_session_sharing`` flag, independent of spawn / declared
@@ -586,6 +592,8 @@ class ToolManager:
         if self._spec.spawn:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
             self._tools[SysChildCapTool.name()] = SysChildCapTool()
+            self._tools[SysChildCheckinTool.name()] = SysChildCheckinTool()
+            self._tools[SysHostLoadTool.name()] = SysHostLoadTool()
 
     def _register_session_tools(self) -> None:
         """Register framework-owned tools for the current session."""

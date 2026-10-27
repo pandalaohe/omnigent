@@ -111,13 +111,27 @@ def test_active_sandbox_preflights_before_creating_launcher(
     create_launcher.assert_not_called()
 
 
+@pytest.mark.parametrize("snapshot", [False, True, "wrapper"])
 def test_successful_active_sandbox_returns_owned_launcher(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    snapshot: bool | str,
 ) -> None:
     codex = tmp_path / "bin" / "codex"
     codex.parent.mkdir()
     codex.touch()
+    if snapshot is True:
+        (tmp_path / ".omnigent-snapshot.json").write_text("{}")
+    worker_env = None
+    runtime_root = tmp_path / "runtime"
+    if snapshot == "wrapper":
+        (runtime_root / "bin").mkdir(parents=True)
+        (runtime_root / ".omnigent-snapshot.json").write_text("{}")
+        worker_env = {
+            "PATH": os.defpath,
+            "CODEX_HOME": str(tmp_path / "codex-home"),
+            "OMNIGENT_CODEX_RUNTIME_BIN": str(runtime_root / "bin" / "codex"),
+        }
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     launcher = tmp_path / "launcher"
@@ -144,6 +158,7 @@ def test_successful_active_sandbox_returns_owned_launcher(
         codex_home=codex_home,
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
         spawn_env_names=["PATH", "CODEX_HOME"],
+        worker_env=worker_env,
     )
 
     assert worker.launch_path == str(launcher)
@@ -151,8 +166,12 @@ def test_successful_active_sandbox_returns_owned_launcher(
     assert codex_home.resolve() in captured["policy"].write_roots
     read_roots = captured["policy"].read_roots
     assert read_roots is not None
-    assert codex.resolve().parent in read_roots
-    assert captured["policy"].spawn_env_allowlist == ["CODEX_HOME", "PATH"]
+    assert (tmp_path.resolve() if snapshot is True else codex.resolve().parent) in read_roots
+    if snapshot == "wrapper":
+        assert runtime_root.resolve() in read_roots
+    assert captured["policy"].spawn_env_allowlist == sorted(
+        ["CODEX_HOME", "PATH"] + (["OMNIGENT_CODEX_RUNTIME_BIN"] if snapshot == "wrapper" else [])
+    )
     assert captured["policy"].allow_network
 
     worker.close()
@@ -215,13 +234,19 @@ def test_worker_grants_only_selected_skills_directory_read_only(
         worker.close()
 
 
+@pytest.mark.parametrize("wrapper", [False, True])
 def test_brokered_catalog_probe_is_network_denied(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    wrapper: bool,
 ) -> None:
     codex = tmp_path / "bin" / "codex"
     codex.parent.mkdir()
     codex.touch()
+    runtime_root = tmp_path / "runtime"
+    if wrapper:
+        (runtime_root / "bin").mkdir(parents=True)
+        (runtime_root / ".omnigent-snapshot.json").write_text("{}")
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     launcher = tmp_path / "launcher"
@@ -253,14 +278,20 @@ def test_brokered_catalog_probe_is_network_denied(
         cwd=tmp_path,
         codex_home=codex_home,
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
-        spawn_env_names=["PATH", "HOME", "CODEX_HOME"],
+        spawn_env_names=["PATH", "HOME", "CODEX_HOME"]
+        + (["OMNIGENT_CODEX_RUNTIME_BIN"] if wrapper else []),
+        runtime_bin=str(runtime_root / "bin" / "codex") if wrapper else None,
     )
 
     policy = captured["policy"]
     assert not policy.allow_network
     assert policy.egress_relay_port is None
     assert policy.egress_socket_path is None
-    assert policy.spawn_env_allowlist == ["CODEX_HOME", "HOME", "PATH"]
+    assert policy.spawn_env_allowlist == sorted(
+        ["CODEX_HOME", "HOME", "PATH"] + (["OMNIGENT_CODEX_RUNTIME_BIN"] if wrapper else [])
+    )
+    if wrapper:
+        assert runtime_root.resolve() in policy.read_roots
     assert codex_home.resolve() in policy.write_roots
 
     probe.close()

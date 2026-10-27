@@ -14,8 +14,10 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.runtime import get_agent_cache, get_agent_store, get_global_instructions_store
 from omnigent.runtime.instruction_layers import (
     agent_key_for_harness,
+    compose_role,
     compose_route,
     compose_session_text,
+    select_role_layers,
 )
 from omnigent.spec import AgentSpec
 from omnigent.stores.global_instructions_store import GlobalInstructionsStore
@@ -90,17 +92,25 @@ def route_session_text(
     *,
     has_parent: bool,
     quota_line: str = "",
+    quota_resolver: Callable[[], str] | None = None,
 ) -> str | None:
     """Compose user layers and the exclusive role without changing the runner envelope."""
-    text = compose_route(store.latest_layers(route.host_id, route.agent_key)).text
     role = "child" if has_parent else "mother" if route.spawn else None
-    block = store.current(scope=role) if role else None
+    layers = store.latest_layers(route.host_id, route.agent_key, role=role)
+    text = compose_route(layers).text
+    role_text = (
+        compose_role(select_role_layers(layers, role, route.host_id, route.agent_key))
+        if role
+        else ""
+    )
+    if role == "mother" and role_text.strip() and quota_resolver is not None:
+        quota_line = quota_resolver()
     result = compose_session_text(
         text,
         has_parent=has_parent,
         spawn=route.spawn,
-        mother_text=block.text if block is not None and role == "mother" else "",
-        child_text=block.text if block is not None and role == "child" else "",
+        mother_text=role_text if role == "mother" else "",
+        child_text=role_text if role == "child" else "",
         quota_line=quota_line,
     )
     return result or None
@@ -117,14 +127,10 @@ async def session_instructions_text(
         return None
     route = await resolve_instruction_route(conversation)
 
-    def compose() -> str | None:
-        has_parent = conversation.parent_conversation_id is not None
-        mother = store.current(scope="mother") if not has_parent and route.spawn else None
-        line = (
-            quota_resolver(conversation)
-            if quota_resolver is not None and mother is not None and mother.text.strip()
-            else ""
-        )
-        return route_session_text(store, route, has_parent=has_parent, quota_line=line)
-
-    return await asyncio.to_thread(compose)
+    return await asyncio.to_thread(
+        route_session_text,
+        store,
+        route,
+        has_parent=conversation.parent_conversation_id is not None,
+        quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
+    )

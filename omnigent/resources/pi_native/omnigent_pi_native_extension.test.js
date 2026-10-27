@@ -752,7 +752,9 @@ async function testPiRotation(fault = "none") {
       return { status: 503, json: async () => ({}) };
     }
     if (pathname.endsWith("/succession")) {
-      if (fault === "pending" && !failed) {
+      if (fault === "retired") {
+        data = { status: "retired", successor_id: "actual_successor" };
+      } else if (fault === "pending" && !failed) {
         failed = true;
         data = { status: "pending" };
       } else if (fault === "refused" && !failed) {
@@ -766,6 +768,18 @@ async function testPiRotation(fault = "none") {
   ctx.sessionManager = { getSessionId: () => "pi_new_context" };
   try {
     await h.handlers.session_start({ reason: fault === "startup-recovery" ? "startup" : "new" }, ctx);
+    if (fault === "retired") {
+      assert("retired: never retries", !h.pi.__omnigentRotationRetry);
+      assert("retired: source pane retained", !calls.some(c => c.method === "DELETE"));
+      const blocked = await h.handlers.tool_call({ toolCallId: "late", toolName: "write", input: {} }, ctx);
+      assert("retired: old tools stay fenced", blocked.block === true);
+      const count = calls.length;
+      await h.handlers.session_start({ reason: "startup" }, ctx);
+      assert("retired: restart never retries", calls.length === count && !h.pi.__omnigentRotationRetry);
+      const config = JSON.parse(fs.readFileSync(path.join(h.bridgeDir, "config.json"), "utf8"));
+      assert("retired: successor retained for recovery", config.retiredSuccessorId === "actual_successor");
+      return;
+    }
     if (["lost-response", "bind", "pending", "refused"].includes(fault)) {
       assert(`${fault}: keeps old pane until completed`, !calls.some(c => c.method === "DELETE"));
       assert(`${fault}: no old identity rebound`, !calls.some(c => c.body && c.body.external_session_id));
@@ -813,7 +827,7 @@ async function testChildResetDoesNotCreateMother() {
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
-    for (const fault of ["none", "lost-response", "bind", "pending", "refused", "startup-recovery"])
+    for (const fault of ["none", "lost-response", "bind", "pending", "refused", "startup-recovery", "retired"])
       await testPiRotation(fault);
     await testChildResetDoesNotCreateMother();
     await testRunningIdleShareResponseId();

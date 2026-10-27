@@ -24,13 +24,14 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from os import PathLike
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, cast
 
 from pydantic import TypeAdapter, ValidationError
 
 from omnigent.codex_rate_limits import validate_codex_rate_limits_snapshot
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
+from omnigent.host.load_level import LEVELS, Level, LoadLines
 from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PATH_ATTACHMENTS,
@@ -85,6 +86,7 @@ CAP_FS_READ_RAW = "fs_read_raw"
 # The host samples machine + process-tree resource metrics and answers
 # ``host.resource_sampling`` leases; the server gates fast-mode on this.
 CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
+CAP_LOAD_LEVEL_V1 = "load_level_v1"
 
 # The runner answers keep-warm controls (``keep_warm_ping`` / ``keep_warm_touch``)
 # and posts ``external_keep_warm_receipt`` events; the server pings only runners
@@ -107,6 +109,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_RESOURCE_SNAPSHOT,
+    CAP_LOAD_LEVEL_V1,
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
     CONTEXT_INVENTORY_V2,
@@ -226,6 +229,7 @@ class HostFrameKind(str, Enum):
     POST_BIND_HOOK_RESULT = "host.post_bind_hook_result"
     RESOURCE_SNAPSHOT = "host.resource_snapshot"
     RESOURCE_SAMPLING = "host.resource_sampling"
+    LOAD_LINES = "host.load_lines"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -358,6 +362,9 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param retain_runner_ids: Runners that still serve other sessions and must
+        survive this launch. ``None`` from an older server keeps the legacy
+        session-id supersession rule.
     """
 
     request_id: str
@@ -368,6 +375,7 @@ class HostLaunchRunnerFrame:
     inference_config: dict[str, Any] | None = None
     startup: StartupAttemptRef | None = None
     startup_required: bool = False
+    retain_runner_ids: list[str] | None = None
 
 
 @dataclass
@@ -571,6 +579,34 @@ class ResourceMachine:
     disk_used: int
     disk_total: int
     load1: float | None
+    cpu_count: int | None = None
+    load_per_core: float | None = None
+    swap_used: int | None = None
+    swap_total: int | None = None
+    load_equiv: float | None = None
+    estimate: bool = False
+
+
+@dataclass
+class LoadLevelReport:
+    """Host-computed level and the effective scheduling lines."""
+
+    level: Level
+    reason: str | None
+    since: str
+    heavy: float
+    new_session: float
+    lines_synced_at: str | None
+
+
+@dataclass
+class HostLoadLinesFrame:
+    """Server → host: replace effective load lines for this connection."""
+
+    heavy: float
+    new_session: float
+    mem_pct: float
+    revision: int
 
 
 @dataclass
@@ -633,6 +669,7 @@ class HostResourceSnapshotFrame:
     runner_count: int
     sampler_cpu_ms: float
     monitor_rss_delta: int
+    load_level: LoadLevelReport | None = None
 
 
 @dataclass
@@ -1789,6 +1826,7 @@ HostFrame = (
     | HostPostBindHookResultFrame
     | HostResourceSnapshotFrame
     | HostResourceSamplingFrame
+    | HostLoadLinesFrame
 )
 
 
@@ -1875,19 +1913,20 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.LAUNCH_RUNNER.value,
-                "request_id": frame.request_id,
-                "binding_token": frame.binding_token,
-                "workspace": frame.workspace,
-                "session_id": frame.session_id,
-                "harness": frame.harness,
-                "inference_config": frame.inference_config,
-                "startup": frame.startup.model_dump() if frame.startup else None,
-                "startup_required": frame.startup_required,
-            }
-        )
+        payload: dict[str, Any] = {
+            "kind": HostFrameKind.LAUNCH_RUNNER.value,
+            "request_id": frame.request_id,
+            "binding_token": frame.binding_token,
+            "workspace": frame.workspace,
+            "session_id": frame.session_id,
+            "harness": frame.harness,
+            "inference_config": frame.inference_config,
+            "startup": frame.startup.model_dump() if frame.startup else None,
+            "startup_required": frame.startup_required,
+        }
+        if frame.retain_runner_ids is not None:
+            payload["retain_runner_ids"] = frame.retain_runner_ids
+        return _encode_payload(payload)
     if isinstance(frame, HostStartupClaimFrame):
         return _encode_payload(
             {
@@ -2488,6 +2527,12 @@ def encode_host_frame(frame: HostFrame) -> str:
                     "disk_used": frame.machine.disk_used,
                     "disk_total": frame.machine.disk_total,
                     "load1": frame.machine.load1,
+                    "cpu_count": frame.machine.cpu_count,
+                    "load_per_core": frame.machine.load_per_core,
+                    "swap_used": frame.machine.swap_used,
+                    "swap_total": frame.machine.swap_total,
+                    "load_equiv": frame.machine.load_equiv,
+                    "estimate": frame.machine.estimate,
                 },
                 "processes": [
                     {
@@ -2505,8 +2550,11 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runner_count": frame.runner_count,
                 "sampler_cpu_ms": frame.sampler_cpu_ms,
                 "monitor_rss_delta": frame.monitor_rss_delta,
+                "load_level": asdict(frame.load_level) if frame.load_level is not None else None,
             }
         )
+    if isinstance(frame, HostLoadLinesFrame):
+        return _encode_payload({"kind": HostFrameKind.LOAD_LINES.value, **asdict(frame)})
     if isinstance(frame, HostResourceSamplingFrame):
         return _encode_payload(
             {
@@ -3126,6 +3174,15 @@ def _decode_known_host_frame(
             return _decode_post_bind_hook_result(msg)
         case HostFrameKind.RESOURCE_SNAPSHOT:
             return _decode_resource_snapshot(msg)
+        case HostFrameKind.LOAD_LINES:
+            lines = LoadLines(
+                _required_float(msg, "heavy"),
+                _required_float(msg, "new_session"),
+                _required_float(msg, "mem_pct"),
+            )
+            return HostLoadLinesFrame(
+                lines.heavy, lines.new_session, lines.mem_pct, _required_int(msg, "revision")
+            )
         case HostFrameKind.RESOURCE_SAMPLING:
             return _decode_resource_sampling(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
@@ -3214,6 +3271,11 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         ),
         startup_required=(
             _required_bool(msg, "startup_required") if "startup_required" in msg else False
+        ),
+        retain_runner_ids=(
+            _optional_str_list(msg, "retain_runner_ids")
+            if msg.get("retain_runner_ids") is not None
+            else None
         ),
     )
 
@@ -4213,6 +4275,7 @@ def _decode_resource_snapshot(msg: _JsonObject) -> HostResourceSnapshotFrame:
         runner_count=_required_int(msg, "runner_count"),
         sampler_cpu_ms=_required_float(msg, "sampler_cpu_ms"),
         monitor_rss_delta=_required_int(msg, "monitor_rss_delta"),
+        load_level=_decode_load_level(msg),
     )
 
 
@@ -4228,6 +4291,40 @@ def _decode_resource_machine(msg: _JsonObject) -> ResourceMachine:
         disk_used=_required_int(machine, "disk_used"),
         disk_total=_required_int(machine, "disk_total"),
         load1=_optional_nullable_float(machine, "load1"),
+        cpu_count=_required_int(machine, "cpu_count")
+        if machine.get("cpu_count") is not None
+        else None,
+        load_per_core=_optional_nullable_float(machine, "load_per_core"),
+        swap_used=_required_int(machine, "swap_used")
+        if machine.get("swap_used") is not None
+        else None,
+        swap_total=_required_int(machine, "swap_total")
+        if machine.get("swap_total") is not None
+        else None,
+        load_equiv=_optional_nullable_float(machine, "load_equiv"),
+        estimate=_required_bool(machine, "estimate") if "estimate" in machine else False,
+    )
+
+
+def _decode_load_level(msg: _JsonObject) -> LoadLevelReport | None:
+    raw = msg.get("load_level")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("load_level must be an object")
+    level = _required_str(raw, "level")
+    if level not in LEVELS:
+        raise ValueError(f"Unsupported load level: {level}")
+    reason = _optional_nullable_str(raw, "reason")
+    if reason not in (None, "load", "memory"):
+        raise ValueError(f"Unsupported load reason: {reason}")
+    return LoadLevelReport(
+        level=cast(Level, level),
+        reason=reason,
+        since=_required_str(raw, "since"),
+        heavy=_required_float(raw, "heavy"),
+        new_session=_required_float(raw, "new_session"),
+        lines_synced_at=_optional_nullable_str(raw, "lines_synced_at"),
     )
 
 

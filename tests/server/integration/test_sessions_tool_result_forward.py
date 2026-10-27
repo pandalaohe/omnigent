@@ -75,25 +75,25 @@ async def auth_client(auth_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 class _CaptureRunnerClient:
     """Stub runner client that records the forwarded POST and returns 202."""
 
-    def __init__(self, calls: list[dict[str, Any]]) -> None:
+    def __init__(self, calls: list[dict[str, Any]], status: int = 202) -> None:
         self._calls = calls
+        self._status = status
 
     async def post(self, path: str, *, json: dict[str, Any], **_: Any) -> Any:
         self._calls.append({"path": path, "json": json})
 
-        class _Resp:
-            status_code = 202
-
-        return _Resp()
+        return httpx.Response(self._status)
 
     async def get(self, *_: Any, **__: Any) -> Any:
         raise NotImplementedError
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [202, 503])
 async def test_function_call_output_forwarded_as_tool_result(
     auth_client: httpx.AsyncClient,
     db_uri: str,
+    status: int,
 ) -> None:
     """The route translates function_call_output → tool_result verbatim.
 
@@ -107,7 +107,7 @@ async def test_function_call_output_forwarded_as_tool_result(
     calls: list[dict[str, Any]] = []
 
     async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
-        return _CaptureRunnerClient(calls)
+        return _CaptureRunnerClient(calls, status)
 
     session_id = _seed_session(db_uri)
     # Use unittest.mock.patch so cleanup is guaranteed even when pytest-asyncio
@@ -123,7 +123,7 @@ async def test_function_call_output_forwarded_as_tool_result(
         )
 
     assert resp.status_code == 202, resp.text
-    assert resp.json() == {"queued": True, "item_id": "call_x"}
+    assert resp.json() == {"queued": True, "item_id": "call_x", "forwarded": status < 400}
     # Exactly one forward, carrying the tool_result wire shape the scaffold
     # resolves a parked tool on — NOT the raw function_call_output.
     assert len(calls) == 1

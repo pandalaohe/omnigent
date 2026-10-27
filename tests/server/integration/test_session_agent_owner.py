@@ -194,6 +194,7 @@ async def test_only_owner_can_change_codex_approval_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Approval mode needs ownership even in a mixed PATCH on a Codex session."""
+    from omnigent.codex_approval_modes import decode_codex_permission_observation
     from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
 
     forwarded: list[dict[str, object]] = []
@@ -202,7 +203,7 @@ async def test_only_owner_can_change_codex_approval_mode(
         forwarded.append(event)
         return _RunnerForwardResult(200, '{"approval_mode": "full-access"}')
 
-    # Isolate the external runner; keep authorization, persistence, and mode confirmation real.
+    # Isolate the runner while keeping authorization, persistence and control receipts real.
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._forward_session_change_to_runner", forward
     )
@@ -233,6 +234,7 @@ async def test_only_owner_can_change_codex_approval_mode(
     after_denial = await auth_client.get(path, headers=owner)
     assert after_denial.status_code == 200, after_denial.text
     assert after_denial.json()["title"] == original_title
+    assert after_denial.json()["labels"] == before.json()["labels"]
     assert "omnigent.codex_native.approval_mode" not in after_denial.json()["labels"]
     assert forwarded == []
 
@@ -243,7 +245,16 @@ async def test_only_owner_can_change_codex_approval_mode(
     )
     assert owner_update.status_code == 200, owner_update.text
     assert owner_update.json()["title"] == "Owner title"
-    assert owner_update.json()["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+    labels = owner_update.json()["labels"]
+    assert labels["omnigent.codex_native.approval_mode"] == "unknown"
+    observation_key = "omnigent.codex_native.permission_observation"
+    receipt = decode_codex_permission_observation(labels[observation_key])
+    assert receipt.source == "application-receipt"
+    assert receipt.requested_mode == "full-access"
+    assert receipt.mode == "unknown"
+    saved = await auth_client.get(path, headers=owner)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["labels"][observation_key] == labels[observation_key]
     assert forwarded == [{"type": "codex_approval_mode_change", "approval_mode": "full-access"}]
 
 

@@ -25,6 +25,7 @@ from omnigent.db.db_models import current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.attachment_archive_cleanup import SUMMARY_FILENAME
 from omnigent.server.auth import AuthProvider
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.system_status import DEFAULT_HEALTH_CHECK_PROMPT, SystemStatusHub
 from omnigent.stores.host_store import HostStore
@@ -52,6 +53,7 @@ def create_system_status_router(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     host_versions: Callable[[list[str]], dict[str, str]] | None = None,
+    host_registry: HostRegistry | None = None,
 ) -> APIRouter:
     """Build the system-status router (mounted under ``/v1``).
 
@@ -62,6 +64,7 @@ def create_system_status_router(
         mode) treats every caller as an admin.
     :param host_versions: Resolves ``{host_id: version}`` for the brief's
         host lines; a host absent from the map reads ``unknown``.
+    :param host_registry: Live connections receiving changed effective load lines.
     """
     router = APIRouter()
 
@@ -186,7 +189,7 @@ def create_system_status_router(
                 "Admin privileges required to manage system-status settings",
                 code=ErrorCode.FORBIDDEN,
             )
-        settings = _hub(request).get_settings()
+        settings = _hub(request).get_settings(current_workspace_id())
         return {**settings, "default_health_check_prompt": DEFAULT_HEALTH_CHECK_PROMPT}
 
     @router.put("/system/settings")
@@ -201,11 +204,24 @@ def create_system_status_router(
                 code=ErrorCode.FORBIDDEN,
             )
         hub = _hub(request)
+        previous = hub.load_lines_frames()
         try:
-            settings = hub.put_settings(payload)
+            settings = hub.put_settings(payload, workspace_id=current_workspace_id())
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if host_registry is not None:
+            for (workspace_id, host_id), frame in hub.load_lines_frames().items():
+                old = previous.get((workspace_id, host_id))
+                if old is None or (old.heavy, old.new_session, old.mem_pct) != (
+                    frame.heavy,
+                    frame.new_session,
+                    frame.mem_pct,
+                ):
+                    hub.push_load_lines(host_registry, workspace_id, host_id)
         await hub.save_settings(settings)
-        return {**settings, "default_health_check_prompt": DEFAULT_HEALTH_CHECK_PROMPT}
+        return {
+            **hub.get_settings(current_workspace_id()),
+            "default_health_check_prompt": DEFAULT_HEALTH_CHECK_PROMPT,
+        }
 
     return router

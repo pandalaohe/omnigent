@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from typing import Literal
 
 from omnigent.harnesses.codex_native.side_chat import KEEP_WARM_THREAD_SOURCE
+from omnigent.host.recovery import RuntimeObservation
 from omnigent.startup_protocol import (
     ContextKeyV2,
     ContextOperationV2,
     ContextRecordV2,
+    ContextWorkBindingV2,
     ScopeKeyV2,
     SourceEvidenceV2,
     UnresolvedContextV2,
@@ -31,6 +34,104 @@ class CodexContextInventory:
         self._domains: dict[ContextKeyV2, str] = {}
         self._overflow = False
         self._gaps: set[str] = set()
+        self._work_member: tuple[str, str] | None = None
+        self._work_current: Callable[[], bool] = lambda: False
+        self._active_work: dict[ContextKeyV2, set[object]] = {}
+        self._terminal_work: dict[ContextKeyV2, set[str]] = {}
+
+    def bind_work_member(
+        self, runtime_id: str, generation: str, current: Callable[[], bool]
+    ) -> None:
+        """Bind a backend observation lifetime, never a reservation or capacity unit."""
+        self._work_member = (runtime_id, generation)
+        self._work_current = current
+
+    def _work_context(self, thread_id: object) -> ContextKeyV2 | None:
+        matches = [
+            record.key
+            for record in self.records.values()
+            if record.vendor_id is not None and record.vendor_id.value == thread_id
+        ]
+        if len(matches) != 1:
+            self._gaps.add("context_work_thread_ambiguous_or_unobserved")
+            return None
+        return matches[0]
+
+    def begin_work(
+        self, method: str, params: Mapping[str, object], *, current: Callable[[], bool]
+    ) -> Callable[[Mapping[str, object] | None], None]:
+        if method != "turn/start" or not self._work_current() or not current():
+            return lambda _response: None
+        key = self._work_context(params.get("threadId"))
+        if key is None or self._overflow:
+            return lambda _response: None
+        active = self._active_work.setdefault(key, set())
+        if (
+            sum(map(len, self._active_work.values())) + sum(map(len, self._terminal_work.values()))
+            >= 1000
+        ):
+            self._gaps.add("context_work_history_budget")
+            return lambda _response: None
+        pending = object()
+        active.add(pending)
+
+        def finish(response: Mapping[str, object] | None) -> None:
+            result = response.get("result") if response else None
+            turn = result.get("turn") if isinstance(result, Mapping) else None
+            turn_id = turn.get("id") if isinstance(turn, Mapping) else None
+            if (
+                not current()
+                or not self._work_current()
+                or not isinstance(turn_id, str)
+                or not 0 < len(turn_id) <= 256
+            ):
+                self._gaps.add("context_work_outcome_unconfirmed")
+                return
+            active.discard(pending)
+            if turn_id not in self._terminal_work.get(key, ()):
+                active.add(turn_id)
+
+        return finish
+
+    def observe_work_event(self, method: object, params: object) -> None:
+        if (
+            not isinstance(method, str)
+            or method not in {"turn/started", "turn/completed", "turn/failed"}
+            or not isinstance(params, Mapping)
+            or not self._work_current()
+        ):
+            return
+        key = self._work_context(params.get("threadId"))
+        turn = params.get("turn")
+        turn_id = turn.get("id") if isinstance(turn, Mapping) else params.get("turnId")
+        if key is None or not isinstance(turn_id, str) or not 0 < len(turn_id) <= 256:
+            self._gaps.add("context_work_event_unbound")
+            return
+        if (
+            sum(map(len, self._active_work.values())) + sum(map(len, self._terminal_work.values()))
+            >= 1000
+        ):
+            self._gaps.add("context_work_history_budget")
+            return
+        active = self._active_work.setdefault(key, set())
+        terminal = self._terminal_work.setdefault(key, set())
+        if method == "turn/started":
+            if turn_id not in terminal:
+                active.add(turn_id)
+        else:
+            terminal.add(turn_id)
+            active.discard(turn_id)
+
+    def work_observation(self) -> RuntimeObservation | None:
+        """Positive observed work only; unobserved work and descendants stay unknown."""
+        if self._work_member is None or not self._work_current() or self._overflow:
+            return None
+        return RuntimeObservation(
+            runtime_id=self._work_member[0],
+            generation=self._work_member[1],
+            observed_at=time.time(),
+            live_turn=any(self._active_work.values()),
+        )
 
     def begin(
         self,
@@ -178,6 +279,22 @@ class CodexContextInventory:
         }
         if self._overflow:
             gaps.add("context_history_budget")
+        bindings = None
+        if not self._overflow and self._work_member is not None and self._work_current():
+            bindings = tuple(
+                ContextWorkBindingV2(
+                    context=record.key,
+                    runtime_id=self._work_member[0],
+                    generation=self._work_member[1],
+                )
+                for record in self.records.values()
+                if record.lifecycle == "live"
+                and record.vendor_id is not None
+                and sum(other.vendor_id == record.vendor_id for other in self.records.values())
+                == 1
+            )
+            if len(bindings) != len(self.records):
+                gaps.add("context_work_association_incomplete")
         return SourceEvidenceV2(
             scope=scope,
             producer_incarnation=self.incarnation,
@@ -188,6 +305,6 @@ class CodexContextInventory:
             context_revision=None,
             work_revision=None,
             revision_authority="observation_only",
-            age_upper_bound_s=None,
-            work_bindings=None,
+            age_upper_bound_s=0.0 if bindings is not None else None,
+            work_bindings=bindings,
         )

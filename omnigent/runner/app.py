@@ -222,8 +222,8 @@ from omnigent.runner.subagent_work import (
     _SubagentWorkEntry,
     _succeeded_parents,
     _truncate_child_preview,
+    entry_owes_parent_wake,
     get_subagent_work,
-    is_codex_native_subagent_wrapper,
     latest_wake_eligible_subagent_work,
     list_subagent_work,
     mark_subagent_work_started,
@@ -636,6 +636,10 @@ class _SessionSnapshot:
     :param wrapper_label: The child's ``omnigent.wrapper`` label, e.g.
         ``"claude-code-native-ui-subagent"``. ``None`` when the server
         recorded no label or the fetch failed.
+    :param labels: The child's full session labels, e.g.
+        ``{"omnigent.codex_native.collab_tool_call_id": "call_7f"}``. ``None``
+        when the server recorded none or the fetch failed. Read for the
+        codex-native origin discriminator only.
     :param host_id: The session's own host binding, e.g. ``"host_a1b2c3"``.
         ``None`` for a hostless row (a co-located child on its parent's
         runner); the REST loader fills it, the init envelope does not carry
@@ -651,6 +655,7 @@ class _SessionSnapshot:
     parent_session_id: str | None = None
     agent_name: str | None = None
     wrapper_label: str | None = None
+    labels: Mapping[str, object] | None = None
     worktree: str | None = None
     host_id: str | None = None
 
@@ -2044,6 +2049,15 @@ def create_runner_app(
     """
     import hmac
 
+    from omnigent.startup_observation import context as observation_context
+    from omnigent.startup_observation import (
+        loaded_build,
+        mark_observation_endpoint,
+        runtime_fingerprint,
+        wait_for_permission_confirmation,
+    )
+
+    observation_build = loaded_build()
     app = FastAPI(title="omnigent-runner")
     startup_admission = StartupAdmission(
         server_client,
@@ -2347,6 +2361,7 @@ def create_runner_app(
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     permission_tiers = PermissionTierRuntime()
+    permission_startup_errors: dict[str, str] = {}
     app.state.permission_tiers = permission_tiers
     _permission_tier_targets: dict[str, tuple[str, str]] = {}
     _permission_tier_commits: dict[str, tuple[str, str, int]] = {}
@@ -3117,6 +3132,7 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             wrapper_label: str | None = None
+            labels: dict[str, object] | None = None
             host_id: str | None = None
             try:
                 resp = await server_client.get(
@@ -3147,7 +3163,10 @@ def create_runner_app(
                     raw_host_id = body.get("host_id")
                     if isinstance(raw_host_id, str) and raw_host_id:
                         host_id = raw_host_id
-                    wrapper_label = wrapper_label_from_labels(body.get("labels"))
+                    raw_labels = body.get("labels")
+                    wrapper_label = wrapper_label_from_labels(raw_labels)
+                    if isinstance(raw_labels, Mapping):
+                        labels = dict(raw_labels)
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -3160,6 +3179,7 @@ def create_runner_app(
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
                 wrapper_label=wrapper_label,
+                labels=labels,
                 worktree=worktree,
                 host_id=host_id,
             )
@@ -3299,6 +3319,7 @@ def create_runner_app(
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
+            labels=snapshot.labels,
             worktree=snapshot.worktree,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
@@ -3863,6 +3884,11 @@ def create_runner_app(
                     session_id,
                     server_client=server_client,
                     optional_labels=init_context.labels,
+                    existing_bridge_dir=(
+                        binding.bridge_dir
+                        if (binding := _session_comment_relays.get(session_id))
+                        else None
+                    ),
                 )
             # An agent-cache reset acknowledged while init awaited retired
             # this entry; skip the memoization so the reset wins. Init still
@@ -3899,6 +3925,7 @@ def create_runner_app(
 
         try:
             permission_tiers.fence_start(init_context.envelope, harness_name)
+            permission_startup_errors.pop(session_id, None)
         except PermissionTierEpochChanged:
             return JSONResponse(
                 status_code=409,
@@ -4300,6 +4327,8 @@ def create_runner_app(
                         _publish_terminal_pending(_publish_event, session_id, False)
 
         permission_tier_ack: str | None = None
+        from omnigent.inner.pi_settings import PiSdkLoaderUnavailableError
+
         try:
             if harness_name == "pi":
                 from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
@@ -4328,6 +4357,11 @@ def create_runner_app(
                     or not isinstance(bootstrap_body, dict)
                     or bootstrap_body.get("installed") is not True
                 ):
+                    if (
+                        isinstance(bootstrap_body, dict)
+                        and bootstrap_body.get("error") == PiSdkLoaderUnavailableError.code
+                    ):
+                        raise PiSdkLoaderUnavailableError
                     raise ValueError("Pi permission extension did not acknowledge startup")
             elif harness_name == "pi-native" and init_context.envelope is not None:
                 from omnigent.harnesses.pi_native.bridge import (
@@ -4351,11 +4385,17 @@ def create_runner_app(
             if permission_state is not None:
                 permission_tier_ack = PERMISSION_TIERS_CAPABILITY
         except (OSError, ValueError, TypeError, ImportError, httpx.HTTPError, TimeoutError) as exc:
+            detail = (
+                str(PiSdkLoaderUnavailableError())
+                if isinstance(exc, PiSdkLoaderUnavailableError)
+                else _client_safe_error_detail(exc, context="permission tier startup")
+            )
+            permission_startup_errors[session_id] = detail
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "permission_tier_unavailable",
-                    "detail": _client_safe_error_detail(exc, context="permission tier startup"),
+                    "detail": detail,
                 },
             )
 
@@ -4702,6 +4742,43 @@ def create_runner_app(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @app.get("/v1/sessions/{session_id}/startup-observation/v1")
+    async def get_permission_startup_observation_v1(session_id: str) -> JSONResponse:
+        # No init, cache eviction, liveness probe, rebind or process-manager call.
+        cached = _session_init_envelopes.get(session_id)
+        envelope = cached[1] if cached is not None else None
+        state = permission_tiers.state(session_id)
+        binding = observation_context(
+            envelope.snapshot if envelope is not None else None,
+            session_id=session_id,
+            agent_id=envelope.agent_id if envelope is not None else None,
+        )
+        state_context_matches = (
+            state is not None
+            and envelope is not None
+            and state.session_id == session_id
+            and state.host_id == (binding["host_id"] or f"runner:{binding['runner_id']}")
+            and state.workspace == (binding["worktree"] or binding["workspace"])
+        )
+        return JSONResponse(
+            content={
+                "id": session_id,
+                "startup_observation": {
+                    "schema_version": 1,
+                    "binding": binding,
+                    "init_fresh": cached is not None
+                    and time.monotonic() - cached[0] <= _SESSION_INIT_ENVELOPE_TTL_SECONDS,
+                    "state_context_matches": state_context_matches,
+                    "expected_runner_revision": state.revision if state is not None else None,
+                    "harness": permission_tiers.observation_harness(session_id),
+                    "permission_runtime_fingerprint": runtime_fingerprint(PERMISSION_RUNTIME_ID),
+                    "loaded_build": observation_build,
+                },
+            }
+        )
+
+    mark_observation_endpoint(get_permission_startup_observation_v1)
 
     @app.get("/v1/sessions/{session_id}")
     async def get_session(session_id: str) -> JSONResponse:
@@ -5655,7 +5732,19 @@ def create_runner_app(
                     timeout=30.0,
                 )
                 succession.raise_for_status()
-                if succession.json().get("status") != "done":
+                succession_body = succession.json()
+                if succession_body.get("status") == "retired":
+                    if require_label:
+                        _logger.warning("Pi succession retired for session %s", conv_id)
+                        return False
+                    raise HTTPException(
+                        409,
+                        {
+                            "error": "succession_retired",
+                            "successor_id": succession_body.get("successor_id"),
+                        },
+                    )
+                if succession_body.get("status") != "done":
                     return False
                 await process_manager.release(conv_id)
                 return True
@@ -5667,6 +5756,8 @@ def create_runner_app(
                     extra={"session_id": conv_id},
                 )
                 return False
+        except HTTPException:
+            raise
         except Exception:  # noqa: BLE001 - no retry; the label remains for a manual clear.
             _logger.warning(
                 "Pending rotation /clear failed for session %s",
@@ -5775,7 +5866,10 @@ def create_runner_app(
             return
         message = approval["params"].get("message") or "Approval required"
         policy_name = approval["params"].get("policy_name")
-        config_file = await _native_cost_popup_config_file(conv_id, harness)
+        try:
+            config_file = await _native_cost_popup_config_file(conv_id, harness)
+        except HTTPException:
+            return
         await asyncio.to_thread(
             launch_cost_popup,
             socket_path,
@@ -6574,12 +6668,17 @@ def create_runner_app(
             from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
 
             try:
-                resolved_dir = bridge_dir or await _claude_prompt_bridge_dir(session_id)
+                resolved_dir = bridge_dir
                 while _session_message_buffers.get(session_id):
                     if session_id in _active_turns:
                         return
                     try:
+                        if resolved_dir is None:
+                            resolved_dir = await _claude_prompt_bridge_dir(session_id)
                         pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
+                    except HTTPException:
+                        await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+                        continue
                     except (OSError, RuntimeError):
                         _logger.warning(
                             "Failed to inspect pending Claude prompt for %s; retrying",
@@ -6627,7 +6726,11 @@ def create_runner_app(
                 _rewake_parent_if_inbox_stranded(session_id)
                 return
 
-            pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            try:
+                pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            except HTTPException:
+                _start_claude_prompt_waiter(session_id)
+                return
             # Stop/delete can clear the queue while the pane inspection is in flight.
             buf = _session_message_buffers.get(session_id)
             if not buf:
@@ -6737,23 +6840,30 @@ def create_runner_app(
             )
 
     def _owes_parent_wake(entry: _SubagentWorkEntry) -> bool:
-        """Tool-dispatched children owe a wake; Codex internal threads do not."""
-        codex_internal = is_codex_native_subagent_wrapper(entry.wrapper_label) or (
-            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
-        )
-        return not codex_internal or entry.registered_by is not None
+        """Whether this child's terminal result owes its parent an inbox wake."""
+        return entry_owes_parent_wake(entry, _session_harness_name(entry.parent_session_id))
 
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
-        # A codex-native internal thread (a /side side chat, or one codex
-        # spawned) is consumed inside the parent's own app-server, so waking
-        # the parent would inject a notice into a chat the user is reading.
-        # The skip is narrowed to entries no Omnigent tool registered — the
-        # wrapper label path and forwarder/recovery entries — so a real
-        # sys_session_create / sys_session_send child of a Codex mother
-        # still wakes it (D12).
+        # A codex-native internal thread (a /side side chat) is consumed inside
+        # the parent's own app-server, so waking the parent would inject a
+        # notice into a chat the user is reading. A delegated Codex job is the
+        # exception: its labels prove Codex spawned it for work the mother asked
+        # for, and an Omnigent-registered child of a Codex mother still wakes it
+        # (D12). ``entry_owes_parent_wake`` is the whole rule; the stranded-wake
+        # rescue calls it too.
         if not _owes_parent_wake(entry):
+            _logger.info(
+                "Sub-agent wake suppressed for parent=%s child=%s wrapper=%s origin=%s "
+                "registered_by=%s (Codex-internal thread)",
+                entry.parent_session_id,
+                entry.child_session_id,
+                entry.wrapper_label,
+                entry.native_origin,
+                entry.registered_by,
+                extra={"session_id": runner_primary_session_id()},
+            )
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
@@ -6859,7 +6969,8 @@ def create_runner_app(
         if drained:
             return
         latest = latest_wake_eligible_subagent_work(
-            [entry for entry in list_subagent_work(parent_session_id) if _owes_parent_wake(entry)]
+            list_subagent_work(parent_session_id),
+            _session_harness_name(parent_session_id),
         )
         if latest is None:
             last_async = _last_async_result.get(parent_session_id)
@@ -6885,7 +6996,7 @@ def create_runner_app(
                 if inbox is None or inbox.empty():
                     continue
                 latest = latest_wake_eligible_subagent_work(
-                    [entry for entry in list_subagent_work(parent_id) if _owes_parent_wake(entry)]
+                    list_subagent_work(parent_id), _session_harness_name(parent_id)
                 )
                 if latest is None:
                     last_async = _last_async_result.get(parent_id)
@@ -7404,14 +7515,23 @@ def create_runner_app(
 
         bridge_dir = known_bridge_dir
         if bridge_dir is None:
-            bridge_dir = bridge_dir_for_bridge_id(
-                await _claude_native_bridge_id_with_optional_labels(
+            try:
+                resolved_bridge_id = await _claude_native_bridge_id_with_optional_labels(
                     server_client=server_client,
                     session_id=session_id,
                     session_labels=session_labels,
                 )
-                or session_id
-            )
+            except HTTPException:
+                current = _session_comment_relays.get(session_id)
+                if current is None:
+                    raise
+                bridge_dir = current.bridge_dir
+                _logger.warning(
+                    "Session labels unavailable; keeping the current native relay directory",
+                    extra={"session_id": session_id},
+                )
+            else:
+                bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
         skill_registry = await _session_skill_registry(session_id, spec_entry)
 
         # Re-read after the awaits above: a concurrent caller may have
@@ -7684,26 +7804,37 @@ def create_runner_app(
                     _cli_runtime_lifecycle.mark_live(conv)
                     permission_state = permission_tiers.state(conv)
                     if permission_state is not None:
-                        deadline = asyncio.get_running_loop().time() + 20.0
-                        session_path = f"/v1/sessions/{urllib.parse.quote(conv, safe='')}"
-                        while True:
-                            response = await server_client.get(
-                                session_path,
-                                headers={"X-Omnigent-Permission-Tiers": "1"},
+                        if permission_state.status != "ready":
+                            raise RuntimeError(
+                                permission_startup_errors.get(conv)
+                                or "Permission tier is unavailable: " + permission_state.status
                             )
-                            if response.status_code == 200:
-                                snapshot = response.json()
-                                if (
-                                    isinstance(snapshot, dict)
-                                    and snapshot.get("permission_tier_state") == "ready"
-                                    and snapshot.get("permission_tier_revision")
-                                    == permission_state.revision
-                                    and snapshot.get("permission_tiers_capability") is True
-                                ):
-                                    break
-                            if asyncio.get_running_loop().time() >= deadline:
-                                raise RuntimeError("Permission tier was not confirmed before turn")
-                            await asyncio.sleep(0.1)
+                        observed_init = _session_init_envelopes.get(conv)
+                        await wait_for_permission_confirmation(
+                            server_client,
+                            f"/v1/sessions/{urllib.parse.quote(conv, safe='')}",
+                            permission_state.revision,
+                            {
+                                "session_id": conv,
+                                "host_id": permission_state.host_id,
+                                "workspace": permission_state.workspace,
+                                "init_binding": observation_context(
+                                    observed_init[1].snapshot
+                                    if observed_init is not None
+                                    else None,
+                                    session_id=conv,
+                                    agent_id=(
+                                        observed_init[1].agent_id
+                                        if observed_init is not None
+                                        else None
+                                    ),
+                                ),
+                                "permission_runtime_fingerprint": runtime_fingerprint(
+                                    PERMISSION_RUNTIME_ID
+                                ),
+                                "loaded_build": observation_build,
+                            },
+                        )
                     await _run_turn_bg_setup_and_stream(msg_body, conv, handed_off)
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the
@@ -8164,6 +8295,7 @@ def create_runner_app(
             codex_labels = await _session_labels_for_runner_spawn(
                 server_client=server_client,
                 session_id=conv,
+                required=True,
             )
             speed = codex_labels.get(SPEED_TIER_LABEL_KEY)
             if valid_speed_tier(speed, "codex-native"):
@@ -8197,6 +8329,7 @@ def create_runner_app(
             antigravity_labels = await _session_labels_for_runner_spawn(
                 server_client=server_client,
                 session_id=conv,
+                required=True,
             )
             antigravity_bid = antigravity_labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
@@ -8413,6 +8546,11 @@ def create_runner_app(
                 conv_id,
                 server_client=server_client,
                 optional_labels=startup_labels,
+                existing_bridge_dir=(
+                    binding.bridge_dir
+                    if (binding := _session_comment_relays.get(conv_id))
+                    else None
+                ),
             )
 
         if dispatch is None:
@@ -10908,6 +11046,18 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "clear":
+            if _session_harness_name(conversation_id) == "pi-native":
+                return await _handle_codex_native_slash_command(
+                    conversation_id,
+                    "/new",
+                    error_code="pi_native_new_failed",
+                    context="pi-native new",
+                    terminal_name="pi",
+                )
+            if _session_harness_name(conversation_id) == "claude-native":
+                return await _handle_claude_native_clear(conversation_id)
+            if _session_harness_name(conversation_id) == "codex-native":
+                return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
             return Response(status_code=204)
@@ -11379,6 +11529,7 @@ def create_runner_app(
         _native_controls.handle_antigravity_native_effort_change
     )
     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
+    _handle_claude_native_clear = _native_controls.handle_claude_native_clear
     _handle_claude_native_compact = _native_controls.handle_claude_native_compact
     _handle_claude_native_cost_popup = _native_controls.handle_claude_native_cost_popup
     _handle_claude_native_effort_change = _native_controls.handle_claude_native_effort_change
@@ -11391,6 +11542,7 @@ def create_runner_app(
     _handle_codex_native_approval_mode_change = (
         _native_controls.handle_codex_native_approval_mode_change
     )
+    _handle_codex_native_clear = _native_controls.handle_codex_native_clear
     _handle_codex_native_compact = _native_controls.handle_codex_native_compact
     _handle_codex_native_cost_popup = _native_controls.handle_codex_native_cost_popup
     _handle_codex_native_plan_mode_change = _native_controls.handle_codex_native_plan_mode_change

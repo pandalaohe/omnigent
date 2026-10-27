@@ -94,7 +94,8 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     codex_app_server_diagnostic_env,
     report_capture_start_failure,
 )
-from omnigent.inner import _proc
+from omnigent.inner import _liveness_exec, _proc
+from omnigent.inner.codex_binary import CODEX_RUNTIME_BIN_ENV, snapshot_codex_binary
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     CODEX_AGENT_PID_CONFIG_KEY,
@@ -226,7 +227,7 @@ _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CodexModelDiscoveryProcess:
     """Short-lived Codex process plus its bounded stderr drain."""
 
@@ -235,6 +236,7 @@ class _CodexModelDiscoveryProcess:
     session_tag: str | None = None
     owner_lock: CodexNativeProcessOwnerLock | None = None
     process_group_id: int | None = None
+    liveness_fd: int | None = None
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:
@@ -1297,16 +1299,25 @@ class CodexAppServerClient:
     ) -> CodexMessage:
         inventory, owner_current = self._context_inventory, self._context_current
         connection = self._current_established_connection()
+
+        def current() -> bool:
+            return (
+                owner_current()
+                and connection is not None
+                and self._current_established_connection() is connection
+            )
+
+        finish_work = (
+            inventory.begin_work(method, params, current=current)
+            if inventory is not None
+            else lambda _response: None
+        )
         finish = (
             inventory.begin(
                 method,
                 params,
                 domain=inventory.incarnation,
-                current=lambda: (
-                    owner_current()
-                    and connection is not None
-                    and self._current_established_connection() is connection
-                ),
+                current=current,
                 provenance=context_provenance,
             )
             if inventory is not None
@@ -1316,8 +1327,10 @@ class CodexAppServerClient:
             response = await self._request_unobserved(method, params)
         except BaseException:
             finish(None)
+            finish_work(None)
             raise
         finish(response)
+        finish_work(response)
         return response
 
     async def _request_unobserved(self, method: str, params: CodexParams) -> CodexMessage:
@@ -1467,6 +1480,17 @@ class CodexAppServerClient:
                     and connection[2] is asyncio.current_task()
                 ):
                     self._resident_thread_started_revision += 1
+                connection = self._current_established_connection()
+                if (
+                    self._context_inventory is not None
+                    and self._context_current()
+                    and connection is not None
+                    and connection[1] is websocket
+                    and connection[2] is asyncio.current_task()
+                ):
+                    self._context_inventory.observe_work_event(
+                        message.get("method"), message.get("params")
+                    )
                 await self._events.put(message)
         finally:
             # Wake iter_events() consumers: no further events can arrive.
@@ -1620,21 +1644,40 @@ async def _start_codex_model_discovery_process(
         config_overrides=config_overrides,
     )
     owner_lock = acquire_codex_native_process_owner_lock()
+    read_fd: int | None = None
+    liveness_fd: int | None = None
     try:
+        spawn_argv = argv
+        if os.name == "posix":
+            read_fd, liveness_fd = os.pipe()
+            spawn_argv = [
+                sys.executable,
+                str(Path(_liveness_exec.__file__)),
+                "--liveness-fd",
+                str(read_fd),
+                codex_path,
+                *argv[1:],
+            ]
         process = await asyncio.create_subprocess_exec(
-            *argv,
+            *spawn_argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=str(cwd),
-            executable=codex_path,
+            executable=codex_path if read_fd is None else None,
+            pass_fds=() if read_fd is None else (read_fd,),
             **_proc.spawn_kwargs(),
         )
     except BaseException:
+        if liveness_fd is not None:
+            os.close(liveness_fd)
         if owner_lock is not None:
             owner_lock.close()
         raise
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
     process_group_id = _process_group_id(process)
     if owner_lock is not None:
         register_codex_native_process(
@@ -1654,6 +1697,7 @@ async def _start_codex_model_discovery_process(
         session_tag=session_tag,
         owner_lock=owner_lock,
         process_group_id=process_group_id,
+        liveness_fd=liveness_fd,
     )
 
 
@@ -1684,6 +1728,10 @@ async def _capture_codex_discovery_stderr_tail(
 async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryProcess) -> None:
     """Terminate a discovery process and finish draining its stderr pipe."""
     try:
+        if discovery.liveness_fd is not None:
+            liveness_fd, discovery.liveness_fd = discovery.liveness_fd, None
+            with contextlib.suppress(OSError):
+                os.close(liveness_fd)
         process = discovery.process
         if process.returncode is None:
             if os.name == "posix":
@@ -2417,6 +2465,26 @@ class CodexNativeAppServer:
                 and not self.process_exit_confirmed
             ),
         )
+        connection = client._current_established_connection()
+        self._context_inventory.bind_work_member(
+            incarnation,
+            str(generation),
+            lambda: (
+                client._context_current()
+                and connection is not None
+                and client._current_established_connection() is connection
+            ),
+        )
+
+    def context_work_snapshot_v2(self, session_id: str):
+        """One backend observation lifetime; it is not a reservation/capacity unit."""
+        source = self.context_source_v2(session_id)
+        observation = (
+            self._context_inventory.work_observation()
+            if self._context_inventory is not None
+            else None
+        )
+        return source, observation
 
     def context_source_v2(self, session_id: str) -> SourceEvidenceV2:
         inventory = self._context_inventory
@@ -2467,6 +2535,9 @@ class CodexNativeAppServer:
         :raises OmnigentError: ``WORKSPACE_MISSING`` when the session's working
             directory was removed, e.g. a deleted git worktree.
         """
+        self.codex_path = await asyncio.to_thread(
+            snapshot_codex_binary, self.codex_path, env=self.env
+        )
         if not self.cwd.is_dir():
             # Spawning in it would only fail with a bare ENOENT; name the cause.
             raise OmnigentError(
@@ -2495,7 +2566,11 @@ class CodexNativeAppServer:
         # (``None``) is treated as supported so a flaky probe never
         # silently disables enforcement — a genuine trust failure is then
         # caught below.
-        codex_version = await _codex_cli_version(self.codex_path)
+        codex_version = (
+            await _codex_cli_version(self.codex_path, env=self.env)
+            if CODEX_RUNTIME_BIN_ENV in self.env
+            else await _codex_cli_version(self.codex_path)
+        )
         self.codex_cli_version = codex_version
         policy_hooks_supported = (
             codex_version is None or codex_version >= _MIN_POLICY_HOOK_CODEX_VERSION
@@ -5222,7 +5297,13 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
         if key
-        in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
+        in {
+            "CODEX_HOME",
+            "DATABRICKS_HOST",
+            "DATABRICKS_CODEX_TOKEN",
+            "OTEL_RESOURCE_ATTRIBUTES",
+            CODEX_RUNTIME_BIN_ENV,
+        }
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
     if app_server.session_id:

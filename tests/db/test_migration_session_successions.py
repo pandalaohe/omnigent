@@ -57,3 +57,44 @@ def test_upgrade_creates_and_downgrade_drops_the_table(tmp_path: Path) -> None:
     finally:
         engine.dispose()
         clear_engine_cache()
+
+
+def test_deferred_runner_migration_preserves_existing_receipts(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'deferred.db'}"
+    engine = sa.create_engine(uri)
+    previous = "a42c20261022"
+    migration = "a48c20261026"
+    try:
+        _run(uri, engine, "upgrade", previous)
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO session_successions "
+                    "(workspace_id, id, old_id, new_id, phase, direct_ids, moved_ids, "
+                    "created_at, updated_at) "
+                    "VALUES (0, 'receipt', :old, :new, 'done', '[]', '[]', 1, 1)"
+                ),
+                {"old": bytes.fromhex("11" * 16), "new": bytes.fromhex("22" * 16)},
+            )
+        _run(uri, engine, "upgrade", migration)
+        columns = {
+            column["name"]: column
+            for column in sa.inspect(engine).get_columns("session_successions")
+        }
+        assert columns["deferred_runners"]["nullable"]
+        with engine.connect() as conn:
+            assert (
+                conn.execute(
+                    sa.text("SELECT deferred_runners FROM session_successions")
+                ).scalar_one()
+                is None
+            )
+        _run(uri, engine, "downgrade", previous)
+        with engine.connect() as conn:
+            assert (
+                conn.execute(sa.text("SELECT phase FROM session_successions")).scalar_one()
+                == "done"
+            )
+    finally:
+        engine.dispose()
+        clear_engine_cache()

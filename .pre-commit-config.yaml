@@ -22,7 +22,9 @@ repos:
       - id: pyrefly
         name: pyrefly
         language: system
-        entry: .venv/bin/pyrefly check
+        # Keep these globs in sync with project-includes in pyrefly.toml; the
+        # exclude mirrors the generated _build_info.py that .gitignore hides.
+        entry: .venv/bin/pyrefly check 'omnigent/**/*.py' 'omnigent/**/*.pyi' 'sdks/python-client/**/*.py' --project-excludes 'omnigent/_build_info.py'
         pass_filenames: false
         files: ^(omnigent/.*\.pyi?|sdks/python-client/.*\.py|pyproject\.toml|pyrefly\.toml|uv\.lock)$
 

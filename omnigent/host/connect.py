@@ -109,6 +109,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostLoadLinesFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -145,6 +146,7 @@ from omnigent.host.frames import (
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
     ImportSessionChunkingUnsupportedError,
+    LoadLevelReport,
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
@@ -160,6 +162,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
+from omnigent.host.load_level import FACTORY_LINES, LevelState, LoadLines, utc_iso
 from omnigent.host.maintenance import (
     HostMaintenanceJanitor,
     RunnerLogRunawayTracker,
@@ -237,6 +240,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.util.atomic_json import atomic_write_json
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -1369,6 +1373,13 @@ class HostProcess:
         self._resource_fast_until = 0.0
         self._resource_fast_interval_s = _RESOURCE_SNAPSHOT_FAST_INTERVAL_S
         self._resource_wake = asyncio.Event()
+        self._resource_updated = asyncio.Event()
+        self._resource_latest: str | None = None
+        self._load_state = LevelState()
+        self._load_lines = FACTORY_LINES
+        self._load_lines_revision = -1
+        self._load_lines_synced_at: str | None = None
+        self._load_report: LoadLevelReport | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -2245,6 +2256,7 @@ class HostProcess:
                 (rid, handle)
                 for rid, handle in self._runners.items()
                 if handle.session_id == frame.session_id
+                and rid not in (frame.retain_runner_ids or ())
             ]
             for rid, handle in superseded:
                 self._runners.pop(rid, None)
@@ -4608,6 +4620,9 @@ class HostProcess:
                 name="host-zygote-prestart",
             )
         backoff = _RECONNECT_BASE_S
+        resource_publisher = asyncio.create_task(
+            self._resource_publisher_loop(), name="host-load-publisher"
+        )
         try:
             # Warm the pre-launch model listings once for the host lifetime so a
             # first picker or launch can use the shared store instead of waiting
@@ -4780,6 +4795,9 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            resource_publisher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await resource_publisher
             model_options_prewarm_task = self._model_options_prewarm_task
             if model_options_prewarm_task is not None:
                 model_options_prewarm_task.cancel()
@@ -4916,6 +4934,7 @@ class HostProcess:
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        self._load_lines_revision = -1
         url = self._tunnel_url()
         # Credential discovery may invoke the Databricks CLI. Keep it off the
         # event loop so startup capability discovery can make progress at the
@@ -5475,45 +5494,56 @@ class HostProcess:
         self,
         ws: websockets.asyncio.client.ClientConnection,
     ) -> None:
-        """Send periodic ``host.resource_snapshot`` frames to the server.
-
-        Sampling runs on one dedicated executor thread; this task only copies
-        the runner / zygote state on the event loop, awaits the job, and
-        sends. The job stores its own thread CPU in the sampler for the NEXT
-        frame, so each frame carries the previous sample's measured cost.
-        """
+        """Transmit daemon-owned samples while this tunnel is connected."""
+        if self._resource_latest is not None:
+            await ws.send(self._resource_latest)
         while True:
-            # Wait out the current cadence, or wake early when the server
-            # grants a sampling lease so a viewer gets data without waiting.
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    self._resource_wake.wait(), timeout=self._resource_interval()
-                )
-                self._resource_wake.clear()
+            await self._resource_updated.wait()
+            self._resource_updated.clear()
+            if self._resource_latest is not None:
+                await ws.send(self._resource_latest)
+
+    async def _resource_publisher_loop(self) -> None:
+        """Sample for the daemon lifetime, including tunnel reconnection waits."""
+        next_publish = 0.0
+        while True:
             try:
                 runner_sessions = {
                     handle.proc.pid: handle.session_id for handle in self._runners.values()
                 }
                 zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
                 interval = self._resource_interval()
-                text = await asyncio.get_running_loop().run_in_executor(
+                publish = time.monotonic() >= next_publish
+                if publish:
+                    next_publish = time.monotonic() + 60
+                self._resource_latest = await asyncio.get_running_loop().run_in_executor(
                     self._resource_executor_for(),
                     self._sample_resource_snapshot,
                     runner_sessions,
                     zygote_pid,
                     int(interval),
+                    publish,
                 )
-                await ws.send(text)
+                self._resource_updated.set()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - advisory telemetry must not stop sampling
                 _logger.debug("Host resource snapshot sampling failed", exc_info=True)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._resource_wake.wait(),
+                    timeout=min(
+                        self._resource_interval(), max(0, next_publish - time.monotonic())
+                    ),
+                )
+            self._resource_wake.clear()
 
     def _sample_resource_snapshot(
         self,
         runner_sessions: dict[int, str | None],
         zygote_pid: int | None,
         interval_s: int,
+        publish: bool = False,
     ) -> str:
         """Sample + encode on the sampler thread; returns the encoded frame."""
         sampler = self._resource_sampler
@@ -5526,6 +5556,53 @@ class HostProcess:
             zygote_pid=zygote_pid,
             interval_s=interval_s,
         )
+        now = time.time()
+        machine = frame.machine
+        mem_pct = machine.mem_used / machine.mem_total * 100 if machine.mem_total else None
+        if mem_pct is not None:
+            self._load_state.add_sample(now, sampler.sample_load_per_core, mem_pct)
+        lines = self._load_lines
+        level, reason = self._load_state.step(now, lines)
+        previous = self._load_report
+        report = LoadLevelReport(
+            level=level,
+            reason=reason,
+            since=previous.since
+            if previous and (previous.level, previous.reason) == (level, reason)
+            else utc_iso(now),
+            heavy=lines.heavy,
+            new_session=lines.new_session,
+            lines_synced_at=self._load_lines_synced_at,
+        )
+        self._load_report = report
+        frame.load_level = report
+        if publish:
+            path = data_dir() / "run" / "host-load.json"
+            try:
+                atomic_write_json(
+                    path,
+                    {
+                        "schema": 1,
+                        "host_id": self._identity.host_id,
+                        "sampled_at": utc_iso(now),
+                        "reading_at": utc_iso(self._load_state.reading_at)
+                        if self._load_state.reading_at is not None
+                        else None,
+                        "cpu_count": machine.cpu_count,
+                        "load1": machine.load1,
+                        "load_equiv": machine.load_equiv,
+                        "estimate": machine.estimate,
+                        "load_per_core": machine.load_per_core,
+                        "mem_pct": mem_pct,
+                        "level": report.level,
+                        "reason": report.reason,
+                        "lines": {"heavy": report.heavy, "new_session": report.new_session},
+                        "lines_synced_at": report.lines_synced_at,
+                        "path": str(path),
+                    },
+                )
+            except OSError:
+                _logger.debug("Host load file publication failed", exc_info=True)
         text = encode_host_frame(frame)
         sampler.last_cpu_ms = (time.thread_time() - started) * 1000.0
         return text
@@ -5857,6 +5934,12 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await self._send_text(ws, encode_host_frame(options_result))
+        elif isinstance(frame, HostLoadLinesFrame):
+            # Revisions are scoped to a server connection, reset on reconnect.
+            if frame.revision >= self._load_lines_revision:
+                self._load_lines = LoadLines(frame.heavy, frame.new_session, frame.mem_pct)
+                self._load_lines_revision = frame.revision
+                self._load_lines_synced_at = utc_iso(time.time())
         elif isinstance(frame, HostResourceSamplingFrame):
             # A viewer is watching: hold the fast cadence for the lease. Only a
             # slow -> fast switch wakes the sampler; renewals every 10 s must not
