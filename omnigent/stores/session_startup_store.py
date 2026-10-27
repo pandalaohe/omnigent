@@ -29,6 +29,7 @@ from omnigent.entities.session_startup import (
     StartupReceipt,
     StartupReleaseReceipt,
     StartupReleaseRequest,
+    StartupReleaseTarget,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 
@@ -523,6 +524,7 @@ class SessionStartupStore:
             return SessionStartupStatus.model_validate(
                 {
                     "id": row.id,
+                    "host_id": row.host_id,
                     "attempt_id": row.attempt_id,
                     "input_id": row.input_id,
                     "state": "uncertain" if stuck else row.state,
@@ -893,6 +895,75 @@ class SessionStartupStore:
             return changed
 
         return run_write_transaction(self._session, "expire_startup_observation_budget", write)
+
+    def release_candidates(
+        self, host_id: str, *, actor_user_id: str | None, actor_account_generation: str | None
+    ) -> tuple[str | None, list[StartupReleaseTarget]]:
+        """Read only the caller's current stuck attempts; observations grant no authority."""
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+
+        with self._session("preview_owned_startup_releases") as db:
+            if actor_user_id is not None:
+                require_active_account(db, actor_user_id, generation=actor_account_generation)
+            host = db.get(SqlHost, (current_workspace_id(), host_id))
+            if host is None or host.deleted_at is not None:
+                raise OmnigentError("Host not found", code=ErrorCode.NOT_FOUND)
+            if (host.user_id, host.account_generation) != (
+                actor_user_id if actor_user_id is not None else RESERVED_USER_LOCAL,
+                actor_account_generation,
+            ):
+                raise OmnigentError("Host owner required", code=ErrorCode.FORBIDDEN)
+            budget = db.get(SqlStartupBudget, f"{current_workspace_id()}:{host_id}")
+            query = (
+                select(SqlSessionStartup, SqlConversationMetadata)
+                .join(
+                    SqlConversationMetadata,
+                    (SqlConversationMetadata.workspace_id == SqlSessionStartup.workspace_id)
+                    & (SqlConversationMetadata.id == SqlSessionStartup.session_id),
+                )
+                .where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == host_id,
+                    SqlSessionStartup.admission_mode == "startup_only",
+                    SqlSessionStartup.occupied.is_(True),
+                    SqlSessionStartup.release_receipt.is_(None),
+                    SqlSessionStartup.state.in_(
+                        ("starting", "verifying", "uncertain", "blocked", "cancelling")
+                    ),
+                    SqlSessionStartup.admitted_at <= now_epoch() - 180,
+                    SqlSessionStartup.attempt_id.is_not(None),
+                )
+            )
+            if actor_user_id is not None:
+                query = query.where(
+                    select(SqlSessionPermission.conversation_id)
+                    .where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.conversation_id == SqlSessionStartup.session_id,
+                        SqlSessionPermission.user_id == actor_user_id,
+                        SqlSessionPermission.level == LEVEL_OWNER,
+                    )
+                    .exists()
+                )
+            targets = []
+            for row, binding in db.execute(query.order_by(SqlSessionStartup.sequence)):
+                current = self._current_session_row(db, row.session_id)
+                if current is None or current.id != row.id:
+                    continue
+                targets.append(
+                    StartupReleaseTarget(
+                        startup_id=row.id,
+                        session_id=row.session_id,
+                        attempt_id=row.attempt_id,
+                        input_id=row.input_id,
+                        runtime_id=row.runtime_id,
+                        host_generation=row.host_generation,
+                        runner_id=binding.runner_id,
+                    )
+                )
+                if len(targets) == 2:
+                    break
+            return budget.current_generation if budget else None, targets
 
     def release_startups(
         self,

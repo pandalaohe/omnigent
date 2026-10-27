@@ -7,6 +7,8 @@ from fastapi import APIRouter, HTTPException, Request
 from omnigent.db.account_authority import AccountAuthority, account_generation
 from omnigent.entities.session_startup import (
     SessionStartupStatus,
+    StartupReleasePreview,
+    StartupReleasePreviewItem,
     StartupReleaseReceipt,
     StartupReleaseRequest,
 )
@@ -14,7 +16,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import session_stream
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
+from omnigent.server.routes._auth_helpers import (
+    get_user_id,
+    require_access_and_level,
+    require_user,
+)
 from omnigent.server.schemas import CancelStartupRequest, SessionStartupEvent
 from omnigent.server.startup_observations import accept_observation
 from omnigent.startup_protocol import STARTUP_QUEUE_V1, StartupBoundaryClaim, StartupObservation
@@ -30,6 +36,70 @@ def register_startup_routes(
     permission_store: PermissionStore | None,
     auth_provider: AuthProvider | None,
 ) -> None:
+    @router.get("/hosts/{host_id}/startup-releases", response_model=StartupReleasePreview)
+    async def preview_startup_releases(request: Request, host_id: str) -> StartupReleasePreview:
+        user_id = require_user(request, auth_provider)
+        admission = getattr(request.app.state, "startup_admission", None)
+        store = getattr(request.app.state, "startup_store", None)
+        if admission is None or store is None or admission.policy.mode != "startup_only":
+            raise HTTPException(409, "Startup-only queue is not enabled")
+        generation, targets = await asyncio.to_thread(
+            store.release_candidates,
+            host_id,
+            actor_user_id=user_id,
+            actor_account_generation=account_generation(user_id) if user_id is not None else None,
+        )
+        from omnigent.server.resident_inventory import read_host_session_work_inventory_v2
+
+        hosts = request.app.state.host_registry
+        conn = hosts.get(host_id)
+        inventory = (
+            await read_host_session_work_inventory_v2(
+                hosts,
+                conn,
+                conversation_store,
+                getattr(request.app.state, "runner_router", None),
+                getattr(request.app.state, "runner_session_initializer", None),
+            )
+            if conn is not None and targets
+            else None
+        )
+        working = set()
+        if inventory is not None:
+            for session in inventory.sessions:
+                if session.runner is not None and any(
+                    row.live_turn
+                    or row.live_tool
+                    or row.background_job
+                    or row.protected_interaction
+                    for row in session.runner.inventory.observations
+                ):
+                    working.add(session.session_id)
+        # Re-read ownership after the optional, bounded observation; POST still checks exact targets.
+        current_generation, current_targets = await asyncio.to_thread(
+            store.release_candidates,
+            host_id,
+            actor_user_id=user_id,
+            actor_account_generation=account_generation(user_id) if user_id is not None else None,
+        )
+        items = []
+        for target in targets if generation == current_generation else []:
+            if target not in current_targets:
+                continue
+            conversation = await asyncio.to_thread(
+                conversation_store.get_conversation, target.session_id
+            )
+            if conversation is None or conversation.archived:
+                continue
+            items.append(
+                StartupReleasePreviewItem(
+                    target=target,
+                    title=conversation.title,
+                    work_hint="working" if target.session_id in working else "unknown",
+                )
+            )
+        return StartupReleasePreview(current_host_generation=current_generation, targets=items)
+
     @router.post("/hosts/{host_id}/startup-releases", response_model=StartupReleaseReceipt)
     async def release_startups(
         request: Request, host_id: str, body: StartupReleaseRequest

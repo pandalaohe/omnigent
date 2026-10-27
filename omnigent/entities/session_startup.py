@@ -33,6 +33,7 @@ class SessionStartupStatus(BaseModel):
     """Permission-filtered presentation carries no provider identity or input payload."""
 
     id: str
+    host_id: str | None = None
     attempt_id: str | None
     input_id: str | None
     state: StartupState
@@ -95,3 +96,14 @@ class StartupReleaseReceipt(StartupReleaseRequest):
     actor_user_id: str | None
     actor_account_generation: str | None
     released_at: int
+
+
+class StartupReleasePreviewItem(BaseModel):
+    target: StartupReleaseTarget
+    title: str | None
+    work_hint: Literal["working", "unknown"] = "unknown"
+
+
+class StartupReleasePreview(BaseModel):
+    current_host_generation: str | None
+    targets: list[StartupReleasePreviewItem]

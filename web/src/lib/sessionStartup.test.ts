@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { sessionStartupFromWire } from "./sessionStartup";
 import { parseEvent } from "./sse";
-import { cancelStartup } from "./sessionsApi";
+import { cancelStartup, getStartupReleasePreview, releaseStartupSlots } from "./sessionsApi";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -35,6 +35,7 @@ describe("sessionStartupFromWire", () => {
   it("preserves independent evidence and the server's elapsed duration", () => {
     expect(sessionStartupFromWire(wire)).toEqual({
       id: "startup",
+      hostId: null,
       attemptId: "attempt",
       inputId: "input",
       state: "verifying",
@@ -111,5 +112,69 @@ describe("sessionStartupFromWire", () => {
       conversationId: "session",
       startup: null,
     });
+  });
+  it.each(["opened", "operator_released"])(
+    "keeps %s in REST and SSE without inventing work",
+    (state) => {
+      const raw = { ...wire, state, host_id: "target-host", can_cancel: false };
+      expect(sessionStartupFromWire(raw)).toMatchObject({
+        state,
+        hostId: "target-host",
+        evidence: { workStarted: false },
+      });
+      expect(
+        parseEvent("session.startup", { conversation_id: "session", startup: raw }),
+      ).toMatchObject({
+        type: "session_startup",
+        startup: { state, hostId: "target-host" },
+      });
+    },
+  );
+  it("rejects an invalid host identity", () => {
+    expect(sessionStartupFromWire({ ...wire, host_id: 1 })).toBeNull();
+  });
+  it("validates the preview and submits only its exact targets", async () => {
+    const target = {
+      startup_id: "a".repeat(32),
+      session_id: "b".repeat(32),
+      attempt_id: "c".repeat(32),
+      input_id: null,
+      runtime_id: null,
+      host_generation: "old",
+      runner_id: null,
+    };
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            current_host_generation: "current",
+            targets: [{ target, title: "Draft", work_hint: "unknown" }],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(new Response("{}"));
+    vi.stubGlobal("fetch", fetch);
+    const preview = await getStartupReleasePreview("host/id");
+    await releaseStartupSlots("host/id", {
+      current_host_generation: preview.current_host_generation!,
+      targets: preview.targets.map((item) => item.target),
+    });
+    expect(fetch.mock.calls[0][0]).toContain("/v1/hosts/host%2Fid/startup-releases");
+    expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual({
+      current_host_generation: "current",
+      targets: [target],
+    });
+    fetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          current_host_generation: "current",
+          targets: [
+            { target: { ...target, attempt_id: null }, title: "Draft", work_hint: "unknown" },
+          ],
+        }),
+      ),
+    );
+    await expect(getStartupReleasePreview("host")).rejects.toThrow();
   });
 });

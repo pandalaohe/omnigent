@@ -6,6 +6,8 @@ import { Conversation, ConversationContent } from "@/components/ai-elements/conv
 import { CodeBlockSendContext } from "@/components/ai-elements/message";
 import type { AnyBlock, BlockContext, ElicitationBlock } from "@/lib/blocks";
 import { MemoryRouter } from "react-router-dom";
+import * as sessionsApi from "@/lib/sessionsApi";
+import type { Session, SessionStartupStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import type { Virtualizer } from "@tanstack/react-virtual";
 import {
@@ -25,6 +27,7 @@ const sendCodeBlock = vi.fn(() => true);
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   useChatStore.setState({
     blocks: [],
     conversationId: null,
@@ -237,7 +240,7 @@ const pendingElicitation: ElicitationBlock = {
   response: null,
 };
 
-function renderTranscript(blocks: ElicitationBlock[]) {
+function renderTranscript(blocks: ElicitationBlock[], canCancelStartup = false) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   useChatStore.setState({
     blocks,
@@ -260,6 +263,7 @@ function renderTranscript(blocks: ElicitationBlock[]) {
         showsWorking
         agentsError={null}
         sandboxLaunching={false}
+        canCancelStartup={canCancelStartup}
         conversationId="conv-test"
         scrollToBottomOnSessionOpen={false}
         openedConversationIdRef={{ current: null }}
@@ -301,8 +305,113 @@ it("shows the created session waiting for its first message in the transcript", 
   });
 
   expect(screen.getByRole("status")).toHaveTextContent("Waiting for your first message");
-  expect(screen.getByRole("status")).toHaveTextContent("5s since host admission");
+  expect(screen.getByRole("status")).toHaveTextContent("5s since opening began");
+  act(() =>
+    useChatStore.setState({
+      startup: {
+        ...useChatStore.getState().startup!,
+        state: "operator_released",
+        canCancel: false,
+      },
+    }),
+  );
+  expect(screen.getByText("Startup slot released", { exact: true })).toBeVisible();
+  act(() =>
+    useChatStore.setState({ startup: { ...useChatStore.getState().startup!, state: "opened" } }),
+  );
+  expect(screen.getByText("Session opened", { exact: true })).toBeVisible();
 });
+
+const waitingStartup: SessionStartupStatus = {
+  id: "startup",
+  hostId: "host",
+  attemptId: null,
+  inputId: null,
+  state: "waiting_input",
+  reason: null,
+  elapsedSeconds: 180,
+  admittedElapsedSeconds: 180,
+  queuePositionEstimate: null,
+  canCancel: false,
+  evidence: { runtimeReady: false, toolsReady: false, inputAccepted: false, workStarted: false },
+};
+
+it.each(["opened", "operator_released"] as const)(
+  "keeps actual work visible after the startup reaches %s",
+  (state) => {
+    renderTranscript([]);
+    act(() => useChatStore.setState({ startup: { ...waitingStartup, state } }));
+    expect(
+      screen.getByText(state === "opened" ? "Session opened" : "Startup slot released", {
+        exact: true,
+      }),
+    ).toBeVisible();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  },
+);
+
+it.each([false, true])(
+  "refreshes release state without overwriting a newer SSE (newer event: %s)",
+  async (newerEvent) => {
+    const queued: SessionStartupStatus = {
+      ...waitingStartup,
+      state: "queued",
+      unconfirmedStartups: 2,
+    };
+    vi.spyOn(sessionsApi, "getStartupReleasePreview").mockResolvedValue({
+      current_host_generation: "generation",
+      targets: [
+        {
+          title: "Earlier session",
+          work_hint: "unknown",
+          target: {
+            startup_id: "a".repeat(32),
+            session_id: "b".repeat(32),
+            attempt_id: "c".repeat(32),
+            input_id: null,
+            runtime_id: null,
+            host_generation: "generation",
+            runner_id: null,
+          },
+        },
+      ],
+    });
+    vi.spyOn(sessionsApi, "releaseStartupSlots").mockResolvedValue(undefined);
+    let finish!: (session: Session) => void;
+    vi.spyOn(sessionsApi, "getSession").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderTranscript([], true);
+    act(() => useChatStore.setState({ startup: queued }));
+    fireEvent.click(screen.getByRole("button", { name: "Review stuck starts" }));
+    const confirm = await screen.findByRole("button", { name: "Release startup slots" });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    fireEvent.click(confirm);
+    await waitFor(() => expect(sessionsApi.getSession).toHaveBeenCalledOnce());
+    if (newerEvent)
+      act(() => useChatStore.setState({ startup: { ...waitingStartup, state: "opened" } }));
+    await act(async () =>
+      finish({
+        id: "conv-test",
+        title: null,
+        status: "running",
+        agentId: "agent",
+        agentName: null,
+        createdAt: 0,
+        items: [],
+        permissionLevel: null,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+        startup: { ...waitingStartup, state: "starting" },
+      }),
+    );
+    expect(useChatStore.getState().startup?.state).toBe(newerEvent ? "opened" : "starting");
+  },
+);
 
 function blockCtx(overrides: Partial<BlockContext> = {}): BlockContext {
   return {

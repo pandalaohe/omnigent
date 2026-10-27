@@ -100,6 +100,34 @@ def release(store, host, request):
 
 
 @pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+@pytest.mark.parametrize("preparing", [False, True])
+def test_release_candidates_keep_exact_current_attempt_and_binding(
+    request, monkeypatch, store_fixture, preparing
+):
+    conversations = request.getfixturevalue(store_fixture)
+    store, _conv, _item, attempt, body = opening(
+        conversations, preparing_from=(None, None) if preparing else None
+    )
+    monkeypatch.setattr(
+        "omnigent.stores.session_startup_store.now_epoch", lambda: attempt.admitted_at + 179
+    )
+    assert store.release_candidates(
+        attempt.host_id, actor_user_id=None, actor_account_generation=None
+    ) == ("generation", [])
+    monkeypatch.setattr(
+        "omnigent.stores.session_startup_store.now_epoch", lambda: attempt.admitted_at + 180
+    )
+    assert store.release_candidates(
+        attempt.host_id, actor_user_id=None, actor_account_generation=None
+    ) == ("generation", body.targets)
+    assert store.presentation(attempt.session_id).host_id == attempt.host_id
+    release(store, attempt.host_id, body)
+    assert store.release_candidates(
+        attempt.host_id, actor_user_id=None, actor_account_generation=None
+    ) == ("generation", [])
+
+
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
 @pytest.mark.parametrize("previous_host", [None, "old"])
 @pytest.mark.parametrize("moved", [False, True])
 def test_preparing_release_owns_attempt_without_a_bound_target_host(

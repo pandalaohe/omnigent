@@ -24,7 +24,7 @@ import {
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { handleSessionEvent, useChatStore } from "@/store/chatStore";
-import { cancelStartup } from "@/lib/sessionsApi";
+import { cancelStartup, getSession } from "@/lib/sessionsApi";
 import { SessionStartupIndicator } from "./SessionStartupIndicator";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
@@ -159,6 +159,8 @@ function TranscriptImpl({
       "cancelling",
       "ready_empty",
       "waiting_input",
+      "opened",
+      "operator_released",
     ].includes(startup.state);
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
@@ -350,7 +352,8 @@ function TranscriptImpl({
   }, [nav]);
 
   const showWorkingIndicator =
-    !startupVisible && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+    (!startupVisible || startup?.state === "opened" || startup?.state === "operator_released") &&
+    shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
@@ -400,6 +403,21 @@ function TranscriptImpl({
                 key={startup.id}
                 startup={startup}
                 readOnly={!canCancelStartup}
+                hostId={hostId}
+                onReleased={async () => {
+                  const startupBeforeFetch = useChatStore.getState().startup;
+                  const session = await getSession(conversationId);
+                  const current = useChatStore.getState();
+                  if (
+                    current.conversationId === conversationId &&
+                    current.startup === startupBeforeFetch
+                  ) {
+                    handleSessionEvent(
+                      { type: "session_startup", conversationId, startup: session.startup ?? null },
+                      conversationId,
+                    );
+                  }
+                }}
                 onCancel={async (id, attemptId) => {
                   const status = await cancelStartup(conversationId, id, attemptId);
                   handleSessionEvent(

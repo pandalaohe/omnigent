@@ -659,6 +659,7 @@ export interface SandboxStatus {
 /** Durable startup state; readiness flags come from correlated runtime receipts. */
 export interface SessionStartupStatus {
   id: string;
+  hostId?: string | null;
   attemptId: string | null;
   inputId: string | null;
   state:
@@ -671,6 +672,8 @@ export interface SessionStartupStatus {
     | "ready_empty"
     | "waiting_input"
     | "working"
+    | "opened"
+    | "operator_released"
     | "cancelled"
     | "stopped"
     | "command_completed";

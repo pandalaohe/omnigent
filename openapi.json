@@ -11002,6 +11002,17 @@
           "evidence": {
             "$ref": "#/components/schemas/StartupEvidence"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -12027,6 +12038,67 @@
           }
         },
         "title": "StartupInputOptions",
+        "type": "object"
+      },
+      "StartupReleasePreview": {
+        "properties": {
+          "current_host_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Host Generation"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/StartupReleasePreviewItem"
+            },
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current_host_generation",
+          "targets"
+        ],
+        "title": "StartupReleasePreview",
+        "type": "object"
+      },
+      "StartupReleasePreviewItem": {
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/StartupReleaseTarget"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "work_hint": {
+            "default": "unknown",
+            "enum": [
+              "working",
+              "unknown"
+            ],
+            "title": "Work Hint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "title"
+        ],
+        "title": "StartupReleasePreviewItem",
         "type": "object"
       },
       "StartupReleaseReceipt": {
@@ -16532,6 +16604,46 @@
       }
     },
     "/v1/hosts/{host_id}/startup-releases": {
+      "get": {
+        "operationId": "preview_startup_releases_v1_hosts__host_id__startup_releases_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupReleasePreview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Startup Releases",
+        "tags": [
+          "sessions"
+        ]
+      },
       "post": {
         "operationId": "release_startups_v1_hosts__host_id__startup_releases_post",
         "parameters": [

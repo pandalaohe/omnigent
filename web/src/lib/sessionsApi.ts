@@ -21,6 +21,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { parseBackgroundTasks } from "./sse";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import { sessionStartupFromWire } from "./sessionStartup";
+import { z } from "zod";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -36,6 +37,59 @@ import type {
 } from "./types";
 
 export { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
+
+const startupReleaseTarget = z.object({
+  startup_id: z.string().regex(/^[0-9a-f]{32}$/),
+  session_id: z.string().regex(/^[0-9a-f]{32}$/),
+  attempt_id: z.string().regex(/^[0-9a-f]{32}$/),
+  input_id: z
+    .string()
+    .regex(/^[0-9a-f]{32}$/)
+    .nullable(),
+  runtime_id: z.string().max(128).nullable(),
+  host_generation: z.string().max(128).nullable(),
+  runner_id: z.string().max(128).nullable(),
+});
+const startupReleasePreview = z.object({
+  current_host_generation: z.string().min(1).max(128).nullable(),
+  targets: z
+    .array(
+      z.object({
+        target: startupReleaseTarget,
+        title: z.string().nullable(),
+        work_hint: z.enum(["working", "unknown"]),
+      }),
+    )
+    .max(2),
+});
+export type StartupReleasePreview = z.infer<typeof startupReleasePreview>;
+export interface StartupReleaseRequest {
+  current_host_generation: string;
+  targets: z.infer<typeof startupReleaseTarget>[];
+}
+
+export async function getStartupReleasePreview(hostId: string): Promise<StartupReleasePreview> {
+  const response = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/startup-releases`,
+  );
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return startupReleasePreview.parse(await response.json());
+}
+
+export async function releaseStartupSlots(
+  hostId: string,
+  request: StartupReleaseRequest,
+): Promise<void> {
+  const response = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/startup-releases`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    },
+  );
+  if (!response.ok) throw await apiErrorFromResponse(response);
+}
 
 /**
  * Broadcast when the user's own interaction (a user message or an approval)

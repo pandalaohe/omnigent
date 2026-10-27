@@ -23,13 +23,14 @@ from tests.stores.test_startup_operator_release import opening, release
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("actor", ["owner", "manager", "other-owner"])
+@pytest.mark.parametrize("session_level", [3, 4])
 async def test_release_endpoint_requires_host_and_session_owner(
-    auth_app, auth_client, db_uri, monkeypatch, actor
+    auth_app, auth_client, db_uri, monkeypatch, actor, session_level
 ):
     conversations = SqlAlchemyConversationStore(db_uri)
     startups, conv, item, attempt, body = opening(conversations)
     permissions = SqlAlchemyPermissionStore(db_uri)
-    for user, level in (("owner", 4), ("manager", 3), ("other-owner", 4)):
+    for user, level in (("owner", session_level), ("manager", 3), ("other-owner", 4)):
         permissions.ensure_user(f"{user}@example.test")
         permissions.grant(f"{user}@example.test", conv.id, level)
     HostStore(db_uri).upsert_on_connect(
@@ -49,10 +50,22 @@ async def test_release_endpoint_requires_host_and_session_owner(
         "omnigent.stores.session_startup_store.now_epoch", lambda: attempt.admitted_at + 180
     )
     route = f"/v1/hosts/{conv.host_id}/startup-releases"
-    response = await auth_client.post(
-        route, json=body.model_dump(), headers={"X-Forwarded-Email": f"{actor}@example.test"}
-    )
+    headers = {"X-Forwarded-Email": f"{actor}@example.test"}
+    before = startups.get(attempt.id)
+    preview = await auth_client.get(route, headers=headers)
     if actor != "owner":
+        assert preview.status_code == 403, preview.text
+    else:
+        assert preview.status_code == 200, preview.text
+        expected = (
+            [{"target": body.targets[0].model_dump(), "title": conv.title, "work_hint": "unknown"}]
+            if session_level == 4
+            else []
+        )
+        assert preview.json() == {"current_host_generation": "generation", "targets": expected}
+    assert startups.get(attempt.id) == before
+    response = await auth_client.post(route, json=body.model_dump(), headers=headers)
+    if actor != "owner" or session_level != 4:
         assert response.status_code == 403, response.text
         assert startups.get(attempt.id).occupied
     else:
@@ -63,8 +76,69 @@ async def test_release_endpoint_requires_host_and_session_owner(
         assert duplicate.json() == response.json()
         assert startups.get(attempt.id).state == "operator_released"
         assert conversations.get_item(conv.id, item.id).status == "in_progress"
+        assert (await auth_client.get(route, headers=headers)).json()["targets"] == []
     await admission.shutdown()
     await auth_app.state.startup_inputs.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hint", ["working", "unknown"])
+async def test_preview_hints_do_not_veto_targets_or_expose_archived_sessions(
+    app, client, db_uri, monkeypatch, hint
+):
+    conversations, startups, hosts, conn, conv, _item, ref, _runner = _startup(
+        app, db_uri, mode="startup_only"
+    )
+    HostStore(db_uri).upsert_on_connect(conn.host_id, "sample-host", "local")
+    app.state.startup_inputs = ManagedStartupInputs(conversations, hosts)
+    admission = StartupAdmission(
+        startups, conversations, hosts, StartupAdmissionPolicy(None, None, 2, "startup_only")
+    )
+    admission.bind(app)
+    observation = SimpleNamespace(
+        live_turn=True, live_tool=False, background_job=False, protected_interaction=False
+    )
+    inventory = SimpleNamespace(
+        sessions=[
+            SimpleNamespace(
+                session_id=conv.id,
+                runner=SimpleNamespace(inventory=SimpleNamespace(observations=[observation])),
+            )
+        ]
+    )
+    read = AsyncMock(return_value=inventory if hint == "working" else None)
+    monkeypatch.setattr(
+        "omnigent.server.resident_inventory.read_host_session_work_inventory_v2", read
+    )
+    attempt = startups.get(ref.startup_id)
+    monkeypatch.setattr(
+        "omnigent.stores.session_startup_store.now_epoch", lambda: attempt.admitted_at + 179
+    )
+    route = f"/v1/hosts/{conn.host_id}/startup-releases"
+    assert (await client.get(route)).json()["targets"] == []
+    read.assert_not_awaited()
+    monkeypatch.setattr(
+        "omnigent.stores.session_startup_store.now_epoch", lambda: attempt.admitted_at + 180
+    )
+    response = await client.get(route)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert len(preview["targets"]) == 1
+    assert preview["targets"][0]["work_hint"] == hint
+    conversations.update_conversation(conv.id, archived=True)
+    assert (await client.get(route)).json()["targets"] == []
+    conversations.update_conversation(conv.id, archived=False)
+    response = await client.post(
+        route,
+        json={
+            "current_host_generation": preview["current_host_generation"],
+            "targets": [item["target"] for item in preview["targets"]],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert startups.get(attempt.id).state == "operator_released"
+    await admission.shutdown()
+    await app.state.startup_inputs.shutdown()
 
 
 @pytest.mark.asyncio
