@@ -2813,7 +2813,11 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Links" testId="settings-group-links">
           <ArtifactSharingSettings />
-          {supportsBrowser() && <OpenLinksInAppControl />}
+          {supportsBrowser() && (
+            <div className="mt-4 border-t border-border pt-4">
+              <OpenLinksInAppControl />
+            </div>
+          )}
         </SettingsGroup>
         {browserLoginBridge() && (
           <SettingsGroup title="In-app browser" testId="settings-group-browser-login">
