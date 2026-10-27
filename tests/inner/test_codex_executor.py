@@ -9883,7 +9883,18 @@ async def test_codex_thread_start_workspace_profile(
 
 
 @pytest.mark.parametrize(
-    "gate", ["open", "private-default", "windows", "unknown", "old", "non-repo", "error"]
+    "gate",
+    [
+        "open",
+        "private-default",
+        "windows",
+        "windows-unknown",
+        "windows-probe-error",
+        "unknown",
+        "old",
+        "non-repo",
+        "error",
+    ],
 )
 async def test_codex_spawn_workspace_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate: str, caplog: pytest.LogCaptureFixture
@@ -9912,10 +9923,23 @@ async def test_codex_spawn_workspace_profile(
         "prepare_codex_worker",
         lambda **kw: CodexWorkerLaunch(launch_path="/fixture/codex", sandboxed=False),
     )
-    if gate == "windows":
+    windows = gate.startswith("windows")
+    if windows:
         monkeypatch.setattr(module, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
-    version = None if gate == "unknown" else (0, 138, 9) if gate == "old" else (0, 139, 0)
+    if gate == "windows":
+        (workspace / ".git" / "config.worktree").touch()
+    version = (
+        None
+        if gate in {"unknown", "windows-unknown"}
+        else (0, 138, 9)
+        if gate == "old"
+        else (0, 163, 0)
+        if gate == "windows"
+        else (0, 139, 0)
+    )
     probe = AsyncMock(return_value=version)
+    if gate == "windows-probe-error":
+        probe.side_effect = OSError("version probe unavailable")
     monkeypatch.setattr(module, "_codex_cli_version", probe)
     original = module.codex_workspace_profile
     main_thread = threading.get_ident()
@@ -9924,8 +9948,14 @@ async def test_codex_spawn_workspace_profile(
         assert threading.get_ident() != main_thread
         assert kwargs["launch_args"] == ()
         assert kwargs["server_overrides"] == ["sandbox_workspace_write.network_access=false"]
+        assert kwargs["windows_sdk"] == windows
         if gate == "error":
             raise RuntimeError("profile discovery failed")
+        if gate == "windows":
+            from omnigent.harnesses.codex_native import launch_args
+
+            with patch.object(launch_args, "os", SimpleNamespace(**{**vars(os), "name": "nt"})):
+                return original(*args, **kwargs)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(module, "codex_workspace_profile", build)
@@ -9940,7 +9970,7 @@ async def test_codex_spawn_workspace_profile(
     )
     with pytest.raises(RuntimeError, match="stop before worker spawn"):
         await session.start()
-    assert probe.await_count == (0 if gate in {"windows", "non-repo"} else 1)
+    assert probe.await_count == (0 if gate == "non-repo" else 1)
     argv = list(spawn.await_args.args)
     baseline = [
         "/fixture/codex",
@@ -9948,7 +9978,7 @@ async def test_codex_spawn_workspace_profile(
         "-c",
         "sandbox_workspace_write.network_access=false",
     ]
-    if gate == "open":
+    if gate in {"open", "windows"}:
         assert session._workspace_profile is not None
         assert session._workspace_profile_cwd == workspace.resolve()
         overrides = session._workspace_profile.config_overrides
@@ -9959,6 +9989,15 @@ async def test_codex_spawn_workspace_profile(
         assert argv == baseline
     if gate == "error":
         assert "Failed to build Codex workspace permission profile" in caplog.text
+    if gate in {"windows-unknown", "windows-probe-error"}:
+        warnings = [
+            record.getMessage() for record in caplog.records if record.levelname == "WARNING"
+        ]
+        assert warnings == [
+            "Codex Windows workspace permission profile disabled: Codex version is unavailable"
+            if gate == "windows-unknown"
+            else "Failed to probe Codex permission profile support"
+        ]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="workspace profiles require POSIX")

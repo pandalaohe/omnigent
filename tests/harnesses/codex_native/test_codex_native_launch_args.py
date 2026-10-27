@@ -1,6 +1,7 @@
 """Codex remote-resume compatibility for CLI spellings and user profiles."""
 
 import ntpath
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -885,7 +886,7 @@ def profile_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     "linked,subdirectory", [(False, False), (True, False), (False, True), (True, True)]
 )
 @pytest.mark.parametrize("extra_root", [None, "ancestor", "common", "unrelated", "alias"])
-@pytest.mark.parametrize("platform", ["darwin", "linux"])
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
 def test_workspace_profile_repository_entries(
     profile_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -897,6 +898,11 @@ def test_workspace_profile_repository_entries(
     import subprocess
 
     monkeypatch.setattr(launch_args, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(
+        launch_args,
+        "os",
+        SimpleNamespace(**{**vars(os), "name": "nt" if platform == "win32" else "posix"}),
+    )
     repo = profile_repo.resolve()
     workspace = repo
     common = repo / ".git"
@@ -939,7 +945,7 @@ def test_workspace_profile_repository_entries(
         if extra_root == "alias":
             root.symlink_to(repo, target_is_directory=True)
         roots.append(str(root))
-        if extra_root != "unrelated":
+        if extra_root != "unrelated" and platform != "win32":
             del expected[str(common / "worktrees")]
             del expected[str(common / "modules")]
         if extra_root != "common":
@@ -947,12 +953,17 @@ def test_workspace_profile_repository_entries(
     cache = profile_repo.parent / "Library" / "Caches" / "ms-playwright"
     if platform == "darwin":
         expected[str(cache)] = "write"
+    if platform == "win32":
+        (common / "config.worktree").touch()
+        if linked:
+            (own / "config.worktree").touch()
     profile = launch_args.codex_workspace_profile(
         workspace,
         launch_args=["--approve-for-me"],
         server_overrides=[],
         private_config={"sandbox_workspace_write": {"writable_roots": roots}},
-        codex_version=(0, 162, 1),
+        codex_version=(0, 163, 0),
+        windows_sdk=platform == "win32",
     )
     assert profile is not None
     assert profile.profile_id == "omnigent-workspace"
@@ -966,6 +977,96 @@ def test_workspace_profile_repository_entries(
         "permissions.omnigent-workspace.filesystem": expected,
         "default_permissions": "omnigent-workspace",
     }
+
+
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize(
+    "guard,reason",
+    [
+        ("open", None),
+        ("disabled-extension", None),
+        ("extension", "extensions.worktreeConfig is enabled"),
+        ("invalid-extension", "common worktreeConfig could not be read"),
+        ("gitmodules", "repository has submodules"),
+        ("modules", "repository has submodules"),
+        ("missing-common-config", "a protected Git path is missing"),
+        ("missing-hooks", "a protected Git path is missing"),
+        ("missing-common-worktree-config", "a protected Git path is missing"),
+        ("missing-own-worktree-config", "a protected Git path is missing"),
+        ("old-version", "unsupported platform or Codex version"),
+        ("custom-profile", "a custom permission profile is configured"),
+    ],
+)
+def test_windows_sdk_workspace_profile_guards(
+    profile_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    linked: bool,
+    guard: str,
+    reason: str | None,
+) -> None:
+    import subprocess
+
+    repo = profile_repo.resolve()
+    common = repo / ".git"
+    workspace = repo
+    own = common
+    if linked:
+        workspace = repo.parent / "linked"
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-b", "linked", str(workspace)],
+            check=True,
+            capture_output=True,
+        )
+        own = common / "worktrees" / "linked"
+    (common / "config.worktree").touch()
+    (own / "config.worktree").touch()
+    if guard in {"extension", "disabled-extension", "invalid-extension"}:
+        value = {
+            "extension": "true",
+            "disabled-extension": "false",
+            "invalid-extension": "invalid",
+        }[guard]
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "--file",
+                str(common / "config"),
+                "extensions.worktreeConfig",
+                value,
+            ],
+            check=True,
+            capture_output=True,
+        )
+    elif guard == "gitmodules":
+        (workspace / ".gitmodules").touch()
+    elif guard == "modules":
+        (common / "modules").mkdir()
+    elif guard == "missing-common-config":
+        (common / "config").unlink()
+    elif guard == "missing-hooks":
+        (common / "hooks").rename(common / "unused-hooks")
+    elif guard == "missing-common-worktree-config":
+        (common / "config.worktree").unlink()
+    elif guard == "missing-own-worktree-config":
+        (own / "config.worktree").unlink()
+    monkeypatch.setattr(launch_args, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    profile = launch_args.codex_workspace_profile(
+        workspace,
+        launch_args=(),
+        server_overrides=(),
+        private_config={"default_permissions": "custom"} if guard == "custom-profile" else {},
+        codex_version=(0, 162, 9) if guard == "old-version" else (0, 163, 0),
+        windows_sdk=True,
+    )
+    assert (profile is not None) == (reason is None)
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert warnings == (
+        []
+        if reason is None
+        else [f"Codex Windows workspace permission profile disabled: {reason}"]
+    )
 
 
 @pytest.mark.parametrize("target", ["hooks", "common", "repo", "ancestor"])
@@ -1254,20 +1355,27 @@ def test_workspace_profile_declines_relative_roots(profile_repo: Path, source: s
     )
 
 
+@pytest.mark.parametrize("windows", [False, True])
 def test_workspace_profile_git_error_falls_back(
-    profile_repo: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    profile_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    windows: bool,
 ) -> None:
     def fail(*args: object, **kwargs: object) -> None:
         raise OSError("git unavailable")
 
     monkeypatch.setattr(launch_args, "detect_git_root", fail)
+    if windows:
+        monkeypatch.setattr(launch_args, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
     assert (
         launch_args.codex_workspace_profile(
             profile_repo,
             launch_args=["--approve-for-me"],
             server_overrides=[],
             private_config={},
-            codex_version=(0, 162, 1),
+            codex_version=(0, 163, 0),
+            windows_sdk=windows,
         )
         is None
     )

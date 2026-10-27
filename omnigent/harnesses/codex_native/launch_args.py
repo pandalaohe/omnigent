@@ -633,17 +633,24 @@ def codex_workspace_profile(
     private_config: Mapping[str, Any],
     codex_version: tuple[int, int, int] | None,
     workspace_write_stance: bool | None = None,
+    windows_sdk: bool = False,
 ) -> CodexWorkspaceProfile | None:
     """Gate and build a repository permission profile; failures keep legacy behavior."""
+    windows = os.name == "nt" and windows_sdk
+
+    def decline(reason: str) -> None:
+        if windows:
+            _logger.warning("Codex Windows workspace permission profile disabled: %s", reason)
+
     try:
         if (
-            os.name != "posix"
+            (os.name != "posix" and not windows)
             or codex_version is None
-            or codex_version < MIN_PROFILE_CODEX_VERSION
+            or codex_version < ((0, 163, 0) if windows else MIN_PROFILE_CODEX_VERSION)
         ):
-            return None
+            return decline("unsupported platform or Codex version")
         if private_config.get("default_permissions", ":workspace") != ":workspace":
-            return None
+            return decline("a custom permission profile is configured")
         options = list(_workspace_profile_options(launch_args))
         layers = [dict(private_config)]
         for tokens in [*(("-c", override) for override in server_overrides), *options]:
@@ -658,7 +665,7 @@ def codex_workspace_profile(
                 key == f"permissions.{PROFILE_ID}" or key.startswith(f"permissions.{PROFILE_ID}.")
                 for key in layer
             ):
-                return None
+                return decline("generated permission profile name is already configured")
         for tokens in options:
             if len(tokens) == 2 and tokens[0] in {"-c", "--config"}:
                 key, _, value = tokens[1].partition("=")
@@ -666,7 +673,7 @@ def codex_workspace_profile(
                     key.strip() == "default_permissions"
                     and codex_config_string(value) != ":workspace"
                 ):
-                    return None
+                    return decline("launch args select a custom permission profile")
         if workspace_write_stance is False or (
             workspace_write_stance is None
             and not codex_stance_is_workspace_write(
@@ -675,11 +682,11 @@ def codex_workspace_profile(
                 bypass_sandbox=False,
             )
         ):
-            return None
+            return decline("effective stance is not workspace-write")
         effective_cwd, additional_roots = codex_workspace_roots(launch_args, workspace)
         top = detect_git_root(effective_cwd)
         if top is None:
-            return None
+            return decline("workspace is not a repository")
         common = _git_common_dir(top)
         opened = [common]
         git_dir = None
@@ -690,10 +697,42 @@ def codex_workspace_profile(
                 or git_dir.resolve().parent != (common / "worktrees").resolve()
                 or not all((common / name).exists() for name in ("HEAD", "objects", "refs"))
             ):
-                return None
+                return decline("unsupported repository layout")
             opened.append(git_dir)
+        if windows:
+            if (top / ".gitmodules").exists() or (common / "modules").exists():
+                return decline("repository has submodules")
+            result = subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "--no-includes",
+                    "--file",
+                    str(common / "config"),
+                    "--type=bool",
+                    "--get",
+                    "extensions.worktreeConfig",
+                ],
+                capture_output=True,
+                env=_anchored_git_env(),
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode not in (0, 1):
+                return decline("common worktreeConfig could not be read")
+            if result.stdout.strip() == "true":
+                return decline("extensions.worktreeConfig is enabled")
+            # Windows drops missing deny targets; never silently reopen their creation.
+            protected = [common / name for name in ("hooks", "config", "config.worktree")]
+            if git_dir is not None:
+                protected.extend(
+                    git_dir / name for name in ("commondir", "gitdir", "config.worktree")
+                )
+            if any(not path.exists() for path in protected):
+                return decline("a protected Git path is missing")
         if not _git_profile_config_is_safe(top, opened):
-            return None
+            return decline("Git configuration references writable metadata")
         effective_config = {
             "sandbox_workspace_write": copy.deepcopy(
                 private_config.get("sandbox_workspace_write", {})
@@ -709,12 +748,12 @@ def codex_workspace_profile(
                 _set_codex_resume_config_value(effective_config, key, value)
         sandbox = effective_config["sandbox_workspace_write"]
         if not isinstance(sandbox, dict):
-            return None
+            return decline("invalid workspace sandbox configuration")
         roots = sandbox.get("writable_roots", [])
         if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
-            return None
+            return decline("invalid writable roots")
         if any(not Path(root).is_absolute() and not root.startswith("~") for root in roots):
-            return None
+            return decline("relative writable roots")
         writable_roots = [
             *(absolute_codex_path(root, effective_cwd) for root in roots),
             *additional_roots,
@@ -729,7 +768,7 @@ def codex_workspace_profile(
         entries = {str(directory): "write" for directory in opened}
         for name in ("hooks", "config", "config.worktree"):
             entries[str(common / name)] = "read"
-        if not common_already_writable:
+        if windows or not common_already_writable:
             for name in ("modules", "worktrees"):
                 entries[str(common / name)] = "read"
         if git_dir is not None:
@@ -752,7 +791,7 @@ def codex_workspace_profile(
                 if matches:
                     access = max(matches)[1]
                     if access == "read":
-                        return None
+                        return decline("a writable root would reopen a protected Git path")
                     covered = True
             if not covered:
                 entries[root] = "write"
