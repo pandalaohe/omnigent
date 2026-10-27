@@ -26,6 +26,270 @@ from tests.harnesses.codex_native.test_codex_native_app_server_rpc import (
 from tests.inner.test_native_context_inventory import NATIVE_CONTEXT_CASES
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
+from tests.test_opencode_native_app_server import context_server as context_server
+
+
+@pytest.mark.parametrize("operation", ["prompt", "prompt_async", "summarize", "bridge"])
+async def test_opencode_work_read_uses_owned_requests_and_exact_message_events(
+    context_server, monkeypatch, operation
+):
+    import json
+
+    from omnigent.startup_protocol import (
+        decode_context_work_evidence_v2,
+        harness_context_authority_v2,
+        session_context_scopes_v2,
+    )
+
+    server, native, responses, _requests = context_server
+    await native.create_session()
+    await native.fork("primary")
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    monkeypatch.setattr(orchestration, "_native_backend_exit_coverage_complete", True)
+    monkeypatch.setattr(orchestration, "_native_context_history_overflow", False)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def pending(_request):
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={})
+
+    responses[0] = pending
+    app = create_runner_app(server_client=NullServerClient(), auth_token="test-auth")
+    async with _runner_client(app) as client:
+
+        async def read():
+            response = await client.get(
+                "/v2/startup/context-work-inventory",
+                params={"session_id": "conversation", "read_id": "read-opencode"},
+                headers={"Authorization": "Bearer test-auth"},
+            )
+            assert response.status_code == 200
+            return decode_context_work_evidence_v2(
+                response.content,
+                read_id="read-opencode",
+                authority=harness_context_authority_v2("conversation"),
+                expected_scopes=session_context_scopes_v2("conversation"),
+            )
+
+        if operation == "bridge":
+            from omnigent.harnesses.opencode_native.bridge import (
+                OpenCodeNativeBridgeState,
+                write_bridge_state,
+            )
+            from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+            from omnigent.native.native_server_transport import NativePrompt
+
+            write_bridge_state(
+                server.bridge_dir,
+                OpenCodeNativeBridgeState(
+                    session_id="conversation",
+                    server_base_url=server.base_url,
+                    opencode_session_id="primary",
+                    workspace="/opt/work/repo",
+                ),
+            )
+            action = OpenCodeHttpTransport(bridge_dir=server.bridge_dir).send_prompt(
+                "primary", NativePrompt(text="work")
+            )
+        else:
+            action = (
+                native.summarize("primary", provider_id="test", model_id="test")
+                if operation == "summarize"
+                else getattr(native, operation)("primary", {"parts": []})
+            )
+        task = asyncio.create_task(action)
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            evidence = await read()
+            (row,) = evidence.inventory.observations
+            source = evidence.context.sources[1]
+            assert row.runtime_id == server.resident_incarnation_id
+            assert row.live_turn == (operation != "bridge")
+            assert row.generation == str(server._start_generation)
+            assert len(source.contexts) == len(source.work_bindings) == 2
+            assert all(b.runtime_id == row.runtime_id for b in source.work_bindings)
+            assert source.contexts[0].key != source.contexts[1].key
+            assert evidence.assessment.reason == (
+                "inventory_incomplete" if operation == "bridge" else "other_session_working"
+            )
+            release.set()
+            await task
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        evidence = await read()
+        assert not evidence.inventory.observations[0].live_turn
+        assert evidence.assessment.reason == "inventory_incomplete"
+        if operation in {"prompt_async", "summarize"}:
+            assert "opencode_async_work_outcome_unconfirmed" in {
+                u.reason for u in evidence.context.sources[1].unresolved
+            }
+
+        async def events(*entries):
+            async def stream(_request):
+                return httpx.Response(
+                    200,
+                    text="".join("data: " + json.dumps(e) + "\n\n" for e in entries),
+                    headers={"content-type": "text/event-stream"},
+                )
+
+            responses[0] = stream
+            observed = [event async for event in native.events()]
+            assert len(observed) == len(entries)
+
+        def message(identifier, *, completed=False):
+            return {
+                "type": "message.updated",
+                "properties": {
+                    "info": {
+                        "id": identifier,
+                        "sessionID": "primary",
+                        "role": "assistant",
+                        "time": {"completed": 10} if completed else {"created": 1},
+                    }
+                },
+            }
+
+        await events(message("old"), message("new"), message("old", completed=True))
+        assert (await read()).inventory.observations[0].live_turn
+        malformed = message("new")
+        malformed["properties"]["info"]["time"] = {"completed": True}
+        await events(malformed)
+        assert (await read()).inventory.observations[0].live_turn
+        await events({"type": "session.idle", "properties": {"sessionID": "primary"}})
+        assert (await read()).inventory.observations[0].live_turn
+        await events(message("new", completed=True), message("old"))
+        final = await read()
+        assert not final.inventory.observations[0].live_turn
+        assert not final.inventory.local_complete and not final.inventory.execution_fence
+        assert not final.inventory.observations[0].no_live_work_confirmed
+        assert not final.inventory.observations[0].no_owned_descendants
+        assert all(s.coverage != "complete" for s in final.context.sources)
+
+
+@pytest.mark.parametrize("loss", ["cancel", "generation", "closing", "registry", "ambiguous"])
+async def test_opencode_work_links_retain_uncertain_lifetimes(context_server, monkeypatch, loss):
+    from omnigent.runner.resident_inventory import session_context_work_evidence_v2
+
+    server, native, responses, _requests = context_server
+    await native.create_session()
+    if loss == "ambiguous":
+        await native.create_session()  # Same literal vendor id, distinct owning operations.
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_CLOSING_NATIVE_BACKENDS", {})
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_CONTEXTS", [])
+    monkeypatch.setattr(orchestration, "_RETIRED_NATIVE_OWNERS", {})
+    entered = asyncio.Event()
+
+    async def pending(_request):
+        entered.set()
+        await asyncio.Event().wait()
+
+    responses[0] = pending
+    task = asyncio.create_task(native.prompt_async("primary", {"parts": []}))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    if loss == "generation":
+        server._start_generation += 1
+    elif loss == "closing":
+        close = server.close()
+        close.close()  # Inspect the synchronous close boundary without terminating a fake process.
+    elif loss == "registry":
+        orchestration._AUTO_OPENCODE_SERVERS.clear()
+        orchestration._STARTING_NATIVE_BACKENDS[object()] = (
+            "conversation",
+            "opencode-native",
+            server,
+        )
+    evidence = await session_context_work_evidence_v2(
+        "conversation", "loss", process_manager=None, resources=SessionResourceRegistry()
+    )
+    source = evidence.context.sources[1]
+    assert source.contexts and not evidence.assessment.allowed
+    if loss == "cancel":
+        assert evidence.inventory.observations[0].live_turn
+        assert "opencode_work_outcome_unconfirmed" in {u.reason for u in source.unresolved}
+    elif loss == "ambiguous":
+        assert not source.work_bindings
+        assert "opencode_work_context_ambiguous_or_unobserved" in {
+            u.reason for u in source.unresolved
+        }
+    else:
+        assert source.work_bindings is None and not evidence.inventory.observations
+    if loss != "cancel":
+        assert "context_work_association_unconfirmed" in {u.reason for u in source.unresolved}
+
+
+@pytest.mark.parametrize("boundary", ["history_budget", "old_client"])
+async def test_opencode_work_events_are_bounded_and_do_not_cross_owner(context_server, boundary):
+    import json
+
+    server, native, responses, _requests = context_server
+    await native.create_session()
+
+    async def stream(*identifiers):
+        async def reply(_request):
+            return httpx.Response(
+                200,
+                text="".join(
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "message.updated",
+                            "properties": {
+                                "info": {
+                                    "id": identifier,
+                                    "sessionID": "primary",
+                                    "role": "assistant",
+                                }
+                            },
+                        }
+                    )
+                    + "\n\n"
+                    for identifier in identifiers
+                ),
+            )
+
+        responses[0] = reply
+        return [event async for event in native.events()]
+
+    await stream("old-message")
+    assert server.context_work_snapshot_v2("conversation")[1].live_turn
+    if boundary == "history_budget":
+        delivered = await stream(*(f"message-{i}" for i in range(1000)))
+        assert len(delivered) == 1000  # Observer exhaustion does not suppress SSE delivery.
+        source, row = server.context_work_snapshot_v2("conversation")
+        assert row is None and source.work_bindings is None and source.contexts
+        assert "opencode_work_history_budget" in {u.reason for u in source.unresolved}
+    else:
+        server._start_generation += 1
+        server.resident_incarnation_id = "replacement-owner"
+        replacement = server.client()
+
+        async def created(_request):
+            return httpx.Response(200, json={"id": "primary"})
+
+        responses[0] = created
+        await replacement.create_session()
+        await stream("stale-from-old-client")
+        source, row = server.context_work_snapshot_v2("conversation")
+        assert row.runtime_id == "replacement-owner" and not row.live_turn
+        assert len(source.contexts) == len(source.work_bindings) == 1
+        assert source.contexts[0].key.source_owner_incarnation == "replacement-owner"
+        assert "old_backend_generation" in {u.reason for u in source.unresolved}
+        await replacement.aclose()
 
 
 async def test_context_work_read_is_authenticated_partial_and_read_only(monkeypatch):

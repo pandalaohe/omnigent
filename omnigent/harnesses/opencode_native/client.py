@@ -150,10 +150,14 @@ class OpenCodeClient:
         context_observer: Callable[[str, str | None], Callable[[OpenCodeSession | None], None]]
         | None = None,
         forwarder_observer: Callable[[bool], None] | None = None,
+        work_observer: Callable[[str, str], Callable[[bool], None]] | None = None,
+        event_observer: Callable[[OpenCodeEvent], None] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._context_observer = context_observer
         self._forwarder_observer = forwarder_observer
+        self._work_observer = work_observer
+        self._event_observer = event_observer
         default_headers: dict[str, str] = dict(headers or {})
         if directory:
             default_headers.setdefault("x-opencode-directory", directory)
@@ -238,6 +242,19 @@ class OpenCodeClient:
         """Notify the existing backend owner without granting alias or exit proof."""
         if self._forwarder_observer is not None:
             self._forwarder_observer(active)
+
+    @contextmanager
+    def _work_operation(self, session_id: str, operation: str) -> Iterator[None]:
+        finish = self._work_observer(session_id, operation) if self._work_observer else None
+        try:
+            yield
+        except BaseException:
+            if finish is not None:
+                finish(False)
+            raise
+        else:
+            if finish is not None:
+                finish(True)
 
     async def create_session(self, payload: _JsonMapping | None = None) -> OpenCodeSession:
         """
@@ -325,9 +342,10 @@ class OpenCodeClient:
         :param payload: Prompt body, e.g. ``{"parts": [...]}``.
         :returns: The server response object (often the assistant message).
         """
-        data = await self._request_json(
-            "POST", f"/session/{session_id}/message", json_body=payload
-        )
+        with self._work_operation(session_id, "prompt"):
+            data = await self._request_json(
+                "POST", f"/session/{session_id}/message", json_body=payload
+            )
         return data if isinstance(data, dict) else {}
 
     async def prompt_async(self, session_id: str, payload: _JsonMapping) -> _JsonObject:
@@ -341,9 +359,10 @@ class OpenCodeClient:
         :param payload: Prompt body, e.g. ``{"parts": [...]}``.
         :returns: The server response object (may be empty).
         """
-        data = await self._request_json(
-            "POST", f"/session/{session_id}/prompt_async", json_body=payload
-        )
+        with self._work_operation(session_id, "prompt_async"):
+            data = await self._request_json(
+                "POST", f"/session/{session_id}/prompt_async", json_body=payload
+            )
         return data if isinstance(data, dict) else {}
 
     async def abort(self, session_id: str) -> bool:
@@ -375,11 +394,12 @@ class OpenCodeClient:
         :returns: ``True`` once opencode has accepted the compaction request.
         :raises OpenCodeClientError: On a non-2xx status.
         """
-        await self._request_json(
-            "POST",
-            f"/session/{session_id}/summarize",
-            json_body={"providerID": provider_id, "modelID": model_id},
-        )
+        with self._work_operation(session_id, "summarize"):
+            await self._request_json(
+                "POST",
+                f"/session/{session_id}/summarize",
+                json_body={"providerID": provider_id, "modelID": model_id},
+            )
         return True
 
     async def seed_context(
@@ -514,6 +534,8 @@ class OpenCodeClient:
                     f"OpenCode /event failed: {response.status_code} {body[:200]!r}"
                 )
             async for event in _parse_sse(response.aiter_lines()):
+                if self._event_observer is not None:
+                    self._event_observer(event)
                 yield event
 
 

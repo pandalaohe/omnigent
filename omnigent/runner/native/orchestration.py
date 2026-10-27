@@ -503,7 +503,15 @@ def native_context_work_snapshot_v2(
                 observations.append(row)
             sources.append(source)
         elif isinstance(backend, OpenCodeNativeServer):
-            sources.append(backend.context_source_v2(session_id))
+            source, row = backend.context_work_snapshot_v2(session_id)
+            if _AUTO_OPENCODE_SERVERS.get(session_id) is not backend:
+                source = source.model_copy(
+                    update={"work_bindings": None, "age_upper_bound_s": None}
+                )
+                row = None
+            if row is not None:
+                observations.append(row)
+            sources.append(source)
     sources.extend(
         source.model_copy(update={"work_bindings": None, "age_upper_bound_s": None})
         for source in _RETIRED_NATIVE_CONTEXTS
