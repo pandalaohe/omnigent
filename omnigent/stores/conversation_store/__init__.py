@@ -1250,6 +1250,7 @@ class ConversationStore(ABC):
         search_scope: str = "all",
         include_search_match: bool = True,
         host_id: str | None = None,
+        live_only: bool = False,
         created_after: int | None = None,
         created_before: int | None = None,
         updated_after: int | None = None,

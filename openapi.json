@@ -19088,6 +19088,17 @@
             }
           },
           {
+            "description": "Return only sessions with a fresh runner heartbeat or a running/waiting turn. Includes idle connected sessions; an online host alone does not make a session live.",
+            "in": "query",
+            "name": "live_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Live Only",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "query",
             "name": "created_after",
             "required": false,
@@ -19224,7 +19235,7 @@
             }
           },
           {
-            "description": "Conversation kind to return. `\"default\"` (the default) returns only top-level user-initiated sessions \u2014 the sidebar's view. `\"sub_agent\"` returns only sub-agent child sessions. `\"any\"` returns both; this lets the new-session agent picker discover agents that are only bound to sub-agent sessions (e.g. ones uploaded via `sys_session_create`).",
+            "description": "Conversation kind to return. `\"default\"` (the default) returns only top-level user-initiated sessions \u2014 the sidebar's view. `\"sub_agent\"` returns only sub-agent child sessions. `\"any\"` returns both; this lets the new-session agent picker discover agents that are only bound to sub-agent sessions (e.g. ones uploaded via `sys_session_create`). When combined with `host_id`, `\"any\"` also includes side chats.",
             "in": "query",
             "name": "kind",
             "required": false,

@@ -153,6 +153,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_ARCHIVE_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ROTATION_SUCCESSOR_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
     TOUCHED_LABEL_KEY,
@@ -5754,6 +5755,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         search_scope: str = "all",
         include_search_match: bool = True,
         host_id: str | None = None,
+        live_only: bool = False,
         created_after: int | None = None,
         created_before: int | None = None,
         updated_after: int | None = None,
@@ -5818,6 +5820,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             supported text fields. ``"all"`` also includes workspace metadata.
         :param include_search_match: Populate the first matching item, snippet,
             and match count. Facet scans disable this extra result query.
+        :param live_only: Only sessions with a fresh bound runner heartbeat or
+            a running/waiting turn. Does not imply host-relaunch reachability.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -5891,6 +5895,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             (accessible_by is not None)
             or (owned_by is not None)
             or (host_id is not None)
+            or live_only
             or shared_only
         )
         if shared_only and accessible_by is None:
@@ -5902,10 +5907,32 @@ class SqlAlchemyConversationStore(ConversationStore):
         # through Python — the prefetch otherwise costs O(all-accessible) per
         # request (ids out, ids back in as an IN clause, two UUID conversions
         # each). Split-DB: a cross-DB EXISTS is impossible, so keep the
-        # prefetch fallback. host_id is a metadata filter, not a permission
-        # scope, and the EXISTS does not carry it — those queries keep the
-        # prefetch too, or the host filter would silently drop.
-        acl_pushdown = needs_meta_filter and host_id is None and self._conv_engine is self._engine
+        # prefetch fallback. Host and liveness predicates use a second EXISTS
+        # over metadata, scoped to the same workspace and conversation.
+        acl_pushdown = needs_meta_filter and self._conv_engine is self._engine
+        metadata_conditions = [
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+        ]
+        if host_id is not None:
+            metadata_conditions.append(SqlConversationMetadata.host_id == host_id)
+        if live_only:
+            metadata_conditions.append(
+                or_(
+                    (
+                        SqlConversationMetadata.runner_id.is_not(None)
+                        & (
+                            SqlConversationMetadata.runner_last_seen
+                            >= now_epoch() - RUNNER_LIVENESS_TTL_S
+                        )
+                    ),
+                    SqlConversationMetadata.live_status.in_(
+                        (
+                            encode_session_live_status("running"),
+                            encode_session_live_status("waiting"),
+                        )
+                    ),
+                )
+            )
 
         qualifying_ids: list[str] | None = None
         workspace_matching_ids: list[str] | None = None
@@ -5949,13 +5976,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                         for candidate in (accessible_set, owned_set)
                         if candidate is not None
                     ]
-                if host_id is not None:
+                if host_id is not None or live_only:
                     qualifying_sets.append(
                         set(
                             meta_sess.execute(
                                 select(SqlConversationMetadata.id).where(
-                                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                                    SqlConversationMetadata.host_id == host_id,
+                                    *metadata_conditions,
                                 )
                             ).scalars()
                         )
@@ -6022,6 +6048,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
 
             if acl_pushdown:
+                if host_id is not None or live_only:
+                    stmt = stmt.where(
+                        select(SqlConversationMetadata.id)
+                        .where(
+                            *metadata_conditions,
+                            SqlConversationMetadata.id == SqlConversation.id,
+                        )
+                        .exists()
+                    )
                 # Correlated on both PK members so Postgres can drive the
                 # semi-join off pk_session_permissions
                 # (workspace_id, user_id, conversation_id). accessible_by and

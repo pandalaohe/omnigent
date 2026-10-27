@@ -238,6 +238,93 @@ def test_tiered_list_and_recent_strip_permission_labels_for_old_clients(
         assert "omnigent.pi.permission_tier" not in pages.sessions[0]["labels"]
 
 
+@pytest.mark.parametrize("include_archived", [False, True])
+def test_host_status_lists_live_children_without_archived_history(
+    app, stores, db_uri, monkeypatch, include_archived
+):
+    from click.testing import CliRunner
+
+    import omnigent.cli as cli_module
+    from omnigent.stores.host_store import HostStore
+
+    host = HostStore(db_uri).upsert_on_connect("a" * 32, "test-host", ALICE)
+    parent = _seed_session(stores, owner=ALICE, title="Parent")
+    for index in range(47):
+        old = _seed_session(stores, owner=ALICE, title=f"Archived {index}")
+        stores[0].set_host_id(old, host_id=host.host_id, workspace="/opt/work/omnigent/fork/test")
+        stores[0].update_conversation(old, archived=True)
+    live_ids = []
+    for index in range(4):
+        child = stores[0].create_conversation(
+            title=f"Child {index}",
+            kind="sub_agent",
+            parent_conversation_id=parent,
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            runner_id=f"runner_{index}",
+            host_id=host.host_id,
+            workspace="/opt/work/omnigent/fork/test",
+        )
+        stores[2].grant(ALICE, child.id, LEVEL_OWNER)
+        stores[0].set_session_live_status(
+            child.id, "waiting" if index == 1 else "running" if index == 0 else "idle"
+        )
+        if index >= 2:
+            stores[0].touch_runner_liveness([f"runner_{index}"], int(time.time()))
+        live_ids.append(child.id)
+    stopped = _seed_session(stores, owner=ALICE, title="Stopped")
+    stores[0].set_host_id(stopped, host_id=host.host_id, workspace="/opt/work/omnigent/fork/test")
+    side_chat = _seed_session(stores, owner=ALICE, title="Side chat")
+    stores[0].set_host_id(
+        side_chat, host_id=host.host_id, workspace="/opt/work/omnigent/fork/test"
+    )
+    stores[0].set_labels(side_chat, {"omnigent.side_chat": "true"})
+    stores[0].set_session_live_status(side_chat, "running")
+    live_ids.append(side_chat)
+    record = cli_module._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+        host_id=host.host_id,
+    )
+    monkeypatch.setattr(cli_module, "_selected_daemon_records", lambda **_: [record])
+    monkeypatch.setattr(cli_module, "_add_daemon_host_status", lambda _: None)
+    monkeypatch.setattr(cli_module, "_pid_is_recorded_daemon", lambda _: True)
+    with TestClient(app) as client:
+        sidebar = client.get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+        assert side_chat not in {row["id"] for row in sidebar.json()["data"]}
+
+        def asgi_request(**kwargs):
+            if kwargs["path"].startswith("/v1/runners/"):
+                return cli_module._HostHttpResult(status_code=200, body={"online": True})
+            response = client.request(
+                kwargs["method"],
+                kwargs["path"],
+                params=kwargs.get("params"),
+                headers={"X-Forwarded-Email": ALICE},
+            )
+            return cli_module._HostHttpResult(
+                status_code=response.status_code, body=response.json()
+            )
+
+        monkeypatch.setattr(cli_module, "_host_http_json", asgi_request)
+        args = ["host", "status", "--sessions", "--json"]
+        if include_archived:
+            args += ["--include-archived", "--archived-limit", "2"]
+        result = CliRunner().invoke(cli_module.cli, args)
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)["daemons"][0]["sessions"]
+        assert {row["id"] for row in rows[:5]} == set(live_ids)
+        assert len(rows) == (7 if include_archived else 5)
+        assert (
+            json.loads(result.output)["daemons"][0]["archived_sessions_has_more"]
+            == include_archived
+        )
+        assert all(row["title"].startswith("Archived") for row in rows[5:])
+
+
 @pytest.mark.usefixtures("fast_rescan")
 def test_tiered_updates_close_old_watch_before_snapshot(app, stores):
     session_id = _seed_session(stores, owner=ALICE, title="Tiered")

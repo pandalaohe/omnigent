@@ -3644,6 +3644,7 @@ def register_core_routes(
         *,
         user_id: str | None,
         include_preview: bool,
+        include_side_chats: bool = False,
     ) -> PaginatedList:
         """
         Decorate one store page into sidebar session rows.
@@ -3656,12 +3657,16 @@ def register_core_routes(
         :param page: The store's conversation page to decorate.
         :param user_id: Caller identity for permission checks and rows.
         :param include_preview: When ``True``, batch-fetch last-message previews.
+        :param include_side_chats: Include side chats in a host inventory.
         :returns: The serialized :class:`PaginatedList` response body.
         """
         # Side chats surface only as Workspace-rail tabs, so drop any
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).
-        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+        if not include_side_chats:
+            page.data = [
+                conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
+            ]
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -3871,6 +3876,7 @@ def register_core_routes(
         include_archived: bool = Query(default=False),
         archived_only: bool = Query(default=False),
         host_id: str | None = Query(default=None),
+        live_only: bool = Query(default=False),
         created_after: int | None = Query(default=None, ge=0),
         created_before: int | None = Query(default=None, ge=0),
         updated_after: int | None = Query(default=None, ge=0),
@@ -3929,6 +3935,10 @@ def register_core_routes(
             this lets the new-session agent picker discover agents
             that are only bound to sub-agent sessions (e.g. ones
             uploaded via ``sys_session_create``).
+            When combined with ``host_id``, ``"any"`` also includes side chats.
+        :param live_only: Return only sessions with a fresh runner heartbeat
+            or a running/waiting turn. Includes idle connected sessions;
+            an online host alone does not make a session live.
         :param pinned: When ``True``, return only sessions the user
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
@@ -4038,6 +4048,7 @@ def register_core_routes(
             include_archived=include_archived_param,
             archived_only=archived_only_param,
             host_id=host_id,
+            live_only=live_only,
             created_after=created_after,
             created_before=created_before,
             updated_after=updated_after,
@@ -4052,7 +4063,11 @@ def register_core_routes(
             pinned_owner=user_id,
         )
         return await _session_list_page(
-            request, page, user_id=user_id, include_preview=include_preview
+            request,
+            page,
+            user_id=user_id,
+            include_preview=include_preview,
+            include_side_chats=host_id is not None and kind == "any",
         )
 
     # ── GET /me/recent-sessions ─────────────────────────────────
