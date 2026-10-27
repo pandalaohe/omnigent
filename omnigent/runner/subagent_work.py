@@ -1431,6 +1431,7 @@ def reap_stalled_subagent_launches(
     now: float | None = None,
     timeout_s: float | None = None,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    child_statuses: Mapping[str, str | None] | None = None,
 ) -> list[_SubagentWorkEntry]:
     """
     Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
@@ -1449,6 +1450,8 @@ def reap_stalled_subagent_launches(
         also schedules the parent wake POST — the sole signal that rouses an
         idle parent to drain its inbox. Defaults to the inbox-only
         :func:`mark_subagent_work_terminal`.
+    :param child_statuses: Fresh server statuses for expired dispatches. Running
+        children are promoted; terminal children await normal result delivery.
     :returns: The entries that were failed by this sweep.
     """
     budget = resolve_subagent_launch_timeout_s() if timeout_s is None else timeout_s
@@ -1461,6 +1464,12 @@ def reap_stalled_subagent_launches(
         if entry.status != "launching":
             continue
         if current - entry.created_at < budget:
+            continue
+        status = child_statuses.get(entry.child_session_id) if child_statuses else None
+        if status in {"running", "waiting"}:
+            mark_subagent_work_started(entry.child_session_id)
+            continue
+        if status in _SUBAGENT_TERMINAL_STATUSES:
             continue
         _logger.warning(
             "Sub-agent dispatch stuck in launching for %.0fs; failing it: parent=%s child=%s",
@@ -1486,6 +1495,7 @@ async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    child_status: Callable[[str], Awaitable[str | None]] | None = None,
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
     check_remote_members: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
@@ -1500,6 +1510,7 @@ async def run_subagent_launch_reaper(
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
     :param reconcile_pending: Refresh recovered work awaiting remote completion.
+    :param child_status: Read a child's current server status before timing it out.
     :param check_remote_members: Slow liveness check for remote members that
         ended without reporting a result.
     :returns: None.
@@ -1507,7 +1518,18 @@ async def run_subagent_launch_reaper(
     while True:
         await asyncio.sleep(interval_s)
         try:
-            reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+            now = time.time()
+            budget = resolve_subagent_launch_timeout_s()
+            statuses: dict[str, str | None] = {}
+            if child_status is not None and budget > 0:
+                for entry in list(_subagent_work_by_child.values()):
+                    if entry.status == "launching" and now - entry.created_at >= budget:
+                        statuses[entry.child_session_id] = await child_status(
+                            entry.child_session_id
+                        )
+            reap_stalled_subagent_launches(
+                now=now, timeout_s=budget, mark_terminal=mark_terminal, child_statuses=statuses
+            )
             if reconcile_pending is not None:
                 await reconcile_pending()
             if check_remote_members is not None:

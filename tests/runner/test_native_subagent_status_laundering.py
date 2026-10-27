@@ -17,6 +17,7 @@ import asyncio
 import uuid
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.runner import create_runner_app, subagent_work
@@ -27,6 +28,76 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        "running",
+        "waiting",
+        "idle",
+        "completed",
+        "failed",
+        "cancelled",
+        "stopped",
+        "killed",
+        None,
+        "launching",
+    ],
+)
+async def test_launch_reaper_checks_server_before_reporting_failure(status: str | None) -> None:
+    parent_id, child_id = uuid.uuid4().hex, uuid.uuid4().hex
+    reads: list[str] = []
+    swept = asyncio.Event()
+
+    class StatusServer(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            reads.append(url)
+            return httpx.Response(200, json={"status": status})
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=StatusServer(),  # type: ignore[arg-type]
+    )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="codex", title="impl"
+    )
+    entry.created_at -= 181
+
+    async def reconciled() -> None:
+        swept.set()
+
+    task = None
+    try:
+        task = asyncio.create_task(
+            subagent_work.run_subagent_launch_reaper(
+                interval_s=0.001,
+                child_status=app.state.subagent_child_status,
+                reconcile_pending=reconciled,
+            )
+        )
+        await asyncio.wait_for(swept.wait(), 5)
+        assert reads == [f"/v1/sessions/{child_id}"]
+        if status in {"running", "waiting"}:
+            assert entry.status == "running"
+            assert inbox.empty()
+        elif status in {None, "launching", "idle"}:
+            assert entry.status == "failed"
+            assert "no start acknowledgment" in inbox.get_nowait()["output"]
+        else:
+            # Terminal delivery must keep the child's real result, not invent a timeout.
+            assert entry.status == "launching"
+            assert inbox.empty()
+    finally:
+        if task is not None:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio

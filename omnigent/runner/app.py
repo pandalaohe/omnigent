@@ -7163,6 +7163,11 @@ def create_runner_app(
     # that also schedules the parent wake POST, not just the inbox insert.
     app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
 
+    async def _subagent_child_status(child_session_id: str) -> str | None:
+        return await _fetch_session_status(server_client, child_session_id)
+
+    app.state.subagent_child_status = _subagent_child_status
+
     def _peer_copy_payload(
         peer_turn: dict[str, object],
         *,

@@ -38,6 +38,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_child_status_to_parent,
     _publish_external_conversation_item,
     _publish_session_superseded,
+    _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
 )
 from omnigent.server.routes._sessions.orchestration import _post_system_message
@@ -557,10 +558,23 @@ async def _phase_open(
 
     handover = await _handover_text(conversation_store, old_conversation)
     children = await _direct_children(receipt, conversation_store)
+    child_states: dict[str, str] = {}
+    for child in children:
+        client = (
+            await _get_runner_client(child.id, runner_router, conversation=child)
+            if child.runner_id is not None
+            else None
+        )
+        child_states[child.id] = (
+            _session_status_from_cache(child.id, child.live_status)
+            if client is not None
+            else "runner offline — send a message to restart it"
+        )
     text = _opening_text(
         old_id=receipt.old_id,
         handover=handover,
         children=children,
+        child_states=child_states,
         questions=questions,
         dropped=dropped,
         created_at=receipt.created_at,
@@ -1014,6 +1028,7 @@ def _opening_text(
     old_id: str,
     handover: str | None,
     children: list[Conversation],
+    child_states: dict[str, str],
     questions: list[dict[str, Any]],
     dropped: list[dict[str, Any]],
     created_at: int | None = None,
@@ -1030,7 +1045,7 @@ def _opening_text(
         lines = []
         lines.append("Children now under this session:")
         for child in children:
-            lines.append(f"- {child.id}: {child.title or child.id}")
+            lines.append(f"- {child.id}: {child.title or child.id} ({child_states[child.id]})")
         sections.append("\n".join(lines))
     if questions:
         lines = []
