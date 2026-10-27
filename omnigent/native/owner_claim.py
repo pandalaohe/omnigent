@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from omnigent._platform import IS_LINUX
+from omnigent._platform import IS_LINUX, IS_WINDOWS
 
 OWNER_PID_FILENAME = "owner.pid"
 
@@ -23,6 +23,9 @@ class OwnerClaim:
 
 def current_pid_namespace() -> str | None:
     """Return a namespace identity, or None when Linux cannot identify it."""
+    if IS_WINDOWS:
+        boot = _windows_boot_id()
+        return f"windows:{boot}" if boot else None
     if not IS_LINUX:
         return "none"
     try:
@@ -33,9 +36,32 @@ def current_pid_namespace() -> str | None:
 
 def current_boot_id() -> str | None:
     """Return the kernel boot identity when available."""
+    if IS_WINDOWS:
+        return _windows_boot_id()
     try:
         return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip() or None
     except (OSError, UnicodeError):
+        return None
+
+
+def _windows_boot_id() -> str | None:
+    """Read the boot GUID; estimated boot times vary between Windows processes."""
+    import ctypes
+
+    try:
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            return None
+        query = loader("ntdll").NtQuerySystemInformation
+        query.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
+        query.restype = ctypes.c_long
+        # SYSTEM_BOOT_ENVIRONMENT_INFORMATION begins with the 16-byte BootIdentifier.
+        buffer = ctypes.create_string_buffer(32)
+        if query(90, buffer, len(buffer), None) != 0:
+            return None
+        guid = buffer.raw[:16]
+        return guid.hex() if any(guid) else None
+    except (AttributeError, OSError):
         return None
 
 
@@ -72,7 +98,7 @@ def owner_is_gone(claim: OwnerClaim, *, process_alive: Callable[[int], bool]) ->
     """Require a dead process in the same boot and known namespace."""
     boot_id = current_boot_id()
     # Different boot IDs can belong to live kernels sharing a filesystem.
-    if claim.boot_id != boot_id or (IS_LINUX and boot_id is None):
+    if claim.boot_id != boot_id or ((IS_LINUX or IS_WINDOWS) and boot_id is None):
         return False
     pid_ns = current_pid_namespace()
     if pid_ns is None or claim.pid_ns != pid_ns:

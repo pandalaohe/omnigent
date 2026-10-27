@@ -176,7 +176,9 @@ async def test_start_can_delegate_orphan_sweep_to_host(short_tmp_parent: Path) -
     """Host-spawned runners can start without scanning machine-global state."""
     stale_dir = short_tmp_parent / "ap-dead"
     stale_dir.mkdir(mode=0o700)
-    (stale_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    write_owner_claim(stale_dir, filename=_AP_PID_FILE)
+    marker = stale_dir / _AP_PID_FILE
+    marker.write_text(marker.read_text().replace(str(os.getpid()), "99999999", 1))
 
     manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
     await manager.start(sweep_orphans=False)
@@ -1353,7 +1355,9 @@ async def test_orphan_sweep_removes_dead_omnigent_dirs(
     """
     fake_dir = short_tmp_parent / "ap-deaduuid"
     fake_dir.mkdir(mode=0o700)
-    (fake_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    write_owner_claim(fake_dir, filename=_AP_PID_FILE)
+    marker = fake_dir / _AP_PID_FILE
+    marker.write_text(marker.read_text().replace(str(os.getpid()), "99999999", 1))
     # Plant a stale socket file too so the sweep has something to
     # try-and-clean (no live runner to kill, but the dir removal
     # path is what matters).
@@ -1557,12 +1561,16 @@ async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
         pytest.skip("permission checks do not apply to root")
     inaccessible = short_tmp_parent / "ap-inaccessible"
     inaccessible.mkdir(mode=0o700)
-    (inaccessible / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    write_owner_claim(inaccessible, filename=_AP_PID_FILE)
+    marker = inaccessible / _AP_PID_FILE
+    marker.write_text(marker.read_text().replace(str(os.getpid()), "99999999", 1))
     inaccessible.chmod(0o000)
 
     dead = short_tmp_parent / "ap-deadsibling"
     dead.mkdir(mode=0o700)
-    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    write_owner_claim(dead, filename=_AP_PID_FILE)
+    marker = dead / _AP_PID_FILE
+    marker.write_text(marker.read_text().replace(str(os.getpid()), "99999999", 1))
 
     live = short_tmp_parent / "ap-livesibling"
     live.mkdir(mode=0o700)
@@ -1591,10 +1599,14 @@ async def test_orphan_sweep_treats_vanishing_child_as_benign_race(
     """An injected is_dir race must not prevent cleanup of the next dead orphan."""
     vanishing = short_tmp_parent / "ap-avanishing"
     vanishing.mkdir(mode=0o700)
-    (vanishing / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    write_owner_claim(vanishing, filename=_AP_PID_FILE)
+    marker = vanishing / _AP_PID_FILE
+    marker.write_text(marker.read_text().replace(str(os.getpid()), "99999999", 1))
     dead = short_tmp_parent / "ap-zzdead"
     dead.mkdir(mode=0o700)
-    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    write_owner_claim(dead, filename=_AP_PID_FILE)
+    marker = dead / _AP_PID_FILE
+    marker.write_text(marker.read_text().replace(str(os.getpid()), "99999999", 1))
 
     real_is_dir = Path.is_dir
 
