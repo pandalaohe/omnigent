@@ -164,6 +164,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 "sys_instruction_layer_update",
                 "sys_project_settings_read",
                 "sys_project_settings_update",
+                "sys_standing_pass",
             }
         )
         == BUILTIN_NAMES
