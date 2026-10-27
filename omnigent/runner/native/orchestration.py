@@ -570,6 +570,20 @@ def native_context_work_snapshot_v2(
                 ),
             }
         ), ()
+    linked = {binding.context for binding in current.work_bindings or ()}
+    unresolved.extend(
+        UnresolvedContextV2(
+            candidate=record.key.context_incarnation,
+            reason="context_work_association_unconfirmed",
+        )
+        for record in current.contexts
+        if record.key not in linked
+    )
+    if len(unresolved) > 1000:
+        unresolved = [
+            *unresolved[:999],
+            UnresolvedContextV2(candidate=None, reason="context_work_association_reason_budget"),
+        ]
     return current.model_copy(update={"unresolved": tuple(unresolved)}), tuple(observations)
 
 

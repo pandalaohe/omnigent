@@ -262,6 +262,11 @@ async def test_context_work_pending_and_invalid_lifetimes_stay_unknown(context_v
         source, rows = orchestration.native_context_work_snapshot_v2("conversation")
         if change in {"generation", "closing"}:
             assert source.work_bindings is None and rows == ()
+            assert any(
+                gap.reason == "context_work_association_unconfirmed"
+                and gap.candidate == source.contexts[0].key.context_incarnation
+                for gap in source.unresolved
+            )
         elif change == "ambiguous":
             assert source.work_bindings == ()
             assert "context_work_thread_ambiguous_or_unobserved" in {
@@ -301,6 +306,32 @@ async def test_context_work_history_budget_retains_unknown_work(context_v2_nativ
     assert "context_work_history_budget" in {gap.reason for gap in source.unresolved}
     assert rows[0].live_turn and not rows[0].no_live_work_confirmed
     assert not rows[0].no_owned_descendants and source.coverage == "partial"
+
+
+async def test_missing_work_link_reason_budget_preserves_known_contexts(context_v2_native):
+    backend, client, websocket = context_v2_native
+    count = 0
+
+    async def created(raw):
+        nonlocal count
+        count += 1
+        message = json.loads(raw)
+        client._pending_requests[message["id"]].set_result(
+            {"result": {"thread": {"id": f"context-{count}"}}}
+        )
+
+    websocket.send.side_effect = created
+    for _ in range(1000):
+        await client.request("thread/start", {})
+    before = backend.context_source_v2("conversation")
+    assert len(before.contexts) == len(before.work_bindings) == 1000
+    backend._start_generation += 1
+    source, rows = orchestration.native_context_work_snapshot_v2("conversation")
+    assert rows == () and source.work_bindings is None
+    assert source.contexts == before.contexts
+    assert len(source.unresolved) == 1000
+    assert source.unresolved[-1].reason == "context_work_association_reason_budget"
+    assert source.coverage == "partial" and source.revision_authority == "observation_only"
 
 
 def test_context_v2_history_budget_vetoes_instead_of_truncating():

@@ -292,6 +292,11 @@ class ContextWorkEvidenceV2(_ContextValueV2):
             ):
                 raise ValueError("runner work observation has unsupported negative proof")
         for source in self.context.sources:
+            if source.scope.namespace == "native" and any(
+                binding.runtime_id != binding.context.source_owner_incarnation
+                for binding in source.work_bindings or ()
+            ):
+                raise ValueError("native work binding belongs to another source owner")
             if (
                 source.coverage == "complete"
                 or source.revision_authority != "observation_only"

@@ -123,6 +123,15 @@ async def test_context_work_read_consumes_production_owner_and_rejects_forgery(
         assert not row.no_live_work_confirmed and not row.no_owned_descendants
         assert methods == ["thread/start", "turn/start"]
         assert "/v2/startup/context-work-inventory" not in app.openapi()["paths"]
+        malformed = response.json()
+        native_source = next(
+            s for s in malformed["context"]["sources"] if s["scope"]["namespace"] == "native"
+        )
+        native_source["work_bindings"][0]["runtime_id"] = "different-backend-owner"
+        malformed["inventory"]["observations"][0]["runtime_id"] = "different-backend-owner"
+        malformed["inventory"]["local_members"] = [["different-backend-owner", row.generation]]
+        with pytest.raises(ValueError):
+            decode_context_work_evidence_v2(json.dumps(malformed).encode(), **args)
         for section, field, value in (
             ("inventory", "execution_fence", True),
             ("inventory", "extra", True),
