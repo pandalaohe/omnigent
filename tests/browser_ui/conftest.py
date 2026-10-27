@@ -18,7 +18,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pytest
 from playwright.sync_api import BrowserContext, Request, Route, WebSocketRoute
@@ -227,6 +227,15 @@ def browser_contract(
     for path, body in (
         ("/v1/system/status", {"revision": 0, "level": "ok", "findings": []}),
         ("/v1/custom-agents", {"object": "list", "data": [], "has_more": False}),
+        (
+            re.compile(
+                rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/standing-pass(?:\?.*)?$"
+            ),
+            lambda request: {
+                "root_id": unquote(urlparse(request.url).path.split("/")[-2]),
+                "record": {"kinds": [], "exceptions": [], "since": 0, "events": []},
+            },
+        ),
         (
             "/v1/artifact-sharing",
             {"external": False, "share_code_set": False, "allow_comments": True},

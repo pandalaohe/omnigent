@@ -457,8 +457,12 @@ def test_keep_warm_table_convert_and_cell_persist_with_support_reasons(
         "Main on"
     )
     assert conversion_calls == [True]
-    section.get_by_role("button", name="Add agent", exact=True).click()
+    add_agent = section.get_by_role("button", name="Add agent", exact=True)
+    # Center the trigger before clicking in the long General section.
+    add_agent.evaluate("element => element.scrollIntoView({block: 'center'})")
+    add_agent.click()
     picker = page.get_by_role("dialog", name="Add agent", exact=True)
+    expect(picker).to_be_visible()
     picker.get_by_role("button", name="Not supported here (1)").click()
     expect(
         picker.get_by_role("button", name=re.compile("Other.*no declared keep-warm channel"))
@@ -729,6 +733,7 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     expect(copy).to_be_enabled()
     if width == 390:
         page.set_viewport_size({"width": width, "height": 1200})
+    detail.get_by_text("Default agent", exact=True).scroll_into_view_if_needed()
     expect(detail.get_by_text("Default agent", exact=True)).to_be_in_viewport()
     page.screenshot(path=str(output / f"project-host-row-{width}.png"), full_page=True)
     page.set_viewport_size({"width": width, "height": 900})
