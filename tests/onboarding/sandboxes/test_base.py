@@ -270,7 +270,7 @@ def test_start_host_default_materialize_clones_repo() -> None:
 
     assert workspace == "/root/workspace/repo"
     assert (
-        "git clone --branch release-1.2 --single-branch -- "
+        "python3 -I -m omnigent.git_commands -- clone --branch release-1.2 --single-branch -- "
         "https://github.com/org/repo /root/workspace/repo"
     ) in launcher.commands
 
@@ -296,9 +296,13 @@ def test_start_host_clones_multiple_repos_into_sibling_dirs() -> None:
     )
 
     assert workspace == "/root/workspace"
-    assert "git clone -- https://github.com/org/api /root/workspace/api" in launcher.commands
     assert (
-        "git clone --branch dev --single-branch -- https://github.com/org/web /root/workspace/web"
+        "python3 -I -m omnigent.git_commands -- clone -- "
+        "https://github.com/org/api /root/workspace/api"
+    ) in launcher.commands
+    assert (
+        "python3 -I -m omnigent.git_commands -- clone --branch dev --single-branch -- "
+        "https://github.com/org/web /root/workspace/web"
     ) in launcher.commands
 
 
@@ -342,7 +346,9 @@ def test_materialize_workspace_override_resolves_local_checkout_without_cloning(
 
     assert workspace == "/checkouts/repo"
     # No clone happened; the override resolved a local checkout instead.
-    assert not any(cmd.startswith("git clone") for cmd in launcher.commands)
+    assert not any(
+        cmd.startswith("python3 -I -m omnigent.git_commands -- clone") for cmd in launcher.commands
+    )
     assert "git -C /checkouts/repo checkout main" in launcher.commands
     # The host still launched, in the resolved workspace.
     [raw] = launcher.backgrounded

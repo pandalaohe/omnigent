@@ -2893,7 +2893,7 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
     # the sandbox clones the wrong thing (or interprets the URL as a
     # flag).
     clone_cmd = (
-        "git clone --branch release-1.2 --single-branch "
+        "python3 -I -m omnigent.git_commands -- clone --branch release-1.2 --single-branch "
         "-- https://github.com/org/myrepo.git /root/workspace/myrepo"
     )
     assert clone_cmd in fake.commands
@@ -2911,7 +2911,7 @@ async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> 
     (and its token) deleted — and the 502 names the repository so the
     create error tells the user WHAT didn't clone.
     """
-    fake = FakeSandboxLauncher(fail_on_command="git clone")
+    fake = FakeSandboxLauncher(fail_on_command="python3 -I -m omnigent.git_commands -- clone")
     host_store = HostStore(db_uri)
 
     with pytest.raises(HTTPException) as exc:
@@ -3446,6 +3446,8 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
             git_command += '; printf "clone failed\\n" >&2; return 1'
         script = (
             'python3() { if [ "$1" = "-c" ]; then printf "credentials\\n" >> "$CALL_LOG"; '
+            'elif [ "$1 $2 $3 $4" = "-I -m omnigent.git_commands --" ]; '
+            'then shift 4; git "$@"; '
             'else command python3 "$@"; fi; }\n'
             'git() { printf "git %s\\n" "$*" >> "$CALL_LOG"; ' + git_command + "; }\n" + command[2]
         )

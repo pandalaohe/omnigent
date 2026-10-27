@@ -653,12 +653,13 @@ def test_start_gates_on_preparation_and_preserves_broker_configuration(
     assert HOST_TOKEN_ENV_VAR in payload["prepare_command"][-1]
     if git_clone.depth:
         assert (
-            "git clone --single-branch --depth 50 --filter=blob:none --no-tags --"
+            "python3 -I -m omnigent.git_commands -- clone "
+            "--single-branch --depth 50 --filter=blob:none --no-tags --"
             in payload["prepare_command"][-1]
         )
     else:
         assert (
-            "git clone -- https://github.com/example/repository.git"
+            "python3 -I -m omnigent.git_commands -- clone -- https://github.com/example/repository.git"
             in payload["prepare_command"][-1]
         )
     assert render.call_args.args[-1] == {"profile": "oss"}
