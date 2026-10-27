@@ -849,6 +849,7 @@ def register_core_routes(
             conversation_store,
             permission_store,
             getattr(request.app.state, "user_preferences_store", None),
+            project_store,
         )
         open_children = await asyncio.to_thread(
             conversation_store.count_counted_children, session_id
@@ -912,7 +913,7 @@ def register_core_routes(
         except (KeyError, ValueError):
             last = None
         cap, _source = await asyncio.to_thread(
-            child_cap_for, conv, conversation_store, permission_store, prefs
+            child_cap_for, conv, conversation_store, permission_store, prefs, project_store
         )
         return {
             "min_gap_seconds": policy.min_gap_s,
@@ -1950,6 +1951,7 @@ def register_core_routes(
                     )
                     if quota_service is not None
                     else None,
+                    setup_resolver=getattr(request.app.state, "project_setup_resolver", None),
                 )
                 # Prefer the initializer's owner-aware snapshot; embedded
                 # builds without one keep the deployment flag.
@@ -2059,6 +2061,7 @@ def register_core_routes(
                 conversation_store,
                 permission_store,
                 getattr(request.app.state, "user_preferences_store", None),
+                project_store,
             )
             if cap is not None:
                 count = await asyncio.to_thread(

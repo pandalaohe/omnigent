@@ -695,7 +695,12 @@ class ChildIdleSweeper:
                 )
             prefs = getattr(self._app.state, "user_preferences_store", None)
             cap, _source = await asyncio.to_thread(
-                child_cap_for, parent, self._store, self._permissions, prefs
+                child_cap_for,
+                parent,
+                self._store,
+                self._permissions,
+                prefs,
+                getattr(self._app.state, "project_store", None),
             )
             count = await asyncio.to_thread(self._store.count_counted_children, parent_id)
             capacity = json.dumps(

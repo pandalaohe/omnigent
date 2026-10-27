@@ -204,6 +204,7 @@ class RunnerSessionInitializer:
             Callable[[Conversation], Awaitable[StartupAttemptRef | None]] | None
         ) = None,
         quota_resolver: Callable[[Conversation], str] | None = None,
+        setup_resolver: Callable[[Conversation], str] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
@@ -218,6 +219,7 @@ class RunnerSessionInitializer:
         self._startup_control_resolver = startup_control_resolver
         self._startup_recovery_resolver = startup_recovery_resolver
         self._quota_resolver = quota_resolver
+        self._setup_resolver = setup_resolver
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._agent_store = agent_store
@@ -728,9 +730,15 @@ class RunnerSessionInitializer:
             async with store_slots or nullcontext():
                 global_instructions = (
                     await session_instructions_text(
-                        conversation, quota_resolver=self._quota_resolver
+                        conversation,
+                        quota_resolver=self._quota_resolver,
+                        **(
+                            {"setup_resolver": self._setup_resolver}
+                            if self._setup_resolver
+                            else {}
+                        ),
                     )
-                    if self._quota_resolver is not None
+                    if self._quota_resolver is not None or self._setup_resolver is not None
                     else await session_instructions_text(conversation)
                 )
                 project_code = await self.resolve_project_code(conversation)

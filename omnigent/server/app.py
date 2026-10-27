@@ -1754,6 +1754,15 @@ def create_app(
         conversation_store, permission_store, user_preferences_store, host_registry, host_store
     )
     from omnigent.entities import Conversation
+    from omnigent.server.instruction_layers import project_setup_line
+
+    project_setup_resolver = partial(
+        project_setup_line,
+        project_store=project_store,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        prefs_store=user_preferences_store,
+    )
     from omnigent.server.startup_admission import active_startup_attempt
     from omnigent.startup_protocol import StartupAttemptRef
 
@@ -1766,6 +1775,7 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
         quota_resolver=agent_quota_service.line,
+        setup_resolver=project_setup_resolver,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -2253,6 +2263,7 @@ def create_app(
     app.state.archive_close_coordinator = archive_close_coordinator
     app.state.cli_release_intent_store = cli_release_intent_store
     app.state.runner_session_initializer = runner_session_initializer
+    app.state.project_setup_resolver = project_setup_resolver
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     from omnigent.server.startup_inputs import ManagedStartupInputs, StartupDispatch
