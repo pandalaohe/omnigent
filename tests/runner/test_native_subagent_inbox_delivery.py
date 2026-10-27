@@ -97,7 +97,7 @@ class _SnapshotServerClient(NullServerClient):
             name = self.host_names.get(host_id)
             if name is not None:
                 return self._Resp({"host_id": host_id, "name": name})
-        return self._Response()
+        return await super().get(url)
 
     async def post(self, url: str, **kwargs: Any) -> Any:
         """Record the request, then answer like the empty-200 base client."""
