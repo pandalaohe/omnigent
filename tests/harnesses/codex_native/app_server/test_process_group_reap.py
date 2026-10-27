@@ -19,6 +19,7 @@ import pytest
 from omnigent.harnesses.codex_native.app_server import (
     CodexNativeAppServer,
 )
+from omnigent.harnesses.codex_native.process_registry import _ps_output as _real_registry_ps_output
 from omnigent.inner import _proc
 from tests._helpers.polling import poll_until, poll_until_async
 from tests.harnesses.codex_native.app_server._support import _test_app_server
@@ -1009,6 +1010,128 @@ async def test_real_owned_group_keeps_context_work_unknown_through_close_and_ret
             json.dumps({"pid": process.pid, "pgid": pgid, "returncode": process.returncode}),
         )
         assert process.returncode is not None
+
+
+@pytest.mark.posix_only
+async def test_real_tagged_group_exit_keeps_context_work_unknown(
+    context_v2_native, monkeypatch, record_property
+):
+    """Scripted Codex RPC + real tagged benign OS process groups."""
+    from omnigent.harnesses.codex_native import app_server as module
+    from omnigent.harnesses.codex_native.process_registry import (
+        codex_native_session_tag_cmdline_arg,
+    )
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resident_inventory import session_context_work_evidence_v2
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    backend, client, websocket = context_v2_native
+    from omnigent.harnesses.codex_native import process_registry
+
+    # Undo the unit fixture's empty census; use the unchanged production reader.
+    monkeypatch.setattr(process_registry, "_ps_output", _real_registry_ps_output)
+    tag = f"owned-group-{os.getpid()}-{time.monotonic_ns()}"
+    processes = []
+    groups = []
+    unregistered = []
+    monkeypatch.setattr(module, "unregister_codex_native_process", unregistered.append)
+
+    async def respond(raw):
+        request = json.loads(raw)
+        result = (
+            {"thread": {"id": "primary"}}
+            if request["method"] == "thread/start"
+            else {"turn": {"id": "turn-one"}}
+        )
+        client._pending_requests[request["id"]].set_result({"result": result})
+
+    async def read():
+        return await session_context_work_evidence_v2(
+            "conversation",
+            "tagged-group-acceptance",
+            process_manager=None,
+            resources=SessionResourceRegistry(),
+        )
+
+    websocket.send.side_effect = respond
+    try:
+        for _ in range(2):
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+                codex_native_session_tag_cmdline_arg(tag),
+                start_new_session=True,
+            )
+            processes.append(process)
+            groups.append(os.getpgid(process.pid))
+        target, sentinel = processes
+        target_group, sentinel_group = groups
+        assert target_group == target.pid and sentinel_group == sentinel.pid
+        assert target_group != sentinel_group
+        for process, group in zip(processes, groups, strict=True):
+            assert process.returncode is None
+            assert await asyncio.to_thread(module._tagged_process_group_members, group, tag) == [
+                process.pid
+            ], "real same-UID/tag/PGID enumeration unavailable or unexpected"
+        backend.proc = target
+        backend._resident_spawned = True
+        backend.process_group_id, backend.process_registry_tag = target_group, tag
+        incarnation = backend.resident_incarnation_id
+        await client.request("thread/start", {})
+        await client.request("turn/start", {"threadId": "primary"})
+        before = await read()
+        (primary,) = before.context.sources[1].contexts
+        (work,) = before.inventory.observations
+        assert (work.runtime_id, work.generation) == (incarnation, str(backend._start_generation))
+        assert work.live_turn and not work.no_live_work_confirmed and not work.no_owned_descendants
+        assert before.assessment.reason == "other_session_working"
+
+        for _ in range(2):
+            await asyncio.wait_for(
+                orchestration._close_native_backend("conversation", "codex-native", backend),
+                timeout=10,
+            )
+            assert await asyncio.wait_for(target.wait(), 2) == -signal.SIGTERM
+            with pytest.raises(ProcessLookupError):
+                os.killpg(target_group, 0)
+            assert backend.process_exit_confirmed and backend.exit_confirmed
+            assert backend.resident_incarnation_id == incarnation
+            assert backend.process_group_id is backend.process_registry_tag is None
+            assert unregistered == [tag]
+            assert sentinel.returncode is None
+            assert os.getpgid(sentinel.pid) == sentinel_group
+            os.killpg(sentinel_group, 0)
+            after = await read()
+            source = after.context.sources[1]
+            assert {row.key for row in source.contexts} == {primary.key}
+            assert source.coverage == "partial" and source.work_bindings is None
+            assert all(
+                row.lifecycle == "unknown" and row.stop_proof is row.continuity_proof is None
+                for row in source.contexts
+            )
+            assert not after.inventory.observations and not after.assessment.allowed
+            assert not after.inventory.local_complete and not after.inventory.execution_fence
+    finally:
+        for process in processes:
+            if process.returncode is None:
+                process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), 2)
+            except asyncio.TimeoutError:
+                process.kill()
+                await asyncio.wait_for(process.wait(), 2)
+        record_property("proof_kind", "scripted Codex RPC + real tagged benign OS process groups")
+        record_property(
+            "owned_processes",
+            json.dumps(
+                [
+                    {"pid": process.pid, "pgid": group, "returncode": process.returncode}
+                    for process, group in zip(processes, groups, strict=True)
+                ]
+            ),
+        )
+        assert all(process.returncode is not None for process in processes)
 
 
 @pytest.mark.posix_only
