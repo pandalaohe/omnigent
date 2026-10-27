@@ -46,11 +46,15 @@ from __future__ import annotations
 import argparse
 import gc
 import importlib
+import json
+import logging
 import os
 import signal
 import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 from types import FrameType
 from typing import cast
 
@@ -59,6 +63,7 @@ from fastapi import FastAPI
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.inner import _proc
+from omnigent.inner.sandbox import ContainmentHandle
 from omnigent.process_logging import env_truthy
 from omnigent.runner._zygote import ZYGOTE_HARNESS_FORKED_ENV_VAR
 
@@ -100,6 +105,38 @@ _HARD_EXIT_TIMEOUT_S = float(
 
 _HARD_EXIT_LOCK = threading.Lock()
 _HARD_EXIT_ARMED = False
+_WINDOWS_JOB: ContainmentHandle | None = None
+
+
+def _bind_windows_job(process_record: str | None) -> None:
+    """Contain CLI descendants before importing any harness-specific code."""
+    global _WINDOWS_JOB
+    if not IS_WINDOWS:
+        return
+    logger = logging.getLogger(__name__)
+    try:
+        from omnigent.inner.windows_jobobject_sandbox import create_kill_on_close_job
+        from omnigent.native.windows_processes import process_birth
+
+        name = "Global\\omnigent-sdk-" + uuid.uuid4().hex
+        _WINDOWS_JOB = create_kill_on_close_job(os.getpid(), name=name)
+        if _WINDOWS_JOB is None:
+            logger.warning("SDK runner containment unavailable; keeping census-only recovery")
+            return
+        # Keep the sole handle until OS exit, including when receipt writing fails.
+        birth = process_birth(os.getpid())
+        if process_record is None or birth is None:
+            raise OSError("No owner directory or process birth identity for Job receipt")
+        record = Path(process_record)
+        receipt = record.with_name(record.name.removesuffix(".process.json") + ".job.json")
+        temporary = receipt.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"pid": os.getpid(), "create_time": birth, "job_name": name}),
+            encoding="utf-8",
+        )
+        temporary.replace(receipt)
+    except Exception:
+        logger.exception("SDK runner Job setup incomplete; keeping census-only recovery")
 
 
 def _set_pdeathsig() -> None:
@@ -355,6 +392,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="AP-allocated conversation id (e.g. 'conv_abc123').",
     )
     parser.add_argument(
+        "--process-record",
+        default=None,
+        help="Per-launch process-manager record path for Windows Job ownership receipts.",
+    )
+    parser.add_argument(
         "--parent-pid",
         type=int,
         default=None,
@@ -450,6 +492,7 @@ def main(argv: list[str] | None = None) -> None:
     # exception below WARNING is dropped. An agent CLI's own stderr (drained at
     # debug) and an executor traceback then reach no file an operator can read.
     _configure_logging(args.harness, args.conversation_id)
+    _bind_windows_job(args.process_record)
 
     # Initialize OTel tracing in the harness subprocess so ExecutorAdapter
     # can emit spans for agent turns, tool calls, and LLM interactions.

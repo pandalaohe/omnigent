@@ -33,7 +33,6 @@ import ctypes
 import ctypes.wintypes as wintypes
 import functools
 import logging
-from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol, cast
@@ -122,6 +121,8 @@ class _Kernel32(Protocol):
     OpenProcess: _WinFunction
     AssignProcessToJobObject: _WinFunction
     CloseHandle: _WinFunction
+    OpenJobObjectW: _WinFunction
+    GetLastError: _WinFunction
 
 
 class _WinLibraries(Protocol):
@@ -133,8 +134,7 @@ def _kernel32() -> _Kernel32:
 
 
 def _get_last_error() -> int:
-    get_last_error = cast(Callable[[], int], vars(ctypes)["get_last_error"])
-    return get_last_error()
+    return int(_kernel32().GetLastError() or 0)
 
 
 class _JobHandle:
@@ -234,82 +234,87 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
         del policy
 
     def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
-        """
-        Assign the just-spawned helper ``pid`` to a kill-on-close Job Object.
-
-        Creates an anonymous Job Object with
-        ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` (plus any configured memory
-        ceiling), then assigns ``pid``. Returns a handle the caller holds for
-        the helper's lifetime; closing it terminates the whole tree.
-
-        Degrades gracefully (returns ``None`` after logging) if the Win32
-        calls fail — e.g. the process is already in a job that forbids
-        nesting/breakaway, which can happen inside some CI containers.
-
-        :param policy: The resolved policy (read for resource ceilings).
-        :param pid: OS process id of the just-spawned helper.
-        :returns: A :class:`_JobHandle`, or ``None`` if containment could
-            not be established.
-        """
+        """Assign a helper to a kill-on-close job; log and return None on failure."""
         del policy
-        kernel32 = _kernel32()
+        return create_kill_on_close_job(pid)
 
-        job = kernel32.CreateJobObjectW(None, None)
-        if not job:
-            _LOGGER.warning(
-                "windows_jobobject: CreateJobObject failed (err=%d); helper pid "
-                "%d runs without Job Object containment.",
-                _get_last_error(),
-                pid,
-            )
-            return None
 
-        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(
-            wintypes.HANDLE(job),
-            _JobObjectExtendedLimitInformation,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
+def job_has_exited(name: str) -> bool:
+    """Confirm destruction: a job outlives its handles until every member exits."""
+    kernel32 = _kernel32()
+    handle = kernel32.OpenJobObjectW(0x0004, False, name)  # JOB_OBJECT_QUERY
+    if not handle:
+        return _get_last_error() == 2  # ERROR_FILE_NOT_FOUND; other errors are unknown.
+    kernel32.CloseHandle(wintypes.HANDLE(handle))
+    return False
+
+
+def create_kill_on_close_job(pid: int, *, name: str | None = None) -> _JobHandle | None:
+    """Assign a process to a fresh, non-inheritable kill-on-close job."""
+
+    kernel32 = _kernel32()
+
+    job = kernel32.CreateJobObjectW(None, name)
+    if not job:
+        _LOGGER.warning(
+            "windows_jobobject: CreateJobObject failed (err=%d); helper pid "
+            "%d runs without Job Object containment.",
+            _get_last_error(),
+            pid,
+        )
+        return None
+
+    if name is not None and _get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(wintypes.HANDLE(job))
+        _LOGGER.warning("windows_jobobject: refusing an existing named job")
+        return None
+
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        wintypes.HANDLE(job),
+        _JobObjectExtendedLimitInformation,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        _LOGGER.warning(
+            "windows_jobobject: SetInformationJobObject failed (err=%d); "
+            "closing job and continuing uncontained.",
+            _get_last_error(),
+        )
+        kernel32.CloseHandle(wintypes.HANDLE(job))
+        return None
+
+    proc_handle = kernel32.OpenProcess(
+        _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, wintypes.DWORD(pid)
+    )
+    if not proc_handle:
+        _LOGGER.warning(
+            "windows_jobobject: OpenProcess(pid=%d) failed (err=%d); continuing uncontained.",
+            pid,
+            _get_last_error(),
+        )
+        kernel32.CloseHandle(wintypes.HANDLE(job))
+        return None
+
+    try:
+        if not kernel32.AssignProcessToJobObject(
+            wintypes.HANDLE(job), wintypes.HANDLE(proc_handle)
         ):
             _LOGGER.warning(
-                "windows_jobobject: SetInformationJobObject failed (err=%d); "
-                "closing job and continuing uncontained.",
-                _get_last_error(),
-            )
-            kernel32.CloseHandle(wintypes.HANDLE(job))
-            return None
-
-        proc_handle = kernel32.OpenProcess(
-            _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, wintypes.DWORD(pid)
-        )
-        if not proc_handle:
-            _LOGGER.warning(
-                "windows_jobobject: OpenProcess(pid=%d) failed (err=%d); continuing uncontained.",
+                "windows_jobobject: AssignProcessToJobObject(pid=%d) failed "
+                "(err=%d) — process may already be in a non-nestable job. "
+                "Continuing without Job Object containment.",
                 pid,
                 _get_last_error(),
             )
             kernel32.CloseHandle(wintypes.HANDLE(job))
             return None
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
 
-        try:
-            if not kernel32.AssignProcessToJobObject(
-                wintypes.HANDLE(job), wintypes.HANDLE(proc_handle)
-            ):
-                _LOGGER.warning(
-                    "windows_jobobject: AssignProcessToJobObject(pid=%d) failed "
-                    "(err=%d) — process may already be in a non-nestable job. "
-                    "Continuing without Job Object containment.",
-                    pid,
-                    _get_last_error(),
-                )
-                kernel32.CloseHandle(wintypes.HANDLE(job))
-                return None
-        finally:
-            kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
-
-        _LOGGER.debug("windows_jobobject: assigned helper pid %d to job", pid)
-        return _JobHandle(job)
+    _LOGGER.debug("windows_jobobject: assigned helper pid %d to job", pid)
+    return _JobHandle(job)
 
 
 def os_name() -> str:
@@ -337,6 +342,10 @@ def _configure_prototypes() -> None:
     k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k.AssignProcessToJobObject.restype = wintypes.BOOL
     k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k.OpenJobObjectW.restype = wintypes.HANDLE
+    k.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k.GetLastError.restype = wintypes.DWORD
+    k.GetLastError.argtypes = []
     k.CloseHandle.restype = wintypes.BOOL
     k.CloseHandle.argtypes = [wintypes.HANDLE]
 

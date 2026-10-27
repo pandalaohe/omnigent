@@ -211,7 +211,10 @@ async def test_windows_spawn_records_identity_until_confirmed_close(
     monkeypatch.setattr(pm, "_spawn_harness_process", AsyncMock(return_value=process))
     try:
         entry = await pm._spawn_entry("example", "claude-sdk", None)
-        record = pm.instance_dir / "conv-6000.process.json"
+        spawn_argv = pm._spawn_harness_process.call_args.args[0]
+        record = entry.process_record_path
+        assert record is not None
+        assert spawn_argv[-2:] == ["--process-record", str(record)]
         assert json.loads(record.read_text()) == {"pid": 6000, "create_time": 123.5}
         assert await pm._close_entry(entry)
         assert not record.exists()

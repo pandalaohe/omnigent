@@ -493,6 +493,7 @@ class _SubprocessEntry:
         harness: str,
         model: str | None = None,
         acp_config: dict[str, str] | None = None,
+        process_record_path: Path | None = None,
     ) -> None:
         self.incarnation_id = uuid.uuid4().hex
         self.process = process
@@ -501,6 +502,7 @@ class _SubprocessEntry:
         self.harness = harness
         self.model = model
         self.acp_config = acp_config or {}
+        self.process_record_path = process_record_path
         self.last_used_at: float = 0.0
         self.exit_confirmed = False
         # Release generations may roll back after failed teardown; this evidence never does.
@@ -1921,6 +1923,11 @@ class HarnessProcessManager:
             "--parent-pid",
             str(parent_pid),
         ]
+        process_record_path = None
+        if IS_WINDOWS:
+            # The venv redirector and the actual interpreter can have different PIDs.
+            process_record_path = self._instance_dir / f"conv-{uuid.uuid4().hex}.process.json"
+            runner_argv.extend(["--process-record", str(process_record_path)])
         spawn_started_at = time.monotonic()
         process = await self._spawn_harness_process(runner_argv, effective_env)
         try:
@@ -1930,7 +1937,8 @@ class HarnessProcessManager:
                 birth = process_birth(process.pid)
                 if birth is None:
                     raise RuntimeError("Cannot record Windows harness process identity")
-                (self._instance_dir / f"conv-{process.pid}.process.json").write_text(
+                assert process_record_path is not None
+                process_record_path.write_text(
                     json.dumps({"pid": process.pid, "create_time": birth}), encoding="utf-8"
                 )
             await _wait_for_bind(process, endpoint, harness, conversation_id)
@@ -1998,6 +2006,7 @@ class HarnessProcessManager:
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
                 acp_config=_acp_startup_config(env) if harness == "acp" else None,
+                process_record_path=process_record_path,
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:
@@ -2019,7 +2028,8 @@ class HarnessProcessManager:
             with contextlib.suppress(Exception):
                 endpoint.cleanup()
             if IS_WINDOWS and process.returncode is not None:
-                (self._instance_dir / f"conv-{process.pid}.process.json").unlink(missing_ok=True)
+                assert process_record_path is not None
+                process_record_path.unlink(missing_ok=True)
             raise
 
     async def _spawn_harness_process(
@@ -2153,9 +2163,10 @@ class HarnessProcessManager:
             if closed:
                 entry.exit_confirmed = True
                 if IS_WINDOWS:
-                    (self._instance_dir / f"conv-{entry.process.pid}.process.json").unlink(
-                        missing_ok=True
+                    record = entry.process_record_path or (
+                        self._instance_dir / f"conv-{entry.process.pid}.process.json"
                     )
+                    record.unlink(missing_ok=True)
                 self._closing_entries.pop(entry.incarnation_id, None)
                 with contextlib.suppress(Exception):
                     close_subprocess_transport(entry.process)
@@ -2329,7 +2340,12 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
         from omnigent.native import windows_processes
 
         complete = True
-        for record in instance_dir.glob("conv-*.process.json"):
+        records = set(instance_dir.glob("conv-*.process.json"))
+        records.update(
+            path.with_name(path.name.removesuffix(".job.json") + ".process.json")
+            for path in instance_dir.glob("conv-*.job.json")
+        )
+        for record in records:
             if not await asyncio.to_thread(windows_processes.reap_record, record):
                 complete = False
         return complete
