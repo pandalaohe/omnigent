@@ -6,6 +6,7 @@ import errno
 import json
 import logging
 import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -1319,6 +1320,240 @@ def _make_unmarked_bridge(root: Path, *, inactive_since: float) -> tuple[Path, P
     for path in (rollout, bridge_dir / "bridge.json", bridge_dir / "codex-home", bridge_dir):
         os.utime(path, (inactive_since, inactive_since))
     return bridge_dir, rollout
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "none",
+        "fresh",
+        "fresh-sha",
+        "fresh-lock",
+        "fresh-dir",
+        "locked",
+        "open",
+        "live",
+        "unknown",
+        "probe-error",
+        "missing-lock",
+        "symlink",
+        "bridge-locked",
+        "partial-delete",
+        "scan-error",
+        "replaced-lock",
+        "staging-symlink",
+        "unrelated-mount",
+        "own-mount",
+        "mixed-warnings",
+        "two-mounts",
+        "invalid-device",
+        "nested-mount",
+    ],
+)
+def test_prune_orphan_plugin_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, guard: str
+) -> None:
+    import contextlib
+    import fcntl
+    from unittest.mock import patch
+
+    root = tmp_path / "codex-native"
+    bridge_dir = root / "dead"
+    bundle = bridge_dir / "codex-home" / ".tmp"
+    plugins = bundle / "plugins"
+    plugins.mkdir(parents=True)
+    plugin = plugins / "plugin.txt"
+    plugin.write_text("mirror")
+    sha = bundle / "plugins.sha"
+    sha.write_text("revision")
+    lock = bundle / "plugins.sync.lock"
+    lock.touch()
+    other = bundle / "keep.txt"
+    other.write_text("unrelated")
+    marker = bridge_dir / "owner.pid"
+    marker.write_text("invalid" if guard == "unknown" else "999999")
+    now = codex_native_bridge.time.time()
+    aged = now - 8 * 86400
+    for path in (plugin, plugins, sha, lock, marker):
+        os.utime(path, (aged, aged))
+    if guard == "partial-delete":
+        git_dir = plugins / ".git"
+        git_dir.mkdir()
+        for path in (git_dir, plugins):
+            os.utime(path, (aged, aged))
+
+        def partial_delete(path: Path, **kwargs: object) -> None:
+            (path / "plugin.txt").unlink()
+            raise OSError("interrupted recursive removal")
+
+        rmtree = codex_native_bridge.shutil.rmtree
+        monkeypatch.setattr(codex_native_bridge.shutil, "rmtree", partial_delete)
+    if guard == "scan-error":
+
+        def fail_scan(*args: object, **kwargs: object) -> None:
+            raise PermissionError("unreadable tree")
+
+        monkeypatch.setattr(codex_native_bridge.os, "walk", fail_scan)
+    if guard == "replaced-lock":
+        open_file = os.open
+
+        def replace_lock(path: Any, flags: int, mode: int = 0o777) -> int:
+            fd = open_file(path, flags, mode)
+            if path == lock:
+                replacement = bundle / "replacement"
+                replacement.touch()
+                replacement.replace(lock)
+            return fd
+
+        monkeypatch.setattr(codex_native_bridge.os, "open", replace_lock)
+    if guard == "staging-symlink":
+        external = tmp_path / "external"
+        external.mkdir()
+        (bridge_dir / "codex-home" / "tmp").symlink_to(external, target_is_directory=True)
+    if guard == "nested-mount":
+        nested = plugins / "mounted"
+        nested.mkdir()
+        for path in (plugins, nested):
+            os.utime(path, (aged, aged))
+        lstat = Path.lstat
+
+        def mounted_stat(path: Path) -> os.stat_result:
+            info = lstat(path)
+            if path == nested:
+                fields = list(info)
+                fields[2] = 0x36000113
+                return os.stat_result(fields)
+            return info
+
+        monkeypatch.setattr(Path, "lstat", mounted_stat)
+    mount_cases = {
+        "unrelated-mount",
+        "own-mount",
+        "mixed-warnings",
+        "two-mounts",
+        "invalid-device",
+        "nested-mount",
+    }
+    if guard in mount_cases:
+        monkeypatch.setattr(codex_native_bridge.sys, "platform", "darwin")
+    fresh_path = {"fresh": plugin, "fresh-sha": sha, "fresh-lock": lock, "fresh-dir": plugins}.get(
+        guard
+    )
+    if fresh_path is not None:
+        os.utime(fresh_path, (now, now))
+    if guard == "missing-lock":
+        lock.unlink()
+    if guard == "symlink":
+        external = tmp_path / "external"
+        plugins.rename(external)
+        plugins.symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _: guard == "live")
+    opened = plugin if guard == "open" else lock
+    cleanup_guard = codex_native_bridge.native_bridge_common.bridge_dir_preparation_lock(
+        bridge_dir
+    )
+    with contextlib.ExitStack() as stack:
+        if guard == "bridge-locked":
+            stack.enter_context(cleanup_guard)
+        fd = stack.enter_context(opened.open("rb")) if guard in {"locked", "open"} else None
+        if guard == "locked":
+            assert fd is not None
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        probe = codex_native_bridge._plugin_bundle_in_use
+
+        def controlled_probe(paths: list[Path], lock_fd: int) -> bool:
+            # Deterministic lsof output: unrelated host mounts can emit warnings.
+            output = f"p{os.getpid()}\nf{lock_fd}\n"
+            if guard == "open":
+                assert fd is not None
+                output += f"f{fd.fileno()}\n"
+            result = subprocess.CompletedProcess(
+                [], 1, output, "warning" if guard == "probe-error" else ""
+            )
+            if guard in mount_cases:
+                device = 0x36000113  # Captured Time Machine mount-table device ID.
+                if guard == "own-mount":
+                    device = lock.stat().st_dev & 0xFFFFFFFF
+                else:
+                    assert device != lock.stat().st_dev & 0xFFFFFFFF
+                # Captured macOS lsof 4.91 warning, with a neutral mount path.
+                result.stderr = (
+                    "lsof: WARNING: can't stat() smbfs file system /mnt/backup\n"
+                    "      Output information may be incomplete.\n"
+                    f'      assuming "dev={device:x}" from mount table\n'
+                )
+                if guard == "mixed-warnings":
+                    result.stderr += "lsof: unexpected inspection warning\n"
+                if guard == "two-mounts":
+                    result.stderr += result.stderr.replace(
+                        f"dev={device:x}", f"dev={lock.stat().st_dev & 0xFFFFFFFF:x}"
+                    )
+                if guard == "invalid-device":
+                    result.stderr = result.stderr.replace(f"dev={device:x}", "dev=100000000")
+            with patch.object(codex_native_bridge.subprocess, "run", return_value=result):
+                return probe(paths, lock_fd)
+
+        monkeypatch.setattr(codex_native_bridge, "_plugin_bundle_in_use", controlled_probe)
+        assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+        for path in (plugins, sha, lock):
+            if path == lock and guard == "missing-lock":
+                assert not path.exists()
+                continue
+            removed = guard in {"none", "unrelated-mount"} or (
+                guard == "partial-delete" and path == plugins
+            )
+            assert path.exists() != removed
+        if guard == "partial-delete":
+            assert list((bridge_dir / "codex-home" / "tmp").glob("plugins-trim-*/plugins/.git"))
+            monkeypatch.setattr(codex_native_bridge.shutil, "rmtree", rmtree)
+            assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+            assert not (bridge_dir / "codex-home" / "tmp").exists()
+            assert not sha.exists()
+            assert not lock.exists()
+        assert other.read_text() == "unrelated"
+        assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "output", "error", "busy"),
+    [
+        (0, "p123\nf4\n", "", False),
+        (1, "p123\nf4\n", "", False),
+        (0, "p123\nf4\nf5\n", "", True),
+        (0, "p123\nf4\np999\nf4\n", "", True),
+        (0, "p123\nf4\n", "warning", True),
+        (0, "invalid", "", True),
+        (0, "", "", True),
+        (1, "", "", True),
+        (1, "p999\nf4\n", "", True),
+        (2, "", "", True),
+    ],
+)
+def test_plugin_bundle_descriptor_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    output: str,
+    error: str,
+    busy: bool,
+) -> None:
+    result = subprocess.CompletedProcess([], returncode, output, error)
+    monkeypatch.setattr(codex_native_bridge.os, "getpid", lambda: 123)
+    monkeypatch.setattr(codex_native_bridge.subprocess, "run", lambda *a, **kw: result)
+    assert codex_native_bridge._plugin_bundle_in_use([tmp_path], 4) is busy
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError(), subprocess.TimeoutExpired("lsof", 5)])
+def test_plugin_bundle_descriptor_probe_failure_keeps_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(codex_native_bridge.subprocess, "run", fail)
+    assert codex_native_bridge._plugin_bundle_in_use([tmp_path], 4)
 
 
 def test_prune_orphaned_bridge_dirs_removes_expired_unmarked_bridge(

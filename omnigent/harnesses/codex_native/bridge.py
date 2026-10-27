@@ -8,10 +8,12 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -369,6 +371,7 @@ def _trim_codex_orphan_caches(bridge_dir: Path) -> None:
         entries = list(codex_home.iterdir())
     except OSError:
         return
+    _trim_codex_orphan_plugin_bundle(codex_home)
     for entry in entries:
         if entry.name not in _ORPHAN_CACHE_TRIM_NAMES and not entry.name.startswith("logs_"):
             continue
@@ -393,6 +396,141 @@ def _trim_codex_orphan_caches(bridge_dir: Path) -> None:
             )
     except OSError:
         _logger.warning("Could not preserve Codex orphan cache activity time")
+
+
+def _plugin_bundle_expired(paths: list[Path]) -> bool:
+    """Require every bundle entry, including nested directories, to be old."""
+    cutoff = time.time() - _ORPHAN_CACHE_TRIM_SECONDS
+
+    def scan_error(error: OSError) -> None:
+        raise error
+
+    try:
+        for path in paths:
+            root_stat = path.lstat()
+            if root_stat.st_mtime > cutoff:
+                return False
+            if path.is_dir():
+                for directory, dirs, files in os.walk(path, onerror=scan_error, followlinks=False):
+                    for name in dirs + files:
+                        info = (Path(directory) / name).lstat()
+                        # lsof +D does not inspect nested filesystems by default.
+                        if info.st_dev != root_stat.st_dev or info.st_mtime > cutoff:
+                            return False
+    except OSError:
+        return False
+    return True
+
+
+def _plugin_bundle_warnings_relevant(warnings: str, paths: list[Path]) -> bool:
+    """Only ignore Darwin mount warnings proven to name other devices."""
+    if not warnings:
+        return False
+    if sys.platform != "darwin":
+        return True
+    try:
+        devices = {path.stat().st_dev & 0xFFFFFFFF for path in paths}
+    except OSError:
+        return True
+    # Darwin lsof prints its mount-table fallback st_dev with C's unsigned %x.
+    pattern = (
+        r"lsof: WARNING: can't stat\(\) \S+ file system /[^\n]+\n"
+        r"      Output information may be incomplete\.\n"
+        r'      assuming "dev=([0-9a-fA-F]{1,8})" from mount table\n'
+    )
+    consumed = 0
+    for warning in re.finditer(pattern, warnings):
+        if warning.start() != consumed or int(warning[1], 16) in devices:
+            return True
+        consumed = warning.end()
+    return consumed != len(warnings)
+
+
+def _plugin_bundle_in_use(paths: list[Path], lock_fd: int) -> bool:
+    """Keep on any open descriptor or incomplete lsof inspection."""
+    command = ["lsof", "-Fpf"]
+    for path in paths:
+        if path.is_dir():
+            command.extend(["+D", str(path)])
+    command.extend(["--", *(str(path) for path in paths if not path.is_dir())])
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if result.returncode not in {0, 1} or _plugin_bundle_warnings_relevant(result.stderr, paths):
+        return True
+    # Unmatched bundle members make lsof return 1 even with our lock listed.
+    pid = ""
+    saw_own_lock = False
+    for field in result.stdout.splitlines():
+        if field.startswith("p") and field[1:].isdigit():
+            pid = field[1:]
+        elif field.startswith("f"):
+            if pid != str(os.getpid()) or field[1:] != str(lock_fd):
+                return True
+            saw_own_lock = True
+        else:
+            return True
+    return not saw_own_lock
+
+
+def _trim_codex_orphan_plugin_bundle(codex_home: Path) -> None:
+    """Trim only the curated plugin mirror, under Codex's startup-sync lock."""
+    try:
+        import fcntl
+    except ImportError:
+        return
+    tmp = codex_home / ".tmp"
+    if tmp.is_symlink() or not tmp.is_dir():
+        return
+    paths: list[Path] = []
+    try:
+        for name in ("plugins", "plugins.sha", "plugins.sync.lock"):
+            path = tmp / name
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not (stat.S_ISDIR(mode) if name == "plugins" else stat.S_ISREG(mode)):
+                return
+            paths.append(path)
+        lock_path = tmp / "plugins.sync.lock"
+        if lock_path not in paths or not _plugin_bundle_expired(paths):
+            return
+        # Rust File.lock() uses flock on Unix, not POSIX record locks (lockf).
+        fd = os.open(lock_path, os.O_WRONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = os.fstat(fd)
+            current = lock_path.lstat()
+            if (locked.st_dev, locked.st_ino) != (current.st_dev, current.st_ino):
+                return
+            if _plugin_bundle_in_use(paths, fd) or not _plugin_bundle_expired(paths):
+                return
+            plugins = tmp / "plugins"
+            staging: Path | None = None
+            if plugins in paths:
+                cache_tmp = codex_home / "tmp"
+                if cache_tmp.is_symlink():
+                    return
+                cache_tmp.mkdir(exist_ok=True)
+                staging = Path(tempfile.mkdtemp(prefix="plugins-trim-", dir=cache_tmp))
+                retired = staging / "plugins"
+                # Never leave a partially removed mirror at Codex's reusable path.
+                # Interrupted staging is reclaimed by the existing top-level tmp trim.
+                plugins.rename(retired)
+                paths[paths.index(plugins)] = retired
+            for path in paths:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            if staging is not None:
+                staging.rmdir()
+        finally:
+            os.close(fd)
+    except OSError:
+        return
 
 
 def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
