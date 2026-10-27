@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import Counter
-from dataclasses import asdict, dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
@@ -24,15 +26,19 @@ from omnigent.host.frames import (
     HostOwnerInventorySnapshot,
     encode_host_frame,
 )
+from omnigent.host.recovery import RecoveryAssessment
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.startup_protocol import (
     CONTEXT_INVENTORY_CONTRACT_HEADER,
     CONTEXT_INVENTORY_MAX_BYTES,
     CONTEXT_INVENTORY_V2,
+    CONTEXT_WORK_INVENTORY_V2,
     ContextAuthorityV2,
     ContextEvidenceV2,
+    ContextWorkEvidenceV2,
     ScopeKeyV2,
     decode_context_evidence_v2,
+    decode_context_work_evidence_v2,
     harness_context_authority_v2,
     host_context_scope_v2,
     session_context_scopes_v2,
@@ -48,6 +54,8 @@ if TYPE_CHECKING:
 _HOST_BINDING_PAGE_SIZE = 100
 _MAX_HOST_BINDING_PAGES = 10
 _MAX_CONCURRENT_RUNNER_READS = 4
+_MAX_HOST_CONTEXT_SESSIONS = 1000
+_MAX_HOST_CONTEXT_BYTES = CONTEXT_INVENTORY_MAX_BYTES
 
 
 @dataclass(frozen=True)
@@ -660,57 +668,342 @@ async def read_runner_context_inventory_v2(
     timeout_s: float = 5.0,
 ) -> ContextEvidenceV2 | None:
     """Read one runner's aggregate v2 evidence on its existing authenticated client."""
+    read = await _prepare_runner_context_inventory_v2(
+        router, initializer, member, timeout_s=timeout_s, work=False
+    )
+    evidence = read.reconcile()
+    return evidence if isinstance(evidence, ContextEvidenceV2) else None
+
+
+@dataclass(frozen=True)
+class _PreparedRunnerContextV2:
+    reconcile: Callable[[], ContextEvidenceV2 | ContextWorkEvidenceV2 | None]
+    wire_bytes: int = 0
+
+
+def _age_context_v2(evidence: ContextEvidenceV2, elapsed: float) -> ContextEvidenceV2:
+    return evidence.model_copy(
+        update={
+            "sources": tuple(
+                source.model_copy(update={"age_upper_bound_s": source.age_upper_bound_s + elapsed})
+                if source.age_upper_bound_s is not None
+                else source
+                for source in evidence.sources
+            )
+        }
+    )
+
+
+async def _prepare_runner_context_inventory_v2(
+    router: RunnerRouter,
+    initializer: RunnerSessionInitializer,
+    member: HostRunnerMembership,
+    *,
+    timeout_s: float,
+    work: bool,
+) -> _PreparedRunnerContextV2:
+    missing = _PreparedRunnerContextV2(lambda: None)
     if not 0 < timeout_s <= 5.0 or not member.session_ids:
-        return None
+        return missing
     if not router.runner_has_capability(member.runner_id, CONTEXT_INVENTORY_V2):
-        return None
+        return missing
     session_id = member.session_ids[0]
+    started = time.monotonic()
+    contract = CONTEXT_WORK_INVENTORY_V2 if work else CONTEXT_INVENTORY_V2
+    path = "/v2/startup/context-work-inventory" if work else "/v2/startup/context-inventory"
     try:
         # The tunnel transport ignores httpx's per-phase timeouts, so the whole
         # read (routing, head, body, cleanup) runs under one total deadline.
         async with asyncio.timeout(timeout_s):
             routed = await asyncio.to_thread(router.client_for_existing_conversation, session_id)
             if routed is None or routed.runner_id != member.runner_id:
-                return None
+                return missing
             generation = initializer.generation_for(routed.runner_id, routed.client)
             read_id = uuid4().hex
             async with routed.client.stream(
                 "GET",
-                "/v2/startup/context-inventory",
+                path,
                 params={"read_id": read_id, "session_id": session_id},
                 timeout=timeout_s,
                 follow_redirects=False,
             ) as response:
                 if (
                     response.status_code != 200
-                    or response.headers.get(CONTEXT_INVENTORY_CONTRACT_HEADER)
-                    != CONTEXT_INVENTORY_V2
+                    or response.headers.get(CONTEXT_INVENTORY_CONTRACT_HEADER) != contract
                 ):
-                    return None
+                    return missing
                 payload = bytearray()
                 async for chunk in response.aiter_bytes():
                     if len(payload) + len(chunk) > CONTEXT_INVENTORY_MAX_BYTES:
-                        return None
+                        return missing
                     payload.extend(chunk)
             initializer.require_generation(routed.runner_id, routed.client, generation)
-            return decode_context_evidence_v2(
+            decode = decode_context_work_evidence_v2 if work else decode_context_evidence_v2
+            evidence = decode(
                 bytes(payload),
                 read_id=read_id,
                 authority=harness_context_authority_v2(session_id),
                 expected_scopes=session_context_scopes_v2(session_id),
             )
+
+            def reconcile() -> ContextEvidenceV2 | ContextWorkEvidenceV2 | None:
+                try:
+                    initializer.require_generation(routed.runner_id, routed.client, generation)
+                except ConnectionError:
+                    return None
+                if routed.client.is_closed or not router.runner_has_capability(
+                    member.runner_id, CONTEXT_INVENTORY_V2
+                ):
+                    return None
+                elapsed = time.monotonic() - started
+                if isinstance(evidence, ContextWorkEvidenceV2):
+                    return evidence.model_copy(
+                        update={"context": _age_context_v2(evidence.context, elapsed)}
+                    )
+                return _age_context_v2(evidence, elapsed)
+
+            return _PreparedRunnerContextV2(reconcile, len(payload))
     except TimeoutError:
-        return None
+        return missing
     except (httpx.HTTPError, ConnectionError, ValueError):
-        return None
+        return missing
     except OmnigentError as exc:
         if exc.code in {
             ErrorCode.UNAUTHORIZED,
             ErrorCode.WRONG_REPLICA,
             ErrorCode.RUNNER_UNAVAILABLE,
         }:
-            return None
+            return missing
         raise
+
+
+@dataclass(frozen=True)
+class HostSessionWorkReadV2:
+    session_id: str
+    runner_id: str | None
+    runner: ContextWorkEvidenceV2 | None
+    host: ContextEvidenceV2 | None
+    normalization: ContextInventoryNormalization
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class HostSessionWorkInventoryV2:
+    membership: HostMembershipInventory
+    sessions: tuple[HostSessionWorkReadV2, ...]
+    diagnostics: tuple[str, ...]
+    assessment: RecoveryAssessment
+
+
+async def read_host_session_work_inventory_v2(
+    hosts: HostRegistry,
+    conn: HostConnection,
+    conversations: ConversationStore,
+    router: RunnerRouter | None,
+    initializer: RunnerSessionInitializer | None,
+    *,
+    timeout_s: float = 5.0,
+) -> HostSessionWorkInventoryV2 | None:
+    """Union session observations; no combined authority or recovery permission."""
+    if router is None or initializer is None or not 0 < timeout_s <= 5.0:
+        return None
+    owner = (
+        conn.ws,
+        conn.workspace_id,
+        conn.owner,
+        conn.account_generation,
+        conn.startup_generation,
+        conn.hello.connection_id,
+    )
+    try:
+        async with asyncio.timeout(timeout_s):
+            ownership = await read_host_context_inventory(
+                hosts, conn, conversations, router, initializer, timeout_s=timeout_s
+            )
+            if ownership is None:
+                return None
+            selected = ownership.membership
+            candidates: list[tuple[HostRunnerMembership | None, str]] = []
+            diagnostics = []
+            for owner_read in ownership.runners:
+                member = owner_read.membership
+                ids = set(member.session_ids)
+                if member.host_owner is not None and member.host_owner.session_id is not None:
+                    ids.add(member.host_owner.session_id)
+                inventory = owner_read.inventory
+                if inventory is None:
+                    diagnostics.append("runner_owner_inventory_unknown")
+                else:
+                    ids.update(
+                        sid
+                        for native in inventory.native_backends.owners
+                        for sid in native.session_ids
+                    )
+                    if inventory.harnesses is not None:
+                        ids.update(owner.session_id for owner in inventory.harnesses.owners)
+                    if inventory.terminals is not None:
+                        ids.update(owner.conversation_id for owner in inventory.terminals)
+                if not ids:
+                    diagnostics.append("runner_without_session")
+                candidates.extend((member, sid) for sid in sorted(ids))
+            candidates.extend((None, sid) for sid in selected.unbound_session_ids)
+            if len(candidates) > _MAX_HOST_CONTEXT_SESSIONS:
+                return None
+            prepared = {}
+            host_reads = {}
+            reasons = {}
+            wire_bytes = 0
+            budget_exhausted = False
+            pending = iter(candidates)
+
+            async def read_sessions() -> None:
+                nonlocal wire_bytes, budget_exhausted
+                for member, sid in pending:
+                    if budget_exhausted:
+                        return
+                    key = (member.runner_id if member else None, sid)
+                    reason = None
+                    if member is None:
+                        reason = "unbound_session"
+                    elif member.host_owner is None:
+                        reason = "host_owner_missing"
+                    elif member.host_owner.stop_requested:
+                        reason = "runner_stop_requested"
+                    elif sid not in member.session_ids:
+                        reason = (
+                            "host_only_session"
+                            if sid == member.host_owner.session_id
+                            else "runner_only_session"
+                        )
+                    elif member.runner_id in selected.host.pending_runner_ids:
+                        reason = "runner_launch_pending"
+                    elif not router.runner_has_capability(member.runner_id, CONTEXT_INVENTORY_V2):
+                        reason = "peer_needs_update"
+                    reasons[key] = reason
+                    if reason is not None or member is None:
+                        continue
+                    read = await _prepare_runner_context_inventory_v2(
+                        router,
+                        initializer,
+                        replace(member, session_ids=(sid,)),
+                        timeout_s=timeout_s,
+                        work=True,
+                    )
+                    wire_bytes += read.wire_bytes
+                    if wire_bytes > _MAX_HOST_CONTEXT_BYTES:
+                        budget_exhausted = True
+                        return
+                    prepared[key] = read
+                    started = time.monotonic()
+                    host_evidence = await read_host_context_inventory_v2(
+                        hosts, conn, sid, timeout_s=timeout_s
+                    )
+                    if host_evidence is not None:
+                        wire_bytes += len(host_evidence.model_dump_json().encode())
+                        if wire_bytes > _MAX_HOST_CONTEXT_BYTES:
+                            budget_exhausted = True
+                            return
+                    host_reads[key] = (host_evidence, started)
+
+            async with asyncio.TaskGroup() as workers:
+                for _ in range(min(_MAX_CONCURRENT_RUNNER_READS, len(candidates))):
+                    workers.create_task(read_sessions())
+            if budget_exhausted:
+                return None
+            population_reads = []
+            for owner_read in ownership.runners:
+                if owner_read.runner_generation is not None:
+                    member = owner_read.membership
+                    try:
+                        routed = await asyncio.to_thread(
+                            router.client_for_existing_conversation, member.session_ids[0]
+                        )
+                    except OmnigentError as exc:
+                        if exc.code in {
+                            ErrorCode.UNAUTHORIZED,
+                            ErrorCode.WRONG_REPLICA,
+                            ErrorCode.RUNNER_UNAVAILABLE,
+                        }:
+                            return None
+                        raise
+                    if routed is None or routed.runner_id != member.runner_id:
+                        return None
+                    population_reads.append(
+                        (member.runner_id, routed.client, owner_read.runner_generation)
+                    )
+            final = await read_host_membership_inventory(
+                hosts, conn, conversations, timeout_s=timeout_s
+            )
+            if (
+                final is None
+                or final != selected
+                or owner
+                != (
+                    conn.ws,
+                    conn.workspace_id,
+                    conn.owner,
+                    conn.account_generation,
+                    conn.startup_generation,
+                    conn.hello.connection_id,
+                )
+            ):
+                return None
+            for runner_id, client, generation in population_reads:
+                try:
+                    initializer.require_generation(runner_id, client, generation)
+                    if client.is_closed:
+                        diagnostics.append("runner_owner_inventory_changed")
+                except ConnectionError:
+                    diagnostics.append("runner_owner_inventory_changed")
+            sessions = []
+            working = False
+            for member, sid in candidates:
+                key = (member.runner_id if member else None, sid)
+                read = prepared.get(key)
+                evidence = read.reconcile() if read is not None else None
+                runner = evidence if isinstance(evidence, ContextWorkEvidenceV2) else None
+                host_read = host_reads.get(key)
+                host = (
+                    _age_context_v2(host_read[0], time.monotonic() - host_read[1])
+                    if host_read is not None and host_read[0] is not None
+                    else None
+                )
+                normalization = normalize_context_inventory_v2(
+                    expected_scopes=(*session_context_scopes_v2(sid), host_context_scope_v2(sid)),
+                    runner_evidence=runner.context if runner is not None else None,
+                    host_evidence=host,
+                    runner_capable=member is not None
+                    and router.runner_has_capability(member.runner_id, CONTEXT_INVENTORY_V2),
+                    host_capable=CONTEXT_INVENTORY_V2 in conn.hello.capabilities,
+                )
+                sessions.append(
+                    HostSessionWorkReadV2(
+                        sid,
+                        key[0],
+                        runner,
+                        host,
+                        normalization,
+                        reasons[key] or ("runner_read_unavailable" if runner is None else None),
+                    )
+                )
+                if runner is not None:
+                    working |= any(
+                        row.live_turn
+                        or row.live_tool
+                        or row.background_job
+                        or row.protected_interaction
+                        for row in runner.inventory.observations
+                    )
+            return HostSessionWorkInventoryV2(
+                final,
+                tuple(sessions),
+                tuple(diagnostics),
+                RecoveryAssessment(
+                    False, "other_session_working" if working else "inventory_incomplete"
+                ),
+            )
+    except (TimeoutError, ConnectionError):
+        return None
 
 
 def _host_context_authority(conn: HostConnection, session_id: str) -> ContextAuthorityV2:

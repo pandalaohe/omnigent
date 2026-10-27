@@ -22,6 +22,9 @@ from omnigent.db.session_startup import SqlStartupBudget
 from omnigent.entities.session_startup import StartupReceipt
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runner import create_runner_app
+from omnigent.runner.resident_inventory import (
+    owner_registration_snapshot as read_registered_owners,
+)
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, ResponseHeadFrame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -33,6 +36,9 @@ from omnigent.server.startup_admission import StartupAdmission
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.session_startup_store import SessionStartupStore
 from omnigent.terminals import TerminalRegistry
+from tests.harnesses.codex_native.test_codex_native_app_server_rpc import (
+    context_v2_native as context_v2_native,
+)
 from tests.runner.helpers import NullServerClient
 from tests.server.test_host_registry import FakeWebSocket
 
@@ -1156,6 +1162,182 @@ async def _exchange_host_context_inventory(setup, **kwargs):
             outbound = await asyncio.wait_for(conn.outbound_queue.get(), 2)
             await host._handle_raw_message(socket, outbound.data)
         return await asyncio.wait_for(read, 2)
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+
+
+async def _exchange_host_session_work_v2(setup, **kwargs):
+    from omnigent.server import resident_inventory
+
+    control, conversations, router, initializer, _tunnels, _client, _requests = setup
+    hosts, conn, host, socket, _sent, _fault, _process = control
+
+    async def pump():
+        while True:
+            outbound = await conn.outbound_queue.get()
+            await host._handle_raw_message(socket, outbound.data)
+
+    driver = asyncio.create_task(pump())
+    try:
+        return await resident_inventory.read_host_session_work_inventory_v2(
+            hosts, conn, conversations, router, initializer, **kwargs
+        )
+    finally:
+        driver.cancel()
+        await asyncio.gather(driver, return_exceptions=True)
+
+
+async def test_host_session_work_v2_preserves_union_and_independent_authorities(
+    host_context_reader, context_v2_native, monkeypatch
+):
+    import json
+
+    from omnigent.runner.native import orchestration
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
+
+    control, conversations, _router, _initializer, tunnels, _runner, requests = host_context_reader
+    _hosts, conn, host, _socket, _sent, _fault, process = control
+    host._identity = SimpleNamespace(host_id=conn.host_id)
+    conn.hello.capabilities.append(CONTEXT_INVENTORY_V2)
+    tunnels.get("runner-one").hello.capabilities.append(CONTEXT_INVENTORY_V2)
+    ids = conversations.list_host_conversation_ids(conn.host_id)
+    main, side = sorted(ids)
+    conversations.update_conversation(side, archived=True)
+    unbound, server_only = (conversations.create_conversation().id for _ in range(2))
+    for sid in (unbound, server_only):
+        conversations.set_host_id(sid, conn.host_id, "/opt/work/project")
+    conversations.set_runner_id(server_only, "server-only")
+    host._pending_runner_launches["pending-only"] = set()
+    monkeypatch.setattr(
+        "omnigent.runner.resident_inventory.owner_registration_snapshot", read_registered_owners
+    )
+    backend, native, websocket = context_v2_native
+    orchestration._AUTO_CODEX_APP_SERVERS[main] = backend
+    orchestration._bind_codex_inventory_client(main, backend, native, incarnation_id=None)
+
+    async def respond(raw):
+        message = json.loads(raw)
+        result = (
+            {"thread": {"id": "primary"}}
+            if message["method"] == "thread/start"
+            else {"turn": {"id": "turn"}}
+        )
+        native._pending_requests[message["id"]].set_result({"result": result})
+
+    websocket.send.side_effect = respond
+    await native.request("thread/start", {})
+    await native.request("turn/start", {"threadId": "primary"})
+    result = await _exchange_host_session_work_v2(host_context_reader)
+    assert result is not None and result.assessment.reason == "other_session_working"
+    by_session = {row.session_id: row for row in result.sessions}
+    assert set(by_session) == {main, side, unbound, server_only, "session-one", "conversation"}
+    assert by_session[main].runner.context.authority.session_id == main
+    assert by_session[side].runner.context.authority.session_id == side
+    assert by_session[main].host.authority.session_id == main
+    assert by_session[side].host.authority.session_id == side
+    assert by_session[main].runner.inventory.observations[0].live_turn
+    assert not by_session[side].runner.inventory.observations
+    assert by_session[main].runner.context.sources[1].age_upper_bound_s > 0
+    assert by_session["session-one"].reason == "host_only_session"
+    assert by_session["conversation"].reason == "runner_only_session"
+    assert by_session[unbound].reason == "unbound_session"
+    assert by_session[server_only].reason == "host_owner_missing"
+    assert "runner_without_session" in result.diagnostics
+    assert all(row.normalization.readiness != "complete" for row in result.sessions)
+    assert requests == ["/v1/startup/owner-inventory", *["/v2/startup/context-work-inventory"] * 2]
+    assert not conn.pending_owner_inventory and not conn.pending_context_inventory
+    process.poll.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "change", ["runner", "binding", "host", "account", "malformed", "unsupported"]
+)
+async def test_host_session_work_v2_rechecks_and_retains_missing_sources(
+    host_context_reader, change
+):
+    import json
+
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
+
+    control, conversations, _router, _initializer, tunnels, runner, _requests = host_context_reader
+    _hosts, conn, host, _socket, _sent, _fault, _process = control
+    host._identity = SimpleNamespace(host_id=conn.host_id)
+    conn.hello.capabilities.append(CONTEXT_INVENTORY_V2)
+    tunnels.get("runner-one").hello.capabilities.append(CONTEXT_INVENTORY_V2)
+    ids = conversations.list_host_conversation_ids(conn.host_id)
+    calls = 0
+
+    async def changed(response):
+        nonlocal calls
+        if response.request.url.path != "/v2/startup/context-work-inventory":
+            return
+        calls += 1
+        if change == "malformed":
+            await response.aread()
+            body = response.json()
+            body["context"]["authority"]["session_id"] = "foreign"
+            response._content = json.dumps(body).encode()
+        elif calls == 2:
+            if change == "runner":
+                tunnels.register("runner-one", FakeWebSocket(), HelloFrame("test", 1))
+            elif change == "binding":
+                conversations.replace_runner_id(ids[0], "replacement")
+            elif change == "host":
+                host._pending_runner_launches["new-owner"] = set()
+            elif change == "account":
+                conn.account_generation = "replacement"
+
+    runner.event_hooks["response"].append(changed)
+    if change == "unsupported":
+        tunnels.get("runner-one").hello.capabilities.remove(CONTEXT_INVENTORY_V2)
+    result = await _exchange_host_session_work_v2(host_context_reader)
+    if change in {"binding", "host", "account"}:
+        assert result is None
+    else:
+        assert result is not None and not result.assessment.allowed
+        assert all(row.runner is None for row in result.sessions)
+        assert all(row.normalization.readiness != "complete" for row in result.sessions)
+    assert not conn.pending_owner_inventory and not conn.pending_context_inventory
+
+
+@pytest.mark.parametrize("end", ["sessions", "bytes", "timeout", "cancel"])
+async def test_host_session_work_v2_bounds_and_drains(host_context_reader, monkeypatch, end):
+    from omnigent.server import resident_inventory
+    from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
+
+    control, _conversations, _router, _initializer, tunnels, runner, _requests = (
+        host_context_reader
+    )
+    _hosts, conn, host, _socket, _sent, _fault, _process = control
+    host._identity = SimpleNamespace(host_id=conn.host_id)
+    conn.hello.capabilities.append(CONTEXT_INVENTORY_V2)
+    tunnels.get("runner-one").hello.capabilities.append(CONTEXT_INVENTORY_V2)
+    entered = asyncio.Event()
+
+    async def pause(request):
+        if request.url.path == "/v2/startup/context-work-inventory":
+            entered.set()
+            await asyncio.Event().wait()
+
+    if end == "sessions":
+        monkeypatch.setattr(resident_inventory, "_MAX_HOST_CONTEXT_SESSIONS", 1)
+    elif end == "bytes":
+        monkeypatch.setattr(resident_inventory, "_MAX_HOST_CONTEXT_BYTES", 1)
+    else:
+        runner.event_hooks["request"].append(pause)
+    read = asyncio.create_task(_exchange_host_session_work_v2(host_context_reader, timeout_s=0.5))
+    try:
+        if end in {"timeout", "cancel"}:
+            await asyncio.wait_for(entered.wait(), 2)
+        if end == "cancel":
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+        else:
+            assert await asyncio.wait_for(read, 2) is None
+        assert not conn.pending_owner_inventory and not conn.pending_context_inventory
     finally:
         if not read.done():
             read.cancel()
