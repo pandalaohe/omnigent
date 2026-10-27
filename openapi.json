@@ -7911,6 +7911,7 @@
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
             "session.speed_tier": "#/components/schemas/SessionSpeedTierEvent",
+            "session.standing_pass": "#/components/schemas/SessionStandingPassEvent",
             "session.startup": "#/components/schemas/SessionStartupEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
@@ -8001,6 +8002,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionStandingPassEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -10916,6 +10920,50 @@
           "speed_tier"
         ],
         "title": "SessionSpeedTierEvent",
+        "type": "object"
+      },
+      "SessionStandingPassEvent": {
+        "description": "The mother's advisory pass changed; descendants share the root record.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "record": {
+            "additionalProperties": true,
+            "title": "Record",
+            "type": "object"
+          },
+          "root_id": {
+            "title": "Root Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.standing_pass",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "root_id",
+          "record"
+        ],
+        "title": "SessionStandingPassEvent",
         "type": "object"
       },
       "SessionStartupEvent": {
@@ -16775,6 +16823,47 @@
           }
         },
         "summary": "Initialize User Preferences"
+      }
+    },
+    "/v1/me/preferences/keep_warm/convert": {
+      "post": {
+        "operationId": "convert_keep_warm_v1_me_preferences_keep_warm_convert_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Convert Keep Warm V1 Me Preferences Keep Warm Convert Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Convert Keep Warm"
       }
     },
     "/v1/me/preferences/worktree_archive/migrate": {
@@ -23995,7 +24084,7 @@
     },
     "/v1/sessions/{session_id}/succession": {
       "post": {
-        "description": "Hand a top-level session's live children to its successor.\n\nThe caller must hold edit access on both sessions. A session without\na parent and without live children is a `noop`, unless `allow_empty`\nrequests retirement. Undo is the same call reversed: when the\ntarget still points back at the caller via `omnigent.succeeded_by`,\nthe move transaction clears the forward pair and writes the inverse.",
+        "description": "Hand a top-level session's live children to its successor.\n\nThe caller must hold edit access on both sessions. A session without\na parent and without live children is a `noop`, unless `allow_empty`\nrequests retirement or the server already prepared this successor.\nUndo is the same call reversed: when the\ntarget still points back at the caller via `omnigent.succeeded_by`,\nthe move transaction clears the forward pair and writes the inverse.",
         "operationId": "start_session_succession_v1_sessions__session_id__succession_post",
         "parameters": [
           {
@@ -24046,7 +24135,7 @@
     },
     "/v1/sessions/{session_id}/successor": {
       "post": {
-        "description": "Create or recover one server-configured successor for a Pi session.",
+        "description": "Create or recover a successor before its runner can initialize it.",
         "operationId": "create_session_successor_v1_sessions__session_id__successor_post",
         "parameters": [
           {

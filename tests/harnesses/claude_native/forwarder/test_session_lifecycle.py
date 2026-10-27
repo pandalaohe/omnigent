@@ -90,21 +90,14 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                     },
                 },
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            assert body == {
-                "agent_id": "ag_claude",
-                "title": "续接状态检查",
-                "project_id": "project_alpha",
-                "workspace": "/opt/work/claude-project",
-                "git": None,
-                "labels": {
-                    "omnigent.ui": "terminal",
-                    BRIDGE_ID_LABEL_KEY: "bridge_shared",
-                },
-            }
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
+            assert body is None
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
-            assert body == {"runner_id": "runner_one"}
+            assert body in (
+                {"runner_id": "runner_one"},
+                {"labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"}},
+            )
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "GET" and request.url.path.endswith(
             "/terminals/terminal_claude_main"
@@ -165,21 +158,8 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     assert (bridge_dir / "hook_forwarder.json").exists()
     assert [call for call in calls if call[0] != "GET" or call[1] == "/v1/sessions/conv_old"] == [
         ("GET", "/v1/sessions/conv_old", None),
-        (
-            "POST",
-            "/v1/sessions",
-            {
-                "agent_id": "ag_claude",
-                "title": "续接状态检查",
-                "project_id": "project_alpha",
-                "workspace": "/opt/work/claude-project",
-                "git": None,
-                "labels": {
-                    "omnigent.ui": "terminal",
-                    BRIDGE_ID_LABEL_KEY: "bridge_shared",
-                },
-            },
-        ),
+        ("POST", "/v1/sessions/conv_old/successor", None),
+        ("PATCH", "/v1/sessions/conv_new", {"labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"}}),
         ("PATCH", "/v1/sessions/conv_new", {"runner_id": "runner_one"}),
         (
             "POST",
@@ -228,8 +208,8 @@ async def test_requested_handover_keeps_empty_succession_default(
                     },
                 },
             )
-        if request.url.path == "/v1/sessions":
-            assert json.loads(request.content)["labels"][BRIDGE_ID_LABEL_KEY] == "bridge_shared"
+        if request.url.path == "/v1/sessions/conv_old/successor":
+            assert not request.content
             return httpx.Response(201, json={"id": "conv_new"})
         return httpx.Response(200, json={})
 
@@ -295,11 +275,14 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
                     "labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"},
                 },
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
             create_count += 1
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
-            assert body == {"runner_id": "runner_one"}
+            assert body in (
+                {"runner_id": "runner_one"},
+                {"labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"}},
+            )
             return httpx.Response(200, json={"id": "conv_new"})
         if (
             request.method == "POST"
@@ -393,7 +376,7 @@ async def test_clear_hook_transfer_failure_does_not_loop(
                     "labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"},
                 },
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
             create_count += 1
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
@@ -477,7 +460,7 @@ async def test_clear_retries_the_same_candidate_after_unavailable_ownership_prob
             return httpx.Response(
                 200, json={"agent_id": "ag_claude", "runner_id": "runner_one", "labels": {}}
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
             creates += 1
             return httpx.Response(201, json={"id": "conv_new"})
         if request.url.path.endswith("/transfer"):
@@ -554,7 +537,7 @@ async def test_clear_checkpoint_finishes_after_detach_reply_is_lost(
                     },
                 },
             )
-        if request.method == "POST" and path == "/v1/sessions":
+        if request.method == "POST" and path == "/v1/sessions/conv_old/successor":
             creates += 1
             return httpx.Response(201, json={"id": "conv_new"})
         if path.endswith("/transfer"):
@@ -1017,7 +1000,10 @@ async def test_fork_hook_creates_omnigent_fork_and_consumes_hook(
             assert body == {}
             return httpx.Response(201, json={"id": "conv_fork"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_fork":
-            assert body == {"runner_id": "runner_one"}
+            assert body in (
+                {"runner_id": "runner_one"},
+                {"labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"}},
+            )
             return httpx.Response(200, json={"id": "conv_fork"})
         if (
             request.method == "POST"

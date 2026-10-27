@@ -69,7 +69,6 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     post_session_succession,
 )
-from omnigent.native._native_session_labels import replacement_session_labels
 from omnigent.native._native_supersession import (
     post_clear_supersession as _post_clear_supersession,
 )
@@ -5121,25 +5120,7 @@ async def _create_clear_replacement_session(
     if not isinstance(agent_id, str) or not agent_id:
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
     runner_id = old.get("runner_id")
-    raw_labels = old.get("labels")
-    labels = (
-        {str(key): str(value) for key, value in raw_labels.items()}
-        if isinstance(raw_labels, dict)
-        else {}
-    )
-    labels[BRIDGE_ID_LABEL_KEY] = read_bridge_id(bridge_dir) or old_session_id
-
-    create_body: dict[str, object] = {
-        "agent_id": agent_id,
-        "labels": replacement_session_labels(labels),
-        "workspace": old.get("workspace"),
-        "git": None,
-    }
-    if (title := old.get("title")) is not None:
-        create_body["title"] = title
-    project_id = old.get("project_id")
-    if isinstance(project_id, str):
-        create_body["project_id"] = project_id
+    labels = old.get("labels") if isinstance(old.get("labels"), dict) else {}
     new_session_id = checkpoint.pending_clear_new_id
     if new_session_id is not None and not checkpoint.pending_clear_transferred:
         candidate = await _fetch_session_snapshot(client, new_session_id)
@@ -5155,15 +5136,7 @@ async def _create_clear_replacement_session(
             )
             raise RuntimeError("clear replacement was already rejected and archived")
     if new_session_id is None:
-        create_resp = await client.post("/v1/sessions", json=create_body)
-        if isinstance(project_id, str) and create_resp.status_code == 404:
-            error = create_resp.json().get("error")
-            if isinstance(error, dict) and error.get("code") == "not_found":
-                _logger.info(
-                    "Project %s was removed before clear replacement; retrying unfiled", project_id
-                )
-                create_body.pop("project_id")
-                create_resp = await client.post("/v1/sessions", json=create_body)
+        create_resp = await client.post(f"/v1/sessions/{url_component(old_session_id)}/successor")
         create_resp.raise_for_status()
         created = _parse_json_response(create_resp, context="clear-replacement session create")
         new_session_id = created.get("id")
@@ -5193,6 +5166,11 @@ async def _create_clear_replacement_session(
 
     transferred = checkpoint.pending_clear_transferred
     try:
+        bridge_response = await client.patch(
+            f"/v1/sessions/{url_component(new_session_id)}",
+            json={"labels": {BRIDGE_ID_LABEL_KEY: read_bridge_id(bridge_dir) or old_session_id}},
+        )
+        bridge_response.raise_for_status()
         if checkpoint.pending_clear_new_id and not transferred:
             source_present, target_present = await owners()
             transferred = target_present and not source_present

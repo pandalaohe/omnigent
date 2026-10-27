@@ -9870,6 +9870,24 @@ async def _apply_pending_policy_ask_writes(
     pending = _pending_policy_ask_writes.get(elicitation_id)
     if pending is None:
         return
+    identity = pending.mcp_call_identity
+    if (
+        data.get("action") == "accept"
+        and not pending.standing_pass_approval_recorded
+        and identity is not None
+        and identity[0] == session_id
+        and identity[1].removeprefix("mcp__omnigent__") == "sys_standing_pass"
+        and pending.reviewed_arguments is not None
+        and pending.transformed_arguments in (None, pending.reviewed_arguments)
+    ):
+        from omnigent.server.standing_pass import remember_grant_approval
+
+        remember_grant_approval(session_id, pending.reviewed_arguments, elicitation_id)
+        from dataclasses import replace
+
+        _pending_policy_ask_writes[elicitation_id] = replace(
+            pending, standing_pass_approval_recorded=True
+        )
     if pending.from_mcp:
         # MCP entries: the retry path (POST /mcp with requestState)
         # pops and applies the writes itself. Applying here too would
@@ -11813,6 +11831,13 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.stores.conversation_store import _may_collate_to
+
+    if any(_may_collate_to(key, "omnigent.standing_pass", prefix=True) for key in labels):
+        raise OmnigentError(
+            "label 'omnigent.standing_pass' is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if any(is_codex_permission_observation_label_key(key) for key in labels):
         raise OmnigentError(
             "permission observation labels are server-internal and cannot be set by clients",

@@ -4730,6 +4730,9 @@ def register_events_routes(
                 "item_id": dispatch.item_id,
                 "forwarded": dispatch.forwarded,
             }
+        body = await asyncio.to_thread(
+            request.app.state.standing_pass_service.first_message, conv, body
+        )
         comment_ids = body.data.pop("omnigent_comment_ids", None)
         comment_store = None
         if comment_ids is not None:
@@ -4818,6 +4821,20 @@ def register_events_routes(
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
+
+    async def post_standing_pass_notice(request: Request, session_id: str, text: str) -> None:
+        await _post_event_impl(
+            request,
+            session_id,
+            SessionEventInput(
+                type="message",
+                data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+            ),
+        )
+
+    # The same intake owns persistence and steering for ordinary child messages.
+    if app_state is not None:
+        app_state.standing_pass_post_event = post_standing_pass_notice
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

@@ -1753,6 +1753,11 @@ def create_app(
     agent_quota_service = AgentQuotaService(
         conversation_store, permission_store, user_preferences_store, host_registry, host_store
     )
+    from omnigent.server.standing_pass import StandingPassService
+
+    standing_pass_service = StandingPassService(
+        conversation_store, permission_store, user_preferences_store, project_store
+    )
     from omnigent.entities import Conversation
     from omnigent.server.startup_admission import active_startup_attempt
     from omnigent.startup_protocol import StartupAttemptRef
@@ -1766,6 +1771,7 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
         quota_resolver=agent_quota_service.line,
+        standing_pass_resolver=standing_pass_service.line,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -2309,6 +2315,7 @@ def create_app(
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
     app.state.user_preferences_store = user_preferences_store
+    app.state.standing_pass_service = standing_pass_service
     app.state.agent_quota_service = agent_quota_service
     app.include_router(
         create_agent_quota_router(

@@ -120,17 +120,23 @@ async def session_instructions_text(
     conversation: Conversation,
     *,
     quota_resolver: Callable[[Conversation], str] | None = None,
+    standing_pass_resolver: Callable[[Conversation], str] | None = None,
 ) -> str | None:
     """Return the newly initialized session's route text, or no injection if disabled."""
     store = get_global_instructions_store()
-    if store is None:
-        return None
-    route = await resolve_instruction_route(conversation)
-
-    return await asyncio.to_thread(
-        route_session_text,
-        store,
-        route,
-        has_parent=conversation.parent_conversation_id is not None,
-        quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
+    text = None
+    if store is not None:
+        route = await resolve_instruction_route(conversation)
+        text = await asyncio.to_thread(
+            route_session_text,
+            store,
+            route,
+            has_parent=conversation.parent_conversation_id is not None,
+            quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
+        )
+    pass_line = (
+        await asyncio.to_thread(standing_pass_resolver, conversation)
+        if standing_pass_resolver is not None
+        else ""
     )
+    return "\n\n".join(part for part in (text, pass_line) if part) or None

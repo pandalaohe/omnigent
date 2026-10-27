@@ -979,6 +979,20 @@ async def _publish_and_wait_for_harness_elicitation(
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
+
+    def approved_verdict(verdict: ElicitationResult | None) -> ElicitationResult | None:
+        if (
+            verdict is not None
+            and verdict.action == "accept"
+            and tool_name is not None
+            and tool_name.removeprefix("mcp__omnigent__") == "sys_standing_pass"
+            and isinstance(tool_input, dict)
+        ):
+            from omnigent.server.standing_pass import remember_grant_approval
+
+            remember_grant_approval(session_id, tool_input, elicitation_id)
+        return verdict
+
     # ``resolved_elsewhere`` is set when a native-side signal proves the
     # prompt was answered outside the web UI: either a mirrored tool
     # result for this gated tool, or Codex app-server's exact
@@ -1013,7 +1027,7 @@ async def _publish_and_wait_for_harness_elicitation(
         )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
-            return tombstone.result
+            return approved_verdict(tombstone.result)
         if timeout_policy is not None:
             # First park for this (id, fingerprint): take the snapshot the
             # whole wait — including a later retry — is governed by.
@@ -1078,7 +1092,7 @@ async def _publish_and_wait_for_harness_elicitation(
                     verdict = future.result()
                     settled_action = getattr(verdict, "action", None)
                     _drop_harness_elicitation_timeout(elicitation_id)
-                    return verdict
+                    return approved_verdict(verdict)
                 # Only the wait still holding the registry entry may take
                 # the decision: a retry re-parks over it, and a
                 # proxy-stranded older wait must neither stop the turn the
@@ -1152,7 +1166,7 @@ async def _publish_and_wait_for_harness_elicitation(
             verdict = future.result()
             settled_action = getattr(verdict, "action", None)
             _drop_harness_elicitation_timeout(elicitation_id)
-            return verdict
+            return approved_verdict(verdict)
         settled = parked.resolved_elsewhere.is_set()
         if settled:
             _drop_harness_elicitation_timeout(elicitation_id)
@@ -12234,6 +12248,8 @@ async def _evaluate_independent_tool_call_policy(
             params=params,
             timeout_s=float(resolve_ask_timeout(engine, result)),
             conversation_store=conversation_store,
+            tool_name=tool_name,
+            tool_input=args_payload if isinstance(args_payload, dict) else None,
         )
         if approval is None or approval.action != "accept":
             return {"verdict": "deny", "reason": result.reason or "Approval was not granted"}
@@ -12266,6 +12282,8 @@ async def _evaluate_independent_tool_call_policy(
     _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
         state_updates=result.state_updates,
         set_labels=result.set_labels,
+        reviewed_arguments=args_payload if isinstance(args_payload, dict) else None,
+        mcp_call_identity=(session_id, tool_name, (actor or {}).get("run_as"), None),
     )
     return {
         "verdict": "pending",
@@ -14877,6 +14895,13 @@ async def _create_session_from_existing_agent(
     except Exception:  # noqa: BLE001
         pass
 
+    if conv.parent_conversation_id is not None and body.initial_items:
+        for index, item in enumerate(body.initial_items):
+            if item.type == "message" and item.data.get("role", "user") == "user":
+                body.initial_items[index] = await asyncio.to_thread(
+                    request.app.state.standing_pass_service.first_message, conv, item
+                )
+                break
     if host_load_hold and body.initial_items:
         for index, item in enumerate(body.initial_items):
             await request.app.state.host_load_inputs.enqueue(

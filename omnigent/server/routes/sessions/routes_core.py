@@ -527,6 +527,13 @@ class ChildCapPatch(BaseModel):
     cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"]
 
 
+class StandingPassChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    op: Literal["revoke", "grant"]
+    kinds: list[Annotated[str, Field(min_length=1, max_length=120)]] = Field(max_length=32)
+    source: str | None = Field(default=None, max_length=256)
+
+
 async def apply_session_archive_transition(
     request: Request,
     conv: Conversation,
@@ -792,6 +799,104 @@ def register_core_routes(
         WorkspaceScopedCache()
     )
     child_cap_locks = ChildCapLocks()
+
+    async def standing_pass_session(request: Request, session_id: str, level: int) -> Conversation:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, level, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        return conv
+
+    @router.get("/sessions/{session_id}/standing-pass", include_in_schema=False)
+    async def get_standing_pass(request: Request, session_id: str) -> dict[str, Any]:
+        from omnigent.server.standing_pass import standing_pass_line
+
+        conv = await standing_pass_session(request, session_id, LEVEL_READ)
+        service = request.app.state.standing_pass_service
+        record = await asyncio.to_thread(service.resolve, conv)
+        root = await asyncio.to_thread(service.root, conv)
+        return {"root_id": root.id, "record": record, "line": standing_pass_line(record)}
+
+    @router.post("/sessions/{session_id}/standing-pass", include_in_schema=False)
+    async def change_standing_pass(
+        request: Request, session_id: str, body: StandingPassChange
+    ) -> dict[str, Any]:
+        from omnigent.server.standing_pass import consume_grant_approval, pass_strings
+
+        conv = await standing_pass_session(request, session_id, LEVEL_EDIT)
+        service = request.app.state.standing_pass_service
+        await asyncio.to_thread(service.require_mutable_root, conv)
+        try:
+            kinds = pass_strings(body.kinds)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        source = body.source or ""
+        if body.op == "grant":
+            approval = consume_grant_approval(session_id, kinds)
+            if approval is None:
+                from uuid import uuid4
+
+                from omnigent.server.routes._sessions.orchestration import (
+                    _publish_and_wait_for_harness_elicitation,
+                )
+                from omnigent.server.schemas import ElicitationRequestParams
+
+                approval = f"elicit_{uuid4().hex}"
+                verdict = await _publish_and_wait_for_harness_elicitation(
+                    request,
+                    session_id=session_id,
+                    params=ElicitationRequestParams(
+                        message=f"Grant these standing pass kinds: {json.dumps(kinds)}. Approve?",
+                        requestedSchema={},
+                        policy_name="ask_on_standing_pass_grant",
+                    ),
+                    timeout_s=300,
+                    conversation_store=conversation_store,
+                    elicitation_id=approval,
+                )
+                if verdict is None or verdict.action != "accept":
+                    raise OmnigentError(
+                        "Standing pass grant was not approved", code=ErrorCode.FORBIDDEN
+                    )
+            source = f"approval:{approval}"
+        record = await asyncio.to_thread(service.change, conv, body.op, kinds, source)
+
+        async def post(child_id: str, text: str) -> bool:
+            from omnigent.server.routes._sessions.common import _session_status_cache
+
+            child = await asyncio.to_thread(conversation_store.get_conversation, child_id)
+            if (
+                child is None
+                or child.archived
+                or _session_status_cache.get(child_id, child.live_status) != "running"
+                or await _get_runner_client(child_id, runner_router, conversation=child) is None
+            ):
+                return False
+            dispatcher = request.app.state.standing_pass_post_event
+            await dispatcher(request, child_id, text)
+            return True
+
+        notices = await service.steer(session_id, record, post)
+        from omnigent.runtime import session_stream
+        from omnigent.server.schemas import SessionStandingPassEvent
+
+        for changed_id in [session_id, *notices]:
+            session_stream.publish(
+                changed_id,
+                SessionStandingPassEvent(
+                    type="session.standing_pass",
+                    conversation_id=changed_id,
+                    root_id=session_id,
+                    record=record,
+                ).model_dump(),
+            )
+        return {"root_id": session_id, "record": record, "notices": notices}
+
     from omnigent.server.routes.sessions.routes_startup import register_startup_routes
 
     @router.post("/sessions/{session_id}/startup/registered", include_in_schema=False)
@@ -1945,6 +2050,7 @@ def register_core_routes(
                 quota_service = getattr(request.app.state, "agent_quota_service", None)
                 global_instructions = await session_instructions_text(
                     conv,
+                    standing_pass_resolver=request.app.state.standing_pass_service.line,
                     quota_resolver=(
                         lambda c: quota_service.line(c, _get_user_id(request, auth_provider))
                     )

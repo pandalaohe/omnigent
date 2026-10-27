@@ -32,6 +32,7 @@ def replacement_session_labels(labels: Mapping[str, str]) -> dict[str, str]:
         "omnigent.member.",
         "omnigent.mcp_service.",
         "omnigent.sandbox.",
+        "omnigent.standing_pass",
         f"{conversation_store.PINNED_LABEL_KEY}.",
         f"{conversation_store.ARCHIVE_CASCADE_LABEL_KEY}.",
         f"{conversation_store.PROJECT_ARCHIVE_LABEL_KEY}.",

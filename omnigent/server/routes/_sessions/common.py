@@ -896,6 +896,7 @@ class _PendingPolicyAskWrites:
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
     mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
+    standing_pass_approval_recorded: bool = False
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be
