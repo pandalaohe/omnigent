@@ -19,6 +19,24 @@ from omnigent.entities.session_startup import StartupReceipt
 from omnigent.host.recovery import RecoveryAssessment, RecoveryInventory, RuntimeObservation
 
 SDK_STARTUP_SOURCES = frozenset({"codex", "claude-sdk"})
+STARTUP_QUEUE_V1 = "startup_queue_v1"
+QUEUE_STARTUP_SOURCES = SDK_STARTUP_SOURCES | frozenset(
+    {
+        "acp",
+        "codex-native",
+        "claude-native",
+        "pi-native",
+        "antigravity-native",
+        "cursor-native",
+        "opencode-native",
+        "goose-native",
+        "hermes-native",
+        "kimi-native",
+        "qwen-native",
+        "kiro-native",
+        "devin-native",
+    }
+)
 CONTEXT_INVENTORY_V2 = "resident_context_inventory_v2"
 CONTEXT_INVENTORY_CONTRACT_HEADER = "Omnigent-Context-Inventory-Contract"
 CONTEXT_INVENTORY_MAX_BYTES = 1024 * 1024
@@ -448,6 +466,8 @@ class StartupAttemptRef(BaseModel):
     input_id: str | None = Field(pattern=r"^[0-9a-f]{32}$")
     runtime_id: str = Field(min_length=1, max_length=128)
     host_generation: str = Field(min_length=1, max_length=128)
+    mode: Literal["guarded", "startup_only"] = "guarded"
+    policy_revision: int = Field(default=0, strict=True, ge=0)
 
 
 class StartupBoundaryClaim(BaseModel):
@@ -467,6 +487,7 @@ class StartupObservation(BaseModel):
 
     attempt: StartupAttemptRef
     phase: Literal[
+        "opening_settled",
         "runtime_ready",
         "tools_ready",
         "input_dispatched",
@@ -482,6 +503,15 @@ class StartupObservation(BaseModel):
 
     @model_validator(mode="after")
     def _require_vendor_identity(self) -> Self:
+        if self.phase == "opening_settled" and (
+            self.source != "runner"
+            or self.attempt.mode != "startup_only"
+            or self.vendor_session_id is not None
+            or self.vendor_turn_id is not None
+            or self.reason not in (None, "waiting_input")
+            or (self.reason == "waiting_input" and self.attempt.input_id is not None)
+        ):
+            raise ValueError("Opening settlement requires its runner-owned queue attempt")
         if self.phase in ("input_dispatched", "input_accepted", "work_started") and (
             self.source == "runner"
             or not self.vendor_session_id
@@ -493,6 +523,6 @@ class StartupObservation(BaseModel):
 
     def receipt(self) -> StartupReceipt:
         return StartupReceipt(
-            **self.attempt.model_dump(exclude={"host_generation"}),
+            **self.attempt.model_dump(exclude={"host_generation", "mode", "policy_revision"}),
             **self.model_dump(exclude={"attempt"}),
         )

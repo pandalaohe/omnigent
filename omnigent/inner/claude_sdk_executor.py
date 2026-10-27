@@ -73,6 +73,7 @@ from omnigent.startup_evidence import (
     ClaudeTurnEvidence,
     StartupPermissionUnavailable,
     claim_startup_boundary,
+    opening_settled,
 )
 from omnigent.startup_protocol import (
     ContextEvidenceV2,
@@ -4121,6 +4122,7 @@ class ClaudeSDKExecutor(Executor):
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
+            opening_settled()
             message_stream = client.receive_response()
             try:
                 while True:

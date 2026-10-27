@@ -25,5 +25,5 @@ def create_app() -> FastAPI:
 
     :returns: The FastAPI app from :class:`ExecutorAdapter`.
     """
-    adapter = ExecutorAdapter(executor_factory=_build_pi_native_executor)
+    adapter = ExecutorAdapter(executor_factory=_build_pi_native_executor, startup_source="native")
     return adapter.build()

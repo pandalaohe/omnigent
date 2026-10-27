@@ -96,6 +96,7 @@ CAP_WORKTREE_SAFE_ARCHIVE = "worktree_safe_archive_v1"
 CAP_WORKTREE_ARCHIVE_CONTENT = "worktree_archive_content_v1"
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
+    "startup_queue_v1",
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PATH_ATTACHMENTS,

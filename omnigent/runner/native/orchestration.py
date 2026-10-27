@@ -10812,6 +10812,7 @@ class NativeLaunchContext:
     rebind_bridge: Callable[[str, str], Awaitable[None]] | None = None
     startup_required: bool = False
     admit_cold: Callable[[], Awaitable[None]] | None = None
+    settle_empty: Callable[[], Awaitable[None]] | None = None
 
 
 async def _admit_native_cold(ctx: NativeLaunchContext) -> None:
@@ -11117,6 +11118,8 @@ async def _launch_native_terminal(
                 ),
             )
             await adapter(ctx)
+            if ctx.settle_empty is not None:
+                await ctx.settle_empty()
             _logger.info(
                 "Native terminal started",
                 extra=debug_event(
@@ -11283,6 +11286,8 @@ async def _ensure_native_terminal(
                 ),
             )
             view = await adapter(ctx)
+            if ctx.settle_empty is not None:
+                await ctx.settle_empty()
             _logger.info(
                 "Native terminal started",
                 extra=debug_event(

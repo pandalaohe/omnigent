@@ -88,7 +88,7 @@ from omnigent.sdk_peer_delivery import PeerOutcome, ReportPeerOutcome, SDKPeerIn
 from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
 from omnigent.session_default_modes import codex_service_tier, valid_speed_tier
 from omnigent.spec.types import RetryPolicy
-from omnigent.startup_evidence import CodexTurnEvidence, claim_startup_boundary
+from omnigent.startup_evidence import CodexTurnEvidence, claim_startup_boundary, opening_settled
 from omnigent.startup_protocol import (
     ContextEvidenceV2,
     executor_context_scope_v2,
@@ -4567,6 +4567,7 @@ class _CodexAppServerSession:
         # thread/start established the owned runtime. A configured dynamic-tool
         # bridge is ready only after the thread and turn RPCs have both returned.
         startup_evidence.ready(tool_bridge_installed=not tools or self._tool_executor is not None)
+        opening_settled()
 
         retained_events: list[CodexMessage | HarnessTransportClosedError] = []
         retaining_current_turn = False
@@ -6437,8 +6438,10 @@ class CodexExecutor(Executor):
         cfg = config or ExecutorConfig()
         session_key = _session_key(messages)
         state = self._session_states.get(session_key) or _CodexSessionState()
+        cold_admitted = False
         if state.codex_path is None:
             await claim_startup_boundary("executor_prepare")
+            cold_admitted = True
             state.launch_env = dict(self._env)
             state.codex_path = await asyncio.to_thread(
                 snapshot_codex_binary, self._codex_path, env=state.launch_env
@@ -6489,7 +6492,8 @@ class CodexExecutor(Executor):
             or getattr(app_session, "_closing", False)
             or getattr(app_session, "_transport_error", None) is not None
         ):
-            await claim_startup_boundary("executor_prepare")
+            if not cold_admitted:
+                await claim_startup_boundary("executor_prepare")
         if self._signer_backed and (
             None in binary_identity or binary_identity != self._brokered_version_identity
         ):

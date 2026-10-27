@@ -417,9 +417,13 @@ class ManagedStartupInputs:
                     code=ErrorCode.CONFLICT,
                 )
             if (conv.host_id is not None or current is not None) and (
-                current is None or current.state not in ("working", "command_completed")
+                current is None or current.state not in ("working", "opened", "command_completed")
             ):
                 return True
+            if current is not None and current.state == "opened" and current.input_id is not None:
+                pending = await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
+                if any(item.id == current.input_id for item in pending):
+                    return True
         state = conv.labels.get(STARTUP_LABEL)
         if state not in ("pending", "ready"):
             return False
@@ -601,7 +605,8 @@ class ManagedStartupInputs:
             if (
                 (
                     current is not None
-                    and current.state not in ("working", "command_completed", "ready_empty")
+                    and current.state
+                    not in ("working", "opened", "command_completed", "ready_empty")
                 )
                 or (head is not None and (current is None or current.state == "ready_empty"))
                 or (state == "pending" and conv.runner_id is None)
@@ -612,6 +617,13 @@ class ManagedStartupInputs:
                     return await admission.recover_session(session_id, connection)
                 except StartupQueued:
                     return False
+            if (
+                current is not None
+                and current.state == "opened"
+                and head is not None
+                and head.id == current.input_id
+            ):
+                return False
         if head is not None:
             # Delivered even without the label: a message saved while the label
             # was being cleared still belongs to this session's startup.

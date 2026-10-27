@@ -52,6 +52,19 @@ async def claim_startup_boundary(boundary: Literal["executor_prepare"]) -> None:
         raise StartupPermissionUnavailable("Startup permission unavailable")
 
 
+def opening_settled() -> None:
+    """The owning local handoff returned; this says nothing about vendor work."""
+    owner = _scope.get()
+    if owner is not None and owner.attempt is not None and owner.attempt.mode == "startup_only":
+        owner.emit(
+            StartupObservation(
+                attempt=owner.attempt,
+                phase="opening_settled",
+                source="runner",
+            )
+        )
+
+
 class CodexTurnEvidence:
     """The owning turn/start RPC supplies immutable thread and turn identities."""
 
@@ -198,7 +211,11 @@ class ClaudeTurnEvidence:
 
     @property
     def enabled(self) -> bool:
-        return self._owner is not None and self._owner.attempt is not None
+        return (
+            self._owner is not None
+            and self._owner.attempt is not None
+            and self._owner.attempt.mode != "startup_only"
+        )
 
     def _emit(
         self,

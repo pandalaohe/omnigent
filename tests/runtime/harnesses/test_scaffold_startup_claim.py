@@ -114,6 +114,49 @@ async def test_supported_factory_without_current_attempt_stays_cold():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_error", [False, True])
+async def test_native_queue_settles_only_after_actual_local_handoff(
+    tmp_path, monkeypatch, delivery_error
+):
+    from omnigent.inner.pi_native_executor import PiNativeExecutor
+
+    order = []
+
+    def enqueue(_bridge, text):
+        assert text == "work"
+        order.append("handoff")
+        if delivery_error:
+            raise RuntimeError("unknown local handoff")
+
+    monkeypatch.setattr("omnigent.inner.pi_native_executor.enqueue_user_message", enqueue)
+    executor = PiNativeExecutor(bridge_dir=tmp_path)
+    monkeypatch.setattr(executor, "_refresh_auth_headers", lambda: None)
+    adapter = ExecutorAdapter(lambda: executor, startup_source="native")
+    ctx = _scaffold.TurnContext("resp_" + "a" * 32, asyncio.Queue(), asyncio.Event(), "session")
+    ctx.claim_startup = AsyncMock(side_effect=lambda *_: order.append("claim") or True)
+    ref = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id="c" * 32,
+        runtime_id="runtime",
+        host_generation="generation",
+        mode="startup_only",
+    )
+    request = CreateResponseRequest(model="agent", input="work", startup_attempt=ref)
+    if delivery_error:
+        with pytest.raises(RuntimeError, match="unknown local handoff"):
+            await adapter.run_turn(request, ctx)
+    else:
+        await adapter.run_turn(request, ctx)
+    observations = [
+        event.observation for event in ctx._event_queue._queue if event.type == "startup.proof"
+    ]
+    assert order == ["claim", "handoff"]
+    assert [item.phase for item in observations] == ([] if delivery_error else ["opening_settled"])
+    assert all(item.attempt == ref and item.source == "runner" for item in observations)
+
+
+@pytest.mark.asyncio
 async def test_refused_cold_boundary_preserves_executor_and_finishes_trace(monkeypatch):
     class DeniedExecutor(MockExecutor):
         async def run_turn(self, *args, **kwargs):

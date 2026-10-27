@@ -43,6 +43,35 @@ def test_two_replicas_reserve_only_two_and_restart_retains_permits(db_uri):
     assert stores[0].reserve(uuid4().hex) is None
 
 
+@pytest.mark.parametrize("with_input", [False, True])
+def test_queue_settlement_releases_without_claiming_vendor_acceptance_or_work(db_uri, with_input):
+    store, host = SessionStartupStore(db_uri), uuid4().hex
+    store.configure(host, mode="startup_only")
+    queued = store.enqueue(
+        owner_user_id="owner",
+        host_id=host,
+        session_id=uuid4().hex,
+        operation_key="opening",
+        input_id=uuid4().hex if with_input else None,
+    )
+    attempt = store.reserve(host)
+    assert store.claim(queued.id, attempt.attempt_id, runtime_id="runtime")
+    receipt = StartupReceipt(
+        startup_id=queued.id,
+        attempt_id=attempt.attempt_id,
+        input_id=queued.input_id,
+        runtime_id="runtime",
+        phase="opening_settled",
+        source="runner",
+    )
+    assert store.observe(receipt)
+    current = SessionStartupStore(db_uri).get(queued.id)
+    assert not current.occupied and not current.input_accepted
+    assert current.state == ("opened" if with_input else "ready_empty")
+    assert current.proof_source is None
+    assert store.observe(receipt)
+
+
 @pytest.mark.parametrize("unbound", [False, True])
 def test_reconnect_keeps_unreconciled_runtime_generation_unknown(db_uri, unbound):
     store, host = SessionStartupStore(db_uri), uuid4().hex

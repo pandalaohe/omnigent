@@ -47,7 +47,7 @@ class StartupSnapshot:
     proof_source: str | None
     admitted_at: int | None
     first_dispatch_at: int | None
-    admission_mode: str
+    admission_mode: Literal["guarded", "startup_only"]
     policy_revision: int
 
 
@@ -161,6 +161,39 @@ class SessionStartupStore:
             row.admission_mode == host.admission_mode
             and row.policy_revision == host.policy_revision
         )
+
+    def recreate_exempt(
+        self,
+        session_id: str,
+        *,
+        host_id: str,
+        runner_id: str | None,
+        host_generation: str,
+        account: AccountAuthority | None = None,
+    ) -> bool:
+        """Read current recreate eligibility without changing an opening or its permit."""
+        with self._session("read_recreate_exemption") as db:
+            if account is not None:
+                if account.workspace_id != current_workspace_id():
+                    return False
+                require_active_account(db, account.user_id, generation=account.generation)
+            binding = db.get(SqlConversationMetadata, (current_workspace_id(), session_id))
+            host = db.get(SqlStartupBudget, f"{current_workspace_id()}:{host_id}")
+            current = self._current_session_row(db, session_id)
+            return (
+                binding is not None
+                and (binding.host_id, binding.runner_id) == (host_id, runner_id)
+                and host is not None
+                and not host.fenced
+                and host.admission_mode == "startup_only"
+                and host.current_generation == host_generation
+                and current is not None
+                and current.host_id == host_id
+                and current.admission_mode == "startup_only"
+                and current.state in ("opened", "ready_empty")
+                and not current.occupied
+                and not current.cancel_requested
+            )
 
     def get(self, startup_id: str) -> StartupSnapshot | None:
         with self._session("read_startup") as db:
@@ -922,7 +955,8 @@ class SessionStartupStore:
                         parent is None
                         or parent_current is None
                         or parent_current.id != parent.id
-                        or parent.state not in ("working", "ready_empty", "command_completed")
+                        or parent.state
+                        not in ("working", "opened", "ready_empty", "command_completed")
                     ):
                         continue
                 eligible.append(row)
@@ -1040,7 +1074,11 @@ class SessionStartupStore:
                 or row.host_generation not in (None, host_generation)
                 or host.current_generation not in (None, host_generation)
                 or (expected_runner_id is not None and host.current_generation != host_generation)
-                or ("resident_reuse" in row.cold_claims and boundary != "input_dispatch")
+                or (
+                    row.admission_mode != "startup_only"
+                    and "resident_reuse" in row.cold_claims
+                    and boundary != "input_dispatch"
+                )
                 or boundary in row.cold_claims
                 or (boundary == "runner_spawn" and "runner_prepare" not in row.cold_claims)
             ):
@@ -1325,7 +1363,10 @@ class SessionStartupStore:
             ):
                 return False
             if (
-                not row.occupied
+                (
+                    not row.occupied
+                    and not (row.admission_mode == "startup_only" and row.state == "opened")
+                )
                 or row.cancel_requested
                 or row.state == "blocked"
                 or row.attempt_id != attempt_id
@@ -1441,6 +1482,31 @@ class SessionStartupStore:
                 return True
             if row.cancel_requested:
                 return False
+            if receipt.phase == "opening_settled":
+                if (
+                    row.admission_mode != "startup_only"
+                    or not self._current_policy(row, host)
+                    or receipt.source != "runner"
+                    or row.state == "blocked"
+                ):
+                    return False
+                if not row.occupied:
+                    return row.state in ("opened", "ready_empty", "waiting_input")
+                if receipt.reason == "waiting_input":
+                    if row.input_id is not None or any(
+                        boundary in row.cold_claims
+                        for boundary in (
+                            "native_prepare",
+                            "executor_construct",
+                            "executor_prepare",
+                        )
+                    ):
+                        return False
+                    row.state, row.resident = "waiting_input", False
+                else:
+                    row.state = "opened" if row.input_id is not None else "ready_empty"
+                row.occupied, row.reason, row.updated_at = False, None, now_epoch()
+                return True
             if receipt.phase in ("input_dispatched", "input_accepted", "work_started"):
                 if row.proof_source is None or (
                     row.proof_source,
@@ -1450,7 +1516,9 @@ class SessionStartupStore:
                     return False
             elif receipt.source not in ("runner", row.proof_source):
                 return False
-            if not row.occupied:
+            if not row.occupied and not (
+                row.admission_mode == "startup_only" and row.state == "opened"
+            ):
                 return row.state in ("working", "ready_empty") and receipt.phase in (
                     "runtime_ready",
                     "tools_ready",
@@ -1458,6 +1526,8 @@ class SessionStartupStore:
                     "input_accepted",
                     "work_started",
                 )
+            if not row.occupied and receipt.phase in ("blocked", "uncertain"):
+                return False
             if receipt.phase in ("blocked", "uncertain") and row.state != "blocked":
                 row.state, row.reason = receipt.phase, receipt.reason
             elif receipt.phase == "input_dispatched":
@@ -1465,7 +1535,12 @@ class SessionStartupStore:
                     row.first_dispatch_at = now_epoch()
             elif receipt.phase not in ("blocked", "uncertain"):
                 setattr(row, receipt.phase, True)
-                if row.state != "blocked" and row.runtime_ready and row.tools_ready:
+                if (
+                    row.admission_mode != "startup_only"
+                    and row.state != "blocked"
+                    and row.runtime_ready
+                    and row.tools_ready
+                ):
                     if row.input_id is None:
                         row.state, row.occupied, row.reason = "ready_empty", False, None
                     elif row.input_accepted and row.work_started:

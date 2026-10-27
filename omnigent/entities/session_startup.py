@@ -14,6 +14,7 @@ StartupState = Literal[
     "ready_empty",
     "waiting_input",
     "working",
+    "opened",
     "cancelled",
     "stopped",
     "command_completed",
@@ -54,6 +55,7 @@ class StartupReceipt(BaseModel):
     input_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     runtime_id: str = Field(min_length=1, max_length=128)
     phase: Literal[
+        "opening_settled",
         "runtime_ready",
         "tools_ready",
         "input_accepted",

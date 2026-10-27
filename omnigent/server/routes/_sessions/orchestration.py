@@ -8230,6 +8230,11 @@ async def _forward_native_terminal_message(
         agent_revision=agent_revision,
     )
     event["usage_admission"] = usage_admission
+    event.pop("startup_attempt", None)
+    event.pop("startup_required", None)
+    if startup_context is not None and startup_context.startup is not None:
+        event["startup_required"] = True
+        event["startup_attempt"] = startup_context.startup.model_dump()
     log_input_event(
         _logger,
         "native_input_forward_started",

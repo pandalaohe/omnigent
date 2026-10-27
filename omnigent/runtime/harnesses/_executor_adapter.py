@@ -70,7 +70,11 @@ from omnigent.server.schemas import (
     SDKPeerReceiptEvent,
     StartupProofEvent,
 )
-from omnigent.startup_evidence import StartupPermissionUnavailable, startup_evidence_scope
+from omnigent.startup_evidence import (
+    StartupPermissionUnavailable,
+    opening_settled,
+    startup_evidence_scope,
+)
 from omnigent.startup_protocol import ContextEvidenceV2, unknown_context_evidence_v2
 
 _logger = logging.getLogger(__name__)
@@ -202,7 +206,7 @@ class ExecutorAdapter(HarnessApp):
         session_key: str | None = None,
         harness_label: str = "Claude",
         *,
-        startup_source: Literal["codex", "claude-sdk"] | None = None,
+        startup_source: Literal["codex", "claude-sdk", "native", "acp"] | None = None,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
@@ -266,7 +270,13 @@ class ExecutorAdapter(HarnessApp):
         startup_attempt = request.startup_attempt
         startup_required = request.startup_required or startup_attempt is not None
         if startup_required:
-            if self._startup_source is None:
+            if self._startup_source is None or (
+                self._startup_source in ("native", "acp")
+                and (
+                    (startup_attempt is not None and startup_attempt.mode != "startup_only")
+                    or (startup_attempt is None and self._executor is None)
+                )
+            ):
                 raise RuntimeError("startup_proof_unavailable")
             if self._executor is None:
                 if startup_attempt is None or not await ctx.claim_startup(
@@ -498,6 +508,8 @@ class ExecutorAdapter(HarnessApp):
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):
+                        if self._startup_source == "native":
+                            opening_settled()
                         log_input_event(
                             _logger,
                             "native_input_execution_finished",

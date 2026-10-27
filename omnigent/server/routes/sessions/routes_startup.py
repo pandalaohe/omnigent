@@ -13,7 +13,7 @@ from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.schemas import CancelStartupRequest, SessionStartupEvent
 from omnigent.server.startup_observations import accept_observation
-from omnigent.startup_protocol import StartupBoundaryClaim, StartupObservation
+from omnigent.startup_protocol import STARTUP_QUEUE_V1, StartupBoundaryClaim, StartupObservation
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_startup_store import SessionStartupStore
@@ -26,6 +26,31 @@ def register_startup_routes(
     permission_store: PermissionStore | None,
     auth_provider: AuthProvider | None,
 ) -> None:
+    @router.post("/sessions/{session_id}/startup/recreate-exemption", include_in_schema=False)
+    async def recreate_exemption(request: Request, session_id: str) -> dict[str, bool]:
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if (
+            not token
+            or conv is None
+            or not conv.runner_id
+            or token_bound_runner_id(token) != conv.runner_id
+        ):
+            raise HTTPException(403, "Recreate exemption requires the bound runner")
+        admission = getattr(request.app.state, "startup_admission", None)
+        hosts = getattr(request.app.state, "host_registry", None)
+        conn = hosts.get(conv.host_id) if hosts is not None and conv.host_id else None
+        if admission is None or conn is None:
+            return {"exempt": False}
+        try:
+            return {
+                "exempt": await admission.recreate_exempt(
+                    conn, session_id, expected_runner_id=token_bound_runner_id(token)
+                )
+            }
+        except OmnigentError:
+            return {"exempt": False}
+
     @router.post("/sessions/{session_id}/startup/claims", include_in_schema=False)
     async def claim_startup_boundary(
         request: Request, session_id: str, body: StartupBoundaryClaim
@@ -55,7 +80,17 @@ def register_startup_routes(
             or current.runtime_id != body.attempt.runtime_id
             or current.input_id != body.attempt.input_id
             or conn.startup_generation != body.attempt.host_generation
-            or "startup_admission_v1" not in conn.hello.capabilities
+            or current.admission_mode != body.attempt.mode
+            or (
+                body.attempt.mode == "startup_only"
+                and current.policy_revision != body.attempt.policy_revision
+            )
+            or (
+                STARTUP_QUEUE_V1
+                if current.admission_mode == "startup_only"
+                else "startup_admission_v1"
+            )
+            not in conn.hello.capabilities
             or hosts.launch_authorizer is None
         ):
             return {"granted": False}

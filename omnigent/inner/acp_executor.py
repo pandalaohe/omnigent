@@ -94,6 +94,7 @@ from omnigent.models.model_catalog_store import (
     write_catalog,
 )
 from omnigent.process_logging import current_process_log_path, display_log_path
+from omnigent.startup_evidence import claim_startup_boundary, opening_settled
 from omnigent.startup_protocol import ContextEvidenceV2
 
 logger = logging.getLogger(__name__)
@@ -2143,6 +2144,8 @@ class AcpExecutor(Executor):
         # let stale data accidentally reach the session/prompt path (#4917).
         self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
         try:
+            if self._proc is None or self._proc.returncode is not None or self._session_id is None:
+                await claim_startup_boundary("executor_prepare")
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
             await self._ensure_initialized()
@@ -2288,6 +2291,7 @@ class AcpExecutor(Executor):
             }
         )
 
+        opening_settled()
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
 
