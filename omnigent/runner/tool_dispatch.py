@@ -7243,7 +7243,7 @@ async def _execute_project_settings_tool(
             raise ValueError("arguments must be an object")
         required = {"project_id"}
         fields = (
-            {"project_id", "expected_revision", "project", "host"}
+            {"project_id", "expected_revision", "project", "host", "orchestration"}
             if tool_name == "sys_project_settings_update"
             else {"project_id", "host_id", "harness"}
         )

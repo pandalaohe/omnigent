@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import asdict, replace
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from omnigent.calling_defaults import (
     CallingResolution,
@@ -68,11 +68,27 @@ class _HostPatch(BaseModel):
     harnesses: dict[str, _HarnessPatch] | None = None
 
 
+class _ProjectStandingPassPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    remove: list[StrictStr] | None = None
+    exceptions: (
+        Annotated[list[Annotated[StrictStr, Field(max_length=120)]], Field(max_length=5)] | None
+    ) = None
+
+
+class _OrchestrationPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    child_cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"] | None = None
+    setup: Annotated[StrictStr, Field(max_length=400)] | None = None
+    standing_pass: _ProjectStandingPassPatch = Field(default_factory=_ProjectStandingPassPatch)
+
+
 class _SettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: str
     project: _ProjectPatch | None = None
     host: _HostPatch | None = None
+    orchestration: _OrchestrationPatch = Field(default_factory=_OrchestrationPatch)
 
 
 def _invalid(field: str, message: str) -> OmnigentError:
@@ -118,6 +134,37 @@ def _apply_patch(config: dict[str, Any], body: _SettingsPatch) -> tuple[dict[str
     """Apply named leaves only, preserving every unrelated config key."""
     result = deepcopy(config)
     named: list[str] = []
+    if "orchestration" in body.model_fields_set:
+        patch = body.orchestration
+        stored = result.get("orchestration")
+        orchestration = deepcopy(stored) if isinstance(stored, dict) else {}
+        for field in ("child_cap", "setup"):
+            if field in patch.model_fields_set:
+                value = getattr(patch, field)
+                if value is None:
+                    orchestration.pop(field, None)
+                else:
+                    orchestration[field] = value
+                named.append(f"orchestration.{field}")
+        if "standing_pass" in patch.model_fields_set:
+            stored = orchestration.get("standing_pass")
+            standing_pass = deepcopy(stored) if isinstance(stored, dict) else {}
+            for field in ("remove", "exceptions"):
+                if field in patch.standing_pass.model_fields_set:
+                    value = getattr(patch.standing_pass, field)
+                    if value is None:
+                        standing_pass.pop(field, None)
+                    else:
+                        standing_pass[field] = value
+                    named.append(f"orchestration.standing_pass.{field}")
+            if standing_pass:
+                orchestration["standing_pass"] = standing_pass
+            else:
+                orchestration.pop("standing_pass", None)
+        if orchestration:
+            result["orchestration"] = orchestration
+        else:
+            result.pop("orchestration", None)
     if body.project is not None:
         for field in ("host_id", "agent_id", "model"):
             if field in body.project.model_fields_set:

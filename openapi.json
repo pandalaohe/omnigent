@@ -13242,6 +13242,45 @@
         "title": "_HostPatch",
         "type": "object"
       },
+      "_OrchestrationPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "child_cap": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "const": "none",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Child Cap"
+          },
+          "setup": {
+            "anyOf": [
+              {
+                "maxLength": 400,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Setup"
+          },
+          "standing_pass": {
+            "$ref": "#/components/schemas/_ProjectStandingPassPatch"
+          }
+        },
+        "title": "_OrchestrationPatch",
+        "type": "object"
+      },
       "_ProjectPatch": {
         "additionalProperties": false,
         "properties": {
@@ -13282,6 +13321,43 @@
         "title": "_ProjectPatch",
         "type": "object"
       },
+      "_ProjectStandingPassPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "exceptions": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 120,
+                  "type": "string"
+                },
+                "maxItems": 5,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exceptions"
+          },
+          "remove": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remove"
+          }
+        },
+        "title": "_ProjectStandingPassPatch",
+        "type": "object"
+      },
       "_SettingsPatch": {
         "additionalProperties": false,
         "properties": {
@@ -13298,6 +13374,9 @@
                 "type": "null"
               }
             ]
+          },
+          "orchestration": {
+            "$ref": "#/components/schemas/_OrchestrationPatch"
           },
           "project": {
             "anyOf": [
@@ -16775,6 +16854,47 @@
           }
         },
         "summary": "Initialize User Preferences"
+      }
+    },
+    "/v1/me/preferences/keep_warm/convert": {
+      "post": {
+        "operationId": "convert_keep_warm_v1_me_preferences_keep_warm_convert_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Convert Keep Warm V1 Me Preferences Keep Warm Convert Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Convert Keep Warm"
       }
     },
     "/v1/me/preferences/worktree_archive/migrate": {
