@@ -151,21 +151,15 @@ WORKTREE_INSTRUCTION = (
     "{worktree}: make code changes, run git and tests there."
 )
 
-# Steers models toward the embedded browser they are handed: the browser_*
-# tools are auto-registered for every agent (ToolManager._register_browser_tools),
-# but a tool description alone loses to a model's native web tooling, so the
-# composed system prompt must carry the preference explicitly.
+# Distinguishes the user's browser from the desktop app's embedded pane.
 EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
-    "Embedded browser: the browser_navigate / browser_snapshot / "
-    "browser_click / browser_type / browser_screenshot tools drive the "
-    "Omnigent app's embedded browser pane, which the user can watch "
-    "alongside the chat. When asked to look at, open, or interact with a "
-    "web page, prefer these embedded-browser tools over your own web "
-    "tooling (a built-in web fetch/search tool, shell commands like curl, "
-    "or launching a separate browser) so the user sees the page as you "
-    "work. Fall back to other web tooling only when the embedded browser "
-    "is unavailable (its tools fail because no Omnigent app window is "
-    "attached) or for non-interactive bulk fetching."
+    "Browser: for web browsing, search and page interaction use your own "
+    "web tooling (a browser CLI, fetch or search tools). When the user "
+    "should see or review a page, open it as a new tab in the user's own "
+    "browser and leave it open. Show files the user should read (HTML "
+    "reports, Markdown, PDF) in Omnigent's right panel. The browser_* tools "
+    "drive the Omnigent desktop app's embedded pane; use them only when "
+    "the user asks for that pane."
 )
 
 
@@ -179,7 +173,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     even under ``async: false``, where
     ``ToolManager._register_async_inbox_tools`` keeps the inbox drain.
 
-    The embedded-browser priority guidance applies to every agent,
+    The browser routing guidance applies to every agent,
     mirroring the unconditional ``browser_*`` registration
     (``ToolManager._register_browser_tools``).
 
