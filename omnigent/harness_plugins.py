@@ -990,7 +990,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
-        "pi": "Pi",
+        "pi": "Pi RPC",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
@@ -998,6 +998,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     product_agents={
         "claude-sdk": "claude-sdk",
         "codex": "codex-sdk",
+        "pi": "pi-rpc",
         **{name: name for name in ACP_CLI_HARNESSES},
     },
 )

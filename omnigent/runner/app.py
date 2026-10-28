@@ -41,6 +41,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
@@ -4358,7 +4359,7 @@ def create_runner_app(
                     init_harness_client.post(
                         "/v1/permission-tier/bootstrap", json={"session_id": session_id}
                     ),
-                    timeout=20.0,
+                    timeout=45.0 if IS_WINDOWS else 20.0,
                 )
                 bootstrap_body = bootstrap.json()
                 if (
@@ -7806,6 +7807,21 @@ def create_runner_app(
         # context carries it for its lifetime). Coded errors keep their own phase.
         with phase_scope(ErrorPhase.TURN):
             try:
+                permission_state = permission_tiers.state(conv)
+                if permission_state is not None and permission_state.status != "ready":
+                    # Initialization owns the deny-safe fence until bootstrap settles.
+                    initializations = [
+                        task for key, task in list(_session_init_tasks.items()) if key[0] == conv
+                    ]
+                    if initializations:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(asyncio.gather(*initializations)), timeout=60.0
+                            )
+                        except TimeoutError:
+                            raise RuntimeError(
+                                "Permission tier initialization timed out"
+                            ) from None
                 # Shared for the whole stream: a reclaim waits the turn out (it
                 # cancels first, which is what makes the wait short), while a
                 # handshake arriving mid-turn is answered rather than queued.

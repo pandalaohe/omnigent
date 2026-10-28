@@ -337,6 +337,96 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "windows,ack_at,expected",
+    [
+        (False, 1.0, None),
+        (True, 12.0, None),
+        (False, None, "missing_ack"),
+        (True, None, "missing_ack"),
+        (False, None, "ack_mismatch"),
+        (False, None, "process_exit (status=7)"),
+    ],
+)
+async def test_permission_bootstrap_waits_for_live_process_and_reports_safe_reason(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    windows,
+    ack_at,
+    expected,
+):
+    from omnigent.inner import pi_executor as module
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState(
+            session_id="cold-pi",
+            host_id="host",
+            workspace=str(tmp_path),
+            tier="auto",
+            revision=1,
+            status="blocked",
+        ),
+    )
+    if expected == "ack_mismatch":
+        (bridge / "permission_installation.json").write_text("{}")
+    rpc = _PiRpcSession()
+    rpc.process = _FakeProcess()
+    if expected and expected.startswith("process_exit"):
+        rpc.process.returncode = 7
+    rpc._stderr_lines = [
+        "private prompt and credentials",
+        "Error [ERR_MODULE_NOT_FOUND]: private path",
+    ]
+    clock = [0.0]
+    sleeps = []
+
+    async def sleep(delay):
+        clock[0] += delay
+        sleeps.append(delay)
+
+    # Patch only this module's clock/sleep view, leaving pytest's loop intact.
+    monkeypatch.setattr(
+        module,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0]),
+            sleep=sleep,
+        ),
+    )
+    monkeypatch.setattr(module, "IS_WINDOWS", windows)
+    monkeypatch.setattr(module, "bridge_dir_for_session_id", lambda _: bridge)
+    monkeypatch.setattr(
+        module,
+        "verify_pi_permission_installation",
+        lambda *_: ack_at is not None and clock[0] >= ack_at,
+    )
+    executor = object.__new__(PiExecutor)
+    if expected is None:
+        await executor._await_permission_installation("cold-pi", rpc)
+        assert ack_at <= clock[0] < ack_at + 0.1
+        assert not caplog.records
+    else:
+        with pytest.raises(
+            module.PiPermissionBootstrapError,
+            match=expected.replace("(", r"\(").replace(")", r"\)"),
+        ):
+            await executor._await_permission_installation("cold-pi", rpc)
+        assert expected in caplog.text
+        assert "ERR_MODULE_NOT_FOUND" in caplog.text
+        assert "private" not in caplog.text
+        if expected.startswith("process_exit"):
+            assert not sleeps
+        else:
+            bound = 30.0 if windows else 8.0
+            assert bound <= clock[0] < bound + 0.1
+
+
 @pytest.fixture
 async def context_v2_pi(monkeypatch):
     from omnigent.inner import pi_executor as module

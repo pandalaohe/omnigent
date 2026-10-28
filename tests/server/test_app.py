@@ -1566,11 +1566,13 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
 
     assert seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
     assert seed_stores.agent_store.get_by_name("codex-sdk") is not None
+    assert seed_stores.agent_store.get_by_name("pi-rpc") is not None
 
 
 @pytest.mark.parametrize(
     ("name", "harness", "native_name", "seed_agent"),
     [
+        ("pi-rpc", "pi", "pi-native-ui", server_app._ensure_default_pi_rpc_agent),
         ("codex-sdk", "codex", "codex-native-ui", server_app._ensure_default_codex_sdk_agent),
         (
             "claude-sdk",
@@ -1636,25 +1638,33 @@ def test_sdk_seed_is_distinct_and_uses_host_defaults(
     assert not any(name.startswith(("sys_os_", "sys_terminal_")) for name in granted)
 
 
-def test_claude_sdk_seed_skips_foreign_template(
-    seed_stores: _SeedStores, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    "name,seed",
+    [
+        ("claude-sdk", server_app._ensure_default_claude_sdk_agent),
+        ("pi-rpc", server_app._ensure_default_pi_rpc_agent),
+    ],
+)
+def test_product_seed_skips_foreign_template(
+    seed_stores: _SeedStores,
+    caplog: pytest.LogCaptureFixture,
+    name,
+    seed,
 ) -> None:
     from omnigent.db.utils import builtin_agent_id
 
     foreign_id = "f" * 32
     foreign_location = f"{foreign_id}/original"
-    seed_stores.agent_store.create(foreign_id, "claude-sdk", foreign_location)
+    seed_stores.agent_store.create(foreign_id, name, foreign_location)
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
-        server_app._ensure_default_claude_sdk_agent(
-            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
-        )
+        seed(seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
 
-    agent = seed_stores.agent_store.get_by_name("claude-sdk")
+    agent = seed_stores.agent_store.get_by_name(name)
     assert agent is not None
     assert agent.id == foreign_id
     assert agent.bundle_location == foreign_location
     assert agent.version == 1
-    assert seed_stores.agent_store.get(builtin_agent_id("claude-sdk")) is None
+    assert seed_stores.agent_store.get(builtin_agent_id(name)) is None
     assert foreign_id in caplog.text
 
 
