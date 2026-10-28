@@ -18,7 +18,10 @@ from omnigent.permission_tiers.host import (
     trusted_permission_control_paths,
     write_host_permission_state,
 )
-from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
+from omnigent.runner.session_init_protocol import (
+    RunnerSessionInitEnvelope,
+    RunnerSessionInitSnapshot,
+)
 from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_VALUE,
     PERMISSION_RUNTIME_ID_LABEL_KEY,
@@ -46,7 +49,9 @@ class PermissionLease:
 class PermissionTierRuntime:
     """Mutable host state; only authenticated server controls can update it."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, runner_workspace: Path | None = None) -> None:
+        # Shared-runner children may omit their own launch directory.
+        self._runner_workspace = str(runner_workspace.resolve()) if runner_workspace else None
         self._states: dict[str, HostPermissionState] = {}
         self._paths: dict[str, Path] = {}
         self._harnesses: dict[str, str] = {}
@@ -69,15 +74,16 @@ class PermissionTierRuntime:
 
         return bridge_dir_for_session_id(session_id) / HOST_PERMISSION_STATE_FILE
 
+    def _workspace(self, snapshot: RunnerSessionInitSnapshot) -> str | None:
+        if snapshot.worktree and not snapshot.workspace:
+            raise ValueError("Permission-tier worktree requires an explicit launch workspace")
+        return (snapshot.worktree or snapshot.workspace or "").strip() or self._runner_workspace
+
     def fence_start(self, envelope: RunnerSessionInitEnvelope | None, harness: str) -> None:
         """Place a deny-safe cache before any tiered harness can launch."""
         if harness not in TIER_HARNESSES:
             return
-        if (
-            envelope is None
-            or not envelope.snapshot.workspace
-            or not (envelope.snapshot.host_id or envelope.snapshot.runner_id)
-        ):
+        if envelope is None or not (envelope.snapshot.host_id or envelope.snapshot.runner_id):
             raise ValueError("Permission-tier startup requires a trusted host snapshot")
         if self._leases.get(envelope.session_id):
             raise ValueError("Permission-tier reinitialization requires idle tool execution")
@@ -85,7 +91,7 @@ class PermissionTierRuntime:
         host_id = permission_execution_host_id(
             host_id=snapshot.host_id, runner_id=snapshot.runner_id
         )
-        workspace = snapshot.worktree or snapshot.workspace
+        workspace = self._workspace(snapshot)
         if not host_id or not workspace:
             raise ValueError("Incomplete permission host snapshot")
         if PERMISSION_STATE_LABEL_KEY not in snapshot.labels:
@@ -127,7 +133,7 @@ class PermissionTierRuntime:
         host_id = permission_execution_host_id(
             host_id=snapshot.host_id, runner_id=snapshot.runner_id
         )
-        workspace = snapshot.worktree or snapshot.workspace
+        workspace = self._workspace(snapshot)
         if not host_id or not workspace:
             raise ValueError("Permission-tier session is missing host or workspace")
         if PERMISSION_STATE_LABEL_KEY not in snapshot.labels:

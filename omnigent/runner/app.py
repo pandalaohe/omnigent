@@ -2368,7 +2368,7 @@ def create_runner_app(
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
-    permission_tiers = PermissionTierRuntime()
+    permission_tiers = PermissionTierRuntime(runner_workspace=runner_workspace)
     permission_startup_errors: dict[str, str] = {}
     app.state.permission_tiers = permission_tiers
     _permission_tier_targets: dict[str, tuple[str, str]] = {}
