@@ -13545,18 +13545,6 @@
             ],
             "title": "Child Cap"
           },
-          "setup": {
-            "anyOf": [
-              {
-                "maxLength": 400,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Setup"
-          },
           "standing_pass": {
             "$ref": "#/components/schemas/_ProjectStandingPassPatch"
           }

@@ -17,7 +17,7 @@ class SysProjectSettingsReadTool(Tool):
             "available host/harness/model/mode choices, and catalog freshness. Use this before "
             "setting up project defaults. Reads do not run entry templates or setup hooks. "
             "Calling defaults apply to future sessions. The config also includes saved project "
-            "orchestration: child cap, mother setup, and standing-pass removals and exceptions."
+            "orchestration: child cap and standing-pass removals and exceptions."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -51,11 +51,10 @@ class SysProjectSettingsUpdateTool(Tool):
             "Set one project's future-session defaults after sys_project_settings_read. Pass its "
             "revision as expected_revision. Name leaves to change: project host_id, agent_id, "
             "model; or a host's workspace, agent_id and harness model, effort, speed, permission. "
-            "Orchestration leaves: child_cap (positive integer or 'none'), setup (up to 400 "
-            "characters), standing_pass.remove (up to 32 kinds) and standing_pass.exceptions "
+            "Orchestration leaves: child_cap (positive integer or 'none'), "
+            "standing_pass.remove (up to 32 kinds) and standing_pass.exceptions "
             "(up to five exceptions), each a nonblank string of at most 120 characters. "
-            "Setup applies at mother initialization; child caps are "
-            "read on subsequent child creates. "
+            "Child caps are read on subsequent child creates. "
             "Null removes only that override. A new entry may initialize its Agent from the "
             "owner's template; an online entry change runs the setup hook after saving. Hook "
             "failure is a persisted-settings warning; unchanged entries do not rerun hooks. "
@@ -90,7 +89,6 @@ class SysProjectSettingsUpdateTool(Tool):
                                         {"type": "null"},
                                     ]
                                 },
-                                "setup": {"type": ["string", "null"], "maxLength": 400},
                                 "standing_pass": {
                                     "type": "object",
                                     "properties": {

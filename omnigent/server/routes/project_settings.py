@@ -80,7 +80,6 @@ class _ProjectStandingPassPatch(BaseModel):
 class _OrchestrationPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     child_cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"] | None = None
-    setup: Annotated[StrictStr, Field(max_length=400)] | None = None
     standing_pass: _ProjectStandingPassPatch = Field(default_factory=_ProjectStandingPassPatch)
 
 
@@ -139,14 +138,12 @@ def _apply_patch(config: dict[str, Any], body: _SettingsPatch) -> tuple[dict[str
         patch = body.orchestration
         stored = result.get("orchestration")
         orchestration = deepcopy(stored) if isinstance(stored, dict) else {}
-        for field in ("child_cap", "setup"):
-            if field in patch.model_fields_set:
-                value = getattr(patch, field)
-                if value is None:
-                    orchestration.pop(field, None)
-                else:
-                    orchestration[field] = value
-                named.append(f"orchestration.{field}")
+        if "child_cap" in patch.model_fields_set:
+            if patch.child_cap is None:
+                orchestration.pop("child_cap", None)
+            else:
+                orchestration["child_cap"] = patch.child_cap
+            named.append("orchestration.child_cap")
         if "standing_pass" in patch.model_fields_set:
             stored = orchestration.get("standing_pass")
             standing_pass = deepcopy(stored) if isinstance(stored, dict) else {}

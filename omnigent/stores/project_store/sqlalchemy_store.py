@@ -54,6 +54,21 @@ _PROJECT_ORDER_KEY = "project_order"
 _PREFERENCE_MAX_STORED_BYTES = 65535
 
 
+def _without_retired_setup(config: dict[str, Any]) -> dict[str, Any]:
+    """Ignore the retired mother setup without altering other project defaults."""
+    orchestration = config.get("orchestration")
+    if not isinstance(orchestration, dict) or "setup" not in orchestration:
+        return config
+    config = dict(config)
+    orchestration = dict(orchestration)
+    orchestration.pop("setup")
+    if orchestration:
+        config["orchestration"] = orchestration
+    else:
+        config.pop("orchestration")
+    return config
+
+
 def _encode_config(config: dict[str, Any] | None) -> str | None:
     """Pack a project's config dict into a compact JSON blob for storage.
 
@@ -65,6 +80,7 @@ def _encode_config(config: dict[str, Any] | None) -> str | None:
     :raises OmnigentError: ``INVALID_INPUT`` if the serialized config exceeds
         :data:`_CONFIG_MAX_SERIALIZED_LEN`.
     """
+    config = _without_retired_setup(config) if config else None
     if not config:
         return None
     blob = json.dumps(config, separators=(",", ":"))
@@ -90,7 +106,7 @@ def _decode_config(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     decoded = json.loads(raw)
-    return decoded if isinstance(decoded, dict) else {}
+    return _without_retired_setup(decoded) if isinstance(decoded, dict) else {}
 
 
 def _to_entity(row: SqlProject) -> Project:
@@ -521,10 +537,14 @@ class SqlAlchemyProjectStore(ProjectStore):
                     )
                 row.name = name
                 changed = True
-            if config is not None:
-                if row.config != encoded_config:
-                    row.config = encoded_config
-                    changed = True
+            next_config = (
+                encoded_config
+                if config is not None
+                else _encode_config(_decode_config(row.config))
+            )
+            if row.config != next_config:
+                row.config = next_config
+                changed = True
             if changed:
                 row.updated_at = updated_at
             session.flush()
