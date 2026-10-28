@@ -7,10 +7,12 @@ import json
 from typing import Any
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
+from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import tool_dispatch
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 
 pytestmark = pytest.mark.asyncio
 
@@ -228,6 +230,144 @@ async def test_execute_tool_refuses_ungranted_tool_directly(
     assert "sys_os_shell" in out["error"]
     assert "not enabled" in out["error"]
     assert executed == []
+
+
+@pytest.mark.parametrize("with_spec", [False, True])
+async def test_session_create_unknown_arguments_have_no_server_side_effects(
+    with_spec: bool,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "conv_parent"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await tool_dispatch.execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"args": "the child brief", "mesage": "typo"}),
+                agent_spec=AgentSpec(spec_version=1, spawn=True) if with_spec else None,
+                conversation_id="conv_parent",
+                server_client=client,
+            )
+        )
+
+    assert requests == []
+    assert "args" in result["error"] and "mesage" in result["error"]
+    assert "accepted" in result["error"].lower() and "message" in result["error"]
+
+
+@pytest.mark.parametrize("spawn", [False, True])
+@pytest.mark.parametrize("peer_enabled", [False, True])
+@pytest.mark.parametrize("harness", ["claude-sdk", "codex-native"])
+async def test_system_tool_argument_keys_match_each_advertised_schema(
+    monkeypatch: pytest.MonkeyPatch, spawn: bool, peer_enabled: bool, harness: str
+) -> None:
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", Mock)
+    spec = AgentSpec(
+        spec_version=1,
+        spawn=spawn,
+        timers=True,
+        agent_session_sharing=SharePolicy.PUBLIC,
+        terminals={"shell": TerminalEnvSpec()},
+        tools=ToolsConfig(agents=["worker"] if spawn else []),
+        sub_agents=[AgentSpec(spec_version=1, name="worker")] if spawn else [],
+    )
+    monkeypatch.setattr(tool_dispatch, "_peer_messaging_enabled_for", lambda _cid: peer_enabled)
+    monkeypatch.setattr(tool_dispatch, "_session_open_enabled_for", lambda _cid: peer_enabled)
+    manager = tool_dispatch.ToolManager(
+        spec,
+        peer_messaging_enabled=peer_enabled,
+        session_open_enabled=peer_enabled,
+        os_env_schema_only=True,
+        skill_registry=[],
+    )
+    try:
+        schemas = {s["function"]["name"]: s["function"] for s in manager.get_tool_schemas()}
+    finally:
+        manager.shutdown()
+    if harness == "codex-native":
+        schemas.update(
+            {
+                s["name"]: s
+                for s in tool_dispatch.build_native_relay_tool_schemas(
+                    spec,
+                    peer_messaging_enabled=peer_enabled,
+                    session_open_enabled=peer_enabled,
+                )
+            }
+        )
+
+    for name, schema in schemas.items():
+        if not name.startswith("sys_"):
+            continue
+        parameters = schema["parameters"]
+        # The key gate must leave value validation to the existing handlers.
+        for key in parameters.get("properties", {}):
+            assert (
+                tool_dispatch._ungranted_tool_reason(
+                    name,
+                    spec,
+                    harness,
+                    peer_messaging_enabled=peer_enabled,
+                    session_open_enabled=peer_enabled,
+                    arguments={key: None},
+                )
+                is None
+            ), (name, key)
+        if parameters.get("additionalProperties") is False:
+            result = json.loads(
+                await tool_dispatch.execute_tool(
+                    tool_name=name,
+                    arguments=json.dumps({"unexpected_field": "value must not be echoed"}),
+                    agent_spec=spec,
+                    effective_harness=harness,
+                )
+            )
+            assert "unexpected_field" in result["error"], name
+            assert "value must not be echoed" not in result["error"], name
+            for key in parameters.get("properties", {}):
+                assert key in result["error"], (name, key)
+
+
+@pytest.mark.parametrize(
+    "extra_schema",
+    [
+        {},
+        {"additionalProperties": True},
+        {"additionalProperties": {"type": "string"}},
+        {"additionalProperties": False, "patternProperties": {"^extra_": {}}},
+    ],
+)
+async def test_schema_allowed_additional_keys_are_preserved(extra_schema: dict[str, Any]) -> None:
+    assert (
+        tool_dispatch._unknown_tool_argument_reason(
+            "sys_example",
+            {"extra_key": "allowed"},
+            {"properties": {"message": {}}, **extra_schema},
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("id_key", ["handle_id", "task_id"])
+async def test_cancel_async_accepts_canonical_and_legacy_handle_keys(id_key: str) -> None:
+    task = asyncio.create_task(asyncio.sleep(0, result="done"))
+    cancel_event = asyncio.Event()
+    try:
+        output = await tool_dispatch.execute_tool(
+            tool_name="sys_cancel_async",
+            arguments=json.dumps({id_key: "handle_example"}),
+            agent_spec=AgentSpec(spec_version=1),
+            session_async_tasks={"handle_example": (task, cancel_event)},
+        )
+        assert json.loads(output) == {"cancelled": True, "handle_id": "handle_example"}
+        assert cancel_event.is_set()
+    finally:
+        await task
 
 
 async def test_native_harness_spec_keeps_relayed_sys_os_tools(

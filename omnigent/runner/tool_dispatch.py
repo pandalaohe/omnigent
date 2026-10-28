@@ -109,6 +109,7 @@ from omnigent.tools.builtins.spawn import (
     _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
     _HISTORY_MAX_TOTAL_CHARS,
+    SysSessionCreateTool,
     _bound_history_content_chars,
     _clamp_history_content_chars,
     _clamp_history_offset_chars,
@@ -1160,13 +1161,19 @@ def should_dispatch_locally(tool_name: str) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
-# Granted tool names per live AgentSpec + effective harness, keyed by
+@dataclass(frozen=True)
+class _GrantedToolSurface:
+    names: frozenset[str]
+    parameters: dict[str, _JsonObject]
+
+
+# Granted tool metadata per live AgentSpec + effective harness, keyed by
 # ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
 # guards against id reuse after the spec is garbage-collected. The session
 # release flag is part of the key: the same spec advertises a different
 # surface under each flag.
-_granted_tool_names_cache: dict[
-    tuple[int, str | None, bool, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
+_granted_tool_surface_cache: dict[
+    tuple[int, str | None, bool, bool], tuple[weakref.ref[AgentSpec], _GrantedToolSurface]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -1198,7 +1205,23 @@ def _granted_tool_names(
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
 ) -> frozenset[str]:
-    """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
+    """Return the names in the session's cached, advertised tool surface."""
+    return _granted_tool_surface(
+        agent_spec,
+        harness,
+        peer_messaging_enabled=peer_messaging_enabled,
+        session_open_enabled=session_open_enabled,
+    ).names
+
+
+def _granted_tool_surface(
+    agent_spec: AgentSpec,
+    harness: str | None = None,
+    *,
+    peer_messaging_enabled: bool = False,
+    session_open_enabled: bool = False,
+) -> _GrantedToolSurface:
+    """Return the non-MCP tool metadata advertised for *agent_spec* on *harness*.
 
     Mirrors advertisement: the names ``ToolManager`` registers, spec-local
     tools by declared name (no workdir load needed), and ``sys_os_*`` when the
@@ -1220,7 +1243,7 @@ def _granted_tool_names(
         callers can fail closed instead of guessing at the surface.
     """
     cache_key = (id(agent_spec), harness, peer_messaging_enabled, session_open_enabled)
-    cached = _granted_tool_names_cache.get(cache_key)
+    cached = _granted_tool_surface_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
     manager = ToolManager(
@@ -1228,11 +1251,16 @@ def _granted_tool_names(
         peer_messaging_enabled=peer_messaging_enabled,
         session_open_enabled=session_open_enabled,
         os_env_schema_only=True,
-        # Names only: keep skill discovery out of the per-call grant check.
+        # Keep skill discovery out of the per-call metadata check.
         skill_registry=[],
     )
     try:
         names = set(manager.get_tool_names())
+        parameters: dict[str, _JsonObject] = {}
+        for name in names:
+            tool = manager.get_tool(name)
+            if name.startswith("sys_") and tool is not None:
+                parameters[name] = tool.get_schema()["function"]["parameters"]
     finally:
         manager.shutdown()
     # read_skill_file only reads inside skills load_skill already serves;
@@ -1242,11 +1270,34 @@ def _granted_tool_names(
     names.update(info.name for info in agent_spec.local_tools)
     if is_native_harness(harness):
         names.update(_OS_ENV_TOOLS)
-    granted = frozenset(names)
-    if len(_granted_tool_names_cache) >= _GRANTED_TOOL_NAMES_CACHE_MAX:
-        _granted_tool_names_cache.clear()
-    _granted_tool_names_cache[cache_key] = (weakref.ref(agent_spec), granted)
+        for tool_type in OS_ENV_TOOL_TYPES:
+            parameters[tool_type.name()] = tool_type.get_schema()["function"]["parameters"]
+    granted = _GrantedToolSurface(frozenset(names), parameters)
+    if len(_granted_tool_surface_cache) >= _GRANTED_TOOL_NAMES_CACHE_MAX:
+        _granted_tool_surface_cache.clear()
+    _granted_tool_surface_cache[cache_key] = (weakref.ref(agent_spec), granted)
     return granted
+
+
+def _unknown_tool_argument_reason(
+    tool_name: str, args: _JsonObject, parameters: _JsonObject
+) -> str | None:
+    """Enforce closed top-level argument objects without changing value validation."""
+    if parameters.get("additionalProperties") is not False:
+        return None
+    properties = _string_object_dict(parameters.get("properties")) or {}
+    patterns = _string_object_dict(parameters.get("patternProperties")) or {}
+    unknown = sorted(
+        key
+        for key in args
+        if key not in properties and not any(re.search(p, key) for p in patterns)
+    )
+    if not unknown:
+        return None
+    accepted = ", ".join(sorted(properties)) or "(none; this tool takes no arguments)"
+    return (
+        f"{tool_name}: unknown argument(s): {', '.join(unknown)}. Accepted arguments: {accepted}."
+    )
 
 
 def _ungranted_tool_reason(
@@ -1256,13 +1307,13 @@ def _ungranted_tool_reason(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    arguments: _JsonObject | None = None,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
 
-    The check is skipped when no granted surface is known: ``agent_spec`` is
-    ``None`` (spec-less dispatch paths) or is not a real :class:`AgentSpec`
-    (partial stand-ins cannot build a ``ToolManager``). Fails closed when the
-    surface exists but cannot be computed.
+    Membership is unchecked without a real :class:`AgentSpec`; create's
+    static argument schema still applies in that case. Fails closed when
+    the granted surface exists but cannot be computed.
 
     :param tool_name: Tool the caller wants to dispatch, e.g. ``"sys_os_shell"``.
     :param agent_spec: The session's resolved agent spec, or ``None``.
@@ -1273,15 +1324,21 @@ def _ungranted_tool_reason(
         so the judged surface matches the one the session advertised.
     :param session_open_enabled: The session's cached open flag, so the
         judged surface matches the one the session advertised.
+    :param arguments: When provided, also reject unknown system-tool keys
+        against that tool's advertised parameter schema.
     """
     from omnigent.spec.types import AgentSpec as _AgentSpec
 
     if not isinstance(agent_spec, _AgentSpec):
+        if tool_name == SysSessionCreateTool.name() and arguments is not None:
+            return _unknown_tool_argument_reason(
+                tool_name, arguments, SysSessionCreateTool().get_schema()["function"]["parameters"]
+            )
         return None
     if tool_name in _SESSION_OPEN_TOOLS and not session_open_enabled:
         return "sys_session_open is available only to top-level sessions"
     try:
-        granted = _granted_tool_names(
+        granted = _granted_tool_surface(
             agent_spec,
             _effective_harness_name(agent_spec, effective_harness),
             peer_messaging_enabled=peer_messaging_enabled,
@@ -1293,7 +1350,11 @@ def _ungranted_tool_reason(
             f"tool {tool_name!r} is not enabled: the agent's granted tool surface "
             f"could not be resolved ({type(exc).__name__}: {exc})"
         )
-    if tool_name in granted:
+    if tool_name in granted.names:
+        if arguments is not None and tool_name in granted.parameters:
+            return _unknown_tool_argument_reason(
+                tool_name, arguments, granted.parameters[tool_name]
+            )
         return None
     return (
         f"tool {tool_name!r} is not enabled for this agent "
@@ -10246,6 +10307,7 @@ async def execute_tool(
             effective_harness,
             peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
             session_open_enabled=_session_open_enabled_for(conversation_id),
+            arguments=args,
         )
         if refusal is not None:
             return json.dumps({"error": refusal})
