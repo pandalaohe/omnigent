@@ -102,16 +102,16 @@ def _config_snapshot(
     cwd: str | os.PathLike[str] | None,
     env: Mapping[str, str],
     *,
-    global_helpers: bool = False,
+    trusted_helpers: bool = False,
     deadline: float | None = None,
 ) -> bytes:
     query = ["git", "--no-pager", *globals_, "config", "--null"]
-    query.extend(["--global", "--no-includes"] if global_helpers else ["--name-only"])
+    query.extend(["--show-scope", "--no-includes"] if trusted_helpers else ["--name-only"])
     query.extend(
         [
             "--get-regexp",
             r"^credential(\..*)?\.helper$"
-            if global_helpers
+            if trusted_helpers
             else r"^filter\..*\.(clean|smudge|process|required)$",
         ]
     )
@@ -188,15 +188,18 @@ def _prepare_git(
         )
     child_env["GIT_ALLOW_PROTOCOL"] = ":".join(sorted(protocols))
     _append_config(child_env, list(_FIXED_CONFIG.items()))
-    # Trusted host-global credential helpers retain managed-clone authentication.
-    # Local/worktree helpers are reset; global includes are not imported as trusted code.
-    helpers = _config_snapshot(globals_, cwd, child_env, global_helpers=True, deadline=deadline)
+    # Direct system/global helpers retain image and host authentication in Git order.
+    # Local/worktree helpers and includes are not imported as trusted code.
+    helpers = _config_snapshot(globals_, cwd, child_env, trusted_helpers=True, deadline=deadline)
     credentials = []
-    for record in helpers.decode("utf-8", errors="surrogateescape").split("\0"):
-        if record:
-            key, separator, value = record.partition("\n")
-            if not separator:
-                raise OSError("Invalid global Git credential configuration snapshot")
+    records = helpers.decode("utf-8", errors="surrogateescape").split("\0")
+    if records.pop() != "" or len(records) % 2:
+        raise OSError("Invalid Git credential configuration snapshot")
+    for scope, record in zip(records[::2], records[1::2], strict=True):
+        key, separator, value = record.partition("\n")
+        if not separator:
+            raise OSError("Invalid Git credential configuration snapshot")
+        if scope in {"system", "global"}:
             credentials.append((key, value))
     _append_config(child_env, credentials)
     keys = _config_snapshot(globals_, cwd, child_env, deadline=deadline)

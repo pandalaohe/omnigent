@@ -128,20 +128,23 @@ def test_required_filter_can_be_neutralized_without_failing_status(callback_repo
     assert not marker.exists()
 
 
-def test_repo_credentials_are_reset_but_host_global_helper_is_retained(
-    callback_repo: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("scope", ["system", "global"])
+def test_repo_credentials_are_reset_but_host_helper_is_retained(
+    callback_repo: Path, monkeypatch: pytest.MonkeyPatch, scope: str
 ) -> None:
     repo_marker = callback_repo / "repo-helper-ran"
     host_marker = callback_repo.parent / "host-helper-ran"
     script = callback_repo.parent / "host-helper.py"
     script.write_text(f"from pathlib import Path\nPath({str(host_marker)!r}).touch()\n")
-    global_file = callback_repo.parent / "host.gitconfig"
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_file))
+    host_file = callback_repo.parent / "host.gitconfig"
+    monkeypatch.setenv(f"GIT_CONFIG_{scope.upper()}", str(host_file))
+    if scope == "system":
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
     subprocess.run(
         [
             "git",
             "config",
-            "--global",
+            f"--{scope}",
             "credential.helper",
             "!" + shlex.join([sys.executable, str(script)]),
         ],
@@ -149,6 +152,19 @@ def test_repo_credentials_are_reset_but_host_global_helper_is_retained(
     )
     repo_script = callback_repo / "repo-helper.py"
     repo_script.write_text(f"from pathlib import Path\nPath({str(repo_marker)!r}).touch()\n")
+    included_file = callback_repo.parent / "included.gitconfig"
+    subprocess.run(
+        [
+            "git",
+            "config",
+            "--file",
+            str(included_file),
+            "credential.helper",
+            "!" + shlex.join([sys.executable, str(repo_script)]),
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "config", f"--{scope}", "include.path", str(included_file)], check=True)
     subprocess.run(
         [
             "git",
@@ -168,6 +184,29 @@ def test_repo_credentials_are_reset_but_host_global_helper_is_retained(
     )
     assert host_marker.exists()
     assert not repo_marker.exists()
+
+
+@pytest.mark.parametrize("disabled_by", ["global_reset", "nosystem"])
+def test_host_system_helper_respects_resets_and_nosystem(
+    callback_repo: Path, monkeypatch: pytest.MonkeyPatch, disabled_by: str
+) -> None:
+    marker = callback_repo.parent / "system-helper-ran"
+    system_file = callback_repo.parent / "system.gitconfig"
+    system_file.write_text(f'[credential]\n\thelper = "!touch {marker}"\n')
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_file))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1" if disabled_by == "nosystem" else "0")
+    if disabled_by == "global_reset":
+        global_file = callback_repo.parent / "global.gitconfig"
+        global_file.write_text('[credential "https://example.test"]\n\thelper =\n')
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_file))
+    result = git_commands.run_git(
+        ["git", "credential", "fill"],
+        cwd=callback_repo,
+        input=b"protocol=https\nhost=example.test\n\n",
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
 
 
 def test_guard_failure_never_runs_the_requested_command(
@@ -587,7 +626,7 @@ def test_driver_added_after_snapshot_is_not_protected(
 
     def insert_driver(*args, **kwargs):
         snapshot = original(*args, **kwargs)
-        if not kwargs.get("global_helpers"):
+        if not kwargs.get("trusted_helpers"):
             subprocess.run(
                 [
                     "git",
