@@ -21,6 +21,8 @@ from omnigent.runner.tool_dispatch import (
     _send_to_existing_session,
 )
 
+pytestmark = pytest.mark.usefixtures("_clean_subagent_registry")
+
 _CALLER = "conv_caller"
 _TARGET = "conv_peer"
 
