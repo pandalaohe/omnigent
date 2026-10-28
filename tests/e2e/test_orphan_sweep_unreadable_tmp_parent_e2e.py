@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.native.owner_claim import write_owner_claim
 from tests._helpers.live_server import find_free_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -165,7 +166,13 @@ def test_server_boot_survives_inaccessible_ap_sibling(tmp_path: Path) -> None:
     # every real pid_max default, so it is reliably not alive.
     dead = parent / "ap-orphan-dead"
     dead.mkdir(mode=0o700)
-    (dead / "AP_PID").write_text(str(2**22 + 5), encoding="utf-8")
+    write_owner_claim(dead, filename="AP_PID")
+    marker = dead / "AP_PID"
+    lines = [str(2**22 + 5), *marker.read_text(encoding="utf-8").splitlines()[1:]]
+    marker.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    legacy = parent / "ap-legacy"
+    legacy.mkdir(mode=0o700)
+    (legacy / "AP_PID").write_text(str(2**22 + 6), encoding="utf-8")
     boot = _boot_server_and_wait_health(parent, tmp_path)
     try:
         _proc, outcome, log_path = next(boot)
@@ -179,6 +186,7 @@ def test_server_boot_survives_inaccessible_ap_sibling(tmp_path: Path) -> None:
         # The unreadable sibling itself is preserved (we cannot prove it is
         # dead), not clobbered.
         assert blocked.exists()
+        assert legacy.exists(), "a bare PID cannot prove ownership and must be preserved"
     finally:
         boot.close()
         blocked.chmod(0o700)
