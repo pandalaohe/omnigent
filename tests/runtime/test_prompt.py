@@ -394,29 +394,26 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
 
 
 def test_embedded_browser_guidance_included_for_every_agent() -> None:
-    """
-    Every agent's composed prompt steers the model to the embedded browser.
-
-    The ``browser_*`` tools are auto-registered for every agent without a
-    spec gate (``ToolManager._register_browser_tools``); a tool description
-    alone loses to a model's native web tooling, so the system prompt must
-    carry the preference for any spec — authored or not.
-    """
+    """Every agent receives the browser routing guidance."""
     authored = _spec("Agent prompt")
     assert build_instructions(authored, None, []) == (
         f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
     )
 
 
-def test_embedded_browser_guidance_names_registered_tools() -> None:
-    """
-    The guidance must track the canonical registered browser tool names, so
-    a tool rename cannot silently orphan the prompt text.
-    """
-    from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
+@pytest.mark.parametrize("native", [False, True])
+def test_browser_guidance_routes_work_and_review_surfaces(native: bool) -> None:
+    """Native startup and per-turn prompts carry the same browser routing."""
+    spec = _spec("Agent prompt")
+    result = native_startup_instructions(spec) if native else build_instructions(spec, None, [])
 
-    for name in sorted(BROWSER_TOOL_NAMES):
-        assert name in EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert result is not None
+    assert "use your own web tooling (a browser CLI, fetch or search tools)." in result
+    assert "open it as a new tab in the user's own browser and leave it open." in result
+    assert "Show files the user should read (HTML reports, Markdown, PDF)" in result
+    assert "in Omnigent's right panel." in result
+    assert "The browser_* tools drive the Omnigent desktop app's embedded pane;" in result
+    assert "use them only when the user asks for that pane." in result
 
 
 def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
