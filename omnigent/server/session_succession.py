@@ -30,8 +30,11 @@ import httpx
 from omnigent.db.utils import generate_task_id, now_epoch
 from omnigent.entities import Conversation, ErrorData, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+from omnigent.native._native_session_labels import replacement_session_labels
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations, session_stream
+from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _message_text,
@@ -45,6 +48,7 @@ from omnigent.server.routes._sessions.orchestration import _post_system_message
 from omnigent.server.runner_session_init import runner_archive_states_for_conversation
 from omnigent.server.schemas import SessionCreatedEvent
 from omnigent.stores.conversation_store import (
+    _INSTANCE_SCOPED_LABEL_KEYS,
     HANDOVER_ITEM_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     ConversationStore,
@@ -540,6 +544,24 @@ async def _phase_open(
         )
 
     dropped: list[dict[str, Any]] = list(receipt.dropped or [])
+    if successor is not None:
+        configuration_keys = replacement_session_labels(old_conversation.labels).keys() | {
+            key for key in old_conversation.labels if key.startswith(MCP_SELECTION_PREFIX)
+        }
+        runtime_keys = (_INSTANCE_SCOPED_LABEL_KEYS - {CHILD_CAP_LABEL_KEY}) | {
+            "omnigent.pi.bridge_id",
+            "omnigent.pi_native.bridge_id",
+            "omnigent.keep_warm",
+            "omnigent.keep_warm_stats",
+            "omnigent.pi_cache",
+            "omnigent.last_cache",
+            "omnigent.running_since",
+            "omnigent.last_real_turn_settled",
+        }
+        for key in sorted(configuration_keys - successor.labels.keys() - runtime_keys):
+            item = {"kind": "configuration label", "id": key}
+            if item not in dropped:
+                dropped.append(item)
     if peer_message_store is not None:
         retargeted = await asyncio.to_thread(
             peer_message_store.retarget_receiver,

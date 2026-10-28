@@ -26,6 +26,7 @@ from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.permission_tiers import PermissionTier
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.permission_tiers import ConfirmedPermissionState, read_permission_state
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -93,7 +94,13 @@ def _successor_labels(
         key: value
         for key, value in source.labels.items()
         if key
-        in {WRAPPER_LABEL_KEY, UI_MODE_LABEL_KEY, WORKTREE_ROOT_LABEL_KEY, PROJECT_LABEL_KEY}
+        in {
+            WRAPPER_LABEL_KEY,
+            UI_MODE_LABEL_KEY,
+            WORKTREE_ROOT_LABEL_KEY,
+            PROJECT_LABEL_KEY,
+            CHILD_CAP_LABEL_KEY,
+        }
         or key.startswith(MCP_SELECTION_PREFIX)
         or not key.startswith(("omnigent.", "omnigent:", "cost_control."))
     }
@@ -411,4 +418,5 @@ def register_succession_routes(
             "receipt_id": receipt.id,
             "phase": receipt.phase,
             "moved_ids": receipt.moved_ids,
+            "dropped": receipt.dropped or [],
         }
