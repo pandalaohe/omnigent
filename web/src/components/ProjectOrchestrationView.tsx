@@ -24,10 +24,6 @@ export function ProjectOrchestrationView({
             ? "Unlimited"
             : (orchestration?.child_cap ?? "Use account default")}
         </dd>
-        <dt className="text-muted-foreground">Setup</dt>
-        <dd className="whitespace-pre-wrap break-words">
-          {orchestration?.setup ?? "No project setup"}
-        </dd>
         <dt className="text-muted-foreground">Removed pass kinds</dt>
         <dd className="break-words">
           {orchestration?.standing_pass?.remove?.join(", ") || "None"}

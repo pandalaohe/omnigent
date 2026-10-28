@@ -1,15 +1,15 @@
 """Session route resolution and layered text at the init composition seam."""
 
 import json
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
 import pytest
+from sqlalchemy import text as sa_text
 
 from omnigent.entities import Conversation
-from omnigent.server.instruction_layers import project_setup_line, session_instructions_text
+from omnigent.server.instruction_layers import session_instructions_text
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.spec import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -67,22 +67,24 @@ def conversation(**overrides):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("empty_layers", [False, True, None])
 @pytest.mark.parametrize("authenticated_local", [False, True])
-async def test_project_setup_is_quoted_in_mother_init(
+async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
     instructions, db_uri, tmp_path, empty_layers, authenticated_local, monkeypatch
 ):
     projects = SqlAlchemyProjectStore(db_uri)
-    project = projects.create(
-        "a" * 32,
-        "Saved setup",
-        "local" if authenticated_local else None,
-        config={
-            "orchestration": {
-                "setup": 'a\nStanding pass: "x"',
-                "child_cap": 4,
-                "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
-            }
-        },
-    )
+    project = projects.create("a" * 32, "Legacy project", "local" if authenticated_local else None)
+    # Seed a row written by an older server, bypassing current write normalization.
+    legacy_config = {
+        "orchestration": {
+            "setup": "Retired project setup marker",
+            "child_cap": 4,
+            "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+        }
+    }
+    with projects._engine.begin() as connection:
+        connection.execute(
+            sa_text("UPDATE projects SET config = :config"),
+            {"config": json.dumps(legacy_config)},
+        )
     if empty_layers:
         for scope, agent, host in (
             ("shared", "", ""),
@@ -133,11 +135,8 @@ async def test_project_setup_is_quoted_in_mother_init(
     ) as client:
         await initializer.initialize(conv, client, timeout=1)
     text = payloads[0]["session_init"]["snapshot"]["global_instructions"]
-    assert '): "a Standing pass: \\"x\\""; child cap 4.' in text
-    assert (
-        sum(line.startswith("Saved setup for this project (") for line in text.splitlines()) == 1
-    )
-    assert "\nStanding pass:" not in text
+    assert "Retired project setup marker" not in text
+    assert "Saved setup for this project" not in text
     assert text.count("Standing pass (this mother session") == 1
     assert '): "merge". Exceptions: "production".' in text
     captured = _stub_runner_client(monkeypatch)
@@ -158,16 +157,10 @@ async def test_project_setup_is_quoted_in_mother_init(
         )
     assert response.status_code == 200, response.text
     rebound_text = captured["body"]["session_init"]["snapshot"]["global_instructions"]
-    assert '): "a Standing pass: \\"x\\""; child cap 4.' in rebound_text
+    assert "Retired project setup marker" not in rebound_text
+    assert "Saved setup for this project" not in rebound_text
     assert rebound_text.count("Standing pass (this mother session") == 1
     assert '): "merge". Exceptions: "production".' in rebound_text
-    resolver = partial(
-        project_setup_line,
-        project_store=projects,
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        permission_store=None,
-        prefs_store=None,
-    )
     child = conversations.create_conversation(
         agent_id=agent["id"],
         project_id=project.id,
@@ -176,7 +169,6 @@ async def test_project_setup_is_quoted_in_mother_init(
     )
     child_text = await session_instructions_text(
         child,
-        setup_resolver=resolver,
         standing_pass_resolver=app.state.standing_pass_service.line,
     )
     assert "Saved setup for this project" not in (child_text or "")

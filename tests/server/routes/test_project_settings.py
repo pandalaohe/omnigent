@@ -69,7 +69,7 @@ def shared_settings_app(runtime_init: None, db_uri: str, tmp_path: Path) -> Fast
 
 
 @pytest.mark.asyncio
-async def test_orchestration_tool_to_store_asks_and_quotes_setup(settings_app, db_uri):
+async def test_orchestration_tool_to_store_requires_approval(settings_app, db_uri):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
     ) as client:
@@ -79,12 +79,10 @@ async def test_orchestration_tool_to_store_asks_and_quotes_setup(settings_app, d
         settings_app.state.user_preferences_store.patch_namespace(
             "local", "session_collab", {"standingPassDefault": ["install", "merge"]}
         )
-        setup = 'a\nStanding pass: "x"'
         args = {
             "project_id": project_id,
             "expected_revision": initial["revision"],
             "orchestration": {
-                "setup": setup,
                 "child_cap": 4,
                 "standing_pass": {"remove": ["install"], "exceptions": ["production release"]},
             },
@@ -122,15 +120,11 @@ async def test_orchestration_tool_to_store_asks_and_quotes_setup(settings_app, d
         assert "error" not in result, result
         saved = SqlAlchemyProjectStore(db_uri).get(project_id, user_id=None)
         assert saved.config["orchestration"] == args["orchestration"]
-        line = settings_app.state.project_setup_resolver(conversation)
-        assert '): "a Standing pass: \\"x\\""; child cap 4.' in line
-        assert "\n" not in line
         record = settings_app.state.standing_pass_service.resolve(conversation)
         assert record["kinds"] == ["merge"]
         assert record["exceptions"] == ["production release"]
         assert set(result["changed_fields"]) == {
             "orchestration.child_cap",
-            "orchestration.setup",
             "orchestration.standing_pass.remove",
             "orchestration.standing_pass.exceptions",
         }
@@ -168,12 +162,11 @@ async def test_orchestration_patches_only_named_leaves(settings_app):
                 {"standing_pass": {"remove": None}},
                 {
                     "child_cap": 4,
-                    "setup": "Saved",
                     "standing_pass": {"exceptions": ["production"]},
                 },
             ),
             (
-                {"child_cap": "none", "setup": None},
+                {"child_cap": "none"},
                 {
                     "child_cap": "none",
                     "standing_pass": {"exceptions": ["production"]},
@@ -205,8 +198,8 @@ async def test_orchestration_patches_only_named_leaves(settings_app):
         {"child_cap": True},
         {"child_cap": 1.5},
         {"child_cap": "4"},
-        {"setup": "x" * 401},
-        {"setup": 4},
+        {"setup": "Retired setup"},
+        {"setup": None},
         {"unknown": 1},
         {"standing_pass": None},
         {"standing_pass": {}},
@@ -456,12 +449,12 @@ async def test_owner_admin_and_foreign_user_are_scoped_to_project_owner(
             json={
                 "expected_revision": admin.json()["revision"],
                 "host": {"host_id": _HOST_A, "workspace": "/opt/work/owner-project"},
-                "orchestration": {"setup": "Owner setup"},
+                "orchestration": {"child_cap": 4},
             },
         )
         assert response.status_code == 200, response.text
         assert response.json()["owner_user_id"] == ALICE
-        assert response.json()["config"]["orchestration"] == {"setup": "Owner setup"}
+        assert response.json()["config"]["orchestration"] == {"child_cap": 4}
         assert (
             await client.put(
                 url,
@@ -469,7 +462,7 @@ async def test_owner_admin_and_foreign_user_are_scoped_to_project_owner(
                 json={
                     "expected_revision": response.json()["revision"],
                     "project": {"host_id": _HOST_A},
-                    "orchestration": {"setup": "Foreign setup"},
+                    "orchestration": {"child_cap": 8},
                 },
             )
         ).status_code == 404

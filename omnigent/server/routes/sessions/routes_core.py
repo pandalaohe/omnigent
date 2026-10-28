@@ -2057,7 +2057,6 @@ def register_core_routes(
                     )
                     if quota_service is not None
                     else None,
-                    setup_resolver=getattr(request.app.state, "project_setup_resolver", None),
                 )
                 # Prefer the initializer's owner-aware snapshot; embedded
                 # builds without one keep the deployment flag.

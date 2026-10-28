@@ -6,11 +6,15 @@ real SQLite database, covering owner scoping and per-owner name uniqueness.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.db.db_models import SqlProject
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
@@ -234,6 +238,80 @@ def test_create_persists_config(store: SqlAlchemyProjectStore) -> None:
     store.create(_uid("p1"), "Configured", "alice@example.com", cfg)
     assert store.get(_uid("p1"), user_id="alice@example.com").config == cfg
     assert store.list(user_id="alice@example.com")[0].config == cfg
+
+
+@pytest.mark.parametrize("legacy_setup", ["Old mother setup", None, {"malformed": True}])
+@pytest.mark.parametrize("operation", ["rename", "config", "calling-defaults", "settings"])
+def test_retired_setup_is_ignored_and_removed_on_write(
+    store: SqlAlchemyProjectStore, legacy_setup, operation: str
+) -> None:
+    from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
+        SqlAlchemyProjectHostBindingStore,
+    )
+    from omnigent.stores.project_store import project_config_revision
+
+    config = {
+        "custom": "keep",
+        "orchestration": {
+            "setup": legacy_setup,
+            "child_cap": 4,
+            "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+        },
+    }
+    expected = {
+        "custom": "keep",
+        "orchestration": {
+            "child_cap": 4,
+            "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+        },
+    }
+    owner = "alice@example.com"
+    project = store.create(_uid("legacy"), "Legacy", owner, config=config)
+    assert project.config == expected
+    assert config["orchestration"]["setup"] == legacy_setup
+    # Simulate existing persisted data from before retirement.
+    with store._engine.begin() as connection:
+        connection.execute(
+            sa_text("UPDATE projects SET config = :config"), {"config": json.dumps(config)}
+        )
+    assert store.get(project.id, user_id=owner).config == expected
+    assert store.list(user_id=owner)[0].config == expected
+    if operation == "rename":
+        store.update(project.id, user_id=owner, name="Renamed")
+    elif operation == "config":
+        store.update(project.id, user_id=owner, config=config)
+    elif operation == "calling-defaults":
+        store.patch_calling_defaults(
+            project.id,
+            user_id=owner,
+            expected_revision=project_config_revision(expected),
+            host_id="neutral-host",
+            harness="codex-native",
+            fields={},
+        )
+    else:
+        bindings = SqlAlchemyProjectHostBindingStore(store.storage_location)
+        _, _, revision = bindings.settings_snapshot(project.id, caller_id=owner, is_admin=False)
+        bindings.update_settings(
+            project.id,
+            caller_id=owner,
+            is_admin=False,
+            expected_revision=revision,
+            config=expected,
+        )
+    with store._engine.connect() as connection:
+        persisted = connection.execute(select(SqlProject.config)).scalar_one()
+    assert json.loads(persisted) == expected
+
+
+def test_retired_setup_only_config_becomes_empty(store: SqlAlchemyProjectStore) -> None:
+    project = store.create(
+        _uid("setup-only"),
+        "Legacy",
+        "alice@example.com",
+        config={"orchestration": {"setup": "Old"}},
+    )
+    assert project.config == {}
 
 
 def test_update_replaces_config_and_stamps_updated_at(store: SqlAlchemyProjectStore) -> None:

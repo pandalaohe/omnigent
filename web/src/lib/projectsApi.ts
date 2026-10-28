@@ -74,7 +74,6 @@ export interface ProjectConfig {
   calling_defaults?: Record<string, ProjectCallingDefaultsHost>;
   orchestration?: {
     child_cap?: number | "none";
-    setup?: string;
     standing_pass?: { remove?: string[]; exceptions?: string[] };
   };
 }

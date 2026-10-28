@@ -77,57 +77,32 @@ async def _exercise_project_cap(client, db_uri):
 
 def test_project_orchestration_reads_only_the_session_owners_project(db_uri):
     from omnigent.server.child_cap import child_cap_for
-    from omnigent.server.instruction_layers import project_setup_line
 
     conversations = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create(
         "a" * 32,
-        "Private setup",
+        "Private project",
         "alice@example.test",
-        config={"orchestration": {"child_cap": 2, "setup": "Alice setup"}},
+        config={"orchestration": {"child_cap": 2}},
     )
     parent = conversations.create_conversation(project_id=project.id)
     permissions.grant("alice@example.test", parent.id, LEVEL_OWNER)
     assert child_cap_for(parent, conversations, permissions, None, projects) == (2, "project")
-    assert "Alice setup" in project_setup_line(
-        parent,
-        project_store=projects,
-        conversation_store=conversations,
-        permission_store=permissions,
-        prefs_store=None,
-    )
     permissions.revoke("alice@example.test", parent.id)
     permissions.grant("bob@example.test", parent.id, LEVEL_OWNER)
     assert child_cap_for(parent, conversations, permissions, None, projects) == (None, "none")
-    assert (
-        project_setup_line(
-            parent,
-            project_store=projects,
-            conversation_store=conversations,
-            permission_store=permissions,
-            prefs_store=None,
-        )
-        == ""
-    )
     permissions.revoke("bob@example.test", parent.id)
     local_project = projects.create(
         "b" * 32,
-        "Local setup",
+        "Local project",
         None,
-        config={"orchestration": {"child_cap": 3, "setup": "Local setup"}},
+        config={"orchestration": {"child_cap": 3}},
     )
     conversations.set_conversation_project(parent.id, local_project.id)
     parent = conversations.get_conversation(parent.id)
     assert child_cap_for(parent, conversations, permissions, None, projects) == (3, "project")
-    assert "Local setup" in project_setup_line(
-        parent,
-        project_store=projects,
-        conversation_store=conversations,
-        permission_store=permissions,
-        prefs_store=None,
-    )
 
 
 async def test_cap_precedence_validation_and_user_exemption(

@@ -25,7 +25,7 @@ available through the CLI or UI yet.
 - `standing-pass`: choose defaults for new parent sessions, inspect the current
   pass in a session header, revoke a kind, and grant it back after approval.
   Children inherit the parent's current pass and show read-only controls.
-- `project-orchestration`: inspect a project's child limit, setup, removed pass
+- `project-orchestration`: inspect a project's child limit, removed pass
   kinds and exceptions without changing them through the generic defaults form.
 
 ## How to get to it (user POV)
