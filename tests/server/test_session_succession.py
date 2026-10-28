@@ -29,6 +29,12 @@ from omnigent.server import session_succession as succession_module
 from omnigent.server.app import create_app
 from omnigent.server.archive_close import ArchiveCloseCoordinator
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, UnifiedAuthProvider
+from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
+from omnigent.server.permission_tiers import (
+    PERMISSION_CAPABILITY_LABEL_KEY,
+    PERMISSION_CAPABILITY_VALUE,
+    ConfirmedPermissionState,
+)
 from omnigent.server.routes import sessions as sessions_facade
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -53,6 +59,7 @@ from omnigent.stores.peer_message_store.sqlalchemy_store import (
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -305,6 +312,93 @@ def _succession_notices(store: SqlAlchemyConversationStore, session_id: str) -> 
     """All persisted succession notices on a session."""
     page = store.list_items(session_id, limit=200, order="desc", type="error")
     return [item for item in page.data if getattr(item.data, "code", None) == "session_succession"]
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi", "pi-native"])
+@pytest.mark.parametrize("cap", ["7", "none"])
+async def test_successor_preserves_explicit_child_cap(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    db_uri: str,
+    harness: str,
+    cap: str,
+) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(
+        "c" * 32, "Project", None, config={"orchestration": {"child_cap": 2}}
+    )
+    old = store.create_conversation(
+        agent_id="a" * 32,
+        runner_id=RUNNER_ID,
+        harness_override=harness,
+        project_id=project.id,
+        labels={
+            **(
+                {
+                    **ConfirmedPermissionState("ask", 2, "ready").labels(harness),
+                    PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+                }
+                if harness in {"pi", "pi-native"}
+                else {}
+            ),
+            CHILD_CAP_LABEL_KEY: cap,
+        },
+    ).id
+    response = await client.post(f"/v1/sessions/{old}/successor")
+    assert response.status_code == 200, response.text
+    new = response.json()["id"]
+    response = await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "done"
+    target = store.get_conversation(new)
+    assert target is not None and target.labels.get(CHILD_CAP_LABEL_KEY) == cap
+    effective = await client.get(f"/v1/sessions/{new}/child-cap")
+    assert effective.status_code == 200, effective.text
+    assert effective.json() == {
+        "cap": 7 if cap == "7" else None,
+        "source": "session",
+        "open_children": 0,
+    }
+
+
+async def test_succession_reports_dropped_configuration_without_values(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+) -> None:
+    old = _create(store)
+    new = _create(store)
+    store.set_labels(
+        old,
+        {
+            "omnigent.custom_setting": "private-config-value",
+            "omnigent.mcp_service.disabled": "0",
+            "cost_control.current": "old-cost",
+            "omnigent.pi.bridge_id": "old-bridge",
+            "omnigent.last_context_tokens": "123",
+            "omnigent.last_context_window": "456",
+            "omnigent.last_provider_usage_limits": "old-usage",
+            "omnigent.startup": "ready",
+            "omnigent.keep_warm": "old-episode",
+            **ConfirmedPermissionState("ask", 2, "ready").labels("pi"),
+        },
+    )
+    response = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new, "allow_empty": True},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "done"
+    assert response.json()["dropped"] == [
+        {"kind": "configuration label", "id": "omnigent.custom_setting"},
+        {"kind": "configuration label", "id": "omnigent.mcp_service.disabled"},
+    ]
+    receipt = store.get_succession(old, new)
+    assert receipt is not None and receipt.opening is not None
+    assert "configuration label omnigent.custom_setting" in receipt.opening["text"]
+    assert "private-config-value" not in receipt.opening["text"]
+    assert len(_succession_notices(store, new)) == 1
 
 
 async def test_succession_happy_path_moves_children_and_completes(
