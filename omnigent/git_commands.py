@@ -196,11 +196,12 @@ def _prepare_git(
     if records.pop() != "" or len(records) % 2:
         raise OSError("Invalid Git credential configuration snapshot")
     for scope, record in zip(records[::2], records[1::2], strict=True):
+        if scope not in {"system", "global"}:
+            continue
         key, separator, value = record.partition("\n")
         if not separator:
             raise OSError("Invalid Git credential configuration snapshot")
-        if scope in {"system", "global"}:
-            credentials.append((key, value))
+        credentials.append((key, value))
     _append_config(child_env, credentials)
     keys = _config_snapshot(globals_, cwd, child_env, deadline=deadline)
     drivers = {

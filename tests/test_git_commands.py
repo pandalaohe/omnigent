@@ -186,6 +186,17 @@ def test_repo_credentials_are_reset_but_host_helper_is_retained(
     assert not repo_marker.exists()
 
 
+def test_valueless_command_credential_helper_is_ignored(callback_repo: Path) -> None:
+    result = git_commands.run_git(
+        ["git", "-c", "credential.helper", "rev-parse", "--is-inside-work-tree"],
+        cwd=callback_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "true"
+
+
 @pytest.mark.parametrize("disabled_by", ["global_reset", "nosystem"])
 def test_host_system_helper_respects_resets_and_nosystem(
     callback_repo: Path, monkeypatch: pytest.MonkeyPatch, disabled_by: str
