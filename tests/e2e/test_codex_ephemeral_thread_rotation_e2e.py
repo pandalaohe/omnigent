@@ -59,7 +59,7 @@ class _RecordingAP:
     """httpx-shaped Omnigent client: answers the snapshot GET, records writes.
 
     ``_create_thread_replacement_session`` fetches the old session snapshot
-    (GET), then creates the replacement (POST /v1/sessions) and issues a series
+    (GET), then creates the replacement (POST /successor) and issues a series
     of PATCH/POST calls to bind and transfer it. Recording those lets the test
     assert whether a rotation was performed at all.
     """
@@ -86,17 +86,20 @@ class _RecordingAP:
             request=httpx.Request("GET", url),
         )
 
-    async def post(self, url: str, *, json: dict, timeout: float | None = None) -> httpx.Response:
+    async def post(
+        self, url: str, *, json: dict | None = None, timeout: float | None = None
+    ) -> httpx.Response:
         """Record a POST and return 200 (a session id for a create).
 
         :param url: Request URL, e.g. ``"/v1/sessions"``.
-        :param json: JSON body of the POST.
+        :param json: Optional JSON body of the POST.
         :param timeout: Request timeout in seconds, e.g. ``60.0``; accepted
             but unused.
-        :returns: A 200 response; ``/v1/sessions`` returns a new id.
+        :returns: A 200 response; session creation returns a new id.
         """
-        self.posts.append((url, json))
-        body: dict = {"id": REPLACEMENT_SESSION} if url == "/v1/sessions" else {}
+        self.posts.append((url, json if json is not None else {}))
+        creates = {"/v1/sessions", f"/v1/sessions/{PARENT_SESSION}/successor"}
+        body: dict = {"id": REPLACEMENT_SESSION} if url in creates else {}
         return httpx.Response(200, json=body, request=httpx.Request("POST", url))
 
     async def patch(self, url: str, *, json: dict) -> httpx.Response:
@@ -110,8 +113,9 @@ class _RecordingAP:
         return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     def created_sessions(self) -> list[dict]:
-        """Return the bodies of every ``POST /v1/sessions`` (session creates)."""
-        return [body for url, body in self.posts if url == "/v1/sessions"]
+        """Return the recorded bodies of session creation requests."""
+        creates = {"/v1/sessions", f"/v1/sessions/{PARENT_SESSION}/successor"}
+        return [body for url, body in self.posts if url in creates]
 
 
 def _make_target(ap: _RecordingAP) -> fwd._ForwarderTarget:
