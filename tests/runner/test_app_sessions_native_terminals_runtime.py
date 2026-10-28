@@ -247,7 +247,7 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pi rejects a missing trusted workspace; blank cwd falls back to the runner."""
+    """Pi binds permissions and execution to the runner when the session omits cwd."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
     # which on a multi-profile Databricks dev box otherwise 400s the create
@@ -287,12 +287,10 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
             json={"session_id": session_id, "agent_id": "86c64e0f9cab937bd04c79b9957dd55a"},
         )
 
-    if workspace_value is None:
-        assert resp.status_code == 409, resp.text
-        assert resp.json()["error"] == "permission_tier_unavailable"
-        assert not pm.get_client_calls
-        return
     assert resp.status_code == 201, resp.text
+    assert app.state.permission_tiers.state(session_id).workspace == str(
+        runner_workspace.resolve()
+    )
     assert pm.get_client_calls
     conversation_id, harness, env = pm.get_client_calls[-1]
     assert conversation_id == session_id

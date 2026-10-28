@@ -866,29 +866,77 @@ def test_full_install_skips_rules_but_auto_requires_them(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
+@pytest.mark.parametrize(
+    "workspace_source", ["session", "runner", "session-worktree", "worktree", "missing"]
+)
 async def test_runner_rejects_missing_trusted_init_and_accepts_current_server_input(
-    monkeypatch, tmp_path, harness
+    monkeypatch, tmp_path, harness, workspace_source
 ):
-    from unittest.mock import AsyncMock
-
+    from omnigent.permission_tiers.host import read_host_permission_state
+    from omnigent.runner import create_runner_app
     from omnigent.runner.native import orchestration
-    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _spec_resolver_returning,
+    )
+    from tests.runner.helpers import NullServerClient
     from tests.runner.native_helpers import _harness_spec
 
-    monkeypatch.setattr(orchestration, "_auto_create_pi_terminal", AsyncMock())
-    monkeypatch.setattr(orchestration, "_auto_create_antigravity_terminal", AsyncMock())
-    app, _ = await _build_app_for_spec(_harness_spec(harness))
+    runner_workspace = tmp_path / "runner-workspace"
+    expected_workspace = tmp_path / workspace_source
+    if workspace_source == "runner":
+        expected_workspace = runner_workspace
+    launches = []
+
+    async def launch(session_id, *_args, **_kwargs):
+        state_path = app.state.permission_tiers.state_path(session_id, harness, {})
+        state = read_host_permission_state(state_path)
+        assert state.workspace == str(expected_workspace)
+        assert state.status == "blocked"
+        launches.append(session_id)
+
+    monkeypatch.setattr(orchestration, "_auto_create_pi_terminal", launch)
+    monkeypatch.setattr(orchestration, "_auto_create_antigravity_terminal", launch)
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,
+        spec_resolver=await _spec_resolver_returning(_harness_spec(harness)),
+        server_client=NullServerClient(),
+        runner_workspace=runner_workspace if workspace_source != "missing" else None,
+    )
     body = {"session_id": "trusted-startup", "agent_id": "test-agent"}
     async with _runner_client(app) as client:
         refused = await client.post("/v1/sessions", json=body)
     assert refused.status_code == 409, refused.text
     assert refused.json()["error"] == "permission_tier_unavailable"
     assert app.state.permission_tiers.state(body["session_id"]) is None
-    async with _runner_client(app, permission_harness=harness) as client:
+    snapshot = {
+        "workspace": str(expected_workspace) if workspace_source.startswith("session") else None,
+        "worktree": str(expected_workspace) if "worktree" in workspace_source else None,
+        "host_id": None,
+        "runner_id": "runner-parent",
+        "parent_session_id": "parent-session",
+    }
+    async with _runner_client(
+        app, permission_harness=harness, permission_snapshot=snapshot
+    ) as client:
         created = await client.post("/v1/sessions", json=body)
+    if workspace_source in ("missing", "worktree"):
+        assert created.status_code == 409, created.text
+        assert not pm.get_client_calls
+        assert not launches
+        assert app.state.permission_tiers.state(body["session_id"]) is None
+        return
     assert created.status_code == 201, created.text
     state = app.state.permission_tiers.state(body["session_id"])
     assert (state.tier, state.revision, state.status) == ("auto", 1, "ready")
+    assert state.workspace == str(expected_workspace)
+    assert state.host_id == "runner:runner-parent"
+    assert launches == ([] if harness == "pi" else [body["session_id"]])
+    if harness == "pi":
+        assert pm.get_client_calls[-1][2]["HARNESS_PI_CWD"] == str(expected_workspace)
     state_path = app.state.permission_tiers.state_path(body["session_id"], harness, {})
     assert state_path.is_relative_to(tmp_path)
     assert state_path.is_file()
