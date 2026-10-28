@@ -1,0 +1,9 @@
+spec_version: 1
+name: pi-rpc
+description: Pi in chat using the host Pi login and default model, including on Windows.
+executor:
+  type: omnigent
+  config:
+    harness: pi
+spawn: true
+instructions: You are a coding assistant. Help the user complete their task.

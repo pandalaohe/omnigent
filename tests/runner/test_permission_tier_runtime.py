@@ -23,6 +23,60 @@ from omnigent.runner.session_init_protocol import (
 from omnigent.server.permission_tiers import ConfirmedPermissionState
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [True, False])
+async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, installed, caplog):
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    app, pm = await _build_app_for_spec(_harness_spec("pi"))
+    harness = pm._client
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_post = harness.post
+
+    async def bootstrap(url, **kwargs):
+        if url == "/v1/permission-tier/bootstrap":
+            entered.set()
+            await release.wait()
+            return httpx.Response(200 if installed else 503, json={"installed": installed})
+        return await original_post(url, **kwargs)
+
+    monkeypatch.setattr(harness, "post", bootstrap)
+    async with _runner_client(app, permission_harness="pi") as client:
+        init = asyncio.create_task(
+            client.post("/v1/sessions", json={"session_id": "cold-pi", "agent_id": "test-agent"})
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        try:
+            response = await client.post(
+                "/v1/sessions/cold-pi/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "test-agent",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            )
+            assert response.status_code == 202, response.text
+            turn = app.state.active_turns.get("cold-pi")
+            assert turn is not None
+            done, _ = await asyncio.wait([turn], timeout=0.05)
+            assert not done, "first turn failed while permission bootstrap was still running"
+            assert app.state.permission_tiers.state("cold-pi").status == "blocked"
+        finally:
+            release.set()
+            initialized = await asyncio.wait_for(init, 5)
+        await asyncio.wait_for(turn, 5)
+    assert initialized.status_code == (201 if installed else 503)
+    assert "Permission tier is unavailable: blocked" not in caplog.text
+    if installed:
+        assert harness.posted_bodies
+        assert "turn setup failed" not in caplog.text
+    else:
+        assert not harness.posted_bodies
+        assert "permission tier startup failed" in caplog.text
+
+
 def _runtime(tmp_path: Path, tier: str) -> PermissionTierRuntime:
     runtime = PermissionTierRuntime()
     workspace = tmp_path / "workspace"

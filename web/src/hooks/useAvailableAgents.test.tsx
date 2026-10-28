@@ -300,6 +300,12 @@ describe("useAvailableAgents", () => {
             harness: "pi-native",
           },
           {
+            id: "ag_pi_rpc",
+            name: "pi-rpc",
+            description: null,
+            harness: "pi",
+          },
+          {
             id: "ag_kiro_native",
             name: "kiro-native-ui",
             description: null,
@@ -373,6 +379,14 @@ describe("useAvailableAgents", () => {
         display_name: "Pi",
         description: null,
         harness: "pi-native",
+        skills: [],
+      },
+      {
+        id: "ag_pi_rpc",
+        name: "pi-rpc",
+        display_name: "Pi RPC",
+        description: null,
+        harness: "pi",
         skills: [],
       },
       {

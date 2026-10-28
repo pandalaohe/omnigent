@@ -235,6 +235,7 @@ async def test_product_identity_is_declared_for_seeded_sdk_bundles_only(
     for name, harness in (
         ("claude-sdk", "claude-sdk"),
         ("codex-sdk", "codex"),
+        ("pi-rpc", "pi"),
         ("polly", "claude-sdk"),
     ):
         bundle = build_agent_bundle(
@@ -254,9 +255,11 @@ async def test_product_identity_is_declared_for_seeded_sdk_bundles_only(
     rows = {row["name"]: row for row in response.json()["data"]}
     assert rows["claude-sdk"]["product_of"] == "claude-sdk"
     assert rows["codex-sdk"]["product_of"] == "codex"
+    assert rows["pi-rpc"]["product_of"] == "pi"
     assert rows["polly"]["product_of"] is None
     assert rows["claude-sdk"]["integration_mode"] == "sdk-in-process"
     assert rows["codex-sdk"]["integration_mode"] == "cli-subprocess"
+    assert rows["pi-rpc"]["integration_mode"] == "cli-subprocess"
 
 
 @pytest.mark.parametrize(

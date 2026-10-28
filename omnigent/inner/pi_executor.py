@@ -61,6 +61,7 @@ from uuid import uuid4
 from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
 from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.bridge import (
+    PERMISSION_INSTALLATION_FILE,
     bridge_dir_for_session_id,
     clear_inbox,
     permission_tool_registry_source,
@@ -146,6 +147,28 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 _GATEWAY_AUTH_TIMEOUT_S = 7
 _GATEWAY_AUTH_REAP_TIMEOUT_S = 0.5
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
+
+
+class PiPermissionBootstrapError(RuntimeError):
+    """Fixed startup diagnostic without subprocess output or receipt contents."""
+
+
+def _permission_stderr_tail(lines: list[str]) -> str:
+    """Expose only recognized error categories; arbitrary stderr may contain secrets."""
+    categories = (
+        "ERR_MODULE_NOT_FOUND",
+        "MODULE_NOT_FOUND",
+        "ERR_REQUIRE_ESM",
+        "SyntaxError",
+        "TypeError",
+        "ReferenceError",
+        "EACCES",
+        "ENOENT",
+    )
+    return "\n".join(
+        next((category for category in categories if category in line), "[filtered]")
+        for line in lines[-10:]
+    )
 
 
 class _GatewayAuthError(OSError):
@@ -2149,8 +2172,8 @@ class _PiRpcSession:
                 text = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if text:
                     logger.debug("pi stderr: %s", text)
-                    if len(self._stderr_lines) < 50:
-                        self._stderr_lines.append(text)
+                    self._stderr_lines.append(text)
+                    del self._stderr_lines[:-50]
         except (asyncio.CancelledError, Exception):  # noqa: BLE001 — stderr drainer is best-effort; never crashes
             pass
 
@@ -3930,7 +3953,7 @@ class PiExecutor(Executor):
             and state.tool_names == effective_tool_names
         ):
             if self._permission_controlled:
-                await self._await_permission_installation(session_key)
+                await self._await_permission_installation(session_key, state.rpc)
             return state.rpc
 
         previous_rpc = state.rpc
@@ -4010,7 +4033,7 @@ class PiExecutor(Executor):
                 launcher_args=subprocess_config.launcher_args,
             )
             if self._permission_controlled:
-                await self._await_permission_installation(session_key)
+                await self._await_permission_installation(session_key, rpc)
             if self._session_states.get(session_key) is not state or state.rpc is not previous_rpc:
                 raise RuntimeError("Pi RPC owner changed during startup")
         except BaseException:
@@ -4027,17 +4050,34 @@ class PiExecutor(Executor):
         state._has_sent_prompt = False
         return rpc
 
-    async def _await_permission_installation(self, session_key: str) -> None:
+    async def _await_permission_installation(self, session_key: str, rpc: _PiRpcSession) -> None:
         bridge_dir = bridge_dir_for_session_id(session_key)
         state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
         if state.session_id != session_key:
             raise RuntimeError("Pi permission state has wrong session")
-        deadline = asyncio.get_running_loop().time() + 8.0
+        # Starts after spawn returns; includes Node, SDK and extension loading.
+        deadline = asyncio.get_running_loop().time() + (30.0 if IS_WINDOWS else 8.0)
+        reason = "timeout"
         while asyncio.get_running_loop().time() < deadline:
+            if rpc.process is None or rpc.process.returncode is not None:
+                status = rpc.process.returncode if rpc.process is not None else None
+                reason = f"process_exit (status={status})"
+                break
             if verify_pi_permission_installation(bridge_dir, state.tier):
                 return
             await asyncio.sleep(0.05)
-        raise RuntimeError("Pi permission extension installation was not verified")
+        else:
+            reason = (
+                "ack_mismatch"
+                if (bridge_dir / PERMISSION_INSTALLATION_FILE).exists()
+                else "missing_ack"
+            )
+        logger.warning(
+            "Pi permission bootstrap failed: reason=%s; filtered stderr tail=%s",
+            reason,
+            _permission_stderr_tail(rpc._stderr_lines),
+        )
+        raise PiPermissionBootstrapError(f"Pi permission bootstrap failed: {reason}")
 
     async def bootstrap_permission_tier(self, session_id: str) -> bool:
         """Spawn Pi without a user prompt and prove the installed extension."""

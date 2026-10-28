@@ -558,6 +558,7 @@ _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _CODEX_SDK_AGENT_NAME = "codex-sdk"
 _CLAUDE_SDK_AGENT_NAME = "claude-sdk"
+_PI_RPC_AGENT_NAME = "pi-rpc"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
@@ -624,6 +625,7 @@ _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).p
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
 _CODEX_SDK_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "codex-sdk.yaml"
 _CLAUDE_SDK_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "claude-sdk.yaml"
+_PI_RPC_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "pi-rpc.yaml"
 
 
 class _FastAPICallNext(Protocol):
@@ -986,6 +988,7 @@ def _ensure_default_agents(
     _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_sdk_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_claude_sdk_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_pi_rpc_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -1309,6 +1312,29 @@ def _ensure_default_claude_sdk_agent(
         agent_cache,
         name=_CLAUDE_SDK_AGENT_NAME,
         bundle_bytes=_build_claude_sdk_bundle(),
+    )
+
+
+def _ensure_default_pi_rpc_agent(
+    agent_store: AgentStore, artifact_store: ArtifactStore, agent_cache: Any
+) -> None:
+    """Seed the headless Pi product with the host's model and login defaults."""
+    import tempfile
+
+    from omnigent.db.utils import builtin_agent_id
+
+    if not _PI_RPC_BUNDLE_SOURCE.is_file():
+        return
+    existing = agent_store.get_by_name(_PI_RPC_AGENT_NAME)
+    if existing is not None and existing.id != builtin_agent_id(_PI_RPC_AGENT_NAME):
+        _logger.warning("Skipping Pi RPC seed: template %s owns the name", existing.id)
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = Path(tmpdir)
+        (bundle_dir / "config.yaml").write_bytes(_PI_RPC_BUNDLE_SOURCE.read_bytes())
+        bundle = _tar_gz_dir(bundle_dir)
+    _ensure_builtin_agent(
+        agent_store, artifact_store, agent_cache, name=_PI_RPC_AGENT_NAME, bundle_bytes=bundle
     )
 
 
