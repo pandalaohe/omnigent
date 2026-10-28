@@ -303,6 +303,7 @@ def test_main_freezes_gc_and_arms_first_turn_freeze_before_serving(
     from omnigent.runtime.harnesses import _scaffold
 
     calls: list[str] = []
+    monkeypatch.setattr(_runner, "_bind_windows_job", lambda _owner_dir: None)
     monkeypatch.setattr(_runner, "_configure_logging", lambda *_a: None)
     monkeypatch.setattr(_runner, "_load_harness_app", lambda *_a: FastAPI())
     monkeypatch.setattr(_runner.gc, "freeze", lambda: calls.append("freeze"))
