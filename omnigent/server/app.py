@@ -5541,6 +5541,12 @@ def create_app(
             # A deleted account's still-signed session JWTs must stop
             # authenticating; every request checks the generation and tombstone.
             auth_provider.set_account_check(account_store.accepts_generation)
+
+            def usage_read_account_lookup(user_id: str) -> str | None:
+                account = account_store.get_user(user_id)
+                return account.account_generation if account is not None else None
+
+            auth_provider.set_usage_read_account_lookup(usage_read_account_lookup)
             app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
             app.include_router(
                 create_accounts_auth_router(
