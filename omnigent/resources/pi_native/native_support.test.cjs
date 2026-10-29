@@ -257,9 +257,8 @@ test("effective placement keeps valid local and remote projections",async t=>{
 });
 test("known outside actions and Gist produce explicit outside facts",async t=>{
   const cases=[
-    ...["schedule.list","schedule.show","schedule.history","schedule.pause","schedule.delete"].map(action=>({action,...action==="schedule.list"?{}:{id:"schedule"}})),
     {action:"mission.list"},{action:"project.status"},
-    {action:"schedule.list",options:{topic:"fixture",agentScope:"both"}},
+    {action:"mission.list",options:{topic:"fixture",agentScope:"both"}},
     {action:"create",agent:"reader",config:{description:"fixture"}},
     {action:"worktree.cleanup",mode:"plan"},
     {agent:"reader",task:"read",async:false,share:true},
@@ -286,6 +285,7 @@ test("the whole package action domain follows the non-launching or native-proof 
     const fact=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state);
     assert.equal(fact.status,policy==="launch"?"failed_native":policy==="outside"?"outside_native_support":"attested_native");
     if(policy==="launch") {
+      assert.match(fact.reason,/Native launching action requires its effective launch proof/);
       assert.equal((await f.run("subagent",input))?.block,true);
       assert.equal(f.policyCalls(),0);
       assert.equal(f.backendStarts(),0);
@@ -302,7 +302,7 @@ test("resume and unknown outside options cannot bypass retained launch proof",as
   });
   for(const options of [{unknown:true},null,[],{agentScope:"unknown"}]) await t.test(JSON.stringify(options),async t=>{
     const f=await fixture(t);
-    assert.equal((await f.run("subagent",{action:"schedule.list",options}))?.block,true);
+    assert.equal((await f.run("subagent",{action:"mission.list",options}))?.block,true);
     assert.equal(f.policyCalls(),0);
     assert.equal(f.backendStarts(),0);
   });

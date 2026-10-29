@@ -117,6 +117,50 @@ def test_native_support_node_consumers(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_native_launch_gate_removal_is_detected_by_action_admission_contract(tmp_path):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for native support consumer tests")
+    workspace = Path(__file__).resolve().parents[2]
+    resources = workspace / "omnigent/resources/pi_native"
+    copied = tmp_path / "omnigent/resources/pi_native"
+    copied.mkdir(parents=True)
+    for source in resources.iterdir():
+        if source.is_file() and source.suffix in (".cjs", ".js", ".mjs"):
+            shutil.copyfile(source, copied / source.name)
+    rules = tmp_path / "omnigent/permission_tiers/native_support_rules.json"
+    rules.parent.mkdir(parents=True)
+    shutil.copyfile(workspace / "omnigent/permission_tiers/native_support_rules.json", rules)
+    target = copied / "native_support.cjs"
+    source = target.read_text()
+    start = source.index('    if(event.toolName==="subagent" && "action" in normalized) {')
+    end = source.index("    const unsupported=outsideAction", start)
+    target.write_text(source[:start] + source[end:])
+    result = subprocess.run(
+        [
+            node,
+            "--test",
+            "--test-name-pattern",
+            "the whole package action domain",
+            str(copied / "native_support.test.cjs"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "TMPDIR": str(tmp_path),
+            "OMNIGENT_NATIVE_ACTION_CASES": json.dumps(ACTION_CASES),
+        },
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, (
+        "Removing only the action gate must violate explicit launch admission"
+    )
+    assert "ERR_ASSERTION" in output and "effective launch proof" in output, output
+
+
 def _host(name, arguments, status=NativeSupportStatus.ATTESTED, action="ordinary", **changes):
     binding = NativeCallBinding(
         "scope",
