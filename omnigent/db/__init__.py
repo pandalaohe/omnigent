@@ -15,6 +15,14 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.query_context import current_query_name, query_name_scope
 from omnigent.db.session_startup import SqlSessionStartup, SqlStartupBudget
+from omnigent.db.subagent_retry import (
+    SqlRetryChain,
+    SqlRetryControl,
+    SqlRetryFinal,
+    SqlRetryInput,
+    SqlRetryOwner,
+    SqlRetryTerminal,
+)
 
 __all__ = [
     "DEFAULT_WORKSPACE_ID",
@@ -24,6 +32,12 @@ __all__ = [
     "SqlConversation",
     "SqlConversationItem",
     "SqlFile",
+    "SqlRetryChain",
+    "SqlRetryControl",
+    "SqlRetryFinal",
+    "SqlRetryInput",
+    "SqlRetryOwner",
+    "SqlRetryTerminal",
     "SqlSessionPermission",
     "SqlSessionStartup",
     "SqlStartupBudget",
