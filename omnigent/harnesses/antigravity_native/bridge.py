@@ -192,9 +192,8 @@ class AntigravityNativeBridgeState:
         There is intentionally no durable read cursor. The retired transcript
         forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
         mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
-        driver that superseded it (:mod:`omnigent.harnesses.antigravity_native.reader`) keeps
-        an *in-memory* seen-set only and is recreated per session by the runner, so
-        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        driver uses an in-memory seen-set within a run and stable item source ids
+        for server-side deduplication across restarts. Legacy ``forwarded_step_index`` /
         ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
         ignored on read.
 
@@ -274,10 +273,12 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove antigravity-native bridge dirs whose owner process is provably dead
     and whose newest file is at least 70 days old.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    agy keeps the session's conversation store inside the bridge dir (see
+    :func:`agy_gemini_dir`), and a runner restart is a normal resume boundary,
+    so owner death alone cannot imply that the bridge is disposable. Keep the
+    whole bridge for 70 days after its newest file activity, then remove it intact.
+    Explicit session deletion remains immediate. Global maintenance calls this via
+    ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
     :returns: The number of orphaned bridge dirs removed.
     """
@@ -384,6 +385,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_get_startup_observation_v1",
     "sys_session_handover",
     "sys_session_list",
+    "sys_session_message",
     "sys_session_open",
     "sys_session_rename",
     "sys_session_send",
@@ -397,6 +399,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_terminal_send",
     "sys_timer_cancel",
     "sys_timer_set",
+    "ui_open_file",
     "update_comment",
 ]
 
@@ -996,7 +999,9 @@ _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
 _AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
-def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+def ensure_agy_feedback_survey_disabled(
+    home: Path, *, launch_env: dict[str, str] | None = None
+) -> None:
     """
     Disable agy's feedback survey in the launch HOME's ``settings.json``.
 
@@ -1018,6 +1023,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
         ``<home>/.gemini/antigravity-cli/settings.json``.
+    :param launch_env: Resolved child environment; None uses the current process.
     :returns: None.
     """
     # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
@@ -1068,7 +1074,8 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             return
         data = loaded
     desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
-    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+    environment = os.environ if launch_env is None else launch_env
+    if (environment.get("GEMINI_API_KEY") or "").strip():
         desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
     provider_removed = False
     current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)

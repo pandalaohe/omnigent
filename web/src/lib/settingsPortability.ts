@@ -16,6 +16,7 @@ import { SESSION_NAVIGATION_STORAGE_KEY } from "./sessionNavigationPreferences";
 import { USAGE_CONTEXT_STORAGE_KEY } from "./usageContextPreferences";
 import { syncAllUserPreferencesFromLocal } from "./userPreferencesSync";
 import { WORKTREE_DEFAULTS_STORAGE_KEY } from "./worktreeDefaultPreferences";
+import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
 import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
@@ -41,6 +42,7 @@ const EXPORTABLE_KEYS = [
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   WORKTREE_DEFAULTS_STORAGE_KEY,

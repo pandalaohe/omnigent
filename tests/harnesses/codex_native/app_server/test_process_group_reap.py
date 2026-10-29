@@ -167,13 +167,13 @@ async def test_model_discovery_spawn_registers_crash_safe_entry(
         assert args[0] == "/test/codex"
         assert "omnigent_crash_teardown_tag" not in args[0]
         assert args[1:] == [
-            "app-server",
             "-c",
             needle,
-            "--listen",
-            listen_url,
             "-c",
             'model="probe-model"',
+            "app-server",
+            "--listen",
+            listen_url,
         ]
         assert discovery.owner_lock is not None
         entries = _read_discovery_registry_entries(registry_path)
@@ -597,7 +597,7 @@ async def test_close_surviving_posix_child_finishes_cleanup(
         async def wait(self):
             self.waits += 1
             if self.waits == 1:
-                raise asyncio.TimeoutError
+                raise TimeoutError
             await asyncio.Event().wait()
 
     class OwnerLock:
@@ -870,7 +870,7 @@ async def test_real_untagged_group_is_not_an_exit_receipt(monkeypatch):
             process.terminate()
         try:
             await asyncio.wait_for(process.wait(), 2)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             process.kill()
             await process.wait()
     assert await module._reap_process_group_survivors(process.pid, "fixture-tag")
@@ -995,7 +995,7 @@ async def test_real_owned_group_keeps_context_work_unknown_through_close_and_ret
             process.terminate()
         try:
             await asyncio.wait_for(process.wait(), 2)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             process.kill()
             await process.wait()
         for task in (delayed, closing):
@@ -1118,7 +1118,7 @@ async def test_real_tagged_group_exit_keeps_context_work_unknown(
                 process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), 2)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 process.kill()
                 await asyncio.wait_for(process.wait(), 2)
         record_property("proof_kind", "scripted Codex RPC + real tagged benign OS process groups")

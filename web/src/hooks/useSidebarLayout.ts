@@ -79,11 +79,14 @@ export function useSidebarLayout(): {
 
   useEffect(() => {
     const sync = () => setLayout(readSidebarLayout());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === STORAGE_KEY) sync();
+    };
     window.addEventListener(CHANGED_EVENT, sync);
-    window.addEventListener("storage", sync);
+    window.addEventListener("storage", onStorage);
     return () => {
       window.removeEventListener(CHANGED_EVENT, sync);
-      window.removeEventListener("storage", sync);
+      window.removeEventListener("storage", onStorage);
     };
   }, []);
 

@@ -612,7 +612,8 @@ class SysSessionListTool(Tool):
             "history, get info, or close. 'sessions': a global list of "
             "every session "
             "you can access, each with status + runner connectivity, "
-            "project, workspace, last activity time and a last-message "
+            "project, workspace, creation-origin session id, last activity time "
+            "and a last-message "
             "excerpt, "
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, read the full transcript via "
@@ -1029,7 +1030,7 @@ class SysSessionShareTool(Tool):
 
 class SysSessionCreateTool(Tool):
     """
-    Create a child session from an existing agent or a local bundle.
+    Create a session from an existing agent or a local bundle.
 
     The child is a separate Omnigent agent session — its own
     conversation, visible in the session tree, optionally a different
@@ -1037,11 +1038,10 @@ class SysSessionCreateTool(Tool):
     subagent/Task tool (which remains the right choice for quick
     in-context helpers).
 
-    A **child-only write**: the new session's ``parent_session_id`` is
-    forced to the caller's own session, so an orchestrator can only spawn
-    sessions inside its own subtree — never a top-level or sibling
-    session. The child inherits the caller's runner (co-location), so it
-    starts executing as soon as a message is queued.
+    The default placement forces ``parent_session_id`` to the caller.
+    A child inherits the caller's runner and starts when a message is queued.
+    With ``agent_id``, independent placements use the server's orchestration
+    gate and create private top-level sessions without completion forwarding.
 
     Two optional addressing modes — at most one of ``agent_id`` or
     ``config_path``; with neither the child launches the parent
@@ -1063,16 +1063,13 @@ class SysSessionCreateTool(Tool):
       fills the parent project's per-host default agent (and its model
       / effort). An error when the project has no default for the host.
 
-    An optional ``message`` is queued as the child's first user turn;
+    An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
 
     Returns a handle ``{conversation_id, agent_id, title, status, project_id}``. The
     session runs asynchronously — use ``sys_session_get_history`` /
-    ``sys_session_get_info`` to monitor it, or ``sys_session_send`` (with
-    the returned ``conversation_id``) to drive it further.
-
-    Runner-dispatched: both modes force ``parent_session_id`` to the
-    caller.
+    ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
+    further child work and ``sys_session_message`` for independent sessions.
     """
 
     @classmethod
@@ -1084,7 +1081,7 @@ class SysSessionCreateTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Create a child session from an agent. This launches a "
+            "Create a session from an agent. This launches a "
             "separate Omnigent agent session — its own conversation, "
             "visible in the session tree, optionally a different "
             "registered agent. It is not your harness's built-in "
@@ -1105,9 +1102,18 @@ class SysSessionCreateTool(Tool):
             "Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
-            "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions). "
-            "With agent_id you can place the child anywhere: `host` picks a "
+            "message. By default the new session is a child of the caller. "
+            "With agent_id, placement='same_host' creates an independent private session "
+            "on the caller's host/workspace; placement='managed' provisions a new sandbox "
+            "using the server's configured default provider. Managed creation requires a "
+            "configured sandbox provider; use same_host for an existing connected host. "
+            "These placements require orchestration enabled "
+            "and a private sending session, including its side-chat source chain. "
+            "An independent worker's optional "
+            "first message must contain 1–8000 characters. "
+            "Independent sessions do not forward replies: "
+            "read their status/history, and use sys_session_message for subsequent work. "
+            "With the default child placement you can place the child anywhere: `host` picks a "
             "registered host (id or exact name); `workspace` is the absolute "
             "directory there; `project_id` overrides the parent's project; "
             "`worktree` {branch, base} cuts a NEW branch worktree (base "
@@ -1131,8 +1137,9 @@ class SysSessionCreateTool(Tool):
             "before creating again, and never resend a pending first message. "
             "The session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send. May be refused by the session restriction setting; "
-            "when refused, report the need to your parent in your final output."
+            "with sys_session_send for children or sys_session_message for independent sessions."
+            " May be refused by session restrictions; "
+            "report the need to your parent in your final output."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1153,6 +1160,14 @@ class SysSessionCreateTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "placement": {
+                            "type": "string",
+                            "enum": ["child", "same_host", "managed"],
+                            "description": (
+                                "Default child; same_host or managed launches a private "
+                                "top-level session (agent_id only)."
+                            ),
+                        },
                         "agent_id": {
                             "type": "string",
                             "description": (

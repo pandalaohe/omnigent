@@ -76,6 +76,10 @@ import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
+import {
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { showToast } from "@/components/ui/toast";
 import { customAgentBundle, useCustomAgents } from "@/lib/customAgentsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -87,7 +91,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // creates the session WITH `project_id`: the server files it atomically and
 // default-fills config-seeded fields the composer omits. These tests pin the
 // new request shape, the field-omission semantics, the skipped follow-up
-// move, and the untouched legacy paths (label-only folders, plain visits).
+// move, the legacy paths (label-only, plain visits), and the saved start.
 const navigateMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
@@ -98,6 +102,7 @@ const EXISTING_WORKTREE = "/Users/corey/worktrees/alpha-feature";
 // Mutable so a test can choose a project-driven or plain visit.
 let searchParams = new URLSearchParams("project=Alpha");
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -459,6 +464,26 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("workspace" in body).toBe(false);
   });
 
+  it("keeps server project defaults ahead of the browser's last start", async () => {
+    // The configured project entry remains authoritative over browser-local history.
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+    setProjectConfig(config);
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      { agentId: "ag_hello", hostId: "host_1", workspace: RECENT_WORKSPACE },
+      config,
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.agent_id).toBe("ag_other");
+    expect(body).not.toHaveProperty("workspace");
+  });
+
   it("keeps a non-project visit explicit and adds only the create token label", async () => {
     searchParams = new URLSearchParams("");
     localStorage.setItem("omnigent:last-agent-id", "ag_hello");
@@ -499,6 +524,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // label and the follow-up move creates the row on demand.
     setProjects([{ id: null, name: "Alpha" }]);
     setProjectConfig(undefined);
+    vi.mocked(moveConversationToProject).mockResolvedValue({ project_id: "proj_new" } as never);
     renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
@@ -508,6 +534,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("project_id" in body).toBe(false);
     expect((body.labels as Record<string, string>).omni_project).toBe("Alpha");
     expect(vi.mocked(moveConversationToProject)).toHaveBeenCalledWith("conv_new", "Alpha");
+    // Project starts are governed by server calling defaults.
+    expect(readProjectLaunchDefaults("proj_new", {})).toBeNull();
   });
 
   it("sends agent_id when the user explicitly re-picks the config agent", async () => {
@@ -606,7 +634,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // Absent fields are default-filled from the project config, and a managed
     // create rejects a path workspace / git block — the explicit nulls keep
     // the server from filling them in.
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+    setProjectConfig(config);
     renderLanding({ managed_sandboxes_enabled: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
@@ -627,8 +656,9 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
   });
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
-    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+    setProjectConfig(config);
+    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
     renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
@@ -677,6 +707,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // The runner still launches with the explicit client-side workspace.
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
+    // No browser-local launch seed is written over project defaults.
+    expect(readProjectLaunchDefaults("proj_alpha", config)).toBeNull();
   });
 });
 

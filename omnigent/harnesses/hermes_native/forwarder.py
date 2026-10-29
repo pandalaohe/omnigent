@@ -1303,7 +1303,7 @@ async def forward_hermes_store_to_session(
                                     hermes_session_id=hermes_session_id,
                                 )
                                 compaction_persisted = True
-                            except Exception:  # noqa: BLE001
+                            except Exception:  # noqa: BLE001 — preserve the boundary failure contract
                                 _logger.warning(
                                     "Failed to persist hermes compaction item for %s",
                                     session_id,
@@ -1357,7 +1357,7 @@ async def forward_hermes_store_to_session(
                                         ),
                                     )
                                     continue
-                            except Exception:  # noqa: BLE001
+                            except Exception:  # noqa: BLE001 — preserve the boundary failure contract
                                 _logger.warning(
                                     "hermes forwarder failed to re-pin to child session "
                                     "after compaction; staying on %s; session=%s",

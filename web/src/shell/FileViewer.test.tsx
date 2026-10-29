@@ -19,12 +19,17 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import { copyText } from "@/lib/clipboard";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
 const codeViewerRenders = vi.hoisted(() => vi.fn());
 const codeViewerComments = vi.hoisted(() => vi.fn());
 const addCommentMutateAsync = vi.hoisted(() => vi.fn());
+
+vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 // ── Mock heavy child components ───────────────────────────────────────────────
 
@@ -274,13 +279,12 @@ import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext
 import { type ElementAnchorV1, encodeElementAnchor } from "./annotationAnchor";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
-import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { DEFAULT_FILE_VIEW_PREFERENCES, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as identityModule from "@/lib/identity";
 import { hasOmnigentHostFetcher } from "@/lib/host";
 import type * as hostModule from "@/lib/host";
-import { toast } from "sonner";
 import type * as sonnerModule from "sonner";
 import type * as workspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import { clearCommentDraft, setCommentDraft } from "./commentDrafts";
@@ -319,11 +323,13 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  syncUrl?: boolean;
   frameless?: boolean;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
   open?: boolean;
   mediaActive?: boolean;
+  viewport?: "desktop" | "mobile";
   path?: string;
   /**
    * Initial URL search string (without leading "?"), e.g. "diff=1" or
@@ -347,11 +353,13 @@ interface RenderProps {
  * the current params after state changes.
  */
 function viewerTree({
+  syncUrl,
   frameless,
   mobileOverlay,
   position,
   open = false,
   mediaActive,
+  viewport,
   path = "file1.py",
   initialSearch = "",
   onClose = vi.fn(),
@@ -365,11 +373,13 @@ function viewerTree({
       <MemoryRouter initialEntries={[url]}>
         <LocationDisplay />
         <FileViewer
+          syncUrl={syncUrl}
           frameless={frameless}
           mobileOverlay={mobileOverlay}
           position={position}
           open={open}
           mediaActive={mediaActive}
+          viewport={viewport}
           conversationId="conv_1"
           path={path}
           onClose={onClose}
@@ -1405,6 +1415,100 @@ describe("FileViewer comment post settlement", () => {
   });
 });
 
+describe("FileViewer clickable file path", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(copyText).mockReset().mockResolvedValue(undefined);
+  });
+
+  it.each(["editor", "preview", "source"] as const)(
+    "copies the complete displayed path from Markdown %s mode",
+    async (mode) => {
+      writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, previewableViewMode: mode });
+      const path = "/home/user/work notes/design-review/compat-doc-full.md";
+      renderViewer({ open: true, path });
+      const pathButton = screen.getByRole("button", { name: `Copy file path: ${path}` });
+      expect(pathButton).toHaveTextContent(path);
+
+      fireEvent.click(pathButton);
+
+      expect(copyText).toHaveBeenCalledWith(path);
+      await waitFor(() => expect(toast.success).toHaveBeenCalledWith("File path copied"));
+    },
+  );
+
+  it("copies the absolute workspace path after the path prop changes", () => {
+    const context = localDesktopContext();
+    const { rerender } = render(
+      <FileViewerContext.Provider value={context}>
+        {viewerTree({ open: true, path: "src/first.py" })}
+      </FileViewerContext.Provider>,
+    );
+    rerender(
+      <FileViewerContext.Provider value={context}>
+        {viewerTree({ open: true, path: "src/second.py" })}
+      </FileViewerContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy file path: src/second.py" }));
+
+    expect(copyText).toHaveBeenCalledWith("/repo/src/second.py");
+  });
+
+  it.each([
+    ["/", "notes.md", "/notes.md"],
+    ["C:\\work\\", "docs\\notes.md", "C:\\work\\docs\\notes.md"],
+    ["/repo", "/tmp/notes.md", "/tmp/notes.md"],
+  ])("copies the host path for root %s and file %s", (root, path, expectedPath) => {
+    const context = localDesktopContext();
+    context.workspaceRoot = root;
+    render(
+      <FileViewerContext.Provider value={context}>
+        {viewerTree({ open: true, path })}
+      </FileViewerContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: `Copy file path: ${path}` }));
+
+    expect(copyText).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it("does not claim to copy a relative path while the workspace root is unknown", () => {
+    renderViewer({ open: true, path: "src/file.py" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy file path: src/file.py" }));
+
+    expect(copyText).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith("Workspace path unavailable");
+  });
+
+  it("keeps the path clickable when the mobile toolbar collapses", () => {
+    vi.mocked(useIsMobileViewport).mockReturnValue(true);
+    installCollapsedToolbar();
+    const context = localDesktopContext();
+    render(
+      <FileViewerContext.Provider value={context}>
+        {viewerTree({ open: true, path: "notes.md" })}
+      </FileViewerContext.Provider>,
+    );
+    expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy file path: notes.md" }));
+
+    expect(copyText).toHaveBeenCalledWith("/repo/notes.md");
+  });
+
+  it("reports a clipboard failure without claiming the path was copied", async () => {
+    vi.mocked(copyText).mockRejectedValue(new Error("Clipboard unavailable"));
+    renderViewer({ open: true, path: "/repo/file1.py" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy file path: /repo/file1.py" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Failed to copy file path"));
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+});
+
 function makeAnchoredComment(
   overrides: Partial<Comment> &
     Pick<Comment, "id" | "start_index" | "end_index" | "anchor_content">,
@@ -1449,6 +1553,73 @@ describe("classifyAndRemapComments", () => {
     });
     const source = '<script>const label = "Code"</script><p>Code</p><p>Code</p>';
     expect(classifyAndRemapComments([comment], source).open).toEqual([comment]);
+  });
+
+  it("uses legacy search after the Markdown remapping module fails to load", () => {
+    const comment = makeAnchoredComment({
+      id: "failed-load",
+      path: "doc.md",
+      start_index: 0,
+      end_index: 16,
+      anchor_content: "say word now",
+    });
+    const addressed = { ...comment, id: "addressed", status: "addressed" as const };
+    expect(classifyAndRemapComments([comment], "prefix say word now").open).toEqual([comment]);
+    expect(classifyAndRemapComments([comment, addressed], "prefix say word now", null)).toEqual({
+      open: [{ ...comment, start_index: 7, end_index: 19 }],
+      addressed: [addressed],
+    });
+  });
+  it("uses source-aware remapping only for open formatted Markdown anchors", () => {
+    const formatted = makeAnchoredComment({
+      id: "formatted",
+      path: "doc.md",
+      start_index: 0,
+      end_index: 16,
+      anchor_content: "say word now",
+    });
+    const literal = { ...formatted, id: "literal", end_index: 12 };
+    const addressed = { ...formatted, id: "addressed", status: "addressed" as const };
+    const remapped = { ...formatted, start_index: 7, end_index: 19 };
+    const remap = vi.fn(() => remapped);
+    const result = classifyAndRemapComments(
+      [formatted, literal, addressed],
+      "prefix say word now",
+      remap,
+    );
+    expect(result.open).toEqual([remapped, { ...literal, start_index: 7, end_index: 19 }]);
+    expect(result.addressed).toEqual([addressed]);
+    expect(remap).toHaveBeenCalledExactlyOnceWith(formatted, "prefix say word now");
+  });
+  it.each(["doc.md", "doc.markdown", "doc.MD"])(
+    "preserves a markup-spanning raw range in %s instead of relocating to a literal copy",
+    (path) => {
+      const comment = makeAnchoredComment({
+        id: "split-word",
+        path,
+        start_index: 21,
+        end_index: 27,
+        anchor_content: "word",
+      });
+
+      expect(classifyAndRemapComments([comment], "[Details](word) word wo**rd**").open).toEqual([
+        comment,
+      ]);
+    },
+  );
+
+  it.each(["file1.py", "doc.md"])("still remaps literal source selections in %s", (path) => {
+    const comment = makeAnchoredComment({
+      id: "literal-word",
+      path,
+      start_index: 0,
+      end_index: 4,
+      anchor_content: "word",
+    });
+
+    expect(classifyAndRemapComments([comment], "prefix word").open).toEqual([
+      { ...comment, start_index: 7, end_index: 11 },
+    ]);
   });
 
   it("buckets addressed comments separately and never remaps them", () => {
@@ -2800,9 +2971,44 @@ describe("FileViewer video files", () => {
       },
     } as ReturnType<typeof useWorkspaceChangedFiles>);
     renderViewer({ open: true, path: "demo.webm" });
-    expect(useFileContent).toHaveBeenCalledWith("conv_1", null);
+    expect(useFileContent).toHaveBeenCalledWith("conv_1", null, { visible: true });
     expect(useFileDiff).toHaveBeenCalledWith("conv_1", null, { requested: false });
     expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+  });
+});
+
+describe("FileViewer content refresh", () => {
+  afterEach(() => vi.mocked(useFileContent).mockReset());
+
+  it.each([
+    { name: "open in the active viewport", open: true, visible: true },
+    { name: "closed", open: false, visible: false },
+    { name: "in a hidden rail", open: true, mediaActive: false, visible: false },
+    { name: "in the inactive viewport", open: true, viewport: "mobile" as const, visible: false },
+  ])("refreshes only while on screen: $name", ({ open, mediaActive, viewport, visible }) => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open, mediaActive, viewport, path: "notes.md" });
+    expect(useFileContent).toHaveBeenLastCalledWith("conv_1", "notes.md", { visible });
+  });
+
+  it("says when a refresh failed and the shown content may be stale", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: "last loaded", path: "notes.md", encoding: "utf-8" },
+      isRefetchError: true,
+      error: new Error("404 Not Found"),
+    } as ReturnType<typeof useFileContent>);
+    const { rerender } = renderViewer({ open: true, path: "notes.md" });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Couldn't refresh this file (404 Not Found). Showing the last loaded version.",
+    );
+
+    // A later successful refresh clears the notice.
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: "back", path: "notes.md", encoding: "utf-8" },
+    } as ReturnType<typeof useFileContent>);
+    rerender(viewerTree({ open: true, path: "notes.md" }));
+    expect(screen.queryByText(/Couldn't refresh this file/)).toBeNull();
   });
 });
 
@@ -3112,4 +3318,18 @@ describe("large Markdown file routing", () => {
       );
     },
   );
+});
+
+it("keeps grid file viewers independent of shared URL parameters and copies a session link", () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal("navigator", { clipboard: { writeText } });
+  useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  renderViewer({ open: true, syncUrl: false, initialSearch: "diff=1&comment=other-cell" });
+  expect(screen.queryByTestId("diff-viewer")).toBeNull();
+  expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1&comment=other-cell");
+  fireEvent.click(screen.getByRole("button", { name: "Copy link to file" }));
+  const copied = new URL(writeText.mock.calls[0][0]);
+  expect(copied.pathname).toBe("/c/conv_1");
+  expect(copied.searchParams.get("file")).toBe("file1.py");
+  expect(copied.searchParams.has("comment")).toBe(false);
 });

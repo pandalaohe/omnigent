@@ -1,6 +1,11 @@
 import { useCallback } from "react";
 
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
+import {
+  storedListToShow,
+  type StoredPullRequests,
+  useSessionPullRequests,
+} from "@/hooks/useSessionPullRequests";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import { gitProviderCopy } from "@/lib/gitProviders";
@@ -61,6 +66,16 @@ export interface ComposerGitStatus {
  *   from the launch directory.
  * @param creationBranch - Static `session.gitBranch`, surfaced as history only.
  */
+/** Ready once live info or the server's list can answer; the server's list doesn't wait on the host. */
+function githubStateOf(
+  github: { data?: unknown; isError: boolean; isLoading: boolean },
+  stored: StoredPullRequests | undefined,
+): ComposerGitStatus["githubState"] {
+  if (github.data && !github.isError) return "ready";
+  if (stored && (stored.prs.length > 0 || stored.synced)) return "ready";
+  return github.isLoading ? "loading" : "unknown";
+}
+
 export function useComposerGitStatus({
   sessionId,
   hostId,
@@ -77,6 +92,7 @@ export function useComposerGitStatus({
   const gitRoot = effectiveWorktree({ worktree, workspace });
   const worktrees = useSessionWorktrees(sessionId, hostId, gitRoot);
   const github = usePullRequestInfo(sessionId ?? undefined);
+  const stored = useSessionPullRequests(sessionId ?? undefined, github.data);
   const info = github.data;
   const result = worktrees.data;
 
@@ -112,7 +128,10 @@ export function useComposerGitStatus({
     }
   }
 
-  const prs = info?.prs;
+  // Servers that store PRs decide which PRs the session links once they have
+  // imported them, unless the host doesn't track PRs; older servers only have live info.
+  const fromStored = storedListToShow(stored.data, !!info);
+  const prs = fromStored && (!info || info.tracking_available === true) ? fromStored : info?.prs;
   const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
   // The primary PR's own provider first, then the session's.
@@ -136,7 +155,7 @@ export function useComposerGitStatus({
     worktreePath,
     creationBranch: creationBranch?.trim() || null,
     repoNameWithOwner: info?.repo?.name_with_owner ?? null,
-    githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
+    githubState: githubStateOf(github, stored.data),
     prCount,
     prNumber,
     prNumberPrefix,

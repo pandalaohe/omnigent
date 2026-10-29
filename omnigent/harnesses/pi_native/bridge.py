@@ -113,17 +113,23 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove pi-native bridge dirs whose owner process is provably dead and whose
     newest file is at least 70 days old.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    Runner death is a normal resume boundary. Keep the native session JSONL
+    through restarts so Pi retains provider usage and compaction history.
+    Explicit session deletion still removes the bridge immediately.
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(
-        bridge_root(),
-        should_prune=native_bridge_common.orphan_retention_expired,
-    )
+
+    def history_expired(bridge_dir: Path) -> bool:
+        sessions = bridge_dir / _SESSIONS_DIR
+        try:
+            if sessions.is_symlink() or (sessions.exists() and not sessions.is_dir()):
+                return False
+        except OSError:
+            return False
+        return native_bridge_common.orphan_retention_expired(bridge_dir)
+
+    return native_bridge_common.prune_orphaned_dirs(bridge_root(), should_prune=history_expired)
 
 
 def clear_inbox(bridge_dir: Path) -> None:
@@ -355,6 +361,7 @@ def write_extension_files(
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
     startup_instructions: str | None = None,
+    usage_baseline: dict[str, int | float] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -374,6 +381,8 @@ def write_extension_files(
         tools (Pi falls back to its own built-in tool surface only).
     :param startup_instructions: Composed session instructions appended to
         Pi's native system prompt at every agent start.
+    :param usage_baseline: Server-recorded own-session cumulative usage,
+        excluding child sessions; ``None`` retains local-only restoration.
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -414,6 +423,8 @@ def write_extension_files(
             payload["pendingRotationSource"] = source
             if isinstance(successor, str) and successor:
                 payload["pendingSuccessorId"] = successor
+    if usage_baseline is not None:
+        payload["usageBaseline"] = usage_baseline
     # A marker left by a previous Pi process would report this launch ready early.
     (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
     source = _extension_source()
@@ -581,6 +592,16 @@ async def apply_pi_permission_tier(
         return False
     except (OSError, ValueError, TypeError):
         return False
+
+
+def write_agent_instructions(bridge_dir: Path, instructions: str | None) -> Path | None:
+    """Atomically replace owner-only startup instructions, or remove stale text."""
+    path = bridge_dir / "agent_instructions.md"
+    if instructions is None:
+        path.unlink(missing_ok=True)
+        return None
+    _atomic_text(path, instructions)
+    return path
 
 
 def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:

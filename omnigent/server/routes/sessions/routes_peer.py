@@ -1086,6 +1086,11 @@ def register_peer_routes(
         Busy is re-read once more after any await above: a turn can start
         concurrently while this coroutine is probing readiness.
         """
+        launches = getattr(app_state, "managed_launches", None)
+        if conv.runner_id is None and launches is not None and launches.get(conv.id) is not None:
+            # Keep durable peer admission asynchronous while provisioning;
+            # ordinary events would wait for the launch to finish.
+            return "not_ready", False
         liveness = _liveness(conv.id)
         runner_online = liveness.runner_online if liveness is not None else None
         host_online = liveness.host_online if liveness is not None else None
@@ -1230,6 +1235,8 @@ def register_peer_routes(
                 return "rejected", f"init_failed: {exc.message}"
             if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
                 return "failed", "offline"
+            if exc.code in {ErrorCode.FORBIDDEN, ErrorCode.UNAUTHORIZED, ErrorCode.INVALID_INPUT}:
+                return "rejected", f"authorization_refused:{exc.message}"
             _logger.warning(
                 "Peer delivery uncertain: %s",
                 exc.message,
@@ -1243,6 +1250,8 @@ def register_peer_routes(
                 extra={"session_id": receiver.id},
             )
             return "uncertain", "not_ready"
+        if isinstance(delivery, dict) and delivery.get("denied") is True:
+            return "rejected", f"policy_denied:{delivery.get('reason') or 'Denied'}"
         if isinstance(delivery, dict) and delivery.get("forwarded") is False:
             return "rejected", "not_forwarded"
         if (
@@ -1821,7 +1830,11 @@ def register_peer_routes(
                 response = await _queued_response_for_record(record, runner_online)
                 response["reason"] = "uncertain"
                 return response
-            if sdk_identity is not None and result_state in ("failed", "rejected"):
+            if (
+                sdk_identity is not None
+                and result_state in ("failed", "rejected")
+                and not (reason or "").startswith(("policy_denied:", "authorization_refused:"))
+            ):
                 await asyncio.to_thread(
                     peer_message_store.transition,
                     record.id,

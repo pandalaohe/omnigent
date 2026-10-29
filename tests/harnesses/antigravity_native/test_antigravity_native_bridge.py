@@ -7,8 +7,10 @@ import logging
 import os
 import shlex
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -3424,47 +3426,219 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
 
 
-def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+_RETENTION_NOW = 2_000_000_000.0
+
+
+def _conversations_dir(bridge_dir: Path) -> Path:
+    """agy's conversation store under the bridge's isolated ``--gemini_dir``."""
+    return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+
+
+def _dead_owner_bridge(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    owner_marker_age_s: float,
+) -> Path:
+    """Create a dead-owner bridge under *root* with the sweep's clock frozen."""
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr(_mod.time, "time", lambda: _RETENTION_NOW)
+    bridge_dir = root / "deadowner"
+    bridge_dir.mkdir(parents=True)
+    owner_marker = bridge_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    marked_at = _RETENTION_NOW - owner_marker_age_s
+    os.utime(owner_marker, (marked_at, marked_at))
+    return bridge_dir
+
+
+def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prune removes only provably-dead-owner dirs held past the 70-day window."""
-    import os
-    import subprocess
-    import sys
-    import time
+    """A recently prepared bridge survives whole, even before agy minted a conversation."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native", monkeypatch, owner_marker_age_s=60
+    )
+    (dead_dir / "state.json").write_text("{}", encoding="utf-8")
+    (dead_dir / "bridge.json").write_text("secret", encoding="utf-8")
 
+    assert _mod.prune_orphaned_bridge_dirs() == 0
+    assert (dead_dir / "owner.pid").read_text(encoding="utf-8") == "999999"
+    assert (dead_dir / "bridge.json").read_text(encoding="utf-8") == "secret"
+
+
+def test_prune_orphaned_bridge_dirs_removes_expired_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead-owner bridge inactive for 70 days is removed with its conversation store."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod.native_bridge_common.ORPHAN_RETENTION_SECONDS,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.mkdir(parents=True)
+    expired_at = _RETENTION_NOW - _mod.native_bridge_common.ORPHAN_RETENTION_SECONDS
+    for name in ("7d5e1c2a.db", "7d5e1c2a.db-wal", "7d5e1c2a.db-shm"):
+        (conversations / name).write_bytes(b"history")
+        os.utime(conversations / name, (expired_at, expired_at))
+    unrelated = conversations / "index.json"
+    unrelated.write_text("{}", encoding="utf-8")
+    os.utime(unrelated, (expired_at, expired_at))
+    # Every resumable bridge file participates in the recursive retention window.
+    backup = conversations / "7d5e1c2a.db.backup"
+    backup.write_bytes(b"stale copy")
+    os.utime(backup, (expired_at, expired_at))
+
+    assert _mod.prune_orphaned_bridge_dirs() == 1
+    assert not dead_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_removes_bridge_with_non_directory_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired bridge whose conversation path is not a directory is reclaimed."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod.native_bridge_common.ORPHAN_RETENTION_SECONDS,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.parent.mkdir(parents=True)
+    conversations.write_bytes(b"not a directory")
+    expired_at = _RETENTION_NOW - _mod.native_bridge_common.ORPHAN_RETENTION_SECONDS
+    os.utime(conversations, (expired_at, expired_at))
+
+    assert _mod.prune_orphaned_bridge_dirs() == 1
+    assert not dead_dir.exists()
+
+
+@pytest.mark.parametrize("recent_suffix", [".db", ".db-wal", ".db-shm"])
+def test_prune_orphaned_bridge_dirs_uses_latest_conversation_activity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recent_suffix: str,
+) -> None:
+    """A recent database or SQLite sidecar keeps a bridge whose marker and other files are old."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod.native_bridge_common.ORPHAN_RETENTION_SECONDS + 1,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.mkdir(parents=True)
+    expired_at = _RETENTION_NOW - _mod.native_bridge_common.ORPHAN_RETENTION_SECONDS - 1
+    conversation_files = []
+    for suffix in (".db", ".db-wal", ".db-shm"):
+        conversation_file = conversations / f"7d5e1c2a{suffix}"
+        conversation_file.write_bytes(b"history")
+        modified_at = _RETENTION_NOW - 60 if suffix == recent_suffix else expired_at
+        os.utime(conversation_file, (modified_at, modified_at))
+        conversation_files.append(conversation_file)
+
+    assert _mod.prune_orphaned_bridge_dirs() == 0
+    assert all(
+        conversation_file.read_bytes() == b"history" for conversation_file in conversation_files
+    )
+
+
+def _fail_conversation_listing(monkeypatch: pytest.MonkeyPatch, conversations: Path) -> None:
+    """Make listing the conversations directory raise."""
+    real_scandir = os.scandir
+
+    def _failing_scandir(path: object = ".") -> Any:
+        if Path(path) == conversations:
+            raise PermissionError("conversation store unreadable")
+        return real_scandir(path)
+
+    monkeypatch.setattr(_mod.os, "scandir", _failing_scandir)
+
+
+def _fail_path_stat(monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Make the recursive scanner's file activity probe fail closed."""
+    real_lstat = os.lstat
+
+    def _failing_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path) == target:
+            raise PermissionError(f"{target} is unreadable")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(_mod.os, "lstat", _failing_lstat)
+
+
+@pytest.mark.parametrize(
+    "install_failure",
+    [
+        pytest.param(
+            lambda mp, convs, db: _fail_conversation_listing(mp, convs),
+            id="directory-listing",
+        ),
+        pytest.param(lambda mp, convs, db: _fail_path_stat(mp, db), id="database-stat"),
+    ],
+)
+def test_prune_orphaned_bridge_dirs_retains_bridge_when_conversation_scan_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    install_failure: Callable[[pytest.MonkeyPatch, Path, Path], None],
+) -> None:
+    """An unreadable conversation store fails closed instead of deleting the bridge.
+
+    Covers recursive directory listing and per-file activity lookup errors.
+    """
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod.native_bridge_common.ORPHAN_RETENTION_SECONDS + 1,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.mkdir(parents=True)
+    database = conversations / "7d5e1c2a.db"
+    database.write_bytes(b"history")
+    os.utime(
+        database, (_RETENTION_NOW - _mod.native_bridge_common.ORPHAN_RETENTION_SECONDS - 1,) * 2
+    )
+
+    install_failure(monkeypatch, conversations, database)
+
+    assert _mod.prune_orphaned_bridge_dirs() == 0
+    assert dead_dir.exists()
+    assert database.read_bytes() == b"history"
+
+
+def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired dead-owner bridges go; live owners and recently active unmarked bridges remain."""
     root = tmp_path / "antigravity-native"
-    root.mkdir(parents=True)
-    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
-
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
-    dead_dir = root / "deadowner"
-    dead_dir.mkdir()
-    dead_marker = dead_dir / "owner.pid"
-    dead_marker.write_text(str(dead.pid), encoding="utf-8")
-    now = time.time()
-    expired_at = now - 71 * 24 * 60 * 60
-    os.utime(dead_marker, (expired_at, expired_at))
-
+    dead_dir = _dead_owner_bridge(
+        root,
+        monkeypatch,
+        owner_marker_age_s=_mod.native_bridge_common.ORPHAN_RETENTION_SECONDS + 1,
+    )
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda pid: pid == os.getpid())
+    expired_at = _RETENTION_NOW - _mod.native_bridge_common.ORPHAN_RETENTION_SECONDS - 1
     held_dir = root / "heldowner"
     held_dir.mkdir()
     held_marker = held_dir / "owner.pid"
-    held_marker.write_text(str(dead.pid), encoding="utf-8")
-    held_at = now - 8 * 24 * 60 * 60
-    os.utime(held_marker, (held_at, held_at))
+    held_marker.write_text("999999", encoding="utf-8")
+    os.utime(held_marker, (_RETENTION_NOW - 8 * 24 * 60 * 60,) * 2)
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
-    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    live_marker = live_dir / "owner.pid"
+    live_marker.write_text(str(os.getpid()), encoding="utf-8")
+    os.utime(live_marker, (expired_at, expired_at))
 
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()
+    os.utime(unmarked_dir, (_RETENTION_NOW, _RETENTION_NOW))
 
-    pruned = _mod.prune_orphaned_bridge_dirs()
-
-    assert pruned == 1
+    assert _mod.prune_orphaned_bridge_dirs() == 1
     assert not dead_dir.exists()
     assert held_dir.exists()
     assert live_dir.exists()

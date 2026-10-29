@@ -18,12 +18,14 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from omnigent.host.frames import (
+    CAP_WORKTREE_CREATE_BUDGET,
     HostCreateWorktreeFrame,
     HostFolderFactsFrame,
     HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     encode_host_frame,
 )
+from omnigent.host.git_worktree import WORKTREE_CREATE_BUDGET_S
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
 _logger = logging.getLogger(__name__)
@@ -39,6 +41,9 @@ _WORKTREE_LOOKUP_TIMEOUT_S: float = 5.0
 # timeout; the settings dialog wants them quickly and can re-read on
 # Refresh, so the server waits only modestly longer than one read.
 _FOLDER_FACTS_TIMEOUT_S: float = 15.0
+# A successful create ends within the host's budget plus at most one trailing
+# metadata command; outwait that rather than strand a late success.
+_WORKTREE_CREATE_TIMEOUT_S: float = WORKTREE_CREATE_BUDGET_S + _WORKTREE_TIMEOUT_S
 
 
 WORKTREE_ROOT_LABEL_KEY = "omnigent.git.worktree_root_sha256"
@@ -157,6 +162,7 @@ async def _await_host_worktree_result(
     op: str,
     timeout: float | None = None,
     timeout_hint: str = (" (it may be running an older version that does not support worktrees)"),
+    older_host_hint: bool = True,
 ) -> dict[str, object]:
     """
     Send a worktree frame and await its matching result over the tunnel.
@@ -177,6 +183,9 @@ async def _await_host_worktree_result(
         :data:`_WORKTREE_TIMEOUT_S` at call time.
     :param timeout_hint: Suffix appending the likely cause of silence;
         the empty string omits it.
+    :param timeout: Seconds to wait for the host's reply.
+    :param older_host_hint: Suggest an outdated host on timeout. ``False``
+        when the host already advertised support for this request.
     :returns: The host's result dict (``status`` plus op-specific
         fields).
     :raises WorktreeHostUnavailableError: On connection loss or no
@@ -189,16 +198,17 @@ async def _await_host_worktree_result(
     try:
         try:
             host_registry.send_text(host_conn, frame)
+            # The registry fails the future when the tunnel drops, so a dead
+            # host surfaces at once instead of waiting out the bound.
+            return await asyncio.wait_for(future, timeout=timeout)
         except ConnectionError as exc:
             raise WorktreeHostUnavailableError(
                 f"host '{host_conn.host_id}' connection lost during {op}"
             ) from exc
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
+            hint = timeout_hint if older_host_hint else ""
             raise WorktreeHostUnavailableError(
-                f"host '{host_conn.host_id}' did not respond to {op} within "
-                f"{timeout:.0f}s{timeout_hint}"
+                f"host '{host_conn.host_id}' did not respond to {op} within {timeout:.0f}s{hint}"
             ) from exc
     finally:
         pending.pop(request_id, None)
@@ -238,7 +248,9 @@ async def create_worktree_on_host(
         upstream sibling layout. The host validates and renders it.
     :returns: The created worktree's path and branch.
     :raises WorktreeHostUnavailableError: If the host connection drops
-        or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
+        or doesn't respond within :data:`_WORKTREE_CREATE_TIMEOUT_S`
+        (:data:`_WORKTREE_TIMEOUT_S` for a host that does not advertise
+        ``CAP_WORKTREE_CREATE_BUDGET``).
     :raises WorktreeProxyError: If the host reports a worktree failure.
     """
     request_id = secrets.token_hex(8)
@@ -251,8 +263,11 @@ async def create_worktree_on_host(
             existing_branch=existing_branch,
             entry=entry,
             path_template=path_template,
+            timeout_s=WORKTREE_CREATE_BUDGET_S,
         )
     )
+    # Older hosts ignore timeout_s, and some never answer a create at all.
+    budgeted_host = CAP_WORKTREE_CREATE_BUDGET in host_conn.hello.capabilities
     result = await _await_host_worktree_result(
         host_registry=host_registry,
         host_conn=host_conn,
@@ -260,6 +275,8 @@ async def create_worktree_on_host(
         request_id=request_id,
         frame=frame,
         op="worktree creation",
+        timeout=_WORKTREE_CREATE_TIMEOUT_S if budgeted_host else _WORKTREE_TIMEOUT_S,
+        older_host_hint=not budgeted_host,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(
@@ -334,6 +351,7 @@ async def remove_worktree_on_host(
         request_id=request_id,
         frame=frame,
         op="worktree removal",
+        timeout=_WORKTREE_TIMEOUT_S,
     )
     if result.get("status") != "ok":
         raise WorktreeHostRefusalError(

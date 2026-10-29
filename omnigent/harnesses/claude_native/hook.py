@@ -245,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
             active = read_active_session_id(bridge_dir)
             if active:
                 capture_claude_hook_path(active, payload, harness="claude-native")
-    except Exception as exc:  # noqa: BLE001 - hook must not break Claude Code.
+    except Exception as exc:  # noqa: BLE001
         print(f"omnigent claude hook: failed to record hook: {exc}", file=sys.stderr)
     conversation_url = _conversation_url_for_active_session(bridge_dir, args.conversation_url)
     if conversation_url and payload.get("hook_event_name") == "SessionStart":
@@ -941,6 +941,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.native import policy_allow_cache
+
+    # Read before the session identity: a session switch picks a new
+    # generation, so an answer for the previous session opens no window.
+    cache_generation = policy_allow_cache.generation(bridge_dir)
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0
@@ -1003,6 +1008,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)
 
+    requested_at = time.time()
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -1029,6 +1035,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         begin_admitted_turn(session_id, "claude-native", eval_response["usage_admission"])
         check_live_route(session_id, "claude-native", os.environ)
         record_hook_event(bridge_dir, {**payload, "admission_id": eval_response["admission_id"]})
+    # Through the relay the server evaluated the relay's session, which can
+    # trail a session switch.
+    if relay is None or relay[2] == session_id:
+        policy_allow_cache.record(bridge_dir, cache_generation, eval_response, requested_at)
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))

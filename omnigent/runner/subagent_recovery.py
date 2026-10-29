@@ -279,7 +279,7 @@ def build_subagent_recovery(
             await task
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001 - recovery failure must not block session deletion
+        except Exception:  # noqa: BLE001 — recovery failure must not block session deletion
             _logger.warning(
                 "Sub-agent recovery failed while deleting session %s",
                 parent_id,

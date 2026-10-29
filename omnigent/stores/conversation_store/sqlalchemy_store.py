@@ -174,6 +174,7 @@ from omnigent.stores.conversation_store import (
     NativeReplayConflictError,
     NativeSubagentReconcileFingerprint,
     NativeSubagentReconcileWriteResult,
+    SessionActivity,
     SessionConnectivity,
     SessionSuccession,
     SuccessionRefusedError,
@@ -324,6 +325,31 @@ def _encode_session_state(
 # it never leaks to the connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
+# ``list_conversations(search_scope=...)`` values; see its docstring.
+_SEARCH_SCOPES = frozenset({"all", "title", "content"})
+
+# Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
+# ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
+_LIKE_ESCAPE = "/"
+
+
+def _like_contains_pattern(query: str) -> str:
+    """
+    Return a lowercase ``LIKE`` pattern matching ``query`` as a literal substring.
+
+    :param query: The user's search string, e.g. ``"50%_off"``.
+    :returns: The pattern with ``%``, ``_`` and the escape character escaped,
+        e.g. ``"%50/%/_off%"``; pass ``escape=_LIKE_ESCAPE`` alongside it.
+    """
+    escaped = (
+        query.lower()
+        .replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", f"{_LIKE_ESCAPE}%")
+        .replace("_", f"{_LIKE_ESCAPE}_")
+    )
+    return f"%{escaped}%"
+
 
 # Upper bound on rows fetched per SQL statement when listing conversation
 # items. A deployed managed-Postgres backend failed one oversized read of a
@@ -2147,6 +2173,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in meta_rows
         }
+
+    def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
+        """One ``SELECT`` per database for the ids' update times and live statuses."""
+        if not conversation_ids:
+            return {}
+        unique_ids = list(set(conversation_ids))
+        with self._conv_session("get_session_activity") as session:
+            updated = session.execute(
+                select(SqlConversation.id, SqlConversation.updated_at).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
+                )
+            ).all()
+        if not updated:
+            return {}
+        with self._session("get_session_activity") as session:
+            meta_rows = session.execute(
+                select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_([row.id for row in updated]),
+                )
+            ).all()
+        statuses = {row.id: row.live_status for row in meta_rows}
+        activity: dict[str, SessionActivity] = {}
+        for row in updated:
+            status = statuses.get(row.id)
+            try:
+                live_status = decode_session_live_status(status) if status is not None else None
+            except ValueError:
+                # A newer replica's status must not drop the rest of the batch.
+                live_status = None
+            activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
+        return activity
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
         """
@@ -5816,7 +5875,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
             Postgres without extra extensions.
-        :param search_scope: Search ``"title"``, ``"content"``, or ``"all"``
+        :param search_scope: Search ``"title"``, non-title ``"content"``, or ``"all"``
             supported text fields. ``"all"`` also includes workspace metadata.
         :param include_search_match: Populate the first matching item, snippet,
             and match count. Facet scans disable this extra result query.
@@ -5865,6 +5924,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             raises ``ValueError``.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises ValueError: If ``search_scope`` is not a known scope.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
@@ -5900,6 +5960,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if shared_only and accessible_by is None:
             raise ValueError("shared_only=True requires accessible_by to be set")
+        if search_scope not in _SEARCH_SCOPES:
+            raise ValueError(f"invalid search_scope: {search_scope!r}")
 
         # ACL strategy. Single-DB (the AP and Omnigent tables share one bind):
         # push the permission check into the conversations query as a
@@ -6203,7 +6265,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if search_scope == "title":
                     stmt = stmt.where(title_match)
                 elif search_scope == "content":
-                    stmt = stmt.where(content_match)
+                    stmt = stmt.where(~title_match, content_match)
                 else:
                     workspace_match = SqlConversation.id.in_(workspace_matching_ids or [])
                     stmt = stmt.where(or_(title_match, content_match, workspace_match))
@@ -6553,6 +6615,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_archive_batch: str | None = None,
         archive_project_id: str | None = None,
         archive_op_id: str | None = None,
+        label_updates: dict[str, str] | None = None,
     ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
@@ -6614,6 +6677,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             the close (clearing any completed revision) so a delete-only
             teardown runs. A transition without it deletes any prior label,
             as does unarchive.
+        :param label_updates: Labels to merge in the same transaction as model
+            and effort settings. Omitted labels remain unchanged.
         :returns: The updated conversation and requested model-setting change
             flags, or ``None`` if the conversation does not exist.
         """
@@ -7027,6 +7092,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                         },
                         now,
                     )
+            if label_updates:
+                _upsert_labels(ap_sess, conversation_id, label_updates, now)
+                ap_changed = True
+            if ap_changed:
+                row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)
             return (
                 row,
@@ -9183,6 +9253,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     mapped_boundary_id = copied_item_ids.get(boundary_id)
                     if mapped_boundary_id is not None:
                         compaction_data["last_item_id"] = mapped_boundary_id
+                    # Replay snapshots own attachment references just like message rows.
+                    if file_id_map:
+                        for message in compaction_data.get("compacted_messages") or []:
+                            if isinstance(message, dict):
+                                _remap_item_file_references(message, file_id_map, new_conv_id)
                     remapped.append(json.dumps(compaction_data))
                 remapped_compaction_data = dict(
                     zip(

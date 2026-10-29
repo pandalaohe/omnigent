@@ -368,6 +368,11 @@ export function questionAnswerFromContent(
 // must see the same text extraction the bubble render uses.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 
+/** `text` without the "[Attached: …]" markers a native executor adds for uploads. */
+export function withoutAttachedMarkers(text: string): string {
+  return text.replace(ATTACHED_RE, "").trim();
+}
+
 /**
  * True when a user-role message is actually a runtime `[System: …]` marker
  * (task/timer/sub-agent notice, interrupt record) rather than a real user
@@ -381,12 +386,12 @@ const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 export function isSystemUserContent(content: MessageContentBlock[]): boolean {
   const hasAttachments = content.some((c) => c.type === "input_image" || c.type === "input_file");
   if (hasAttachments) return false;
-  const text = content
-    .filter(isTextBlock)
-    .map((c) => c.text)
-    .join("")
-    .replace(ATTACHED_RE, "")
-    .trim();
+  const text = withoutAttachedMarkers(
+    content
+      .filter(isTextBlock)
+      .map((c) => c.text)
+      .join(""),
+  );
   return parseSystemMessage(text) !== null;
 }
 

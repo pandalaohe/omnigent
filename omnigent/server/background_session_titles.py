@@ -133,7 +133,7 @@ class BackgroundSessionTitleCoordinator:
         try:
             async with asyncio.timeout(self._timeout_seconds), self._generation_slots:
                 return await self._generate_title(request)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — preserve the boundary failure contract
             _logger.warning(
                 "agent session title generation failed session=%s",
                 request.session_id,
@@ -299,7 +299,7 @@ class BackgroundSessionTitleCoordinator:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - background metadata must never fail the user turn
+        except Exception:  # noqa: BLE001 — background metadata must never fail the user turn
             _logger.warning(
                 "background session title failed session=%s elapsed_ms=%.1f",
                 request.session_id,
@@ -349,7 +349,7 @@ class BackgroundSessionTitleCoordinator:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — preserve the boundary failure contract
             _logger.warning(
                 "background task summary failed session=%s elapsed_ms=%.1f",
                 request.session_id,

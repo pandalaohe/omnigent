@@ -18,6 +18,7 @@ import {
   shortcutAriaKeys,
   shortcutBindingLabels,
   shortcutChordFromEvent,
+  setShortcutRecordingActive,
   writeMacWindowsKeyPositions,
   writeShortcutPreference,
   type ShortcutActionId,
@@ -50,6 +51,32 @@ describe("keyboardShortcutPreferences", () => {
     expect(resolveShortcutBindings("newSession", "windows")).toEqual(
       DEFAULT_SHORTCUT_DEFINITIONS.newSession.defaultBindings,
     );
+  });
+
+  it.each([
+    "cycleModel",
+    "cycleEffort",
+    "cyclePermissionMode",
+    "renameSession",
+    "previousPane",
+    "nextPane",
+    "splitTerminalColumns",
+    "splitTerminalRows",
+  ] as const)("records, disables and detects conflicts for %s", (action) => {
+    const event = new KeyboardEvent("keydown", { code: "KeyY", ctrlKey: true });
+    writeShortcutPreference(action, { common: [{ code: "KeyY", modifiers: ["control"] }] });
+    expect(eventMatchesShortcutAction(event, action, "windows")).toBe(true);
+    expect(
+      findShortcutConflicts("openSettings", [{ code: "KeyY", modifiers: ["control"] }], "windows"),
+    ).toContain(action);
+    setShortcutRecordingActive(true);
+    try {
+      expect(eventMatchesShortcutAction(event, action, "windows")).toBe(false);
+    } finally {
+      setShortcutRecordingActive(false);
+    }
+    writeShortcutPreference(action, { enabled: false });
+    expect(eventMatchesShortcutAction(event, action, "windows")).toBe(false);
   });
 
   it("uses a common recording on every platform without an override", () => {

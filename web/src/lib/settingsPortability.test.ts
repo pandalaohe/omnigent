@@ -8,6 +8,7 @@ import {
   SESSION_NAVIGATION_CHANGED_EVENT,
   SESSION_NAVIGATION_STORAGE_KEY,
 } from "./sessionNavigationPreferences";
+import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   readAlwaysUseWorktree,
@@ -172,19 +173,22 @@ it.each([
   expect(readSessionWorkspaceState("browser")).toEqual({ openBrowsers: ["one"] });
 });
 
-describe("composer shortcut portability", () => {
+describe.each([
+  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
+  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
+])("%s portability", (_label, storageKey) => {
   it("exports, imports, and clears the device-local preference", () => {
-    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
-    expect(collectSettings()?.settings[COMPOSER_SEND_SHORTCUT_STORAGE_KEY]).toBe("true");
+    localStorage.setItem(storageKey, "true");
+    expect(collectSettings()?.settings[storageKey]).toBe("true");
 
     applyImportedSettings({ version: 1, settings: {} });
-    expect(localStorage.getItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(storageKey)).toBeNull();
 
     applyImportedSettings({
       version: 1,
-      settings: { [COMPOSER_SEND_SHORTCUT_STORAGE_KEY]: "true" },
+      settings: { [storageKey]: "true" },
     });
-    expect(localStorage.getItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY)).toBe("true");
+    expect(localStorage.getItem(storageKey)).toBe("true");
   });
 });
 

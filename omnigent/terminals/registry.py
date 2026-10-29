@@ -163,7 +163,7 @@ async def _close_unregistered_instance(instance: TerminalInstance) -> _Unregiste
     while not close_task.done():
         try:
             await asyncio.wait_for(asyncio.shield(close_task), timeout=deadline - loop.time())
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if close_task.done() or timed_out:
                 break
             # Cancel the close as ``asyncio.wait_for`` would, but wait only one more window for it.
@@ -175,8 +175,7 @@ async def _close_unregistered_instance(instance: TerminalInstance) -> _Unregiste
                 cancel_requests = current.cancelling()
                 caller_cancelled = True
             # Otherwise ``close()`` itself ended cancelled and the loop exits.
-        except Exception:
-            # The failure is read back from the task below.
+        except Exception:  # noqa: BLE001 — the failure is read back from the task below
             break
     if not close_task.done():
         # A loop that closed with a pending close never runs its done callbacks.
@@ -381,7 +380,7 @@ class TerminalRegistry:
                             conversation_id=conversation_id,
                             kind="tmux",
                         )
-                except Exception:
+                except Exception:  # noqa: BLE001 — owner bookkeeping is best-effort
                     logger.debug("tmux owner-file write failed", exc_info=True)
         except BaseException as exc:
             # Until registration, no shutdown sweep can discover this instance.
@@ -455,7 +454,7 @@ class TerminalRegistry:
         if instance_to_close is not None:
             try:
                 await asyncio.wait_for(instance_to_close.close(), timeout=_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "Race-loser terminal close timed out for %s:%s in conv %s",
                     terminal_name,
@@ -740,7 +739,7 @@ class TerminalRegistry:
 
         try:
             await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _restore_unclosed_instance()
             logger.warning(
                 "Terminal close timed out for %s:%s in conv %s",
@@ -788,7 +787,7 @@ class TerminalRegistry:
         for (name, key), instance in slot.items():
             try:
                 await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "cleanup_conversation: close timed out for %s:%s in conv %s",
                     name,
@@ -826,7 +825,7 @@ class TerminalRegistry:
             for (name, key), instance in slot.items():
                 try:
                     await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning(
                         "shutdown: close timed out for %s:%s in conv %s",
                         name,

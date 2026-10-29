@@ -114,7 +114,7 @@ interface AskUserQuestionFormProps {
  *
  * Single-select: when the custom row is selected, the custom text
  * is the answer (and must be non-empty). Otherwise the selected
- * option label is the answer.
+ * option label is the answer. Text editors preserve whitespace and allow empty text.
  *
  * Multi-select: the answer is the union of selected option labels
  * and (the custom text, when the custom row is selected and the
@@ -135,6 +135,7 @@ function answerForQuestion(
     return all.length > 0 ? all : null;
   }
   if (customSelected) {
+    if (question.textInput) return customText;
     return customValue || null;
   }
   return typeof selection === "string" && selection ? selection : null;
@@ -223,12 +224,12 @@ export function AskUserQuestionForm({
   // the answer).
   const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
     const initial: Record<string, boolean> = {};
-    for (const q of questions) initial[questionKey(q)] = false;
+    for (const q of questions) initial[questionKey(q)] = q.textInput !== undefined;
     return initial;
   });
   const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
     const initial: Record<string, string> = {};
-    for (const q of questions) initial[questionKey(q)] = "";
+    for (const q of questions) initial[questionKey(q)] = q.textInput?.default ?? "";
     return initial;
   });
   const customInputsRef = useRef(customInputs);
@@ -800,6 +801,7 @@ export function AskUserQuestionForm({
     (opt) => selectedLabels.includes(opt.label) && opt.preview,
   );
 
+  const allowCustomInput = current.isOther !== false;
   const customRowId = `${currentKey}__custom`;
   const customRowChecked = customSelected[currentKey] ?? false;
   const customRowValue = customInputs[currentKey] ?? "";
@@ -907,158 +909,162 @@ export function AskUserQuestionForm({
               </label>
             );
           })}
-          {/* Custom-input row — visually "one more option" with a
+          {allowCustomInput && (
+            <>
+              {/* Custom-input row — visually "one more option" with a
               matching radio/checkbox prefix, so the user picks
               between predefined options and free-form input the
               same way. */}
-          <label
-            htmlFor={customRowId}
-            data-highlighted={
-              keyboardActive && highlight === current.options.length ? true : undefined
-            }
-            className="flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60"
-          >
-            <input
-              type={current.multiSelect ? "checkbox" : "radio"}
-              id={customRowId}
-              name={current.multiSelect ? undefined : currentKey}
-              checked={customRowChecked}
-              onChange={() =>
-                current.multiSelect
-                  ? handleCustomToggleMulti(currentKey)
-                  : handleCustomToggleSingle(currentKey)
-              }
-              onFocus={() => setHighlight(current.options.length)}
-              className="mt-1"
-              data-testid="ask-user-question-custom-toggle"
-            />
-            {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
+              <label
+                htmlFor={customRowId}
+                data-highlighted={
+                  keyboardActive && highlight === current.options.length ? true : undefined
+                }
+                className="flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60"
+              >
+                <input
+                  type={current.multiSelect ? "checkbox" : "radio"}
+                  id={customRowId}
+                  name={current.multiSelect ? undefined : currentKey}
+                  checked={customRowChecked}
+                  onChange={() =>
+                    current.multiSelect
+                      ? handleCustomToggleMulti(currentKey)
+                      : handleCustomToggleSingle(currentKey)
+                  }
+                  onFocus={() => setHighlight(current.options.length)}
+                  className="mt-1"
+                  data-testid="ask-user-question-custom-toggle"
+                />
+                {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
                 the textarea to fit its content, so typing past the
                 first line wraps and expands downward instead of
                 scrolling within a fixed single row. */}
-            <textarea
-              ref={customInputRef}
-              rows={1}
-              placeholder="Type something"
-              value={customRowValue}
-              onChange={(e) => handleCustomInput(currentKey, e)}
-              onFocus={(event) => {
-                setHighlight(current.options.length);
-                if (pendingCaretRef.current?.key === currentKey) return;
-                caretRef.current[currentKey] = {
-                  start: event.currentTarget.selectionStart,
-                  end: event.currentTarget.selectionEnd,
-                };
-              }}
-              onSelect={(event) => {
-                if (pendingCaretRef.current?.key === currentKey) return;
-                caretRef.current[currentKey] = {
-                  start: event.currentTarget.selectionStart,
-                  end: event.currentTarget.selectionEnd,
-                };
-              }}
-              onKeyDown={
-                asyncTarget
-                  ? (event) => {
-                      if (
-                        submittingRef.current ||
-                        (event.key !== "Backspace" && event.key !== "Delete") ||
-                        event.ctrlKey ||
-                        event.metaKey ||
-                        event.altKey ||
-                        event.shiftKey ||
-                        event.currentTarget.selectionStart !== event.currentTarget.selectionEnd
-                      )
-                        return;
-                      const edit = deleteTokenAt(
-                        event.currentTarget,
-                        event.currentTarget.value,
-                        event.currentTarget.selectionStart,
-                        event.key,
-                        imagesRef.current[currentKey] ?? [],
+                <textarea
+                  ref={customInputRef}
+                  rows={1}
+                  placeholder="Type something"
+                  value={customRowValue}
+                  onChange={(e) => handleCustomInput(currentKey, e)}
+                  onFocus={(event) => {
+                    setHighlight(current.options.length);
+                    if (pendingCaretRef.current?.key === currentKey) return;
+                    caretRef.current[currentKey] = {
+                      start: event.currentTarget.selectionStart,
+                      end: event.currentTarget.selectionEnd,
+                    };
+                  }}
+                  onSelect={(event) => {
+                    if (pendingCaretRef.current?.key === currentKey) return;
+                    caretRef.current[currentKey] = {
+                      start: event.currentTarget.selectionStart,
+                      end: event.currentTarget.selectionEnd,
+                    };
+                  }}
+                  onKeyDown={
+                    asyncTarget
+                      ? (event) => {
+                          if (
+                            submittingRef.current ||
+                            (event.key !== "Backspace" && event.key !== "Delete") ||
+                            event.ctrlKey ||
+                            event.metaKey ||
+                            event.altKey ||
+                            event.shiftKey ||
+                            event.currentTarget.selectionStart !== event.currentTarget.selectionEnd
+                          )
+                            return;
+                          const edit = deleteTokenAt(
+                            event.currentTarget,
+                            event.currentTarget.value,
+                            event.currentTarget.selectionStart,
+                            event.key,
+                            imagesRef.current[currentKey] ?? [],
+                          );
+                          if (edit) {
+                            event.preventDefault();
+                            commitCustomText(currentKey, edit.text, edit.caret);
+                          }
+                        }
+                      : undefined
+                  }
+                  onPaste={
+                    asyncTarget
+                      ? (event) => {
+                          const pasted = Array.from(event.clipboardData?.items ?? [])
+                            .filter((item) => item.kind === "file")
+                            .map((item) => item.getAsFile())
+                            .filter((file): file is File => file !== null);
+                          if (pasted.length) {
+                            event.preventDefault();
+                            addImages(currentKey, pasted);
+                          }
+                        }
+                      : undefined
+                  }
+                  data-testid="ask-user-question-custom-input"
+                  className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+                />
+              </label>
+              {asyncTarget && (
+                <div className="flex flex-col gap-2 pl-6">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="sr-only"
+                    aria-label="Choose answer images"
+                    onChange={(event) => {
+                      addImages(currentKey, Array.from(event.currentTarget.files ?? []));
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="self-start"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    <ImagePlusIcon className="mr-1 size-3.5" />
+                    Add image
+                  </Button>
+                  <ComposerAttachments
+                    files={images[currentKey] ?? []}
+                    onRemove={(index) => {
+                      if (submittingRef.current) return;
+                      const files = imagesRef.current[currentKey] ?? [];
+                      const removed = files[index];
+                      if (!removed) return;
+                      const remaining = files.filter((_, i) => i !== index);
+                      const text = customInputsRef.current[currentKey] ?? "";
+                      const caret = caretRef.current[currentKey]?.start ?? text.length;
+                      const strippedPrefix = removeTokens(
+                        { quotes: [], text: text.slice(0, caret) },
+                        removed,
                       );
-                      if (edit) {
-                        event.preventDefault();
-                        commitCustomText(currentKey, edit.text, edit.caret);
-                      }
-                    }
-                  : undefined
-              }
-              onPaste={
-                asyncTarget
-                  ? (event) => {
-                      const pasted = Array.from(event.clipboardData?.items ?? [])
-                        .filter((item) => item.kind === "file")
-                        .map((item) => item.getAsFile())
-                        .filter((file): file is File => file !== null);
-                      if (pasted.length) {
-                        event.preventDefault();
-                        addImages(currentKey, pasted);
-                      }
-                    }
-                  : undefined
-              }
-              data-testid="ask-user-question-custom-input"
-              className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
-            />
-          </label>
-          {asyncTarget && (
-            <div className="flex flex-col gap-2 pl-6">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                multiple
-                className="sr-only"
-                aria-label="Choose answer images"
-                onChange={(event) => {
-                  addImages(currentKey, Array.from(event.currentTarget.files ?? []));
-                  event.currentTarget.value = "";
-                }}
-              />
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="self-start"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <ImagePlusIcon className="mr-1 size-3.5" />
-                Add image
-              </Button>
-              <ComposerAttachments
-                files={images[currentKey] ?? []}
-                onRemove={(index) => {
-                  if (submittingRef.current) return;
-                  const files = imagesRef.current[currentKey] ?? [];
-                  const removed = files[index];
-                  if (!removed) return;
-                  const remaining = files.filter((_, i) => i !== index);
-                  const text = customInputsRef.current[currentKey] ?? "";
-                  const caret = caretRef.current[currentKey]?.start ?? text.length;
-                  const strippedPrefix = removeTokens(
-                    { quotes: [], text: text.slice(0, caret) },
-                    removed,
-                  );
-                  const stripped = removeTokens({ quotes: [], text }, removed);
-                  const compacted = compactLabels(stripped, remaining);
-                  commitCustomText(
-                    currentKey,
-                    compacted.text,
-                    Math.min(strippedPrefix.text.length, compacted.text.length),
-                  );
-                  const nextImages = { ...imagesRef.current, [currentKey]: remaining };
-                  imagesRef.current = nextImages;
-                  setImages(nextImages);
-                  setAttachmentError(null);
-                }}
-              />
-              {attachmentError && (
-                <p role="alert" className="text-sm text-destructive">
-                  {attachmentError}
-                </p>
+                      const stripped = removeTokens({ quotes: [], text }, removed);
+                      const compacted = compactLabels(stripped, remaining);
+                      commitCustomText(
+                        currentKey,
+                        compacted.text,
+                        Math.min(strippedPrefix.text.length, compacted.text.length),
+                      );
+                      const nextImages = { ...imagesRef.current, [currentKey]: remaining };
+                      imagesRef.current = nextImages;
+                      setImages(nextImages);
+                      setAttachmentError(null);
+                    }}
+                  />
+                  {attachmentError && (
+                    <p role="alert" className="text-sm text-destructive">
+                      {attachmentError}
+                    </p>
+                  )}
+                </div>
               )}
-            </div>
+            </>
           )}
         </div>
         {previewsToShow.length > 0 && (

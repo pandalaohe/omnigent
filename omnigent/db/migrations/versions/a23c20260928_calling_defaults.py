@@ -54,8 +54,12 @@ def upgrade() -> None:
         sa.Column("error", sa.Text(), nullable=True),
         sa.PrimaryKeyConstraint("workspace_id", "host_id", "harness"),
     )
+    task_columns = {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("scheduled_tasks")
+    }
     with op.batch_alter_table("scheduled_tasks") as batch_op:
-        batch_op.add_column(sa.Column("project_id", Uuid16(), nullable=True))
+        if "project_id" not in task_columns:
+            batch_op.add_column(sa.Column("project_id", Uuid16(), nullable=True))
         batch_op.add_column(sa.Column("explicit_null_fields", sa.Text(), nullable=True))
     with op.batch_alter_table("assignments") as batch_op:
         batch_op.alter_column("target_agent_id", existing_type=Uuid16(), nullable=True)
@@ -80,7 +84,10 @@ def downgrade() -> None:
             )
         else:
             batch_op.alter_column("target_agent_id", existing_type=Uuid16(), nullable=False)
+    task_columns = {column["name"] for column in sa.inspect(bind).get_columns("scheduled_tasks")}
     with op.batch_alter_table("scheduled_tasks") as batch_op:
         batch_op.drop_column("explicit_null_fields")
-        batch_op.drop_column("project_id")
+        # Dispatch still owns this column while its branch remains applied.
+        if "next_run_at" not in task_columns:
+            batch_op.drop_column("project_id")
     op.drop_table("host_model_catalog_cache")

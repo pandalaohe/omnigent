@@ -9,7 +9,7 @@
 // (Raycast/Rectangle/…) before the page ever sees them. Adding ⌥ dodges both —
 // it's not a browser gesture and is essentially never grabbed system-wide — and
 // it shares the ⌘⌥ chord with ChatPage's message-nav hotkey. Bind ONCE at the
-// app shell, where the sidebar open-state lives.
+// app shell, where the sidebar open-state lives (a grid binds its own ⌘⌥]).
 
 import { useEffect, useRef } from "react";
 import {
@@ -21,9 +21,9 @@ import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 
 export interface SidebarToggleHandlers {
   /** Flip the left (Conversations) sidebar. Bound to ⌘/Ctrl + ⌥/Alt + [. */
-  onToggleLeft: () => void;
-  /** Flip the right (Workspace) sidebar. Bound to ⌘/Ctrl + ⌥/Alt + ]. */
-  onToggleRight: () => void;
+  onToggleLeft?: () => void;
+  /** Flip the right (Workspace) sidebar. Bound to ⌘/Ctrl + ⌥/Alt + ]. Unset sides stay unclaimed. */
+  onToggleRight?: () => void;
 }
 
 export function useSidebarToggleHotkeys(
@@ -42,6 +42,13 @@ export function useSidebarToggleHotkeys(
       // the call: not every environment implements getModifierState, and an
       // unguarded call there would throw and break the whole keydown handler.
       if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return;
+      if (
+        isMac &&
+        document.activeElement?.closest(".monaco-editor") &&
+        !hasCustomShortcutBindings("toggleConversationsSidebar") &&
+        !hasCustomShortcutBindings("toggleWorkspaceSidebar")
+      )
+        return;
       // Ignore auto-repeat: holding the chord would flap the panel open/closed.
       if (e.repeat) return;
       const defaultChord = hasCommandModifier(e, isMac) && e.altKey && !e.shiftKey;
@@ -51,18 +58,19 @@ export function useSidebarToggleHotkeys(
       const toggleRight = hasCustomShortcutBindings("toggleWorkspaceSidebar")
         ? eventMatchesShortcutAction(e, "toggleWorkspaceSidebar")
         : defaultChord && e.code === "BracketRight";
-      if (toggleLeft) {
+      if (toggleLeft && latest.current.onToggleLeft) {
         e.preventDefault();
         e.stopPropagation();
         latest.current.onToggleLeft();
-      } else if (toggleRight) {
+      } else if (toggleRight && latest.current.onToggleRight) {
         e.preventDefault();
         e.stopPropagation();
         latest.current.onToggleRight();
       }
     };
 
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    // Capture before a focused xterm encodes Ctrl+Alt+[ / ] for its PTY.
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
   }, [isMac]);
 }

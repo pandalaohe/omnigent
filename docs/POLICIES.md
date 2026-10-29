@@ -69,11 +69,12 @@ After starting, you can also add or remove policies at runtime through the REST 
 
 ### Attachment admission controls
 
-The upload, copy, and fork routes apply additional server settings to `.zip`, `.docx`,
-`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These formats require
-Claude Code or Codex and an updated execution host/runner that supports their
-delivery and restoration. They are stored without extraction; the harness
-reads a local copy outside the working checkout. See
+The upload, copy, and fork routes apply additional server settings to files
+delivered through the harness's filesystem tools. By default every file that
+cannot be inlined is delivered this way, including archives, Office documents,
+databases and video. Every harness receives a local path; the execution host
+and runner must support delivery and restoration. Files are stored without
+extraction outside the working checkout. See
 [attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
 
 | Server config key | Default | Scope |
@@ -83,6 +84,7 @@ reads a local copy outside the working checkout. See
 | `attachment_max_uncompressed_image_bytes` | `5242880` (5 MiB) | Bytes per other image upload |
 | `attachment_max_pdf_bytes` | `20971520` (20 MiB) | Bytes per PDF upload |
 | `attachment_max_text_bytes` | `10485760` (10 MiB) | Bytes per text/code upload |
+| `filesystem_attachment_allowed_extensions` | `"*"` | Which files are delivered as files (see below) |
 | `filesystem_attachment_max_bytes` | `0` (unlimited) | Bytes per file |
 | `filesystem_attachment_max_files` | `0` (unlimited) | Stored files of these types per session |
 | `filesystem_attachment_max_total_bytes` | `0` (unlimited) | Combined bytes of these types per session |
@@ -110,6 +112,30 @@ and fetch return HTTP 410, its quota share is released, and its row remains as
 a name-only chip. The last sweep's summary is written to
 `<data_dir>/system-status/attachment-archive-cleanup.json` and returned under
 `attachment_archive_cleanup` by the admin-only `GET /v1/system/brief`.
+
+`filesystem_attachment_allowed_extensions` accepts:
+
+- a list of extensions, which replaces the defaults, e.g. `[".zip", ".gz", ".har"]`.
+  Files match on their last extension, so list `.gz` for `.tar.gz` files; a
+  compound entry such as `.tar.gz` is skipped with a warning.
+  A listed text or image type, such as `.log` or `.png`, is delivered as a file,
+  with its original bytes, instead of inline. The harness reads it from the
+  host's attachment directory.
+  A default extension left off the list is refused, even when the browser
+  labels it as text.
+- `[]`, which turns filesystem attachments off.
+- `"*"` (or a list containing `"*"`), which keeps the defaults and also delivers
+  every other file that can't be inlined, such as `.gz`, `.tar`, `.har`, or video.
+  Images, PDFs, and text/code files stay inline, except for extensions listed
+  beside `"*"`: `["*", ".log"]` also delivers `.log` files as files.
+
+The server reads this key at startup. Each upload records how it is delivered,
+so changing the setting does not change files a session already holds. Types
+outside the default extensions need a host and runner that advertise
+`filesystem_attachment_delivery`; older builds refuse them with an update
+message. `GET /v1/info` reports the effective setting as
+`filesystem_attachments`, which the web composer uses to accept files before
+uploading them.
 
 These are filename-based admission and storage limits, not content inspection.
 Classification uses the stored filename's extension, even when the browser

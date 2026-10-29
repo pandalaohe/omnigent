@@ -11,6 +11,7 @@ soft-interrupt fall-through contract, and the 503 mapping.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import sys
@@ -19,9 +20,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.responses import Response
 
+from omnigent.harnesses.opencode_native import app_server as opencode_app_server
+from omnigent.harnesses.opencode_native import bridge as opencode_bridge
+from omnigent.harnesses.opencode_native.client import OpenCodeClientError
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 
 
@@ -169,7 +174,7 @@ def test_native_session_has_active_work_prefers_observed_pane_status(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["antigravity-native", "claude-sdk", None])
 async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
     """Harnesses without an interrupt/stop handler return None (caller falls through)."""
     runner, _ = _make_runner()
@@ -403,6 +408,106 @@ async def test_http_owned_native_stop_waits_for_runtime_registration(
         assert response.status_code == 204, response.text
         assert not instance.running
         assert registry.get(session_id, name, "main") is None
+
+
+_OPENCODE_STATE = SimpleNamespace(
+    server_base_url="http://127.0.0.1:9999/",
+    opencode_session_id="ses_oc",
+    auth_secret="secret",
+    workspace="/ws",
+)
+
+
+class _FakeOpenCodeClient:
+    """Records the native abort, raising *error* when one is given."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.abort_calls: list[str] = []
+        self.closed = False
+
+    async def abort(self, session_id: str) -> bool:
+        self.abort_calls.append(session_id)
+        if self.error is not None:
+            raise self.error
+        return True
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _patch_opencode_bridge(
+    monkeypatch: pytest.MonkeyPatch, *, state: Any, client: _FakeOpenCodeClient
+) -> dict[str, Any]:
+    """Serve *state* as the bridge state and *client* as its client; return the routing kwargs."""
+    routed: dict[str, Any] = {}
+
+    def _client_for_state(**kwargs: Any) -> _FakeOpenCodeClient:
+        routed.update(kwargs)
+        return client
+
+    monkeypatch.setattr(opencode_bridge, "read_bridge_state", lambda bridge_dir: state)
+    monkeypatch.setattr(opencode_app_server, "client_for_state", _client_for_state)
+    return routed
+
+
+@pytest.mark.asyncio
+async def test_opencode_interrupt_aborts_native_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Interrupt aborts the turn on OpenCode's own server and records it for the dispatch.
+
+    The pending record lets a bare idle or the grace timer settle the dispatch as
+    cancelled; the handler itself wakes nothing.
+    """
+    client = _FakeOpenCodeClient()
+    routed = _patch_opencode_bridge(monkeypatch, state=_OPENCODE_STATE, client=client)
+    runner, captured = _make_runner()
+    captured["current_work_id"] = "work_oc"
+
+    resp = await runner.interrupt("opencode-native", "conv_oc")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert client.abort_calls == ["ses_oc"] and client.closed
+    assert routed == {
+        "base_url": "http://127.0.0.1:9999/",
+        "auth_secret": "secret",
+        "directory": "/ws",
+    }
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_oc") == (True, "work_oc")
+    stopped = await runner.stop("opencode-native", "conv_oc")
+    assert stopped is not None and stopped.status_code == 204
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "error", "expected_status"),
+    [
+        pytest.param(None, None, None, id="no-bridge-state"),
+        pytest.param(_OPENCODE_STATE, OpenCodeClientError("boom"), 503, id="client-error"),
+        pytest.param(_OPENCODE_STATE, httpx.ReadTimeout("slow"), 503, id="transport-error"),
+    ],
+)
+async def test_opencode_interrupt_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    state: Any,
+    error: Exception | None,
+    expected_status: int | None,
+) -> None:
+    """Missing bridge state falls through; a failed abort is a 503."""
+    client = _FakeOpenCodeClient(error)
+    _patch_opencode_bridge(monkeypatch, state=state, client=client)
+    runner, captured = _make_runner()
+
+    resp = await runner.interrupt("opencode-native", "conv_oc")
+
+    if expected_status is None:
+        assert resp is None
+    else:
+        assert resp is not None and resp.status_code == expected_status
+        assert json.loads(bytes(resp.body))["error"] == "opencode_native_interrupt_failed"
+    assert client.closed is (state is not None)
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_oc")[0] is False
 
 
 @pytest.mark.asyncio

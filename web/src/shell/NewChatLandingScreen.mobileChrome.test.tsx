@@ -47,6 +47,7 @@ import { NewChatLandingScreen } from "./NewChatDialog";
 const projectRoute = vi.hoisted(() => ({ search: "" }));
 
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => vi.fn(),
   useSearchParams: () => [new URLSearchParams(projectRoute.search), vi.fn()],
 }));

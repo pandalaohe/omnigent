@@ -27,6 +27,16 @@ afterEach(() => {
 });
 
 describe("useSidebarLayout", () => {
+  it("keeps its current layout when another storage namespace changes", () => {
+    const { result } = renderHook(() => useSidebarLayout());
+    const layout = result.current.layout;
+    act(() =>
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: "omnigent:session-grids:example:local" }),
+      ),
+    );
+    expect(result.current.layout).toBe(layout);
+  });
   it("reads the default layout when nothing is stored", () => {
     const { result } = renderHook(() => useSidebarLayout());
     expect(result.current.layout).toEqual(defaultLayout());

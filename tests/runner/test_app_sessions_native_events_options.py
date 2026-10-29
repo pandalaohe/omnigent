@@ -1852,6 +1852,55 @@ async def test_events_compact_on_opencode_native_503_when_summarize_raises(
 
 
 @pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_waits_for_an_idle_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``/clear`` relaunches OpenCode only after a reap holding the terminal lock finishes.
+
+    The relaunch reuses the session's tool relay before it registers the new pane;
+    interleaved with a reap, the reap would close the relay the new pane uses.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = f"conv_{uuid.uuid4().hex[:12]}"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation[conv_id] = {("opencode", "main"): instance}
+    relaunches: list[str] = []
+
+    async def _record_relaunch(session_id: str, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        relaunches.append(session_id)
+
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _record_relaunch)
+    app, _pm = await _build_app_for_spec(
+        _harness_spec("opencode-native"), terminal_registry=terminal_registry
+    )
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        lock = app.state.native_terminal_ensure_locks["opencode"].setdefault(
+            conv_id, asyncio.Lock()
+        )
+        async with lock:
+            clear = asyncio.create_task(
+                http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+            )
+            await asyncio.sleep(0.2)
+            assert not relaunches, "/clear relaunched OpenCode while the lock was held"
+        resp = await clear
+        assert resp.status_code == 200, resp.text
+        assert relaunches == [conv_id]
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2124,6 +2173,8 @@ async def _post_model_change_with_status_sequence(
     empty_session_catalog: bool = False,
     stored_catalog_rows: list[dict[str, object]] | None = None,
     pane_idle_after_polls: int | None = None,
+    model_env: dict[str, str] | None = None,
+    expected_command: str | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -2153,7 +2204,11 @@ async def _post_model_change_with_status_sequence(
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
-        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+        lambda _bridge_dir: (
+            {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"}
+            if model_env is None
+            else model_env
+        ),
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
@@ -2239,7 +2294,7 @@ async def _post_model_change_with_status_sequence(
             json={"type": "model_change", "model": model},
         )
     switch_rejected = empty_session_catalog or stored_catalog_rows == []
-    assert commands == ([] if switch_rejected else [f"/model {model}"])
+    assert commands == ([] if switch_rejected else [expected_command or f"/model {model}"])
     return response
 
 
@@ -2258,6 +2313,90 @@ async def test_events_model_change_confirms_against_the_status_file(
         ["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"],
     )
     assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.parametrize(
+    ("selected_model", "pin_model", "status_model", "status_code"),
+    [
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7[1m]", 204),
+        (
+            "system.ai.claude-opus-4-7[1m]",
+            "system.ai.claude-opus-4-7[1m]",
+            "claude-opus-4-7[1m]",
+            204,
+        ),
+        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
+        ("opus[1m]", "system.ai.claude-opus-4-7[1M]", "claude-opus-4-7[1m]", 204),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6[1m]", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 503),
+        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("opus", None, "claude-opus-4-7", 503),
+    ],
+    ids=[
+        "gateway-pin",
+        "canonical-spelling",
+        "bracket-alias",
+        "uppercase-bracket-alias",
+        "uppercase-pin-marker",
+        "different-generation",
+        "different-context",
+        "bracket-alias-different-context",
+        "uppercase-bracket-alias-different-context",
+        "unpinned-alias",
+    ],
+)
+async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_model: str,
+    pin_model: str | None,
+    status_model: str,
+    status_code: int,
+) -> None:
+    """An unchanged model confirms only the pin's exact generation and context."""
+
+    async def _skip_terminal_creation(**_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal",
+        _skip_terminal_creation,
+    )
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        [status_model],
+        model=selected_model,
+        picker_values=(selected_model,),
+        model_env={"ANTHROPIC_DEFAULT_OPUS_MODEL": pin_model} if pin_model else {},
+    )
+    assert resp.status_code == status_code, resp.text
+
+
+@pytest.mark.parametrize("translation", ["alias", "custom-slot", "picker"])
+@pytest.mark.parametrize("marker", ["[1m]", "[1M]"])
+async def test_events_model_change_does_not_confirm_plain_pin_for_marked_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    translation: str,
+    marker: str,
+) -> None:
+    """A translation must not confirm the plain sibling of a 1M pick."""
+    plain = "system.ai.claude-opus-4-7"
+    model_env = {
+        "alias": {"ANTHROPIC_DEFAULT_OPUS_MODEL": plain},
+        "custom-slot": {"ANTHROPIC_CUSTOM_MODEL_OPTION": plain},
+        "picker": {},
+    }[translation]
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model=plain + marker,
+        model_env=model_env,
+        picker_values=(plain,) if translation == "picker" else (),
+        expected_command="/model opus" if translation == "alias" else f"/model {plain}",
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
 
 
 @pytest.mark.parametrize("picker_source", ["bridge", "catalog", "session"])
@@ -2299,6 +2438,34 @@ async def test_bound_claude_switch_preserves_private_model_id(
             model=selected,
         )
     assert response.status_code == 204, response.text
+
+
+async def test_bound_claude_switch_does_not_fold_private_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inference_config import inference_config_scope
+
+    selected = "private/claude-opus-4-7"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": selected,
+                    "model_allowlist": [selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            ["claude-opus-4-7"],
+            model=selected,
+        )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unconfirmed"
 
 
 async def test_events_managed_glm_switch_rejects_an_unchanged_terminal(
@@ -2688,7 +2855,111 @@ async def test_events_model_change_reports_a_tmux_failure_as_503(
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "claude_native_model_failed"
+    # No person can act on this, so the reply names the log, not the raw text.
+    detail = resp.json()["detail"]
+    assert detail.startswith("Request failed on the runner; see the runner log for details:")
+    assert "command not found" not in detail
     assert typed == ([] if stage == "wait" else ["/model claude-opus-4-7"])
+
+
+_PASSWORD_PANE_TAIL = (
+    " Last terminal output:\n"
+    "✔ Unity Gateway connected\n"
+    "• Enter password to configure settings for Claude Code.\n"
+    "Password:"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "error", "expected_detail"),
+    [
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudePromptTimeout(
+                "Claude Code terminal did not become ready within 9.0s. "
+                "The message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's input box never appeared. It may still be starting, or waiting "
+            "on a prompt such as a password. Check the terminal, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="launcher-password-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation="Open the sign-in link and sign in.",
+            ),
+            "Claude Code can't start until you sign in to Databricks. "
+            "Finish the sign-in in the terminal, then switch models again.",
+            id="sign-in",
+        ),
+        pytest.param(
+            "inject",
+            claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request before "
+                "changing settings."
+            ),
+            "Claude is waiting for an answer to a question or prompt. "
+            "Answer it, then switch models again.",
+            id="permission-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalDialog(
+                "Claude Code is waiting for an answer in its terminal (Trust this folder?), "
+                "so the message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again." + _PASSWORD_PANE_TAIL,
+            id="dialog",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalExited(
+                "The Claude Code terminal has exited (status 1)." + _PASSWORD_PANE_TAIL,
+                exit_status="1",
+            ),
+            "The Claude Code terminal has exited. Relaunch it, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="exited",
+        ),
+    ],
+)
+async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error: Exception,
+    expected_detail: str,
+) -> None:
+    """A switch refused by a terminal awaiting the person names what to do, not the log path."""
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        if stage == "wait":
+            raise error
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir, command
+        raise error
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch, wait=_wait, inject=_inject, status=lambda _bridge_dir: None
+    )
+
+    assert resp.status_code == 503, resp.text
+    expected = {"error": "claude_native_model_failed", "detail": expected_detail}
+    if isinstance(
+        error,
+        claude_native_bridge.ClaudeSignInPending
+        | claude_native_bridge.ClaudeTerminalDialog
+        | claude_native_bridge.ClaudeUserPromptPending,
+    ):
+        # Only a pane awaiting the person's answer is flagged; an exit or timeout is a failure.
+        expected["waiting_on_person"] = True
+    assert resp.json() == expected
 
 
 @pytest.mark.asyncio
@@ -2859,7 +3130,8 @@ async def test_events_model_change_sends_no_key_past_its_budget(
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "claude_native_model_failed"
     keys = [key for _, key in tui.sent]
-    assert keys[:4] == ["Space", "C-u", "/model claude-opus-4-7", "Enter"], keys
+    clear_composer = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
+    assert keys[:4] == ["Space", clear_composer, "/model claude-opus-4-7", "Enter"], keys
     late = [
         (round(at - started_at, 2), key) for at, key in tui.sent if at >= started_at + budget_s
     ]

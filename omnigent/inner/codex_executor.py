@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -39,10 +40,14 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast
 from uuid import uuid4
 
 import psutil
-import tomllib
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import IS_LINUX, resolve_cli_binary
+from omnigent.databricks_ai_gateway import (
+    CODEX_AGENT,
+    is_databricks_ai_gateway_url,
+    with_gateway_attribution,
+)
 from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.errors import HarnessTransportClosedError
 from omnigent.harnesses.codex_egress import (
@@ -671,7 +676,7 @@ async def _codex_cli_version_text(
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with suppress(ProcessLookupError):
             proc.kill()
         with suppress(Exception):
@@ -1253,9 +1258,10 @@ def _sync_codex_role_defaults(source_config: Path, dest_config: Path) -> None:
     :param source_config: Host ``config.toml`` to read the defaults from.
     :param dest_config: Existing private ``config.toml`` to update in place.
     """
+    import tomllib
+
     import tomlkit
     import tomlkit.exceptions
-    import tomllib
 
     try:
         source_data = tomllib.loads(source_config.read_text(encoding="utf-8"))
@@ -1299,9 +1305,10 @@ def _sync_codex_role_defaults(source_config: Path, dest_config: Path) -> None:
 
 def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
     """Refresh only the host's explicit Windows sandbox setting in a private copy."""
+    import tomllib
+
     import tomlkit
     import tomlkit.exceptions
-    import tomllib
 
     try:
         source_data = tomllib.loads(source_config.read_text(encoding="utf-8"))
@@ -1640,6 +1647,8 @@ def materialize_codex_provider_config(
 
     Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
     untouched: Codex rejects unsupported fields there by discarding the whole config.
+    Custom providers on a Databricks Unity Gateway also get the gateway's
+    usage-attribution ``http_headers``.
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
@@ -1704,6 +1713,12 @@ def materialize_codex_provider_config(
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
+        base_url = provider_config.get("base_url")
+        if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            headers = provider_config.get("http_headers")
+            provider_config["http_headers"] = with_gateway_attribution(
+                headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
+            )
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -2540,6 +2555,7 @@ def _databricks_codex_config_overrides(
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
+    auth_config: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -2551,10 +2567,28 @@ def _databricks_codex_config_overrides(
         a bearer token, e.g. ``"databricks auth token --host ..."``.
     :param auth_refresh_interval_ms: Refresh cadence in milliseconds,
         e.g. ``900000``.
+    :param auth_config: ucode's structured auth command, args and timeout.
+        Invalid or missing values retain the legacy shell helper and defaults.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_databricks"
-    auth_command_json = json.dumps(auth_command)
+    command = "sh"
+    args = ["-c", auth_command]
+    timeout_ms = _GATEWAY_AUTH_TIMEOUT_MS
+    if auth_config is not None:
+        configured_command = auth_config.get("command")
+        configured_args = auth_config.get("args", [])
+        if (
+            isinstance(configured_command, str)
+            and configured_command.strip()
+            and isinstance(configured_args, list)
+            and all(isinstance(arg, str) for arg in configured_args)
+        ):
+            command = configured_command
+            args = configured_args
+        configured_timeout = auth_config.get("timeout_ms")
+        if type(configured_timeout) is int and configured_timeout > 0:
+            timeout_ms = configured_timeout
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -2563,9 +2597,9 @@ def _databricks_codex_config_overrides(
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
             f"base_url={json.dumps(base_url)},"
-            'auth={command="sh",'
-            f'args=["-c",{auth_command_json}],'
-            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
+            f"auth={{command={json.dumps(command)},"
+            f"args={json.dumps(args)},"
+            f"timeout_ms={timeout_ms},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
@@ -3432,7 +3466,7 @@ class _CodexAppServerSession:
                         "Codex Windows workspace permission profile disabled: "
                         "Codex version is unavailable"
                     )
-        except Exception:  # noqa: BLE001 - profile discovery keeps the legacy launch.
+        except Exception:  # noqa: BLE001
             logger.warning("Failed to probe Codex permission profile support", exc_info=True)
         if router_bridge_dir is not None:
             # Older CLIs keep the symlinked home without routing hooks.
@@ -3511,7 +3545,7 @@ class _CodexAppServerSession:
                 self._workspace_profile_cwd, self._workspace_profile = await asyncio.to_thread(
                     build_profile
                 )
-            except Exception:  # noqa: BLE001 - discovery/config errors preserve legacy permissions.
+            except Exception:  # noqa: BLE001
                 logger.warning("Failed to build Codex workspace permission profile", exc_info=True)
         # Override CODEX_HOME so Codex stores its data (including conversation
         # history) in a private temp directory rather than the user's ~/.codex/.
@@ -3651,7 +3685,7 @@ class _CodexAppServerSession:
                         source_home=config_source,
                         private_home=self._codex_home_dir,
                     )
-                except Exception:  # noqa: BLE001 - user hook failure never blocks startup
+                except Exception:  # noqa: BLE001
                     logger.warning("Codex user hook approval inheritance failed", exc_info=True)
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
@@ -3661,7 +3695,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # noqa: BLE001 - never block session startup
+                except Exception:  # noqa: BLE001
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -4164,7 +4198,7 @@ class _CodexAppServerSession:
                 return final_response
             try:
                 message = await asyncio.wait_for(self._events.get(), timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return final_response
             if isinstance(message, HarnessTransportClosedError):
                 # A completed turn remains successful when its process exits.
@@ -4263,7 +4297,7 @@ class _CodexAppServerSession:
                     return
                 try:
                     message = await asyncio.wait_for(self._events.get(), timeout=remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     return
                 if isinstance(message, HarnessTransportClosedError):
                     # Re-queue so the next turn still observes the closed transport.

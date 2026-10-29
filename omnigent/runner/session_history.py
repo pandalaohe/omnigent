@@ -55,7 +55,7 @@ class SessionHistory:
     convert_raw_items_to_input: Callable[[list[_JsonObject]], list[_JsonObject]]
     extract_last_assistant_text: Callable[[str], str]
     fetch_history_items: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
-    handle_harness_compaction: Callable[[str, _JsonObject], Coroutine[Any, Any, None]]
+    handle_harness_compaction: Callable[[str, _JsonObject], Coroutine[Any, Any, bool]]
     load_history_as_input: _LoadHistoryAsInputFn
     seed_last_server_item_id: Callable[[str], Coroutine[Any, Any, None]]
 
@@ -353,7 +353,7 @@ def build_session_history(
     async def _handle_harness_compaction(
         conv: str,
         event: _JsonObject,
-    ) -> None:
+    ) -> bool:
         summary = cast(str, event.get("summary", ""))
         token_count = cast(int, event.get("total_tokens") or 0)
         model = cast(str | None, event.get("summary_model"))
@@ -366,7 +366,7 @@ def build_session_history(
                 conv,
                 extra={"session_id": conv},
             )
-            return
+            return False
 
         compacted_messages = cast(list[_JsonObject] | None, event.get("compacted_messages"))
         compaction_event: _JsonObject = {
@@ -424,6 +424,7 @@ def build_session_history(
                     ],
                 },
             ]
+        return True
 
     _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
     _CANCELLATION_MARKER_TEXT = (

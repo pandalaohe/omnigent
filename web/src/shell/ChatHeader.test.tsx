@@ -10,9 +10,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import { copyText } from "@/lib/clipboard";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
-import type { SessionStartupHold } from "@/lib/types";
+import type { SessionStartupHold, Session } from "@/lib/types";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import type { ChildSessionLike } from "./subagentRailGroups";
+import * as sessionsApi from "@/lib/sessionsApi";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
@@ -87,6 +88,8 @@ function renderHeader(props: {
   childSession?: ChildSessionLike | null;
   childCwd?: string | null;
   conversationId?: string;
+  createdBySessionId?: string;
+  queryClient?: QueryClient;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
@@ -110,7 +113,8 @@ function renderHeader(props: {
   onFork?: () => void;
   settingsMode?: boolean;
 }) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const qc =
+    props.queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
@@ -127,6 +131,7 @@ function renderHeader(props: {
             // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
+            createdBySessionId={props.createdBySessionId}
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
@@ -159,6 +164,7 @@ function renderHeader(props: {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
@@ -166,6 +172,56 @@ afterEach(() => {
 });
 
 beforeEach(() => localStorage.clear());
+it.each([false, true])("links the creating session (mobile=%s)", async (mobile) => {
+  isMobileMock.mockReturnValue(mobile);
+  let resolveCreator!: (session: Session) => void;
+  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
+    new Promise<Session>((resolve) => {
+      resolveCreator = resolve;
+    }),
+  );
+  renderHeader({ sidebarOpen: true, conversationId: "worker", createdBySessionId: "manager" });
+  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
+  await act(async () => {
+    resolveCreator({ id: "manager", title: "Release manager" } as Session);
+  });
+  expect(await screen.findByRole("link", { name: "Release manager" })).toHaveAttribute(
+    "href",
+    "/c/manager",
+  );
+  expect(lookup).toHaveBeenCalledWith("manager");
+  expect(screen.getByText(/Created by/)).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Back to parent session" })).not.toBeInTheDocument();
+});
+
+it("rechecks creator access without displaying cached metadata", async () => {
+  const queryClient = new QueryClient();
+  const cached = { id: "private", title: "Previously shared manager" } as Session;
+  queryClient.setQueryData(["session", "private"], cached);
+  queryClient.setQueryData(["session-creator", "private"], cached);
+  let rejectCreator!: (error: Error) => void;
+  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
+    new Promise<Session>((_, reject) => {
+      rejectCreator = reject;
+    }),
+  );
+  renderHeader({
+    sidebarOpen: true,
+    conversationId: "worker",
+    createdBySessionId: "private",
+    queryClient,
+  });
+  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
+  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
+  expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  await act(async () => {
+    rejectCreator(new sessionsApi.ApiError("Unavailable", 403, null));
+  });
+  expect(await screen.findByText("Created by another session")).toBeInTheDocument();
+  expect(lookup).toHaveBeenCalledWith("private");
+  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
+  expect(screen.queryByRole("link")).not.toBeInTheDocument();
+});
 
 describe("ChatHeader — deployed Share presentation", () => {
   it("matches the compact Vercel action", () => {
@@ -247,6 +303,15 @@ describe("ChatHeader — workspace pane alignment", () => {
 
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+  });
+
+  it("adds the glass backdrop only on session pages", () => {
+    const landing = renderHeader({ sidebarOpen: true });
+    expect(landing.container.querySelector("header")).not.toHaveClass("session-header-glass");
+    landing.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).toHaveClass("session-header-glass");
   });
 });
 
@@ -908,6 +973,24 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     labels: {},
     permission_level: 3,
   };
+
+  it.each([
+    { name: "landing", actionConversation: null },
+    { name: "shared session", actionConversation: null, conversationId: "conv-1" },
+    { name: "sub-agent", actionConversation: conversation, isChildSession: true },
+    { name: "pending session", actionConversation: conversation, pending: true },
+  ])("leaves the rename shortcut untouched on $name", (props) => {
+    renderHeader({ sidebarOpen: true, conversationTitle: conversation.title, ...props });
+    const pressed = new KeyboardEvent("keydown", {
+      code: "KeyR",
+      ctrlKey: true,
+      altKey: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(pressed);
+    expect(pressed.defaultPrevented).toBe(false);
+    expect(screen.queryByRole("textbox", { name: "Session name" })).toBeNull();
+  });
 
   it("keeps the overflow trigger immediately after a truncating title", () => {
     renderHeader({

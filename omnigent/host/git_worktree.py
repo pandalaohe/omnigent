@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import subprocess
+import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, overload
@@ -22,13 +24,27 @@ from omnigent.git_urls import redact_remote_url
 
 _logger = logging.getLogger(__name__)
 
-# fetch/add can be slow on large repos; bound it so git can't hang the
-# host's tunnel loop.
+# Bound every git command so a wedged git cannot pin its worker thread
+# (and the orphan-reaper pause) forever. Metadata commands finish well
+# within this on any repository.
 _GIT_TIMEOUT_S: float = 120.0
 
 # Folder facts are display-only; a hung git (huge repo, network
 # filesystem) must not hold the host's worker thread for minutes.
 _FOLDER_FACTS_GIT_TIMEOUT_S: float = 10.0
+# Total time one create may spend. Fetching and populating a worktree scale
+# with repository size, so a large monorepo can legitimately take many minutes.
+WORKTREE_CREATE_BUDGET_S: float = 3600.0
+
+# Share of a create budget (at most _GIT_TIMEOUT_S) held back for rolling back a
+# failed pinned checkout, so even the failure reply arrives within the budget.
+_ROLLBACK_RESERVE_FRACTION: float = 0.25
+
+# ``(deadline, budget_s)`` of the create running in this context. Every git
+# command it runs, metadata included, is cut off at that time.monotonic() deadline.
+_CREATE_DEADLINE: ContextVar[tuple[float, float] | None] = ContextVar(
+    "_CREATE_DEADLINE", default=None
+)
 
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
@@ -125,21 +141,58 @@ def _sanitize_dirname(branch_name: str) -> str:
 
 
 @overload
+def _exec_git(
+    args: list[str], *, cwd: str, timeout: float, text: Literal[True] = True
+) -> subprocess.CompletedProcess[str]: ...
+@overload
+def _exec_git(
+    args: list[str], *, cwd: str, timeout: float, text: Literal[False]
+) -> subprocess.CompletedProcess[bytes]: ...
+def _exec_git(
+    args: list[str], *, cwd: str, timeout: float, text: bool = True
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+    """Spawn one git command, killing it after ``timeout`` seconds.
+
+    :param args: Git argv *after* ``git``, e.g. ``["rev-parse", "--show-toplevel"]``.
+    :param cwd: Working directory to run git in.
+    :param timeout: Seconds to allow before killing git.
+    :returns: The completed process with captured text stdout/stderr.
+    :raises FileNotFoundError: If git is not installed.
+    :raises subprocess.TimeoutExpired: If the command exceeds ``timeout``.
+    """
+    return run_git(
+        ["git", *args],
+        cwd=cwd,
+        # Keep failure diagnostics stable for repository classification, and
+        # fail a credential prompt at once instead of holding the create budget.
+        env={**os.environ, "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=text,
+        timeout=timeout,
+        check=False,
+    )
+
+
+@overload
 def _run_git(
-    args: list[str], *, cwd: str, timeout: float = ..., text: Literal[True] = ...
+    args: list[str], *, cwd: str, timeout: float | None = ..., text: Literal[True] = ...
 ) -> subprocess.CompletedProcess[str]: ...
 @overload
 def _run_git(
-    args: list[str], *, cwd: str, timeout: float = ..., text: Literal[False]
+    args: list[str], *, cwd: str, timeout: float | None = ..., text: Literal[False]
 ) -> subprocess.CompletedProcess[bytes]: ...
 def _run_git(
     args: list[str],
     *,
     cwd: str,
-    timeout: float = _GIT_TIMEOUT_S,
+    timeout: float | None = None,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Run a git command, returning the completed process.
+
+    Inside :func:`create_worktree`, the command is also cut off when the
+    create's deadline arrives, and that is reported as the budget running out.
 
     :param args: Git argv *after* ``git``, e.g.
         ``["rev-parse", "--show-toplevel"]``. Passed as a list so no
@@ -154,29 +207,91 @@ def _run_git(
         where decoding would normalise newlines).
     :returns: The completed process with captured stdout/stderr.
     :raises WorktreeError: If git is not installed, or the command
-        exceeds ``timeout``.
+        exceeds ``timeout`` or the create deadline.
     """
+    bound = _GIT_TIMEOUT_S if timeout is None else timeout
+    create_deadline = _CREATE_DEADLINE.get()
+    cut_by_deadline = False
+    if create_deadline is not None:
+        remaining = _time_left(*create_deadline)
+        if remaining < bound:
+            bound, cut_by_deadline = remaining, True
     try:
-        return run_git(
-            ["git", *args],
-            cwd=cwd,
-            # Keep failure diagnostics stable for repository classification.
-            env={**os.environ, "LC_ALL": "C"},
-            capture_output=True,
-            text=text,
-            timeout=timeout,
-            check=False,
+        return (
+            _exec_git(args, cwd=cwd, timeout=bound)
+            if text
+            else _exec_git(args, cwd=cwd, timeout=bound, text=False)
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         if isinstance(exc, FileNotFoundError):
             message = "git is not installed on the host"
         elif isinstance(exc, subprocess.TimeoutExpired):
-            message = f"git command timed out after {timeout:.0f}s"
+            message = (
+                f"worktree creation timed out after {create_deadline[1]:.0f}s"
+                if create_deadline is not None and cut_by_deadline
+                else f"git command timed out after {bound:.0f}s"
+            )
         else:
             message = f"git command could not start: {exc}"
         if notes := getattr(exc, "__notes__", None):
             message += "; " + "; ".join(notes)
         raise WorktreeError(message) from exc
+    except subprocess.TimeoutExpired as exc:
+        if create_deadline is not None and cut_by_deadline:
+            raise WorktreeError(
+                f"worktree creation timed out after {create_deadline[1]:.0f}s"
+            ) from exc
+        raise WorktreeError(f"git command timed out after {bound:.0f}s") from exc
+
+
+def _run_git_within_budget(
+    args: list[str], *, cwd: str, deadline: float, budget_s: float
+) -> subprocess.CompletedProcess[str]:
+    """Run a size-scaling git command with what is left of a create budget.
+
+    :param args: Git argv *after* ``git``, e.g. ``["fetch"]``.
+    :param cwd: Working directory to run git in.
+    :param deadline: :func:`time.monotonic` value at which the budget ends.
+    :param budget_s: The whole budget, named in the timeout error.
+    :returns: The completed process with captured text stdout/stderr.
+    :raises WorktreeError: If git is not installed, or the budget runs out
+        before or during the command.
+    """
+    try:
+        return _run_git(args, cwd=cwd, timeout=_time_left(deadline, budget_s))
+    except WorktreeError as exc:
+        if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+            raise WorktreeError(f"worktree creation timed out after {budget_s:.0f}s") from exc
+        raise
+
+
+def _time_left(deadline: float, budget_s: float) -> float:
+    """Return what is left of a create budget.
+
+    :param deadline: :func:`time.monotonic` value at which the budget ends.
+    :param budget_s: The whole budget, named in the timeout error.
+    :returns: Seconds remaining, always positive.
+    :raises WorktreeError: If the budget is already spent.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise WorktreeError(f"worktree creation timed out after {budget_s:.0f}s")
+    return remaining
+
+
+def _rollback_timeout(deadline: float, cap: float | None) -> float:
+    """Bound one rollback command by what is left before the create deadline.
+
+    :param deadline: :func:`time.monotonic` value by which the create must reply.
+    :param cap: The command's own bound, e.g. :data:`_GIT_TIMEOUT_S`; ``None``
+        lets a size-scaling command use all the remaining time.
+    :returns: Seconds the command may run.
+    :raises WorktreeError: If no time is left for the command.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise WorktreeError("no time left to roll back the worktree")
+    return remaining if cap is None else min(cap, remaining)
 
 
 def _git_error(label: str, result: subprocess.CompletedProcess[str]) -> WorktreeError:
@@ -864,7 +979,9 @@ def _resolve_worktree_path(
     )
 
 
-def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
+def _ensure_base_resolvable(
+    repo_root: str, base_branch: str, *, deadline: float, budget_s: float
+) -> None:
     """Make ``base_branch`` resolvable, fetching once if needed.
 
     If the base ref doesn't resolve locally (e.g. a remote-tracking
@@ -876,6 +993,9 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
         ``"/Users/alice/myrepo"``.
     :param base_branch: Base ref the user requested, e.g. ``"main"``
         or ``"origin/main"``.
+    :param deadline: :func:`time.monotonic` end of the create budget,
+        which bounds the size-scaling ``git fetch``.
+    :param budget_s: The whole create budget, named in a timeout error.
     :raises WorktreeError: If the base ref cannot be resolved even
         after a fetch attempt.
     """
@@ -891,7 +1011,7 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
     ):
         return
     # Best-effort fetch from the default remote, then re-verify.
-    _run_git(["fetch"], cwd=repo_root)
+    _run_git_within_budget(["fetch"], cwd=repo_root, deadline=deadline, budget_s=budget_s)
     if (
         _run_git(
             ["rev-parse", "--verify", "--quiet", "--end-of-options", base_branch], cwd=repo_root
@@ -926,6 +1046,7 @@ def create_worktree(
     existing_branch: bool = False,
     entry: str | None = None,
     path_template: str | None = None,
+    timeout_s: float | None = None,
 ) -> CreatedWorktree:
     """Create a git worktree with a new — or existing — branch checked out.
 
@@ -959,6 +1080,12 @@ def create_worktree(
         ``info/exclude`` line naming the worktree directory. ``None``
         keeps the upstream sibling location under the repo's parent,
         with neither check.
+    :param timeout_s: Seconds the whole create may take. Fetch,
+        ``worktree add`` and ``checkout`` share what remains of it;
+        metadata commands keep their own short bound within it. When a failed
+        pinned checkout may need rolling back, those commands stop early
+        so the rollback also finishes within ``timeout_s``. ``None`` uses
+        :data:`WORKTREE_CREATE_BUDGET_S`.
     :returns: The worktree root, branch, and relocated selected directory.
     :raises WorktreeError: If the branch name is invalid, the path is
         not a git repo, the base ref can't be resolved,
@@ -966,6 +1093,40 @@ def create_worktree(
         create mode, is missing or still checked out in
         existing-branch mode), the template is invalid, or the
         worktree directory would resolve outside the template's anchor.
+    """
+    budget_s = WORKTREE_CREATE_BUDGET_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + budget_s
+    token = _CREATE_DEADLINE.set((deadline, budget_s))
+    try:
+        return _create_worktree(
+            repo_path=repo_path,
+            branch_name=branch_name,
+            base_branch=base_branch,
+            existing_branch=existing_branch,
+            deadline=deadline,
+            budget_s=budget_s,
+            entry=entry,
+            path_template=path_template,
+        )
+    finally:
+        _CREATE_DEADLINE.reset(token)
+
+
+def _create_worktree(
+    *,
+    repo_path: str,
+    branch_name: str,
+    base_branch: str | None,
+    existing_branch: bool,
+    deadline: float,
+    budget_s: float,
+    entry: str | None,
+    path_template: str | None,
+) -> CreatedWorktree:
+    """Do :func:`create_worktree`'s work against its deadline.
+
+    :param deadline: :func:`time.monotonic` value by which the create must return.
+    :param budget_s: The whole budget, named in a timeout error.
     """
     validate_branch_name(branch_name)
     if existing_branch and base_branch is not None:
@@ -1007,8 +1168,13 @@ def create_worktree(
         raise WorktreeError(
             f"a branch named {branch_name!r} already exists; choose a different branch name"
         )
+    # A pinned checkout (see below) is rolled back if it fails, inside the same budget.
+    work_deadline = deadline
+    if relative_directory:
+        work_deadline -= min(_GIT_TIMEOUT_S, budget_s * _ROLLBACK_RESERVE_FRACTION)
+        _CREATE_DEADLINE.set((work_deadline, budget_s))
     if base_branch is not None:
-        _ensure_base_resolvable(repo_root, base_branch)
+        _ensure_base_resolvable(repo_root, base_branch, deadline=work_deadline, budget_s=budget_s)
     validated_commit: str | None = None
     if relative_directory:
         revision = f"refs/heads/{branch_name}" if existing_branch else (base_branch or "HEAD")
@@ -1071,7 +1237,9 @@ def create_worktree(
             add_args.insert(2, "--no-checkout")
         if base_branch is not None:
             add_args += ["--end-of-options", base_branch]
-    result = _run_git(add_args, cwd=repo_root)
+    result = _run_git_within_budget(
+        add_args, cwd=repo_root, deadline=work_deadline, budget_s=budget_s
+    )
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)
     if validated_commit is not None:
@@ -1086,18 +1254,23 @@ def create_worktree(
                     )
             else:
                 # This request owns the new branch and its not-yet-populated checkout.
-                checkout = _run_git(
+                checkout = _run_git_within_budget(
                     ["checkout", "--force", "-B", branch_name, validated_commit],
                     cwd=str(worktree_path),
+                    deadline=work_deadline,
+                    budget_s=budget_s,
                 )
                 if checkout.returncode != 0:
                     raise _git_error("could not check out validated worktree revision", checkout)
         except WorktreeError:
+            # The rollback may use the reserve kept back from the work above.
+            _CREATE_DEADLINE.set((deadline, budget_s))
             try:
                 remove_worktree(
                     worktree_path=str(worktree_path),
                     branch=branch_name,
                     delete_branch=not existing_branch,
+                    deadline=deadline,
                 )
             except WorktreeError:
                 _logger.warning("Could not roll back worktree %s", worktree_path, exc_info=True)
@@ -1109,7 +1282,7 @@ def create_worktree(
     )
 
 
-def _main_repo_for_worktree(worktree_path: str) -> str:
+def _main_repo_for_worktree(worktree_path: str, *, timeout: float | None = None) -> str:
     """Find the main repository work tree for a linked worktree.
 
     Uses ``git rev-parse --git-common-dir`` (which points at the
@@ -1119,6 +1292,7 @@ def _main_repo_for_worktree(worktree_path: str) -> str:
 
     :param worktree_path: Absolute path of a linked worktree, e.g.
         ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param timeout: Bound for the git call; ``None`` uses :data:`_GIT_TIMEOUT_S`.
     :returns: Absolute path of the main repo work tree, e.g.
         ``"/Users/alice/myrepo"``.
     :raises WorktreeError: If ``worktree_path`` is missing or not part
@@ -1126,7 +1300,7 @@ def _main_repo_for_worktree(worktree_path: str) -> str:
     """
     if not Path(worktree_path).exists():
         raise WorktreeError(f"worktree path does not exist: {worktree_path}")
-    result = _run_git(["rev-parse", "--git-common-dir"], cwd=worktree_path)
+    result = _run_git(["rev-parse", "--git-common-dir"], cwd=worktree_path, timeout=timeout)
     if result.returncode != 0:
         raise WorktreeError(f"not a git worktree: {worktree_path}")
     common_dir = Path(result.stdout.strip())
@@ -1143,6 +1317,7 @@ def remove_worktree(
     safe_only: bool = False,
     archive_mode: str | None = None,
     rebuildable_paths: list[str] | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Remove a git worktree and optionally delete its branch.
 
@@ -1162,15 +1337,26 @@ def remove_worktree(
         ``branch`` after removing the worktree directory.
     :param safe_only: Refuse a dirty, detached, main, or mismatched tree;
         never force-remove or delete its branch.
-    :raises WorktreeError: If the worktree path is missing/invalid, or
-        a git command fails.
+    :param deadline: :func:`time.monotonic` value by which a create's
+        rollback must finish. ``git worktree remove`` may then use all the
+        remaining time, which can outlast the metadata bound on a large
+        worktree, and every other command keeps its own bound within it.
+        ``None`` gives each command :data:`_GIT_TIMEOUT_S`.
+    :raises WorktreeError: If the worktree path is missing/invalid, a
+        git command fails, or ``deadline`` passes.
     """
+
+    def bound(cap: float | None) -> float | None:
+        return None if deadline is None else _rollback_timeout(deadline, cap)
+
     if not Path(worktree_path).exists():
         raise WorktreeError(f"worktree path does not exist: {worktree_path}")
     if not Path(worktree_path).is_dir():
         raise WorktreeError(f"worktree path is not a directory: {worktree_path}")
-    main_repo = _main_repo_for_worktree(worktree_path)
-    root = _run_git(["rev-parse", "--show-toplevel"], cwd=worktree_path)
+    main_repo = _main_repo_for_worktree(worktree_path, timeout=bound(_GIT_TIMEOUT_S))
+    root = _run_git(
+        ["rev-parse", "--show-toplevel"], cwd=worktree_path, timeout=bound(_GIT_TIMEOUT_S)
+    )
     if root.returncode != 0:
         raise _git_error("could not resolve worktree root", root)
     if os.path.normcase(root.stdout.strip()) != os.path.normcase(os.path.abspath(worktree_path)):
@@ -1241,10 +1427,13 @@ def remove_worktree(
     remove_result = _run_git(
         ["worktree", "remove", *([] if safe_only else ["--force"]), root.stdout.strip()],
         cwd=main_repo,
+        timeout=bound(None),
     )
     if remove_result.returncode != 0:
         raise _git_error("git worktree remove failed", remove_result)
     if delete_branch and branch is not None:
-        branch_result = _run_git(["branch", "-D", branch], cwd=main_repo)
+        branch_result = _run_git(
+            ["branch", "-D", branch], cwd=main_repo, timeout=bound(_GIT_TIMEOUT_S)
+        )
         if branch_result.returncode != 0:
             raise _git_error("git branch -D failed", branch_result)

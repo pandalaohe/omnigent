@@ -91,7 +91,7 @@ def require_session_tool_allowed(
             prefs_store,
             action="unarchive" if name == "sys_session_unarchive" else "open",
         )
-    elif name == "sys_session_send" and isinstance(arguments, dict):
+    elif name in {"sys_session_send", "sys_session_message"} and isinstance(arguments, dict):
         target_id = arguments.get("session_id")
         if isinstance(target_id, str):
             target = conversation_store.get_conversation(target_id)

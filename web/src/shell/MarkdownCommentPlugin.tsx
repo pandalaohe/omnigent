@@ -46,8 +46,7 @@ function rebuildDecorations(editor: Editor, pendingRange?: { from: number; to: n
 
 interface MarkdownCommentPluginProps {
   editor: Editor | null;
-  /** Shared mutable ref pointing to the raw server file content. */
-  contentRef: RefObject<string>;
+  content: string;
   /** Shared mutable ref used by CommentDecorationExtension's plugin. */
   commentStateRef: RefObject<CommentDecorationState | null>;
   comments: Comment[];
@@ -63,7 +62,7 @@ interface MarkdownCommentPluginProps {
 
 export function MarkdownCommentPlugin({
   editor,
-  contentRef,
+  content,
   commentStateRef,
   comments,
   isDirty,
@@ -73,6 +72,10 @@ export function MarkdownCommentPlugin({
   canEdit = true,
   onOrphansChange,
 }: MarkdownCommentPluginProps): ReactElement | null {
+  const contentRef = useRef(content);
+  useEffect(() => {
+    contentRef.current = content;
+  }, [content]);
   const [buttonPos, setButtonPos] = useState<{ top: number; left: number } | null>(null);
 
   useEffect(() => {
@@ -127,7 +130,7 @@ export function MarkdownCommentPlugin({
     commentStateRef.current = {
       comments,
       activeSelection,
-      rawContent: contentRef.current,
+      rawContent: content,
       pendingRange: pendingRangeRef.current,
       onClickComment: (comment: Comment) => {
         onSetActiveSelectionRef.current({
@@ -138,7 +141,7 @@ export function MarkdownCommentPlugin({
       },
     };
     rebuildDecorations(editor);
-  }, [editor, comments, activeSelection, contentRef, commentStateRef]);
+  }, [editor, comments, activeSelection, content, commentStateRef]);
 
   // --- When parent clears activeSelection → remove pending decoration ---
   const prevActiveSelectionRef = useRef(activeSelection);
@@ -239,7 +242,13 @@ export function MarkdownCommentPlugin({
     const { selection } = state;
     if (selection.empty) return;
 
-    const data = computeSelectionData(selection.from, selection.to, state.doc, contentRef.current);
+    const data = computeSelectionData(
+      selection.from,
+      selection.to,
+      state.doc,
+      contentRef.current,
+      editor.markdown,
+    );
     if (!data) return;
 
     const newRange = { from: selection.from, to: selection.to };

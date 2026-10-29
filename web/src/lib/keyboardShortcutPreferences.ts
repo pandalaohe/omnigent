@@ -25,6 +25,14 @@ export type ShortcutActionId =
   | "recallNextPrompt"
   | "approvePrompt"
   | "openModelPicker"
+  | "cycleModel"
+  | "cycleEffort"
+  | "cyclePermissionMode"
+  | "renameSession"
+  | "previousPane"
+  | "nextPane"
+  | "splitTerminalColumns"
+  | "splitTerminalRows"
   | "focusComposer"
   | "voiceDictation"
   | "stopResponse"
@@ -79,6 +87,62 @@ const WORKSPACE_TAB_NOTE =
   "Not set by default. Focusing the workspace tabs and pressing the number also works.";
 
 export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefinition> = {
+  cycleModel: {
+    id: "cycleModel",
+    label: "Cycle model",
+    group: "chats",
+    scope: "global",
+    defaultBindings: [chord("KeyM", ["control", "alt"])],
+  },
+  cycleEffort: {
+    id: "cycleEffort",
+    label: "Cycle reasoning effort",
+    group: "chats",
+    scope: "global",
+    defaultBindings: [chord("KeyE", ["control", "alt"])],
+  },
+  cyclePermissionMode: {
+    id: "cyclePermissionMode",
+    label: "Cycle permission mode (in session)",
+    group: "chats",
+    scope: "composer",
+    defaultBindings: [chord("Tab", ["shift"])],
+  },
+  renameSession: {
+    id: "renameSession",
+    label: "Rename current session",
+    group: "general",
+    scope: "global",
+    defaultBindings: [chord("KeyR", ["primary", "alt"])],
+  },
+  previousPane: {
+    id: "previousPane",
+    label: "Focus previous pane",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("BracketLeft", ["primary", "alt", "shift"])],
+  },
+  nextPane: {
+    id: "nextPane",
+    label: "Focus next pane",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("BracketRight", ["primary", "alt", "shift"])],
+  },
+  splitTerminalColumns: {
+    id: "splitTerminalColumns",
+    label: "Split terminal right",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("Backslash", ["primary", "alt", "shift"])],
+  },
+  splitTerminalRows: {
+    id: "splitTerminalRows",
+    label: "Split terminal down",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("Minus", ["primary", "alt"])],
+  },
   newSession: {
     id: "newSession",
     label: "Start a new session",

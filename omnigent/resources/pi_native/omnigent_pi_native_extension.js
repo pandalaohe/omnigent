@@ -58,6 +58,9 @@ const _PARK_REATTACH_MIN_ELAPSED_MS = _PARK_ATTEMPT_TIMEOUT_MS - 5_000;
 // the rounds and then deny, instead of riding the 24h park ceiling to a
 // fail-open. The brief inter-round sleep means this bounds wall-time too.
 const _MAX_RAW_ASK_ROUNDS = 50;
+
+// Allow the 5s routing call and 6s relay to fail open before the 8s client deadline.
+const _ROUTE_TURN_TIMEOUT_MS = 8_000;
 // Reason surfaced when the tool-call gate cannot obtain a usable verdict and
 // fails CLOSED. PHASE_TOOL_CALL is the sole enforcement point for a native
 // connector tool, so an unevaluable policy must block, not proceed — matching
@@ -76,8 +79,19 @@ function mintEvaluateElicitationId() {
   return `elicit_evaluate_${crypto.randomBytes(16).toString("hex")}`;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    function finish() {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", finish);
+      resolve();
+    }
+    const timer = setTimeout(finish, ms);
+    if (signal) {
+      signal.addEventListener("abort", finish, { once: true });
+      if (signal.aborted) finish();
+    }
+  });
 }
 
 function readConfig() {
@@ -642,6 +656,182 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
   }
 }
 
+function mintPiUiElicitationId() {
+  return `elicit_pi_${crypto.randomBytes(16).toString("hex")}`;
+}
+
+const _UNSUPPORTED_ENDPOINT = Symbol("unsupported endpoint");
+
+// Shared long-poll transport for policy verdicts and extension dialogs.
+async function postParkedJson(config, relayPath, serverPath, payload, {
+  parkDeadline, signal, retryEmpty = false,
+}) {
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}${relayPath}`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}${serverPath}`;
+  const body = JSON.stringify(payload);
+  const requestHeaders = () => relay
+    ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
+    : { "content-type": "application/json", ...freshAuthHeaders(config.authHeaders) };
+
+  let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+  let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+  let emptyResponses = 0;
+
+  while (true) {
+    if (signal && signal.aborted) return null;
+    if (Date.now() >= parkDeadline) return null;
+    const controller =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const remaining = parkDeadline - Date.now();
+    const attemptMs = Math.min(_PARK_ATTEMPT_TIMEOUT_MS, Math.max(remaining, 1));
+    const timer = controller
+      ? setTimeout(() => controller.abort(), attemptMs)
+      : null;
+    const callerSignal = signal;
+    const cancelAttempt = () => controller && controller.abort();
+    if (callerSignal) {
+      callerSignal.addEventListener("abort", cancelAttempt, { once: true });
+      if (callerSignal.aborted) cancelAttempt();
+    }
+    const attemptStart = Date.now();
+    let resp;
+    let text;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: requestHeaders(),
+        body,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      text = resp.ok ? await resp.text() : "";
+    } catch (_err) {
+      if ((callerSignal && callerSignal.aborted) || Date.now() >= parkDeadline) return null;
+      if (timer) clearTimeout(timer);
+      const aborted = !!(controller && controller.signal.aborted);
+      const elapsed = Date.now() - attemptStart;
+      const reattachFloor = Math.min(
+        _PARK_REATTACH_MIN_ELAPSED_MS,
+        Math.max(attemptMs - 5_000, attemptMs * 0.8),
+      );
+      const isLongPollReattach = aborted && elapsed >= reattachFloor;
+      if (isLongPollReattach) {
+        if (Date.now() >= parkDeadline) return null;
+        transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+        transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+        continue;
+      }
+      if (Date.now() + transientBackoff >= transientDeadline) return null;
+      await sleep(transientBackoff, signal);
+      transientBackoff = Math.min(
+        transientBackoff * 2,
+        _TRANSIENT_RETRY_MAX_BACKOFF_MS,
+      );
+      continue;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (callerSignal) callerSignal.removeEventListener("abort", cancelAttempt);
+    }
+    if (callerSignal && callerSignal.aborted) return null;
+
+    if (!resp.ok) {
+      if (resp.status === 404 || resp.status === 405) return _UNSUPPORTED_ENDPOINT;
+      if (resp.status >= 500) {
+        if (Date.now() + transientBackoff >= transientDeadline) return null;
+        await sleep(transientBackoff, signal);
+        transientBackoff = Math.min(
+          transientBackoff * 2,
+          _TRANSIENT_RETRY_MAX_BACKOFF_MS,
+        );
+        continue;
+      }
+      return null;
+    }
+
+    if (!text && retryEmpty) {
+      // Bound empty proxy responses; explicit server cancellation never re-parks.
+      if (++emptyResponses >= 3 || Date.now() >= parkDeadline) return null;
+      transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+      transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
+      // A server that answers immediately (consumed tombstone, a proxy that
+      // ends the long poll) would otherwise spin here with no delay.
+      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS, signal);
+      continue;
+    }
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (_err) {
+      return null;
+    }
+    return json && typeof json === "object" ? json : null;
+  }
+}
+
+async function parkPiExtensionUiHttp(config, request, opts = {}) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const timeoutMs = opts && typeof opts.timeout === "number" && opts.timeout > 0
+    ? opts.timeout : _PARK_TOTAL_BUDGET_MS;
+  return postParkedJson(config, "/hook/pi/extension-ui", "/hooks/pi-extension-ui", {
+    elicitation_id: mintPiUiElicitationId(),
+    request: { ...request, timeout: timeoutMs },
+  }, {
+    parkDeadline: Date.now() + timeoutMs,
+    signal: opts && opts.signal,
+    retryEmpty: true,
+  });
+}
+
+function extensionUiValue(response) {
+  return response && !response.cancelled && typeof response.value === "string"
+    ? response.value : undefined;
+}
+
+function wrapExtensionUi(ctx, config) {
+  if (!ctx || ctx.mode !== "tui" || !ctx.ui || ctx.ui.__omnigentUiWrapped) {
+    return;
+  }
+  const ui = ctx.ui;
+  ui.__omnigentUiWrapped = true;
+  const original = Object.fromEntries(
+    ["confirm", "select", "input", "editor"]
+      .filter((method) => typeof ui[method] === "function")
+      .map((method) => [method, ui[method].bind(ui)]),
+  );
+
+  if (original.confirm) ui.confirm = async (title, message, opts) => {
+    const request = { method: "confirm", title, message };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.confirm(title, message, opts);
+    return !!(verdict && verdict.confirmed === true);
+  };
+  if (original.select) ui.select = async (title, options, opts) => {
+    const request = {
+      method: "select",
+      title,
+      options: Array.isArray(options) ? options : [],
+    };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.select(title, options, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.input) ui.input = async (title, placeholder, opts) => {
+    const request = { method: "input", title, placeholder };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.input(title, placeholder, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.editor) ui.editor = async (title, prefill, opts) => {
+    const request = { method: "editor", title, prefill };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.editor(title, prefill, opts);
+    return extensionUiValue(verdict);
+  };
+}
+
 /**
  * Build a Pi tool-result object from an MCP ``tools/call`` JSON-RPC response.
  *
@@ -1029,6 +1219,86 @@ function contentBlocks(message) {
   return message.content;
 }
 
+// Pi's convertToLlm renders these messages as user text.
+const _PI_COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:" +
+  "\n\n<summary>\n";
+const _PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+const _PI_BRANCH_SUMMARY_PREFIX =
+  "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+const _PI_BRANCH_SUMMARY_SUFFIX = "</summary>";
+
+function bashExecutionText(message) {
+  let text = `Ran \`${message.command}\`\n`;
+  text += message.output ? `\`\`\`\n${message.output}\n\`\`\`` : "(no output)";
+  if (message.cancelled) text += "\n\n(command cancelled)";
+  else if (message.exitCode !== null && message.exitCode !== undefined && message.exitCode !== 0)
+    text += `\n\nCommand exited with code ${message.exitCode}`;
+  if (message.truncated && message.fullOutputPath)
+    text += `\n\n[Output truncated. Full output: ${message.fullOutputPath}]`;
+  return text;
+}
+
+// Pi's model context in the item shapes forwarded live, so any harness can replay it.
+// Like live forwarding, it keeps text only: images and tool-result error flags are dropped.
+function compactionSnapshotItems(messages) {
+  const items = [];
+  const addUserText = (text) => {
+    if (!text) return;
+    items.push({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+  };
+  for (const message of messages) {
+    switch (message?.role) {
+      case "compactionSummary":
+        addUserText(
+          _PI_COMPACTION_SUMMARY_PREFIX + message.summary + _PI_COMPACTION_SUMMARY_SUFFIX,
+        );
+        break;
+      case "branchSummary":
+        addUserText(_PI_BRANCH_SUMMARY_PREFIX + message.summary + _PI_BRANCH_SUMMARY_SUFFIX);
+        break;
+      case "bashExecution":
+        // `!!` shell output never reaches the model.
+        if (!message.excludeFromContext) addUserText(bashExecutionText(message));
+        break;
+      case "user":
+      case "custom":
+        addUserText(textFromMessage(message));
+        break;
+      case "assistant": {
+        const text = textFromMessage(message);
+        if (text) {
+          items.push({
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text }],
+          });
+        }
+        for (const block of contentBlocks(message)) {
+          if (block?.type !== "toolCall" || !block.id || !block.name) continue;
+          items.push({
+            type: "function_call",
+            call_id: String(block.id),
+            name: String(block.name),
+            arguments: safeJsonStringify(block.arguments ?? {}),
+          });
+        }
+        break;
+      }
+      case "toolResult":
+        if (message.toolCallId) {
+          items.push({
+            type: "function_call_output",
+            call_id: String(message.toolCallId),
+            output: textFromToolResult(message),
+          });
+        }
+        break;
+    }
+  }
+  return items;
+}
+
 function fingerprint(text) {
   let hash = 5381;
   for (let i = 0; i < text.length; i += 1) {
@@ -1059,7 +1329,7 @@ function toInt(value) {
  * full input a turn sent is ``input + cacheRead + cacheWrite``.
  *
  * @returns {{input:number,output:number,cacheRead:number,cacheWrite:number,
- *   total:number,model:(string|null),provider:(string|null)}|null} the per-message counts, or
+ *   total:number,cost:(number|null),model:(string|null),provider:(string|null)}|null} the per-message counts, or
  *   ``null`` when ``message`` is not an assistant message carrying usage.
  */
 function extractPiUsage(message) {
@@ -1085,9 +1355,17 @@ function extractPiUsage(message) {
     cacheRead,
     cacheWrite,
     total: toInt(usage.totalTokens),
+    // Pi also uses zero when its model has no price; let the server price that.
+    cost: validCost(usage.cost?.total) > 0 ? usage.cost.total : null,
     model,
     provider,
   };
+}
+
+function validCost(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
 }
 
 function headers(config) {
@@ -1098,15 +1376,26 @@ function headers(config) {
   };
 }
 
-const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
-const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
-const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 5;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 1_000;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 8_000;
+const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 30_000;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
 const _PREVIEW_POST_TIMEOUT_MS = 1_000;
 const _PREVIEW_FLUSH_TIMEOUT_MS = 300;
 const _PREVIEW_MAX_QUEUED_EVENTS = 32;
 const _PREVIEW_MAX_QUEUED_CHARS = 32_768;
 const _PREVIEW_MAX_DELTA_CHARS = 8_192;
+
+function settledWithinBudget(settled) {
+  let timeout;
+  return Promise.race([
+    settled.then(() => true),
+    new Promise(resolve => {
+      timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
+    }),
+  ]).finally(() => clearTimeout(timeout));
+}
 
 function boundedSourceId(sourceId) {
   const value = typeof sourceId === "string" ? sourceId.trim() : "";
@@ -1153,9 +1442,9 @@ async function postEventChecked(config, body, signal) {
   return response;
 }
 
-async function postEvent(config, body) {
+async function postEvent(config, body, signal) {
   try {
-    await postEventChecked(config, body);
+    await postEventChecked(config, body, signal);
   } catch (_err) {
     // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
@@ -1176,22 +1465,33 @@ function assistantItemPostTimeoutMs(config) {
     : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
 }
 
-// Final assistant messages and errors survive transient transport failures.
-async function postConversationItem(config, data, sourceId) {
-  const body = {
-    type: "external_conversation_item",
-    data: { ...data, source_id: boundedSourceId(sourceId) },
-  };
+// History and completion delivery share bounded retries.
+async function postEventWithRetry(config, body, signal, readReceipt = false) {
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
+  const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
   for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(),
-      assistantItemPostTimeoutMs(config),
+      Math.min(assistantItemPostTimeoutMs(config), remaining),
     );
     try {
-      return await postEventChecked(config, body, controller.signal);
+      const response = await postEventChecked(
+        config,
+        body,
+        signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+      );
+      if (!readReceipt) return response;
+      try {
+        // Receipt reads share the POST timeout; an accepted write is never retried.
+        return await response?.json?.();
+      } catch (_err) {
+        return;
+      }
     } catch (err) {
       lastError = err;
     } finally {
@@ -1199,13 +1499,120 @@ async function postConversationItem(config, data, sourceId) {
     }
     if (
       attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
-      !isRetryableAssistantError(lastError)
+      !isRetryableAssistantError(lastError) ||
+      Date.now() + backoff >= deadline
     )
       break;
-    await sleep(backoff);
+    signal?.throwIfAborted();
+    await sleep(backoff, signal);
     backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
   }
-  throw lastError || new Error("assistant conversation item POST failed");
+  throw lastError || new Error(`${body.type} POST failed`);
+}
+
+// Bound retained payloads as well as item count while the server is unavailable.
+const _HISTORY_QUEUE_MAX_ITEMS = 256;
+const _HISTORY_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const _HISTORY_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+function createHistoryQueue(config) {
+  const pending = new Map();
+  const controller = new AbortController();
+  let queuedBytes = 0;
+  let worker = null;
+  let closed = false;
+  let lastItemId = null;
+
+  async function deliver(item) {
+    if (item.accepted) return;
+    if (item.data.item_type === "compaction") {
+      item.data.item_data.last_item_id ||= lastItemId || `compact_boundary_${config.sessionId}`;
+    }
+    const receipt = await postEventWithRetry(config, {
+      type: "external_conversation_item",
+      data: { ...item.data, source_id: boundedSourceId(item.sourceId) },
+    }, controller.signal, true);
+    lastItemId = typeof receipt?.item_id === "string" ? receipt.item_id : null;
+    item.accepted = true;
+    item.onAccepted?.();
+  }
+
+  async function drain() {
+    for (const [sourceId, item] of pending) {
+      if (controller.signal.aborted) break;
+      try {
+        // A result cannot overtake a call whose earlier delivery exhausted retries.
+        if (item.dependency) await deliver(item.dependency);
+        await deliver(item);
+      } catch (error) {
+        console.error(`[pi-native] Failed to persist ${item.data.item_type} (${sourceId}):`, error);
+        try {
+          item.onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+      } finally {
+        pending.delete(sourceId);
+        queuedBytes -= item.bytes;
+        item.settle();
+      }
+    }
+    if (pending.size) {
+      console.error(`[pi-native] Discarding ${pending.size} history items at shutdown`);
+      pending.clear();
+      queuedBytes = 0;
+    }
+  }
+
+  function start() {
+    worker = drain().finally(() => {
+      worker = null;
+      if (pending.size) start();
+    });
+  }
+
+  return {
+    enqueue(data, sourceId, { onAccepted, dependency, onFailure, previous } = {}) {
+      const existing = pending.get(sourceId);
+      if (existing) return existing;
+      const bytes = previous?.bytes ??
+        (Buffer.byteLength(JSON.stringify(data)) + (dependency?.bytes || 0));
+      if (
+        closed || pending.size >= _HISTORY_QUEUE_MAX_ITEMS ||
+        queuedBytes + bytes > _HISTORY_QUEUE_MAX_BYTES
+      ) {
+        const error = new Error(`History queue ${closed ? "closed" : "full"}: ${data.item_type}`);
+        console.error("[pi-native]", error);
+        try {
+          onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+        return null;
+      }
+      const item = previous || {
+        data, sourceId, onAccepted, dependency, onFailure, bytes, accepted: false,
+      };
+      item.settled = new Promise(resolve => { item.settle = resolve; });
+      pending.set(sourceId, item);
+      queuedBytes += bytes;
+      if (!worker) start();
+      return item;
+    },
+    async flush() {
+      // Later prompts must not extend the ending turn's delivery barrier.
+      return settledWithinBudget(Promise.all([...pending.values()].map(item => item.settled)));
+    },
+    async close() {
+      closed = true;
+      const timeout = setTimeout(() => controller.abort(), _HISTORY_SHUTDOWN_TIMEOUT_MS);
+      try {
+        while (worker) await worker;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+  };
 }
 
 function assistantMessageSourceId(message, responseId, text) {
@@ -1431,6 +1838,28 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
 }
 
+/**
+ * Route native TUI input before Pi binds its model; composer input is routed upstream.
+ * Errors and timeouts return null, preserving the current model.
+ * @returns {Promise<{action: string, model?: string, terminal?: boolean} | null>}
+ */
+async function routeTurn(config, prompt, model) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function")
+    return null;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/route-turn`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: headers(config),
+      body: JSON.stringify({ harness: "pi-native", prompt, model: model || null }),
+      signal: AbortSignal.timeout(_ROUTE_TURN_TIMEOUT_MS),
+    });
+    return resp.ok ? await resp.json() : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 async function postModelChangeError(config, message) {
   await postEvent(config, {
     type: "external_conversation_item",
@@ -1455,37 +1884,36 @@ function modelReference(model) {
 }
 
 /**
- * Report Pi's live model catalog to Omnigent for the Web UI model picker.
- *
- * Sourced from Pi's model registry — the models Pi actually loaded for THIS
- * session, whatever their origin: an Omnigent-configured provider's generated
- * models.json, or Pi's own ``/login`` / ``~/.pi`` config. Posting the live
- * registry (rather than the server reading a launch-written file) means the
- * picker populates in every auth path, including ``/login`` where no Omnigent
- * models.json exists.
- *
- * Prefers ``getAvailable()`` — only models with configured auth — over
- * ``getAll()`` (Pi's entire built-in catalog spanning every vendor, most with
- * no credentials). This scopes the picker to models the user can actually
- * switch to, and naturally to whichever provider(s) they are logged into.
- * Falls back to ``getAll()`` only when ``getAvailable()`` is unavailable
- * (older Pi). Best-effort and fire-and-forget: an empty or unavailable
- * registry posts nothing, leaving the picker hidden.
+ * Publish Pi's scoped models plus the current model to the web picker.
+ * Without a scope, use authenticated models; older registries fall back to getAll.
+ * An empty or unavailable registry posts nothing.
  */
 async function postModelOptions(config, ctx) {
-  const registry = ctx ? ctx.modelRegistry : undefined;
-  if (!registry) return;
-  let models;
-  try {
-    if (typeof registry.getAvailable === "function") {
-      models = registry.getAvailable();
-    } else if (typeof registry.getAll === "function") {
-      models = registry.getAll();
-    } else {
+  let models = [];
+  const scoped = ctx && Array.isArray(ctx.scopedModels) ? ctx.scopedModels : [];
+  for (const entry of scoped) {
+    if (entry && entry.model) models.push(entry.model);
+  }
+  if (models.length > 0) {
+    const current = ctx ? ctx.model : undefined;
+    const currentId = modelReference(current);
+    if (currentId && !models.some((model) => modelReference(model) === currentId)) {
+      models = [current, ...models];
+    }
+  } else {
+    const registry = ctx ? ctx.modelRegistry : undefined;
+    if (!registry) return;
+    try {
+      if (typeof registry.getAvailable === "function") {
+        models = registry.getAvailable();
+      } else if (typeof registry.getAll === "function") {
+        models = registry.getAll();
+      } else {
+        return;
+      }
+    } catch (_err) {
       return;
     }
-  } catch (_err) {
-    return;
   }
   if (!Array.isArray(models) || models.length === 0) return;
   const options = [];
@@ -1706,12 +2134,56 @@ function startInboxPoller(
 module.exports = function (pi) {
   process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
+  const history = createHistoryQueue(config);
+  pi.on("session_shutdown", () => history.close());
+  pi.on("session_compact", async (_event, ctx) => {
+    const manager = ctx?.sessionManager;
+    if (typeof manager?.buildSessionProjection !== "function") return;
+    const notifyFailure = () =>
+      ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error");
+    let checkpoint;
+    let compactedMessages;
+    let sourceId;
+    try {
+      const projection = manager.buildSessionProjection();
+      // Pi 1.3's event can name an older entry when summaries repeat.
+      checkpoint = projection?.entries?.[0]?.sourceEntry;
+      if (checkpoint?.type !== "compaction" || typeof checkpoint.summary !== "string") {
+        throw new Error("Pi's projection does not start with a compaction checkpoint");
+      }
+      sourceId = `pi:compaction:${manager.getSessionId()}:${checkpoint.id}`;
+      compactedMessages = compactionSnapshotItems(projection.messages ?? []);
+    } catch (error) {
+      console.error("[pi-native] Compaction snapshot failed:", error);
+      notifyFailure();
+      return;
+    }
+    const item = history.enqueue(
+      {
+        item_type: "compaction",
+        item_data: {
+          summary: checkpoint.summary,
+          last_item_id: "",
+          model: ctx.model?.id || null,
+          token_count: Math.ceil(checkpoint.summary.length / 4),
+          window_id: checkpoint.id,
+          compacted_messages: compactedMessages,
+        },
+      },
+      sourceId,
+      { onFailure: notifyFailure },
+    );
+    // Pi awaits this handler before finishing compaction.
+    if (item) await settledWithinBudget(item.settled);
+  });
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
+  let turnResult = null;
+  let turnOutcomeController = new AbortController();
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
@@ -1747,6 +2219,10 @@ module.exports = function (pi) {
     });
     return thinkingLevelReport;
   }
+  // Promise of the last inbox model_change, awaited by ``input``.
+  let pendingModelChange = null;
+  // Set once route-turn gives a final answer for this session (see ``input``).
+  let turnRoutingDone = false;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -1754,6 +2230,7 @@ module.exports = function (pi) {
   const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
+  let toolCallBytes = 0;
   const pendingInterruptMs = 30_000;
   // Live streaming state for assistant text deltas. Pi emits
   // message_update events carrying an assistantMessageEvent of type
@@ -2090,22 +2567,14 @@ module.exports = function (pi) {
     if (changed) await publishTaskList();
   }
 
-  // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
-  // assistant message per LLM call); session billing is their SUM — each call
-  // is billed for the full context it re-sent, so summing per-message inputs is
-  // the correct cumulative input. The server applies vendor pricing to these
-  // cumulative totals and republishes a ``session.usage`` event (the SAME
-  // contract claude-native / codex-native / cursor-native use), so the web
-  // Session-cost badge + per-model token breakdown light up with no
-  // server/frontend changes. Dedup by message fingerprint so a re-emitted
-  // ``message_end`` / ``turn_end`` / ``agent_end`` carrying the same assistant
-  // message never double-counts. ``usageModel`` tracks the latest message's
-  // model (mirrors a mid-session model switch). ``lastPostedUsageKey`` dedups
-  // the POST itself so a flush with no new tokens is skipped.
+  // Sum each assistant message once; restored totals cover pre-relaunch messages.
+  // The POST key skips unchanged totals.
   const countedUsageMessages = new Set();
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
   let cumulativeCacheReadTokens = 0;
+  let cumulativeCostUsd = 0;
+  let completeCost = true;
   let usageModel = null;
   let lastPostedUsageKey = "";
   let lastCacheUsage = null;
@@ -2154,6 +2623,8 @@ module.exports = function (pi) {
     cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
+    if (usage.cost === null) completeCost = false;
+    else cumulativeCostUsd += usage.cost;
     if (usage.model) usageModel = usage.model;
     lastCacheUsage = {
       observedAt: Math.floor(Date.now() / 1000),
@@ -2165,16 +2636,22 @@ module.exports = function (pi) {
     return true;
   }
 
+  function usagePostKey() {
+    return `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${completeCost ? cumulativeCostUsd : "unknown"}-${usageModel || ""}`;
+  }
+
   // POST the cumulative session usage so the server prices it and publishes a
   // ``session.usage`` event. Cumulative (SET) semantics — the server overwrites
   // its stored totals each flush. Deduped so a flush with no advance is a
   // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
   async function postSessionUsage(ctx) {
     const data = {
+      cost_complete: completeCost,
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
     };
+    if (completeCost) data.cumulative_cost_usd = cumulativeCostUsd;
     if (usageModel) data.model = usageModel;
     if (lastCacheUsage) {
       const currentModel = ctx && ctx.model;
@@ -2209,6 +2686,7 @@ module.exports = function (pi) {
     const postKey = JSON.stringify(data);
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
+    persistCumulativeUsage();
     await postEvent(config, { type: "external_session_usage", data });
   }
 
@@ -2235,6 +2713,81 @@ module.exports = function (pi) {
       };
       await postSessionUsage(ctx);
       return;
+    }
+  }
+
+  // Restore cumulative totals before recording new usage after a relaunch.
+  function usageStatePath() {
+    if (!config || !config.bridgeDir) return null;
+    return path.join(config.bridgeDir, "cumulative_usage.json");
+  }
+
+  function persistCumulativeUsage() {
+    const statePath = usageStatePath();
+    if (!statePath) return;
+    // Per-pid temp name: an exiting Pi process and its relaunched successor
+    // can flush concurrently, and a shared temp path could persist a torn file.
+    const tmp = `${statePath}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({
+          cumulative_input_tokens: cumulativeInputTokens,
+          cumulative_output_tokens: cumulativeOutputTokens,
+          cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+          cost_complete: completeCost,
+          ...(completeCost ? { cumulative_cost_usd: cumulativeCostUsd } : {}),
+          model: usageModel,
+        }),
+      );
+      fs.renameSync(tmp, statePath);
+    } catch (_err) {
+      // Remove temporary state after a failed best-effort checkpoint.
+      try {
+        fs.unlinkSync(tmp);
+      } catch (_cleanupErr) {}
+    }
+  }
+
+  function raiseUsageTotals(saved) {
+    if (!saved || typeof saved !== "object") return;
+    const input = toInt(saved.cumulative_input_tokens);
+    const output = toInt(saved.cumulative_output_tokens);
+    const cacheRead = toInt(saved.cumulative_cache_read_input_tokens);
+    const cost = validCost(saved.cumulative_cost_usd);
+    const coversCurrent = input >= cumulativeInputTokens && output >= cumulativeOutputTokens;
+    if (coversCurrent && (input || output)) {
+      completeCost = cost !== null && saved.cost_complete !== false;
+    } else if (input > cumulativeInputTokens || output > cumulativeOutputTokens) {
+      completeCost = false;
+    }
+    if (completeCost && cost !== null) cumulativeCostUsd = Math.max(cumulativeCostUsd, cost);
+    // Only raise the counters; a stale file must never pull a live total down.
+    if (input > cumulativeInputTokens) cumulativeInputTokens = input;
+    if (output > cumulativeOutputTokens) cumulativeOutputTokens = output;
+    if (cacheRead > cumulativeCacheReadTokens) cumulativeCacheReadTokens = cacheRead;
+    if (!usageModel && typeof saved.model === "string" && saved.model)
+      usageModel = saved.model;
+  }
+
+  function restoreCumulativeUsage() {
+    const baseline = config && config.usageBaseline;
+    raiseUsageTotals(baseline);
+    const statePath = usageStatePath();
+    if (statePath) {
+      try {
+        raiseUsageTotals(JSON.parse(fs.readFileSync(statePath, "utf8")));
+      } catch (_err) {}
+    }
+    // The server already holds this baseline. Only reassert a newer local total.
+    if (
+      baseline &&
+      cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
+      cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens) &&
+      (!completeCost || cumulativeCostUsd === (validCost(baseline.cumulative_cost_usd) ?? 0))
+    ) {
+      lastPostedUsageKey = usagePostKey();
     }
   }
 
@@ -2305,12 +2858,10 @@ module.exports = function (pi) {
     const name = String(toolCall.name || toolCall.toolName || "");
     if (!callId || !name) return;
     const key = `${responseId}:${callId}`;
-    toolCallsById.set(callId, { key, responseId, name });
     if (postedToolCalls.has(key)) return;
-    postedToolCalls.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    const known = toolCallsById.get(callId);
+    const item = history.enqueue(
+      {
         response_id: responseId,
         item_type: "function_call",
         item_data: {
@@ -2322,7 +2873,23 @@ module.exports = function (pi) {
           call_id: callId,
         },
       },
-    });
+      `pi:tool-call:${key}`,
+      {
+        onAccepted: () => postedToolCalls.add(key),
+        previous: known?.key === key ? known.item : undefined,
+      },
+    );
+    toolCallBytes -= toolCallsById.get(callId)?.item?.bytes || 0;
+    toolCallsById.delete(callId);
+    toolCallsById.set(callId, { key, responseId, name, item });
+    toolCallBytes += item?.bytes || 0;
+    while (
+      toolCallsById.size > _HISTORY_QUEUE_MAX_ITEMS || toolCallBytes > _HISTORY_QUEUE_MAX_BYTES
+    ) {
+      const oldest = toolCallsById.keys().next().value;
+      toolCallBytes -= toolCallsById.get(oldest)?.item?.bytes || 0;
+      toolCallsById.delete(oldest);
+    }
   }
 
   async function postToolResult(event, responseId) {
@@ -2332,10 +2899,14 @@ module.exports = function (pi) {
     const known = toolCallsById.get(callId);
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
-    postedToolResults.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    const dependency = known?.item ||
+      (postedToolCalls.has(key) ? { accepted: true, bytes: 0 } : null);
+    if (!dependency) {
+      console.error(`[pi-native] Withholding result without a queued call: ${callId}`);
+      return;
+    }
+    history.enqueue(
+      {
         response_id: known && known.responseId ? known.responseId : responseId,
         item_type: "function_call_output",
         item_data: {
@@ -2343,7 +2914,9 @@ module.exports = function (pi) {
           output: textFromToolResult(event),
         },
       },
-    });
+      `pi:tool-result:${key}`,
+      { onAccepted: () => postedToolResults.add(key), dependency },
+    );
   }
 
   async function postCompletedReasoning(text, responseId, keyHint, streamed) {
@@ -2351,16 +2924,14 @@ module.exports = function (pi) {
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
-    postedReasoning.add(key);
-    postedReasoning.add(textKey);
-    if (!streamed) {
+    if (!streamed && !postedReasoning.has(`delta:${textKey}`)) {
+      postedReasoning.add(`delta:${textKey}`);
       queuePreview("external_output_reasoning_delta",
         { delta: text, started: true }, null);
     }
     await flushPreviews();
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    history.enqueue(
+      {
         response_id: responseId,
         item_type: "reasoning",
         item_data: {
@@ -2369,7 +2940,12 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
-    });
+      `pi:reasoning:${textKey}`,
+      { onAccepted: () => {
+        postedReasoning.add(key);
+        postedReasoning.add(textKey);
+      } },
+    );
   }
 
   function reasoningBlockKey(responseId, contentIndex) {
@@ -2536,6 +3112,8 @@ module.exports = function (pi) {
     }, 15000);
     cacheWarmPoller.unref?.();
     await observeCacheWarmUsage(ctx);
+    restoreCumulativeUsage();
+    wrapExtensionUi(ctx, config);
     registerTaskToolIfMissing();
     const permissionState = readPermissionState(config);
     if (permissionState && typeof pi.getActiveTools === "function") {
@@ -2566,13 +3144,17 @@ module.exports = function (pi) {
           if (!agentRunning) {
             await postEvent(config, {
               type: "external_session_status",
-              data: { status: "idle", response_id: responseId },
+              data: { status: "idle", turn_completed: false, response_id: responseId },
             });
           }
           compacting = false;
         }
       },
-      (model) => applyModelChange(pi, config, latestContext, model),
+      (model) => {
+        // Await the composer's async model switch before input binds the turn's model.
+        pendingModelChange = applyModelChange(pi, config, latestContext, model);
+        return pendingModelChange;
+      },
       (level) => {
         settingThinkingLevel = true;
         try {
@@ -2647,6 +3229,7 @@ module.exports = function (pi) {
       });
     }
     await reportThinkingLevel();
+    await postSessionUsage(ctx);
     // Readiness is not turn completion: a queued prompt may already be running.
     // Only agent_end publishes idle so startup cannot complete a child task.
   });
@@ -2745,7 +3328,10 @@ module.exports = function (pi) {
     clearPendingInterrupt();
     await flushPreviews();
     previewDisabled = false;
+    turnOutcomeController.abort();
+    turnOutcomeController = new AbortController();
     agentRunning = true;
+    turnResult = null;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
     turnOrdinal = 0;
@@ -2755,6 +3341,7 @@ module.exports = function (pi) {
     postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
+    toolCallBytes = 0;
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
@@ -2771,6 +3358,12 @@ module.exports = function (pi) {
 
   pi.on("agent_end", async (event, ctx) => {
     rememberContext(ctx);
+    const cancelled = ctx?.signal?.aborted || hasPendingInterrupt();
+    const outcomeSignal = turnOutcomeController.signal;
+    const endResponseId =
+      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    const result = turnResult;
+    const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
     clearPendingInterrupt();
     agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
@@ -2787,17 +3380,43 @@ module.exports = function (pi) {
     }
     await postSessionUsage(ctx);
     await flushPreviews();
+    if (outcomeSignal.aborted) return;
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
-    const endResponseId =
-      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
-    // Manual compact aborts the turn first; its own completion publishes idle.
+    // Compaction interrupts a loop without completing its delegated task.
     if (compacting) return;
+    const outcome = cancelled ? "cancelled" : result?.outcome ?? "failed";
+    // Readiness is not a completed result. Older servers may ignore this observation.
     await postEvent(config, {
-      type: "external_session_status",
-      data: { status: "idle", response_id: endResponseId },
-    });
+      type: "subagent.status",
+      data: { idle: true, response_id: endResponseId },
+    }, AbortSignal.timeout(assistantItemPostTimeoutMs(config)));
+    const drained = await drainedHistory;
+    if (outcomeSignal.aborted) return;
+    // Pi continues queued steering after agent_end; the parent's dispatch is still active.
+    if (outcome === "completed" && ctx?.hasPendingMessages?.()) return;
+    const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
+    const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
+    const output = deliveryFailed
+      ? "Omnigent could not save the Pi turn output; see host logs."
+      : (result?.output ?? (cancelled ? "" : "Pi turn ended without a final response."));
+    try {
+      await postEventWithRetry(config, {
+        type: "external_session_status",
+        data: {
+          status, response_id: endResponseId,
+          turn_completed: !deliveryFailed && outcome === "completed",
+          turn_outcome: deliveryFailed ? "failed" : outcome,
+          output,
+          ...(status === "failed" ? { failure_detail: output } : {}),
+        },
+      }, outcomeSignal);
+    } catch (error) {
+      if (outcomeSignal.aborted) return;
+      console.error("[pi-native] Failed to deliver turn outcome:", error);
+      ctx?.ui?.notify?.("Omnigent could not deliver the Pi turn outcome; see host logs.", "error");
+    }
   });
 
   pi.on("turn_start", async (event, ctx) => {
@@ -2933,6 +3552,24 @@ module.exports = function (pi) {
   pi.on("input", async (event, ctx) => {
     rememberContext(ctx);
     setOmnigentStatus(config, ctx, "running");
+    const text = event && typeof event.text === "string" ? event.text : "";
+    if (!text) return;
+    if (pendingModelChange) {
+      const pending = pendingModelChange;
+      pendingModelChange = null;
+      await pending.catch(() => {});
+    }
+    // Route TUI input once. Stop after a final decision or failure so later
+    // prompts do not repeatedly wait for an unreachable server.
+    if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
+      const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
+      if (!decision || decision.terminal || decision.action === "route") {
+        turnRoutingDone = true;
+      }
+      if (decision && decision.action === "route" && decision.model) {
+        await applyModelChange(pi, config, ctx, decision.model);
+      }
+    }
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -2995,8 +3632,7 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postConversationItem(
-        config,
+      const item = history.enqueue(
         {
           response_id: responseId,
           item_type: "error",
@@ -3008,15 +3644,22 @@ module.exports = function (pi) {
         },
         assistantMessageSourceId(message, responseId, errorMessage),
       );
+      turnResult = { item, outcome: "failed", output: `Pi model error: ${errorMessage}` };
       return;
     }
     const text = textFromMessage(message);
-    if (!text) return;
+    const outcome = stopReason === "aborted" ? "cancelled"
+      : stopReason === "toolUse" || stopReason === "error" ? "failed" : "completed";
+    if (!text) {
+      turnResult = { outcome, output: "", item: null };
+      return;
+    }
     const sourceId = assistantMessageSourceId(message, responseId, text);
     if (postedAssistantMessages.has(sourceId)) return;
-    // The durable identity also suppresses a timed-out preview applied late.
-    await postConversationItem(
-      config,
+    // The authoritative assistant item. The web UI retires + replaces the
+    // oldest in-flight live preview in place with this (FIFO; one preview
+    // per message), so the streamed partials never duplicate the final.
+    const item = history.enqueue(
       {
         response_id: responseId,
         message_id: messageId,
@@ -3028,10 +3671,14 @@ module.exports = function (pi) {
         },
       },
       sourceId,
+      {
+        onAccepted: () => postedAssistantMessages.add(sourceId),
+        onFailure: () => ctx?.ui?.notify?.(
+          "Omnigent could not save the assistant response; see host logs.", "error",
+        ),
+      },
     );
-    // Retry a failed callback on its next delivery; only suppress duplicates
-    // after the authoritative POST has been accepted.
-    postedAssistantMessages.add(sourceId);
+    turnResult = { item, outcome, output: item ? text : "History delivery rejected" };
   });
 
   pi.on("turn_end", async (event, ctx) => {

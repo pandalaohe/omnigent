@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
+from datetime import UTC
 from typing import Any
 
 import cachetools
@@ -142,14 +144,22 @@ _SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.LRUCache(maxsize=4096)
 )
 
-# TTL cache of enabled specs and whether instruction approval is configured,
-# keyed by workspace id, for DB-stored default
+_POLICY_SPECS_CACHE_TTL_S = 30.0
+
+# Cached policy lists are stored with the ``time.monotonic()`` of the store read,
+# so a no-policy answer can say how old it is (see policy_specs_cache_age).
+_CachedPolicySpecs = tuple[list[PolicySpec], float]
+
+_DefaultPolicyConfiguration = tuple[list[PolicySpec], bool, bool]
+_CachedDefaultPolicyConfiguration = tuple[_DefaultPolicyConfiguration, float]
+
+# TTL cache of enabled specs and explicit approval configuration for DB-stored default
 # policies. Default policies are admin-managed and change infrequently, so
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
 # evaluation while still propagating changes within half a minute.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
-_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, tuple[list[PolicySpec], bool, bool]] = (
-    cachetools.TTLCache(maxsize=256, ttl=30)
+_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, _CachedDefaultPolicyConfiguration] = (
+    cachetools.TTLCache(maxsize=256, ttl=_POLICY_SPECS_CACHE_TTL_S)
 )
 
 # TTL+LRU cache of ``conversation_id -> list[PolicySpec]`` for session-scoped
@@ -160,8 +170,8 @@ _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, tuple[list[PolicySpec], bo
 # cannot evict another replica's in-process cache — without it, a deleted session
 # policy would remain enforced on other replicas indefinitely (no natural expiry).
 # TTLCache subsumes LRU eviction, bounding memory the same way.
-_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = WorkspaceScopedCache(
-    lambda: cachetools.TTLCache(maxsize=4096, ttl=30)
+_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, _CachedPolicySpecs] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=_POLICY_SPECS_CACHE_TTL_S)
 )
 # TTLCache reads can expire entries; protect them as well as writes/evictions.
 _POLICY_SPECS_CACHE_LOCK = threading.Lock()
@@ -181,7 +191,7 @@ def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
     :returns: The period string ("day", "week", "month", "quarter", "year")
         for the oldest period, or None if no cost-budget policies are present.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from omnigent.db.utils import now_epoch
 
@@ -206,25 +216,25 @@ def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
 
     # Calculate start date for each period and find the oldest
     now = now_epoch()
-    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    dt = datetime.fromtimestamp(now, tz=UTC)
 
     def period_start_date(period: str) -> datetime:
         if period == "day":
-            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=UTC)
         if period == "week":
             # ISO week starts on Monday
             start = dt.date() - timedelta(days=dt.weekday())
-            return datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
+            return datetime.combine(start, datetime.min.time(), tzinfo=UTC)
         if period == "month":
-            return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+            return datetime(dt.year, dt.month, 1, tzinfo=UTC)
         if period == "quarter":
             quarter = (dt.month - 1) // 3 + 1
             start_month = (quarter - 1) * 3 + 1
-            return datetime(dt.year, start_month, 1, tzinfo=timezone.utc)
+            return datetime(dt.year, start_month, 1, tzinfo=UTC)
         if period == "year":
-            return datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+            return datetime(dt.year, 1, 1, tzinfo=UTC)
         # Unknown period, treat as day
-        return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+        return datetime.combine(dt.date(), datetime.min.time(), tzinfo=UTC)
 
     # Find the period with the oldest start date
     return min(periods, key=period_start_date)
@@ -323,9 +333,9 @@ def _utc_day(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC day string, e.g. ``"2026-08-21"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%d")
 
 
 def _utc_week(epoch: int) -> str:
@@ -334,9 +344,9 @@ def _utc_week(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC ISO week string, e.g. ``"2026-W34"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    dt = datetime.fromtimestamp(epoch, tz=UTC)
     year, week, _ = dt.isocalendar()
     return f"{year}-W{week:02d}"
 
@@ -347,9 +357,9 @@ def _utc_month(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC month string, e.g. ``"2026-08"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m")
 
 
 def _utc_quarter(epoch: int) -> str:
@@ -358,9 +368,9 @@ def _utc_quarter(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC quarter string, e.g. ``"2026-Q3"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    dt = datetime.fromtimestamp(epoch, tz=UTC)
     quarter = (dt.month - 1) // 3 + 1
     return f"{dt.year}-Q{quarter}"
 
@@ -371,9 +381,9 @@ def _utc_year(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC year string, e.g. ``"2026"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y")
 
 
 def _load_user_period_cost(
@@ -399,7 +409,7 @@ def _load_user_period_cost(
     :returns: List of daily cost dicts, one per day in the period. Empty
         in single-user mode.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from omnigent.db.utils import now_epoch
 
@@ -409,7 +419,7 @@ def _load_user_period_cost(
 
     # Calculate date range for the period
     now = now_epoch()
-    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    dt = datetime.fromtimestamp(now, tz=UTC)
 
     if period == "day":
         start = dt.date()
@@ -1822,7 +1832,8 @@ def _load_default_policy_configuration(
         cached = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
         generation = _POLICY_SPECS_CACHE_GENERATION
     if cached is not None:
-        return cached
+        return cached[0]
+    loaded_at = time.monotonic()
     specs: list[PolicySpec] = []
     instruction_approval_configured = False
     project_settings_approval_configured = False
@@ -1853,9 +1864,8 @@ def _load_default_policy_configuration(
         # An invalidation during the DB read must also prevent a stale refill.
         if generation == _POLICY_SPECS_CACHE_GENERATION:
             _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = (
-                specs,
-                instruction_approval_configured,
-                project_settings_approval_configured,
+                (specs, instruction_approval_configured, project_settings_approval_configured),
+                loaded_at,
             )
     return specs, instruction_approval_configured, project_settings_approval_configured
 
@@ -1931,10 +1941,11 @@ def _load_session_policy_specs(
     if policy_store is None:
         return []
     with _POLICY_SPECS_CACHE_LOCK:
-        cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
+        cached = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
         generation = _POLICY_SPECS_CACHE_GENERATION
     if cached is not None:
-        return cached
+        return cached[0]
+    loaded_at = time.monotonic()
     stored = policy_store.list_for_session(conversation_id)
     specs: list[PolicySpec] = []
     for policy in stored:
@@ -1943,8 +1954,35 @@ def _load_session_policy_specs(
         specs.append(_stored_policy_to_spec(policy))
     with _POLICY_SPECS_CACHE_LOCK:
         if generation == _POLICY_SPECS_CACHE_GENERATION:
-            _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
+            _SESSION_POLICY_SPECS_CACHE[conversation_id] = (specs, loaded_at)
     return specs
+
+
+def policy_specs_cache_age(conversation_id: str, policy_store: PolicyStore | None) -> float:
+    """
+    Return how old the store reads behind a session's cached policy lists are.
+
+    A no-policy answer from :func:`any_policies_apply` is only as fresh as the
+    older of the default and session lists it read, so anything that lets
+    callers reuse that answer must subtract this age. A list no longer cached
+    counts as a full cache TTL old.
+
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param policy_store: The policy store; ``None`` means there are no stored
+        policies to go stale.
+    :returns: Age in seconds, e.g. ``12.5``.
+    """
+    if policy_store is None:
+        return 0.0
+    from omnigent.db.db_models import current_workspace_id
+
+    now = time.monotonic()
+    with _POLICY_SPECS_CACHE_LOCK:
+        entries = (
+            _DEFAULT_POLICY_SPECS_CACHE.get(current_workspace_id()),
+            _SESSION_POLICY_SPECS_CACHE.get(conversation_id),
+        )
+    return max(_POLICY_SPECS_CACHE_TTL_S if entry is None else now - entry[1] for entry in entries)
 
 
 def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:

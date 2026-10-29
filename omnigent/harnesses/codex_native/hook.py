@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -124,6 +125,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         return 0
 
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.native import policy_allow_cache
+
+    # Read before the session identity: a session switch picks a new
+    # generation, so an answer for the previous session opens no window.
+    cache_generation = policy_allow_cache.generation(bridge_dir)
     state = read_bridge_state(bridge_dir)
     if state is None:
         return 0
@@ -176,6 +182,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)
 
+    requested_at = time.time()
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -206,6 +213,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         record_usage_admission(bridge_dir, eval_response["usage_admission"]["admission_id"])
         begin_admitted_turn(session_id, "codex-native", eval_response["usage_admission"])
         check_live_route(session_id, "codex-native", os.environ, codex_home=Path(state.codex_home))
+    # Through the relay the server evaluated the relay's session, which can
+    # trail a session switch.
+    if relay is None or relay[2] == session_id:
+        policy_allow_cache.record(bridge_dir, cache_generation, eval_response, requested_at)
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))
@@ -532,7 +543,7 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
 
     try:
         asyncio.run(asyncio.wait_for(_switch(), timeout=SETTINGS_UPDATE_TIMEOUT_S))
-    except Exception as exc:  # noqa: BLE001 - any failure means "leave the model alone"
+    except Exception as exc:  # noqa: BLE001
         return f"thread/settings/update failed: {exc}"
     if declined is not None:
         return declined
@@ -577,7 +588,7 @@ async def _list_codex_models(client: CodexAppServerClient) -> list[dict[str, obj
             cursor = result.get("nextCursor")
             if not isinstance(cursor, str) or not cursor:
                 break
-    except Exception as exc:  # noqa: BLE001 - an unreadable catalog means "do not switch"
+    except Exception as exc:  # noqa: BLE001
         print(
             f"omnigent codex route-turn hook: model/list failed: {exc}",
             file=sys.stderr,

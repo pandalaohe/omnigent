@@ -306,7 +306,7 @@ export function useAgentRegistry() {
   const items = useMemo(
     () =>
       buildRegistry(
-        catalog.data ?? [],
+        catalog.data?.agents ?? [],
         user.data ?? [],
         library.data ?? [],
         harnesses.data ?? {
@@ -326,7 +326,11 @@ export function useAgentRegistry() {
     harnesses.isError ||
     (user.isError && user.isEnabled) ||
     (library.isError && library.isEnabled);
-  const legacyProducts = buildLegacyProductRegistry(catalog.data ?? [], user.data ?? [], items);
+  const legacyProducts = buildLegacyProductRegistry(
+    catalog.data?.agents ?? [],
+    user.data ?? [],
+    items,
+  );
   const legacyLabels = Object.fromEntries(
     Object.entries(legacyProducts).map(([key, item]) => [key, item.label]),
   );

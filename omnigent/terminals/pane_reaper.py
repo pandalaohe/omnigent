@@ -39,9 +39,12 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 _logger = logging.getLogger(__name__)
 
@@ -67,6 +70,7 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
         "claude",
         "codex",
         "cursor",
+        "devin",
         "goose",
         "hermes",
         "kiro",
@@ -96,13 +100,16 @@ class PaneRef:
         ``terminal_resource_id("claude", "main")`` — used for pane-scoped close.
     :param terminal_name: Harness short-name, e.g. ``"claude"``.
     :param socket_path: tmux socket for the attached-client probe.
+    :param instance: The terminal the scan listed, so a reap leaves a pane that
+        replaced it in the meantime alone. ``None`` when the caller has none.
     """
 
     conversation_id: str
     terminal_id: str
     terminal_name: str
     socket_path: Path
-    instance: Any | None = None
+    instance: TerminalInstance | None = None
+    allow_busy_release: bool = False
 
 
 class NativePaneStillAlive(RuntimeError):
@@ -364,7 +371,7 @@ class NativePaneReaper:
         )
         self._managed_conversations.pop(conversation_id, None)
         try:
-            await self._reap(pane)
+            await self._reap(replace(pane, allow_busy_release=True))
         except NativePaneStillAlive as exc:
             self._record_pending(pane, exc.instance)
             if saved_expiry is not None:
@@ -499,7 +506,7 @@ class NativePaneReaper:
                 try:
                     await record.instance.kill_server()
                     probe = await record.instance.probe_alive()
-                except Exception:
+                except Exception:  # noqa: BLE001 — unproven death retains the pane
                     probe = None
                 if probe is not False:
                     if not record.warned:

@@ -21,6 +21,10 @@ from PIL import Image
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENTS,
+    FilesystemAttachmentPolicy,
+)
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
 )
@@ -471,6 +475,38 @@ def test_upload_large_image_is_compressed_under_budget(
     # Opaque image re-encodes (WebP preferred, JPEG fallback), so the stored
     # name is realigned to match the new type.
     assert body["name"] in ("screenshot.webp", "screenshot.jpg")
+
+
+def test_image_delivered_as_a_file_keeps_its_bytes(
+    upload_client: tuple[TestClient, str], db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listed image type skips inline compression, so the agent gets the original file."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import IMAGE_MODEL_BUDGET_BYTES
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_policy",
+        lambda: FilesystemAttachmentPolicy(frozenset({".png"})),
+    )
+    client, session_id = upload_client
+    side = 1600
+    buffer = BytesIO()
+    Image.frombytes("RGB", (side, side), os.urandom(side * side * 3)).save(buffer, format="PNG")
+    payload = buffer.getvalue()
+    assert len(payload) > IMAGE_MODEL_BUDGET_BYTES
+
+    resp = _upload(client, session_id, "screenshot.png", payload, "image/png")
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["name"] == "screenshot.png"
+    assert body["metadata"]["bytes"] == len(payload)
+    stored = SqlAlchemyFileStore(db_uri).get(body["id"])
+    assert stored is not None
+    assert stored.source_metadata == {"delivery": "filesystem"}
 
 
 def test_upload_text_just_under_limit_succeeds(upload_client: tuple[TestClient, str]) -> None:
@@ -1291,3 +1327,156 @@ def test_quota_ignores_only_purged_rows(
         )
         # The purged row freed the whole session budget for the new upload.
         assert cap == 1_000_000
+
+
+_GZ_BYTES = "data:application/gzip;base64,H4s="
+
+
+@pytest.fixture
+def all_types_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configure the server to deliver every file that can't be inlined as a file."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_policy",
+        lambda: FilesystemAttachmentPolicy(all_types=True),
+    )
+
+
+@pytest.mark.parametrize(
+    "filename,content_type,delivery",
+    [
+        ("trace.gz", "application/gzip", "filesystem"),
+        ("site.har", "application/octet-stream", "filesystem"),
+        ("bundle.zip", "text/plain", "filesystem"),
+        ("notes.txt", "text/plain", None),
+    ],
+)
+@pytest.mark.usefixtures("all_types_policy")
+def test_all_types_policy_records_filesystem_delivery(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    filename: str,
+    content_type: str,
+    delivery: str | None,
+) -> None:
+    """Files that can't be inlined are stored for file delivery; inline types are unchanged."""
+    client, session_id = upload_client
+    response = _upload(client, session_id, filename, content_type=content_type)
+    assert response.status_code == 201, response.text
+    stored = SqlAlchemyFileStore(db_uri).get(response.json()["id"])
+    assert stored is not None
+    assert (stored.source_metadata or {}).get("delivery") == delivery
+
+
+@pytest.mark.parametrize("filename,status", [("trace.gz", 409), ("bundle.zip", 409)])
+@pytest.mark.usefixtures("all_types_policy")
+def test_host_without_path_support_refuses_file_delivery(
+    upload_client: tuple[TestClient, str], filename: str, status: int
+) -> None:
+    """Every by-path upload requires a host supporting the streaming protocol."""
+    client, session_id = upload_client
+    host = client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4")
+    host.hello.capabilities = [CAP_FILESYSTEM_ATTACHMENTS]
+    response = _upload(client, session_id, filename)
+    assert response.status_code == status, response.text
+    if status == 409:
+        assert "cannot deliver" in response.text
+
+
+@pytest.mark.parametrize("content_type", ["application/zip", "text/plain"])
+def test_empty_policy_refuses_default_filesystem_types(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    content_type: str,
+) -> None:
+    """An empty extension list turns filesystem attachments off, even for a text MIME."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_policy",
+        lambda: FilesystemAttachmentPolicy(frozenset()),
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, "bundle.zip", content_type=content_type)
+    assert response.status_code == 415, response.text
+    assert repr(content_type) in response.text
+    assert "Claude Code or Codex" not in response.text
+    assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+
+
+def test_unsupported_type_message_names_the_configured_extensions(
+    upload_client: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused upload lists the extensions this server delivers as files."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_policy",
+        lambda: FilesystemAttachmentPolicy(frozenset({".har", ".gz"})),
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, "clip.mp4", content_type="video/mp4")
+    assert response.status_code == 415, response.text
+    assert "attach .gz, .har files for the agent to open." in response.text
+
+
+@pytest.mark.parametrize(
+    "policy,block,named",
+    [
+        (
+            FilesystemAttachmentPolicy(all_types=True),
+            {"type": "input_file", "filename": "trace.gz", "file_data": _GZ_BYTES},
+            "trace.gz",
+        ),
+        (
+            FilesystemAttachmentPolicy(all_types=True),
+            {"type": "input_file", "file_data": _GZ_BYTES},
+            "application/gzip",
+        ),
+        (
+            FilesystemAttachmentPolicy(frozenset({".gz"})),
+            {"type": "input_file", "filename": "trace.gz", "file_data": _GZ_BYTES},
+            "trace.gz",
+        ),
+        (
+            FilesystemAttachmentPolicy(frozenset({".gz"})),
+            {"type": "input_file", "file_data": _GZ_BYTES},
+            "application/gzip",
+        ),
+        # mimetypes has no extension for bzip2, so the name comes from a fixed table.
+        (
+            FilesystemAttachmentPolicy(frozenset({".bz2"})),
+            {"type": "input_file", "file_data": "data:application/x-bzip2;base64,QlpoOQ=="},
+            "application/x-bzip2",
+        ),
+    ],
+    ids=["all-types-named", "all-types-unnamed", "listed-named", "listed-unnamed", "listed-bz2"],
+)
+def test_policy_refuses_inline_bytes_for_file_types(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+    policy: FilesystemAttachmentPolicy,
+    block: dict[str, str],
+    named: str,
+) -> None:
+    """A type delivered as a file must be uploaded, so the upload checks apply."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_policy", lambda: policy
+    )
+    client, session_id = upload_client
+    resp = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": [block]}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert named in resp.text
+
+
+@pytest.mark.usefixtures("all_types_policy")
+def test_quota_counts_files_recorded_for_filesystem_delivery(
+    upload_client: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Types beyond the defaults spend the same per-session quota."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_file_limit", lambda: 1
+    )
+    client, session_id = upload_client
+    assert _upload(client, session_id, "a.gz", content_type="application/gzip").status_code == 201
+    response = _upload(client, session_id, "b.zip", content_type="application/zip")
+    assert response.status_code == 413, response.text

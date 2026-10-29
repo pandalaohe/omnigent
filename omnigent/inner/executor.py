@@ -353,9 +353,9 @@ class ExecutorError(ExecutorEvent):
         call started has already reported its prompt size, and
         discarding it freezes the context-occupancy meter at the
         previous turn's value exactly when the session is in trouble.
-    :param preserve_session: The executor is idle and safe to reuse after this
-        failure. Set only when no prompt or tool work remains in progress.
-        Defaults to ``False`` so failed turns receive normal teardown.
+    :param preserve_session: The executor released its per-call resources and is
+        safe to reuse without teardown. Native submission bridges may preserve
+        independently running work after a lost reply. Defaults to ``False``.
     :param code: Semantic failure code the turn error should carry, e.g.
         ``"databricks_sign_in_pending"``. ``None`` lets the harness adapter
         fall back to its generic classification of the failure.
@@ -472,6 +472,11 @@ class MessageSplit:
 
     persisted: list[Message]
     transient: list[Message]
+
+
+def without_tool_history(messages: list[Message]) -> list[Message]:
+    """Drop ``tool_call`` / ``tool_result`` items, which only a fresh-session replay uses."""
+    return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
 
 
 def split_transient_tail(
@@ -677,6 +682,14 @@ class ExecutorThreadInventorySnapshot:
     thread_ids: tuple[tuple[str, ...] | None, ...] | None
 
 
+class InjectionDeliveryAmbiguous(Exception):
+    """A live message may already have reached the harness, so it must not be resent.
+
+    :meth:`Executor.enqueue_session_message` raises this when the harness's reply
+    to a submission it may have accepted was lost.
+    """
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -719,6 +732,14 @@ class Executor:
         """
         return False
 
+    def replays_tool_history(self) -> bool:
+        """Whether history handed to this executor keeps recorded tool calls and outputs.
+
+        Off by default: an executor that renders history as prompt text would
+        inline every tool output on each fresh session.
+        """
+        return False
+
     def max_context_tokens(self) -> int | None:
         return None
 
@@ -758,7 +779,10 @@ class Executor:
         return False
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
-        """Send a new user message to a live session without interrupting it, if supported."""
+        """Send a new user message to a live session without interrupting it, if supported.
+
+        :raises InjectionDeliveryAmbiguous: The harness may have accepted the message.
+        """
         return False
 
     async def submit_peer_message(
@@ -771,7 +795,7 @@ class Executor:
     async def finish_peer_messages(self, session_key: str) -> None:
         """Settle unconsumed peer attempts before the turn stream closes."""
 
-    async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:  # type: ignore[explicit-any]  # noqa: ARG002 — default unsupported; subclasses with a keep-warm channel override
+    async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:  # noqa: ARG002 — type: ignore[explicit-any]
         """Ping the live session so the provider prompt cache stays warm; returns the receipt."""
         return {
             "attempt_id": attempt_id,

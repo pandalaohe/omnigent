@@ -8,6 +8,7 @@ import {
   CODEX_NATIVE_APPROVAL_MODES,
   permissionModeConcept,
   canonicalNativeHarness,
+  harnessAccountKey,
 } from "./nativeHarnessModes";
 import { CODEX_APPROVAL_PRESETS, CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS } from "./codexApprovalMode";
 import { sdkPermissionOptions } from "./sdkPermissionModes";
@@ -62,6 +63,13 @@ describe("permissionModeConcept", () => {
     expect(canonicalNativeHarness("native-codex")).toBe("codex-native");
     expect(canonicalNativeHarness("native-pi")).toBe("pi-native");
     expect(canonicalNativeHarness("opencode-native")).toBe("opencode-native");
+  });
+
+  it("maps native aliases to canonical host account keys", () => {
+    expect(harnessAccountKey("codex-native")).toBe("codex");
+    expect(harnessAccountKey("native-claude")).toBe("claude");
+    expect(harnessAccountKey("pi-native")).toBe("pi");
+    expect(harnessAccountKey("opencode-native")).toBe("opencode");
   });
 
   it("falls back safely for missing or future values", () => {
