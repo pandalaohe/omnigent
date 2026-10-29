@@ -235,7 +235,7 @@ async def test_handover_non_native_session_refused(
     assert _handover_messages(store, session_id) == []
 
 
-@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize("harness", ["pi", "pi-native", "antigravity-native"])
 @pytest.mark.parametrize("rotate", [True, False])
 async def test_pi_handover_is_recorded_for_top_level_session(
     client: httpx.AsyncClient,

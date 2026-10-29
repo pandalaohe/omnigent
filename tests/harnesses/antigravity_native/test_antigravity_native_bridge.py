@@ -722,10 +722,12 @@ def _fast_tmux_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 5.0)
 
 
+@pytest.mark.parametrize("fence_submission", [False, True])
 def test_inject_user_message_via_tui_happy_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    fence_submission: bool,
 ) -> None:
     """
     The delivery clears, pastes via buffer, and submits with a verified Enter.
@@ -759,7 +761,19 @@ def test_inject_user_message_via_tui_happy_path(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    fenced: list[bool] = []
+
+    def fence() -> None:
+        assert not any(cmd[-1] == "Enter" for cmd in captured)
+        fenced.append(True)
+
+    inject_user_message_via_tui(
+        bridge_dir,
+        content=content,
+        timeout_s=0.5,
+        before_submit=fence if fence_submission else None,
+    )
+    assert fenced == ([True] if fence_submission else [])
 
     # C-a, C-k (clear), load-buffer, paste-buffer, Enter.
     assert len(captured) == 5, f"expected 5 delivery calls, got {captured}"

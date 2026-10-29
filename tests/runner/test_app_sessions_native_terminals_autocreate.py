@@ -4445,6 +4445,18 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
                 "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
             },
         )
+        if not scenario.expect_auto_create:
+            from omnigent.harnesses.antigravity_native.guard import _relay_config
+
+            successor_id = "2d1b1a96e3e08f2cd43c0cc4b695ac5d"
+            try:
+                assert resp.status_code == 201, resp.text
+                state = app.state.permission_tiers.state(successor_id)
+                assert state is not None and state.status == "ready"
+                relay = _relay_config(seed_dir, state)
+                assert relay["session_id"] == successor_id
+            finally:
+                await client.delete(f"/v1/sessions/{successor_id}")
     assert resp.status_code == 201, resp.text
 
     if scenario.expect_auto_create:

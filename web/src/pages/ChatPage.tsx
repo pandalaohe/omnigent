@@ -3336,6 +3336,7 @@ function ComposerImpl(
   const showClear =
     sessionHarness === "claude-native" ||
     sessionHarness === "codex-native" ||
+    sessionHarness === "antigravity-native" ||
     sessionHarness === "pi-native";
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the

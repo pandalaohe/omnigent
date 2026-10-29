@@ -51,6 +51,7 @@ class _RotationServerClient:
         self.created: list[dict[str, Any]] = []
         self.succession: list[dict[str, Any]] = []
         self.bound: list[dict[str, Any]] = []
+        self.errors: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {}
         if rotate_label is not None:
             self.labels["omnigent.rotate_requested"] = rotate_label
@@ -62,6 +63,7 @@ class _RotationServerClient:
             return httpx.Response(200, json={"labels": self.labels})
         return httpx.Response(
             200,
+            request=httpx.Request("GET", f"http://test{url}"),
             json={
                 "archived": self.archived,
                 "labels": self.labels,
@@ -74,6 +76,11 @@ class _RotationServerClient:
         )
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        if (
+            url.endswith("/events")
+            and kwargs.get("json", {}).get("type") == "external_conversation_item"
+        ):
+            self.errors.append(kwargs["json"]["data"]["item_data"])
         if url.endswith("/successor"):
             if not self.created:
                 self.created.append({"id": "conv_pi_next"})
@@ -360,3 +367,46 @@ async def test_pi_retired_rotation_is_a_final_conflict() -> None:
     assert result.status_code == 409
     assert result.json()["detail"]["error"] == "succession_retired"
     assert not manager.released
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["control", "text", "idle"])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_agy_clear_entries_share_confirmation_and_report_failure(
+    monkeypatch: pytest.MonkeyPatch, trigger: str, failure: bool
+) -> None:
+    from omnigent.harnesses.antigravity_native import reader
+
+    calls: list[str] = []
+
+    async def clear(**kwargs: Any) -> str:
+        calls.append(kwargs["old_session_id"])
+        if failure:
+            raise reader.AntigravityClearError("clear_no_new_root: no new root appeared")
+        return "conv_agy_next"
+
+    monkeypatch.setattr(reader, "clear_session", clear, raising=False)
+    server = _RotationServerClient(harness="antigravity-native")
+    app = _build_app(server)
+    async with _runner_client(app, permission_harness="antigravity-native") as client:
+        await _seed_session(client)
+        if trigger == "idle":
+            runner_app.record_pending_rotation(CONV_ID)
+            await _post_idle(client)
+            deadline = asyncio.get_running_loop().time() + 2
+            while not calls and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+        else:
+            body = (
+                {"type": "clear"}
+                if trigger == "control"
+                else {"type": "message", "content": [{"type": "input_text", "text": "/clear"}]}
+            )
+            result = await client.post(f"/v1/sessions/{CONV_ID}/events", json=body)
+            assert result.status_code == (503 if failure else 200), result.text
+            if failure:
+                assert "clear_no_new_root" in result.text
+    assert calls == [CONV_ID]
+    assert len(server.errors) == int(failure)
+    if failure:
+        assert "clear_no_new_root" in server.errors[0]["message"]

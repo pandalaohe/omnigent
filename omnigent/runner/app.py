@@ -4236,6 +4236,18 @@ def create_runner_app(
                             extra={"session_id": session_id},
                         )
                         if inbound:
+                            bridge_dir = permission_tiers.state_path(
+                                session_id, harness_name, init_context.labels or {}
+                            ).parent
+                            await _ensure_comment_relay_started(
+                                session_id,
+                                explicit_bridge_dir=bridge_dir,
+                                session_labels=init_context.labels,
+                            )
+                            if session_id not in _session_comment_relays:
+                                raise ValueError(
+                                    "Antigravity successor permission relay unavailable"
+                                )
                             return PreLaunchResult(skip=True)
                     if not needs:
                         _logger.info(
@@ -5665,6 +5677,61 @@ def create_runner_app(
         bound.raise_for_status()
         return successor_id
 
+    async def _handle_antigravity_native_clear(conv_id: str) -> Response:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+        )
+        from omnigent.harnesses.antigravity_native.reader import (
+            AntigravityClearError,
+            clear_session,
+        )
+
+        try:
+            snapshot = await server_client.get(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                params=_SESSION_METADATA_PARAMS,
+            )
+            snapshot.raise_for_status()
+            labels = snapshot.json().get("labels", {})
+            bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+            successor = await clear_session(
+                client=server_client,
+                old_session_id=conv_id,
+                bridge_dir=bridge_dir_for_bridge_id(bridge_id),
+            )
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            detail = (
+                str(exc)
+                if isinstance(exc, AntigravityClearError)
+                else _client_safe_error_detail(exc, context="antigravity-native clear")
+            )
+            # Idle rotation has no HTTP consumer: persist the same failure there.
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/events",
+                    json={
+                        "type": "external_conversation_item",
+                        "data": {
+                            "item_type": "error",
+                            "item_data": {
+                                "source": "harness",
+                                "code": "antigravity_native_clear_failed",
+                                "message": detail,
+                            },
+                        },
+                    },
+                )
+            except httpx.HTTPError:
+                _logger.warning(
+                    "Could not persist agy clear failure for %s", conv_id, exc_info=True
+                )
+            return JSONResponse(
+                status_code=503,
+                content={"error": "antigravity_native_clear_failed", "detail": detail},
+            )
+        return JSONResponse(content={"successor_id": successor})
+
     async def _run_pending_rotation(conv_id: str, *, require_label: bool = True) -> bool:
         """Type ``/clear`` for a session whose handover asked for rotation.
 
@@ -5735,6 +5802,8 @@ def create_runner_app(
                     error_code="codex_native_clear_failed",
                     context="codex-native clear",
                 )
+            elif harness == "antigravity-native":
+                response = await _handle_antigravity_native_clear(conv_id)
             elif harness == "pi-native":
                 response = await _handle_codex_native_slash_command(
                     conv_id,
@@ -9735,6 +9804,11 @@ def create_runner_app(
                 body.get("content")
             ).strip() in {"/clear", "/new"}:
                 pi_harness = _session_harness_name(conversation_id)
+                if (
+                    pi_harness == "antigravity-native"
+                    and _side_chat_text_from_content(body.get("content")).strip() == "/clear"
+                ):
+                    return await _handle_antigravity_native_clear(conversation_id)
                 if pi_harness == "pi-native":
                     return await _handle_codex_native_slash_command(
                         conversation_id,
@@ -11092,6 +11166,8 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "clear":
+            if _session_harness_name(conversation_id) == "antigravity-native":
+                return await _handle_antigravity_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "pi-native":
                 return await _handle_codex_native_slash_command(
                     conversation_id,
