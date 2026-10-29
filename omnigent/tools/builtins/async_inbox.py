@@ -398,10 +398,8 @@ class SysCancelAsyncTool(SysCancelTaskTool):
         """
         Return the OpenAI-format tool schema.
 
-        Differs from :meth:`SysCancelTaskTool.get_schema` only in
-        the parameter name (``handle_id`` vs ``task_id``) and
-        ``additionalProperties: false`` to match the rest of the
-        async-namespace schemas.
+        Uses ``handle_id`` as the canonical argument, retaining ``task_id``
+        for legacy callers. Rejects unrelated argument names.
 
         :returns: Dict with ``"type": "function"`` and a
             ``"function"`` sub-dict.
@@ -423,8 +421,12 @@ class SysCancelAsyncTool(SysCancelTaskTool):
                                 "async-dispatch identifier)."
                             ),
                         },
+                        "task_id": {
+                            "type": "string",
+                            "description": "Legacy alias for handle_id; prefer handle_id.",
+                        },
                     },
-                    "required": ["handle_id"],
+                    "anyOf": [{"required": ["handle_id"]}, {"required": ["task_id"]}],
                     "additionalProperties": False,
                 },
             },
