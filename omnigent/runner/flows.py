@@ -811,7 +811,7 @@ async def _post_wake(run: _FlowRun) -> None:
             timeout=30.0,
         )
         resp.raise_for_status()
-    except (httpx.HTTPError, asyncio.TimeoutError):
+    except (TimeoutError, httpx.HTTPError):
         _logger.warning(
             "flow %s wake POST failed",
             run.flow_id,

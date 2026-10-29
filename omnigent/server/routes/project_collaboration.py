@@ -627,7 +627,7 @@ async def run_post_bind_request(
             return _post_bind_result("unreachable")
         try:
             result = await asyncio.wait_for(future, timeout=_POST_BIND_HOOK_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return _post_bind_result("unreachable")
     finally:
         # The tunnel's receive loop also pops on success; this is the only

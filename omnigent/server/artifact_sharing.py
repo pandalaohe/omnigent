@@ -262,7 +262,7 @@ class ArtifactSharingStore:
         owner: str,
         *,
         external: bool | None = None,
-        share_code: str | None | KeepShareCode = KEEP_SHARE_CODE,
+        share_code: str | KeepShareCode | None = KEEP_SHARE_CODE,
         allow_comments: bool | None = None,
     ) -> SharingRecord:
         """Merge an update into *owner*'s record and return the new state.
