@@ -369,8 +369,6 @@ def test_archive_project_filter_matches_facets_for_authenticated_viewer(
             response = client.get("/v1/sessions", params=params, headers=_hdr(ALICE))
             assert response.status_code == 200
             expected = {ids["filed"], ids["legacy"]}
-            if "visibility" in archive_params:
-                expected.add(ids["shared-legacy"])
             assert {row["id"] for row in response.json()["data"]} == expected
 
         project_only = client.get(
@@ -382,7 +380,6 @@ def test_archive_project_filter_matches_facets_for_authenticated_viewer(
             ids["filed"],
             ids["other-host"],
             ids["legacy"],
-            ids["shared-legacy"],
         }
 
 

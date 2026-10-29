@@ -720,7 +720,8 @@ class TurnContext:
         )
         result: ElicitationResult | None = None
         try:
-            return await future
+            result = await future
+            return result
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
             self._pending_human_waits -= 1

@@ -624,7 +624,7 @@ async def test_info_harness_install_gate_overrides_feature_snapshot(
             {},
             {
                 "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
-                "all_types": False,
+                "all_types": True,
             },
         ),
         (

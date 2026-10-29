@@ -585,7 +585,8 @@ def test_error_after_draining_retry_stays_ambiguous(
     assert failure.code == (
         "codex_delivery_unconfirmed" if isinstance(error, ConnectionResetError) else None
     )
-    assert failure.preserve_session is isinstance(error, ConnectionResetError)
+    # This executor has no acknowledged native turn of its own to clean up.
+    assert failure.preserve_session is True
     assert failure.retryable is False
     assert draining_client.connections == 2
     assert len(draining_client.requests) == 2
@@ -1737,17 +1738,19 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
 
 
 @pytest.mark.parametrize(
-    "error",
+    "error,input_refused",
     [
-        pytest.param(RuntimeError("request timed out"), id="ambiguous-timeout"),
+        pytest.param(RuntimeError("request timed out"), False, id="ambiguous-timeout"),
         pytest.param(
             CodexAppServerResponseError({"code": -32600, "message": "invalid turn id"}),
+            True,
             id="other-json-rpc-error",
         ),
         pytest.param(
             CodexAppServerResponseError(
                 {"code": -32600, "message": "cannot steer a compact turn"}
             ),
+            False,
             id="compaction-missing-structure",
         ),
         pytest.param(
@@ -1760,6 +1763,7 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
                     },
                 }
             ),
+            False,
             id="compaction-wrong-code",
         ),
         pytest.param(
@@ -1772,6 +1776,7 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
                     },
                 }
             ),
+            False,
             id="compaction-wrong-message",
         ),
         pytest.param(
@@ -1782,6 +1787,7 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
                     "data": {"codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "review"}}},
                 }
             ),
+            False,
             id="compaction-wrong-kind",
         ),
         pytest.param(
@@ -1792,9 +1798,10 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
                     "data": [],
                 }
             ),
+            False,
             id="compaction-malformed-data",
         ),
-        pytest.param(asyncio.CancelledError(), id="cancelled"),
+        pytest.param(asyncio.CancelledError(), False, id="cancelled"),
     ],
 )
 @pytest.mark.parametrize("live_injection", [False, True])
@@ -1802,6 +1809,7 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     error: BaseException,
+    input_refused: bool,
     caplog: pytest.LogCaptureFixture,
     live_injection: bool,
 ) -> None:
@@ -1849,10 +1857,11 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
 
     if not live_injection and not isinstance(error, asyncio.CancelledError):
         assert [type(event) for event in events] == [ExecutorError]
-        if isinstance(error, CodexAppServerResponseError):
+        if input_refused:
             assert events[0].code == "codex_native_input_refused"
             assert events[0].undelivered is True
         else:
+            assert events[0].code is None
             assert events[0].undelivered is False
     assert [method for method, _params in _FailingSteerClient.requests] == ["turn/steer"]
     state = read_bridge_state(tmp_path)

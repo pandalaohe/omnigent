@@ -1034,6 +1034,13 @@ async def _publish_and_wait_for_harness_elicitation(
         )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
+            if (
+                getattr(params, "native_delivery", None) is not None
+                and tombstone.result is not None
+            ):
+                published_request = True
+                settled = True
+                settled_action = tombstone.result.action
             return approved_verdict(tombstone.result)
         if timeout_policy is not None:
             # First park for this (id, fingerprint): take the snapshot the
@@ -1361,6 +1368,7 @@ def _schedule_deferred_elicitation_clear(
 
         grace_s = _facade._HARNESS_ELICITATION_REPARK_GRACE_S
         resolved_in_terminal = False
+        parked_is_current = True
         if parked is None:
             await asyncio.sleep(grace_s)
         else:
@@ -1369,7 +1377,8 @@ def _schedule_deferred_elicitation_clear(
                 resolved_in_terminal = True
             except TimeoutError:
                 pass
-            if _harness_parked_elicitations.get(elicitation_id) is parked:
+            parked_is_current = _harness_parked_elicitations.get(elicitation_id) is parked
+            if parked_is_current:
                 _harness_parked_elicitations.pop(elicitation_id, None)
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear. Hand it the
@@ -1382,6 +1391,8 @@ def _schedule_deferred_elicitation_clear(
                     current.resolved_elsewhere.set()
             return
         if native_delivery_attempt is not None:
+            if not parked_is_current:
+                return  # A reconnect owns its own delivery grace, even for the same attempt.
             entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
             if (
                 entry is None

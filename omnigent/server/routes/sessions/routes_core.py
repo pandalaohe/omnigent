@@ -4002,7 +4002,7 @@ def register_core_routes(
             child_rows,
             liveness_lookup,
         )
-        keep_warm_harnesses = await asyncio.to_thread(_keep_warm_harnesses_for, page.data)
+        keep_warm_harnesses = _keep_warm_harnesses_for(page.data, harnesses_by_id)
         cold_after_by_session = await _cold_after_by_session_for(page.data, request.app.state)
         items: list[SessionListItem] = [
             _build_session_list_item(
@@ -4361,14 +4361,14 @@ def register_core_routes(
 
     def _keep_warm_harnesses_for(
         convs: list[Conversation],
+        harnesses_by_id: dict[str, str | None],
     ) -> dict[tuple[str | None, str | None, str | None], str | None]:
         """
         Resolve harnesses for cache state and unsupported-source reasons.
 
         One harness resolution per distinct ``(agent_id, harness_override,
         sub_agent_name)`` triple, mirroring the sweeper's ``_harness_for``.
-        Blocking (loads agent bundles), so callers run it via
-        :func:`asyncio.to_thread`.
+        Reuse the page's batched agent metadata.
 
         :param convs: Session rows on the page.
         :returns: Lookup keyed by the resolution triple; a missing key means
@@ -4378,10 +4378,7 @@ def register_core_routes(
         for conv in convs:
             key = (conv.agent_id, conv.harness_override, conv.sub_agent_name)
             pending.setdefault(key, conv)
-        return {
-            key: _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
-            for key, conv in pending.items()
-        }
+        return {key: harnesses_by_id.get(conv.id) for key, conv in pending.items()}
 
     async def _cold_after_by_session_for(
         convs: list[Conversation],
@@ -4646,7 +4643,7 @@ def register_core_routes(
             child_rows,
             liveness_lookup,
         )
-        keep_warm_harnesses = await asyncio.to_thread(_keep_warm_harnesses_for, convs)
+        keep_warm_harnesses = _keep_warm_harnesses_for(convs, harnesses_by_id)
         cold_after_by_session = await _cold_after_by_session_for(convs, app_state)
         items = [
             _build_session_list_item(

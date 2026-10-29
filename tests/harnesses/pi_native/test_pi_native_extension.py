@@ -214,12 +214,13 @@ global.fetch = async (_url, request) => {
   return { ok: true };
 };
 global.setInterval = () => ({ fakeInterval: true });
-function launchExtension() {
+function launchExtension(overrides = {}) {
   delete require.cache[require.resolve(extensionPath)];
   const handlers = {};
   require(extensionPath)({
     registerCommand() {},
     on(name, handler) { handlers[name] = handler; },
+    ...overrides,
   });
   return handlers;
 }
@@ -651,11 +652,10 @@ def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
   await resumed.session_start({}, ctx);
   await recordUsage(resumed, 2000, 900, 250, 0.25);
   await recordUsage(resumed, 2000, 900, 250, 0.25);
-  const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
   assert.deepEqual(usageEvents().map(({data}) => [
     data.cumulative_input_tokens, data.cumulative_output_tokens, data.cumulative_cost_usd,
   ]), [
-    ...(reasserts ? [[150000, 30000, 0.75]] : []),
+    [150000, 30000, 0.75],
     [150900, 30250, 1],
   ]);
 })().catch(error => { console.error(error); process.exit(1); });
@@ -1272,6 +1272,10 @@ fs.writeFileSync(
     assistantItemPostTimeoutMs: 10,
   }),
 );
+fs.writeFileSync(path.join(tmpDir, "permission_state.json"), JSON.stringify({
+  session_id: "session-1", host_id: "test-host", workspace: tmpDir,
+  tier: "ask", revision: 1, status: "ready",
+}));
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
 // Advance retry delays only; request timeouts still use real timers.
@@ -1279,15 +1283,19 @@ const retryDelays = [];
 let now = Date.now();
 Date.now = () => now;
 const originalSetTimeout = global.setTimeout;
+const originalClearTimeout = global.clearTimeout;
 global.setTimeout = (callback, delay, ...args) => {
   if ([1000, 2000, 4000, 8000].includes(delay)) {
-    retryDelays.push(delay);
-    now += delay;
-    queueMicrotask(() => callback(...args));
-    return {};
+    return { retryTimer: setImmediate(() => {
+      retryDelays.push(delay);
+      now += delay;
+      callback(...args);
+    }) };
   }
   return originalSetTimeout(callback, delay, ...args);
 };
+global.clearTimeout = (timer) => timer?.retryTimer
+  ? clearImmediate(timer.retryTimer) : originalClearTimeout(timer);
 const diagnostics = [];
 console.error = (...args) => diagnostics.push(args.map(String).join(" "));
 
@@ -1310,7 +1318,13 @@ const pi = {
 require(extensionPath)(pi);
 const notices = [];
 const ctx = { ui: { setTitle() {}, setStatus() {}, notify(text) { notices.push(text); } } };
-const settleHistory = () => new Promise(setImmediate);
+async function settleHistory() {
+  for (let index = 0; index < 20; index++) await new Promise(setImmediate);
+}
+async function consumeInput(event, context) {
+  await handlers.input(event, context);
+  await handlers.message_end({message: {role: "user", content: event.text}}, context);
+}
 function assistantItems() {
   return posted.filter(
     (event) =>
@@ -1459,7 +1473,9 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     reasoning: ["message_update", { assistantMessageEvent: {
       type: "thinking_end", contentIndex: 0, content: "plan",
     } }],
-    user: ["input", { text: "terminal prompt", source: "extension" }],
+    user: ["message_end", { message: {
+      role: "user", content: "terminal prompt", timestamp: 42,
+    } }],
     compaction: ["session_compact", {}],
   };
   if (kind === "tool_result") {
@@ -1494,7 +1510,7 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 6);
   if (kind === "compaction") assert.equal(items[5].data.source_id, items[0].data.source_id);
-  if (kind !== "user" && kind !== "compaction") {
+  if (kind !== "compaction") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
     assert.deepEqual(items[0], items[5]);
     await invoke();
@@ -1505,7 +1521,14 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     const deltas = posted.filter((body) => body.type === "external_output_reasoning_delta");
     assert.equal(deltas.length, 1);
   }
-})().catch((error) => { console.error(error); process.exit(1); });
+  if (kind === "user") {
+    await handlers.message_end({message: {...event.message, timestamp: 43}}, ctx);
+    await settleHistory();
+    items = posted.filter((body) => body.type === "external_conversation_item");
+    assert.equal(items.length, 7, "a later identical prompt is a separate consumed message");
+    assert.notEqual(items[6].data.source_id, items[0].data.source_id);
+  }
+})().catch((error) => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), kind)
@@ -1592,7 +1615,7 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     };
     return response;
   };
-  await handlers.input({text: "covered input", source: "extension"}, ctx);
+  await consumeInput({text: "covered input", source: "extension"}, ctx);
   // Repeated summary text can make Pi's event point at an older checkpoint.
   const compacting = handlers.session_compact(
     {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
@@ -1613,7 +1636,7 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
   assert.deepEqual(retryDelays, []);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(notices, []);
-})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+})().catch((error) => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), receipt)
@@ -1661,7 +1684,7 @@ def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: s
       posted.push(JSON.parse(request.body));
       return new Promise(() => {});
     };
-    await handlers.input({ text: "stuck input", source: "extension" }, ctx);
+    await consumeInput({ text: "stuck input", source: "extension" }, ctx);
     const harnessSetTimeout = global.setTimeout;
     global.setTimeout = (callback, delay, ...args) => {
       if (delay !== 30000) return harnessSetTimeout(callback, delay, ...args);
@@ -1684,7 +1707,7 @@ def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: s
   const failed = failure !== "unsupported" && failure !== "stalled";
   assert.deepEqual(notices, failed ? ["Omnigent could not save the compaction checkpoint."] : []);
   if (failed) assert.match(diagnostics.join("\n"), /Compaction snapshot failed/);
-})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+})().catch((error) => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), failure)
@@ -1702,13 +1725,13 @@ def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> 
     now += 5000;
     return { ok: false, status: 503 };
   };
-  await handlers.input({ text: "keep working", source: "extension" }, ctx);
+  await consumeInput({ text: "keep working", source: "extension" }, ctx);
   await settleHistory();
   assert.equal(fetchCalls, 4);
   assert.deepEqual(retryDelays, [1000, 2000, 4000]);
   assert.equal(Date.now() - started, 27000);
   assert.match(diagnostics.join("\n"), /Failed to persist message/);
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
@@ -1752,7 +1775,7 @@ def test_failed_history_item_preserves_later_items_and_usage(tmp_path: Path, han
   assert.ok(accepted.some(item => item.type === "external_session_usage"));
   await settleHistory();
   assert.match(diagnostics.join("\n"), /Failed to persist function_call/);
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), handler)
@@ -1784,7 +1807,7 @@ def test_reasoning_identity_survives_lost_ack_across_callbacks(tmp_path: Path) -
   assert.equal(reasoning.length, 6);
   assert.equal(new Set(reasoning.map(item => item.data.source_id)).size, 1);
   assert.equal(posted.filter(item => item.type === "external_output_reasoning_delta").length, 1);
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
@@ -1805,7 +1828,7 @@ def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
     if (!url.endsWith('/events')) {
       policyCalls++;
       return {ok: true,
-    text: async () => JSON.stringify({result: `POLICY_ACTION_${process.argv[3]}`})};
+    json: async () => ({result: `POLICY_ACTION_${process.argv[3]}`})};
     }
     const body = JSON.parse(request.body);
     if (body.type !== 'external_conversation_item') return {ok: true, status: 204};
@@ -1820,7 +1843,7 @@ def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
     text: 'done'},
   ]};
   const watchdog = originalSetTimeout(() => { throw new Error('history blocked Pi hooks'); }, 500);
-  await handlers.input({text: 'read a file', source: 'extension'}, ctx);
+  await consumeInput({text: 'read a file', source: 'extension'}, ctx);
   await handlers.message_update({assistantMessageEvent: {type: 'toolcall_end',
     toolCall: tool}}, ctx);
   const decision = await handlers.tool_call({toolCallId: tool.id, toolName: tool.name,
@@ -1839,7 +1862,7 @@ def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
     'reasoning', 'message',
   ]);
   assert.equal(new Set(accepted.map(item => item.source_id)).size, accepted.length);
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), verdict)
@@ -1870,7 +1893,7 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
   let release;
   let completionAttempts = 0;
   global.setTimeout = (callback, delay, ...args) =>
-    originalSetTimeout(callback, delay === 30000 ? 50 : delay, ...args);
+    originalSetTimeout(callback, delay === 30000 && mode === 'deadline' ? 50 : delay, ...args);
   global.fetch = async (_url, request) => {
     const body = JSON.parse(request.body);
     posted.push(body);
@@ -1894,7 +1917,7 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
     }}, ctx);
   }
   const finished = handlers.agent_end({}, ctx);
-  await settleHistory();
+  await new Promise(setImmediate);
   if (!['empty', 'no-response', 'early-abort'].includes(mode)) {
     assert.equal(completionAttempts, 0);
   }
@@ -1920,7 +1943,7 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
   if (failed) assert.equal(terminal.failure_detail, terminal.output);
   assert.equal(completionAttempts, 1);
   await handlers.session_shutdown();
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), mode)
@@ -1964,7 +1987,7 @@ def test_ending_turn_does_not_wait_for_later_input_or_retry_after_supersession(
   const ending = handlers.agent_end({}, ctx).then(() => { finished = true; });
   await settleHistory();
   if (mode === 'superseded-history') await handlers.agent_start({}, ctx);
-  await handlers.input({text: 'next prompt', source: 'extension'}, ctx);
+  await consumeInput({text: 'next prompt', source: 'extension'}, ctx);
   ctx.hasPendingMessages = () => mode === 'queued-followup';
   releases.shift()();
   await settleHistory();
@@ -1986,7 +2009,7 @@ def test_ending_turn_does_not_wait_for_later_input_or_retry_after_supersession(
   }
   releases.shift()();
   await handlers.session_shutdown();
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), mode)
@@ -2022,7 +2045,7 @@ def test_result_retries_its_failed_call_before_delivery(tmp_path: Path, recover:
   await handlers.session_shutdown();
   assert.deepEqual(accepted, status === 204 ? ['function_call', 'function_call_output'] : []);
   assert.match(diagnostics.join('\n'), /Withholding result without a queued call/);
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), str(recover))
@@ -2049,7 +2072,7 @@ def test_history_hung_fetch_is_aborted_and_shutdown_is_bounded(
       reject(request.signal.reason);
     }, {once: true});
   });
-  await handlers.input({text: 'hang', source: 'extension'}, ctx);
+  await consumeInput({text: 'hang', source: 'extension'}, ctx);
   const start = performance.now();
   await handlers.session_shutdown();
   const elapsed = performance.now() - start;
@@ -2058,9 +2081,9 @@ def test_history_hung_fetch_is_aborted_and_shutdown_is_bounded(
   assert.ok(elapsed < 6500, String(elapsed));
   if (process.argv[3] === 'True') assert.ok(elapsed >= 4900, String(elapsed));
   assert.match(diagnostics.join('\n'), /Failed to persist/);
-  await handlers.input({text: 'after shutdown', source: 'extension'}, ctx);
+  await consumeInput({text: 'after shutdown', source: 'extension'}, ctx);
   assert.match(diagnostics.join('\n'), /History queue closed/);
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), str(shutdown))
@@ -2084,7 +2107,7 @@ def test_history_queue_bounds_backlog(tmp_path: Path, limit: str) -> None:
   const items = process.argv[3] === 'items';
   const count = items ? 257 : 3;
   for (let index = 0; index < count; index++) {
-    await handlers.input({text: items ? String(index) : 'x'.repeat(8 * 1024 * 1024),
+    await consumeInput({text: items ? String(index) : 'x'.repeat(8 * 1024 * 1024),
     source: 'extension'}, ctx);
   }
   assert.match(diagnostics.join('\n'), /History queue full/);
@@ -2092,7 +2115,7 @@ def test_history_queue_bounds_backlog(tmp_path: Path, limit: str) -> None:
   await handlers.session_shutdown();
   assert.equal(accepted.length, items ? 256 : 1);
   if (items) assert.deepEqual(accepted, Array.from({length: 256}, (_, i) => String(i)));
-})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), limit)
@@ -2427,7 +2450,7 @@ let mcpCallCount = 0;
 global.fetch = async (url, request) => {
   if (typeof url === "string" && url.indexOf("/policies/evaluate") !== -1) {
     // The server-side ASK park collapses to a hard ALLOW after the human approves.
-    return { ok: true, text: async () => JSON.stringify({ result: "POLICY_ACTION_ALLOW" }) };
+    return { ok: true, json: async () => ({ result: "POLICY_ACTION_ALLOW" }) };
   }
   // /mcp proxy.
   mcpCallCount += 1;
@@ -3640,6 +3663,7 @@ function makeJsonResponse(obj, status) {
     ok: status === undefined || (status >= 200 && status < 300),
     status: status === undefined ? 200 : status,
     text: async () => JSON.stringify(obj),
+    json: async () => obj,
   };
 }
 
@@ -4731,6 +4755,10 @@ def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
   assert.equal(routeCalls, 1);
   assert.equal(setModelCalls.length, 0);
   // The user's prompt is still mirrored to Omnigent.
+  assert.ok(!posted.some((e) => e.type === "external_conversation_item" &&
+    e.data.item_data.role === "user"));
+  await handlers.message_end({message: {role: "user", content: "one"}}, ctx);
+  await new Promise(setImmediate);
   assert.ok(
     posted.some(
       (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
@@ -4859,8 +4887,9 @@ def test_session_start_reports_effective_thinking_level(
     if node is None:
         pytest.skip("node is required for the pi-native extension test")
     script = (
-        _usage_test_preamble()
-        + f"\npi.getThinkingLevel = {getter};\nconst expected = {json.dumps(expected)};\n"
+        _usage_test_preamble().replace("const handlers = launchExtension();", "")
+        + f"\nconst handlers = launchExtension({{getThinkingLevel: {getter}}});\n"
+        + f"const expected = {json.dumps(expected)};\n"
         + r"""
 (async () => {
   await handlers.session_start({}, ctx);

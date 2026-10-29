@@ -92,7 +92,7 @@ def test_usage_feed_migration_backfills_scope_and_round_trips(db_uri: str) -> No
         assert connection.execute(
             sa.text("SELECT client_id,scope FROM device_grants ORDER BY id")
         ).all() == [(None, "sessions"), ("slack", "sessions"), ("omnigent-cli", None)]
-    assert _current_heads(engine) == {"a32c20261020", "nf12ab34cd56"}
+    assert _current_heads(engine) == {"a32c20261020", "d0a1f879a01d"}
     progress = next(
         c for c in sa.inspect(engine).get_columns("usage_feeds") if c["name"] == "progress"
     )
@@ -122,7 +122,7 @@ def test_usage_feed_upgrade_resumes_after_scope_schema_commit(db_uri: str) -> No
             _migrate(engine, db_uri)
     finally:
         sa.event.remove(engine, "before_cursor_execute", interrupt_backfill)
-    assert _current_heads(engine) == {"a31c20261019", "nf12ab34cd56"}
+    assert _current_heads(engine) == {"a31c20261019", "d0a1f879a01d"}
     assert "scope" in {c["name"] for c in sa.inspect(engine).get_columns("device_grants")}
     _migrate(engine, db_uri)
-    assert _current_heads(engine) == {"a32c20261020", "nf12ab34cd56"}
+    assert _current_heads(engine) == {"a32c20261020", "d0a1f879a01d"}

@@ -1047,9 +1047,7 @@ def test_saved_sources_grid_manager_layers_and_confirmed_merge(
     page.goto(f"{appearance_url}/settings/context-usage")
     section = page.get_by_test_id("saved-context-sources")
     table = section.get_by_role("table", name="Saved context sources by computer and agent")
-    open_manager = section.get_by_role(
-        "button", name="Manage Alpha × Claude Code · Claude Code", exact=True
-    )
+    open_manager = section.get_by_role("button", name="Manage Alpha × Claude · Claude", exact=True)
     expect(open_manager).to_be_visible()
     expect(table.get_by_role("row")).to_have_count(4)
     expect(table.get_by_text("1 model override", exact=True)).to_have_count(4)
@@ -1126,9 +1124,7 @@ def test_saved_sources_grid_manager_layers_and_confirmed_merge(
     assert saved_overrides() == merged
     expect(manager.get_by_role("button", name="Merge", exact=True)).to_have_count(0)
     expect(manager.get_by_text(models[0], exact=True)).to_have_count(0)
-    expect(
-        manager.get_by_text("Context 550,000 · Alpha × Claude Code", exact=True)
-    ).to_be_visible()
+    expect(manager.get_by_text("Context 550,000 · Alpha × Claude", exact=True)).to_be_visible()
     page.screenshot(path=str(output / f"saved-sources-merged-{width}.png"), full_page=True)
     manager.get_by_role("button", name="Close", exact=True).click()
     page.reload()
@@ -1149,15 +1145,13 @@ def test_saved_sources_grid_manager_layers_and_confirmed_merge(
     exact_row = manager.get_by_text(models[0], exact=True).locator("xpath=../..")
     inherited_row = manager.get_by_text(models[1], exact=True).locator("xpath=../..")
     expect(exact_row.get_by_text("Context 300,000 · model override", exact=True)).to_be_visible()
-    expect(
-        exact_row.get_by_text("Buffer 20,000 · Alpha × Claude Code", exact=True)
-    ).to_be_visible()
-    expect(inherited_row.get_by_text("Context 400,000 · Alpha × Claude Code")).to_be_visible()
+    expect(exact_row.get_by_text("Buffer 20,000 · Alpha × Claude", exact=True)).to_be_visible()
+    expect(inherited_row.get_by_text("Context 400,000 · Alpha × Claude")).to_be_visible()
     expect(inherited_row.get_by_text("Buffer 10,000 · model override")).to_be_visible()
     expect(
-        manager.get_by_text("Claude Code · all hosts: 500,000 context · 30,000 buffer", exact=True)
+        manager.get_by_text("Claude · all hosts: 500,000 context · 30,000 buffer", exact=True)
     ).to_be_visible()
-    manager.get_by_role("button", name="Edit Alpha Claude Code All models", exact=True).click()
+    manager.get_by_role("button", name="Edit Alpha Claude All models", exact=True).click()
     manager.get_by_role("spinbutton", name="Edit context total", exact=True).fill("")
     with page.expect_response(
         lambda response: (
@@ -1166,12 +1160,12 @@ def test_saved_sources_grid_manager_layers_and_confirmed_merge(
         )
     ):
         manager.get_by_role("button", name="Save", exact=True).click()
-    expect(inherited_row.get_by_text("Context 500,000 · Claude Code · all hosts")).to_be_visible()
+    expect(inherited_row.get_by_text("Context 500,000 · Claude · all hosts")).to_be_visible()
     assert synced["value"]["overrides"][claude_cell] == {
         "contextWindowTokens": None,
         "autoCompactBufferTokens": 20000,
     }
-    manager.get_by_role("button", name=f"Edit Alpha Claude Code {models[0]}", exact=True).click()
+    manager.get_by_role("button", name=f"Edit Alpha Claude {models[0]}", exact=True).click()
     expect(
         manager.get_by_role("spinbutton", name="Edit compact buffer", exact=True)
     ).to_have_value("")
@@ -1192,9 +1186,7 @@ def test_saved_sources_grid_manager_layers_and_confirmed_merge(
     assert saved[claude_keys[1]] == layered[claude_keys[1]]
     assert saved[claude_column] == layered[claude_column]
     expect(exact_row.get_by_text("Context 250,000 · model override", exact=True)).to_be_visible()
-    expect(
-        exact_row.get_by_text("Buffer 20,000 · Alpha × Claude Code", exact=True)
-    ).to_be_visible()
+    expect(exact_row.get_by_text("Buffer 20,000 · Alpha × Claude", exact=True)).to_be_visible()
     exact_row.scroll_into_view_if_needed()
     page.screenshot(path=str(output / f"saved-sources-provenance-{width}.png"), full_page=True)
     assert manager.evaluate("element => element.scrollWidth <= element.clientWidth")

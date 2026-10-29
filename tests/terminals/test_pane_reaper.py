@@ -20,7 +20,7 @@ from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.native import orchestration as native_runtime
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import SessionResourceRegistry, TerminalCloseOutcome
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
@@ -782,9 +782,12 @@ class _FakeHelperServer:
 
     def __init__(self) -> None:
         self.closed = False
+        self.resident_incarnation_id = f"helper-{id(self)}"
+        self.exit_confirmed = False
 
     async def close(self) -> None:
         self.closed = True
+        self.exit_confirmed = True
 
 
 _HELPER_SERVERS: dict[str, dict[str, object]] = {
@@ -831,15 +834,17 @@ async def test_runner_reap_releases_sidecars_before_a_recreate_takes_over(
     reaped_forwarder, reaped_server = _start_sidecars(conv, terminal_name)
     recreated: list[tuple[asyncio.Task[bool], _FakeHelperServer | None]] = []
     closing, finish_close = asyncio.Event(), asyncio.Event()
-    close_terminal = resource_registry.close_terminal
+    close_terminal = resource_registry.close_terminal_detailed
 
-    async def slow_close(session_id: str, terminal_id: str) -> bool:
-        closed = await close_terminal(session_id, terminal_id)
+    async def slow_close(
+        session_id: str, terminal_id: str, *, expected_instance: TerminalInstance | None = None
+    ) -> TerminalCloseOutcome:
+        closed = await close_terminal(session_id, terminal_id, expected_instance=expected_instance)
         closing.set()
         await finish_close.wait()
         return closed
 
-    monkeypatch.setattr(resource_registry, "close_terminal", slow_close)
+    monkeypatch.setattr(resource_registry, "close_terminal_detailed", slow_close)
     lock = app.state.native_terminal_ensure_locks[terminal_name].setdefault(conv, asyncio.Lock())
 
     async def recreate() -> None:
@@ -851,7 +856,7 @@ async def test_runner_reap_releases_sidecars_before_a_recreate_takes_over(
     )
     try:
         reap = asyncio.create_task(reaper._reap(pane))
-        await closing.wait()
+        await asyncio.wait_for(closing.wait(), timeout=5)
         recreate_task = asyncio.create_task(recreate())
         await asyncio.sleep(0)
         assert not recreated, "the re-create ran while the reap was closing the pane"
@@ -876,11 +881,11 @@ async def test_runner_reap_releases_sidecars_before_a_recreate_takes_over(
             servers.pop(conv, None)
 
 
-async def test_runner_reap_releases_sidecars_when_the_pane_close_fails(
+async def test_runner_reap_keeps_sidecars_when_the_pane_close_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed pane close still releases the forwarder and helper server, and raises."""
+    """A failed pane close retains its sidecars so the same generation can retry."""
     conv = "conv_reap_close_fails"
     registry = TerminalRegistry()
     instance = make_test_terminal_instance("opencode", "main", tmp_path)
@@ -895,10 +900,10 @@ async def test_runner_reap_releases_sidecars_when_the_pane_close_fails(
     assert reaper is not None
     forwarder, server = _start_sidecars(conv, "opencode")
 
-    async def failing_close(*_args: object) -> bool:
-        raise RuntimeError("pane close failed")
+    async def failing_close(*_args: object, **_kwargs: object) -> TerminalCloseOutcome:
+        return "close_failed"
 
-    monkeypatch.setattr(resource_registry, "close_terminal", failing_close)
+    monkeypatch.setattr(resource_registry, "close_terminal_detailed", failing_close)
     pane = PaneRef(
         conv, terminal_resource_id("opencode", "main"), "opencode", instance.socket_path
     )
@@ -906,8 +911,8 @@ async def test_runner_reap_releases_sidecars_when_the_pane_close_fails(
         with pytest.raises(RuntimeError, match="pane close failed"):
             await reaper._reap(pane)
 
-        assert forwarder.done(), "forwarder still running after a failed pane close"
-        assert server is not None and server.closed
+        assert not forwarder.done(), "a failed close cancelled the retained pane's forwarder"
+        assert server is not None and not server.closed
     finally:
         forwarder.cancel()
         await asyncio.gather(forwarder, return_exceptions=True)
@@ -942,7 +947,8 @@ async def test_runner_reap_leaves_a_pane_replaced_after_the_scan_listed_it(
     registry._by_conversation[conv] = {("codex", "main"): replacement}
     forwarder, server = _start_sidecars(conv, "codex")
     try:
-        await reaper._reap(pane)
+        with pytest.raises(RuntimeError, match="native pane changed or became busy"):
+            await reaper._reap(pane)
 
         assert registry.get(conv, "codex", "main") is replacement
         assert not forwarder.done(), "the replacement's forwarder was cancelled"
@@ -984,7 +990,8 @@ async def test_runner_reap_leaves_a_pane_a_turn_reused_while_it_waited(
             await asyncio.sleep(0)
             # The ensure path holding the lock found the pane alive; its turn starts.
             app.state.active_turns[conv] = None
-        await reap
+        with pytest.raises(RuntimeError, match="native pane changed or became busy"):
+            await reap
 
         assert registry.get(conv, "claude", "main") is instance
         assert not forwarder.done(), "the reused pane's forwarder was cancelled"

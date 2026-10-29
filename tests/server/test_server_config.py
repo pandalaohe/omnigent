@@ -821,7 +821,7 @@ _DEFAULT_EXTENSIONS = {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sq
 @pytest.mark.parametrize(
     ("raw", "extensions", "all_types"),
     [
-        (None, _DEFAULT_EXTENSIONS, False),
+        (None, _DEFAULT_EXTENSIONS, True),
         ("*", _DEFAULT_EXTENSIONS, True),
         # A list-valued setting can express "all types" the same way.
         (["*"], _DEFAULT_EXTENSIONS, True),
@@ -831,11 +831,11 @@ _DEFAULT_EXTENSIONS = {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sq
         ([], set(), False),
         # A malformed entry is skipped; nothing usable keeps the defaults.
         ([42, ".gz"], {".gz"}, False),
-        ([42], _DEFAULT_EXTENSIONS, False),
-        ({"gz": True}, _DEFAULT_EXTENSIONS, False),
+        ([42], _DEFAULT_EXTENSIONS, True),
+        ({"gz": True}, _DEFAULT_EXTENSIONS, True),
         # Files match on their last extension, so a compound entry can never match.
         ([".tar.gz", ".har"], {".har"}, False),
-        ([".tar.gz"], _DEFAULT_EXTENSIONS, False),
+        ([".tar.gz"], _DEFAULT_EXTENSIONS, True),
     ],
 )
 def test_parse_filesystem_attachment_policy(

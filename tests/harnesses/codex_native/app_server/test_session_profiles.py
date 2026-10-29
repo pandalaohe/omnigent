@@ -316,13 +316,13 @@ def test_app_server_argv_carries_session_tag_as_config_override() -> None:
     assert argv[tag_index + 1] == needle
     assert argv == [
         "codex",
-        "app-server",
         "-c",
         needle,
-        "--listen",
-        "ws://127.0.0.1:9876",
         "-c",
         'model="probe-model"',
+        "app-server",
+        "--listen",
+        "ws://127.0.0.1:9876",
     ]
 
 

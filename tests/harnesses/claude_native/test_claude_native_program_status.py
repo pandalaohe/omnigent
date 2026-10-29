@@ -46,7 +46,7 @@ def _poller(
     turn_activity_epoch: Callable[[], int] | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> ClaudeProgramStatusPoller:
-    def on_status(status: str, _reason: str | None) -> None:
+    def on_status(status: str, _reason: str | None, _count: int | None) -> None:
         published.append(status)
 
     return ClaudeProgramStatusPoller(
@@ -153,7 +153,7 @@ def test_error_report_leaves_the_failed_edge_to_the_stop_failure_hook(
     )
     published: list[str] = []
 
-    def on_status(status: str, _reason: str | None) -> None:
+    def on_status(status: str, _reason: str | None, _count: int | None) -> None:
         published.append(status)
 
     poller = ClaudeProgramStatusPoller(

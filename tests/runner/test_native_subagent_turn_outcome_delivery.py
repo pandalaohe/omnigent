@@ -65,6 +65,7 @@ class _Rig:
         from omnigent.runner import app as runner_app
 
         self.runner_app = runner_app
+        self.harness = harness
         self.parent_id = uuid.uuid4().hex
         self.child_id = uuid.uuid4().hex
         self.inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -111,7 +112,7 @@ async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing(
     """Quiescence or compaction clears runner activity without completing the dispatch."""
     rig = _Rig(harness)
     try:
-        async with _runner_client(rig.app) as client:
+        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
             await rig.create_child_session(client)
             for data in ({"status": "running"}, {"status": "idle", "output": "partial text"}):
                 resp = await rig.post_status(client, data)
@@ -131,7 +132,7 @@ async def test_turn_completed_idle_delivers_completed_result(harness: str) -> No
     """The forwarder's confirmed turn-end edge still completes the dispatch."""
     rig = _Rig(harness)
     try:
-        async with _runner_client(rig.app) as client:
+        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
             await rig.create_child_session(client)
             for _ in range(2):  # A lost acknowledgment retries the same completed result.
                 resp = await rig.post_status(
@@ -155,7 +156,7 @@ async def test_quiescence_idle_for_legacy_native_harness_still_completes() -> No
     """
     rig = _Rig("cursor-native")
     try:
-        async with _runner_client(rig.app) as client:
+        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
             await rig.create_child_session(client)
             resp = await rig.post_status(client, {"status": "idle", "output": "done"})
             assert resp.status_code == 204, resp.text
@@ -225,7 +226,7 @@ async def test_interrupt_then_quiescence_idle_delivers_cancelled_with_output(
 
     rig = _Rig(harness)
     try:
-        async with _runner_client(rig.app) as client:
+        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
             await rig.create_child_session(client)
             resp = await client.post(
                 f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
@@ -267,7 +268,7 @@ async def test_settled_outcome_is_redelivered_on_retried_quiescence_idle(
 
     rig = _Rig("claude-native")
     try:
-        async with _runner_client(rig.app) as client:
+        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
             await rig.create_child_session(client)
             resp = await client.post(
                 f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
