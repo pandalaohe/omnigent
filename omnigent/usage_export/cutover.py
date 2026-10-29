@@ -14,7 +14,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
@@ -63,7 +63,7 @@ def _now() -> float:
 def _iso(epoch: float | None) -> str | None:
     if epoch is None:
         return None
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat().replace("+00:00", "Z")
 
 
 def _epoch(value: str | None) -> float | None:

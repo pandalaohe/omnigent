@@ -605,7 +605,7 @@ def create_comments_router(
         if screenshot_files is not None:
             try:
                 await asyncio.to_thread(screenshot_files.clean_expired_and_count, session_id)
-            except Exception:  # noqa: BLE001 - cleanup must not hide comments
+            except Exception:
                 logger.warning(
                     "Visitor screenshot cleanup failed for session %s", session_id, exc_info=True
                 )

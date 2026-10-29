@@ -2684,7 +2684,7 @@ def create_hosts_router(
                 )
                 if cancel_result.get("status") != "ok":
                     _logger.warning("Host failed to cancel expired login %s", login_id)
-            except Exception:  # noqa: BLE001 — expiry must still be reported
+            except Exception:
                 _logger.warning("Could not cancel expired host login %s", login_id, exc_info=True)
         response: dict[str, Any] = {
             "status": state.status,

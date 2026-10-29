@@ -106,7 +106,7 @@ class VisitorScreenshotFiles:
         for file_id in expired:
             try:
                 self.delete(file_id, session_id)
-            except Exception:  # noqa: BLE001 - retry failed cleanup on a later access
+            except Exception:
                 count += 1
                 logger.warning(
                     "Visitor screenshot cleanup failed for file %s", file_id, exc_info=True

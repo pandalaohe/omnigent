@@ -3466,7 +3466,7 @@ class _CodexAppServerSession:
                         "Codex Windows workspace permission profile disabled: "
                         "Codex version is unavailable"
                     )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Failed to probe Codex permission profile support", exc_info=True)
         if router_bridge_dir is not None:
             # Older CLIs keep the symlinked home without routing hooks.
@@ -3545,7 +3545,7 @@ class _CodexAppServerSession:
                 self._workspace_profile_cwd, self._workspace_profile = await asyncio.to_thread(
                     build_profile
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning("Failed to build Codex workspace permission profile", exc_info=True)
         # Override CODEX_HOME so Codex stores its data (including conversation
         # history) in a private temp directory rather than the user's ~/.codex/.
@@ -3685,7 +3685,7 @@ class _CodexAppServerSession:
                         source_home=config_source,
                         private_home=self._codex_home_dir,
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning("Codex user hook approval inheritance failed", exc_info=True)
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
@@ -3695,7 +3695,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -3806,7 +3806,7 @@ class _CodexAppServerSession:
                         terminate_tree=_terminate_process_tree,
                         kill_tree=_kill_process_tree,
                     )
-                except Exception:  # noqa: BLE001 - cleanup must continue
+                except Exception:
                     logger.warning("Codex worker cleanup failed", exc_info=True)
                     reaped = False
                 if not reaped:
@@ -3873,7 +3873,7 @@ class _CodexAppServerSession:
                     self._worker_launch_close_task = None
                     try:
                         launch_close_task.result()
-                    except Exception:  # noqa: BLE001 - cleanup must continue
+                    except Exception:
                         logger.warning("Codex worker launch cleanup failed", exc_info=True)
                         cleanup_complete = False
                     else:
@@ -3985,7 +3985,7 @@ class _CodexAppServerSession:
             await signer.wait()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
+        except Exception:
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
         if not self._closing and self._proc is not None:
@@ -4016,7 +4016,7 @@ class _CodexAppServerSession:
                 await signer.close()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - cleanup state records failure
+            except Exception:
                 logger.warning("model signer close failed", exc_info=True)
             else:
                 if self._signer is signer:
@@ -5099,7 +5099,7 @@ class _CodexAppServerSession:
             return "unknown", "codex_turn_steer_error"
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — a submitted steer may have reached Codex
+        except Exception:
             logger.debug("Codex peer turn/steer has no receipt", exc_info=True)
             return "unknown", "codex_turn_steer_error"
 
@@ -6120,7 +6120,7 @@ class CodexExecutor(Executor):
                     report(SDKPeerOutcome.for_input(delivery, "unknown", "codex_steer_cancelled"))
                 )
                 raise
-            except Exception:  # noqa: BLE001 — never fail or close the active turn
+            except Exception:
                 logger.debug("Codex peer submission has no receipt", exc_info=True)
                 outcome, source = "unknown", "codex_turn_steer_error"
         await report(SDKPeerOutcome.for_input(delivery, outcome, source))

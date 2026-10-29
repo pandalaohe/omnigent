@@ -8,6 +8,7 @@ import json
 import logging
 import time
 from dataclasses import replace
+from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -2871,17 +2872,17 @@ async def test_subagent_garbage_timestamp_never_reorders(
 
 def test_parse_record_timestamp_precision_shapes() -> None:
     """The timestamp parser normalises every stamp shape Claude emits."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     parse = forwarder._parse_record_timestamp
     assert parse(None) is None
     assert parse("") is None
     assert parse("not-a-timestamp") is None
     assert parse("2026-09-10T13:26:05.710Z") == datetime(
-        2026, 9, 10, 13, 26, 5, 710000, tzinfo=timezone.utc
+        2026, 9, 10, 13, 26, 5, 710000, tzinfo=UTC
     )
     assert parse("2026-09-10T13:26:05.710000Z") == parse("2026-09-10T13:26:05.710Z")
-    assert parse("2026-09-10T13:26:05Z") == datetime(2026, 9, 10, 13, 26, 5, tzinfo=timezone.utc)
+    assert parse("2026-09-10T13:26:05Z") == datetime(2026, 9, 10, 13, 26, 5, tzinfo=UTC)
     assert parse("2026-09-10T13:26:05.710+00:00") == parse("2026-09-10T13:26:05.710Z")
     assert forwarder._record_timestamp_is_newer(
         "2026-09-10T13:26:05.710999Z", "2026-09-10T13:26:05.710Z"

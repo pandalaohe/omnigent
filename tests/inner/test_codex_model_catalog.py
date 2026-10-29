@@ -415,9 +415,8 @@ def test_required_brokered_catalog_is_bundled_private_and_credential_free(
     monkeypatch: pytest.MonkeyPatch,
     wrapper: bool,
 ) -> None:
-    from unittest.mock import Mock
-
     import tomllib
+    from unittest.mock import Mock
 
     from omnigent.inner.codex_worker import CodexWorkerLaunch
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec

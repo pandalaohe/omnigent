@@ -697,7 +697,7 @@ def build_native_controls(
                         "detail": "Codex did not confirm the settings update in time.",
                     },
                 ), settings
-        except Exception as exc:  # noqa: BLE001 — surface app-server settings failures.
+        except Exception as exc:
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
                 conv_id,
@@ -963,7 +963,7 @@ def build_native_controls(
                 bridge = await _codex_native_bridge_state_for_session(
                     conv_id, action="permission profile"
                 )
-            except Exception:  # noqa: BLE001 - the preset switch already succeeded.
+            except Exception:
                 _logger.warning("Failed to read Codex permission profile", exc_info=True)
                 bridge = None
             if bridge is not None and bridge.permission_profile:
@@ -981,13 +981,13 @@ def build_native_controls(
                     )
                     if not selected:
                         _logger.warning("Codex permissions popup did not list omnigent-workspace")
-                except Exception:  # noqa: BLE001 - the confirmed preset switch already succeeded.
+                except Exception:
                     _logger.warning("Failed to select Codex permission profile row", exc_info=True)
                 try:
                     await apply_codex_thread_permissions(
                         bridge.socket_path, bridge.thread_id, bridge.permission_profile
                     )
-                except Exception:  # noqa: BLE001 - preserve the preset switch response.
+                except Exception:
                     _logger.warning("Failed to apply Codex permission profile", exc_info=True)
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
@@ -1056,7 +1056,7 @@ def build_native_controls(
             await asyncio.to_thread(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
             )
-        except Exception:  # noqa: BLE001 — write-back is best-effort
+        except Exception:
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
@@ -1387,7 +1387,7 @@ def build_native_controls(
                 await asyncio.to_thread(
                     confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
                 )
-            except Exception:  # noqa: BLE001 — best-effort; the report reconciles
+            except Exception:
                 _logger.debug(
                     "late model-dialog watch errored for session=%s",
                     conv_id,

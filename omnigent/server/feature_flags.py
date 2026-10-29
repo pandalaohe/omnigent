@@ -208,7 +208,7 @@ def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
     """Resolve a deployment gate for the current request; a failing gate is off."""
     try:
         return bool(gate() if callable(gate) else gate)
-    except Exception:  # noqa: BLE001 — deployment gates fail closed
+    except Exception:
         _logger.warning("%s gate failed; disabling it", name, exc_info=True)
         return False
 

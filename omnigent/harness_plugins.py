@@ -1212,7 +1212,7 @@ def plugin_state() -> HarnessPluginState:
             if error is not None:
                 raise ValueError(error)
             contributions.append(contribution)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             load_errors[entry_point.name] = str(exc)
             _logger.warning(
                 "could not load harness plugin entry point %s (%s)",
@@ -1445,7 +1445,7 @@ def harness_catalog() -> list[dict[str, object]]:
     # importable without pulling in the onboarding/config stack at module load.
     try:
         from omnigent.onboarding.harness_install import ui_setup_steps
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         ui_setup_steps = None  # type: ignore[assignment]
     rows: list[dict[str, object]] = []
@@ -1474,7 +1474,7 @@ def harness_catalog() -> list[dict[str, object]]:
             if acp_capability is not None:
                 acp_row["capabilities"] = acp_capability.as_dict()
             rows.append(acp_row)
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.debug("acp catalog rows skipped", exc_info=True)
     return rows
 
@@ -1495,7 +1495,7 @@ def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, str | None]]]:
     """
     try:
         from omnigent.onboarding.harness_install import ui_installable_harnesses, ui_setup_steps
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         return {}
     # Cover the picker ids (catalog rows) plus every installable spelling

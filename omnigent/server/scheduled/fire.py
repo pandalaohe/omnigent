@@ -1343,7 +1343,7 @@ async def _task_project(deps: FireDeps, task: ScheduledTask) -> Project | None:
     owner = task.user_id if task.user_id is not None else deps.single_user_owner
     try:
         project = await asyncio.to_thread(deps.project_store.get, task.project_id, user_id=owner)
-    except Exception:  # noqa: BLE001 — a project read must never fail a fire
+    except Exception:
         _logger.warning(
             "scheduled fire: could not load project %s for task %s; using master layers",
             task.project_id,
@@ -2451,7 +2451,7 @@ class ClaimedRunExecutor:
                 )
                 await self._fail_revoked_fire(task, recorder)
                 return
-            except Exception:  # noqa: BLE001 — record a failed run on identity failure
+            except Exception:
                 _logger.warning(
                     "scheduled fire: could not act as the owner of task %s", task.id, exc_info=True
                 )
@@ -2468,7 +2468,7 @@ class ClaimedRunExecutor:
         # fire path does, instead of asking a deleted account to re-authorize.
         try:
             deleted = await _owner_is_deleted(self._deps, task)
-        except Exception:  # noqa: BLE001 — unavailable owner check must not disable a task
+        except Exception:
             _logger.warning(
                 "scheduled fire: could not check the owner of task %s", task.id, exc_info=True
             )

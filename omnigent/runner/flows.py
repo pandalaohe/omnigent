@@ -168,7 +168,7 @@ async def read_flow_timer_enabled(server_client: httpx.AsyncClient, session_id: 
                 )
             return True
         body = resp.json()
-    except Exception:  # noqa: BLE001 — any failure reads as the default
+    except Exception:
         _logger.warning(
             "collab-settings read failed; flow timer stays on",
             exc_info=True,
@@ -221,7 +221,7 @@ async def session_lineage_archived(server_client: httpx.AsyncClient, session_id:
             if not isinstance(parent_id, str) or not parent_id:
                 return False
             current_id = parent_id
-    except Exception:  # noqa: BLE001 — a failed check keeps today's behaviour
+    except Exception:
         _logger.warning(
             "session archive lineage check failed for %s; keeping today's behaviour",
             session_id,

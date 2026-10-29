@@ -1362,7 +1362,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
                     " > ".join(("opus", "sonnet", "haiku", "fable")),
                 )
                 return servable
-    except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+    except Exception:
         logger.warning(
             "claude-sdk: live Databricks model discovery failed for profile %r; "
             "falling back to the bundled catalog",
@@ -1434,7 +1434,7 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     )
     try:
         listing = model_catalog.listing_for_provider(provider)
-    except Exception:  # noqa: BLE001 — best-effort; unpinned aliases are the safe default
+    except Exception:
         logger.warning(
             "claude-sdk: could not list the gateway's models; leaving "
             "ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset",
@@ -4264,7 +4264,7 @@ class ClaudeSDKExecutor(Executor):
                     for message in messages
                     if isinstance(message.message, dict)
                 ]
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Failed to read Claude post-compaction session messages "
                     "(session=%s); preserving full server history instead of "

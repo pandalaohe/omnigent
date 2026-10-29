@@ -297,7 +297,7 @@ class RunnerSessionInitializer:
                     self._project_host_binding_store.list_by_project, conversation.project_id
                 ),
             )
-        except Exception:  # noqa: BLE001 — a store failure must not block the start
+        except Exception:
             _logger.warning(
                 "Could not load project code locations for session %s",
                 conversation.id,

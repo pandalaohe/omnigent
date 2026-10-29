@@ -3674,7 +3674,7 @@ class PiExecutor(Executor):
                 workspace_url,
                 self._databricks_token,
             )
-        except Exception:  # noqa: BLE001 — catalog outage uses conservative routing
+        except Exception:
             logger.warning(
                 "Pi could not fetch Databricks model metadata; "
                 "the picker will show only the selected model",
@@ -3691,7 +3691,7 @@ class PiExecutor(Executor):
             models = await run_sync_on_thread(
                 enrich_databricks_model_catalog, models, metadata_models
             )
-        except Exception:  # noqa: BLE001 — live availability remains authoritative
+        except Exception:
             logger.info(
                 "Pi could not enrich the live Databricks model list with MLflow metadata",
                 exc_info=True,
@@ -4062,7 +4062,7 @@ class PiExecutor(Executor):
                 {"type": "get_available_thinking_levels", "id": "thinking_levels"},
                 "get_available_thinking_levels",
             )
-        except Exception:  # noqa: BLE001 — a probe failure must not sink the turn
+        except Exception:
             logger.debug("PiExecutor: get_available_thinking_levels failed", exc_info=True)
             return None
         data = response.get("data") if response else None
@@ -4091,7 +4091,7 @@ class PiExecutor(Executor):
                     {"type": "get_messages", "id": "compacted_messages"},
                     "get_messages",
                 )
-            except Exception:  # noqa: BLE001 — a failed export still persists the summary
+            except Exception:
                 logger.debug("PiExecutor: get_messages failed after compaction", exc_info=True)
         data = response.get("data") if response else None
         pi_messages = data.get("messages") if isinstance(data, dict) else None
@@ -4144,7 +4144,7 @@ class PiExecutor(Executor):
                             latest = event.get("result")
                             if isinstance(latest, dict) and isinstance(latest.get("summary"), str):
                                 result = latest
-            except Exception:  # noqa: BLE001 — preserve the summary if abort or settlement fails
+            except Exception:
                 logger.debug(
                     "PiExecutor: compaction settlement failed before eviction", exc_info=True
                 )

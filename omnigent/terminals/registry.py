@@ -380,7 +380,7 @@ class TerminalRegistry:
                             conversation_id=conversation_id,
                             kind="tmux",
                         )
-                except Exception:  # noqa: BLE001 — owner bookkeeping is best-effort
+                except Exception:
                     logger.debug("tmux owner-file write failed", exc_info=True)
         except BaseException as exc:
             # Until registration, no shutdown sweep can discover this instance.
