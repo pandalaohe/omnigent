@@ -184,6 +184,71 @@ def test_shell_impl_environment_overrides_are_per_command(tmp_path: Path, monkey
     assert os.environ["PI_SESSION_ID"] == "unrelated"
 
 
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_shell_impl_replaces_undecodable_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    popen = subprocess.Popen
+
+    def ascii_popen(*args, **kwargs):
+        return popen(*args, encoding="ascii", **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", ascii_popen)
+    result = _shell_impl(
+        command=(
+            "import sys; "
+            "sys.stdout.buffer.write(b'out\\xff'); "
+            "sys.stderr.buffer.write(b'err\\xff'); "
+            f"sys.exit({exit_code})"
+        ),
+        timeout=10,
+        shell_path=sys.executable,
+        cwd=tmp_path,
+    )
+
+    assert result["stdout"] == "out\ufffd"
+    assert result["stderr"] == "err\ufffd"
+    assert result["exit_code"] == exit_code
+    assert result["timed_out"] is False
+    if exit_code:
+        assert result["error"] == "Command exited with status 7: err\ufffd"
+    else:
+        assert "error" not in result
+
+
+@pytest.mark.parametrize("missing_stream", ["stdout", "stderr", "both"])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_shell_impl_handles_missing_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_stream: str, exit_code: int
+) -> None:
+    communicate = subprocess.Popen.communicate
+
+    def missing_output(process, *args, **kwargs):
+        stdout, stderr = communicate(process, *args, **kwargs)
+        return (
+            None if missing_stream in ("stdout", "both") else stdout,
+            None if missing_stream in ("stderr", "both") else stderr,
+        )
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", missing_output)
+    result = _shell_impl(
+        command=f"import sys; print('out'); print('err', file=sys.stderr); sys.exit({exit_code})",
+        timeout=10,
+        shell_path=sys.executable,
+        cwd=tmp_path,
+    )
+
+    assert result["stdout"] == ("out\n" if missing_stream == "stderr" else "")
+    assert result["stderr"] == ("err\n" if missing_stream == "stdout" else "")
+    assert result["exit_code"] == exit_code
+    assert result["timed_out"] is False
+    if exit_code:
+        detail = {"stdout": ": err", "stderr": ": out", "both": ""}[missing_stream]
+        assert result["error"] == f"Command exited with status 7{detail}"
+    else:
+        assert "error" not in result
+
+
 def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
     """Timed-out shell commands still return the documented result fields."""
     shell_path = shutil.which("bash") or shutil.which("sh")
