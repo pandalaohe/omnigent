@@ -112,6 +112,13 @@ function binding(record, event, state) {
     arguments_digest: digest(event.input), tier_revision: state.revision };
 }
 function failed(bound, reason) { return { binding: bound, status: "failed_native", action: "ordinary", reason }; }
+function validNativeOptions(options) {
+  return !(options.context !== undefined && !["fresh", "fork"].includes(options.context)) &&
+    !(options.agentScope !== undefined && !["user", "project", "both"].includes(options.agentScope)) &&
+    !["timeoutMs", "toolTimeoutMs"].some(key => key in options && !integer(options[key])) &&
+    !("includeProgress" in options && typeof options.includeProgress !== "boolean") &&
+    !("maxOutput" in options && (!allowed(options.maxOutput, ["bytes", "lines"]) || !Object.values(options.maxOutput).every(value => integer(value))));
+}
 function semanticAction(name, input, record) {
   const r = rules();
   const sameCwd = value => text(value) && path.resolve(record.workspace, value) === record.workspace &&
@@ -137,11 +144,7 @@ function semanticAction(name, input, record) {
   }
   if (!allowed(input, r.run_keys) || typeof input.async !== "boolean") return null;
   const options = input.options === undefined ? {} : input.options;
-  if (!allowed(options, r.option_keys) || !(options.context === undefined || ["fresh", "fork"].includes(options.context)) ||
-      !(options.agentScope === undefined || ["user", "project", "both"].includes(options.agentScope)) ||
-      ["timeoutMs", "toolTimeoutMs"].some(key => key in options && !integer(options[key])) ||
-      ("includeProgress" in options && typeof options.includeProgress !== "boolean") ||
-      ("maxOutput" in options && (!allowed(options.maxOutput, ["bytes", "lines"]) || !Object.values(options.maxOutput).every(value => integer(value))))) return null;
+  if (!allowed(options, r.option_keys) || !validNativeOptions(options)) return null;
   const forms = ["agent", "tasks", "chain"].filter(key => key in input);
   if (forms.length !== 1) return null;
   const steps = forms[0] === "agent" ? [input] : input[forms[0]];
@@ -192,7 +195,16 @@ function overrides(settings, name, provider) {
   }
   const selected=groups.filter(group => group !== undefined).map(group => {
     if (!plain(group) || name in group && !plain(group[name])) throw new Error("Invalid native agent override");
-    return group[name];
+    const value=group[name];
+    if(value===undefined) return undefined;
+    if("runner" in value || "launcher" in value || "fallbackModels" in value) throw new Error("Unreviewed runner/launcher override");
+    // The package drops entries containing only ignored fields before precedence is applied.
+    const keys=["description","advertise","output","outputMode","model","fast","thinking","systemPromptMode",
+      "inheritProjectContext","inheritGlobalContext","inheritSkills","defaultContext","acceptanceRole","disabled",
+      "toolBudget","systemPrompt","machine","defaultReads","defaultProvider","skills","tools","excludeTools",
+      "allowNestedSubagents","allowedAgents","extensions","subagentOnlyExtensions","mutationTools"];
+    const normalized=Object.fromEntries(Object.entries(value).filter(([key])=>keys.includes(key)));
+    return Object.keys(normalized).length?normalized:undefined;
   });
   const merged=Object.assign(Object.create(null),...selected.filter(value=>value!==undefined));
   if("runner" in merged || "launcher" in merged) throw new Error("Unreviewed runner/launcher override");
@@ -258,6 +270,15 @@ function placement(value) {
   return outside;
 }
 
+function normalizeSharing(input) {
+  const nested=plain(input.options)?input.options.share:undefined;
+  if(input.share===undefined && nested===undefined) return input;
+  if((input.share!==undefined&&typeof input.share!=="boolean") || (nested!==undefined&&typeof nested!=="boolean") ||
+      (input.share!==undefined&&nested!==undefined&&input.share!==nested)) throw new Error("Invalid or conflicting sharing options");
+  const normalized={...input,share:input.share??nested};
+  if(plain(input.options)) {normalized.options={...input.options};delete normalized.options.share;}
+  return normalized;
+}
 function outsideAction(name,input,record) {
   if(name!=="subagent") return null;
   if(input.share===true) {
@@ -268,7 +289,7 @@ function outsideAction(name,input,record) {
     "mission.create","mission.list","mission.show","mission.update","mission.resolve-decision","mission.attach-run","mission.close",
     "worktree.discard","worktree.cleanup","lane.status","lane.recordMerge","lane.recordSupersession",
     "refine","refine.show","refine.rollback","inspector.open","inspector.command","inspector.close",
-    "project.open","project.status","project.close","debug.run","grant-spawn-budget","resume","command.status",
+    "project.open","project.status","project.close","debug.run","grant-spawn-budget","command.status",
     "watchdog.status","watchdog.check","watchdog.configure","watchdog.recommend-model",
     "schedule.create","schedule.list","schedule.show","schedule.history","schedule.pause","schedule.resume","schedule.run","schedule.run-due","schedule.delete"];
   const fields=["action","agent","task","name","id","runId","cwd","dir","handoffPath","repo","planId","laneId","merge","supersession",
@@ -276,8 +297,14 @@ function outsideAction(name,input,record) {
     "at","every","sessionOnly","quiet","on","timezone","overlap","catchUp","missionId","mission","missionUpdate","missionStatus","missionScope",
     "runMode","runStatus","summary","config","workflow","args","async","options"];
   if(!actions.includes(input.action)||!allowed(input,fields)) return null;
-  if("cwd" in input&&(!text(input.cwd)||path.resolve(record.workspace,input.cwd)!==record.workspace)) return null;
-  if(Object.entries(input).some(([key,value])=>["agent","task","name","id","runId","cwd","at","every","message","mode"].includes(key)&&!text(value))) return null;
+  // Resume needs retained-launch evidence; a tool action name does not identify its target.
+  const options=input.options===undefined?{}:input.options;
+  const topOnly=["action","agent","task","id","cwd","message","async","workflow","args","options"];
+  if(!allowed(options,[...rules().option_keys,...fields.filter(key=>!topOnly.includes(key))]) || !validNativeOptions(options)) return null;
+  if(Object.entries(options).some(([key,value])=>input[key]!==undefined&&canonicalJson(input[key])!==canonicalJson(value))) return null;
+  const values={...input,...options};
+  if("cwd" in values&&(!text(values.cwd)||path.resolve(record.workspace,values.cwd)!==record.workspace)) return null;
+  if(Object.entries(values).some(([key,value])=>["agent","task","name","id","runId","cwd","at","every","message","mode","topic"].includes(key)&&!text(value))) return null;
   return input.action.startsWith("schedule.")?"schedule":"management";
 }
 async function classifyNativeCall(event, ctx, state) {
@@ -308,11 +335,12 @@ async function classifyNativeCall(event, ctx, state) {
       if (/^(?:npm:)?pi-subagents(?:@|$)/.test(tool.sourceInfo?.source || "")) return failed(bound, "Native helper source is unavailable");
       return {binding: bound, status:"attested_native", action:"ordinary", inputs};
     }
-    const unsupported=outsideAction(event.toolName,event.input,record);
+    const normalized=event.toolName==="subagent"?normalizeSharing(event.input):event.input;
+    const unsupported=outsideAction(event.toolName,normalized,record);
     if(unsupported&&unsupported!=="gist") return {binding:bound,status:"outside_native_support",action:"ordinary",outside_kind:unsupported,
       reason:"Established package action outside native support",inputs,semantics_digest:digest(event.input)};
-    const executionInput={...event.input};
-    if(unsupported==="gist") delete executionInput.share;
+    const executionInput={...normalized};
+    if(event.toolName==="subagent") delete executionInput.share;
     const action = semanticAction(event.toolName, executionInput, record);
     if (!action) return failed(bound, "Native helper input, action or cwd is outside the admitted subset");
     if (action !== "delegate") return {binding:bound, status:"attested_native", action, inputs, semantics_digest:digest({action, bound, inputs})};

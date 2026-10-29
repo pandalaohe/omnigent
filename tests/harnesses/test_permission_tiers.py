@@ -791,6 +791,49 @@ def test_unparsed_sed_writes_are_unapprovable_below_full(tier, command):
     assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo sed",
+        "rg sed file.py",
+        "printf '%s' sed",
+        "echo /usr/bin/sed",
+        "env X=1 echo sed",
+        "command -v sed",
+        "command -p -V sed",
+        "sudo -u root echo sed",
+        "sh -c 'echo sed'",
+    ],
+)
+def test_sed_as_an_ordinary_argument_keeps_shell_policy(command: str) -> None:
+    for tier, expected in [
+        ("ask", Verdict.ASK),
+        ("accept-edits", Verdict.ASK),
+        ("auto", Verdict.ALLOW),
+    ]:
+        assert decision(tier, "bash", {"command": command}).action == expected
+    assert decision("plan", "bash", {"command": command}).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "",
+        "X=1 ",
+        "env ",
+        "env -u FLAG X=1 ",
+        "sudo -u root ",
+        "command -p -- ",
+        "builtin ",
+        "if true; then ",
+    ],
+)
+def test_wrapped_sed_writes_keep_unapprovable_script_guard(prefix: str) -> None:
+    command = prefix + "sed -f script.sed input.txt"
+    for tier in NON_FULL_TIERS:
+        assert decision(tier, "bash", {"command": command}).action == Verdict.DENY
+
+
 def test_shell_continued_write_target_does_not_bind_as_workspace_file() -> None:
     command = "echo x > " + "\\\n" + "/usr/local/probe"
     assert decision("auto", "bash", {"command": command}).action == Verdict.DENY

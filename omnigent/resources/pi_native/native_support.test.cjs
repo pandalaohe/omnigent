@@ -259,21 +259,66 @@ test("known outside actions and Gist produce explicit outside facts",async t=>{
   const cases=[
     ...["schedule.list","schedule.show","schedule.history","schedule.pause","schedule.resume","schedule.run","schedule.run-due","schedule.delete"].map(action=>({action,...action==="schedule.list"||action==="schedule.run-due"?{}:{id:"schedule"}})),
     {action:"schedule.create",name:"fixture",agent:"reader",task:"read",at:"+10m"},
-    {action:"mission.list"},{action:"project.status"},{action:"resume",id:"run"},
+    {action:"mission.list"},{action:"project.status"},
+    {action:"schedule.list",options:{topic:"fixture",agentScope:"both"}},
     {action:"create",agent:"reader",config:{description:"fixture"}},
     {action:"worktree.cleanup",mode:"plan"},
     {agent:"reader",task:"read",async:false,share:true},
+    {agent:"reader",task:"read",async:false,options:{share:true}},
+    {agent:"reader",task:"read",async:false,share:true,options:{share:true,timeoutMs:1000}},
   ];
   for(const input of cases) await t.test(JSON.stringify(input),async t=>{
     const f=await fixture(t);
     const fact=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state);
     assert.equal(fact.status,"outside_native_support");
-    assert.equal(fact.outside_kind,input.share?"gist":input.action.startsWith("schedule.")?"schedule":"management");
+    assert.equal(fact.outside_kind,input.share||input.options?.share?"gist":input.action.startsWith("schedule.")?"schedule":"management");
   });
   for(const input of [{action:"schedule.future"},{action:"schedule.list",unknown:true},{agent:"reader",task:"read",async:false,share:"yes"}]) {
     const f=await fixture(t);
     assert.equal((await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state)).status,"failed_native");
   }
+});
+test("resume and unknown outside options cannot bypass retained launch proof",async t=>{
+  for(const definition of [{name:"reader"},{launcher:"retained-broker"},{machine:"host"}]) await t.test(JSON.stringify(definition),async t=>{
+    const f=await fixture(t,{definition});
+    // No retained launch is bound to this id, even if the current agent looks remote.
+    assert.equal((await f.run("subagent",{action:"resume",id:"retained-run"}))?.block,true);
+    assert.equal(f.policyCalls(),0);
+    assert.equal(f.backendStarts(),0);
+  });
+  for(const options of [{unknown:true},null,[],{agentScope:"unknown"}]) await t.test(JSON.stringify(options),async t=>{
+    const f=await fixture(t);
+    assert.equal((await f.run("subagent",{action:"schedule.list",options}))?.block,true);
+    assert.equal(f.policyCalls(),0);
+    assert.equal(f.backendStarts(),0);
+  });
+});
+test("empty and ignored-only builtin overrides preserve effective placement",async t=>{
+  for(const project of [{},{ignored:true},{name:"ignored",prompt:"ignored"}]) await t.test(JSON.stringify(project),async t=>{
+    const f=await fixture(t,{definitionSource:"builtin",projectTrusted:true,
+      settings:{subagents:{agentOverrides:{reader:{machine:"host"}}}},
+      projectSettings:{subagents:{agentOverrides:{reader:project}}}});
+    const fact=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input:{agent:"reader",task:"read",async:false}},f.ctx,f.state);
+    assert.equal(fact.status,"outside_native_support");
+    assert.equal(fact.outside_kind,"remote");
+  });
+});
+test("public sharing options preserve launcher and configuration fences",async t=>{
+  for(const [definition,input] of [
+    [{launcher:"broker"},{options:{share:true}}],
+    [{worktree:true},{options:{share:true}}],
+    [{name:"reader"},{share:false,options:{share:true}}],
+    [{name:"reader"},{options:{share:"yes"}}],
+    [{name:"reader"},{options:{share:true,unknown:true}}],
+  ]) await t.test(JSON.stringify({definition,input}),async t=>{
+    const f=await fixture(t,{definition});
+    assert.equal((await f.run("subagent",{agent:"reader",task:"read",async:false,...input}))?.block,true);
+    assert.equal(f.policyCalls(),0);
+    assert.equal(f.backendStarts(),0);
+  });
+  const f=await fixture(t);
+  const fact=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input:{agent:"reader",task:"read",async:false,options:{share:false}}},f.ctx,f.state);
+  assert.equal(fact.status,"attested_native");
 });
 test("native argument digests conform to Python over legal JSON shapes",async t=>{
   const cases=JSON.parse(process.env.OMNIGENT_NATIVE_DIGEST_CASES||"[]");
