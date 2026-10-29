@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from tests._helpers.live_server import isolated_process_env
 from tests._helpers.polling import poll_until
@@ -325,3 +327,106 @@ def test_hold_refuses_input_drains_reads_receipt_and_releases(tmp_path: Path) ->
                 str(consumer_file),
             )
             assert released["result"] == "released"
+
+
+def test_config_reader_real_accounts_app_cutover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.host_store import HostStore
+    from omnigent.usage_export.cutover import UsageCutoverStore
+    from omnigent.usage_export.store import UsageEventStore
+    from tests.server.test_accounts import _build_accounts_app, _login
+    from tests.stores.test_usage_event_store import (
+        _consumer_receipt,
+        _drain_facts,
+        _rescan,
+        _sealed,
+    )
+
+    token = "fake_usage_" + secrets.token_urlsafe(32)
+    monkeypatch.setenv("OMNIGENT_USAGE_READ_TOKEN", f"admin:{token}")
+    monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    fixture = _build_accounts_app(tmp_path, monkeypatch, init_admin_password="admin-pw-12345")
+    try:
+        owner = _login(next(fixture), "admin", "admin-pw-12345")
+        uri = f"sqlite:///{tmp_path / 'test.db'}"
+        account = SqlAlchemyAccountStore(uri).get_user("admin")
+        assert account is not None
+        feed = UsageEventStore(uri)
+        cutover = UsageCutoverStore(uri)
+        with account_authority_scope("admin", account.account_generation):
+            HostStore(uri).upsert_on_connect(_HOST, "test-host", "admin")
+            owner.app.state.host_registry.register(
+                _HOST,
+                AsyncMock(),
+                HostHelloFrame(version="test", frame_protocol_version=1, name="test-host"),
+                "admin",
+            )
+            feed.append(
+                "admin",
+                _sealed(
+                    "a", host_id=_HOST, harness="claude-sdk", occurred_at="2025-12-31T23:58:59Z"
+                ),
+            )
+            cutover.create_hold("admin", _HOST, "claude-sdk", 1)
+            drained = cutover.submit_drain("admin", _HOST, "claude-sdk", 1, _drain_facts())
+        reader = TestClient(owner.app, headers={"Authorization": f"Bearer {token}"})
+        page = reader.get("/v1/usage-events")
+        assert page.status_code == 200, page.text
+        assert len(page.json()["events"]) == 1
+        assert (
+            reader.get(
+                "/v1/usage-events", params={"cursor": page.json()["next_cursor"]}
+            ).status_code
+            == 200
+        )
+        receipts = reader.get(
+            "/v1/usage-cutover/receipts",
+            params={
+                "host_id": _HOST,
+                "harness": "claude-sdk",
+                "generation": 1,
+            },
+        )
+        assert receipts.status_code == 200, receipts.text
+        assert receipts.json()["receipts"][-1]["digest"] == drained["digest"]
+        for method, path in [
+            ("POST", "/v1/usage-observations"),
+            ("GET", "/v1/sessions"),
+            ("GET", f"/v1/usage-cutover/holds/{_HOST}/claude-sdk"),
+        ]:
+            assert reader.request(method, path, json={}).status_code == 401
+        anonymous = TestClient(owner.app)
+        plain = anonymous.get("/auth/users")
+        supplied = reader.get("/auth/users")
+        # The configured account is admin, so leaking its identity would return 200.
+        assert supplied.status_code == plain.status_code == 403
+        assert supplied.json() == plain.json() == {"error": "admin only"}
+        for path in ("/health", "/api/version"):
+            plain = anonymous.get(path)
+            supplied = reader.get(path)
+            assert supplied.status_code == plain.status_code == 200
+            assert supplied.json().keys() == plain.json().keys()
+        released = owner.post(
+            f"/v1/usage-cutover/holds/{_HOST}/claude-sdk/1/release",
+            json={
+                "consumer_receipt": _consumer_receipt(
+                    drained, usage_read_grant_id="config:usage-read"
+                ),
+                "cutover_at": "2026-01-01T00:00:00Z",
+                "rescan": _rescan(),
+            },
+        )
+        assert released.status_code == 200, released.text
+        assert released.json()["result"] == "released"
+    finally:
+        fixture.close()

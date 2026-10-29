@@ -41,6 +41,7 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
+from omnigent.server.auth import USAGE_READ_TOKEN_PRINCIPAL
 from omnigent.usage_export.models import AccountHint, thread_key
 from omnigent.usage_export.store import UsageExportError
 
@@ -1584,6 +1585,7 @@ class UsageCutoverStore:
         consumer_receipt: dict[str, Any],
         cutover_at: str | None,
         rescan: dict[str, Any],
+        config_reader_user: str | None = None,
     ) -> dict[str, Any]:
         canonical_host = _identifier(host_id)
         feed_harness = _harness(harness)
@@ -1663,19 +1665,23 @@ class UsageCutoverStore:
             ):
                 raise UsageExportError(409, "consumer_not_acked")
             grant_id = consumer_receipt.get("usage_read_grant_id")
-            grant = (
-                session.get(SqlDeviceGrant, (workspace_id, grant_id))
-                if isinstance(grant_id, str)
-                else None
-            )
-            if (
-                grant is None
-                or grant.user_id != owner_id
-                or grant.scope != "usage:read"
-                or decode_device_grant_status(grant.status) != "redeemed"
-                or _digest(owner_id, grant.account_generation) != owner_digest
-            ):
-                raise UsageExportError(409, "consumer_not_acked")
+            if grant_id == USAGE_READ_TOKEN_PRINCIPAL:
+                if config_reader_user != owner_id:
+                    raise UsageExportError(409, "consumer_not_acked")
+            else:
+                grant = (
+                    session.get(SqlDeviceGrant, (workspace_id, grant_id))
+                    if isinstance(grant_id, str)
+                    else None
+                )
+                if (
+                    grant is None
+                    or grant.user_id != owner_id
+                    or grant.scope != "usage:read"
+                    or decode_device_grant_status(grant.status) != "redeemed"
+                    or _digest(owner_id, grant.account_generation) != owner_digest
+                ):
+                    raise UsageExportError(409, "consumer_not_acked")
             if last_sequence is not None:
                 positions = json.loads(
                     self.feed_row(session, workspace_id, owner_digest).grant_positions or "{}"

@@ -756,6 +756,69 @@ def test_drain_merges_thread_evidence_and_release_cas(
     assert done.value.code == "not_drained"
 
 
+@pytest.mark.parametrize(
+    ("config_user", "position", "allowed"),
+    [
+        ("alice", 1, True),
+        (None, 1, False),
+        ("bob", 1, False),
+        ("alice", None, False),
+        ("alice", 0, False),
+    ],
+)
+def test_config_reader_release_requires_owner_and_recorded_position(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_user: str | None,
+    position: int | None,
+    allowed: bool,
+) -> None:
+    from omnigent.usage_export.cutover import UsageCutoverStore
+
+    uri = f"sqlite:///{tmp_path / 'usage.db'}"
+    feed = UsageEventStore(uri)
+    host = uuid.uuid4().hex
+    feed.append(
+        "alice",
+        _sealed("a", host_id=host, harness="claude-sdk", occurred_at="2025-12-31T23:58:59Z"),
+    )
+    store = UsageCutoverStore(uri)
+    monkeypatch.setattr("omnigent.usage_export.cutover._now", lambda: 1767225600)
+    store.create_hold("alice", host, "claude-sdk", 1)
+    drained = store.submit_drain("alice", host, "claude-sdk", 1, _drain_facts())
+    if position == 0:
+        feed.page("alice", grant_id="config:usage-read")
+    elif position == 1:
+        page = feed.page("alice")
+        feed.page("alice", cursor=page["next_cursor"], grant_id="config:usage-read")
+    consumer = _consumer_receipt(drained, usage_read_grant_id="config:usage-read")
+    if allowed:
+        released = store.release(
+            "alice",
+            host,
+            "claude-sdk",
+            1,
+            consumer,
+            "2026-01-01T00:00:00Z",
+            _rescan(),
+            config_reader_user=config_user,
+        )
+        assert released["result"] == "released"
+    else:
+        with pytest.raises(UsageExportError) as error:
+            store.release(
+                "alice",
+                host,
+                "claude-sdk",
+                1,
+                consumer,
+                "2026-01-01T00:00:00Z",
+                _rescan(),
+                config_reader_user=config_user,
+            )
+        assert error.value.code == "consumer_not_acked"
+
+
 def test_release_refuses_each_condition_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
