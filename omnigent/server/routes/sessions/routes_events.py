@@ -43,6 +43,13 @@ from omnigent.entities.conversation import (
     MessageData,
     parse_item_data,
 )
+from omnigent.entities.subagent_retry import (
+    ControlInputReference,
+    ControlInputResolution,
+    InputExecutionClaim,
+    InputExecutionReceipt,
+    RetryExecutionGuard,
+)
 from omnigent.entities.subagent_terminal import (
     TERMINAL_IDENTITY_LABEL_PREFIX,
     TurnIdentity,
@@ -327,6 +334,19 @@ from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
 )
+from omnigent.server.subagent_retry_admission import (
+    ControlDeliveryRefused,
+    ControlDispatch,
+    RetryDispatchRefused,
+    RetryInputControl,
+    SubagentRetryAdmission,
+    active_retry_dispatch,
+    control_dispatch_scope,
+    control_not_sent,
+    control_transport_event,
+    control_was_not_sent,
+    retry_dispatch_scope,
+)
 from omnigent.server.user_preferences_store import read_keep_warm_settings
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
@@ -416,6 +436,10 @@ async def _deliver_interrupt_once(
                 "The runner rejected the interrupt with status "
                 f"{runner_result.status_code}. The turn is still running; try again."
             )
+        if control_was_not_sent() or (
+            runner_result is not None and 400 <= runner_result.status_code < 500
+        ):
+            raise ControlDeliveryRefused(message, code=ErrorCode.RUNNER_UNAVAILABLE)
         raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE)
     if runner_result.body:
         try:
@@ -1451,8 +1475,6 @@ def register_events_routes(
                 await _record_touch(request, session_id, user_id)
             return ack
 
-    router.include_router(event_router)
-
     async def _peer_post_event(
         request: Request,
         session_id: str,
@@ -1716,7 +1738,7 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
-    async def _post_event_impl(
+    async def _post_event_core(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
         body: SessionEventInput,
@@ -1834,6 +1856,21 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if body.type == "message":
+            for key in (
+                "retry_guard",
+                "input_admission_required",
+                "input_id",
+                "input_generation",
+                "_input_admission_required",
+                "input_admission_deadline",
+            ):
+                body.data.pop(key, None)
+            if (
+                conv.parent_conversation_id
+                and getattr(request.app.state, "subagent_retry_admission", None) is not None
+            ):
+                body.data["_input_admission_required"] = True
         if conv.labels.get(SUCCEEDED_BY_LABEL_KEY):
             target_id = await asyncio.to_thread(
                 resolve_succeeded_by, conversation_store, session_id
@@ -2663,16 +2700,23 @@ def register_events_routes(
                     try:
                         interrupt_resp = await runner_client.post(
                             f"/v1/sessions/{target_session_id}/events",
-                            json=interrupt_payload,
+                            json=control_transport_event(interrupt_payload),
                             timeout=5.0,
                         )
                         interrupt_delivered = interrupt_resp.status_code < 400
+                        if 400 <= interrupt_resp.status_code < 500:
+                            raise ControlDeliveryRefused(
+                                "The runner refused the side-chat interrupt.",
+                                code=ErrorCode.RUNNER_UNAVAILABLE,
+                            )
                     except (httpx.HTTPError, ConnectionError):
                         # WSTunnelTransport raises bare ConnectionError on tunnel close.
                         _logger.exception(
                             "Interrupt forward failed for %r",
                             session_id,
                         )
+                else:
+                    control_not_sent()
                 if not interrupt_delivered:
                     raise OmnigentError(
                         "Couldn't interrupt the side chat. Please try again.",
@@ -3419,6 +3463,49 @@ def register_events_routes(
             )
             # Input generations come from server admission, not native status producers.
             data.pop("input_generation", None)
+            service = getattr(request.app.state, "subagent_retry_admission", None)
+            native_identity = TurnIdentity.from_data(data)
+            if (
+                isinstance(service, SubagentRetryAdmission)
+                and conv.parent_conversation_id
+                and conv.runner_id
+                and _has_bound_runner_authority(request, conv)
+                and native_identity.turn_id
+                and native_identity.input_id
+                and data.get("event_kind") != "dispatch_failed"
+                and data.get("recovered") is not True
+            ):
+                stored = await asyncio.to_thread(
+                    service.journal.get_input, native_identity.input_id
+                )
+                native_generation = data.get("native_generation")
+                native_generation = (
+                    native_generation
+                    if type(native_generation) is int and native_generation > 0
+                    else None
+                )
+                observed = None
+                if stored is not None and stored.state in {"reserved", "accepted"}:
+                    observed = await asyncio.to_thread(
+                        service.journal.bind_native_turn,
+                        session_id,
+                        input_id=native_identity.input_id,
+                        turn_id=native_identity.turn_id,
+                        runner_id=conv.runner_id,
+                        native_generation=native_generation,
+                    )
+                elif stored is None and native_generation is not None:
+                    observed = await service.admit_execution(
+                        session_id,
+                        InputExecutionClaim(
+                            input_id=native_identity.input_id,
+                            turn_id=native_identity.turn_id,
+                            native_generation=native_generation,
+                        ),
+                        runner_id=conv.runner_id,
+                    )
+                if observed is not None and observed.accepted and observed.receipt is not None:
+                    data["input_generation"] = observed.receipt.input_generation
             # Forward only the same bounded, typed display detail that the
             # Server accepted. The Runner retains this across reconnects, so
             # raw/nested/oversized task objects must not become resident there.
@@ -4769,6 +4856,15 @@ def register_events_routes(
                 raise OmnigentError(
                     "Invalid question reply comments.", code=ErrorCode.INVALID_INPUT
                 )
+        # A legacy receiver cannot enforce the final execution fence.
+        if active_retry_dispatch() is not None and (
+            runner_router is None
+            or not conv.runner_id
+            or not runner_router.runner_has_capability(
+                conv.runner_id, "subagent_retry_admission_v1"
+            )
+        ):
+            raise RetryDispatchRefused("runner_admission_unsupported")
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
@@ -4832,6 +4928,296 @@ def register_events_routes(
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
         return response
+
+    async def _post_event_impl(
+        request: Request | _RunnerEventContext | StartupInputContext,
+        session_id: str,
+        body: SessionEventInput,
+        in_flight: contextlib.ExitStack | None = None,
+        *,
+        acting_user_id: Any = _ACTING_USER_ID_UNSET,
+        require_init_success: bool = False,
+        trusted_peer: bool = False,
+    ) -> dict[str, bool | str | None]:
+        service = getattr(request.app.state, "subagent_retry_admission", None)
+        control_id = None
+        control_dispatch = None
+        conv = None
+        if isinstance(service, SubagentRetryAdmission) and body.type in {
+            _INTERRUPT_TYPE,
+            _STOP_SESSION_TYPE,
+            _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+        }:
+            user_id, conv = await _authorized_conversation(
+                request, session_id, acting_user_id=acting_user_id
+            )
+            if body.type == _STOP_SESSION_TYPE:
+                await _require_access_and_level(
+                    user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+                )
+            if conv.parent_conversation_id:
+                control_id = secrets.token_hex(16)
+                control_dispatch = ControlDispatch(
+                    ControlInputReference(session_id=session_id, input_id=control_id)
+                )
+                if not await asyncio.to_thread(
+                    service.journal.begin_control, session_id, control_id, runner_id=conv.runner_id
+                ):
+                    raise HTTPException(409, "Control binding changed")
+
+        async def apply() -> dict[str, bool | str | None]:
+            try:
+                with control_dispatch_scope(control_dispatch):
+                    result = await _post_event_core(
+                        request,
+                        session_id,
+                        body,
+                        in_flight,
+                        acting_user_id=acting_user_id,
+                        require_init_success=require_init_success,
+                        trusted_peer=trusted_peer,
+                    )
+            except asyncio.CancelledError:
+                # An interrupted waiter cannot prove an in-flight control failed.
+                # Keep its reservation for same-ID recovery rather than unblock retries.
+                raise
+            except Exception as exc:
+                definite_refusal = (
+                    bool(control_dispatch and control_dispatch.not_sent)
+                    or isinstance(exc, ControlDeliveryRefused)
+                    or (
+                        isinstance(exc, OmnigentError)
+                        and exc.code
+                        in {ErrorCode.INVALID_INPUT, ErrorCode.FORBIDDEN, ErrorCode.CONFLICT}
+                    )
+                )
+                if control_id is not None and definite_refusal:
+                    assert isinstance(service, SubagentRetryAdmission) and conv is not None
+                    await asyncio.to_thread(
+                        service.journal.finish_control,
+                        session_id,
+                        control_id,
+                        accepted=False,
+                    )
+                raise
+            if control_id is not None:
+                assert isinstance(service, SubagentRetryAdmission) and conv is not None
+                await asyncio.to_thread(
+                    service.journal.finish_control,
+                    session_id,
+                    control_id,
+                    accepted=not result.get("denied") and result.get("forwarded") is not False,
+                )
+            return result
+
+        if control_id is None:
+            return await apply()
+        assert isinstance(service, SubagentRetryAdmission)
+        task = asyncio.create_task(apply())
+        service.control_tasks.add(task)
+        task.add_done_callback(service.control_tasks.discard)
+        return await asyncio.shield(task)
+
+    def _retry_admission(request: Request) -> SubagentRetryAdmission:
+        service = getattr(request.app.state, "subagent_retry_admission", None)
+        if not isinstance(service, SubagentRetryAdmission):
+            raise HTTPException(503, "Retry admission is unavailable")
+        return service
+
+    async def _retry_input_owner(
+        request: Request, session_id: str, input_id: str, control: RetryInputControl
+    ):
+        service = _retry_admission(request)
+        # Receipt controls belong to the current parent inbox runner; user edit
+        # permission alone cannot mint execution or close another runner's input.
+        parent = await asyncio.to_thread(
+            conversation_store.get_conversation, control.owner.parent_id
+        )
+        if parent is None or not _has_bound_runner_authority(request, parent):
+            raise HTTPException(403, "Current inbox runner authority required")
+        receipt = await asyncio.to_thread(service.journal.get_input, input_id)
+        chain = (
+            await asyncio.to_thread(service.journal.get_chain, receipt.chain_id)
+            if receipt and receipt.chain_id
+            else None
+        )
+        if chain is None or receipt is None or receipt.target_id != session_id:
+            raise HTTPException(404, "Retry input not found")
+        if not await asyncio.to_thread(service._owns, chain, control.owner):
+            raise HTTPException(409, "Inbox owner changed")
+        return service, chain, receipt
+
+    @event_router.post(
+        "/sessions/{session_id}/retry-inputs/{input_id}/lookup", include_in_schema=False
+    )
+    async def retry_input_lookup(
+        request: Request, session_id: str, input_id: str, body: RetryInputControl
+    ):
+        service, _, _ = await _retry_input_owner(request, session_id, input_id, body)
+        return await service.lookup_or_close_input(
+            input_id, owner=body.owner, expected_version=body.expected_version, reason=body.reason
+        )
+
+    @event_router.post(
+        "/sessions/{session_id}/retry-inputs/{input_id}/dispatch", include_in_schema=False
+    )
+    async def retry_input_dispatch(
+        request: Request, session_id: str, input_id: str, body: RetryInputControl
+    ):
+        service, chain, receipt = await _retry_input_owner(request, session_id, input_id, body)
+        if receipt.kind != "retry":
+            raise HTTPException(409, "Input is not a child retry")
+        if receipt.state != "prepared":
+            return await service.lookup_or_close_input(input_id, owner=body.owner)
+        checked = await service.check_before_retry(chain)
+        if not checked.ready:
+            return await service.lookup_or_close_input(
+                input_id,
+                owner=body.owner,
+                expected_version=receipt.version,
+                reason={"code": checked.reason},
+            )
+        claimed = await asyncio.to_thread(service.journal.claim_input, input_id, owner=body.owner)
+        if claimed is None or not claimed.claimed:
+            return await service.lookup_or_close_input(input_id, owner=body.owner)
+        guard = RetryExecutionGuard(
+            chain_id=chain.chain_id,
+            input_id=input_id,
+            owner=body.owner,
+            expected_turn_id=chain.expected_turn_id,
+            expected_input_generation=chain.expected_input_generation,
+            attempt=receipt.attempt,
+            of=chain.limit,
+        )
+        reason = None
+        try:
+            with retry_dispatch_scope(service, guard, claimed_version=claimed.receipt.version):
+                result = await _post_event_impl(
+                    request, session_id, SessionEventInput.model_validate(receipt.payload)
+                )
+            if result.get("denied"):
+                reason = {"code": "admission_denied", "detail": result.get("reason")}
+            elif result.get("forwarded") is False or result.get("queued") is False:
+                reason = {"code": "not_forwarded", "detail": result}
+        except RetryDispatchRefused as exc:
+            reason = None if exc.reason == "input_already_claimed" else {"code": exc.reason}
+        except OmnigentError as exc:
+            reason = {"code": str(exc.code), "detail": exc.message}
+        except HTTPException as exc:
+            reason = {"code": "routing_error", "detail": exc.detail}
+        # A successful POST, including an SSE transport, is still only pending
+        # until the authenticated final consumer writes its execution receipt.
+        current = await asyncio.to_thread(service.journal.get_input, input_id)
+        return await service.lookup_or_close_input(
+            input_id,
+            owner=body.owner,
+            expected_version=current.version if current and reason else None,
+            reason=reason,
+        )
+
+    @event_router.post("/sessions/{session_id}/input-admission", include_in_schema=False)
+    async def input_execution_admission(
+        request: Request, session_id: str, body: InputExecutionClaim
+    ):
+        service = _retry_admission(request)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not _has_bound_runner_authority(request, conv):
+            raise HTTPException(403, "Bound receiver authority required")
+        assert conv.runner_id is not None
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if (
+            body.retry is not None
+            and harness in {"claude-native", "codex-native", "pi-native"}
+            and body.boundary == "receiver"
+        ):
+            return InputExecutionReceipt(reason="native_reservation_required")
+        result = await service.admit_execution(session_id, body, runner_id=conv.runner_id)
+        if result.accepted and result.receipt is not None and body.retry is not None:
+            harness = await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            if harness not in {"claude-native", "codex-native", "pi-native"}:
+                payload = result.receipt.payload["data"]
+                await asyncio.to_thread(
+                    conversation_store.append,
+                    session_id,
+                    [
+                        NewConversationItem(
+                            type="message",
+                            response_id=body.turn_id or "",
+                            stable_id=body.input_id,
+                            data=parse_item_data("message", payload),
+                        )
+                    ],
+                )
+        return result
+
+    @event_router.post("/sessions/{session_id}/input-admission/resolve", include_in_schema=False)
+    async def resolve_input_execution(
+        request: Request, session_id: str, body: InputExecutionClaim
+    ):
+        service = _retry_admission(request)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not _has_bound_runner_authority(request, conv):
+            raise HTTPException(403, "Bound receiver authority required")
+        assert conv.runner_id is not None
+        if body.boundary in {"native_accept", "native_refuse"}:
+            # Reconcile the same observed native outcome; closing its reservation
+            # would discard proof that the native input was already consumed.
+            return await service.admit_execution(session_id, body, runner_id=conv.runner_id)
+        return await asyncio.to_thread(
+            service.journal.resolve_execution,
+            session_id,
+            body,
+            runner_id=conv.runner_id,
+            close=True,
+        )
+
+    async def _control_receiver(request: Request, session_id: str):
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not _has_bound_runner_authority(request, conv):
+            raise HTTPException(403, "Bound receiver authority required")
+        return _retry_admission(request)
+
+    @event_router.get("/sessions/{session_id}/input-controls", include_in_schema=False)
+    async def pending_input_controls(request: Request, session_id: str):
+        service = await _control_receiver(request, session_id)
+        return await asyncio.to_thread(service.journal.list_controls, session_id)
+
+    @event_router.get("/sessions/{session_id}/input-controls/{input_id}", include_in_schema=False)
+    async def input_control_lookup(request: Request, session_id: str, input_id: str):
+        service = await _control_receiver(request, session_id)
+        receipt = await asyncio.to_thread(service.journal.get_input, input_id)
+        if receipt is None or receipt.target_id != session_id or receipt.kind != "control":
+            raise HTTPException(404, "Control input not found")
+        return receipt
+
+    @event_router.post(
+        "/sessions/{session_id}/input-controls/{input_id}/resolve", include_in_schema=False
+    )
+    async def input_control_resolve(
+        request: Request, session_id: str, input_id: str, body: ControlInputResolution
+    ):
+        service = await _control_receiver(request, session_id)
+        receipt = await input_control_lookup(request, session_id, input_id)
+        if receipt.state == "prepared" and receipt.version == body.expected_version:
+            if body.outcome == "retired":
+                await asyncio.to_thread(
+                    service.journal.retire_control,
+                    session_id,
+                    input_id,
+                    expected_version=body.expected_version,
+                )
+            else:
+                await asyncio.to_thread(
+                    service.journal.finish_control,
+                    session_id,
+                    input_id,
+                    accepted=body.outcome == "accepted",
+                )
+        return await input_control_lookup(request, session_id, input_id)
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
@@ -5339,3 +5725,5 @@ def register_events_routes(
             pass
         await delete_lease.release()
         return ConversationDeleted(id=session_id)
+
+    router.include_router(event_router)

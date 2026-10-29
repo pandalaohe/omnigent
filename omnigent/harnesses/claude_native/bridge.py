@@ -1224,6 +1224,7 @@ class ClaudeHookRecord:
     usage_admission_id: str | None = None
     terminal_turn_id: str | None = None
     terminal_input_id: str | None = None
+    native_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -3184,6 +3185,9 @@ def record_hook_event(
         if is_parent and event_name == "UserPromptSubmit" and "admission_id" not in payload:
             receipt_id = uuid.uuid4().hex
             state["terminal_identity"] = {
+                "native_generation": input_admission.native_generation
+                if input_admission
+                else None,
                 "turn_id": input_admission.turn_id
                 if input_admission
                 else f"claude_turn_{receipt_id}",
@@ -4385,6 +4389,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         )
     identity = payload.get("terminal_identity") if isinstance(payload, dict) else None
     return ClaudeHookRecord(
+        native_generation=(
+            identity.get("native_generation")
+            if isinstance(identity, dict) and type(identity.get("native_generation")) is int
+            else None
+        ),
         terminal_turn_id=(
             identity.get("turn_id")
             if isinstance(identity, dict) and isinstance(identity.get("turn_id"), str)

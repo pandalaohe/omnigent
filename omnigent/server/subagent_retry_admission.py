@@ -7,18 +7,134 @@ the runner's final admission guard. A healthy snapshot never proves execution.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import SQLAlchemyError
 
-from omnigent.entities.subagent_retry import InboxOwnerFence, RetryChain, RetryInput
+from omnigent.entities.subagent_retry import (
+    ControlInputReference,
+    InboxOwnerFence,
+    InputExecutionClaim,
+    InputExecutionReceipt,
+    RetryChain,
+    RetryExecutionGuard,
+    RetryInput,
+)
+from omnigent.errors import OmnigentError
 from omnigent.server.host_registry import HostRegistry
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.subagent_retry_store import SubagentRetryStore
 
 _RECONCILIATION_TIMEOUT_S = 5
+
+
+@dataclass
+class _RetryDispatch:
+    admission: SubagentRetryAdmission
+    guard: RetryExecutionGuard
+    claimed_version: int
+    forwarded: bool = False
+
+
+_dispatch: ContextVar[_RetryDispatch | None] = ContextVar("subagent_retry_dispatch", default=None)
+
+
+class RetryDispatchRefused(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ControlDeliveryRefused(OmnigentError):
+    """A definite receiver refusal, distinct from an ambiguous transport loss."""
+
+
+@dataclass
+class ControlDispatch:
+    reference: ControlInputReference
+    not_sent: bool = False
+
+
+_control_dispatch: ContextVar[ControlDispatch | None] = ContextVar(
+    "control_dispatch", default=None
+)
+
+
+@contextmanager
+def control_dispatch_scope(dispatch: ControlDispatch | None) -> Iterator[None]:
+    token = _control_dispatch.set(dispatch)
+    try:
+        yield
+    finally:
+        _control_dispatch.reset(token)
+
+
+def control_transport_event(event: dict[str, Any]) -> dict[str, Any]:
+    current = _control_dispatch.get()
+    return (
+        {**event, "input_control": current.reference.model_dump()}
+        if current and event.get("type") in {"interrupt", "stop_session"}
+        else event
+    )
+
+
+def control_not_sent() -> None:
+    current = _control_dispatch.get()
+    if current is not None:
+        current.not_sent = True
+
+
+def control_was_not_sent() -> bool:
+    current = _control_dispatch.get()
+    return bool(current and current.not_sent)
+
+
+@contextmanager
+def retry_dispatch_scope(
+    admission: SubagentRetryAdmission, guard: RetryExecutionGuard, *, claimed_version: int
+) -> Iterator[None]:
+    token = _dispatch.set(_RetryDispatch(admission, guard, claimed_version))
+    try:
+        yield
+    finally:
+        _dispatch.reset(token)
+
+
+def active_retry_dispatch() -> RetryExecutionGuard | None:
+    current = _dispatch.get()
+    return current.guard if current else None
+
+
+async def claim_retry_forward(session_id: str, event: dict[str, Any], *, deadline: float) -> None:
+    """Run after normal policy/routing, immediately before the sole forward."""
+    current = _dispatch.get()
+    if current is None:
+        return
+    admission, guard = current.admission, current.guard
+    receipt = await asyncio.to_thread(admission.journal.get_input, guard.input_id)
+    chain = await asyncio.to_thread(admission.journal.get_chain, guard.chain_id)
+    if receipt is None or chain is None or receipt.target_id != session_id:
+        raise RetryDispatchRefused("retry_state_unavailable")
+    checked = await admission.check_before_retry(chain)
+    if not checked.ready:
+        raise RetryDispatchRefused(checked.reason)
+    if (
+        receipt.state != "dispatching"
+        or receipt.version != current.claimed_version
+        or current.forwarded
+    ):
+        raise RetryDispatchRefused("input_already_claimed")
+    current.forwarded = True
+    event["retry_guard"] = guard.model_dump(mode="json")
+    event["input_admission_required"] = True
+    event["input_id"] = guard.input_id
+    event["input_admission_deadline"] = deadline
 
 
 class RetryCheck(BaseModel):
@@ -50,6 +166,14 @@ class RetryInputResolution(BaseModel):
     reason: str | None = None
 
 
+class RetryInputControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner: InboxOwnerFence
+    expected_version: int | None = None
+    reason: dict[str, Any] | None = None
+
+
 class SubagentRetryAdmission:
     """Server-side reads share the journal's workspace and owner fences."""
 
@@ -65,6 +189,17 @@ class SubagentRetryAdmission:
         self.conversations = conversations
         self.host_store = host_store
         self.host_registry = host_registry
+        self.control_tasks: set[asyncio.Task[Any]] = set()
+
+    async def admit_execution(
+        self, child_id: str, claim: InputExecutionClaim, *, runner_id: str | None
+    ) -> InputExecutionReceipt:
+        try:
+            return await asyncio.to_thread(
+                self.journal.admit_execution, child_id, claim, runner_id=runner_id
+            )
+        except (SQLAlchemyError, OSError, ValueError, RuntimeError):
+            return InputExecutionReceipt(state="pending", reason="input_admission_unavailable")
 
     def _owns(self, chain: RetryChain, owner: InboxOwnerFence) -> bool:
         parent = self.conversations.get_conversation(owner.parent_id)
@@ -162,7 +297,11 @@ class SubagentRetryAdmission:
             return RetryInputResolution(state="not_found")
         if not self._owns(chain, owner):
             return RetryInputResolution(state="stale_owner", reason="stale_owner")
-        if expected_version is not None and receipt.state in {"prepared", "dispatching"}:
+        if expected_version is not None and receipt.state in {
+            "prepared",
+            "dispatching",
+            "reserved",
+        }:
             closed = self.journal.close_input(
                 input_id, owner=owner, expected_version=expected_version, reason=reason
             )
@@ -177,7 +316,9 @@ class SubagentRetryAdmission:
             else:
                 receipt = closed
         return RetryInputResolution(
-            state="pending" if receipt.state in {"prepared", "dispatching"} else receipt.state,
+            state="pending"
+            if receipt.state in {"prepared", "dispatching", "reserved"}
+            else receipt.state,
             receipt=receipt,
         )
 

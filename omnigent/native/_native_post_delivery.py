@@ -188,6 +188,7 @@ async def post_external_session_status(
     failure_context: object = None,
     turn_completed: bool | None = None,
     terminal: TerminalEnvelope | None = None,
+    native_generation: int | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -234,6 +235,8 @@ async def post_external_session_status(
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
+    if native_generation is not None:
+        data["native_generation"] = native_generation
     if terminal is not None:
         identity = terminal.model_dump(
             exclude={"child_id", "parent_id", "status", "error"}, exclude_none=True

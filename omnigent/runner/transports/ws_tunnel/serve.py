@@ -1502,6 +1502,7 @@ async def _send_hello(
                 runner_version=runner_version,
                 frame_protocol_version=1,
                 capabilities=[
+                    "subagent_retry_admission_v1",
                     STARTUP_QUEUE_V1,
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_PATH_ATTACHMENTS,

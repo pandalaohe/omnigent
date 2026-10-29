@@ -34,6 +34,7 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.entities.session_startup import SessionStartupStatus
+from omnigent.entities.subagent_retry import InputExecutionClaim, RetryExecutionGuard
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
 
@@ -1361,6 +1362,10 @@ class CreateResponseRequest(BaseModel):
     # Trusted runner control metadata; excluded from the public request schema.
     startup_attempt: SkipJsonSchema[StartupAttemptRef | None] = None
     startup_required: SkipJsonSchema[bool] = False
+    input_admission_required: SkipJsonSchema[bool] = False
+    input_id: SkipJsonSchema[str | None] = None
+    retry_guard: SkipJsonSchema[RetryExecutionGuard | None] = None
+    input_admission_deadline: SkipJsonSchema[float | None] = None
     # Server-side identity of the native web input, independent of native transcript matching.
     input_stable_id: str | None = None
     pending_id: str | None = None
@@ -5785,6 +5790,14 @@ class StartupClaimRequestEvent(_SSEEventBase):
     boundary: Literal["executor_construct", "executor_prepare"]
 
 
+class InputExecutionClaimEvent(_SSEEventBase):
+    """Final harness input admission; consumed by the owning runner only."""
+
+    type: Literal["input.execution.claim"] = "input.execution.claim"
+    claim_id: str = Field(min_length=1, max_length=128)
+    claim: InputExecutionClaim
+
+
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
@@ -5795,6 +5808,7 @@ HarnessStreamEvent = (
     | SubagentToolCallEvent
     | StartupProofEvent
     | StartupClaimRequestEvent
+    | InputExecutionClaimEvent
 )
 
 

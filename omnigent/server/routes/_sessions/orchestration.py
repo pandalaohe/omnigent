@@ -449,6 +449,7 @@ from omnigent.server.subagent_activity import (
     record_claude_subagent_return,
     record_subagent_activity,
 )
+from omnigent.server.subagent_retry_admission import active_retry_dispatch, claim_retry_forward
 from omnigent.server.user_preferences_store import read_worktree_path_template
 from omnigent.session_default_modes import (
     SPEED_TIER_LABEL_KEY,
@@ -7944,6 +7945,10 @@ async def _persist_native_terminal_failure(
     :param failure_context: Normalized cause metadata from the runner's ensure response.
     :returns: Store-assigned id of the consumed user message item.
     """
+    if active_retry_dispatch() is not None:
+        from omnigent.server.subagent_retry_admission import RetryDispatchRefused
+
+        raise RetryDispatchRefused("launch_refused")
     turn_id = generate_task_id()
     user_item = _build_new_item(body, turn_id, created_by=created_by)
     persisted_items = await asyncio.to_thread(
@@ -8181,6 +8186,10 @@ def _build_native_terminal_message_event(
     raw_stable_id = body.data.get("stable_id")
     if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id):
         event["stable_id"] = raw_stable_id
+    if body.data.get("_input_admission_required") is True:
+        event["input_admission_required"] = True
+        event["input_id"] = event.get("stable_id") or uuid.uuid4().hex
+        event["input_admission_deadline"] = time.time() + _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
     event.update(input_attributes(input_delivery))
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
@@ -8297,6 +8306,9 @@ async def _forward_native_terminal_message(
     try:
         if startup_context is not None:
             startup_context.forward_started = True
+        await claim_retry_forward(
+            session_id, event, deadline=time.time() + _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
+        )
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events?stream=true"
             if harness == "claude-native" and body.data.get("confirm_delivery") is True
@@ -8400,6 +8412,11 @@ async def _persist_session_event(
     :returns: The store-assigned item id.
     """
     import uuid
+
+    if active_retry_dispatch() is not None:
+        from omnigent.server.subagent_retry_admission import RetryDispatchRefused
+
+        raise RetryDispatchRefused("not_forwarded")
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id)
@@ -8880,6 +8897,7 @@ async def _forward_event_to_runner(
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
     sdk_peer = body.data.get("peer_delivery") is not None
+    retry_guard = active_retry_dispatch()
     annotation_lookup = getattr(conversation_store, "annotation_receipt_for_item", None)
     annotation_pending = bool(
         startup_input_id is not None
@@ -8915,12 +8933,14 @@ async def _forward_event_to_runner(
         ):
             raise HTTPException(409, "Startup input owner changed")
         persisted_items = [canonical]
-    elif sdk_peer:
+    elif sdk_peer or retry_guard is not None:
         # The peer store owns undelivered input. Only an SDK accepted receipt
         # may put it in conversation history, where recovery could replay it.
         persisted_items = [
             ConversationItem(
-                id=body.data["peer_delivery"]["attempt_id"],
+                id=retry_guard.input_id
+                if retry_guard
+                else body.data["peer_delivery"]["attempt_id"],
                 type=item.type,
                 response_id=turn_id,
                 data=item.data,
@@ -9038,6 +9058,10 @@ async def _forward_event_to_runner(
     }
     runner_body.pop("recovered", None)
     runner_body.pop("input_generation", None)
+    runner_body.pop("_input_admission_required", None)
+    if body.data.get("_input_admission_required") is True:
+        runner_body["input_admission_required"] = True
+        runner_body["input_id"] = persisted_items[0].id
     if conv.parent_conversation_id is not None:
         runner_body.update(
             turn_id="turn_" + persisted_items[0].id,
@@ -9403,6 +9427,11 @@ async def _forward_event_to_runner(
     try:
         if startup_context is not None:
             startup_context.forward_started = True
+        if runner_body.get("input_admission_required") is True:
+            runner_body["input_admission_deadline"] = time.time() + _RUNNER_FORWARD_TIMEOUT.read
+        await claim_retry_forward(
+            session_id, runner_body, deadline=time.time() + _RUNNER_FORWARD_TIMEOUT.read
+        )
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -9418,6 +9447,10 @@ async def _forward_event_to_runner(
         # status rather than via ``raise_for_status`` so the runner-client fakes
         # that only expose ``status_code`` behave as they do in production.
         if _forward_resp.status_code >= 400:
+            if retry_guard is not None:
+                from omnigent.server.subagent_retry_admission import RetryDispatchRefused
+
+                raise RetryDispatchRefused("runner_refused")
             if startup_context is not None:
                 startup_context.forward_rejected = True
             if sdk_peer or startup_attempt is not None:

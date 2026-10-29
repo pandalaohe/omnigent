@@ -14,6 +14,10 @@ from omnigent.entities.subagent_terminal import TerminalEnvelope
 
 @pytest.fixture
 def journal(db_uri, conversation_store):
+    return _journal(db_uri, conversation_store)
+
+
+def _journal(db_uri, conversation_store):
     from omnigent.stores.subagent_retry_store.sqlalchemy_store import (
         SqlAlchemySubagentRetryStore,
     )

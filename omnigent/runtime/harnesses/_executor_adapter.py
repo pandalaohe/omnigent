@@ -46,6 +46,12 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.native.auto_retry import (
+    AutoRetryGuard,
+    NativeRetryRejected,
+    auto_retry_scope,
+    get_snapshot,
+)
 from omnigent.native.input_diagnostics import (
     INPUT_FIELDS,
     input_attributes,
@@ -284,6 +290,28 @@ class ExecutorAdapter(HarnessApp):
                 ):
                     raise RuntimeError("Startup permission unavailable")
         executor = self._ensure_executor()
+        native_retry_guard = None
+        if request.retry_guard is not None and self._startup_source == "native":
+            retry = request.retry_guard
+            bridge_dir = getattr(executor, "_bridge_dir", None)
+            if bridge_dir is None or request.input_admission_deadline is None:
+                raise NativeRetryRejected("native_admission_unsupported")
+            snapshot = await asyncio.to_thread(
+                get_snapshot, bridge_dir, ctx.session_id or self._session_key
+            )
+            if not snapshot.idle or snapshot.turn_id != retry.expected_turn_id:
+                raise NativeRetryRejected("superseded_by_human_input")
+            native_retry_guard = AutoRetryGuard(
+                session_id=snapshot.session_id,
+                chain_id=retry.chain_id,
+                input_id=retry.input_id,
+                expected_turn_id=retry.expected_turn_id,
+                expected_input_generation=retry.expected_input_generation,
+                expected_native_generation=snapshot.generation,
+                admission_deadline=request.input_admission_deadline,
+                attempt=retry.attempt,
+                of=retry.of,
+            )
         messages = _translate_input_to_messages(request.input)
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -415,6 +443,17 @@ class ExecutorAdapter(HarnessApp):
                     getattr(ctx, "claim_startup", None),
                     required=startup_required,
                 ),
+                auto_retry_scope(
+                    native_retry_guard,
+                    lambda: ctx.claim_input_execution(request, boundary="native_reserve"),
+                    lambda outcome, turn_id, reason, detail: ctx.claim_input_execution(
+                        request,
+                        boundary="native_accept" if outcome == "accepted" else "native_refuse",
+                        native_turn_id=turn_id,
+                        native_reason=reason,
+                        native_detail=detail,
+                    ),
+                ),
             ):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id
@@ -439,6 +478,14 @@ class ExecutorAdapter(HarnessApp):
                         initial_peer_receipt("accepted", "sdk_turn_response")
                     elif isinstance(event, ExecutorError) and event.undelivered:
                         initial_peer_receipt("refused", "sdk_turn_not_started")
+                        if native_retry_guard is not None:
+                            from omnigent.native.auto_retry import settle_execution
+
+                            await settle_execution(
+                                "refused",
+                                reason=event.code or "launch_refused",
+                                detail=event.message,
+                            )
                     if ctx.cancelled.is_set():
                         log_input_event(
                             _logger,

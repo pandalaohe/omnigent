@@ -7938,11 +7938,17 @@ async def _forward_session_change_to_runner_impl(
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
+        from omnigent.server.subagent_retry_admission import control_not_sent
+
+        if event.get("type") in {"interrupt", "stop_session"}:
+            control_not_sent()
         return None
     try:
+        from omnigent.server.subagent_retry_admission import control_transport_event
+
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
-            json=event,
+            json=control_transport_event(event),
             timeout=timeout_s,
         )
     except (httpx.HTTPError, ConnectionError):
@@ -8024,10 +8030,12 @@ async def _stop_session_via_runner_impl(
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
         return False
+    from omnigent.server.subagent_retry_admission import control_transport_event
+
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": _STOP_SESSION_TYPE},
+            json=control_transport_event({"type": _STOP_SESSION_TYPE}),
             timeout=5.0,
         )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -8037,6 +8045,14 @@ async def _stop_session_via_runner_impl(
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
     if resp.status_code >= 400:
+        if resp.status_code < 500:
+            from omnigent.server.subagent_retry_admission import ControlDeliveryRefused
+
+            raise ControlDeliveryRefused(
+                f"Runner failed to stop session {session_id!r} "
+                f"(status {resp.status_code}): {resp.text}",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
         raise OmnigentError(
             f"Runner failed to stop session {session_id!r} "
             f"(status {resp.status_code}): {resp.text}",

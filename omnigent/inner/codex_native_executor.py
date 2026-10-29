@@ -234,7 +234,9 @@ async def _native_delivery_request(
     try:
         return await _native_delivery_request_once(client, method, params, state, bridge_dir)
     except CodexAppServerResponseError as error:
-        if not is_server_draining_error(error):
+        from omnigent.native.auto_retry import current_guard
+
+        if current_guard() is not None or not is_server_draining_error(error):
             raise
         log_input_event(
             _logger,
@@ -279,7 +281,7 @@ async def _native_delivery_request_once(
     bridge_dir: Path,
 ) -> CodexMessage:
     """Pair each RPC attempt with its result, including a rejected stale steer."""
-    from omnigent.native.auto_retry import current_guard, prepare_submission
+    from omnigent.native.auto_retry import claim_execution, current_guard, prepare_submission
 
     guard = current_guard()
     if guard is not None:
@@ -294,6 +296,7 @@ async def _native_delivery_request_once(
         )
         # Supported by the checkout's pinned Codex 0.139.0 protocol.
         params = {**params, "clientUserMessageId": guard.input_id}
+        await claim_execution()
     attempt_id = uuid.uuid4().hex
     stage = "turn_start" if method == "turn/start" else "turn_steer"
     expected = params.get("expectedTurnId") if method == "turn/steer" else None
@@ -343,6 +346,10 @@ async def _native_delivery_request_once(
     else:
         turn_id = result.get("turnId") if result is not None else None
     native_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
+    if guard is not None and native_turn_id is not None:
+        from omnigent.native.auto_retry import settle_execution
+
+        await settle_execution("accepted", turn_id=f"codex_{native_turn_id}")
     log_input_event(
         _logger,
         "codex_native_delivery_finished",
@@ -1031,6 +1038,18 @@ class CodexNativeExecutor(Executor):
                         await client.close()
             break
         if error_msg is not None:
+            if undelivered:
+                from omnigent.native.auto_retry import abandon_submission, settle_execution
+
+                native_reason = (
+                    startup_failure.code if startup_failure else refusal_code
+                ) or "launch_refused"
+                abandon_submission(self._bridge_dir, native_reason)
+                await settle_execution(
+                    "refused",
+                    reason=native_reason,
+                    detail=error_msg,
+                )
             self._abandoned_turn_state = self._current_owned_turn()
             yield ExecutorError(
                 message=error_msg,

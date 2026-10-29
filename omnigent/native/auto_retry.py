@@ -9,7 +9,7 @@ import os
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
@@ -22,6 +22,12 @@ from omnigent.util.atomic_json import atomic_write_json
 
 _STATE_FILE = "auto-retry.json"
 _guard: ContextVar[AutoRetryGuard | None] = ContextVar("auto_retry_guard", default=None)
+_execution_claim: ContextVar[Callable[[], Awaitable[bool]] | None] = ContextVar(
+    "auto_retry_execution_claim", default=None
+)
+_execution_outcome: ContextVar[
+    Callable[[str, str | None, str | None, str | None], Awaitable[bool]] | None
+] = ContextVar("auto_retry_execution_outcome", default=None)
 
 
 class AutoRetryGuard(BaseModel):
@@ -88,12 +94,40 @@ class NativeRetryRejected(RuntimeError):
 
 
 @contextlib.contextmanager
-def auto_retry_scope(guard: AutoRetryGuard | None) -> Iterator[None]:
+def auto_retry_scope(
+    guard: AutoRetryGuard | None,
+    claim_execution: Callable[[], Awaitable[bool]] | None = None,
+    settle_execution: Callable[[str, str | None, str | None, str | None], Awaitable[bool]]
+    | None = None,
+) -> Iterator[None]:
     token = _guard.set(guard)
+    claim_token = _execution_claim.set(claim_execution)
+    outcome_token = _execution_outcome.set(settle_execution)
     try:
         yield
     finally:
+        _execution_outcome.reset(outcome_token)
+        _execution_claim.reset(claim_token)
         _guard.reset(token)
+
+
+async def claim_execution() -> None:
+    """Join the local executor guard to the authenticated server journal."""
+    claim = _execution_claim.get()
+    if current_guard() is not None and claim is not None and not await claim():
+        raise NativeRetryRejected("input_execution_refused")
+
+
+async def settle_execution(
+    outcome: str,
+    *,
+    turn_id: str | None = None,
+    reason: str | None = None,
+    detail: str | None = None,
+) -> None:
+    callback = _execution_outcome.get()
+    if current_guard() is not None and callback is not None:
+        await callback(outcome, turn_id, reason, detail)
 
 
 def current_guard() -> AutoRetryGuard | None:
@@ -154,7 +188,16 @@ def abandon_submission(bridge_dir: Path, reason: str = "input_abandoned") -> Non
         return
     with _lock(bridge_dir):
         state = _read(bridge_dir, guard.session_id)
-        if state.receipt and state.receipt.guard == guard and state.receipt.state == "prepared":
+        if (
+            state.receipt
+            and state.receipt.guard == guard
+            and (
+                state.receipt.state == "prepared"
+                or (
+                    state.receipt.state == "rejected" and state.receipt.reason == "input_abandoned"
+                )
+            )
+        ):
             state.receipt.state, state.receipt.reason = "rejected", reason
             _write(bridge_dir, state)
 

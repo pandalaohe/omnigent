@@ -322,6 +322,20 @@ class ClaudeNativeExecutor(Executor):
                 # Track the routed id, not the alias: the next turn's
                 # comparison is against what routing asked for.
                 self._applied_model = wanted_model
+            from omnigent.native.auto_retry import (
+                claim_execution,
+                current_guard,
+                get_snapshot,
+                prepare_submission,
+            )
+
+            guard = current_guard()
+            if guard is not None:
+                snapshot = await asyncio.to_thread(
+                    get_snapshot, self._bridge_dir, guard.session_id
+                )
+                prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
+                await claim_execution()
             await self._inject_prompt(text, notices)
 
     async def _wait_for_answer(self, deadline: float) -> bool:

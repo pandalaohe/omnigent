@@ -51,6 +51,7 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent.entities.subagent_retry import InputExecutionReceipt
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
 from omnigent.native import _native_forwarder_health as native_forwarder_health
@@ -67,6 +68,7 @@ from omnigent.server.schemas import (
     HarnessStreamEvent,
     HeartbeatEvent,
     InProgressEvent,
+    InputExecutionClaimEvent,
     OutputItemDoneEvent,
     PolicyEvaluationRequestEvent,
     ResponseObject,
@@ -450,6 +452,13 @@ class StartupClaimResultEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+class InputExecutionResultEvent(BaseModel):
+    type: Literal["input_execution_result"]
+    claim_id: str
+    result: InputExecutionReceipt
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 # Discriminated union of every downward event the harness accepts on
 # ``POST /v1/sessions/{conversation_id}/events``. FastAPI / Pydantic
 # v2 dispatches by the ``type`` field at request-validation time;
@@ -462,6 +471,7 @@ InboundEventRequest = Annotated[
     | ApprovalEvent
     | PolicyVerdictEvent
     | StartupClaimResultEvent
+    | InputExecutionResultEvent
     | KeepWarmEvent,
     Field(discriminator="type"),
 ]
@@ -553,6 +563,8 @@ class TurnContext:
         # ``policy_verdict`` /events handler.
         self._pending_policy_evaluations: dict[str, asyncio.Future[PolicyVerdictPayload]] = {}
         self._pending_startup_claims: dict[str, asyncio.Future[bool]] = {}
+        self._pending_input_claims: dict[str, asyncio.Future[InputExecutionReceipt]] = {}
+        self.retry_input = False
         # In-band injections (steering, async completions) the
         # scaffold's ``message`` /events handler pushes here when
         # ``previous_response_id`` matches this turn. Subclass
@@ -602,7 +614,7 @@ class TurnContext:
         # but heartbeats for as long as the human takes, so heartbeats hold
         # the idle window open then — via the idle-only hook, so the
         # absolute ceiling stays the hard cap even for an ignored approval.
-        if isinstance(event, StartupClaimRequestEvent):
+        if isinstance(event, (StartupClaimRequestEvent, InputExecutionClaimEvent)):
             self._event_queue.put_nowait(event)
             return
         if not isinstance(event, HeartbeatEvent):
@@ -806,6 +818,58 @@ class TurnContext:
             return False
         finally:
             self._pending_startup_claims.pop(claim_id, None)
+
+    async def claim_input_execution(
+        self,
+        request: CreateResponseRequest,
+        *,
+        boundary: Literal[
+            "receiver", "native_reserve", "native_accept", "native_refuse"
+        ] = "receiver",
+        native_turn_id: str | None = None,
+        native_reason: str | None = None,
+        native_detail: str | None = None,
+    ) -> bool:
+        from omnigent.entities.subagent_retry import InputExecutionClaim
+
+        if not request.input_id or self.cancelled.is_set():
+            return False
+        claim_id = uuid.uuid4().hex
+        future: asyncio.Future[InputExecutionReceipt] = asyncio.get_running_loop().create_future()
+        self._pending_input_claims[claim_id] = future
+        self.emit(
+            InputExecutionClaimEvent(
+                claim_id=claim_id,
+                claim=InputExecutionClaim(
+                    input_id=request.input_id,
+                    turn_id=self.response_id,
+                    retry=request.retry_guard,
+                    admission_deadline=request.input_admission_deadline,
+                    boundary=boundary,
+                    native_turn_id=native_turn_id,
+                    native_reason=native_reason,
+                    native_detail=native_detail,
+                ),
+            )
+        )
+        try:
+            deadline = request.input_admission_deadline
+            remaining = max(0, deadline - time.time()) if deadline else _STARTUP_CLAIM_TIMEOUT_S
+            result = await asyncio.wait_for(future, timeout=remaining + 5)
+            if result.state == "pending":
+                raise RuntimeError("input_execution_acceptance_unknown")
+            return result.state in {"accepted", "reserved"} and not self.cancelled.is_set()
+        except TimeoutError:
+            raise RuntimeError("input_execution_acceptance_unknown") from None
+        finally:
+            self._pending_input_claims.pop(claim_id, None)
+
+    def _complete_input_claim(self, claim_id: str, result: InputExecutionReceipt) -> bool:
+        future = self._pending_input_claims.get(claim_id)
+        if future is None or future.done():
+            return False
+        future.set_result(result)
+        return True
 
     def _complete_startup_claim(self, claim_id: str, granted: bool) -> bool:
         future = self._pending_startup_claims.get(claim_id)
@@ -1466,6 +1530,11 @@ class HarnessApp:
                 if ctx._complete_startup_claim(body.claim_id, body.granted):
                     break
             return Response(status_code=status.HTTP_204_NO_CONTENT)
+        if isinstance(body, InputExecutionResultEvent):
+            for ctx in self._in_flight.values():
+                if ctx._complete_input_claim(body.claim_id, body.result):
+                    break
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
         if isinstance(body, KeepWarmEvent):
             return await self._handle_keep_warm_event(body)
         # Pydantic's discriminated-union validator should reject
@@ -1612,12 +1681,20 @@ class HarnessApp:
         :raises OmnigentError: 409 for a steer with no live turn; 503 on
             shutdown.
         """
+        if request.retry_guard is not None and (
+            self._active_turn_ctx is not None and not self._active_turn_ctx.cancelled.is_set()
+        ):
+            return Response(status_code=status.HTTP_409_CONFLICT)
         if (
             request.previous_response_id is not None
             and request.previous_response_id in self._in_flight
             and not self._in_flight[request.previous_response_id].cancelled.is_set()
         ):
             ctx = self._in_flight[request.previous_response_id]
+            if ctx.retry_input:
+                return Response(status_code=status.HTTP_409_CONFLICT)
+            if request.input_admission_required and not await ctx.claim_input_execution(request):
+                return Response(status_code=status.HTTP_409_CONFLICT)
             ctx._push_injection(request)
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -1632,6 +1709,13 @@ class HarnessApp:
                 and self._active_turn_ctx is not None
                 and not self._active_turn_ctx.cancelled.is_set()
             ):
+                if request.retry_guard is not None or self._active_turn_ctx.retry_input:
+                    return Response(status_code=status.HTTP_409_CONFLICT)
+                if (
+                    request.input_admission_required
+                    and not await self._active_turn_ctx.claim_input_execution(request)
+                ):
+                    return Response(status_code=status.HTTP_409_CONFLICT)
                 self._active_turn_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -1670,6 +1754,7 @@ class HarnessApp:
                 session_id=session_id,
             )
             self._in_flight[response_id] = ctx
+            ctx.retry_input = request.retry_guard is not None
             self._active_turn_ctx = ctx
 
         return StreamingResponse(
@@ -1883,11 +1968,21 @@ class HarnessApp:
         absolute_timeout = _TURN_ABSOLUTE_TIMEOUT_S
         # ``asyncio.timeout(None)`` is a no-op, so ``<= 0`` disables each.
         absolute_wd = asyncio.timeout(absolute_timeout if absolute_timeout > 0 else None)
-        attempts = 1 + max(0, _WEDGED_TURN_RECOVERY_RETRIES)
+        attempts = (
+            1
+            if getattr(request, "retry_guard", None) is not None
+            else 1 + max(0, _WEDGED_TURN_RECOVERY_RETRIES)
+        )
         idle_wd: asyncio.Timeout | None = None
         attempt = 0
         loop = asyncio.get_running_loop()
         try:
+            if getattr(request, "input_admission_required", False) and not (
+                request.retry_guard is not None
+                and getattr(self, "_startup_source", None) == "native"
+            ):
+                if not await ctx.claim_input_execution(request):
+                    raise RuntimeError("Input execution admission refused")
             # Absolute outer (spans every recovery attempt), idle inner
             # (fresh per attempt): ``.expired()`` on each tells which
             # ceiling tripped so the error message is accurate.

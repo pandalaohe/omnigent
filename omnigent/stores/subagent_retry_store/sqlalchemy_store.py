@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import json
 import math
+import time
+from collections.abc import Callable
 from typing import Any, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+from omnigent.db.db_models import (
+    SqlConversation,
+    SqlConversationLabel,
+    SqlConversationMetadata,
+    current_workspace_id,
+)
 from omnigent.db.subagent_retry import (
     SqlRetryChain,
     SqlRetryControl,
@@ -19,12 +26,15 @@ from omnigent.db.subagent_retry import (
     SqlRetryTerminal,
 )
 from omnigent.db.utils import (
+    get_or_create_conversation_engine,
     get_or_create_engine,
     make_named_managed_session_maker,
     run_write_transaction,
 )
 from omnigent.entities.subagent_retry import (
     InboxOwnerFence,
+    InputExecutionClaim,
+    InputExecutionReceipt,
     RetryChain,
     RetryControl,
     RetryFinal,
@@ -36,6 +46,7 @@ from omnigent.entities.subagent_retry import (
 )
 from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.stores.subagent_retry_store import SubagentRetryStore
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, is_session_closed
 
 _JournalRow = TypeVar("_JournalRow")
 
@@ -106,7 +117,9 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
     whole-transaction retry for serialization/deadlock victims.
     """
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.subagent_retry_store", immediate=True
@@ -114,6 +127,531 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
         self._read = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.subagent_retry_store"
         )
+        conv_engine = (
+            get_or_create_conversation_engine(conversation_storage_location)
+            if conversation_storage_location and conversation_storage_location != storage_location
+            else engine
+        )
+        self._conversation_session = make_named_managed_session_maker(
+            conv_engine, query_name_prefix="omnigent.subagent_retry_store", immediate=True
+        )
+
+    def _execution_write(
+        self,
+        child_id: str,
+        write: Callable[[Session], InputExecutionReceipt],
+        *,
+        parent_id: str | None = None,
+    ) -> InputExecutionReceipt:
+        """Hold AP ancestor locks through the metadata admission commit.
+
+        A split database does not share a transaction. Holding its AP locks
+        until the journal commits still orders admission before retirement;
+        same-engine mode uses one transaction to avoid a nested SQLite writer.
+        """
+
+        def locked(ap: Session) -> InputExecutionReceipt:
+            lineage: list[tuple[str, str | None]] = []
+            target: str | None = child_id
+            seen: set[str] = set()
+            while target is not None:
+                if target in seen or len(seen) >= 256:
+                    return InputExecutionReceipt(reason="invalid_ancestry")
+                seen.add(target)
+                row = ap.get(SqlConversation, (current_workspace_id(), target))
+                if row is None:
+                    return InputExecutionReceipt(reason="invalid_ancestry")
+                lineage.append((row.id, row.parent_conversation_id))
+                target = row.parent_conversation_id
+            if parent_id is not None and lineage[0][1] != parent_id:
+                return InputExecutionReceipt(reason="invalid_ancestry")
+            for identity, expected_parent in reversed(lineage):
+                row = _current(ap, SqlConversation, (current_workspace_id(), identity))
+                if row is None or row.parent_conversation_id != expected_parent:
+                    return InputExecutionReceipt(reason="invalid_ancestry")
+                closed_row = _current(
+                    ap, SqlConversationLabel, (current_workspace_id(), identity, CLOSED_LABEL_KEY)
+                )
+                closed = closed_row.value if closed_row else None
+                if (
+                    row.archived
+                    or row.archive_close_requested_revision is not None
+                    or row.archive_close_claim_token is not None
+                    or is_session_closed({CLOSED_LABEL_KEY: closed} if closed else {}, row.title)
+                ):
+                    return InputExecutionReceipt(reason="child_retired")
+            if self._conversation_session.engine is self._session.engine:
+                return write(ap)
+            return run_write_transaction(self._session, "admit_execution", write)
+
+        return run_write_transaction(self._conversation_session, "lock_execution_lineage", locked)
+
+    def admit_execution(
+        self, child_id: str, claim: InputExecutionClaim, *, runner_id: str | None
+    ) -> InputExecutionReceipt:
+        """Called only by the authenticated receiver at its final input boundary."""
+
+        def write(db: Session) -> InputExecutionReceipt:
+            guard = claim.retry
+            ids = {child_id} | ({guard.owner.parent_id} if guard else set())
+            binding = self._bindings(db, ids).get(child_id)
+            if binding is None or binding.runner_id != runner_id:
+                return InputExecutionReceipt(reason="stale_runner")
+            pending_control = db.scalar(
+                select(SqlRetryInput.input_id)
+                .where(
+                    SqlRetryInput.workspace_id == current_workspace_id(),
+                    SqlRetryInput.target_id == child_id,
+                    SqlRetryInput.kind == "control",
+                    SqlRetryInput.state == "prepared",
+                )
+                .with_for_update()
+            )
+            prior_receipt = _current(db, SqlRetryInput, (current_workspace_id(), claim.input_id))
+            if pending_control is not None and (
+                (prior_receipt is None or prior_receipt.state != "accepted")
+                and claim.boundary not in {"native_accept", "native_refuse"}
+            ):
+                return InputExecutionReceipt(state="pending", reason="control_pending")
+            if guard is not None:
+                if guard.input_id != claim.input_id or claim.turn_id is None:
+                    return InputExecutionReceipt(reason="invalid_retry_input")
+                locked = self._locked_input(db, claim.input_id, guard.owner)
+                if locked is None:
+                    return InputExecutionReceipt(reason="stale_owner")
+                receipt, chain = locked
+                if (
+                    receipt.target_id != child_id
+                    or receipt.kind != "retry"
+                    or receipt.chain_id != guard.chain_id
+                    or receipt.attempt != guard.attempt
+                    or chain.retry_limit != guard.of
+                    or receipt.expected_input_generation != guard.expected_input_generation
+                ):
+                    return InputExecutionReceipt(reason="invalid_retry_input")
+                if receipt.state == "accepted":
+                    original_turn = (receipt.reason or {}).get(
+                        "execution_turn_id", receipt.turn_id
+                    )
+                    if original_turn != claim.turn_id:
+                        return InputExecutionReceipt(reason="input_identity_conflict")
+                    return InputExecutionReceipt(
+                        state="accepted", reason="accepted", receipt=_input(receipt)
+                    )
+                if receipt.state == "reserved":
+                    if receipt.turn_id != claim.turn_id:
+                        return InputExecutionReceipt(reason="input_identity_conflict")
+                    if claim.boundary == "native_refuse":
+                        return self._refuse_native_input(db, receipt, chain, claim)
+                    if claim.boundary == "native_reserve":
+                        return InputExecutionReceipt(
+                            state="reserved", reason="reserved", receipt=_input(receipt)
+                        )
+                    if claim.boundary != "native_accept" or not claim.native_turn_id:
+                        return InputExecutionReceipt(reason="native_acceptance_required")
+                    original = receipt.turn_id
+                    if not self._accept(db, receipt, chain, claim.native_turn_id):
+                        return InputExecutionReceipt(reason="superseded")
+                    receipt.reason = {
+                        "execution_turn_id": original,
+                        "native_turn_id": claim.native_turn_id,
+                    }
+                    return InputExecutionReceipt(
+                        state="accepted", reason="accepted", receipt=_input(receipt)
+                    )
+                if receipt.state == "closed" and claim.boundary == "native_refuse":
+                    return InputExecutionReceipt(
+                        reason=(receipt.reason or {}).get("code", "input_closed"),
+                        receipt=_input(receipt),
+                    )
+                if receipt.state == "dispatching" and claim.boundary == "native_refuse":
+                    control = self._child_control(db, child_id)
+                    predecessor = (guard.expected_turn_id, guard.expected_input_generation)
+                    if (
+                        claim.native_reason is None
+                        or claim.native_turn_id is not None
+                        or receipt.turn_id is not None
+                        or chain.retry_closed
+                        or chain.phase != "submitting"
+                        or chain.pending_input_id != receipt.input_id
+                        or (chain.expected_turn_id, chain.expected_input_generation) != predecessor
+                        or (control.turn_id, control.generation) != predecessor
+                    ):
+                        return InputExecutionReceipt(reason="superseded")
+                    return self._refuse_native_input(db, receipt, chain, claim)
+                if claim.boundary in {"native_accept", "native_refuse"}:
+                    return InputExecutionReceipt(
+                        reason="execution_not_reserved", receipt=_input(receipt)
+                    )
+                if (
+                    claim.admission_deadline is not None
+                    and time.time() >= claim.admission_deadline
+                ):
+                    return InputExecutionReceipt(reason="input_expired")
+                if (
+                    receipt.state != "dispatching"
+                    or chain.retry_closed
+                    or (chain.expected_turn_id, chain.expected_input_generation)
+                    != (guard.expected_turn_id, guard.expected_input_generation)
+                ):
+                    return InputExecutionReceipt(reason="superseded")
+                if claim.boundary == "native_reserve":
+                    control = self._child_control(db, child_id)
+                    if (control.turn_id, control.generation) != (
+                        guard.expected_turn_id,
+                        guard.expected_input_generation,
+                    ):
+                        return InputExecutionReceipt(reason="superseded")
+                    receipt.state, receipt.turn_id = "reserved", claim.turn_id
+                    receipt.version += 1
+                    return InputExecutionReceipt(
+                        state="reserved", reason="reserved", receipt=_input(receipt)
+                    )
+                if not self._accept(db, receipt, chain, claim.turn_id):
+                    return InputExecutionReceipt(reason="superseded")
+                return InputExecutionReceipt(
+                    state="accepted", reason="accepted", receipt=_input(receipt)
+                )
+            if claim.boundary != "receiver":
+                return InputExecutionReceipt(reason="invalid_native_admission")
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), claim.input_id))
+            if receipt is not None:
+                original_turn = (receipt.reason or {}).get("execution_turn_id", receipt.turn_id)
+                if (
+                    receipt.target_id != child_id
+                    or receipt.kind not in {"human", "control"}
+                    or original_turn != claim.turn_id
+                ):
+                    return InputExecutionReceipt(reason="input_identity_conflict")
+                if receipt.state != "accepted":
+                    return InputExecutionReceipt(reason="input_closed", receipt=_input(receipt))
+                return InputExecutionReceipt(
+                    state="accepted", reason="accepted", receipt=_input(receipt)
+                )
+            control = self._child_control(db, child_id)
+            if claim.admission_deadline is not None and time.time() >= claim.admission_deadline:
+                return InputExecutionReceipt(reason="input_expired")
+            previous = (
+                _current(db, SqlRetryInput, (current_workspace_id(), control.input_id))
+                if control.input_id
+                else None
+            )
+            native_floor = (previous.payload if previous else {}).get("native_floor")
+            if claim.native_generation is not None:
+                if (
+                    native_floor
+                    and native_floor.get("runner_id") == runner_id
+                    and native_floor["generation"] >= claim.native_generation
+                ):
+                    return InputExecutionReceipt(reason="superseded")
+                native_floor = {"runner_id": runner_id, "generation": claim.native_generation}
+            previous_generation = control.generation
+            control.generation += 1
+            control.turn_id, control.input_id = claim.turn_id, claim.input_id
+            receipt = SqlRetryInput(
+                input_id=claim.input_id,
+                chain_id=None,
+                target_id=child_id,
+                kind="human" if claim.turn_id is not None else "control",
+                attempt=0,
+                state="accepted",
+                payload={"native_floor": native_floor} if native_floor else {},
+                version=0,
+                expected_input_generation=previous_generation,
+                turn_id=claim.turn_id,
+                input_generation=control.generation,
+                reason=None,
+            )
+            db.add(receipt)
+            return InputExecutionReceipt(
+                state="accepted", reason="accepted", receipt=_input(receipt)
+            )
+
+        return self._execution_write(
+            child_id, write, parent_id=claim.retry.owner.parent_id if claim.retry else None
+        )
+
+    def _refuse_native_input(
+        self,
+        db: Session,
+        receipt: SqlRetryInput,
+        chain: SqlRetryChain,
+        claim: InputExecutionClaim,
+    ) -> InputExecutionReceipt:
+        reason = claim.native_reason or "launch_refused"
+        detail = claim.native_detail or reason
+        receipt.state, receipt.reason = "closed", {"code": reason, "detail": detail}
+        receipt.turn_id = claim.turn_id
+        receipt.version += 1
+        chain.retry_closed, chain.phase, chain.due_at = True, "resolving", None
+        chain.version += 1
+        self._finalize(
+            db,
+            chain,
+            chain.version,
+            RetryOutcome(status="failed", reason=reason, output=detail),
+            {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": detail}]},
+            },
+        )
+        return InputExecutionReceipt(reason=reason, receipt=_input(receipt))
+
+    def resolve_execution(
+        self, child_id: str, claim: InputExecutionClaim, *, runner_id: str, close: bool
+    ) -> InputExecutionReceipt:
+        """Close the same ID before a timed-out receiver can refuse consumption."""
+
+        def write(db: Session) -> InputExecutionReceipt:
+            binding = self._bindings(db, {child_id}).get(child_id)
+            if binding is None or binding.runner_id != runner_id:
+                return InputExecutionReceipt(reason="stale_runner")
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), claim.input_id))
+            if receipt is not None:
+                if receipt.target_id != child_id:
+                    return InputExecutionReceipt(reason="input_identity_conflict")
+                if receipt.state in {"closed", "rejected"}:
+                    return InputExecutionReceipt(
+                        reason=(receipt.reason or {}).get("code", "input_closed"),
+                        receipt=_input(receipt),
+                    )
+                if receipt.state == "reserved" and receipt.turn_id != claim.turn_id:
+                    return InputExecutionReceipt(reason="input_identity_conflict")
+                if receipt.state == "accepted":
+                    original = (receipt.reason or {}).get("execution_turn_id", receipt.turn_id)
+                    if original != claim.turn_id:
+                        return InputExecutionReceipt(reason="input_identity_conflict")
+                    return InputExecutionReceipt(
+                        state="accepted", reason="accepted", receipt=_input(receipt)
+                    )
+                if not close:
+                    return InputExecutionReceipt(
+                        state="pending", reason="acceptance_unknown", receipt=_input(receipt)
+                    )
+                receipt.state, receipt.reason = "closed", {"code": "acceptance_unknown"}
+                receipt.version += 1
+                if receipt.chain_id:
+                    chain = _current(db, SqlRetryChain, (current_workspace_id(), receipt.chain_id))
+                    if chain is not None and chain.pending_input_id == receipt.input_id:
+                        chain.retry_closed, chain.phase, chain.due_at = True, "resolving", None
+                        chain.version += 1
+            elif close:
+                receipt = SqlRetryInput(
+                    input_id=claim.input_id,
+                    chain_id=None,
+                    target_id=child_id,
+                    kind="human" if claim.turn_id is not None else "control",
+                    attempt=0,
+                    state="closed",
+                    payload={},
+                    version=0,
+                    expected_input_generation=None,
+                    turn_id=claim.turn_id,
+                    input_generation=None,
+                    reason={"code": "acceptance_unknown"},
+                )
+                db.add(receipt)
+            else:
+                return InputExecutionReceipt(state="pending", reason="acceptance_unknown")
+            return InputExecutionReceipt(reason="input_closed", receipt=_input(receipt))
+
+        return run_write_transaction(self._session, "resolve_receiver_execution", write)
+
+    def begin_control(self, child_id: str, input_id: str, *, runner_id: str | None) -> bool:
+        """Reserve control ordering without claiming that the control succeeded."""
+
+        def write(db: Session) -> bool:
+            binding = self._bindings(db, {child_id}).get(child_id)
+            if binding is None or binding.runner_id != runner_id:
+                return False
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), input_id))
+            if receipt is not None:
+                return (
+                    receipt.target_id == child_id
+                    and receipt.kind == "control"
+                    and receipt.state == "prepared"
+                )
+            control = self._child_control(db, child_id)
+            db.add(
+                SqlRetryInput(
+                    input_id=input_id,
+                    chain_id=None,
+                    target_id=child_id,
+                    kind="control",
+                    attempt=0,
+                    state="prepared",
+                    payload={},
+                    version=0,
+                    expected_input_generation=control.generation,
+                    turn_id=None,
+                    input_generation=None,
+                    reason=None,
+                )
+            )
+            return True
+
+        return run_write_transaction(self._session, "reserve_control_order", write)
+
+    def finish_control(self, child_id: str, input_id: str, *, accepted: bool) -> bool:
+        def write(db: Session) -> bool:
+            binding = self._bindings(db, {child_id}).get(child_id)
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), input_id))
+            if receipt is None or receipt.target_id != child_id or receipt.kind != "control":
+                return False
+            if receipt.state != "prepared":
+                return receipt.state == "accepted"
+            if not accepted or binding is None:
+                receipt.state, receipt.reason = "rejected", {"code": "control_refused"}
+                receipt.version += 1
+                return False
+            # The reservation orders a control on the session, including a
+            # receiver rebind while its transport is in flight.
+            control = self._child_control(db, child_id)
+            previous = (
+                _current(db, SqlRetryInput, (current_workspace_id(), control.input_id))
+                if control.input_id
+                else None
+            )
+            floor = (previous.payload if previous else {}).get("native_floor")
+            control.generation += 1
+            control.turn_id, control.input_id = None, input_id
+            receipt.state, receipt.input_generation = "accepted", control.generation
+            receipt.payload = {"native_floor": floor} if floor else {}
+            receipt.version += 1
+            return True
+
+        return run_write_transaction(self._session, "settle_control_order", write)
+
+    def list_controls(self, child_id: str) -> list[RetryInput]:
+        with self._read("list_unresolved_controls") as db:
+            return [
+                _input(row)
+                for row in db.scalars(
+                    select(SqlRetryInput).where(
+                        SqlRetryInput.workspace_id == current_workspace_id(),
+                        SqlRetryInput.target_id == child_id,
+                        SqlRetryInput.kind == "control",
+                        SqlRetryInput.state == "prepared",
+                    )
+                )
+            ]
+
+    def retire_control(self, child_id: str, input_id: str, *, expected_version: int) -> bool:
+        """Unknown delivery stays unknown; recovery first fences every old retry."""
+
+        def write(db: Session) -> bool:
+            if child_id not in self._bindings(db, {child_id}):
+                return False
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), input_id))
+            if receipt is None or receipt.target_id != child_id or receipt.kind != "control":
+                return False
+            if receipt.state != "prepared":
+                return receipt.state == "closed"
+            active = db.scalar(
+                select(SqlRetryChain.chain_id)
+                .where(
+                    SqlRetryChain.workspace_id == current_workspace_id(),
+                    SqlRetryChain.child_id == child_id,
+                    SqlRetryChain.phase.not_in(("terminal", "finalized", "superseded")),
+                )
+                .with_for_update()
+            )
+            if active is not None or receipt.version != expected_version:
+                return False
+            receipt.state = "closed"
+            receipt.reason = {"code": "control_outcome_unknown"}
+            receipt.version += 1
+            control = self._child_control(db, child_id)
+            if control.generation == receipt.expected_input_generation:
+                previous = (
+                    _current(db, SqlRetryInput, (current_workspace_id(), control.input_id))
+                    if control.input_id
+                    else None
+                )
+                floor = (previous.payload if previous else {}).get("native_floor")
+                control.generation += 1
+                control.turn_id, control.input_id = None, input_id
+                receipt.input_generation = control.generation
+                receipt.payload = {"native_floor": floor} if floor else {}
+            return True
+
+        return run_write_transaction(self._session, "retire_reconciled_control", write)
+
+    def bind_native_turn(
+        self,
+        child_id: str,
+        *,
+        input_id: str,
+        turn_id: str,
+        runner_id: str,
+        native_generation: int | None = None,
+    ) -> InputExecutionReceipt:
+        """Join an existing receiver admission to its real native turn once."""
+        _identifier(turn_id)
+
+        def write(db: Session) -> InputExecutionReceipt:
+            binding = self._bindings(db, {child_id}).get(child_id)
+            if binding is None or binding.runner_id != runner_id:
+                return InputExecutionReceipt(reason="stale_runner")
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), input_id))
+            if (
+                receipt is None
+                or receipt.target_id != child_id
+                or receipt.state not in {"reserved", "accepted"}
+            ):
+                return InputExecutionReceipt(reason="execution_not_admitted")
+            original = receipt.turn_id
+            if receipt.state == "reserved":
+                chain = _current(db, SqlRetryChain, (current_workspace_id(), receipt.chain_id))
+                original = receipt.turn_id
+                if chain is None or not self._accept(db, receipt, chain, turn_id):
+                    return InputExecutionReceipt(reason="superseded")
+                receipt.reason = {"execution_turn_id": original, "native_turn_id": turn_id}
+            if receipt.turn_id != turn_id and (
+                receipt.kind == "control" or (receipt.reason or {}).get("native_turn_id")
+            ):
+                return InputExecutionReceipt(reason="input_identity_conflict")
+            if receipt.turn_id != turn_id:
+                receipt.reason = {"execution_turn_id": original, "native_turn_id": turn_id}
+                receipt.turn_id = turn_id
+                receipt.version += 1
+            control = self._child_control(db, child_id)
+            current_input = (
+                _current(db, SqlRetryInput, (current_workspace_id(), control.input_id))
+                if control.input_id
+                else None
+            )
+            floor = (current_input.payload if current_input else {}).get("native_floor")
+            if (
+                native_generation is not None
+                and current_input is not None
+                and (
+                    not floor
+                    or floor.get("runner_id") != runner_id
+                    or floor["generation"] < native_generation
+                )
+            ):
+                current_input.payload = {
+                    **current_input.payload,
+                    "native_floor": {"runner_id": runner_id, "generation": native_generation},
+                }
+            if (control.input_id, control.turn_id) == (input_id, original):
+                control.turn_id = turn_id
+            if receipt.chain_id:
+                chain = _current(db, SqlRetryChain, (current_workspace_id(), receipt.chain_id))
+                if (
+                    chain
+                    and chain.pending_input_id == input_id
+                    and chain.expected_turn_id == original
+                ):
+                    chain.expected_turn_id = turn_id
+                    chain.version += 1
+            return InputExecutionReceipt(
+                state="accepted", reason="accepted", receipt=_input(receipt)
+            )
+
+        # Binding is historical evidence, including a terminal after retirement.
+        return run_write_transaction(self._session, "bind_native_execution_turn", write)
 
     @staticmethod
     def _bindings(db: Session, ids: set[str]) -> dict[str, SqlConversationMetadata]:
@@ -479,7 +1017,11 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 pending = _current(
                     db, SqlRetryInput, (current_workspace_id(), chain.pending_input_id)
                 )
-                if pending is not None and pending.state in {"prepared", "dispatching"}:
+                if pending is not None and pending.state in {
+                    "prepared",
+                    "dispatching",
+                    "reserved",
+                }:
                     pending.state, pending.reason = "closed", {"code": "superseded"}
                     pending.version += 1
             return _chain(chain)
@@ -599,7 +1141,7 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             if receipt.turn_id != turn_id:
                 raise ValueError("Input receipt already belongs to another turn")
             return True
-        if receipt.state not in {"prepared", "dispatching"}:
+        if receipt.state not in {"prepared", "dispatching", "reserved"}:
             return False
         if receipt.kind == "retry":
             if (
@@ -613,6 +1155,14 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 chain.expected_input_generation,
             ) or receipt.expected_input_generation != control.generation:
                 return False
+            previous = (
+                _current(db, SqlRetryInput, (current_workspace_id(), control.input_id))
+                if control.input_id
+                else None
+            )
+            floor = (previous.payload if previous else {}).get("native_floor")
+            if floor:
+                receipt.payload = {**receipt.payload, "native_floor": floor}
             control.generation += 1
             control.turn_id, control.input_id = turn_id, receipt.input_id
             receipt.input_generation = control.generation
@@ -803,89 +1353,95 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             chain = self._locked_chain(db, chain_id, owner)
             if chain is None:
                 return None
-            existing = _current(db, SqlRetryFinal, (current_workspace_id(), chain_id))
-            if existing is not None:
-                return _final(existing)
-            if chain.version != expected_version or chain.phase == "superseded":
-                return None
-            control = self._child_control(db, chain.child_id)
-            if (control.turn_id, control.generation) != (
-                chain.expected_turn_id,
-                chain.expected_input_generation,
-            ) and not (
-                outcome.status == "cancelled"
-                and control.turn_id is None
-                and control.generation > chain.expected_input_generation
-            ):
-                return None
-            pending = (
-                _current(db, SqlRetryInput, (current_workspace_id(), chain.pending_input_id))
-                if chain.pending_input_id
-                else None
-            )
-            if pending is not None and pending.state in {"prepared", "dispatching"}:
-                raise ValueError("Resolve or close pending admission before finalization")
-            terminal = TerminalEnvelope.model_validate(chain.latest_terminal)
-            known_success = (
-                terminal.status == "completed" and terminal.turn_id == chain.expected_turn_id
-            )
-            if known_success != (outcome.status == "completed"):
-                raise ValueError("Final outcome must preserve the recorded successful turn")
-            if (
-                terminal.status in {"cancelled", "stopped", "killed"}
-                and outcome.status != "cancelled"
-            ):
-                raise ValueError("Final outcome must preserve confirmed cancellation")
-            result_id = retry_identity("subagent-result", chain_id)
-            notice_id = retry_identity("subagent-final", chain_id)
-            if body.get("type") != "message" or not isinstance(body.get("data"), dict):
-                raise ValueError("Final wake must be a visible message payload")
-            data = body["data"]
-            if data.get("stable_id", notice_id) != notice_id:
-                raise ValueError("Final wake payload has another input identity")
-            data["stable_id"] = notice_id
-            final_outcome = outcome.model_copy(
-                update={
-                    "error": outcome.error
-                    if outcome.error is not None
-                    else _json(chain.latest_error)
-                }
-            )
-            final = SqlRetryFinal(
-                chain_id=chain_id,
-                child_id=chain.child_id,
-                parent_id=chain.parent_id,
-                result_id=result_id,
-                notice_id=notice_id,
-                outcome=final_outcome.model_dump(mode="json"),
-                attempts=chain.accepted_attempts,
-                retry_limit=chain.retry_limit,
-                inbox_parent_id=None,
-                wake_receipt=None,
-                drain_receipt=None,
-            )
-            db.add(final)
-            db.add(
-                SqlRetryInput(
-                    input_id=notice_id,
-                    chain_id=chain_id,
-                    target_id=chain.parent_id,
-                    kind="wake",
-                    attempt=0,
-                    state="prepared",
-                    payload=body,
-                    version=0,
-                    expected_input_generation=self._child_control(db, chain.parent_id).generation,
-                    turn_id=None,
-                    input_generation=None,
-                    reason=None,
-                )
-            )
-            chain.phase, chain.retry_closed, chain.due_at = "finalized", True, None
-            chain.version += 1
-            return _final(final)
+            return self._finalize(db, chain, expected_version, outcome, body)
 
         return run_write_transaction(self._session, "finalize_chain_and_outbox", write)
+
+    def _finalize(
+        self,
+        db: Session,
+        chain: SqlRetryChain,
+        expected_version: int,
+        outcome: RetryOutcome,
+        body: dict[str, Any],
+    ) -> RetryFinal | None:
+        chain_id = chain.chain_id
+        existing = _current(db, SqlRetryFinal, (current_workspace_id(), chain_id))
+        if existing is not None:
+            return _final(existing)
+        if chain.version != expected_version or chain.phase == "superseded":
+            return None
+        control = self._child_control(db, chain.child_id)
+        if (control.turn_id, control.generation) != (
+            chain.expected_turn_id,
+            chain.expected_input_generation,
+        ) and not (
+            outcome.status == "cancelled"
+            and control.turn_id is None
+            and control.generation > chain.expected_input_generation
+        ):
+            return None
+        pending = (
+            _current(db, SqlRetryInput, (current_workspace_id(), chain.pending_input_id))
+            if chain.pending_input_id
+            else None
+        )
+        if pending is not None and pending.state in {"prepared", "dispatching", "reserved"}:
+            raise ValueError("Resolve or close pending admission before finalization")
+        terminal = TerminalEnvelope.model_validate(chain.latest_terminal)
+        known_success = (
+            terminal.status == "completed" and terminal.turn_id == chain.expected_turn_id
+        )
+        if known_success != (outcome.status == "completed"):
+            raise ValueError("Final outcome must preserve the recorded successful turn")
+        if terminal.status in {"cancelled", "stopped", "killed"} and outcome.status != "cancelled":
+            raise ValueError("Final outcome must preserve confirmed cancellation")
+        result_id = retry_identity("subagent-result", chain_id)
+        notice_id = retry_identity("subagent-final", chain_id)
+        if body.get("type") != "message" or not isinstance(body.get("data"), dict):
+            raise ValueError("Final wake must be a visible message payload")
+        data = body["data"]
+        if data.get("stable_id", notice_id) != notice_id:
+            raise ValueError("Final wake payload has another input identity")
+        data["stable_id"] = notice_id
+        final_outcome = outcome.model_copy(
+            update={
+                "error": outcome.error if outcome.error is not None else _json(chain.latest_error)
+            }
+        )
+        final = SqlRetryFinal(
+            chain_id=chain_id,
+            child_id=chain.child_id,
+            parent_id=chain.parent_id,
+            result_id=result_id,
+            notice_id=notice_id,
+            outcome=final_outcome.model_dump(mode="json"),
+            attempts=chain.accepted_attempts,
+            retry_limit=chain.retry_limit,
+            inbox_parent_id=None,
+            wake_receipt=None,
+            drain_receipt=None,
+        )
+        db.add(final)
+        db.add(
+            SqlRetryInput(
+                input_id=notice_id,
+                chain_id=chain_id,
+                target_id=chain.parent_id,
+                kind="wake",
+                attempt=0,
+                state="prepared",
+                payload=body,
+                version=0,
+                expected_input_generation=self._child_control(db, chain.parent_id).generation,
+                turn_id=None,
+                input_generation=None,
+                reason=None,
+            )
+        )
+        chain.phase, chain.retry_closed, chain.due_at = "finalized", True, None
+        chain.version += 1
+        return _final(final)
 
     def get_final(self, chain_id: str) -> RetryFinal | None:
         with self._read("read_final_delivery") as db:

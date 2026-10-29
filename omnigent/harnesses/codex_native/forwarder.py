@@ -8510,6 +8510,7 @@ async def _post_status(
     turn_id: str | None = None,
     input_id: str | None = None,
     recovered: bool = False,
+    native_generation: int | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -8531,6 +8532,8 @@ async def _post_status(
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if native_generation is not None:
+        data["native_generation"] = native_generation
     if turn_id is not None and turn_id != response_id:
         data["turn_id"] = turn_id
     if input_id is not None:
@@ -8605,7 +8608,13 @@ async def _post_turn_status_edge(
             ),
         ),
     )
+    native_generation = None
     if bridge_dir is not None and edge.turn_id is not None:
+        from omnigent.native.auto_retry import get_snapshot
+
+        snapshot = get_snapshot(bridge_dir, session_id)
+        if snapshot.turn_id == f"codex_{edge.turn_id}":
+            native_generation = snapshot.generation
         bridge_state = read_bridge_state(bridge_dir)
         if bridge_state is not None and bridge_state.input_turn_id == edge.turn_id:
             input_id = bridge_state.input_id
@@ -8638,6 +8647,7 @@ async def _post_turn_status_edge(
             else None
         ),
         recovered=recovered,
+        native_generation=native_generation,
     )
 
 

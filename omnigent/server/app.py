@@ -2333,6 +2333,24 @@ def create_app(
         else None
     )
     app.state.startup_admission = startup_admission
+    from omnigent.server.subagent_retry_admission import SubagentRetryAdmission
+    from omnigent.stores.subagent_retry_store.sqlalchemy_store import (
+        SqlAlchemySubagentRetryStore,
+    )
+
+    app.state.subagent_retry_admission = (
+        SubagentRetryAdmission(
+            SqlAlchemySubagentRetryStore(
+                conversation_store.storage_location,
+                conversation_store.conversation_storage_location,
+            ),
+            conversation_store,
+            host_store=host_store,
+            host_registry=host_registry,
+        )
+        if isinstance(conversation_store, SqlAlchemyConversationStore)
+        else None
+    )
     if startup_admission is not None:
         startup_admission.bind(app)
     app.state.host_store = host_store

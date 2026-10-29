@@ -3192,8 +3192,16 @@ module.exports = function (pi) {
       if (!text) return;
       const responseId = `pi-consumed-user-${Date.now()}-${++sequence}`;
       const autoRetry = nextInputAdmission?.auto_retry;
+      const nativeGeneration = nextInputAdmission?.native_generation;
       nextInputAdmission = null;
       turnInputId = autoRetry?.input_id ?? `pi:user:${responseId}`;
+      await postEvent(config, {
+        type: "external_session_status",
+        data: {
+          status: "running", turn_id: turnStatusResponseId, input_id: turnInputId,
+          ...(nativeGeneration ? { native_generation: nativeGeneration } : {}),
+        },
+      });
       history.enqueue(
         {
           response_id: responseId,

@@ -55,6 +55,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
+from omnigent.entities.subagent_retry import InputExecutionClaim, InputExecutionReceipt
 from omnigent.entities.subagent_terminal import (
     RESULT_IDENTITY_LABEL_PREFIX,
     TerminalEnvelope,
@@ -261,6 +262,7 @@ from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
+    InputExecutionClaimEvent,
     StartupClaimRequestEvent,
     StartupProofEvent,
 )
@@ -2424,6 +2426,175 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _input_execution_claims: dict[tuple[str, str], tuple[object, float]] = {}
+    _pending_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
+    _abandoned_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
+    _control_receipts: dict[tuple[str, str], bool] = {}
+
+    async def _flush_control_receipts(session_id: str) -> None:
+        for (target, input_id), accepted in list(_control_receipts.items()):
+            if target != session_id:
+                continue
+            url = f"/v1/sessions/{target}/input-controls/{input_id}"
+            try:
+                current = await server_client.get(url, timeout=5)
+                current.raise_for_status()
+                receipt = current.json()
+                if receipt.get("state") != "prepared":
+                    if receipt.get("state") in {"accepted", "rejected", "closed"}:
+                        _control_receipts.pop((target, input_id), None)
+                    continue
+                result = await server_client.post(
+                    url + "/resolve",
+                    json={
+                        "outcome": "accepted" if accepted else "refused",
+                        "expected_version": receipt["version"],
+                    },
+                    timeout=5,
+                )
+                result.raise_for_status()
+                if result.json().get("state") in {"accepted", "rejected", "closed"}:
+                    _control_receipts.pop((target, input_id), None)
+            except (httpx.HTTPError, KeyError, ValueError, RuntimeError):
+                # Keep the same receipt for the next input/reconnect boundary.
+                continue
+
+    async def _settle_control_input(body: object, response: Response) -> None:
+        from omnigent.entities.subagent_retry import ControlInputReference
+
+        if not isinstance(body, dict) or body.get("input_control") is None:
+            return
+        reference = ControlInputReference.model_validate(body["input_control"])
+        if 200 <= response.status_code < 300:
+            accepted = True
+        elif 400 <= response.status_code < 500:
+            accepted = False
+        else:
+            return
+        _control_receipts[(reference.session_id, reference.input_id)] = accepted
+        await _flush_control_receipts(reference.session_id)
+
+    async def _resolve_receiver_input(
+        session_id: str, claim: InputExecutionClaim
+    ) -> InputExecutionReceipt:
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{session_id}/input-admission/resolve",
+                json=claim.model_dump(mode="json"),
+                timeout=5,
+            )
+            response.raise_for_status()
+            return InputExecutionReceipt.model_validate(response.json())
+        except (httpx.HTTPError, ValueError, RuntimeError):
+            return InputExecutionReceipt(state="pending", reason="acceptance_unknown")
+
+    async def _settle_abandoned_inputs(session_id: str) -> bool:
+        for key, claim in list(_abandoned_input_executions.items()):
+            if key[0] != session_id:
+                continue
+            result = await _resolve_receiver_input(session_id, claim)
+            if result.state == "pending":
+                return False
+            _abandoned_input_executions.pop(key, None)
+            _pending_input_executions.pop(key, None)
+            expected = _input_execution_claims.get(key)
+            if expected == (claim.retry, claim.admission_deadline):
+                _input_execution_claims.pop(key, None)
+        return True
+
+    async def _relay_input_execution_claim(
+        harness_client: httpx.AsyncClient, session_id: str, event: object
+    ) -> None:
+        try:
+            await _relay_input_execution_claim_impl(harness_client, session_id, event)
+        except BaseException:
+            frame = InputExecutionClaimEvent.model_validate(event)
+            key = (session_id, frame.claim.input_id)
+            claim = _pending_input_executions.get(key)
+            if claim is not None:
+                # A cancelled HTTP/SSE waiter cannot cancel its remote DB write.
+                # Keep the original ID until it settles before admitting a successor.
+                _abandoned_input_executions[key] = claim
+            raise
+
+    async def _relay_input_execution_claim_impl(
+        harness_client: httpx.AsyncClient, session_id: str, event: object
+    ) -> None:
+        from omnigent.entities.subagent_retry import InputExecutionReceipt
+
+        try:
+            frame = InputExecutionClaimEvent.model_validate(event)
+        except ValueError:
+            return
+        key = (session_id, frame.claim.input_id)
+        expected = _input_execution_claims.get(key, ...)
+        expected_epoch = _turn_bind_epoch.get(session_id)
+        expected_response = _live_response_id.get(session_id)
+        result = InputExecutionReceipt(reason="input_identity_conflict")
+        if (
+            expected is not ...
+            and frame.claim.retry == expected[0]
+            and frame.claim.admission_deadline == expected[1]
+            and frame.claim.turn_id == _live_response_id.get(session_id)
+        ):
+            _pending_input_executions[key] = frame.claim
+            while True:
+                try:
+                    response = await server_client.post(
+                        f"/v1/sessions/{session_id}/input-admission",
+                        json=frame.claim.model_dump(mode="json"),
+                        timeout=5,
+                    )
+                    response.raise_for_status()
+                    result = InputExecutionReceipt.model_validate(response.json())
+                except (httpx.HTTPError, ValueError, RuntimeError):
+                    result = InputExecutionReceipt(
+                        state="pending", reason="input_admission_unavailable"
+                    )
+                if result.reason != "control_pending" or time.time() >= expected[1]:
+                    break
+                await asyncio.sleep(0.05)
+            if result.state == "pending":
+                result = await _resolve_receiver_input(session_id, frame.claim)
+            current_turn = (
+                _turn_bind_epoch.get(session_id) == expected_epoch
+                and _live_response_id.get(session_id) == expected_response
+            )
+            if not current_turn:
+                # The same-ID result remains durable for recovery, but a late
+                # callback cannot grant input or replace a newer turn's identity.
+                result = InputExecutionReceipt(
+                    state="pending" if result.state == "pending" else "refused",
+                    reason="superseded_acceptance_unknown"
+                    if result.state == "pending"
+                    else "superseded",
+                    receipt=result.receipt,
+                )
+            elif result.accepted and result.receipt is not None:
+                _turn_identities[session_id] = {
+                    "turn_id": result.receipt.turn_id,
+                    "input_id": result.receipt.input_id,
+                    "input_generation": result.receipt.input_generation,
+                }
+        reply = await harness_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "input_execution_result",
+                "claim_id": frame.claim_id,
+                "result": result.model_dump(mode="json"),
+            },
+            timeout=5,
+        )
+        reply.raise_for_status()
+        if result.state == "pending":
+            _abandoned_input_executions[key] = frame.claim
+        elif result.state != "reserved":
+            _pending_input_executions.pop(key, None)
+        if (
+            result.state not in {"pending", "reserved"}
+            and _input_execution_claims.get(key, ...) == expected
+        ):
+            _input_execution_claims.pop(key, None)
 
     async def _post_sdk_peer_receipt(session_id: str, outcome: SDKPeerOutcome) -> None:
         payload = {
@@ -8242,6 +8413,13 @@ def create_runner_app(
             harness_body["persisted_item_id"] = msg_body["persisted_item_id"]
         if msg_body.get("input_generation") is not None:
             harness_body["input_generation"] = msg_body["input_generation"]
+        for admission_field in (
+            "input_admission_required",
+            "retry_guard",
+            "input_admission_deadline",
+        ):
+            if admission_field in msg_body:
+                harness_body[admission_field] = msg_body[admission_field]
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union
@@ -8575,6 +8753,8 @@ def create_runner_app(
         conv_id: str,
         dispatch: TurnDispatch | None = None,
     ) -> Response:
+        if not await _settle_abandoned_inputs(conv_id):
+            return JSONResponse(status_code=409, content={"error": "input_acceptance_unresolved"})
         stream_epoch = _turn_bind_epoch.get(conv_id)
         turn_identity = _turn_identities.setdefault(
             conv_id, {"turn_id": f"runner_turn_{uuid.uuid4().hex}"}
@@ -9147,6 +9327,9 @@ def create_runner_app(
                                     )
 
                                 _evt_type = event.get("type")
+                                if _evt_type == "input.execution.claim":
+                                    await _relay_input_execution_claim(client, conv_id, event)
+                                    continue
                                 if _evt_type == "startup.claim.requested":
                                     await _relay_startup_claim(
                                         server_client,
@@ -9693,6 +9876,11 @@ def create_runner_app(
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
         if isinstance(body, dict) and body_type in ("message", None):
+            if not await _settle_abandoned_inputs(conversation_id):
+                return JSONResponse(
+                    status_code=409, content={"error": "input_acceptance_unresolved"}
+                )
+            await _flush_control_receipts(conversation_id)
             _register_startup_control(conversation_id, body)
             if body.get("startup_attempt") is None:
                 await startup_admission.refresh_exemption(conversation_id)
@@ -9806,7 +9994,9 @@ def create_runner_app(
                 )
             finally:
                 await _side_client.close()
-            return Response(status_code=202)
+            control_response = Response(status_code=202)
+            await _settle_control_input(body, control_response)
+            return control_response
         if body_type == "message" and isinstance(body, dict):
             # A codex /side command opens a side chat; it must not run a turn
             # here. Starting one publishes a "running" edge for this session,
@@ -9867,6 +10057,27 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            if message_body.get("input_admission_required") is True:
+                from omnigent.entities.subagent_retry import RetryExecutionGuard
+
+                input_id = message_body.get("input_id")
+                if not isinstance(input_id, str) or not input_id:
+                    return JSONResponse(
+                        status_code=422, content={"error": "missing_input_identity"}
+                    )
+                retry_guard = (
+                    RetryExecutionGuard.model_validate(message_body["retry_guard"])
+                    if message_body.get("retry_guard") is not None
+                    else None
+                )
+                if retry_guard is not None and conversation_id in _active_turns:
+                    return JSONResponse(status_code=409, content={"error": "retry_receiver_busy"})
+                deadline = message_body.get("input_admission_deadline")
+                if not isinstance(deadline, (float, int)) or isinstance(deadline, bool):
+                    return JSONResponse(
+                        status_code=422, content={"error": "missing_input_deadline"}
+                    )
+                _input_execution_claims[(conversation_id, input_id)] = (retry_guard, deadline)
             _apply_archive_states(
                 conversation_id,
                 message_body.pop("_archive_states", None),
@@ -10236,9 +10447,12 @@ def create_runner_app(
                 _harness, conversation_id, prompt_pending=_prompt_pending
             )
             if _interrupt_resp is not None:
+                await _settle_control_input(body, _interrupt_resp)
                 return _interrupt_resp
             await _cancel_inprocess_turn(conversation_id)
-            return Response(status_code=204)
+            control_response = Response(status_code=204)
+            await _settle_control_input(body, control_response)
+            return control_response
 
         if body_type == "external_session_status":
             data = body.get("data") if isinstance(body, dict) else None
@@ -10558,9 +10772,12 @@ def create_runner_app(
             _harness = _session_harness_name(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
+                await _settle_control_input(body, _stop_resp)
                 return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
-            return Response(status_code=204)
+            control_response = Response(status_code=204)
+            await _settle_control_input(body, control_response)
+            return control_response
 
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)

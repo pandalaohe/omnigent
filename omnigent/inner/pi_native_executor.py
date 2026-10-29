@@ -26,6 +26,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.native_attachments import attachment_reference_line
 from omnigent.native.auto_retry import (
     NativeRetryRejected,
+    claim_execution,
     current_guard,
     get_snapshot,
     prepare_submission,
@@ -84,6 +85,7 @@ class PiNativeExecutor(Executor):
         async with self._inject_lock:
             try:
                 self._prepare_retry(text)
+                await claim_execution()
             except NativeRetryRejected:
                 return False
             with submission_scope(self._bridge_dir):
@@ -118,6 +120,7 @@ class PiNativeExecutor(Executor):
         async with self._inject_lock:
             try:
                 self._prepare_retry(text)
+                await claim_execution()
             except NativeRetryRejected as exc:
                 yield ExecutorError(
                     message=exc.reason, code=exc.reason, undelivered=True, preserve_session=True

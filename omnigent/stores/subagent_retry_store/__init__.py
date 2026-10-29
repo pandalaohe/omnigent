@@ -4,6 +4,8 @@ from typing import Any, Protocol
 
 from omnigent.entities.subagent_retry import (
     InboxOwnerFence,
+    InputExecutionClaim,
+    InputExecutionReceipt,
     RetryChain,
     RetryControl,
     RetryFinal,
@@ -89,6 +91,32 @@ class SubagentRetryStore(Protocol):
         owner: InboxOwnerFence,
         turn_id: str,
     ) -> RetryInput | None: ...
+
+    def admit_execution(
+        self, child_id: str, claim: InputExecutionClaim, *, runner_id: str | None
+    ) -> InputExecutionReceipt: ...
+
+    def bind_native_turn(
+        self,
+        child_id: str,
+        *,
+        input_id: str,
+        turn_id: str,
+        runner_id: str,
+        native_generation: int | None = None,
+    ) -> InputExecutionReceipt: ...
+
+    def resolve_execution(
+        self, child_id: str, claim: InputExecutionClaim, *, runner_id: str, close: bool
+    ) -> InputExecutionReceipt: ...
+
+    def begin_control(self, child_id: str, input_id: str, *, runner_id: str | None) -> bool: ...
+
+    def finish_control(self, child_id: str, input_id: str, *, accepted: bool) -> bool: ...
+
+    def list_controls(self, child_id: str) -> list[RetryInput]: ...
+
+    def retire_control(self, child_id: str, input_id: str, *, expected_version: int) -> bool: ...
 
     def close_input(
         self,

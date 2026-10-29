@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from omnigent.entities.subagent_terminal import TerminalEnvelope
 
@@ -73,7 +73,7 @@ class RetryInput(BaseModel):
     target_id: str
     kind: Literal["human", "control", "retry", "wake"]
     attempt: int
-    state: Literal["prepared", "dispatching", "accepted", "closed", "rejected"]
+    state: Literal["prepared", "dispatching", "reserved", "accepted", "closed", "rejected"]
     payload: dict[str, Any]
     version: int
     expected_input_generation: int | None = Field(default=None, strict=True, ge=0)
@@ -87,6 +87,63 @@ class RetryInputClaim(BaseModel):
 
     receipt: RetryInput
     claimed: bool
+
+
+class RetryExecutionGuard(BaseModel):
+    """Server-issued expectations carried outside the visible message payload."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    chain_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    input_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    owner: InboxOwnerFence
+    expected_turn_id: str = Field(min_length=1, max_length=256)
+    expected_input_generation: int = Field(strict=True, ge=0)
+    attempt: int = Field(strict=True, ge=1)
+    of: int = Field(strict=True, ge=1)
+
+
+class InputExecutionClaim(BaseModel):
+    """The receiver's final consumption boundary, authenticated by its runner."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    input_id: str = Field(min_length=1, max_length=256)
+    turn_id: str | None = Field(default=None, min_length=1, max_length=256)
+    retry: RetryExecutionGuard | None = None
+    native_generation: int | None = Field(default=None, strict=True, ge=1)
+    admission_deadline: float | None = Field(default=None, allow_inf_nan=False)
+    boundary: Literal["receiver", "native_reserve", "native_accept", "native_refuse"] = "receiver"
+    native_turn_id: str | None = Field(default=None, min_length=1, max_length=256)
+    native_reason: str | None = Field(default=None, min_length=1, max_length=64)
+    native_detail: str | None = Field(default=None, max_length=4096)
+
+
+class InputExecutionReceipt(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    state: Literal["reserved", "accepted", "refused", "pending"] = "refused"
+    reason: str
+    receipt: RetryInput | None = None
+
+    @computed_field
+    @property
+    def accepted(self) -> bool:
+        return self.state == "accepted"
+
+
+class ControlInputReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    input_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class ControlInputResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: Literal["accepted", "refused", "retired"]
+    expected_version: int = Field(strict=True, ge=0)
 
 
 class RetryOutcome(BaseModel):
