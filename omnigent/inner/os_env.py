@@ -1867,6 +1867,7 @@ def _shell_impl(
             cwd=str(cwd),
             env=env,
             text=True,
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             **_proc.spawn_kwargs(),
@@ -1898,6 +1899,9 @@ def _shell_impl(
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
+    # Windows reader threads can leave a stream unset when reading fails.
+    stdout = stdout or ""
+    stderr = stderr or ""
     detail = stderr.strip() or stdout.strip()
     stdout = _truncate_output(stdout, "stdout", max_output)
     stderr = _truncate_output(stderr, "stderr", max_output)
