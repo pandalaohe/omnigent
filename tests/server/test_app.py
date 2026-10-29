@@ -1606,7 +1606,11 @@ def test_sdk_seed_is_distinct_and_uses_host_defaults(
     assert loaded.spec.executor.model is None
     assert loaded.spec.executor.auth is None
     assert loaded.spec.spawn is True
-    assert loaded.spec.os_env is None
+    if name == "pi-rpc":
+        assert loaded.spec.os_env is not None
+        assert loaded.spec.os_env.type == "caller_process"
+    else:
+        assert loaded.spec.os_env is None
     assert loaded.spec.terminals is None
 
     def advertised_names(spec: AgentSpec) -> set[str]:
@@ -1630,12 +1634,19 @@ def test_sdk_seed_is_distinct_and_uses_host_defaults(
     advertised_added = advertised - advertised_names(without_spawn)
     assert expected_added <= advertised_added <= expected_added | {"sys_advise_models"}
     assert {"sys_session_create", "sys_session_close"} <= advertised
-    assert not any(name.startswith(("sys_os_", "sys_terminal_")) for name in advertised)
+    expected_os_tools = (
+        {"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"}
+        if name == "pi-rpc"
+        else set()
+    )
+    assert {name for name in advertised if name.startswith("sys_os_")} == expected_os_tools
+    assert not any(name.startswith("sys_terminal_") for name in advertised)
 
     granted = _granted_tool_names(loaded.spec, harness)
     assert granted - _granted_tool_names(without_spawn, harness) == advertised_added
     assert "sys_session_create" in granted
-    assert not any(name.startswith(("sys_os_", "sys_terminal_")) for name in granted)
+    assert {name for name in granted if name.startswith("sys_os_")} == expected_os_tools
+    assert not any(name.startswith("sys_terminal_") for name in granted)
 
 
 @pytest.mark.parametrize(
