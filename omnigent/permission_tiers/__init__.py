@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypeAlias
+from urllib.parse import urlsplit
 
 PermissionTier: TypeAlias = Literal["ask", "plan", "accept-edits", "auto", "full"]
 PERMISSION_TIERS: tuple[PermissionTier, ...] = ("ask", "plan", "accept-edits", "auto", "full")
@@ -134,17 +135,23 @@ _PROTECTED_PREFIX = (
 )
 _READ_PATH = {
     "read": "path",
+    "read_file": "Path",
     "sys_os_read": "path",
     "view_file": "AbsolutePath",
     "list_dir": "DirectoryPath",
+    "grep_search": "SearchPath",
+    "find_by_name": "SearchDirectory",
 }
 _EDIT_PATH = {
     "write": "path",
     "edit": "path",
+    "write_file": "Path",
+    "edit_file": "Path",
     "sys_os_write": "path",
     "sys_os_edit": "path",
     "write_to_file": "TargetFile",
     "replace_file_content": "TargetFile",
+    "multi_replace_file_content": "TargetFile",
 }
 _EXEC_COMMAND = {"bash": "command", "sys_os_shell": "command", "run_command": "CommandLine"}
 _READ_NO_PATH = frozenset(
@@ -169,6 +176,11 @@ _READ_NO_PATH = frozenset(
         "browser_screenshot",
         "sys_terminal_read",
         "sys_terminal_list",
+        "command_status",
+        "search_web",
+        "search_marketplace",
+        "list_permissions",
+        "list_plugin_accounts",
     )
 )
 # These operations retain server authorization and must not bypass the plan gate.
@@ -199,10 +211,129 @@ _OPERATIONAL_TOOLS = frozenset(
         "browser_click",
         "browser_type",
         "sys_terminal_close",
+        "define_subagent",
+        "schedule",
+        "send_message",
     )
 )
-_QUESTION_TOOLS = frozenset(("ask_user", "ask_user_async", "request_user_input"))
-_CONTROL_TOOLS = frozenset(("report_result", "sys_read_inbox", "manage_todo_list"))
+_QUESTION_TOOLS = frozenset(("ask_user", "ask_user_async", "request_user_input", "ask_question"))
+_CONTROL_TOOLS = frozenset(
+    (
+        "report_result",
+        "sys_read_inbox",
+        "manage_todo_list",
+        "finish",
+        "wait",
+        "wait_5_seconds",
+        "report_browser_outcome",
+    )
+)
+# Native tools whose effects extend beyond a checkable path or command.
+_AGY_UNCHECKABLE = {
+    "send_command_input": "Interactive terminal input cannot be checked",
+    "run_workflow": "Workflow scripts cannot be checked as a shell command",
+    "sed_file": "Sed expressions may access paths or execute commands beyond the target file",
+    "notebook_execution": "Notebook execution cannot be checked as a shell command",
+    "invoke_subagent": "Subagent tool execution cannot be bound to this permission check",
+    "generate_image": "Image output and input paths cannot yet be bound",
+    "read_resource": "MCP resource access is not a verified filesystem read",
+    "list_resources": "MCP resource access is not a verified filesystem read",
+    "ask_permission": "Native permission grants cannot replace the session permission tier",
+    "ask_custom_permission": "Native permission grants cannot replace the session permission tier",
+}
+_AGY_ACTIONS = {
+    "notebook_edit": {
+        "list": ToolKind.READ,
+        "get": ToolKind.READ,
+        "get_with_outputs": ToolKind.READ,
+        "add": ToolKind.EDIT,
+        "update": ToolKind.EDIT,
+        "delete": ToolKind.EDIT,
+        "create": ToolKind.EDIT,
+    },
+    "manage_task": {"list": ToolKind.READ, "status": ToolKind.READ, "kill": ToolKind.OTHER},
+    "manage_subagents": {
+        "list": ToolKind.READ,
+        "list_peers": ToolKind.READ,
+        "kill": ToolKind.OTHER,
+        "kill_all": ToolKind.OTHER,
+    },
+    "manage_inbox": {"list": ToolKind.READ, "read": ToolKind.READ},
+    "webview_browser": {
+        **dict.fromkeys(("snapshot", "get_state", "list-tabs"), ToolKind.READ),
+        **dict.fromkeys(
+            (
+                "open",
+                "navigate",
+                "click",
+                "fill",
+                "type",
+                "press",
+                "hover",
+                "scroll",
+                "select_option",
+                "wait",
+                "back",
+                "forward",
+                "reload",
+                "new-tab",
+                "activate-tab",
+                "close-tab",
+                "batch",
+            ),
+            ToolKind.OTHER,
+        ),
+    },
+}
+_AGY_CHECKED_FIELDS: dict[str, str] = {
+    key.casefold(): key
+    for key in (
+        "Path",
+        "Content",
+        "Target",
+        "Replacement",
+        "Edits",
+        "Cwd",
+        "RunPersistent",
+        "RequestedTerminalID",
+        "CommandLine",
+        "NotebookPath",
+        "Action",
+        "AbsolutePath",
+        "DirectoryPath",
+        "SearchPath",
+        "SearchDirectory",
+        "TargetFile",
+        "Url",
+        "ServerName",
+        "ToolName",
+        "Arguments",
+        "script",
+    )
+}
+
+
+def _validate_agy_argument_keys(name: str, arguments: Mapping[str, object]) -> None:
+    path_key = _READ_PATH.get(name) or _EDIT_PATH.get(name)
+    if (
+        path_key in (None, "path")
+        and name not in _AGY_ACTIONS
+        and name not in ("run_command", "read_url_content", "call_mcp_tool")
+    ):
+        return
+    seen = set()
+    for key in arguments:
+        if not isinstance(key, str):
+            raise ValueError("Native tool argument keys must be strings")
+        folded = key.casefold()
+        expected = (
+            folded
+            if name == "webview_browser" and folded in ("action", "url")
+            else _AGY_CHECKED_FIELDS.get(folded)
+        )
+        if folded in seen or (expected is not None and key != expected):
+            raise ValueError(f"Ambiguous or noncanonical native argument: {key}")
+        seen.add(folded)
 
 
 def plan_visible_tool_names(names: Iterable[str]) -> tuple[str, ...]:
@@ -430,6 +561,7 @@ def _adapt_unbound_call(
                 detail=reason or "user-extension",
             )
         if name == "call_mcp_tool":
+            _validate_agy_argument_keys(name, arguments)
             server = _required_text(arguments, "ServerName")
             tool = _required_text(arguments, "ToolName")
             if server != "omnigent":
@@ -447,6 +579,7 @@ def _adapt_unbound_call(
             if not isinstance(embedded, dict):
                 raise ValueError("MCP Arguments must be an object")
             name, arguments = tool, embedded
+        _validate_agy_argument_keys(name, arguments)
         if name == "open_in_panel":
             path = _required_text(arguments, "path")
             if any(
@@ -474,12 +607,14 @@ def _adapt_unbound_call(
         if name in _EDIT_PATH:
             if name in ("write", "sys_os_write") and not isinstance(arguments.get("content"), str):
                 raise ValueError("Missing content")
-            if name in ("edit", "sys_os_edit"):
-                pair = all(isinstance(arguments.get(key), str) for key in ("oldText", "newText"))
-                edits = arguments.get("edits")
+            if name == "write_file" and not isinstance(arguments.get("Content"), str):
+                raise ValueError("Missing Content")
+            if name in ("edit", "sys_os_edit", "edit_file"):
+                keys = ("Target", "Replacement") if name == "edit_file" else ("oldText", "newText")
+                pair = all(isinstance(arguments.get(key), str) for key in keys)
+                edits = arguments.get("Edits" if name == "edit_file" else "edits")
                 batch = isinstance(edits, list) and all(
-                    isinstance(edit, dict)
-                    and all(isinstance(edit.get(key), str) for key in ("oldText", "newText"))
+                    isinstance(edit, dict) and all(isinstance(edit.get(key), str) for key in keys)
                     for edit in edits
                 )
                 if not (pair or batch):
@@ -494,13 +629,56 @@ def _adapt_unbound_call(
                 target=_resolve(_required_text(arguments, _EDIT_PATH[name]), context),
             )
         if name in _EXEC_COMMAND:
+            target = None
+            if name == "run_command":
+                if arguments.get("RunPersistent") or arguments.get("RequestedTerminalID"):
+                    return ToolIntent(
+                        ToolKind.UNKNOWN,
+                        name,
+                        digest,
+                        context,
+                        status="unknown",
+                        detail="Persistent terminal working directory cannot be confirmed",
+                    )
+                if "Cwd" in arguments:
+                    target = _resolve(_required_text(arguments, "Cwd"), context)
+                    if target.kind != "directory":
+                        raise ValueError("Command Cwd must be a confirmed directory")
+                    context = replace(context, cwd=target.path)
             return ToolIntent(
                 ToolKind.EXEC,
                 name,
                 digest,
                 context,
                 command=_command_text(_required_text(arguments, _EXEC_COMMAND[name])),
+                target=target,
             )
+        reason = _AGY_UNCHECKABLE.get(name)
+        if name == "manage_task" and arguments.get("Action") == "send_input":
+            reason = "Interactive terminal input cannot be checked"
+        if name == "webview_browser" and "script" in arguments:
+            reason = "Browser script effects cannot be checked"
+        if reason:
+            return ToolIntent(
+                ToolKind.UNKNOWN, name, digest, context, status="unknown", detail=reason
+            )
+        if name == "read_url_content":
+            url = urlsplit(_required_text(arguments, "Url"))
+            if url.scheme not in ("http", "https") or not url.hostname:
+                raise ValueError("Only HTTP(S) URL content reads can be checked")
+            return ToolIntent(ToolKind.READ, name, digest, context)
+        if name in _AGY_ACTIONS:
+            key = "action" if name == "webview_browser" else "Action"
+            action = _required_text(arguments, key)
+            kind = _AGY_ACTIONS[name].get(action)
+            if kind is None:
+                raise ValueError(f"Unknown {name} action")
+            target = (
+                _resolve(_required_text(arguments, "NotebookPath"), context)
+                if name == "notebook_edit"
+                else None
+            )
+            return ToolIntent(kind, name, digest, context, target=target)
         if name == "sys_terminal_send":
             _required_text(arguments, "terminal")
             _required_text(arguments, "session")
@@ -564,13 +742,13 @@ def adapt_tool_call(
             resolved_control_paths=controls,
             protected_exact_paths=tuple(_resolve(path, context).path for path in exact),
             protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
-            command_paths=_command_paths(intent.command, context) if intent.command else (),
+            command_paths=_command_paths(intent.command, intent.context) if intent.command else (),
         )
         try:
             return replace(
                 bound,
                 command_write_paths=(
-                    _command_paths(intent.command, context, writes_only=True)
+                    _command_paths(intent.command, intent.context, writes_only=True)
                     if intent.command
                     else ()
                 ),
@@ -1089,7 +1267,13 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
         for original, path in zip(
             context.control_paths, intent.resolved_control_paths, strict=True
         ):
-            if target and _under(target.path, path, windows):
+            if target and (
+                _under(target.path, path, windows)
+                or (
+                    intent.name in ("grep_search", "find_by_name")
+                    and _under(path, target.path, windows)
+                )
+            ):
                 return TierDecision(Verdict.DENY, control_reason, "control-path")
             if intent.command and any(
                 _mentions_path(intent.command, form, context)

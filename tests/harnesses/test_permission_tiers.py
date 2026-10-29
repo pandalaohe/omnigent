@@ -18,6 +18,7 @@ from omnigent.permission_tiers import (
     PI_PERMISSION_TIER_LABEL_KEY,
     RelaxedRules,
     ResolvedPath,
+    ToolKind,
     TrustedHostContext,
     Verdict,
     adapt_tool_call,
@@ -79,6 +80,259 @@ def test_read_plan_edit_and_single_call_ask() -> None:
     first = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     second = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     assert first.action == second.action == Verdict.ASK
+
+
+@pytest.mark.parametrize(
+    "name,args,kind,target",
+    [
+        ("read_file", {"Path": "src/a.py"}, ToolKind.READ, "src/a.py"),
+        ("grep_search", {"SearchPath": "src", "Query": "TODO"}, ToolKind.READ, "src"),
+        ("find_by_name", {"SearchDirectory": "src", "Pattern": "*.py"}, ToolKind.READ, "src"),
+        ("view_file", {"AbsolutePath": "src/a.py"}, ToolKind.READ, "src/a.py"),
+        ("list_dir", {"DirectoryPath": "src"}, ToolKind.READ, "src"),
+        ("write_file", {"Path": "src/a.py", "Content": "x"}, ToolKind.EDIT, "src/a.py"),
+        (
+            "edit_file",
+            {"Path": "src/a.py", "Target": "x", "Replacement": "y"},
+            ToolKind.EDIT,
+            "src/a.py",
+        ),
+        (
+            "edit_file",
+            {"Path": "src/a.py", "Edits": [{"Target": "x", "Replacement": "y"}]},
+            ToolKind.EDIT,
+            "src/a.py",
+        ),
+        ("multi_replace_file_content", {"TargetFile": "src/a.py"}, ToolKind.EDIT, "src/a.py"),
+        ("notebook_edit", {"NotebookPath": "a.ipynb", "Action": "get"}, ToolKind.READ, "a.ipynb"),
+        ("notebook_edit", {"NotebookPath": "a.ipynb", "Action": "add"}, ToolKind.EDIT, "a.ipynb"),
+    ],
+)
+def test_agy_file_schemas_use_real_path_fields_and_existing_tiers(name, args, kind, target):
+    # Installed CLI schemas use Path for the newer read/write/edit tools.
+    intent = adapt_tool_call(name, args, posix_host())
+    assert intent.kind == kind
+    assert intent.target == ResolvedPath("/opt/work/project/" + target, "new-file")
+    expected = (
+        (Verdict.ALLOW,) * 5
+        if kind == ToolKind.READ
+        else (Verdict.ASK, Verdict.DENY, Verdict.ALLOW, Verdict.ALLOW, Verdict.ALLOW)
+    )
+    assert tuple(decision(tier, name, args).action for tier in PERMISSION_TIERS) == expected
+    for tier in NON_FULL_TIERS:
+        protected_args = {**args}
+        path_key = next(key for key in args if args[key] == target)
+        protected_args[path_key] = "/opt/work/control/settings.json"
+        assert decision(tier, name, protected_args).action == Verdict.DENY
+    if kind == ToolKind.EDIT:
+        protected_args[path_key] = "/etc/profile"
+        assert decision("auto", name, protected_args).rule_id == "protected-path"
+        protected_args[path_key] = "/opt/elsewhere/a.py"
+        assert decision("accept-edits", name, protected_args).action == Verdict.ASK
+
+
+@pytest.mark.parametrize(
+    "name,key",
+    [
+        ("read_file", "Path"),
+        ("write_file", "Path"),
+        ("edit_file", "Path"),
+        ("grep_search", "SearchPath"),
+        ("find_by_name", "SearchDirectory"),
+    ],
+)
+def test_agy_file_calls_without_the_schema_path_fail_closed(name, key):
+    for value in (None, "", 1, "\x00"):
+        for tier in PERMISSION_TIERS:
+            assert decision(tier, name, {key: value}).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("command_status", {"CommandId": "task-1"}),
+        ("search_web", {"query": "Python docs"}),
+        ("search_marketplace", {"queries": ["calendar"]}),
+        ("list_permissions", {}),
+        ("manage_task", {"Action": "status", "TaskId": "task-1"}),
+        ("manage_subagents", {"Action": "list"}),
+        ("manage_inbox", {"Action": "list"}),
+        ("read_url_content", {"Url": "https://example.test/docs"}),
+        ("webview_browser", {"action": "snapshot"}),
+    ],
+)
+def test_agy_non_file_reads_allow_read_tiers(name, args):
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, args).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "name", ["ask_question", "finish", "wait", "wait_5_seconds", "report_browser_outcome"]
+)
+def test_agy_question_and_control_tools_allow_every_tier(name):
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, {}).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("define_subagent", {"Name": "reader"}),
+        ("schedule", {"DurationSeconds": 10, "Prompt": "check"}),
+        ("send_message", {"Recipient": "worker", "Message": "result"}),
+        ("manage_task", {"Action": "kill", "TaskId": "task-1"}),
+        ("manage_subagents", {"Action": "kill_all"}),
+        ("webview_browser", {"action": "click", "uid": "button"}),
+        ("webview_browser", {"action": "open", "url": "https://example.test/docs"}),
+        ("webview_browser", {"action": "navigate", "url": "https://example.test/docs"}),
+        ("webview_browser", {"action": "new-tab", "url": "https://example.test/docs"}),
+    ],
+)
+def test_agy_operations_keep_existing_operational_tiers(name, args):
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert tuple(decision(tier, name, args).action for tier in PERMISSION_TIERS) == expected
+
+
+@pytest.mark.parametrize(
+    "name,args,reason",
+    [
+        ("send_command_input", {"CommandId": "task-1", "Input": "pwd\n"}, "terminal input"),
+        (
+            "manage_task",
+            {"Action": "send_input", "TaskId": "task-1", "Input": "pwd\n"},
+            "terminal input",
+        ),
+        ("run_workflow", {"Script": "print('hello')"}, "Workflow"),
+        ("sed_file", {"target_file": "a.py", "expressions": ["s/x/y/"]}, "Sed"),
+        (
+            "notebook_execution",
+            {"NotebookPath": "a.ipynb", "CellIDs": ["1"]},
+            "Notebook execution",
+        ),
+        ("invoke_subagent", {"TypeName": "worker", "Prompt": "read a.py"}, "Subagent"),
+        ("generate_image", {"ImageName": "diagram", "Prompt": "diagram"}, "Image output"),
+        ("read_resource", {"ServerName": "other", "Uri": "custom:item"}, "MCP resource"),
+        ("list_resources", {"ServerName": "other"}, "MCP resource"),
+        ("ask_permission", {"Action": "command", "Target": "git"}, "Native permission"),
+        ("ask_custom_permission", {"Grant": "custom"}, "Native permission"),
+        ("webview_browser", {"script": "await page.click('button')"}, "Browser script"),
+        ("future_agy_tool", {}, "Unknown tool schema"),
+    ],
+)
+def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args, reason):
+    result = decision("auto", name, args)
+    assert result.action == Verdict.DENY
+    assert reason in result.reason
+    assert decision("ask", name, args).action == Verdict.ASK
+    assert decision("plan", name, args).action == Verdict.DENY
+    assert decision("accept-edits", name, args).action == Verdict.ASK
+    assert decision("full", name, args).action == Verdict.ALLOW
+
+
+def test_agy_shell_cwd_binds_relative_destinations_and_control_paths():
+    def resolve(path):
+        return ResolvedPath(
+            path,
+            "directory"
+            if path in ("/opt/work/project", "/etc", "/opt/work/control")
+            else "new-file",
+        )
+
+    host = posix_host(resolver=resolve)
+    args = {"CommandLine": "echo x > profile", "Cwd": "/etc"}
+    assert decision("auto", "run_command", args, host).rule_id == "protected-path"
+    args["Cwd"] = "/opt/work/control"
+    assert decision("auto", "run_command", args, host).rule_id == "control-path"
+    args["Cwd"] = "/opt/work/project"
+    assert decision("auto", "run_command", args, host).action == Verdict.ALLOW
+    args["RunPersistent"] = True
+    assert decision("auto", "run_command", args, host).action == Verdict.DENY
+
+
+def test_agy_command_cwd_does_not_relocate_trusted_control_paths():
+    def resolve(path):
+        return ResolvedPath(
+            path, "directory" if path in ("/opt/work/project", "/tmp") else "new-file"
+        )
+
+    host = posix_host(control_paths=("bridge",), resolver=resolve)
+    args = {"Cwd": "/tmp", "CommandLine": "echo x > /opt/work/project/bridge/settings.json"}
+    assert decision("auto", "run_command", args, host).rule_id == "control-path"
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("read_url_content", {"Url": "file:///opt/work/control/state"}),
+        ("read_url_content", {"Url": "https:///missing-host"}),
+        ("manage_task", {"Action": "future_action"}),
+        ("webview_browser", {"action": "future_action"}),
+        ("notebook_edit", {"Action": "execute", "NotebookPath": "a.ipynb"}),
+        ("run_command", {"CommandLine": "pwd", "Cwd": "not-a-directory"}),
+    ],
+)
+def test_agy_unsupported_actions_and_unbound_targets_fail_closed(name, args):
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, args).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        (
+            "grep_search",
+            {
+                "SearchPath": "/opt/work/project",
+                "Query": "secret",
+                "Includes": ["bridge/state.json"],
+                "MatchPerLine": True,
+            },
+        ),
+        ("find_by_name", {"SearchDirectory": "/opt/work/project", "Pattern": "state.json"}),
+    ],
+)
+def test_agy_recursive_search_cannot_cover_a_control_directory(name, args):
+    host = posix_host(control_paths=("/opt/work/project/bridge",))
+    for tier in NON_FULL_TIERS:
+        assert decision(tier, name, args, host).rule_id == "control-path"
+    assert decision("full", name, args, host).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("read_file", {"Path": "a.py", "path": "/opt/work/control/state"}),
+        ("write_file", {"Path": "a.py", "path": "/etc/profile", "Content": "x"}),
+        ("run_command", {"CommandLine": "pwd", "commandline": "mkfs.ext4 /dev/disk4"}),
+        (
+            "run_command",
+            {"CommandLine": "echo x > profile", "Cwd": "/opt/work/project", "cwd": "/etc"},
+        ),
+        ("run_command", {"CommandLine": "pwd", "runpersistent": True}),
+        ("manage_task", {"Action": "list", "action": "send_input", "Input": "pwd\n"}),
+        ("notebook_edit", {"Action": "get", "action": "add", "NotebookPath": "a.ipynb"}),
+        ("webview_browser", {"action": "snapshot", "Script": "await page.click('button')"}),
+        ("webview_browser", {"action": "snapshot", "Action": "click", "uid": "button"}),
+        (
+            "webview_browser",
+            {"action": "navigate", "url": "https://example.test", "Url": "https://other.test"},
+        ),
+        (
+            "call_mcp_tool",
+            {
+                "ServerName": "omnigent",
+                "servername": "other",
+                "ToolName": "sys_session_list",
+                "Arguments": {},
+            },
+        ),
+    ],
+)
+def test_agy_permission_fields_reject_ambiguous_or_noncanonical_casing(name, args):
+    for tier in PERMISSION_TIERS:
+        result = decision(tier, name, args)
+        assert result.action == Verdict.DENY
+        assert "native argument" in result.reason
 
 
 def test_plan_visible_tools_only_include_registered_known_safe_names() -> None:
