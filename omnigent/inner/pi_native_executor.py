@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -23,6 +24,13 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.native.auto_retry import (
+    NativeRetryRejected,
+    current_guard,
+    get_snapshot,
+    prepare_submission,
+    submission_scope,
+)
 
 
 class PiNativeExecutor(Executor):
@@ -49,6 +57,7 @@ class PiNativeExecutor(Executor):
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
+        self._inject_lock = asyncio.Lock()
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the Pi extension."""
@@ -72,7 +81,13 @@ class PiNativeExecutor(Executor):
         if not text:
             return False
         self._refresh_auth_headers()
-        enqueue_user_message(self._bridge_dir, text)
+        async with self._inject_lock:
+            try:
+                self._prepare_retry(text)
+            except NativeRetryRejected:
+                return False
+            with submission_scope(self._bridge_dir):
+                enqueue_user_message(self._bridge_dir, text)
         return True
 
     async def run_turn(
@@ -100,8 +115,23 @@ class PiNativeExecutor(Executor):
             yield ExecutorError(message="Pi native turn had no user text to send")
             return
         self._refresh_auth_headers()
-        enqueue_user_message(self._bridge_dir, text)
+        async with self._inject_lock:
+            try:
+                self._prepare_retry(text)
+            except NativeRetryRejected as exc:
+                yield ExecutorError(
+                    message=exc.reason, code=exc.reason, undelivered=True, preserve_session=True
+                )
+                return
+            with submission_scope(self._bridge_dir):
+                enqueue_user_message(self._bridge_dir, text)
         yield TurnComplete(response=None)
+
+    def _prepare_retry(self, text: str) -> None:
+        guard = current_guard()
+        if guard is not None:
+            snapshot = get_snapshot(self._bridge_dir, guard.session_id)
+            prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
 
     def _refresh_auth_headers(self) -> None:
         """

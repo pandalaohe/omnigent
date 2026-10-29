@@ -237,8 +237,40 @@ def main(argv: list[str] | None = None) -> int:
         rotated_session_id = _rotate_session_on_fork(bridge_dir)
         if rotated_session_id:
             payload["omnigent_fork_rotated_to"] = rotated_session_id
+    input_admission = None
+    active = read_active_session_id(bridge_dir)
+    pinned = read_claude_session_id(bridge_dir)
+    if (
+        active
+        and payload.get("hook_event_name") == "UserPromptSubmit"
+        and payload.get("agent_id") is None
+        and (not pinned or payload.get("session_id") == pinned)
+    ):
+        from omnigent.native.auto_retry import admit_prompt
+
+        try:
+            input_admission = admit_prompt(
+                bridge_dir,
+                active,
+                str(payload.get("prompt", "")),
+                turn_id=f"claude_turn_{secrets.token_hex(16)}",
+            )
+        except Exception:  # noqa: BLE001 - an unreadable gate cannot authorize automatic input.
+            if payload.get("prompt") == "retry":
+                print(
+                    json.dumps(
+                        {"decision": "block", "reason": "native_retry_admission_unavailable"}
+                    )
+                )
+                return 0
+        if input_admission and input_admission.block:
+            print(json.dumps({"decision": "block", "reason": input_admission.reason}))
+            return 0
     try:
-        record_hook_event(bridge_dir, payload)
+        if input_admission is None:
+            record_hook_event(bridge_dir, payload)
+        else:
+            record_hook_event(bridge_dir, payload, input_admission=input_admission)
         if payload.get("hook_event_name") in {"Stop", "SubagentStop"}:
             from omnigent.usage_export.runtime import capture_claude_hook_path
 

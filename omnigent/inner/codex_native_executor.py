@@ -232,7 +232,7 @@ async def _native_delivery_request(
 ) -> CodexMessage:
     """Reconnect once after an authoritative refusal; never retry socket loss."""
     try:
-        return await _native_delivery_request_once(client, method, params, state)
+        return await _native_delivery_request_once(client, method, params, state, bridge_dir)
     except CodexAppServerResponseError as error:
         if not is_server_draining_error(error):
             raise
@@ -268,7 +268,7 @@ async def _native_delivery_request(
             ) from error
         # A second refusal still proves non-delivery. Any other failure after
         # this submission is ambiguous and must reach the caller unchanged.
-        return await _native_delivery_request_once(client, method, params, state)
+        return await _native_delivery_request_once(client, method, params, state, bridge_dir)
 
 
 async def _native_delivery_request_once(
@@ -276,8 +276,24 @@ async def _native_delivery_request_once(
     method: Literal["turn/start", "turn/steer"],
     params: CodexParams,
     state: CodexNativeBridgeState,
+    bridge_dir: Path,
 ) -> CodexMessage:
     """Pair each RPC attempt with its result, including a rejected stale steer."""
+    from omnigent.native.auto_retry import current_guard, prepare_submission
+
+    guard = current_guard()
+    if guard is not None:
+        current = read_bridge_state(bridge_dir)
+        prepare_submission(
+            bridge_dir,
+            native_idle=current is not None
+            and current.session_id == guard.session_id
+            and current.active_turn_id is None
+            and method == "turn/start",
+            text="retry" if params.get("input") == [{"type": "text", "text": "retry"}] else "",
+        )
+        # Supported by the checkout's pinned Codex 0.139.0 protocol.
+        params = {**params, "clientUserMessageId": guard.input_id}
     attempt_id = uuid.uuid4().hex
     stage = "turn_start" if method == "turn/start" else "turn_steer"
     expected = params.get("expectedTurnId") if method == "turn/steer" else None
@@ -297,6 +313,10 @@ async def _native_delivery_request_once(
     try:
         response = await client.request(method, params)
     except BaseException as exc:
+        from omnigent.native.auto_retry import abandon_submission
+
+        if not (isinstance(exc, CodexAppServerResponseError) and is_server_draining_error(exc)):
+            abandon_submission(bridge_dir)
         outcome = "rpc_error"
         if isinstance(exc, asyncio.CancelledError):
             outcome = "cancelled"
@@ -952,6 +972,15 @@ class CodexNativeExecutor(Executor):
                             if started_state is not None:
                                 self._record_owned_turn(started_state)
                     except Exception as exc:
+                        from omnigent.native.auto_retry import (
+                            NativeRetryRejected,
+                            abandon_submission,
+                        )
+
+                        abandon_submission(self._bridge_dir)
+
+                        if isinstance(exc, NativeRetryRejected):
+                            refusal_code, undelivered = exc.reason, True
                         if isinstance(exc, _CodexNativeInputUndelivered):
                             startup_failure = exc.failure
                             undelivered = True

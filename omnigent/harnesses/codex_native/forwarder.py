@@ -8609,6 +8609,10 @@ async def _post_turn_status_edge(
         bridge_state = read_bridge_state(bridge_dir)
         if bridge_state is not None and bridge_state.input_turn_id == edge.turn_id:
             input_id = bridge_state.input_id
+        if edge.status in {"idle", "failed"}:
+            from omnigent.native.auto_retry import observe_turn
+
+            observe_turn(bridge_dir, session_id, f"codex_{edge.turn_id}", idle=True)
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None
     reauth_required = False

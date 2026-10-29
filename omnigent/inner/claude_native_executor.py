@@ -58,6 +58,7 @@ from omnigent.inner.native_attachments import (
 )
 from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.native.auto_retry import NativeRetryRejected, submission_scope
 
 _logger = logging.getLogger(__name__)
 
@@ -357,7 +358,8 @@ class ClaudeNativeExecutor(Executor):
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+            with submission_scope(self._bridge_dir):
+                await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise
@@ -464,6 +466,11 @@ class ClaudeNativeExecutor(Executor):
                         if not await self._wait_for_answer(answer_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
+        except NativeRetryRejected as exc:
+            yield ExecutorError(
+                message=exc.reason, code=exc.reason, undelivered=True, preserve_session=True
+            )
+            return
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
             # fails, but the person's own teardown is not a defect; a pane that

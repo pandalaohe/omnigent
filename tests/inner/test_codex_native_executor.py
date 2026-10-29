@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -158,6 +159,48 @@ def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
         return events
 
     return asyncio.run(run())
+
+
+@pytest.mark.parametrize("superseded", [False, True])
+def test_automatic_retry_guard_and_pinned_input_id(draining_client, tmp_path, superseded):
+    from omnigent.native.auto_retry import (
+        AutoRetryGuard,
+        admit_prompt,
+        auto_retry_scope,
+        observe_turn,
+    )
+
+    draining_client.delivery_errors = []
+    _seed_bridge(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    snapshot = observe_turn(tmp_path, state.session_id, "codex_failed", idle=True)
+    guard = AutoRetryGuard(
+        session_id=state.session_id,
+        chain_id="c" * 32,
+        input_id="a" * 32,
+        expected_turn_id="codex_failed",
+        expected_input_generation=3,
+        expected_native_generation=snapshot.generation,
+        admission_deadline=time.time() + 60,
+        attempt=1,
+        of=3,
+    )
+    if superseded:
+        admit_prompt(tmp_path, state.session_id, "replace this", turn_id="human-turn")
+        observe_turn(tmp_path, state.session_id, "human-turn", idle=True)
+    with auto_retry_scope(guard), input_delivery_scope({"input_stable_id": guard.input_id}):
+        events = _collect_turn_events(CodexNativeExecutor(tmp_path), "retry")
+    submitted = [params for method, params in draining_client.requests if method == "turn/start"]
+    if superseded:
+        assert submitted == []
+        assert isinstance(events[0], ExecutorError) and events[0].undelivered
+        assert events[0].code == "superseded_by_human_input"
+    else:
+        assert submitted[0]["clientUserMessageId"] == guard.input_id
+        assert submitted[0]["input"] == [{"type": "text", "text": "retry"}]
+        assert isinstance(events[0], TurnComplete)
+        assert read_bridge_state(tmp_path).input_id == guard.input_id
 
 
 @pytest.fixture

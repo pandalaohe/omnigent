@@ -12,6 +12,7 @@ the same shape the peer native ``test_goose_native_executor.py`` uses.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,47 @@ def test_supports_flags(tmp_path: Path) -> None:
     # executor, so streaming is off but live message queueing is on.
     assert ex.supports_streaming() is False
     assert ex.supports_live_message_queue() is True
+
+
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_automatic_retry_enqueue_guard(tmp_path, monkeypatch, superseded):
+    from omnigent.native.auto_retry import (
+        AutoRetryGuard,
+        admit_prompt,
+        auto_retry_scope,
+        observe_turn,
+    )
+
+    snapshot = observe_turn(tmp_path, "child", "failed-turn", idle=True)
+    guard = AutoRetryGuard(
+        session_id="child",
+        chain_id="c" * 32,
+        input_id="a" * 32,
+        expected_turn_id="failed-turn",
+        expected_input_generation=4,
+        expected_native_generation=snapshot.generation,
+        admission_deadline=time.time() + 60,
+        attempt=1,
+        of=3,
+    )
+    if superseded:
+        admit_prompt(tmp_path, "child", "replacement", turn_id="human-turn")
+        observe_turn(tmp_path, "child", "human-turn", idle=True)
+    enqueued = []
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda bridge, text: enqueued.append(text))
+    with auto_retry_scope(guard):
+        events = [
+            event
+            async for event in pne.PiNativeExecutor(tmp_path).run_turn(
+                [{"role": "user", "content": "retry"}], [], ""
+            )
+        ]
+    if superseded:
+        assert enqueued == [] and isinstance(events[0], ExecutorError) and events[0].undelivered
+        assert events[0].code == "superseded_by_human_input"
+        assert events[0].preserve_session
+    else:
+        assert enqueued == ["retry"] and isinstance(events[0], TurnComplete)
 
 
 def test_content_to_text_plain_and_parts(tmp_path: Path) -> None:

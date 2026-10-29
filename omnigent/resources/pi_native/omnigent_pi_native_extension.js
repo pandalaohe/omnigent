@@ -2,6 +2,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { spawnSync } = require("child_process");
 const permissionToolSources = require("./permission_tool_registry.cjs");
 let permissionToolRegistry = null;
 
@@ -99,6 +100,35 @@ function readConfig() {
   } catch (_err) {
     return null;
   }
+}
+
+function nativeRetryAdmission(config, request) {
+  if (!config?.bridgeDir || !config?.autoRetryPython) return null;
+  if (request.action === "prompt" && request.text !== "retry") {
+    const target = path.join(config.bridgeDir, "auto-retry-intervention.json");
+    const temporary = `${target}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+    const value = JSON.stringify({ id: crypto.randomBytes(16).toString("hex") });
+    try {
+      fs.writeFileSync(temporary, value, { mode: 0o600 });
+      fs.renameSync(temporary, target);
+    } catch (_error) {
+      try {
+        fs.writeFileSync(target, value, { flag: "r+" });
+        fs.truncateSync(target, Buffer.byteLength(value));
+      }
+      catch (_error) { fs.utimesSync(target, new Date(), new Date()); }
+    } finally {
+      try { fs.unlinkSync(temporary); } catch (_error) {}
+    }
+  }
+  const result = spawnSync(config.autoRetryPython, [
+    "-m", "omnigent.native.auto_retry", "--bridge-dir", config.bridgeDir,
+  ], {
+    input: JSON.stringify({ ...request, session_id: config.sessionId }),
+    encoding: "utf8", timeout: 5000, windowsHide: true,
+  });
+  if (result.status !== 0) throw new Error("native_retry_admission_unavailable");
+  return JSON.parse(result.stdout);
 }
 
 function writeConfig(config) {
@@ -1843,6 +1873,7 @@ module.exports = function (pi) {
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
   let turnInputId = null;
+  let nextInputAdmission = null;
   let turnResult = null;
   let turnOutcomeController = new AbortController();
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
@@ -2922,6 +2953,7 @@ module.exports = function (pi) {
     streamingMessageOrdinal = 0;
     // Pin the status response_id for this agent loop through agent_end.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
+    nativeRetryAdmission(config, { action: "status", turn_id: turnStatusResponseId, idle: false });
     turnInputId = null;
     await postEvent(config, {
       type: "external_session_status",
@@ -2939,6 +2971,7 @@ module.exports = function (pi) {
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     const endInputId = turnInputId;
+    nativeRetryAdmission(config, { action: "status", turn_id: endResponseId, idle: true });
     const result = turnResult;
     const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
     clearPendingInterrupt();
@@ -3131,6 +3164,18 @@ module.exports = function (pi) {
 
   pi.on("input", async (event, ctx) => {
     rememberContext(ctx);
+    try {
+      nextInputAdmission = nativeRetryAdmission(config, { action: "prompt", text: event?.text ?? "" });
+    } catch (error) {
+      ctx?.ui?.notify?.(error.message, "error");
+      nextInputAdmission = null;
+      if (event?.text === "retry") return { action: "handled" };
+    }
+    if (nextInputAdmission?.block) {
+      ctx?.ui?.notify?.(nextInputAdmission.reason, "info");
+      nextInputAdmission = null;
+      return { action: "handled" };
+    }
     setOmnigentStatus(config, ctx, "running");
   });
 
@@ -3146,7 +3191,9 @@ module.exports = function (pi) {
       const text = textFromMessage(message).trim();
       if (!text) return;
       const responseId = `pi-consumed-user-${Date.now()}-${++sequence}`;
-      turnInputId = `pi:user:${responseId}`;
+      const autoRetry = nextInputAdmission?.auto_retry;
+      nextInputAdmission = null;
+      turnInputId = autoRetry?.input_id ?? `pi:user:${responseId}`;
       history.enqueue(
         {
           response_id: responseId,
@@ -3154,6 +3201,7 @@ module.exports = function (pi) {
           item_data: {
             role: "user",
             content: [{ type: "input_text", text }],
+            ...(autoRetry ? { stable_id: autoRetry.input_id, auto_retry: autoRetry } : {}),
           },
         },
         `pi:user:${responseId}`,

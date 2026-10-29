@@ -130,6 +130,35 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     session_id = state.session_id
 
     hook_event = payload.get("hook_event_name", "")
+    input_admission = None
+    if (
+        hook_event == "UserPromptSubmit"
+        and payload.get("agent_id") is None
+        and payload.get("session_id") in {None, state.thread_id}
+    ):
+        from omnigent.native.auto_retry import admit_prompt
+
+        native_turn = payload.get("turn_id")
+        try:
+            input_admission = admit_prompt(
+                bridge_dir,
+                session_id,
+                str(payload.get("prompt", "")),
+                turn_id=f"codex_{native_turn}"
+                if isinstance(native_turn, str) and native_turn
+                else None,
+            )
+        except Exception:  # noqa: BLE001 - an unreadable gate cannot authorize automatic input.
+            if payload.get("prompt") == "retry":
+                print(
+                    json.dumps(
+                        {"decision": "block", "reason": "native_retry_admission_unavailable"}
+                    )
+                )
+                return 0
+        if input_admission and input_admission.block:
+            print(json.dumps({"decision": "block", "reason": input_admission.reason}))
+            return 0
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
     if eval_request is None:
         # Unrecognized hook event or an mcp__omnigent__* tool (relay-enforced).
@@ -139,6 +168,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     # ``/model`` writes) onto the request so the cost-budget gate evaluates
     # against the user's CURRENT selection.
     context = eval_request["event"]["context"]
+    if input_admission:
+        context["native_generation"] = input_admission.native_generation
+        if input_admission.auto_retry:
+            context["auto_retry"] = input_admission.auto_retry
     context["harness"] = "codex-native"
     model = read_codex_config_model(bridge_dir)
     if model:

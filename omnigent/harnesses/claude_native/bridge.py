@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
+    from omnigent.native.auto_retry import PromptAdmission
 
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
@@ -3150,7 +3151,9 @@ def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str
     return args
 
 
-def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
+def record_hook_event(
+    bridge_dir: Path, payload: _JsonObject, *, input_admission: PromptAdmission | None = None
+) -> None:
     """
     Record one Claude Code hook payload in the bridge directory.
 
@@ -3181,9 +3184,17 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
         if is_parent and event_name == "UserPromptSubmit" and "admission_id" not in payload:
             receipt_id = uuid.uuid4().hex
             state["terminal_identity"] = {
-                "turn_id": f"claude_turn_{receipt_id}",
-                "input_id": receipt_id,
+                "turn_id": input_admission.turn_id
+                if input_admission
+                else f"claude_turn_{receipt_id}",
+                "input_id": input_admission.auto_retry["input_id"]
+                if input_admission and input_admission.auto_retry
+                else receipt_id,
             }
+            if input_admission:
+                payload = {**payload, "native_generation": input_admission.native_generation}
+                if input_admission.auto_retry:
+                    payload["auto_retry"] = input_admission.auto_retry
         if is_parent and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}:
             payload = {**payload, "terminal_identity": state.get("terminal_identity")}
         envelope = {
@@ -3227,6 +3238,15 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
             state["accepted_input_tmux"] = _tmux_input_identity(bridge_dir)
         state["updated_at"] = time.time()
         _write_json_file(bridge_dir / _STATE_FILE, state)
+        if is_parent and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}:
+            identity = state.get("terminal_identity")
+            active = read_active_session_id(bridge_dir)
+            if active and isinstance(identity, dict) and isinstance(identity.get("turn_id"), str):
+                from omnigent.native.auto_retry import observe_turn
+
+                observe_turn(
+                    bridge_dir, active, identity["turn_id"], idle=event_name != "UserPromptSubmit"
+                )
 
 
 def read_transcript_path(bridge_dir: Path) -> Path | None:
@@ -4750,6 +4770,13 @@ def _paste_and_submit(
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
     """
+    from omnigent.native.auto_retry import current_guard, prepare_submission
+
+    if current_guard() is not None:
+        running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
+        prepare_submission(
+            bridge_dir, native_idle=None if running is None else not running, text=text
+        )
     delivery_diagnostics.start_attempt()
     tmux_info = _tmux_input_identity(bridge_dir)
     startup_submit = (
@@ -4780,7 +4807,10 @@ def _paste_and_submit(
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
+        # The guarded single word cannot end in a backslash; keep its hook text exact.
+        paste_file.write(
+            _paste_payload_bytes(text if current_guard() is not None else text + "\n")
+        )
         paste_path = paste_file.name
     try:
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
