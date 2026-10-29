@@ -578,6 +578,10 @@ function closeNativeSession(manager) {
   return record.scopedClient?.close();
 }
 function hasScopedEvaluator(ctx) { return typeof store.bindings.get(ctx?.sessionManager)?.evaluateScope === "function"; }
+function hasScopedClient(ctx) {
+  const record = store.bindings.get(ctx?.sessionManager);
+  return !!record && !record.closed && record.isInstalled() && typeof record.scopedClient?.bridge === "function";
+}
 function policyVerdict(value) {
   if (!plain(value) || typeof value.block !== "boolean") return {block:true, reason:"Native scoped policy returned no usable verdict"};
   return value.block ? {block:true, reason:typeof value.reason === "string" ? value.reason : "Blocked by native scoped policy"} : undefined;
@@ -594,4 +598,4 @@ function callScopedBridge(event, ctx, port) {
     return Promise.resolve({error:"Scoped Pi bridge unavailable"});
   return record.scopedClient.bridge(event,port);
 }
-module.exports = {bindNativeSession, classifyNativeCall, requireNativeSession, semanticAction, snapshot, loadPackageApi, getNativeState, closeNativeSession, hasScopedEvaluator, evaluateNativeCall, policyVerdict, createInputGuard, callScopedBridge};
+module.exports = {bindNativeSession, classifyNativeCall, requireNativeSession, semanticAction, snapshot, loadPackageApi, getNativeState, closeNativeSession, hasScopedEvaluator, hasScopedClient, evaluateNativeCall, policyVerdict, createInputGuard, callScopedBridge};

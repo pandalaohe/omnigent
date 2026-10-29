@@ -183,9 +183,13 @@ async def main():
             print(error.decode(), file=sys.stderr)
             assert process.returncode == 0, process.returncode
             expected = (
-                {"evaluate": 3, "execute": 3, "finish": 3}
-                if mode == "normal"
-                else {"evaluate": 1, "execute": 1, "finish": 0}
+                {"evaluate": 0, "execute": 0, "finish": 0}
+                if mode == "missing-bootstrap"
+                else (
+                    {"evaluate": 3, "execute": 3, "finish": 3}
+                    if mode == "normal"
+                    else {"evaluate": 1, "execute": 1, "finish": 0}
+                )
             )
             assert counts == expected, counts
             assert actor.token.encode() not in output + error

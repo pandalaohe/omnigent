@@ -343,7 +343,7 @@ require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection})
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["normal", "loss", "replacement"])
+@pytest.mark.parametrize("mode", ["normal", "loss", "replacement", "missing-bootstrap"])
 async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mode):
     node, pi = shutil.which("node"), shutil.which("pi")
     if not node or not pi:
@@ -372,9 +372,13 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
         assert process.returncode == 0, (output + error).decode()
         assert b'"receiptExcluded":true' in output
         expected = (
-            b'"evaluate": 3, "execute": 3, "finish": 3'
-            if mode == "normal"
-            else b'"evaluate": 1, "execute": 1, "finish": 0'
+            b'"evaluate": 0, "execute": 0, "finish": 0'
+            if mode == "missing-bootstrap"
+            else (
+                b'"evaluate": 3, "execute": 3, "finish": 3'
+                if mode == "normal"
+                else b'"evaluate": 1, "execute": 1, "finish": 0'
+            )
         )
         assert expected in output
     finally:

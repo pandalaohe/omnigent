@@ -1525,8 +1525,13 @@ module.exports = function(pi) {{
   // and never traverse the bridged /mcp path, so without this hook they
   // escape all guardrails. Bridged tools ARE evaluated server-side at /mcp,
   // so skip them here to avoid double-evaluation (and double ASK prompts).
-  pi.on("tool_call", async (event) => {{
-    if (SCOPED_BOOTSTRAP) return;
+  pi.on("tool_call", async (event, ctx) => {{
+    if (SCOPED_BOOTSTRAP) {{
+      const support = require({json.dumps(str(scoped_support))});
+      if (!support.hasScopedClient(ctx))
+        return {{block:true, reason:"Scoped Pi bootstrap unavailable"}};
+      return;
+    }}
     if (!event || typeof event.toolName !== "string" || !event.toolName) {{
       return {{ block: true, reason: "invalid tool call" }};
     }}

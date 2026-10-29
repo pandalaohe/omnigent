@@ -19,7 +19,7 @@ http.request=function(url,options,callback){
 const sdk = await import(pathToFileURL(path.join(sdkRoot,"dist/index.js")).href);
 const {AssistantMessageEventStream} = await import(pathToFileURL(path.join(sdkRoot,"node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js")).href);
 const {installScopedSdkFromHandoff} = await import(pathToFileURL(adapter).href);
-const dispose = await installScopedSdkFromHandoff(sdk, locator, {sdkVersion:JSON.parse(fs.readFileSync(path.join(sdkRoot,"package.json"))).version,sdkEntry:path.join(sdkRoot,"dist/index.js")});
+const dispose = mode==="missing-bootstrap" ? ()=>{} : await installScopedSdkFromHandoff(sdk, locator, {sdkVersion:JSON.parse(fs.readFileSync(path.join(sdkRoot,"package.json"))).version,sdkEntry:path.join(sdkRoot,"dist/index.js")});
 const bind=sdk.AgentSession.prototype.bindExtensions, observed=new WeakSet();
 sdk.AgentSession.prototype.bindExtensions=function(...args){
  for(const tool of this.getAllTools()){
@@ -80,7 +80,7 @@ try{
  }else{
   assert.equal(result.isError,true,JSON.stringify(result));
   assert.equal(definitionStarts,0);
-  assert.ok(JSON.stringify(result).includes("settlement was not acknowledged"));
+  assert.ok(JSON.stringify(result).includes(mode==="missing-bootstrap"?"Scoped Pi bootstrap unavailable":"settlement was not acknowledged"));
  }
  assert.equal(JSON.stringify([session.messages,events]).includes(canary),false);
  const journal=fs.readFileSync(session.sessionManager.getSessionFile(),"utf8");
@@ -90,5 +90,5 @@ try{
  fs.writeFileSync(path.join(root,"record.json"),JSON.stringify([session.messages,events]));
  console.log(JSON.stringify({sdk:JSON.parse(fs.readFileSync(path.join(sdkRoot,"package.json"))).version,result,events:events.length,definitionStarts,mode,receiptExcluded:true}));
  if(mode==="normal")await session.extensionRunner.emit({type:"session_shutdown",reason:"quit"});
- else await assert.rejects(()=>session.extensionRunner.emit({type:"session_shutdown",reason:"quit"}),/Scoped Pi/);
+ else if(mode!=="missing-bootstrap")await assert.rejects(()=>session.extensionRunner.emit({type:"session_shutdown",reason:"quit"}),/Scoped Pi/);
 }finally{clearInterval(alive);session.dispose();dispose();http.request=originalRequest;}
