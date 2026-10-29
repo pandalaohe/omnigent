@@ -167,6 +167,32 @@ async def test_list_sessions_keep_warm_state_uses_harness_family(
     assert rows[unsupported.id].get("warm_state") is None
 
 
+@pytest.mark.parametrize("harness", ["antigravity-native", "antigravity"])
+@pytest.mark.parametrize("stamped", [False, True])
+async def test_agy_cache_state_is_unsupported_on_list_and_detail(
+    client: httpx.AsyncClient, db_uri: str, tmp_path: Path, harness: str, stamped: bool
+) -> None:
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    location = f"{agent_id}/bundle"
+    artifacts.put(location, _harness_bundle(harness))
+    agent_store.create(agent_id, name="agy-agent", bundle_location=location)
+    conv = conv_store.create_conversation(agent_id=agent_id)
+    if stamped:
+        conv_store.set_labels(conv.id, {"omnigent.keep_warm": '{"s":"w","y":"claude"}'})
+    listed = await client.get("/v1/sessions")
+    detail = await client.get(f"/v1/sessions/{conv.id}")
+    assert listed.status_code == detail.status_code == 200
+    row = next(row for row in listed.json()["data"] if row["id"] == conv.id)
+    for payload in (row, detail.json()):
+        assert payload.get("warm_state") is None
+        assert payload["warm_state_reason"].startswith("unsupported:")
+        assert "TTL" in payload["warm_state_reason"]
+        assert "Cumulative cache hits" in payload["warm_state_reason"]
+
+
 @pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
 async def test_unlabelled_idle_session_uses_real_turn_settle_for_list_and_detail(
     client: httpx.AsyncClient, db_uri: str, tmp_path: Path, harness: str

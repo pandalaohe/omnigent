@@ -1737,6 +1737,18 @@
             ],
             "description": "Whether the child's provider prompt cache is being kept warm (`\"warm\"` / `\"cold\"`), read from its `omnigent.keep_warm` label without a settings read. `None` when the child has no label, is archived, or runs an unsupported harness.",
             "title": "Warm State"
+          },
+          "warm_state_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explanation when cache warmth is unsupported.",
+            "title": "Warm State Reason"
           }
         },
         "required": [
@@ -9418,6 +9430,18 @@
             "description": "Whether the session's provider prompt cache is being kept warm (`\"warm\"` / `\"cold\"`), read from its `omnigent.keep_warm` label without a harness lookup. `None` when the session has no keep-warm label, is archived, or carries a label written before the family stamp existed.",
             "title": "Warm State"
           },
+          "warm_state_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explanation when cache warmth is unsupported.",
+            "title": "Warm State Reason"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -10744,6 +10768,18 @@
             ],
             "description": "Whether the session's provider prompt cache is being kept warm (`\"warm\"` / `\"cold\"`), read from its `omnigent.keep_warm` label without a harness lookup. `None` when the session has no keep-warm label, is archived, or carries a label written before the family stamp existed.",
             "title": "Warm State"
+          },
+          "warm_state_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explanation when cache warmth is unsupported.",
+            "title": "Warm State Reason"
           },
           "workspace": {
             "anyOf": [

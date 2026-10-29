@@ -602,6 +602,16 @@ _STOP_REASON_STATUS: dict[str, str] = {
 }
 
 
+def warm_state_reason_for_harness(harness: str | None) -> str | None:
+    """Explain why agy's cache warmth cannot be observed."""
+    if harness in ("antigravity", "antigravity-native"):
+        return (
+            "unsupported: agy exposes no verifiable prompt-cache state or TTL. "
+            "Cumulative cache hits do not establish current warmth."
+        )
+    return None
+
+
 def keep_warm_family_for_harness(harness: str | None) -> Literal["claude", "codex", "pi"] | None:
     """
     Map a canonical harness onto the keep-warm family it belongs to.

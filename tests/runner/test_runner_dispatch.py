@@ -9544,7 +9544,8 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_passes_keep_warm_state_through() -> None:
+@pytest.mark.parametrize("unsupported", [False, True])
+async def test_sys_session_get_info_passes_keep_warm_state_through(unsupported: bool) -> None:
     """warm_state / keep_warm / archive_reason ride the snapshot projection."""
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -9560,7 +9561,8 @@ async def test_sys_session_get_info_passes_keep_warm_state_through() -> None:
                     "updated_at": 42,
                     "runner_id": None,
                     "pending_elicitations": [],
-                    "warm_state": "cold",
+                    "warm_state": None if unsupported else "cold",
+                    "warm_state_reason": "unsupported: no cache TTL" if unsupported else None,
                     "keep_warm": {
                         "state": "stopped",
                         "stop_reason": "cap",
@@ -9591,7 +9593,8 @@ async def test_sys_session_get_info_passes_keep_warm_state_through() -> None:
         )
 
     info = json.loads(output)
-    assert info["warm_state"] == "cold"
+    assert info["warm_state"] == (None if unsupported else "cold")
+    assert info["warm_state_reason"] == ("unsupported: no cache TTL" if unsupported else None)
     assert info["keep_warm"]["state"] == "stopped"
     assert info["keep_warm"]["stop_reason"] == "cap"
     assert info["keep_warm"]["episode"]["cost_usd"] == 0.04

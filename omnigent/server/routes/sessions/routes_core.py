@@ -115,10 +115,6 @@ from omnigent.server.child_checkin import (
     patch_checkin_labels,
     remove_checkin_followup,
 )
-from omnigent.server.child_keep_warm import (
-    keep_warm_family_for_harness,
-    keep_warm_family_from_labels,
-)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_load_queue import LABEL as HOST_LOAD_LABEL
@@ -3797,7 +3793,7 @@ def register_core_routes(
             child_rows,
             liveness_lookup,
         )
-        keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, page.data)
+        keep_warm_harnesses = await asyncio.to_thread(_keep_warm_harnesses_for, page.data)
         cold_after_by_session = await _cold_after_by_session_for(page.data, request.app.state)
         items: list[SessionListItem] = [
             _build_session_list_item(
@@ -3818,7 +3814,7 @@ def register_core_routes(
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
                 last_message_preview=(previews_by_conv.get(conv.id) if include_preview else None),
-                keep_warm_families=keep_warm_families,
+                keep_warm_harnesses=keep_warm_harnesses,
                 cold_after_by_session=cold_after_by_session,
             )
             for conv in page.data
@@ -4122,32 +4118,27 @@ def register_core_routes(
         )
         return await _session_list_page(request, page, user_id=user_id, include_preview=False)
 
-    def _keep_warm_families_for(
+    def _keep_warm_harnesses_for(
         convs: list[Conversation],
-    ) -> dict[tuple[str | None, str | None, str | None], Literal["claude", "codex", "pi"] | None]:
+    ) -> dict[tuple[str | None, str | None, str | None], str | None]:
         """
-        Resolve keep-warm families for rows with no family-stamped label.
+        Resolve harnesses for cache state and unsupported-source reasons.
 
         One harness resolution per distinct ``(agent_id, harness_override,
         sub_agent_name)`` triple, mirroring the sweeper's ``_harness_for``.
         Blocking (loads agent bundles), so callers run it via
         :func:`asyncio.to_thread`.
 
-        :param convs: Session rows on the page whose labels may need the
-            harness fallback.
+        :param convs: Session rows on the page.
         :returns: Lookup keyed by the resolution triple; a missing key means
-            the row's harness has no keep-warm family.
+            the row's harness could not be resolved.
         """
         pending: dict[tuple[str | None, str | None, str | None], Conversation] = {}
         for conv in convs:
-            if keep_warm_family_from_labels(conv.labels) is not None:
-                continue
             key = (conv.agent_id, conv.harness_override, conv.sub_agent_name)
             pending.setdefault(key, conv)
         return {
-            key: keep_warm_family_for_harness(
-                _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
-            )
+            key: _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
             for key, conv in pending.items()
         }
 
@@ -4367,7 +4358,7 @@ def register_core_routes(
             child_rows,
             liveness_lookup,
         )
-        keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, convs)
+        keep_warm_harnesses = await asyncio.to_thread(_keep_warm_harnesses_for, convs)
         cold_after_by_session = await _cold_after_by_session_for(convs, app_state)
         items = [
             _build_session_list_item(
@@ -4387,7 +4378,7 @@ def register_core_routes(
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
-                keep_warm_families=keep_warm_families,
+                keep_warm_harnesses=keep_warm_harnesses,
                 cold_after_by_session=cold_after_by_session,
             )
             for conv in convs
