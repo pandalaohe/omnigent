@@ -494,6 +494,54 @@ async def test_context_v2_pi_primary_reuse_replacement_and_close(context_v2_pi):
     assert all(process.stdin.data == [] for process in processes)
 
 
+async def test_pi_reported_context_window_follows_rpc_model(context_v2_pi, monkeypatch):
+    executor, _, _, processes = context_v2_pi
+    monkeypatch.setattr(
+        executor, "_ensure_tool_server", PiExecutor._ensure_tool_server.__get__(executor)
+    )
+    executor._pi_session_event = AsyncMock(return_value={})
+    for model, window, expected in [
+        ("model-1", 550_000, 550_000),
+        ("model-1", None, 550_000),
+        ("model-2", None, None),
+        ("model-2", 300_000, 300_000),
+    ]:
+        await executor._ensure_rpc("session-1", "system", model, [])
+        assert executor._tool_server is not None
+        if window is not None:
+            await executor._tool_server._report_pi_session_event(
+                {
+                    "id": "usage",
+                    "session_id": "session-1",
+                    "kind": "pi_usage_event",
+                    "data": {"context_window": window},
+                }
+            )
+        processes[-1].stdout.feed_data(
+            (
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": _pi_assistant_message_with_usage(model=model),
+                    }
+                )
+                + '\n{"type":"agent_end","messages":[]}\n'
+            ).encode()
+        )
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "hello", "session_id": "session-1"}],
+                [],
+                "system",
+                ExecutorConfig(model=model),
+            )
+        ]
+        completed = next(event for event in events if isinstance(event, TurnComplete))
+        assert completed.usage is not None
+        assert completed.usage.get("context_window") == expected
+
+
 @pytest.mark.parametrize("outcome", ["success", "failed", "cancel", "owner-removed"])
 async def test_context_v2_pi_start_is_visible_before_await_and_cannot_rebind(
     context_v2_pi, outcome
@@ -6906,6 +6954,22 @@ def test_pi_usage_captured_from_message_end(
             ]
         )
 
+        from omnigent.inner.pi_executor import _PiSessionState
+
+        executor._session_states["session-1"] = _PiSessionState()
+        executor._pi_session_event = AsyncMock(return_value={})
+        await executor._ensure_tool_server([])
+        assert executor._tool_server is not None
+        await executor._tool_server._report_pi_session_event(
+            {
+                "id": "usage",
+                "session_id": "session-1",
+                "kind": "pi_usage_event",
+                "data": {"context_window": 550_000},
+            }
+        )
+        await executor._tool_server.stop()
+
         events = [
             e
             async for e in executor.run_turn(
@@ -6929,6 +6993,7 @@ def test_pi_usage_captured_from_message_end(
         assert usage["cache_creation_input_tokens"] == 64  # <- usage.cacheWrite
         # model comes from the assistant message (used for cost pricing).
         assert usage["model"] == "claude-sonnet-4-6"
+        assert usage["context_window"] == 550_000
         # The text still streams through unaffected by usage capture.
         assert turn_complete[0].response == "Done."
         import sqlite3
@@ -6943,6 +7008,7 @@ def test_pi_usage_captured_from_message_end(
         assert rows[0]["input_tokens"] == 1200
         assert rows[0]["cached_input_tokens"] == 800
         assert "Done." not in str(rows)
+        await executor.close()
 
     _run(_test())
 
