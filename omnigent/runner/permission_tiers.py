@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from omnigent.permission_tiers import PermissionTier, TierDecision, Verdict, load_rules
@@ -17,6 +18,13 @@ from omnigent.permission_tiers.host import (
     read_host_permission_state,
     trusted_permission_control_paths,
     write_host_permission_state,
+)
+from omnigent.runner.pi_scopes import (
+    PiOriginReceipt,
+    PiScopeAdmission,
+    PiScopePrincipal,
+    PiScopeRecord,
+    PiScopeRegistry,
 )
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
@@ -59,6 +67,7 @@ class PermissionTierRuntime:
         self._inspected: dict[str, dict[str, tuple[BoundToolCall, dict[str, object], bool]]] = {}
         self._finished: dict[str, set[str]] = {}
         self._pi_control_paths: dict[str, set[str]] = {}
+        self.pi_scopes = PiScopeRegistry(PERMISSION_RUNTIME_ID)
 
     @staticmethod
     def state_path(session_id: str, harness: str, labels: Mapping[str, str]) -> Path:
@@ -82,6 +91,9 @@ class PermissionTierRuntime:
     def fence_start(self, envelope: RunnerSessionInitEnvelope | None, harness: str) -> None:
         """Place a deny-safe cache before any tiered harness can launch."""
         if harness not in TIER_HARNESSES:
+            if envelope is not None:
+                self.pi_scopes.invalidate(envelope.session_id)
+                self._harnesses.pop(envelope.session_id, None)
             return
         if envelope is None or not (envelope.snapshot.host_id or envelope.snapshot.runner_id):
             raise ValueError("Permission-tier startup requires a trusted host snapshot")
@@ -120,12 +132,16 @@ class PermissionTierRuntime:
         self._inspected.pop(envelope.session_id, None)
         self._leases.pop(envelope.session_id, None)
         self._pi_control_paths.pop(envelope.session_id, None)
+        self.pi_scopes.invalidate(envelope.session_id)
 
     def install(
         self, envelope: RunnerSessionInitEnvelope | None, harness: str
     ) -> HostPermissionState | None:
         """Validate server state and local rules before confirming the launch."""
         if harness not in TIER_HARNESSES:
+            if envelope is not None:
+                self.pi_scopes.invalidate(envelope.session_id)
+                self._harnesses.pop(envelope.session_id, None)
             return None
         if envelope is None:
             raise ValueError("A permission-tier session requires a current server envelope")
@@ -172,6 +188,7 @@ class PermissionTierRuntime:
         ):
             self._leases.pop(envelope.session_id, None)
             self._inspected.pop(envelope.session_id, None)
+            self.pi_scopes.invalidate(envelope.session_id)
         self._states[envelope.session_id] = state
         self._paths[envelope.session_id] = path
         self._harnesses[envelope.session_id] = harness
@@ -231,12 +248,194 @@ class PermissionTierRuntime:
     def path(self, session_id: str) -> Path:
         return self._paths[session_id]
 
+    def pi_scope_protocol_active(self, session_id: str) -> bool:
+        return self._harnesses.get(session_id) in ("pi", "pi-native") and self.pi_scopes.enabled(
+            session_id
+        )
+
+    def begin_pi_scope_launch(self, session_id: str) -> PiScopeAdmission:
+        """Called by the trusted bootstrap, never by a tool/event payload."""
+        state = self.state(session_id)
+        if (
+            state is None
+            or state.status != "ready"
+            or self._harnesses.get(session_id) not in ("pi", "pi-native")
+        ):
+            raise ValueError("Pi scope launch unavailable")
+        if self._leases.get(session_id):
+            raise ValueError("Pi scope rebind requires idle execution")
+        self.pi_scopes.begin_launch(session_id)
+        self._inspected.pop(session_id, None)
+        self._finished.pop(session_id, None)
+        return self._open_pi_scope(session_id, origin="parent")
+
+    def open_pi_child_scope(self, session_id: str) -> PiScopeAdmission:
+        """Allocate an independent loader installation from the host bootstrap."""
+        return self._open_pi_scope(session_id, origin="child")
+
+    def _open_pi_scope(
+        self, session_id: str, *, origin: Literal["parent", "child"]
+    ) -> PiScopeAdmission:
+        state = self.state(session_id)
+        if state is None or self._harnesses.get(session_id) not in ("pi", "pi-native"):
+            raise ValueError("Pi scope launch unavailable")
+        from omnigent.permission_tiers.pi_tools import read_pi_tool_expectation
+
+        expected = read_pi_tool_expectation(self.path(session_id).parent)
+        if (
+            expected.get("session_id") != session_id
+            or expected.get("harness") != self._harnesses[session_id]
+        ):
+            raise ValueError("Pi enforcement belongs to another launch")
+        return self.pi_scopes.open_scope(
+            state,
+            self.path(session_id).parent,
+            expected,
+            origin=origin,
+            installation_id=uuid4().hex,
+            registry_generation=uuid4().hex,
+        )
+
+    def acknowledge_pi_scope(self, session_id: str, credential: object) -> bool:
+        """Retry incomplete publication; an existing expectation alone is not readiness."""
+        from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
+
+        record = self.pi_scopes.pending(session_id, credential)
+        state = self.state(session_id)
+        if state is None or state.status != "ready":
+            return False
+        registry = read_pi_tool_registry(
+            record.admission.registry_dir, state, expected_binding=record.expected
+        )
+        if registry.reason or registry.invalid_tools:
+            if record.status == "ready":
+                self.revoke_pi_scope(record.admission.principal)
+            return False
+        record.status = "ready"
+        return True
+
+    def pi_origin_receipt(
+        self,
+        session_id: str,
+        credential: object,
+        *,
+        call_id: str,
+        name: str,
+        arguments: dict[str, object],
+        local_execution: bool,
+    ) -> PiOriginReceipt:
+        """Mint only after transport authentication; classification belongs to the adapter."""
+        record = self.pi_scopes.authenticate(session_id, credential)
+        state = self.state(session_id)
+        if state is None:
+            raise ValueError("Permission state unavailable")
+        return self.pi_scopes.mint(
+            record,
+            state,
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+            local_execution=local_execution,
+        )
+
+    def revoke_pi_scope(self, principal: PiScopePrincipal) -> None:
+        """Seal before acknowledgement; a delayed approval cannot recreate a lease."""
+        for call_id in self.pi_scopes.revoke(principal):
+            root = principal.root_session_id
+            self._inspected.get(root, {}).pop(call_id, None)
+            lease = self._leases.get(root, {}).get(call_id)
+            if lease is not None and lease.operation_id is None:
+                self._leases[root].pop(call_id)
+                self._finished.setdefault(root, set()).add(call_id)
+
+    def pi_settlement_available(self, session_id: str, token: object) -> bool:
+        try:
+            receipt = self.pi_scopes.resolve(session_id, token, settlement=True)
+        except ValueError:
+            return False
+        call_id = receipt.binding.call_id
+        lease = self._leases.get(session_id, {}).get(call_id)
+        return (lease is not None and lease.binding == receipt.binding) or (
+            call_id in self._finished.get(session_id, set())
+        )
+
+    def pi_operation_id(
+        self,
+        session_id: str,
+        operation_id: str,
+        permission: object,
+        *,
+        name: object,
+        arguments: object,
+    ) -> str:
+        """A retained MCP result belongs to one scoped call, including cache hits."""
+        metadata = permission if isinstance(permission, Mapping) else {}
+        token = metadata.get("pi_origin_receipt")
+        state = self.state(session_id)
+        if token is None and (
+            not self.pi_scope_protocol_active(session_id)
+            or (state is not None and state.tier == "full")
+        ):
+            return operation_id
+        receipt = self.pi_scopes.resolve(session_id, token, settlement=True)
+        if (
+            not isinstance(arguments, Mapping)
+            or not isinstance(name, str)
+            or metadata.get("call_id") != receipt.binding.call_id
+            or metadata.get("revision") != receipt.binding.tier_revision
+            or type(metadata.get("revision")) is not int
+            or metadata.get("arguments_digest") != receipt.binding.arguments_digest
+        ):
+            raise ValueError("Pi operation binding does not match")
+        actual = BoundToolCall.bind(
+            session_id=session_id,
+            host_id=receipt.binding.host_id,
+            call_id=receipt.binding.call_id,
+            name=name,
+            arguments=arguments,
+            tier_revision=receipt.binding.tier_revision,
+        )
+        if actual != receipt.binding:
+            raise ValueError("Pi operation arguments changed")
+        return (
+            "pi:"
+            + hashlib.sha256(
+                (receipt.principal.scope_id + "\0" + actual.call_id + "\0" + operation_id).encode()
+            ).hexdigest()
+        )
+
+    def _pi_receipt(
+        self,
+        session_id: str,
+        token: object,
+        binding: BoundToolCall,
+        *,
+        local_execution: bool | None = None,
+        settlement: bool = False,
+    ) -> PiScopeRecord | None:
+        state = self.state(session_id)
+        required = self.pi_scope_protocol_active(session_id) and (
+            state is None or state.tier != "full"
+        )
+        if token is None and not required:
+            return None
+        receipt = self.pi_scopes.resolve(session_id, token, settlement=settlement)
+        if receipt.binding != binding or (
+            local_execution is not None and receipt.local_execution != local_execution
+        ):
+            raise ValueError("Pi origin receipt does not match this call")
+        return self.pi_scopes.record(receipt.principal)
+
     def _control_paths(self, session_id: str, state: HostPermissionState) -> tuple[str, ...]:
         """Bind policy data and this launch's extension paths on the host."""
         harness = self._harnesses.get(session_id)
         state_path = self._paths[session_id]
         package_root = Path(__file__).resolve().parents[1]
-        installed: list[Path] = [Path(__file__).resolve()]
+        installed: list[Path] = [
+            Path(__file__).resolve(),
+            package_root / "runner" / "pi_scopes.py",
+            package_root / "runner" / "pi_scope_relay.py",
+        ]
         if harness == "antigravity-native":
             installed.extend(
                 (
@@ -305,18 +504,36 @@ class PermissionTierRuntime:
         name: str,
         arguments: Mapping[str, object],
         local_execution: bool,
+        pi_scope: PiScopeRecord | None = None,
     ) -> TierDecision:
+        if pi_scope:
+            state = replace(state, workspace=pi_scope.admission.principal.canonical_cwd)
         control_paths = self._control_paths(session_id, state)
         extensions = {}
         if (
             state.tier != "full"
-            and local_execution
+            and (local_execution or pi_scope is not None)
             and self._harnesses.get(session_id) in ("pi", "pi-native")
         ):
             from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
 
-            bridge = self._paths[session_id].parent
-            registry = read_pi_tool_registry(bridge, state)
+            bridge = (
+                pi_scope.admission.registry_dir if pi_scope else self._paths[session_id].parent
+            )
+            registry = read_pi_tool_registry(
+                bridge, state, expected_binding=pi_scope.expected if pi_scope else None
+            )
+            if pi_scope:
+                protected = self._pi_control_paths.setdefault(session_id, set())
+                protected.update(registry.control_paths)
+                control_paths = tuple(dict.fromkeys((*control_paths, *protected)))
+                if registry.reason or registry.invalid_tools:
+                    self.revoke_pi_scope(pi_scope.admission.principal)
+                    return TierDecision(
+                        Verdict.DENY, "Pi scope registry changed; relaunch required"
+                    )
+                if name not in registry.tool_names:
+                    return TierDecision(Verdict.DENY, "Tool is not registered in this Pi scope")
             if name in registry.invalid_tools:
                 return TierDecision(Verdict.DENY, registry.extensions[name])
             if registry.reason:
@@ -350,6 +567,7 @@ class PermissionTierRuntime:
         arguments: Mapping[str, object],
         expected_revision: int,
         local_execution: bool = True,
+        origin_receipt: object = None,
     ) -> tuple[BoundToolCall, TierDecision]:
         state = self.state(session_id)
         if state is None or state.status != "ready" or state.revision != expected_revision:
@@ -362,6 +580,9 @@ class PermissionTierRuntime:
             arguments=arguments,
             tier_revision=expected_revision,
         )
+        pi_scope = self._pi_receipt(
+            session_id, origin_receipt, binding, local_execution=local_execution
+        )
         if call_id in self._finished.get(session_id, set()):
             raise ValueError("Tool call already finished")
         if call_id in self._leases.get(session_id, {}):
@@ -369,7 +590,7 @@ class PermissionTierRuntime:
         saved_arguments = json.loads(
             json.dumps(dict(arguments), sort_keys=True, separators=(",", ":"), allow_nan=False)
         )
-        decision = self._evaluate(session_id, state, name, arguments, local_execution)
+        decision = self._evaluate(session_id, state, name, arguments, local_execution, pi_scope)
         inspected = self._inspected.setdefault(session_id, {})
         prior = inspected.get(call_id)
         if prior is not None and prior[0] != binding:
@@ -388,6 +609,7 @@ class PermissionTierRuntime:
         name: object,
         arguments_digest: object,
         expected_revision: object,
+        origin_receipt: object = None,
     ) -> bool:
         state = self.state(session_id)
         if (
@@ -422,7 +644,12 @@ class PermissionTierRuntime:
         if inspected is None or inspected[0] != binding:
             return False
         try:
-            refreshed = self._evaluate(session_id, state, name, inspected[1], inspected[2])
+            pi_scope = self._pi_receipt(
+                session_id, origin_receipt, binding, local_execution=inspected[2]
+            )
+            refreshed = self._evaluate(
+                session_id, state, name, inspected[1], inspected[2], pi_scope
+            )
         except (OSError, ValueError, TypeError, KeyError):
             return False
         if refreshed.action == Verdict.DENY:
@@ -445,6 +672,7 @@ class PermissionTierRuntime:
         arguments: Mapping[str, object],
         operation_id: object,
         step: object,
+        origin_receipt: object = None,
     ) -> bool:
         state = self.state(session_id)
         if (
@@ -476,6 +704,13 @@ class PermissionTierRuntime:
             return False
         if actual != lease.binding:
             return False
+        try:
+            inspected = self._inspected.get(session_id, {}).get(call_id)
+            if inspected is None or inspected[0] != actual:
+                return False
+            self._pi_receipt(session_id, origin_receipt, actual, local_execution=inspected[2])
+        except ValueError:
+            return False
         if lease.operation_id is not None and lease.operation_id != operation_id:
             return False
         if step in lease.steps:
@@ -493,6 +728,7 @@ class PermissionTierRuntime:
         arguments_digest: object,
         name: object,
         arguments: object,
+        origin_receipt: object = None,
     ) -> bool:
         """Check a live lease without consuming its execution step."""
         state = self.state(session_id)
@@ -521,12 +757,40 @@ class PermissionTierRuntime:
             )
         except (TypeError, ValueError):
             return False
+        try:
+            inspected = self._inspected.get(session_id, {}).get(call_id)
+            if inspected is None or inspected[0] != actual:
+                return False
+            self._pi_receipt(session_id, origin_receipt, actual, local_execution=inspected[2])
+        except ValueError:
+            return False
         return actual == lease.binding
 
-    def finish(self, session_id: str, *, call_id: object, revision: object) -> bool:
+    def finish(
+        self,
+        session_id: str,
+        *,
+        call_id: object,
+        revision: object,
+        origin_receipt: object = None,
+    ) -> bool:
         if not isinstance(call_id, str) or type(revision) is not int:
             return False
         lease = self._leases.get(session_id, {}).get(call_id)
+        state = self.state(session_id)
+        if origin_receipt is not None or (
+            self.pi_scope_protocol_active(session_id) and (state is None or state.tier != "full")
+        ):
+            try:
+                receipt = self.pi_scopes.resolve(session_id, origin_receipt, settlement=True)
+                if receipt.binding.call_id != call_id or receipt.binding.tier_revision != revision:
+                    return False
+                if call_id in self._finished.get(session_id, set()):
+                    return True
+                if lease is None or lease.binding != receipt.binding:
+                    return False
+            except ValueError:
+                return False
         if lease is None or lease.binding.tier_revision != revision:
             return False
         del self._leases[session_id][call_id]

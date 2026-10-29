@@ -2081,6 +2081,7 @@ def register_hooks_routes(
                     call_id=completed.get("call_id"),
                     revision=completed.get("permission_tier_revision"),
                     runner_router=runner_router,
+                    origin_receipt=payload.get("pi_origin_receipt"),
                 )
             if (
                 isinstance(completed, dict)
@@ -2118,6 +2119,7 @@ def register_hooks_routes(
             arguments=arguments,
             call_id=data.get("call_id"),
             runner_router=runner_router,
+            origin_receipt=payload.get("pi_origin_receipt"),
         )
 
         def tier_response(reason: str) -> Response:
@@ -2156,7 +2158,16 @@ def register_hooks_routes(
             runner_router=runner_router,
             can_approve=can_approve,
         )
-        return independent if decision.action == Verdict.ALLOW else tier_response(decision.reason)
+        if decision.action != Verdict.ALLOW:
+            return tier_response(decision.reason)
+        if inspection.origin_receipt is not None:
+            verdict["permission_tier_binding"] = inspection.execution_binding()
+            return Response(
+                content=json.dumps(verdict),
+                status_code=independent.status_code,
+                media_type="application/json",
+            )
+        return independent
 
     async def _evaluate_independent_policy(
         request: Request,

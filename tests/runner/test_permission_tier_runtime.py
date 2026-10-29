@@ -22,7 +22,11 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     RunnerSessionInitSnapshot,
 )
-from omnigent.server.permission_tiers import ConfirmedPermissionState
+from omnigent.server.permission_tiers import (
+    PERMISSION_CAPABILITY_LABEL_KEY,
+    PERMISSION_CAPABILITY_VALUE,
+    ConfirmedPermissionState,
+)
 
 
 @pytest.mark.asyncio
@@ -79,8 +83,10 @@ async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, install
         assert "permission tier startup failed" in caplog.text
 
 
-def _runtime(tmp_path: Path, tier: str) -> PermissionTierRuntime:
-    runtime = PermissionTierRuntime()
+def _runtime(
+    tmp_path: Path, tier: str, runtime: PermissionTierRuntime | None = None
+) -> PermissionTierRuntime:
+    runtime = runtime or PermissionTierRuntime()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     state = HostPermissionState(
@@ -100,11 +106,11 @@ def _runtime(tmp_path: Path, tier: str) -> PermissionTierRuntime:
 
 
 def _extension_runtime(
-    tmp_path: Path, tier: str, scope: str = "user", name: str = "google_search"
+    tmp_path: Path, tier: str, scope: str = "user", name: str = "google_search", runtime=None
 ):
     from omnigent.harnesses.pi_native.bridge import prepare_permission_installation
 
-    runtime = _runtime(tmp_path, tier)
+    runtime = _runtime(tmp_path, tier, runtime)
     runtime._harnesses["session-a"] = "pi-native"
     bridge = runtime.path("session-a").parent
     guard = bridge / "omnigent_pi_native_extension.js"
@@ -144,6 +150,651 @@ def _extension_runtime(
     }
     (bridge / "permission_tools.json").write_text(json.dumps(registry))
     return runtime, source, registry
+
+
+def _publish_scope(runtime, admission, tools):
+    from omnigent.util.atomic_json import atomic_write_json
+
+    expected = json.loads((admission.registry_dir / "permission_expected.json").read_text())
+    loaded = [
+        {
+            "path": expected["extension_path"],
+            "resolved_path": expected["extension_path"],
+            "source_sha256": expected["extension_sha256"],
+        }
+    ]
+    loaded.extend(
+        {
+            "path": tool["sourceInfo"]["path"],
+            "resolved_path": tool["real_path"],
+            "source_sha256": tool["source_sha256"],
+        }
+        for tool in tools
+        if "real_path" in tool
+    )
+    atomic_write_json(
+        admission.registry_dir / "permission_tools.json",
+        {
+            **expected,
+            "tools": tools,
+            "loaded_extensions": loaded,
+        },
+    )
+    ready = runtime.acknowledge_pi_scope("session-a", admission.credential)
+    assert ready
+
+
+def _scoped_runtime(tmp_path, tier="auto", runtime=None):
+    runtime, source, registry = _extension_runtime(tmp_path, tier, runtime=runtime)
+    parent = runtime.begin_pi_scope_launch("session-a")
+    _publish_scope(runtime, parent, registry["tools"])
+    child = runtime.open_pi_child_scope("session-a")
+    _publish_scope(
+        runtime,
+        child,
+        [
+            {
+                "name": "read",
+                "sourceInfo": {"source": "builtin", "path": "builtin:read"},
+            }
+        ],
+    )
+    return runtime, parent, child, source, registry
+
+
+def _scope_call(runtime, admission, *, call_id="same-call", name="read", arguments=None):
+    arguments = arguments if arguments is not None else {"path": "notes.txt"}
+    receipt = runtime.pi_origin_receipt(
+        "session-a",
+        admission.credential,
+        call_id=call_id,
+        name=name,
+        arguments=arguments,
+        local_execution=True,
+    )
+    binding, decision = runtime.inspect(
+        "session-a",
+        call_id=receipt.binding.call_id,
+        name=name,
+        arguments=arguments,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+    return receipt, binding, decision
+
+
+@pytest.mark.parametrize("untrusted", [None, "", "forged", {}, {"origin": "parent"}])
+def test_pi_v2_local_call_requires_runner_receipt(tmp_path, untrusted):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path)
+    with pytest.raises(ValueError):
+        runtime.inspect(
+            "session-a",
+            call_id="same-call",
+            name="read",
+            arguments={"path": "notes.txt", "is_parent": True, "scope_id": "root"},
+            expected_revision=3,
+            origin_receipt=untrusted,
+        )
+
+
+def test_pi_scope_owns_registry_and_namespaces_duplicate_call_ids(tmp_path):
+    runtime, parent, child, _source, _registry = _scoped_runtime(tmp_path)
+    _p_receipt, parent_binding, parent_decision = _scope_call(
+        runtime,
+        parent,
+        name="google_search",
+        arguments={},
+    )
+    receipt, binding, decision = _scope_call(runtime, child)
+    assert parent_decision.action.value == "ALLOW"
+    assert decision.action.value == "ALLOW"
+    assert parent_binding.call_id != binding.call_id
+    assert not runtime.authorize(
+        "session-a",
+        call_id=parent_binding.call_id,
+        name=parent_binding.name,
+        arguments_digest=parent_binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+
+
+@pytest.mark.parametrize("fault", ["source", "registry", "generation", "expectation"])
+def test_pi_child_registry_refreshes_at_authorize(tmp_path, fault):
+    runtime, _parent, child, source, registry = _scoped_runtime(tmp_path)
+    _publish_scope(runtime, child, registry["tools"])
+    receipt, binding, decision = _scope_call(
+        runtime,
+        child,
+        name="google_search",
+        arguments={},
+    )
+    assert decision.action.value == "ALLOW"
+    registry_path = child.registry_dir / "permission_tools.json"
+    if fault == "source":
+        source.write_text("// changed after inspection\n")
+    elif fault == "registry":
+        registry_path.unlink()
+    else:
+        path = (
+            registry_path
+            if fault == "generation"
+            else child.registry_dir / "permission_expected.json"
+        )
+        payload = json.loads(path.read_text())
+        payload["registry_generation"] = "another-generation"
+        path.write_text(json.dumps(payload))
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+
+
+def test_pi_expected_file_does_not_short_circuit_incomplete_publication(tmp_path):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path)
+    pending = runtime.open_pi_child_scope("session-a")
+    assert not runtime.acknowledge_pi_scope("session-a", pending.credential)
+    with pytest.raises(ValueError):
+        runtime.pi_origin_receipt(
+            "session-a",
+            pending.credential,
+            call_id="call",
+            name="read",
+            arguments={},
+            local_execution=True,
+        )
+    _publish_scope(
+        runtime,
+        pending,
+        [
+            {
+                "name": "read",
+                "sourceInfo": {"source": "builtin", "path": "builtin:read"},
+            }
+        ],
+    )
+    assert _scope_call(runtime, pending)[2].action.value == "ALLOW"
+
+
+@pytest.mark.parametrize("authorized", [False, True])
+def test_pi_close_rejects_late_approval_and_unused_lease_without_affecting_sibling(
+    tmp_path, authorized
+):
+    runtime, parent, child, _source, _registry = _scoped_runtime(tmp_path)
+    receipt, binding, _ = _scope_call(runtime, child)
+    if authorized:
+        assert runtime.authorize(
+            "session-a",
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments_digest=binding.arguments_digest,
+            expected_revision=3,
+            origin_receipt=receipt.token,
+        )
+    runtime.revoke_pi_scope(child.principal)
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+    assert not runtime.verify_execute(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments={"path": "notes.txt"},
+        arguments_digest=binding.arguments_digest,
+        revision=3,
+        operation_id="operation",
+        step="initial",
+        origin_receipt=receipt.token,
+    )
+    assert runtime.idle("session-a")
+    with pytest.raises(ValueError):
+        _scope_call(runtime, child, call_id="new-call")
+    assert (
+        _scope_call(runtime, parent, name="google_search", arguments={})[2].action.value == "ALLOW"
+    )
+
+
+def test_pi_revoked_scope_can_only_finish_its_own_already_executing_call(tmp_path):
+    runtime, parent, child, _source, _registry = _scoped_runtime(tmp_path)
+    receipt, binding, _ = _scope_call(runtime, child)
+    assert runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+    assert runtime.verify_execute(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments={"path": "notes.txt"},
+        arguments_digest=binding.arguments_digest,
+        revision=3,
+        operation_id="operation",
+        step="initial",
+        origin_receipt=receipt.token,
+    )
+    other, _, _ = _scope_call(runtime, parent, name="google_search", arguments={})
+    runtime.revoke_pi_scope(child.principal)
+    assert not runtime.finish(
+        "session-a", call_id=binding.call_id, revision=3, origin_receipt=other.token
+    )
+    assert runtime.finish(
+        "session-a", call_id=binding.call_id, revision=3, origin_receipt=receipt.token
+    )
+    assert runtime.finish(
+        "session-a", call_id=binding.call_id, revision=3, origin_receipt=receipt.token
+    )
+    assert runtime.idle("session-a")
+
+
+def test_pi_sdk_resolved_identity_is_used_instead_of_a_guessed_display_path(tmp_path):
+    runtime, _parent, child, source, registry = _scoped_runtime(tmp_path)
+    registry["tools"][0]["sourceInfo"]["path"] = str(source.parent / "index\u00a0alias.js")
+    _publish_scope(runtime, child, registry["tools"])
+    assert (
+        _scope_call(runtime, child, name="google_search", arguments={})[2].action.value == "ALLOW"
+    )
+
+
+def test_pi_root_rebind_invalidates_previous_credentials_and_receipts(tmp_path):
+    runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path)
+    receipt, binding, _ = _scope_call(runtime, child)
+    runtime.begin_pi_scope_launch("session-a")
+    with pytest.raises(ValueError):
+        runtime.inspect(
+            "session-a",
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments={"path": "notes.txt"},
+            expected_revision=3,
+            origin_receipt=receipt.token,
+        )
+    with pytest.raises(ValueError):
+        _scope_call(runtime, child)
+
+
+def test_pi_scope_cannot_invoke_unregistered_builtin_or_switch_execution_class(tmp_path):
+    runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path)
+    _, _, denied = _scope_call(
+        runtime, child, name="write", arguments={"path": "new.txt", "content": "x"}
+    )
+    assert denied.action.value == "DENY"
+    receipt = runtime.pi_origin_receipt(
+        "session-a",
+        child.credential,
+        call_id="classified",
+        name="read",
+        arguments={"path": "notes.txt"},
+        local_execution=False,
+    )
+    with pytest.raises(ValueError):
+        runtime.inspect(
+            "session-a",
+            call_id=receipt.binding.call_id,
+            name="read",
+            arguments={"path": "notes.txt"},
+            expected_revision=3,
+            local_execution=True,
+            origin_receipt=receipt.token,
+        )
+
+
+def test_pi_full_to_restricted_does_not_restore_unscoped_parent_fallback(tmp_path):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, "full")
+    assert (
+        runtime.inspect(
+            "session-a",
+            call_id="legacy",
+            name="read",
+            arguments={},
+            expected_revision=3,
+        )[1].action.value
+        == "ALLOW"
+    )
+    runtime.prepare("session-a", expected_revision=3, transaction_id="switch")
+    runtime.settle("session-a", transaction_id="switch", tier="auto", revision=4)
+    with pytest.raises(ValueError):
+        runtime.inspect(
+            "session-a", call_id="legacy", name="read", arguments={}, expected_revision=4
+        )
+
+
+@pytest.mark.parametrize("harness", ["antigravity-native", "codex-native"])
+def test_trusted_harness_rebind_retires_pi_authority_without_blocking_other_harness(
+    tmp_path, monkeypatch, harness
+):
+    from omnigent.runner.pi_scope_relay import PiScopeRelay
+
+    runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path)
+    labels = (
+        ConfirmedPermissionState("auto", 3, "blocked").labels(harness)
+        if harness == "antigravity-native"
+        else {}
+    )
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=2,
+        server_version="test",
+        session_id="session-a",
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=1,
+            updated_at=1,
+            host_id="host-a",
+            workspace=str(tmp_path / "workspace"),
+            labels=labels,
+        ),
+    )
+    monkeypatch.setattr(
+        PermissionTierRuntime, "state_path", staticmethod(lambda *_: runtime.path("session-a"))
+    )
+    monkeypatch.setattr(
+        PermissionTierRuntime, "_verify_installation", staticmethod(lambda *_: None)
+    )
+    runtime.fence_start(envelope, harness)
+    runtime.install(envelope, harness)
+    assert not runtime.pi_scope_protocol_active("session-a")
+    assert PiScopeRelay(runtime, "session-a").legacy_allowed()
+    with pytest.raises(ValueError):
+        _scope_call(runtime, child)
+    if harness == "antigravity-native":
+        _, decision = runtime.inspect(
+            "session-a",
+            call_id="other-harness-read",
+            name="read",
+            arguments={"path": "notes.txt"},
+            expected_revision=3,
+        )
+        assert decision.action.value == "ALLOW"
+
+
+@pytest.mark.asyncio
+async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import APIRouter
+
+    from omnigent.entities import Conversation
+    from omnigent.harnesses.claude_native import bridge as relay_bridge
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runner.pi_scope_relay import PiScopeRelay
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._auth_helpers import SessionAccess
+    from omnigent.server.routes.sessions import routes_hooks
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    runner, _pm = await _build_app_for_spec(_harness_spec("pi-native"))
+    runtime, parent, child, _source, registry = _scoped_runtime(
+        tmp_path,
+        runtime=runner.state.permission_tiers,
+    )
+    parent_read = {**registry["tools"][0], "name": "read"}
+    parent_read["sourceInfo"] = {**parent_read["sourceInfo"], "scope": "project"}
+    _publish_scope(runtime, parent, [parent_read])
+    conv = Conversation(
+        id="session-a",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="session-a",
+        host_id="host-a",
+        runner_id=token_bound_runner_id("test-binding"),
+        workspace=str(tmp_path / "workspace"),
+        harness_override="pi-native",
+        labels={
+            **ConfirmedPermissionState("auto", 3, "ready").labels("pi-native"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    store = SimpleNamespace(get_conversation=lambda _id: conv)
+
+    async def access(*_args, **_kwargs):
+        return SessionAccess(level=LEVEL_READ, conversation=conv)
+
+    monkeypatch.setattr(routes_hooks, "_require_access_and_level", access)
+    router = APIRouter()
+    routes_hooks.register_hooks_routes(router, conversation_store=store, agent_store=None)
+    server = FastAPI()
+    server.include_router(router, prefix="/v1")
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path)
+
+    async def no_tool(_name, _arguments):
+        raise AssertionError("child must not reach unrestricted relay tool dispatch")
+
+    async with _runner_client(runner) as runner_client:
+
+        async def get_runner(*_args, **_kwargs):
+            return runner_client
+
+        monkeypatch.setattr(sessions, "_get_runner_client", get_runner)
+
+        async def control(body):
+            response = await runner_client.post("/v1/sessions/session-a/events", json=body)
+            return response.json()
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server),
+            base_url="http://server",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: "test-binding"},
+        ) as policy_client:
+            relay = relay_bridge.start_tool_relay(
+                bridge_dir=runtime.path("session-a").parent,
+                tools=[],
+                tool_executor=no_tool,
+                loop=asyncio.get_running_loop(),
+                session_id="session-a",
+                policy_client=policy_client,
+                permission_tier_control=control,
+                pi_scope_relay=PiScopeRelay(runtime, "session-a"),
+            )
+            info = json.loads((runtime.path("session-a").parent / "tool_relay.json").read_text())
+            try:
+                async with httpx.AsyncClient(base_url=info["url"], trust_env=False) as client:
+                    bad = await client.post(
+                        "/policies/evaluate",
+                        content=b"not JSON",
+                        headers={"Authorization": "Bearer invalid"},
+                    )
+                    assert bad.status_code == 401
+                    legacy = await client.post(
+                        "/policies/evaluate",
+                        content=b"not JSON",
+                        headers={"Authorization": "Bearer " + info["token"]},
+                    )
+                    assert legacy.status_code == 401
+                    child_headers = {"Authorization": "Bearer " + child.credential}
+                    event = {
+                        "event": {
+                            "type": "PHASE_TOOL_CALL",
+                            "target": "read",
+                            "data": {
+                                "name": "read",
+                                "arguments": {"path": "notes.txt"},
+                                "call_id": "same-call",
+                            },
+                        },
+                        "pi_origin_receipt": "forged",
+                        "is_parent": True,
+                        "scope_id": parent.principal.scope_id,
+                    }
+                    response = await client.post(
+                        "/policies/evaluate", json=event, headers=child_headers
+                    )
+                    assert response.status_code == 200
+                    body = response.json()
+                    assert body["result"] == "POLICY_ACTION_UNSPECIFIED"
+                    binding = body.get("permission_tier_binding")
+                    assert isinstance(binding, dict)
+                    receipt = runtime.pi_scopes.resolve(
+                        "session-a", binding.get("pi_origin_receipt")
+                    )
+                    assert receipt.principal == child.principal
+                    parent_response = await client.post(
+                        "/policies/evaluate",
+                        json=event,
+                        headers={"Authorization": "Bearer " + parent.credential},
+                    )
+                    assert parent_response.json()["result"] == "POLICY_ACTION_DENY"
+                    bypass = await client.post(
+                        "/permission-tiers/control",
+                        headers=child_headers,
+                        json={"type": "permission_tier_authorize"},
+                    )
+                    assert bypass.status_code == 403
+                    forbidden = await client.post(
+                        "/tool",
+                        headers=child_headers,
+                        json={"name": "sys_session_send", "arguments": {}},
+                    )
+                    assert forbidden.status_code == 401
+                    execute = {
+                        "type": "permission_tier_execute",
+                        "call_id": binding["call_id"],
+                        "name": "read",
+                        "arguments": {"path": "notes.txt"},
+                        "expected_revision": 3,
+                        "arguments_digest": binding["arguments_digest"],
+                        "operation_id": "actual-read",
+                        "step": "initial",
+                        "pi_origin_receipt": receipt.token,
+                    }
+                    started = await client.post(
+                        "/permission-tiers/control", headers=child_headers, json=execute
+                    )
+                    assert started.json().get("executed") is True
+                    runtime.revoke_pi_scope(child.principal)
+                    late = await client.post(
+                        "/permission-tiers/control",
+                        headers=child_headers,
+                        json={**execute, "step": "late"},
+                    )
+                    assert late.status_code == 403
+                    finish = {
+                        "type": "permission_tier_finish",
+                        "call_id": binding["call_id"],
+                        "expected_revision": 3,
+                        "pi_origin_receipt": receipt.token,
+                    }
+                    wrong = await client.post(
+                        "/permission-tiers/control",
+                        headers={"Authorization": "Bearer " + parent.credential},
+                        json=finish,
+                    )
+                    assert wrong.status_code == 403
+                    settled = await client.post(
+                        "/permission-tiers/control", headers=child_headers, json=finish
+                    )
+                    assert settled.json().get("finished") is True
+                    assert runtime.idle("session-a")
+            finally:
+                relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoke", [False, True])
+async def test_pi_ask_reply_after_child_close_is_denied_by_actual_runner(
+    tmp_path, monkeypatch, revoke
+):
+    from types import SimpleNamespace
+
+    from omnigent.entities import Conversation
+    from omnigent.server import permission_gate as gate
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import ElicitationResult
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    app, _pm = await _build_app_for_spec(_harness_spec("pi-native"))
+    runtime, _parent, child, _source, _registry = _scoped_runtime(
+        tmp_path,
+        "ask",
+        app.state.permission_tiers,
+    )
+    _publish_scope(
+        runtime,
+        child,
+        [{"name": "write", "sourceInfo": {"source": "builtin", "path": "builtin:write"}}],
+    )
+    arguments = {"path": "new.txt", "content": "approved"}
+    receipt = runtime.pi_origin_receipt(
+        "session-a",
+        child.credential,
+        call_id="waiting-write",
+        name="write",
+        arguments=arguments,
+        local_execution=True,
+    )
+    conv = Conversation(
+        id="session-a",
+        root_conversation_id="session-a",
+        created_at=1,
+        updated_at=1,
+        host_id="host-a",
+        workspace=str(tmp_path / "workspace"),
+        labels={
+            **ConfirmedPermissionState("ask", 3, "ready").labels("pi-native"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    store = SimpleNamespace(get_conversation=lambda _id: conv)
+    gate._active_approvals.clear()
+    gate._consumed_approvals.clear()
+
+    async def approve(*_args, **_kwargs):
+        if revoke:
+            runtime.revoke_pi_scope(child.principal)
+        return ElicitationResult(action="accept")
+
+    monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", approve)
+    async with _runner_client(app) as client:
+
+        async def get_runner(*_args, **_kwargs):
+            return client
+
+        monkeypatch.setattr(sessions, "_get_runner_client", get_runner)
+        inspection = await gate.inspect_permission_call(
+            conv,
+            harness="pi-native",
+            name="write",
+            arguments=arguments,
+            call_id=receipt.binding.call_id,
+            runner_router=None,
+            origin_receipt=receipt.token,
+        )
+        assert inspection.decision.action.value == "ASK", inspection.decision.reason
+        decision = await gate.authorize_permission_call(
+            inspection,
+            request=None,
+            harness="pi-native",
+            arguments=arguments,
+            conversation_store=store,
+            runner_router=None,
+        )
+        assert decision.action.value == ("DENY" if revoke else "ALLOW")
+        if not revoke:
+            completed = await gate.finish_permission_call(
+                conv,
+                call_id=receipt.binding.call_id,
+                revision=3,
+                runner_router=None,
+                origin_receipt=receipt.token,
+            )
+            assert completed
+        assert runtime.idle("session-a")
 
 
 @pytest.mark.parametrize(
@@ -557,6 +1208,8 @@ def test_installed_policy_and_guard_files_are_control_paths(tmp_path: Path) -> N
     targets = (
         package_root / "permission_tiers" / "ares_rules.json",
         Path(omnigent.runner.permission_tiers.__file__).resolve(),
+        package_root / "runner" / "pi_scopes.py",
+        package_root / "runner" / "pi_scope_relay.py",
         package_root / "harnesses" / "antigravity_native" / "guard.py",
         package_root / "harnesses" / "antigravity_native" / "bridge.py",
     )
@@ -712,29 +1365,63 @@ async def test_full_mcp_call_runs_only_with_ready_runtime(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("raises", [False, True])
 @pytest.mark.parametrize("with_operation", [False, True])
+@pytest.mark.parametrize("scoped", [False, True])
 async def test_mcp_lease_finishes_in_actual_execution_callback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raises: bool, with_operation: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raises: bool,
+    with_operation: bool,
+    scoped: bool,
 ) -> None:
     from omnigent.runner import tool_dispatch
 
-    runtime = _runtime(tmp_path, "ask")
+    token = None
+    if scoped:
+        runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path, "ask")
+        bridge_tools = [
+            {
+                "name": "sys_os_read",
+                "sourceInfo": {
+                    "path": str(
+                        runtime.path("session-a").parent / "omnigent_pi_native_extension.js"
+                    ),
+                },
+            }
+        ]
+        _publish_scope(runtime, child, bridge_tools)
+        receipt = runtime.pi_origin_receipt(
+            "session-a",
+            child.credential,
+            call_id="tool-a",
+            name="sys_os_read",
+            arguments={},
+            local_execution=False,
+        )
+        token = receipt.token
+        call_id = receipt.binding.call_id
+    else:
+        runtime = _runtime(tmp_path, "ask")
+        call_id = "tool-a"
     arguments: dict[str, object] = {}
     binding, decision = runtime.inspect(
         "session-a",
-        call_id="tool-a",
+        call_id=call_id,
         name="sys_os_read",
         arguments=arguments,
         expected_revision=3,
         local_execution=False,
+        origin_receipt=token,
     )
     assert decision.action.value == "ASK"
-    assert runtime.authorize(
+    authorized = runtime.authorize(
         "session-a",
         call_id=binding.call_id,
         name=binding.name,
         arguments_digest=binding.arguments_digest,
         expected_revision=3,
+        origin_receipt=token,
     )
+    assert authorized
     calls = 0
 
     async def execute_tool(**_kwargs: object) -> str:
@@ -765,7 +1452,9 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
             _resolve_session_spec_entry=none,
             _session_agent_ids={},
             _session_async_tasks={},
-            _session_harness_name=lambda _session_id: "antigravity-native",
+            _session_harness_name=lambda _session_id: (
+                "pi-native" if scoped else "antigravity-native"
+            ),
             _session_inboxes={},
             _session_runtime_cwd=cwd,
             _session_spec_cache={},
@@ -789,6 +1478,8 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
                 "arguments_digest": binding.arguments_digest,
             },
         }
+        if token is not None:
+            request["_omnigent_permission"]["pi_origin_receipt"] = token
         if with_operation:
             request["_omnigent_operation"] = {"id": "operation-a", "step": "initial"}
         else:
@@ -813,6 +1504,47 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
             replay = await client.post("/v1/sessions/session-a/mcp/execute", json=request)
             assert replay.json() == response.json()
         assert calls == 1
+        if scoped and with_operation:
+            sibling = runtime.open_pi_child_scope("session-a")
+            _publish_scope(runtime, sibling, bridge_tools)
+            sibling_receipt = runtime.pi_origin_receipt(
+                "session-a",
+                sibling.credential,
+                call_id="tool-a",
+                name="sys_os_read",
+                arguments=arguments,
+                local_execution=False,
+            )
+            sibling_binding, _ = runtime.inspect(
+                "session-a",
+                call_id=sibling_receipt.binding.call_id,
+                name="sys_os_read",
+                arguments=arguments,
+                expected_revision=3,
+                local_execution=False,
+                origin_receipt=sibling_receipt.token,
+            )
+            sibling_allowed = runtime.authorize(
+                "session-a",
+                call_id=sibling_binding.call_id,
+                name=sibling_binding.name,
+                arguments_digest=sibling_binding.arguments_digest,
+                expected_revision=3,
+                origin_receipt=sibling_receipt.token,
+            )
+            assert sibling_allowed
+            sibling_request = {
+                **request,
+                "_omnigent_permission": {
+                    "call_id": sibling_binding.call_id,
+                    "revision": 3,
+                    "arguments_digest": sibling_binding.arguments_digest,
+                    "pi_origin_receipt": sibling_receipt.token,
+                },
+            }
+            second = await client.post("/v1/sessions/session-a/mcp/execute", json=sibling_request)
+            assert ("error" in second.json()) is raises
+            assert calls == 2, "a sibling must not receive another scope's cached result"
 
 
 @pytest.mark.asyncio

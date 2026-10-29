@@ -15874,6 +15874,7 @@ async def _handle_mcp_tools_call(
         call_id=permission_call_id,
         runner_router=runner_router,
         local_execution=tier_local_execution,
+        origin_receipt=params.get("_omnigent_pi_origin_receipt"),
     )
     if tier_inspection.decision.action == Verdict.DENY:
         return _mcp_error_response(rpc_id, -32000, tier_inspection.decision.reason)
@@ -16071,6 +16072,7 @@ async def _handle_mcp_tools_call(
             call_id=permission_call_id,
             runner_router=runner_router,
             local_execution=tier_local_execution,
+            origin_receipt=params.get("_omnigent_pi_origin_receipt"),
         )
     tier_decision = await authorize_permission_call(
         tier_inspection,
@@ -16091,6 +16093,7 @@ async def _handle_mcp_tools_call(
                 call_id=tier_inspection.binding.call_id,
                 revision=tier_inspection.binding.tier_revision,
                 runner_router=runner_router,
+                origin_receipt=tier_inspection.origin_receipt,
             )
 
     # ── Server-side sys_advise_models intercept ──────────────────────────
@@ -16241,6 +16244,7 @@ async def _handle_mcp_tools_call(
                 call_id=str(permission_call_id) + ":elicitation-response",
                 runner_router=runner_router,
                 local_execution=tier_local_execution,
+                origin_receipt=params.get("_omnigent_pi_origin_receipt"),
             )
             retry_permission = await authorize_permission_call(
                 tier_inspection,

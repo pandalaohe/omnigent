@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +17,7 @@ class PiToolRegistry:
     control_paths: tuple[str, ...] = ()
     reason: str = ""
     invalid_tools: frozenset[str] = frozenset()
+    tool_names: frozenset[str] = frozenset()
 
 
 def _object(path: Path) -> dict:
@@ -27,11 +29,64 @@ def _object(path: Path) -> dict:
     return value
 
 
-def read_pi_tool_registry(bridge: Path, state: HostPermissionState) -> PiToolRegistry:
+def read_pi_tool_expectation(bridge: Path) -> dict[str, object]:
+    """Read the launcher's protected enforcement identity before allocating a scope."""
+    expected = _object(bridge / "permission_expected.json")
+    if expected.get("version") != 1 or expected.get("harness") not in ("pi", "pi-native"):
+        raise ValueError("Invalid Pi permission expectation")
+    guard = Path(expected["extension_path"])
+    if (
+        not guard.is_absolute()
+        or not isinstance(expected.get("installation_id"), str)
+        or not expected["installation_id"]
+    ):
+        raise ValueError("Incomplete Pi permission expectation")
+    if guard.is_symlink() or hashlib.sha256(guard.read_bytes()).hexdigest() != expected.get(
+        "extension_sha256"
+    ):
+        raise ValueError("Changed Pi enforcement source")
+    return expected
+
+
+def read_pi_tool_registry(
+    bridge: Path,
+    state: HostPermissionState,
+    *,
+    expected_binding: Mapping[str, object] | None = None,
+) -> PiToolRegistry:
     """Never consume provenance sent in tool arguments or policy event data."""
     try:
         expected = _object(bridge / "permission_expected.json")
         registry = _object(bridge / "permission_tools.json")
+        loaded: dict[str, dict] = {}
+        if expected_binding is not None:
+            if expected != dict(expected_binding) or expected.get("scope_protocol_version") != 2:
+                raise ValueError("changed scope expectation")
+            for key, value in expected_binding.items():
+                if (
+                    key not in ("extension_path", "tool_registry_version")
+                    and registry.get(key) != value
+                ):
+                    raise ValueError("stale scope registry")
+            rows = registry.get("loaded_extensions")
+            if not isinstance(rows, list):
+                raise ValueError("missing actual SDK loaded identities")
+            for row in rows:
+                if not isinstance(row, dict) or not all(
+                    isinstance(row.get(key), str) and row[key]
+                    for key in ("path", "resolved_path", "source_sha256")
+                ):
+                    raise ValueError("malformed loaded extension")
+                prior = loaded.get(row["path"])
+                if prior is not None and prior != row:
+                    raise ValueError("ambiguous loaded extension")
+                loaded[row["path"]] = row
+            if not any(
+                row["resolved_path"] == expected.get("extension_path")
+                and row["source_sha256"] == expected.get("extension_sha256")
+                for row in loaded.values()
+            ):
+                raise ValueError("missing loaded enforcement identity")
         for key in ("version", "installation_id", "session_id", "harness", "extension_sha256"):
             if registry.get(key) != expected.get(key):
                 raise ValueError("stale registry")
@@ -81,7 +136,13 @@ def read_pi_tool_registry(bridge: Path, state: HostPermissionState) -> PiToolReg
                     "source"
                 ) in (None, "", "sdk", "builtin", "inline", "temporary"):
                     continue
-                entry = Path(source["path"])
+                if expected_binding is not None:
+                    identity = loaded.get(source["path"])
+                    if identity is None or identity["source_sha256"] != tool["source_sha256"]:
+                        raise ValueError("unbound loaded tool source")
+                    entry = Path(identity["resolved_path"])
+                else:
+                    entry = Path(source["path"])
                 base = Path(source["baseDir"])
                 root = Path(tool["implementation_root"])
                 if not all(path.is_absolute() for path in (entry, base, root)):
@@ -115,7 +176,10 @@ def read_pi_tool_registry(bridge: Path, state: HostPermissionState) -> PiToolReg
                     "Pi extension implementation or configuration changed; restart to verify it"
                 )
         return PiToolRegistry(
-            extensions, tuple(dict.fromkeys(controls)), invalid_tools=frozenset(invalid)
+            extensions,
+            tuple(dict.fromkeys(controls)),
+            invalid_tools=frozenset(invalid),
+            tool_names=frozenset(names),
         )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return PiToolRegistry(

@@ -7881,6 +7881,7 @@ def create_runner_app(
                         arguments=arguments,
                         expected_revision=cast(int, event.get("expected_revision")),
                         local_execution=True,
+                        origin_receipt=event.get("pi_origin_receipt"),
                     )
                     return {
                         **decision_payload(decision),
@@ -7900,6 +7901,7 @@ def create_runner_app(
                         name=event.get("name"),
                         arguments_digest=event.get("arguments_digest"),
                         expected_revision=event.get("expected_revision"),
+                        origin_receipt=event.get("pi_origin_receipt"),
                     )
                     if not authorized:
                         raise ValueError("Permission authorization stale")
@@ -7914,11 +7916,26 @@ def create_runner_app(
                         "tier_revision": state.revision,
                         "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
                     }
+                if event_type == "permission_tier_execute":
+                    arguments = event.get("arguments")
+                    executed = isinstance(arguments, dict) and permission_tiers.verify_execute(
+                        _captured_session_id,
+                        call_id=event.get("call_id"),
+                        revision=event.get("expected_revision"),
+                        arguments_digest=event.get("arguments_digest"),
+                        name=cast(str, event.get("name")),
+                        arguments=arguments,
+                        operation_id=event.get("operation_id"),
+                        step=event.get("step"),
+                        origin_receipt=event.get("pi_origin_receipt"),
+                    )
+                    return {"executed": executed}
                 if event_type == "permission_tier_finish":
                     finished = permission_tiers.finish(
                         _captured_session_id,
                         call_id=event.get("call_id"),
                         revision=event.get("expected_revision"),
+                        origin_receipt=event.get("pi_origin_receipt"),
                     )
                     return {"finished": finished}
             except (KeyError, OSError, TypeError, ValueError):
@@ -7931,6 +7948,8 @@ def create_runner_app(
                 relay = current.relay
                 relay.update_tools(relay_schemas, _relay_tool_executor)
             else:
+                from omnigent.runner.pi_scope_relay import PiScopeRelay
+
                 relay = start_tool_relay(
                     bridge_dir=bridge_dir,
                     tools=relay_schemas,
@@ -7940,6 +7959,11 @@ def create_runner_app(
                     session_id=session_id,
                     file_change_observer=_observe_native_file_changes,
                     permission_tier_control=_permission_tier_control,
+                    pi_scope_relay=(
+                        PiScopeRelay(permission_tiers, session_id)
+                        if permission_tiers.observation_harness(session_id) in ("pi", "pi-native")
+                        else None
+                    ),
                 )
         except (OSError, RuntimeError):
             _logger.warning(
@@ -10906,6 +10930,7 @@ def create_runner_app(
                     arguments=body["arguments"],
                     expected_revision=body["expected_revision"],
                     local_execution=local_execution,
+                    origin_receipt=body.get("pi_origin_receipt"),
                 )
             except (KeyError, OSError, TypeError, ValueError):
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
@@ -10932,6 +10957,7 @@ def create_runner_app(
                 name=body.get("name"),
                 arguments_digest=body.get("arguments_digest"),
                 expected_revision=body.get("expected_revision"),
+                origin_receipt=body.get("pi_origin_receipt"),
             )
             if not authorized:
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
@@ -10949,11 +10975,33 @@ def create_runner_app(
                 }
             )
 
+        if body_type == "permission_tier_execute":
+            if (
+                not isinstance(body, dict)
+                or not isinstance(body.get("arguments"), dict)
+                or not isinstance(body.get("name"), str)
+            ):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            if not permission_tiers.verify_execute(
+                conversation_id,
+                call_id=body.get("call_id"),
+                revision=body.get("expected_revision"),
+                arguments_digest=body.get("arguments_digest"),
+                name=body["name"],
+                arguments=body["arguments"],
+                operation_id=body.get("operation_id"),
+                step=body.get("step"),
+                origin_receipt=body.get("pi_origin_receipt"),
+            ):
+                return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
+            return JSONResponse(content={"executed": True})
+
         if body_type == "permission_tier_finish":
             if not isinstance(body, dict) or not permission_tiers.finish(
                 conversation_id,
                 call_id=body.get("call_id"),
                 revision=body.get("expected_revision"),
+                origin_receipt=body.get("pi_origin_receipt"),
             ):
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
             return JSONResponse(content={"finished": True})

@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
+    from omnigent.runner.pi_scope_relay import PiScopeRelay
 
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
@@ -8106,6 +8107,7 @@ def start_tool_relay(
     session_id: str | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
     permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
+    pi_scope_relay: PiScopeRelay | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start the shared relay for native-harness Omnigent tool calls.
@@ -8148,6 +8150,7 @@ def start_tool_relay(
         bridge_dir=bridge_dir,
         file_change_observer=file_change_observer,
         permission_tier_control=permission_tier_control,
+        pi_scope_relay=pi_scope_relay,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -8161,6 +8164,8 @@ def start_tool_relay(
         relay_info["session_id"] = session_id
         if policy_client is not None:
             relay_info["permission_tiers_v1"] = True
+    if pi_scope_relay is not None:
+        relay_info["pi_scopes_v2"] = True
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
     env_path = bridge_dir / _TOOL_RELAY_ENV_FILE
@@ -8451,6 +8456,7 @@ def _tool_relay_handler_factory(
     bridge_dir: Path | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
     permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
+    pi_scope_relay: PiScopeRelay | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -8507,9 +8513,20 @@ def _tool_relay_handler_factory(
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            if self.headers.get("Authorization") != f"Bearer {token}":
-                self.send_error(HTTPStatus.UNAUTHORIZED)
-                return
+            authorization = self.headers.get("Authorization")
+            scoped = None
+            legacy = authorization == f"Bearer {token}" and (
+                pi_scope_relay is None or pi_scope_relay.legacy_allowed()
+            )
+            if not legacy:
+                if pi_scope_relay is None:
+                    self.send_error(HTTPStatus.UNAUTHORIZED)
+                    return
+                try:
+                    scoped = pi_scope_relay.authenticate(authorization, self.path)
+                except ValueError:
+                    self.send_error(HTTPStatus.UNAUTHORIZED)
+                    return
             if self.path == "/tool/cancel":
                 payload = self._read_json_body()
                 request_id = payload.get("request_id") if payload is not None else None
@@ -8540,6 +8557,16 @@ def _tool_relay_handler_factory(
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
+            if scoped is not None and pi_scope_relay is not None:
+                future = asyncio.run_coroutine_threadsafe(
+                    pi_scope_relay.prepare(scoped, self.path, payload), loop
+                )
+                try:
+                    payload = future.result(timeout=5.0)
+                except Exception:  # noqa: BLE001 - scoped failure never falls back to parent
+                    future.cancel()
+                    self.send_error(HTTPStatus.FORBIDDEN)
+                    return
             if self.path == "/pi/session-usage":
                 self._handle_pi_session_usage(payload)
                 return
@@ -8781,6 +8808,7 @@ def _tool_relay_handler_factory(
                 "permission_tier_inspect",
                 "permission_tier_authorize",
                 "permission_tier_finish",
+                "permission_tier_execute",
             ):
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
@@ -8960,9 +8988,8 @@ def _tool_relay_handler_factory(
             except ValueError:
                 return None
             if (
-                self.path == "/hook/observe-tool"
-                and not 0 <= length <= _NATIVE_RELAY_BODY_MAX_BYTES
-            ):
+                self.path == "/hook/observe-tool" or pi_scope_relay is not None
+            ) and not 0 <= length <= _NATIVE_RELAY_BODY_MAX_BYTES:
                 return None
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")

@@ -140,6 +140,7 @@ def register_mcp_routes(
                 arguments_digest=permission.get("arguments_digest"),
                 name=tool_name,
                 arguments=arguments,
+                origin_receipt=permission.get("pi_origin_receipt"),
             ):
                 return JSONResponse(
                     status_code=200,
@@ -170,9 +171,23 @@ def register_mcp_routes(
                     },
                 )
 
+            try:
+                operation_id = permission_tiers.pi_operation_id(
+                    session_id,
+                    operation_id,
+                    permission,
+                    name=params.get("name"),
+                    arguments=params.get("arguments"),
+                )
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    status_code=200,
+                    content={"error": {"code": -32000, "message": "Permission lease rejected"}},
+                )
+
             nested_body = cast("_JsonObject", {**body, "_omnigent_operation": None})
             nested_body.pop("_omnigent_operation")
-            nested_body["_omnigent_retained_operation"] = operation
+            nested_body["_omnigent_retained_operation"] = {**operation, "id": operation_id}
             execution_started: dict[str, bool] = {"value": False}
             nested_body["_omnigent_execution_started"] = execution_started
 
@@ -197,6 +212,7 @@ def register_mcp_routes(
                                 session_id,
                                 call_id=permission.get("call_id"),
                                 revision=permission.get("revision"),
+                                origin_receipt=permission.get("pi_origin_receipt"),
                             )
 
             try:
@@ -304,6 +320,7 @@ def register_mcp_routes(
                         arguments=arguments,
                         operation_id=operation.get("id"),
                         step=operation.get("step"),
+                        origin_receipt=permission.get("pi_origin_receipt"),
                     ):
                         return JSONResponse(
                             status_code=200,
