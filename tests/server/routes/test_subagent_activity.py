@@ -15,8 +15,33 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_items,
 )
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.subagent_activity import record_subagent_activity
+from omnigent.server.subagent_activity import (
+    native_subagent_terminal_status,
+    record_subagent_activity,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "pi-native"])
+@pytest.mark.parametrize(
+    "status,completed,outcome,expected",
+    [
+        ("idle", None, None, None),
+        ("idle", False, None, None),
+        ("idle", True, None, "completed"),
+        ("idle", False, "cancelled", "cancelled"),
+        ("failed", False, None, "failed"),
+    ],
+)
+def test_native_activity_requires_a_confirmed_turn_outcome(
+    harness: str, status: str, completed: bool | None, outcome: str | None, expected: str | None
+) -> None:
+    assert (
+        native_subagent_terminal_status(
+            status, harness=harness, turn_completed=completed, turn_outcome=outcome
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize("explicit_turn", [False, True])

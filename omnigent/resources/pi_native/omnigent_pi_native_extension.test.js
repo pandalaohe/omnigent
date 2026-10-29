@@ -518,6 +518,7 @@ async function testPeerReceiptRequiresConsumedUserMessage() {
     { message: { role: "user", content: [{ type: "text", text: envelope }] } },
     {},
   );
+  await h.handlers.session_shutdown();
   const consumed = userItems();
   assert("consumed steer mirrors once", consumed.length === 1, JSON.stringify(consumed));
   assert(
@@ -539,6 +540,9 @@ async function testRunningIdleShareResponseId() {
   const ctx = makeCtx({ idle: false });
 
   await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({
+    message: { role: "assistant", stopReason: "stop", content: [] },
+  }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
 
   const edges = statusEdges(h.postedEvents);
@@ -563,6 +567,9 @@ async function testRunningIdleShareResponseId() {
 
   // A second turn mints a fresh id, still paired across its own running/idle.
   await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({
+    message: { role: "assistant", stopReason: "stop", content: [] },
+  }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
   const edges2 = statusEdges(h.postedEvents);
   const running2 = edges2.filter((e) => e.status === "running");
@@ -702,6 +709,9 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
       JSON.stringify(beforeEnd),
     );
 
+    await h.handlers.message_end({
+      message: { role: "assistant", stopReason: "stop", content: [] },
+    }, ctx);
     await h.handlers.agent_end({ messages: [] }, ctx);
     const afterEnd = statusEdges(h.postedEvents);
     assert(

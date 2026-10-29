@@ -484,7 +484,7 @@ _DEFAULT_REMOTE_MEMBER_CHECK_S = 600.0
 # interrupt). For these, a bare quiescence ``idle`` is NOT a completion. Add a
 # key here only together with its forwarder's ``turn_completed`` plumbing,
 # or that harness's sub-agent completions stop reaching parent inboxes.
-_TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS = frozenset({"claude"})
+_TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS = frozenset({"claude", "pi"})
 
 
 def resolve_remote_member_check_s() -> float:
