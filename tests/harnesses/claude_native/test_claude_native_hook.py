@@ -1214,7 +1214,7 @@ def test_evaluate_policy_answer_for_a_switched_session_opens_no_window(
     assert policy_allow_cache._read_state(bridge_dir)[0] == 0
 
 
-def test_evaluate_policy_no_policy_allow_lets_installed_command_answer_in_shell(
+def test_evaluate_policy_no_policy_allow_lets_installed_post_tool_command_answer_in_shell(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1236,13 +1236,13 @@ def test_evaluate_policy_no_policy_allow_lets_installed_command_answer_in_shell(
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_allow", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     settings = build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:9")
-    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    payload = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {}}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
     assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
     assert capsys.readouterr().out == ""
 
-    command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    command = settings["hooks"]["PostToolUse"][-1]["hooks"][0]["command"]
     result = subprocess.run(
         ["/bin/sh", "-c", command],
         input=json.dumps(payload),
