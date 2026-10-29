@@ -89,6 +89,13 @@ def test_sdk_receipt_requires_bound_runner_and_current_attempt(outcome, state):
         {"type": "message", "data": {"role": "user", "content": [], "peer_delivery": {}}},
         {"type": "message", "data": {"role": "user", "content": [], "peer_message_id": "a" * 32}},
         {
+            "type": "external_session_status",
+            "data": {
+                "status": "completed",
+                "sdk_peer_delivery": {"peer_id": "a" * 32, "attempt_id": "b" * 32},
+            },
+        },
+        {
             "type": "external_conversation_item",
             "data": {
                 "item_type": "message",

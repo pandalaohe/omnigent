@@ -100,6 +100,7 @@ from omnigent.permission_tiers import plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
 from omnigent.startup_protocol import (
@@ -2373,6 +2374,13 @@ class _PiRpcSession:
 
 
 @dataclass
+class _PiPeerPending:
+    delivery: SDKPeerInput
+    report: ReportPeerOutcome
+    expected_text: str
+
+
+@dataclass
 class _PiSessionState:
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
@@ -2385,6 +2393,9 @@ class _PiSessionState:
     applied_thinking: str | None = None
     _has_sent_prompt: bool = False
     owner_incarnation: str = field(default_factory=lambda: uuid4().hex)
+    peer_turn_active: bool = False
+    peer_pending: dict[str, _PiPeerPending] = field(default_factory=dict)
+    peer_commands: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -3314,6 +3325,7 @@ class PiExecutor(Executor):
         self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
+        self._peer_initial: dict[str, _PiPeerPending] = {}
         self._context_incarnation = uuid4().hex
         self._context_records: dict[str, ContextRecordV2] = {}
         self._context_bindings: dict[str, tuple[str, int]] = {}
@@ -3364,6 +3376,7 @@ class PiExecutor(Executor):
             return False
 
     async def close_session(self, session_key: str) -> None:
+        await self.finish_peer_messages(session_key)
         state = self._session_states.get(session_key)
         rpc = state.rpc if state is not None else None
         tool_server = self._tool_server
@@ -3382,6 +3395,49 @@ class PiExecutor(Executor):
             and state.rpc is rpc
         ):
             self._session_states.pop(session_key, None)
+
+    async def prepare_peer_turn(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> bool:
+        self._peer_initial[session_key] = _PiPeerPending(delivery, report, delivery.text)
+        return True
+
+    async def submit_peer_message(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> None:
+        """Submit once; only Pi's final consumed user event accepts the peer."""
+        state = self._session_states.get(session_key)
+        if state is None or state.rpc is None or not state.peer_turn_active:
+            await report(SDKPeerOutcome.for_input(delivery, "refused", "pi_no_active_turn"))
+            return
+        if delivery.attempt_id in state.peer_commands or delivery.attempt_id in state.peer_pending:
+            return
+        state.peer_pending[delivery.attempt_id] = _PiPeerPending(delivery, report, delivery.text)
+        state.peer_commands.add(delivery.attempt_id)
+        try:
+            await state.rpc.send_command(
+                {"type": "steer", "id": delivery.attempt_id, "message": delivery.text}
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a partial write has no definitive delivery outcome
+            await report(SDKPeerOutcome.for_input(delivery, "unknown", "pi_steer_write"))
+
+    async def finish_peer_messages(self, session_key: str) -> None:
+        """Drop executable pending input at turn end; never blindly resubmit it."""
+        state = self._session_states.get(session_key)
+        pending = []
+        if state is not None:
+            state.peer_turn_active = False
+            pending.extend(state.peer_pending.values())
+            state.peer_pending.clear()
+        initial = self._peer_initial.pop(session_key, None)
+        if initial is not None:
+            pending.append(initial)
+        for item in pending:
+            await item.report(
+                SDKPeerOutcome.for_input(item.delivery, "unknown", "pi_turn_no_receipt")
+            )
 
     def _register_rpc_context(
         self, session_key: str, state: _PiSessionState, rpc: _PiRpcSession
@@ -3512,6 +3568,7 @@ class PiExecutor(Executor):
         """Drop *rpc* mid-turn so frames it still emits can't reach the next turn."""
         state = self._session_states.get(session_key)
         if state is not None and state.rpc is rpc:
+            await self.finish_peer_messages(session_key)
             self._session_states.pop(session_key, None)
             if self._tool_server is not None:
                 self._tool_server.revoke_pi_usage_token(session_key)
@@ -4272,7 +4329,15 @@ class PiExecutor(Executor):
             )
 
         if previous_rpc is not None:
+            # The new turn's input does not belong to the process being replaced.
+            initial_peer = self._peer_initial.pop(session_key, None)
+            try:
+                await self.finish_peer_messages(session_key)
+            finally:
+                if initial_peer is not None:
+                    self._peer_initial[session_key] = initial_peer
             await previous_rpc.close()
+        state.peer_commands.clear()
 
         # A replacement process may use a different model; its own report wins.
         state.context_window = None
@@ -4507,9 +4572,16 @@ class PiExecutor(Executor):
         }
         if images:
             command["images"] = images
+        if turn_state is not None:
+            turn_state.peer_turn_active = True
+            initial = self._peer_initial.pop(session_key, None)
+            if initial is not None:
+                initial.expected_text = message
+                turn_state.peer_pending[initial.delivery.attempt_id] = initial
         try:
             await rpc.send_command(command)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
+            await self.finish_peer_messages(session_key)
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
@@ -4584,6 +4656,7 @@ class PiExecutor(Executor):
                         message_usages, model, turn_state.context_window if turn_state else None
                     )
                     _notify_usage_from_dict(model=model, usage=turn_usage)
+                    await self.finish_peer_messages(session_key)
                     yield TurnComplete(
                         response=response_text,
                         usage=dict(turn_usage) if turn_usage is not None else None,
@@ -4601,6 +4674,22 @@ class PiExecutor(Executor):
 
             # Skip the command-ack response.
             if event_type == "response":
+                command_id = event.get("id")
+                if (
+                    turn_state is not None
+                    and isinstance(command_id, str)
+                    and command_id in turn_state.peer_commands
+                ):
+                    turn_state.peer_commands.discard(command_id)
+                    if not event.get("success", True):
+                        pending = turn_state.peer_pending.pop(command_id, None)
+                        if pending is not None:
+                            await pending.report(
+                                SDKPeerOutcome.for_input(
+                                    pending.delivery, "refused", "pi_steer_rejected"
+                                )
+                            )
+                    continue
                 if not event.get("success", True):
                     if settled_boundary:
                         await self._evict_rpc(session_key, rpc)
@@ -4770,6 +4859,7 @@ class PiExecutor(Executor):
                     message_usages, model, turn_state.context_window if turn_state else None
                 )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
+                await self.finish_peer_messages(session_key)
                 yield TurnComplete(
                     response=response_text,
                     usage=dict(turn_usage) if turn_usage is not None else None,
@@ -4789,6 +4879,7 @@ class PiExecutor(Executor):
                     message_usages, model, turn_state.context_window if turn_state else None
                 )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
+                await self.finish_peer_messages(session_key)
                 yield TurnComplete(
                     response=response_text,
                     usage=dict(turn_usage) if turn_usage is not None else None,
@@ -4801,6 +4892,19 @@ class PiExecutor(Executor):
             if event_type == "message_end":
                 msg = event.get("message", {})
                 if isinstance(msg, dict):
+                    if msg.get("role") == "user" and turn_state is not None:
+                        content = msg.get("content")
+                        if isinstance(content, list) and len(content) == 1:
+                            block = content[0]
+                            content = block.get("text") if isinstance(block, dict) else None
+                        for attempt_id, pending in list(turn_state.peer_pending.items()):
+                            if content == pending.expected_text:
+                                turn_state.peer_pending.pop(attempt_id, None)
+                                await pending.report(
+                                    SDKPeerOutcome.for_input(
+                                        pending.delivery, "accepted", "pi_user_message_end"
+                                    )
+                                )
                     captured = _extract_pi_turn_usage(msg, model)
                     if captured is not None:
                         message_usages.append(captured)

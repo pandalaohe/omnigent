@@ -44,6 +44,7 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations
 from omnigent.sdk_peer_delivery import (
     CLAUDE_SDK_PEER_CAPABILITY,
+    PI_RPC_PEER_CAPABILITY,
     SDK_PEER_CAPABILITY,
     SDKPeerInput,
     sdk_attempt,
@@ -1045,11 +1046,13 @@ def register_peer_routes(
             harness = _resolve_harness(conv, agent_store=agent_store)
         except Exception:
             return False
-        if harness not in ("codex", "claude-sdk"):
+        if harness not in ("codex", "claude-sdk", "pi"):
             return False
         has_capability = getattr(runner_router, "runner_has_capability", None)
         if has_capability is None or not has_capability(conv.runner_id, SDK_PEER_CAPABILITY):
             return False
+        if harness == "pi":
+            return has_capability(conv.runner_id, PI_RPC_PEER_CAPABILITY)
         return harness != "claude-sdk" or has_capability(
             conv.runner_id, CLAUDE_SDK_PEER_CAPABILITY
         )
@@ -1492,8 +1495,14 @@ def register_peer_routes(
                 "ref": body.correlation_id or "",
                 "receiver": _receiver_summary(receiver, runner_online=None),
             }
-        if receiver.parent_conversation_id is not None and not await asyncio.to_thread(
-            _peer_reachable_child, receiver
+        sdk_pi_child = (
+            receiver.kind == "sub_agent"
+            and not is_parent_owned_subagent(receiver)
+            and _sdk_capable(receiver)
+            and _resolve_harness(receiver, agent_store=agent_store) == "pi"
+        )
+        if receiver.parent_conversation_id is not None and not (
+            sdk_pi_child or await asyncio.to_thread(_peer_reachable_child, receiver)
         ):
             return {
                 "disposition": "refused",

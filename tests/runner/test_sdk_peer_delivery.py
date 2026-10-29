@@ -49,11 +49,13 @@ def _peer_body() -> dict[str, Any]:
     }
 
 
-def _app(harness: _ScriptedHarnessClient, server: _RecordingServer) -> Any:
+def _app(
+    harness: _ScriptedHarnessClient, server: _RecordingServer, harness_name: str = "codex"
+) -> Any:
     spec = AgentSpec(
         spec_version=1,
         name="agent",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
     )
 
     async def resolve(_agent_id: str, _session_id: str | None = None) -> AgentSpec:
@@ -75,7 +77,10 @@ async def _wait_for(predicate: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_midturn_peer_requires_stream_receipt_and_never_enters_continuation() -> None:
+@pytest.mark.parametrize("harness_name", ["codex", "pi"])
+async def test_midturn_peer_requires_stream_receipt_and_never_enters_continuation(
+    harness_name: str,
+) -> None:
     gate = asyncio.Event()
     harness = _BlockingHarnessClient(
         [
@@ -94,8 +99,8 @@ async def test_midturn_peer_requires_stream_receipt_and_never_enters_continuatio
         gate,
     )
     server = _RecordingServer()
-    app = _app(harness, server)
-    async with _runner_client(app) as client:
+    app = _app(harness, server, harness_name)
+    async with _runner_client(app, permission_harness=harness_name) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": SESSION, "agent_id": AGENT}
         )
@@ -139,7 +144,8 @@ async def test_midturn_peer_requires_stream_receipt_and_never_enters_continuatio
 
 
 @pytest.mark.asyncio
-async def test_idle_peer_starts_real_sdk_turn_with_receipt_metadata() -> None:
+@pytest.mark.parametrize("harness_name", ["codex", "pi"])
+async def test_idle_peer_starts_real_sdk_turn_with_receipt_metadata(harness_name: str) -> None:
     harness = _ScriptedHarnessClient(
         [
             _sse({"type": "response.created", "response": {"id": "resp_2"}}),
@@ -156,8 +162,8 @@ async def test_idle_peer_starts_real_sdk_turn_with_receipt_metadata() -> None:
         ]
     )
     server = _RecordingServer()
-    app = _app(harness, server)
-    async with _runner_client(app) as client:
+    app = _app(harness, server, harness_name)
+    async with _runner_client(app, permission_harness=harness_name) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": SESSION, "agent_id": AGENT}
         )
@@ -243,7 +249,8 @@ async def test_peer_with_active_slot_but_no_sdk_client_is_refused_without_buffer
 
 
 @pytest.mark.asyncio
-async def test_persisted_peer_envelope_does_not_start_sdk_recovery_turn() -> None:
+@pytest.mark.parametrize("harness_name", ["codex", "pi"])
+async def test_persisted_peer_envelope_does_not_start_sdk_recovery_turn(harness_name: str) -> None:
     """A durable peer transcript item is context, not executable replay authority."""
 
     class _HistoryServer(_RecordingServer):
@@ -272,8 +279,8 @@ async def test_persisted_peer_envelope_does_not_start_sdk_recovery_turn() -> Non
             return await super().get(url, **kwargs)
 
     harness = _ScriptedHarnessClient([])
-    app = _app(harness, _HistoryServer())
-    async with _runner_client(app) as client:
+    app = _app(harness, _HistoryServer(), harness_name)
+    async with _runner_client(app, permission_harness=harness_name) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": SESSION, "agent_id": AGENT}
         )
@@ -281,3 +288,70 @@ async def test_persisted_peer_envelope_does_not_start_sdk_recovery_turn() -> Non
     assert created.status_code == 201
     assert SESSION not in app.state.active_turns
     assert not harness.posted_bodies
+
+
+async def test_pi_peer_child_reports_its_attempt_for_server_attribution() -> None:
+    class ChildServer(_RecordingServer):
+        def __init__(self):
+            super().__init__()
+            self.terminal_posts = []
+
+        async def get(self, url, **kwargs):
+            response = await super().get(url, **kwargs)
+            if url == f"/v1/sessions/{SESSION}":
+                snapshot = {
+                    **response.json(),
+                    "id": SESSION,
+                    "agent_id": AGENT,
+                    "parent_session_id": "parent",
+                    "kind": "sub_agent",
+                    "harness_override": "pi",
+                }
+
+                class Snapshot(self._Response):
+                    def json(self):
+                        return snapshot
+
+                return Snapshot()
+            return response
+
+        async def post(self, url, **kwargs):
+            body = kwargs.get("json", {})
+            if body.get("type") == "external_session_status":
+                self.terminal_posts.append(body["data"])
+            return await super().post(url, **kwargs)
+
+    server = ChildServer()
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "peer_response"}}),
+            _sse(
+                {
+                    "type": "sdk.peer.receipt",
+                    "peer_id": PEER,
+                    "attempt_id": ATTEMPT,
+                    "outcome": "accepted",
+                    "proof_source": "sdk_turn_response",
+                }
+            ),
+            _sse({"type": "response.output_text.delta", "delta": "peer answer"}),
+            _sse({"type": "response.completed", "response": {"id": "peer_response"}}),
+        ]
+    )
+    app = _app(harness, server, "pi")
+    async with _runner_client(
+        app, permission_harness="pi", permission_snapshot={"parent_session_id": "parent"}
+    ) as client:
+        assert (
+            await client.post("/v1/sessions", json={"session_id": SESSION, "agent_id": AGENT})
+        ).status_code == 201
+        assert (
+            await client.post(f"/v1/sessions/{SESSION}/events", json=_peer_body())
+        ).status_code == 202
+        await _wait_for(lambda: bool(server.terminal_posts))
+    assert server.receipts[0]["outcome"] == "accepted"
+    assert server.terminal_posts[-1]["sdk_peer_delivery"] == {
+        "peer_id": PEER,
+        "attempt_id": ATTEMPT,
+    }
+    assert server.terminal_posts[-1]["response_id"] == "peer_response"

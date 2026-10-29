@@ -429,8 +429,10 @@ async def test_master_switch_off_still_records_annotated_copy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sdk_peer_turn", [False, True])
 async def test_running_mother_dispatch_wins_over_peer_annotation(
     _clean_subagent_registry: None,
+    sdk_peer_turn: bool,
 ) -> None:
     """A running mother-owned entry keeps today's delivery and wake.
 
@@ -449,11 +451,22 @@ async def test_running_mother_dispatch_wins_over_peer_annotation(
     async with _runner_client(app) as client:
         resp = await _post_status(
             client,
-            {"status": "idle", "output": "the result", "peer_turn": _peer_turn()},
+            {
+                "status": "idle",
+                "output": "the result",
+                "peer_turn": _peer_turn(),
+                "sdk_peer_turn": sdk_peer_turn,
+            },
         )
         await asyncio.sleep(0.05)
 
     assert resp.status_code == 204
+    if sdk_peer_turn:
+        assert entry.status == "running", "the SDK peer turn preceded this newer dispatch"
+        assert len(subagent_work.pop_peer_copies(PARENT_SESSION_ID)[0]) == 1
+        assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
+        assert _wake_posts(server_client) == []
+        return
     assert subagent_work.pop_peer_copies(PARENT_SESSION_ID)[0] == []
     inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
     assert [inbox.get_nowait()["status"]] == ["completed"]

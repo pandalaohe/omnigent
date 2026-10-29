@@ -10,6 +10,7 @@ every miss the design enumerates.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -199,6 +200,78 @@ def test_classify_hit_returns_peer_turn(stores: Any) -> None:
     assert turn is not None
     assert turn.as_dict()["result_item_id"] == x_item.id
     assert turn.as_dict()["sender_origin"] == SENDER_ORIGIN
+
+
+@pytest.mark.parametrize("persist_output", [False, True])
+@pytest.mark.parametrize("receipt_first", [False, True])
+async def test_sdk_child_waits_for_receipt_and_its_own_persisted_response(
+    stores: Any, monkeypatch: pytest.MonkeyPatch, persist_output: bool, receipt_first: bool
+) -> None:
+    from omnigent.sdk_peer_delivery import SDKPeerInput, sdk_attempt_reason
+    from omnigent.server.routes.sessions import peer_child_turn as module
+
+    monkeypatch.setattr(module, "_SDK_PEER_TURN_WAIT_S", 1.0)
+    conv, peer, mother, child, sender = stores
+    record = _record(peer, sender=sender.id, receiver=child.id, state="delivering")
+    attempt = "b" * 32
+    peer.transition(record.id, "delivering", sdk_attempt_reason(attempt, "wait"), ("delivering",))
+    # An old identical answer must not settle this attempt's new response.
+    conv.append(child.id, [_assistant("answer").model_copy(update={"response_id": "old"})])
+
+    async def persist() -> None:
+        if persist_output and not receipt_first:
+            conv.append(child.id, [_assistant("answer")])
+        await asyncio.sleep(0.01)
+        peer.transition(
+            record.id, "delivered", sdk_attempt_reason(attempt, "accepted"), ("delivering",)
+        )
+        await asyncio.sleep(0.01)
+        receipt = _user(_envelope(record))
+        receipt = receipt.model_copy(
+            update={
+                "response_id": f"peer_{attempt}",
+                "data": receipt.data.model_copy(update={"peer_message_id": record.id}),
+            }
+        )
+        conv.append(child.id, [receipt])
+        if persist_output and receipt_first:
+            await asyncio.sleep(0.01)
+            conv.append(child.id, [_assistant("answer")])
+
+    writer = asyncio.create_task(persist())
+    try:
+        ready = await module.wait_for_sdk_peer_turn(
+            conv, peer, child, SDKPeerInput(record.id, attempt, ""), "resp-1", "answer"
+        )
+    finally:
+        await writer
+    if persist_output:
+        assert ready
+        turn = classify_child_turn(
+            conv,
+            peer,
+            child,
+            "answer",
+            sdk_delivery=SDKPeerInput(record.id, attempt, ""),
+            response_id="resp-1",
+        )
+        assert turn is not None
+        assert turn.sender_session_id == sender.id
+        assert turn.parent_session_id == mother.id
+        assert turn.peer_id == record.id
+        assert (
+            classify_child_turn(
+                conv,
+                peer,
+                child,
+                "answer",
+                sdk_delivery=SDKPeerInput(record.id, attempt, ""),
+                response_id="old",
+            )
+            is None
+        )
+    else:
+        assert not ready
 
 
 @pytest.mark.parametrize(

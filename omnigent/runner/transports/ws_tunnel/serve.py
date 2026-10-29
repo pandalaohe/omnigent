@@ -75,7 +75,11 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
-from omnigent.sdk_peer_delivery import CLAUDE_SDK_PEER_CAPABILITY, SDK_PEER_CAPABILITY
+from omnigent.sdk_peer_delivery import (
+    CLAUDE_SDK_PEER_CAPABILITY,
+    PI_RPC_PEER_CAPABILITY,
+    SDK_PEER_CAPABILITY,
+)
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
 from omnigent.util.tunnel_limits import (
@@ -1509,6 +1513,7 @@ async def _send_hello(
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_PATH_ATTACHMENTS,
                     SDK_PEER_CAPABILITY,
+                    PI_RPC_PEER_CAPABILITY,
                     *([CLAUDE_SDK_PEER_CAPABILITY] if claude_peer_receipts_supported() else []),
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,

@@ -544,6 +544,158 @@ async def test_peer_turn_annotates_both_cross_host_forwards(
         assert peer_turn["parent_session_id"] == route.parent_id
 
 
+@pytest.mark.parametrize("cross_host_route", [True], indirect=True)
+@pytest.mark.parametrize("receipt_first", [False, True])
+@pytest.mark.parametrize(
+    ("origin", "advance_at"),
+    [
+        ("foreign", "none"),
+        ("mother", "none"),
+        ("reply", "none"),
+        ("foreign", "classification"),
+        ("foreign", "status"),
+    ],
+)
+async def test_pi_sdk_peer_terminal_uses_bound_runner_and_persisted_turn(
+    cross_host_route: _CrossHostRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_first: bool,
+    origin: str,
+    advance_at: str,
+) -> None:
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.sdk_peer_delivery import sdk_attempt_reason
+    from tests.server.helpers import PERMISSION_TIERS_HEADERS
+
+    route = cross_host_route
+    _seed_peer_turn(route)
+    assert route.peer_store is not None
+    sender = (
+        route.store.get_conversation(route.parent_id)
+        if origin == "mother"
+        else route.store.create_conversation(title="current sender")
+    )
+    assert sender is not None
+    if origin == "reply":
+        route.peer_store.create(
+            SessionPeerMessage(
+                id=uuid4().hex,
+                sender_session_id=route.child_id,
+                receiver_session_id=sender.id,
+                ref="sdk-thread",
+                text="child question",
+                state="delivered",
+                created_at=1,
+                expires_at=4,
+            )
+        )
+    record = route.peer_store.create(
+        SessionPeerMessage(
+            id=uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=route.child_id,
+            ref="current-ref",
+            text="current request",
+            state="delivered",
+            created_at=3,
+            expires_at=4,
+            correlation_id="sdk-thread" if origin == "reply" else None,
+        )
+    )
+    attempt, token = "b" * 32, "test-pi-peer-runner"
+    route.store.update_conversation(route.child_id, harness_override="pi")
+    route.store.replace_runner_id(route.child_id, token_bound_runner_id(token))
+    route.peer_store.transition(
+        record.id, "delivered", sdk_attempt_reason(attempt, "accepted"), ("delivered",)
+    )
+    envelope = format_peer_envelope(
+        sender_session_id=sender.id,
+        sender_title="current sender",
+        sender_agent_name="pi",
+        sender_project_id=None,
+        ref=record.ref,
+        peer_id=record.id,
+        text=record.text,
+    )
+    receipt, answer = (
+        NewConversationItem(
+            type="message",
+            response_id=f"peer_{attempt}",
+            stable_id=attempt,
+            data=MessageData(
+                role="user",
+                peer_message_id=record.id,
+                content=[{"type": "input_text", "text": envelope}],
+            ),
+        ),
+        NewConversationItem(
+            type="message",
+            response_id="pi-peer-response",
+            data=MessageData(
+                role="assistant",
+                agent="pi",
+                content=[{"type": "output_text", "text": "final answer"}],
+            ),
+        ),
+    )
+    route.store.append(route.child_id, [receipt, answer] if receipt_first else [answer, receipt])
+
+    def advance_response() -> None:
+        route.store.append(route.child_id, [answer.model_copy(update={"response_id": "new-work"})])
+        monkeypatch.setitem(sessions._session_active_response_cache, route.child_id, "new-work")
+
+    if advance_at == "classification":
+        real_to_thread = asyncio.to_thread
+
+        async def interleaved_to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+            if func is classify_child_turn:
+                advance_response()
+            return await real_to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", interleaved_to_thread)
+    elif advance_at == "status":
+        from omnigent.server.routes.sessions import routes_events
+
+        real_enrich = routes_events._enrich_terminal_status_with_subagent_output
+
+        async def interleaved_enrich(*args: Any, **kwargs: Any) -> Any:
+            result = await real_enrich(*args, **kwargs)
+            advance_response()
+            return result
+
+        monkeypatch.setattr(
+            routes_events, "_enrich_terminal_status_with_subagent_output", interleaved_enrich
+        )
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "completed",
+                "output": "final answer",
+                "response_id": "pi-peer-response",
+                "sdk_peer_delivery": {"peer_id": record.id, "attempt_id": attempt},
+            },
+        },
+        headers={**PERMISSION_TIERS_HEADERS, RUNNER_TUNNEL_TOKEN_HEADER: token},
+    )
+    assert response.status_code == 202, response.text
+    if advance_at != "none":
+        assert route.forwarded == []
+        assert sessions._session_active_response_cache[route.child_id] == "new-work"
+        return
+    assert len(route.forwarded) == 2
+    for _, body in route.forwarded:
+        if origin != "foreign":
+            assert "peer_turn" not in body["data"]
+            assert "sdk_peer_turn" not in body["data"]
+            continue
+        assert body["data"]["sdk_peer_turn"] is True
+        assert body["data"]["peer_turn"]["sender_session_id"] == sender.id
+        assert body["data"]["peer_turn"]["peer_id"] == record.id
+        assert body["data"]["peer_turn"]["parent_session_id"] == route.parent_id
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cross_host_route", [True], indirect=True)
 async def test_plain_user_turn_drops_a_forged_peer_turn(
