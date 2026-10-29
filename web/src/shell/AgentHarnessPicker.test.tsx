@@ -114,11 +114,15 @@ afterEach(cleanup);
 
 describe("AgentHarnessPicker inline harness list", () => {
   it("keeps the preferred harnesses inline when they are seeded", async () => {
-    renderPicker({ harnessEntries: [claude, codex, pi], effectiveAgentId: claude.id });
+    renderPicker({ harnessEntries: [claude, codex, openCode, pi], effectiveAgentId: claude.id });
     await openPicker();
 
-    // claude + codex are preferred and stay inline; pi stays behind "Other...".
-    expect(inlineHarnessIds([claude.id, codex.id])).toEqual([claude.id, codex.id]);
+    // Ready rows fill three slots; Pi follows the higher-ranked OpenCode row.
+    expect(inlineHarnessIds([claude.id, codex.id, openCode.id])).toEqual([
+      claude.id,
+      codex.id,
+      openCode.id,
+    ]);
     expect(screen.queryByTestId(`new-chat-landing-agent-${pi.id}`)).toBeNull();
     expect(screen.getByTestId("new-chat-landing-harness-more")).toBeInTheDocument();
   });

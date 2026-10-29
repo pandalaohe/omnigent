@@ -19,6 +19,23 @@ import {
 } from "./renderedTextAnchor";
 
 const SEP = "\n";
+const sourceHashes = new WeakMap<SourceMap, string>();
+
+// Distinguish document revisions before trusting a persisted source position.
+function sourceContentHash(map: SourceMap, raw: string): string {
+  const cached = sourceHashes.get(map);
+  if (cached) return cached;
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < raw.length; index++) {
+    const code = raw.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ code, 0x85ebca6b);
+  }
+  const hash = `${raw.length.toString(16)}:${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0).toString(16).padStart(8, "0")}`;
+  sourceHashes.set(map, hash);
+  return hash;
+}
 
 function exactRange(
   starts: number[],
@@ -103,8 +120,9 @@ function mappedRange(
 /**
  * Finds the PM [from, to) range for a saved comment.
  *
- * Typed anchors resolve by exact rendered quote and context. Historical plain
- * text comments retain their raw offset hint.
+ * Typed anchors use verified source positions while the source is unchanged,
+ * then fall back to rendered quote and context. Historical plain text comments
+ * retain their raw offset hint.
  *
  * Returns null when anchor_content is absent or not found in the document.
  */
@@ -128,6 +146,20 @@ export function findPmRangeForComment(
 
   const rendered = decodeRenderedTextAnchor(anchor_content);
   if (isRenderedTextAnchor(anchor_content) && rendered?.kind !== "markdown") return null;
+  if (
+    map &&
+    rendered?.source &&
+    rendered.source.contentHash === sourceContentHash(map, rawContent)
+  ) {
+    const range = mappedRange(
+      doc,
+      map,
+      rendered.source.start_index,
+      rendered.source.end_index,
+      rendered.text,
+    );
+    if (range) return range;
+  }
   const match = rendered ? resolveRenderedTextAnchor(textContent, rendered) : null;
   // Historical plain-text comments retain their old source-position hint.
   const hint =
@@ -148,14 +180,14 @@ export function findPmRangeForComment(
 
 /**
  * Capture the selected text in the rendered ProseMirror document. Numeric
- * offsets are rendered positions for sorting; raw source is never inferred.
+ * offsets are rendered positions for sorting; validated source spans live in the anchor.
  */
 export function computeSelectionData(
   from: number,
   to: number,
   doc: ProseMirrorNode,
-  _rawContent: string,
-  _manager?: MarkdownManager,
+  rawContent: string,
+  manager?: MarkdownManager,
 ): { start_index: number; end_index: number; anchor_content: string } | null {
   const selectedText = doc.textBetween(from, to, SEP);
   if (!selectedText.trim()) return null;
@@ -170,6 +202,26 @@ export function computeSelectionData(
     textFrom + selectedText.length,
   );
   if (!anchor || anchor.text !== selectedText) return null;
+  const map = markdownSourceMap(doc, rawContent, manager);
+  if (map) {
+    const first = map.positions.findIndex((position) => position >= from);
+    const after = map.positions.findIndex((position) => position >= to);
+    const last = (after === -1 ? map.positions.length : after) - 1;
+    if (first !== -1 && last >= first) {
+      const start_index = map.starts[first];
+      const end_index = map.ends[last];
+      const range = mappedRange(doc, map, start_index, end_index, selectedText);
+      if (
+        range &&
+        range.from >= from &&
+        range.to <= to &&
+        !doc.textBetween(from, range.from, SEP) &&
+        !doc.textBetween(range.to, to, SEP)
+      ) {
+        anchor.source = { start_index, end_index, contentHash: sourceContentHash(map, rawContent) };
+      }
+    }
+  }
   const anchor_content = encodeRenderedTextAnchor(anchor);
   if (!anchor_content) return null;
   return { start_index: textFrom, end_index: textFrom + selectedText.length, anchor_content };

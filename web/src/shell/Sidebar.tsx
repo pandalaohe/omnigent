@@ -1766,6 +1766,7 @@ function ProjectFolder({
     name: string,
     conversations: Conversation[],
     instanceKey?: string,
+    loadedConversations?: Conversation[],
   ) => void;
   /** Set on a favorites copy: the section it sits in and its row index. The
       copy is a reorder target (not a project drop target) and disables its
@@ -1883,8 +1884,8 @@ function ProjectFolder({
   // resolves them (the parent sources its action set from these, not the global
   // paginated window), and the visible count for keyboard and range selection.
   useEffect(() => {
-    onConversationsLoaded?.(name, display.rows, folderInstanceKey);
-  }, [name, display.rows, onConversationsLoaded, folderInstanceKey]);
+    onConversationsLoaded?.(name, display.rows, folderInstanceKey, conversations);
+  }, [name, display.rows, onConversationsLoaded, folderInstanceKey, conversations]);
 
   // While the first page loads, show a "Loading…" footer instead of the "No
   // chats" empty state (which would otherwise flash before rows arrive).
@@ -2095,6 +2096,7 @@ function FavoriteProjectCopy({
     name: string,
     conversations: Conversation[],
     instanceKey?: string,
+    loadedConversations?: Conversation[],
   ) => void;
 }) {
   const group = entry.group;
@@ -3420,9 +3422,19 @@ function ConversationList({
   const [folderConversations, setFolderConversations] = useState<Map<string, Conversation[]>>(
     () => new Map(),
   );
+  // Bulk actions retain selected rows even after they move behind Show more.
+  const [folderSelectionConversations, setFolderSelectionConversations] = useState<
+    Map<string, Conversation[]>
+  >(() => new Map());
   const handleFolderConversationsLoaded = useCallback(
-    (name: string, conversations: Conversation[], instanceKey?: string) => {
+    (name: string, conversations: Conversation[], instanceKey?: string, loaded = conversations) => {
       const key = instanceKey === undefined ? name : `${name}#${instanceKey}`;
+      setFolderSelectionConversations((prev) => {
+        const existing = prev.get(key);
+        if (existing?.length === loaded.length && existing.every((c, i) => c === loaded[i]))
+          return prev;
+        return new Map(prev).set(key, loaded);
+      });
       setFolderConversations((prev) => {
         const existing = prev.get(key);
         // Row objects, not ids: Poll reads pending cards and updated_at from
@@ -3709,11 +3721,11 @@ function ConversationList({
     for (const group of sections.projectGroups) {
       for (const c of group.conversations) byId.set(c.id, c);
     }
-    for (const conversations of folderConversations.values()) {
+    for (const conversations of folderSelectionConversations.values()) {
       for (const c of conversations) byId.set(c.id, c);
     }
     return [...byId.values()].filter((c) => !hidePinnedHomeCopies || !pinnedSet.has(c.id));
-  }, [sections.projectGroups, folderConversations, pinnedSet, hidePinnedHomeCopies]);
+  }, [sections.projectGroups, folderSelectionConversations, pinnedSet, hidePinnedHomeCopies]);
 
   // The bulk-action bar lives under the header of the section it targets, so it
   // unmounts when that section empties (e.g. every selected session

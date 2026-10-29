@@ -2333,7 +2333,9 @@ export function AgentHarnessPicker({
             </>
           )}
           {/* Agents group — the pinned Agents (Polly / Debby by default). */}
-          <PickerSectionHeader>Agents</PickerSectionHeader>
+          {(pinnedEntries.length > 0 || hasOtherGroup) && (
+            <PickerSectionHeader>Agents</PickerSectionHeader>
+          )}
           {pinnedEntries.map((agent) => renderEntry(agent, "agent"))}
           {/* Every unpinned Agent folds into "Other..." with the pending upload
             and the create action; the submenu also shows when it would hold

@@ -4,11 +4,12 @@ import type { Comment } from "@/hooks/useComments";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import {
-  computeSelectionData,
+  computeSelectionData as captureSelectionData,
   findPmRangeForComment,
   remapMarkdownComment,
 } from "./TipTapEditorHelpers";
 import { markdownSourceMap } from "./markdownSourceMap";
+import { decodeRenderedTextAnchor } from "./renderedTextAnchor";
 import callTable from "../../../tests/e2e_ui/comments/fixtures/call-table.md?raw";
 import mixedStructures from "../../../tests/e2e_ui/comments/fixtures/mixed-structures.md?raw";
 import escapedPipe from "../../../tests/e2e_ui/comments/fixtures/escaped-pipe.md?raw";
@@ -37,6 +38,18 @@ function paragraphs(...texts: string[]) {
 }
 function legacySelection(from: number, to: number, doc: ReturnType<typeof parse>, raw: string) {
   return computeSelectionData(from, to, doc, raw);
+}
+// Source spans now travel inside the typed anchor alongside rendered context.
+function computeSelectionData(...args: Parameters<typeof captureSelectionData>) {
+  const captured = captureSelectionData(...args);
+  const anchor = decodeRenderedTextAnchor(captured?.anchor_content);
+  return anchor?.source
+    ? {
+        start_index: anchor.source.start_index,
+        end_index: anchor.source.end_index,
+        anchor_content: anchor.text,
+      }
+    : captured;
 }
 const link = `[Details](https://example.com/${"x".repeat(2000)})`;
 // Brackets identify the expected raw range independently of the implementation.
@@ -133,6 +146,43 @@ const cases: [string, string, number, string?][] = [
 ];
 
 describe("validated Markdown source positions", () => {
+  it("captures exact source positions and rendered context in one restorable anchor", () => {
+    const raw = "word wo**rd** word";
+    const doc = parse(raw);
+    const captured = captureSelectionData(6, 10, doc, raw, editor.markdown)!;
+    expect(decodeRenderedTextAnchor(captured.anchor_content)).toMatchObject({
+      kind: "markdown",
+      text: "word",
+      occ: 1,
+      source: { start_index: 5, end_index: 11 },
+    });
+    expect(findPmRangeForComment(doc, captured as Comment, raw, editor.markdown)).toEqual({
+      from: 6,
+      to: 10,
+    });
+  });
+  it("restores a typed source anchor with repeated identical rendered context", () => {
+    const repeated = `${"a".repeat(40)} word ${"b".repeat(40)}`;
+    const raw = `${repeated}\n\n${repeated}`;
+    const doc = parse(raw);
+    const ranges: { from: number; to: number }[] = [];
+    doc.descendants((node, position) => {
+      if (!node.isText || !node.text) return;
+      const index = node.text.indexOf("word");
+      if (index >= 0) ranges.push({ from: position + index, to: position + index + 4 });
+    });
+    const selected = ranges[1];
+    const captured = captureSelectionData(selected.from, selected.to, doc, raw, editor.markdown)!;
+    expect(findPmRangeForComment(doc, captured as Comment, raw, editor.markdown)).toEqual(selected);
+
+    // A later edit must not let an old offset select a different identical copy.
+    for (const changedRaw of [`c${raw.slice(1)}`, `${repeated}\n\n${raw}`]) {
+      const changed = parse(changedRaw);
+      expect(
+        findPmRangeForComment(changed, captured as Comment, changedRaw, editor.markdown),
+      ).toBeNull();
+    }
+  });
   it.each<[string, number, number, number, number, string]>([
     ["alpha\r\nbeta", 1, 7, 0, 7, "alpha\n"],
     ["> alpha\r\n> beta", 2, 8, 2, 9, "alpha\n"],
@@ -227,6 +277,11 @@ describe("validated Markdown source positions", () => {
         sourceCursor = start_index + phrase.length;
         const anchor = { start_index, end_index: sourceCursor, anchor_content: phrase };
         expect(computeSelectionData(from, to, doc, raw, editor.markdown)).toEqual(anchor);
+        const typed = captureSelectionData(from, to, doc, raw, editor.markdown)!;
+        expect(findPmRangeForComment(doc, typed as Comment, raw, editor.markdown)).toEqual({
+          from,
+          to,
+        });
         expect(findPmRangeForComment(doc, anchor as Comment, raw, editor.markdown)).toEqual({
           from,
           to,
@@ -264,6 +319,11 @@ describe("validated Markdown source positions", () => {
         end_index,
         anchor_content: word,
       });
+      const typed = captureSelectionData(from, to, doc, raw, editor.markdown)!;
+      expect(findPmRangeForComment(doc, typed as Comment, raw, editor.markdown)).toEqual({
+        from,
+        to,
+      });
       expect(
         findPmRangeForComment(
           doc,
@@ -294,10 +354,10 @@ describe("validated Markdown source positions", () => {
     } as Comment;
 
     expect(doc.textBetween(selectedOccurrence.from, selectedOccurrence.to)).toBe("word");
-    expect(legacySelection(selectedOccurrence.from, selectedOccurrence.to, doc, raw)).toEqual(
-      legacyComment,
-    );
-    expect(findPmRangeForComment(doc, legacyComment, raw)).toEqual({ from: 0, to: 5 });
+    const captured = legacySelection(selectedOccurrence.from, selectedOccurrence.to, doc, raw);
+    expect(decodeRenderedTextAnchor(captured?.anchor_content)?.text).toBe("word");
+    expect(findPmRangeForComment(doc, captured as Comment, raw)).toEqual(selectedOccurrence);
+    expect(findPmRangeForComment(doc, legacyComment, raw)).toEqual({ from: 1, to: 5 });
 
     expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
     expect(findPmRangeForComment(doc, legacyComment, raw, editor.markdown)).toEqual({

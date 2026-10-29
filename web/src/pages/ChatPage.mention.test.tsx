@@ -11,6 +11,10 @@ import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  resetShortcutPreference,
+  writeShortcutPreference,
+} from "@/lib/keyboardShortcutPreferences";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
 // Drill-down "@"-mention browses one directory at a time, so the test stubs
@@ -256,6 +260,8 @@ describe("Composer @-file-mention browser (native sessions)", () => {
   });
 
   it("gives Shift+Tab to the open menu before the permission-mode shortcut", async () => {
+    writeShortcutPreference("applySuggestion", { common: [{ code: "Tab", modifiers: ["shift"] }] });
+    onTestFinished(() => resetShortcutPreference("applySuggestion"));
     const { setClaudePermissionMode } = useChatStore.getState();
     // Zustand copies the spy into later states, so put the real setter back.
     onTestFinished(() =>

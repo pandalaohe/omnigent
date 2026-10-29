@@ -13,6 +13,7 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createRef, type ComponentRef, type ReactElement } from "react";
@@ -38,6 +39,10 @@ vi.mock("@/hooks/usePullRequests", () => ({
 // The archived-comments banner reads session comments via a TanStack query
 // hook; stub it so bare Composer renders don't need a QueryClientProvider.
 vi.mock("@/hooks/useComments", () => ({ useComments: () => ({ data: [] }) }));
+vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHarnessInventoryModule>()),
+  useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: () => ({
     branch: null,

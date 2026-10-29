@@ -1,27 +1,27 @@
 import type { NativeModelOption } from "./types";
-import { nativeCodingAgentForHarness } from "./nativeCodingAgents";
-import { codexEffortLevelsForModel } from "./codexNativeModels";
+import { nativeCodingAgentForHarness, nativeCodingAgentForWrapper } from "./nativeCodingAgents";
 import { findModelLabelOption } from "./composerModelLabel";
-import { effortLevelsForFamily, supportsEffortControl } from "./sessionCapabilities";
+import {
+  effortLevelsForFamily,
+  isSdkHarnessSession,
+  supportsEffortControl,
+} from "./sessionCapabilities";
+import { effortLevelsFor } from "./modelEffortOptions";
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 
-/** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
-const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-
-/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
-const PI_NATIVE_EFFORT_LEVELS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-
 export type NativeModelPickerKind =
-  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "kiro"
+  | "opencode"
+  | "pi"
+  | "devin"
+  | "antigravity"
+  | "acp"
+  | "configured"
+  | "sdk";
 
 /** Preserve inherited effort; clear an explicit choice that the new model cannot use. */
 export function effortAfterModelChange(
@@ -52,6 +52,7 @@ function effectiveWrapperLabel(
         labels?: Record<string, string | null> | null;
         harness?: string | null;
         parentSessionId?: string | null;
+        inferenceConfigured?: boolean;
       }
     | null
     | undefined,
@@ -76,6 +77,7 @@ export function effortLevelsForConv(
         labels?: Record<string, string | null> | null;
         harness?: string | null;
         parentSessionId?: string | null;
+        inferenceConfigured?: boolean;
       }
     | null
     | undefined,
@@ -83,20 +85,16 @@ export function effortLevelsForConv(
   currentModel: string | null = null,
   effortFamily: string | null = null,
 ): readonly string[] {
-  switch (effectiveWrapperLabel(conv)) {
-    case "claude-code-native-ui":
-      return CLAUDE_NATIVE_EFFORT_LEVELS;
-    case "devin-native-ui":
-    case "codex-native-ui":
-      // Both catalogs declare effort per model; Devin encodes it as a model variant.
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
-    case "pi-native-ui":
-      return PI_NATIVE_EFFORT_LEVELS;
-    default:
-      // A non-native harness offers its declared family's ladder (claude-sdk →
-      // anthropic, codex → openai); with no family the shared default holds.
-      return effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS;
-  }
+  if (isSdkHarnessSession(conv) && effortFamily) return effortLevelsForFamily(effortFamily);
+  const harness =
+    nativeCodingAgentForWrapper(effectiveWrapperLabel(conv))?.harness ??
+    (isSdkHarnessSession(conv) || conv?.harness === "acp" || conv?.harness?.startsWith("acp:")
+      ? conv?.harness
+      : null);
+  return (
+    effortLevelsFor(harness, codexModelOptions, currentModel) ??
+    (effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS)
+  );
 }
 
 /**
@@ -135,15 +133,21 @@ export function modelPickerKindForConv(
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "antigravity-native-ui":
+      return "antigravity";
     case "devin-native-ui":
       // Like opencode/pi: Devin mirrors its live model into ``model_override``
       // (the executor types ``/model`` when a routed model changes).
       return "devin";
     case "pi-native-ui":
-      // Pi applies switches through setModel and mirrors /model picks to model_override.
+      // Like cursor: the runner types a model switch into the live Pi process
+      // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
+      // ``/model`` picks back to ``model_override`` via the extension's
+      // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
       if (conv?.inferenceConfigured) return "configured";
+      if (isSdkHarnessSession(conv)) return "sdk";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes
       // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
       if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
@@ -177,11 +181,16 @@ export function shouldShowEffortPicker(
     | {
         labels?: Record<string, string | null> | null;
         harness?: string | null;
+        inferenceConfigured?: boolean;
         parentSessionId?: string | null;
       }
     | null
     | undefined,
   effortFamily: string | null = null,
+  models?: readonly NativeModelOption[],
 ): boolean {
-  return supportsEffortControl(conv, effortFamily);
+  if (isSdkHarnessSession(conv)) {
+    return conv?.parentSessionId == null && effortLevelsForFamily(effortFamily).length > 0;
+  }
+  return supportsEffortControl(conv, effortFamily, models);
 }

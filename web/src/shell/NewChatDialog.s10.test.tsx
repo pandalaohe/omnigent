@@ -69,6 +69,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 const TEMP_ID = "temp:1234567890abcdef1234567890abcdef";
 
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ pathname: "/new", search: "", state: null }),
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));

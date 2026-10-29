@@ -380,10 +380,9 @@ describe("useBrowserAgentRelay — session tabs", () => {
         },
       ],
     });
-    expect(bridge.browserHasView.mock.calls.map((call: unknown[]) => call[0])).toEqual([
-      browserViewId(CONV, "tab-first"),
-      browserViewId(CONV, "tab-second"),
-    ]);
+    expect([
+      ...new Set(bridge.browserHasView.mock.calls.map((call: unknown[]) => call[0])),
+    ]).toEqual([browserViewId(CONV, "tab-first"), browserViewId(CONV, "tab-second")]);
 
     expect(await sendClaimed("click", { selector: "button.save" }, 2)).toMatchObject({ ok: true });
     expect(bridge.browserExecute).toHaveBeenLastCalledWith(

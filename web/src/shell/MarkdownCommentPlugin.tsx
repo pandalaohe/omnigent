@@ -87,7 +87,12 @@ export function MarkdownCommentPlugin({
             .filter(
               (comment) =>
                 isRenderedTextAnchor(comment.anchor_content) &&
-                !findPmRangeForComment(editor.state.doc, comment, contentRef.current),
+                !findPmRangeForComment(
+                  editor.state.doc,
+                  comment,
+                  contentRef.current,
+                  editor.markdown,
+                ),
             )
             .map((comment) => comment.id),
         ),
