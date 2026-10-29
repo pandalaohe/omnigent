@@ -134,6 +134,30 @@ async def test_successor_is_stable_and_copies_only_configuration(
     assert PERMISSION_CAPABILITY_LABEL_KEY not in target.labels
 
 
+@pytest.mark.parametrize("tier", ["ask", "plan", "full"])
+async def test_agy_successor_carries_tier_and_bridge_without_runtime_authority(
+    app: FastAPI, store: SqlAlchemyConversationStore, tier: PermissionTier
+) -> None:
+    source = _source(store, harness="antigravity-native", tier=tier)
+    store.set_labels(source, {"omnigent.antigravity_native.bridge_id": "agy-bridge"})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.post(f"/v1/sessions/{source}/successor")
+        again = await client.post(f"/v1/sessions/{source}/successor")
+    assert first.status_code == 200, first.text
+    assert again.json() == first.json()
+    target = store.get_conversation(first.json()["id"])
+    assert target is not None
+    assert target.labels["omnigent.antigravity_native.bridge_id"] == "agy-bridge"
+    assert (
+        ConfirmedPermissionState(tier, 1, "blocked").labels("antigravity-native").items()
+        <= target.labels.items()
+    )
+    assert PERMISSION_CAPABILITY_LABEL_KEY not in target.labels
+    assert HANDOVER_ITEM_LABEL_KEY not in target.labels
+
+
 @pytest.mark.parametrize("deleted_project", [False, True])
 @pytest.mark.parametrize("title", ["Saved name", None])
 @pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi", "pi-native"])

@@ -4166,8 +4166,12 @@ def _rotation_client(
         calls.append((request.method, request.url.path, body))
         if request.method == "GET":
             return httpx.Response(200, json=snapshot)
-        if request.method == "POST" and request.url.path == "/v1/sessions":
+        if request.method == "POST" and (
+            request.url.path == "/v1/sessions" or request.url.path.endswith("/successor")
+        ):
             return httpx.Response(200, json={"id": new_session_id})
+        if request.url.path.endswith("/succession"):
+            return httpx.Response(200, json={"status": "done"})
         return httpx.Response(200, json={"id": "terminal_antigravity_main"})
 
     return httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
@@ -4178,17 +4182,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_rotate_session_for_cascade`` runs claude's exact session-rotation sequence.
-
-    Asserts: GET old snapshot → POST /v1/sessions (agent_id + inherited labels) →
-    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" — and that
-    bridge state is rewritten with the new session id + new cascade id. Crucially,
-    NO ``external_session_id`` PATCH is made: agy is one long-lived process hosting
-    many cascades, so the new cascade is already live (reached via the rewritten
-    bridge state, not a later ``--resume``), exactly as claude's
-    ``_create_clear_replacement_session`` makes no such PATCH. The old code PATCHed
-    it, which 400'd on the auto-cold-started session and looped the rotation.
-    """
+    """A TUI rotation transfers its terminal and enters durable succession."""
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
         read_bridge_state,
@@ -4211,36 +4205,28 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         )
 
     assert new_session_id == "conv_new"
-    # The exact ordered API sequence (method, path) mirroring claude rotation —
-    # ONE PATCH on the new session (runner_id bind), then transfer, then release.
     methods_paths = [(m, p) for (m, p, _b) in calls]
     assert methods_paths == [
         ("GET", f"/v1/sessions/{_SESSION_ID}"),
-        ("POST", "/v1/sessions"),
+        ("POST", f"/v1/sessions/{_SESSION_ID}/successor"),
         ("PATCH", "/v1/sessions/conv_new"),  # runner_id bind
         (
             "POST",
             f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
         ),
-        ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
+        ("POST", f"/v1/sessions/{_SESSION_ID}/succession"),
     ]
     # No external_session_id PATCH is made anywhere (the loop-bug source): every
     # PATCH body is a runner_id bind/release, never an external_session_id write.
     assert all("external_session_id" not in body for (_m, _p, body) in calls), (
         f"rotation must not PATCH external_session_id (claude parity); calls={calls!r}"
     )
-    # The create POST inherited the old agent_id + bridge-id label (so the new
-    # session resolves to the same bridge_dir).
-    create_body = calls[1][2]
-    assert create_body["agent_id"] == "agent_xyz"
-    assert isinstance(create_body["labels"], dict)
-    assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
+    assert calls[1][2] == {}  # server owns configuration and permission carry
     # The runner_id bind carried the old runner; the new session is owned by it.
     assert calls[2][2] == {"runner_id": "runner_abc"}
     # The terminal transfer targeted the new session (the SAME agy moves over).
     assert calls[3][2] == {"target_session_id": "conv_new"}
-    # Old runner released.
-    assert calls[4][2] == {"runner_id": ""}
+    assert calls[4][2] == {"target_session_id": "conv_new", "allow_empty": True}
     # Bridge state was rewritten to the new session + new cascade (the reader
     # rebinds to the new cascade on the SAME agy via this shared bridge_dir).
     state = read_bridge_state(bridge_dir)
@@ -4289,6 +4275,346 @@ async def test_rotate_session_for_cascade_returns_none_on_create_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["unique", "none", "ambiguous", "unreadable"])
+async def test_explicit_clear_confirms_only_one_new_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from omnigent.harnesses.antigravity_native import bridge, rpc
+
+    bridge_dir = _bridge_dir(tmp_path)
+    before = {_CASCADE_ID: _summary(), "stale": _summary()}
+    after = dict(before)
+    if outcome != "none":
+        after["new-root"] = _summary()
+        after["child"] = {**_summary(), "trajectoryMetadata": {"parentConversationId": "new-root"}}
+        after["agy_conv_placeholder"] = _summary()
+    if outcome == "ambiguous":
+        after["another-root"] = _summary()
+    injected: list[str] = []
+
+    def summaries(port: int) -> dict[str, Any]:
+        assert port == 54321
+        if outcome == "unreadable":
+            return {}
+        return {"trajectorySummaries": after if injected else before}
+
+    monkeypatch.setattr(rpc, "resolve_language_server_port", lambda _id: 54321)
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", summaries)
+
+    def inject(_dir: Path, *, content: str, before_submit: Any, **_kw: Any) -> None:
+        before_submit()
+        injected.append(content)
+
+    monkeypatch.setattr(bridge, "inject_user_message_via_tui", inject)
+    calls: list[tuple[str, str, dict[str, object]]] = []
+    async with _rotation_client(
+        monkeypatch, calls=calls, snapshot={"agent_id": "agent_xyz", "runner_id": "runner_abc"}
+    ) as client:
+        if outcome == "unique":
+            assert (
+                await reader.clear_session(
+                    client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+                )
+                == "conv_new"
+            )
+            assert any(path.endswith("/succession") for _, path, _ in calls)
+        else:
+            reason = {"none": "no_new_root", "ambiguous": "ambiguous", "unreadable": "unreadable"}[
+                outcome
+            ]
+            with pytest.raises(RuntimeError, match=f"clear_{reason}"):
+                await reader.clear_session(
+                    client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+                )
+            with pytest.raises(RuntimeError, match=f"clear_{reason}"):
+                await reader.clear_session(
+                    client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+                )
+            assert not any(path.endswith("/successor") for _, path, _ in calls)
+    assert injected == ([] if outcome == "unreadable" else ["/clear"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["binding", "succession", "state_write"])
+async def test_explicit_clear_retry_resumes_without_clearing_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from omnigent.harnesses.antigravity_native import bridge, rpc
+
+    bridge_dir = _bridge_dir(tmp_path)
+    injected: list[str] = []
+    moved = False
+    failed = False
+    targets: list[str] = []
+    monkeypatch.setattr(rpc, "resolve_language_server_port", lambda _id: 54321)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {
+                _CASCADE_ID: _summary(),
+                **({"new-root": _summary()} if injected else {}),
+            }
+        },
+    )
+
+    def inject(_dir: Path, *, content: str, before_submit: Any, **_kw: Any) -> None:
+        before_submit()
+        injected.append(content)
+
+    monkeypatch.setattr(bridge, "inject_user_message_via_tui", inject)
+    real_write = reader.write_bridge_state
+
+    def write_state(*args: Any, **kwargs: Any) -> None:
+        nonlocal failed
+        if failure == "state_write" and not failed:
+            failed = True
+            raise OSError("simulated state write failure")
+        real_write(*args, **kwargs)
+
+    monkeypatch.setattr(reader, "write_bridge_state", write_state)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal moved, failed
+        if request.method == "GET":
+            if "/resources/terminals/" in request.url.path:
+                return httpx.Response(
+                    200, json={"id": "terminal_antigravity_main", "metadata": {"running": moved}}
+                )
+            return httpx.Response(200, json={"runner_id": "runner_abc", "agent_id": "agent_xyz"})
+        if request.url.path.endswith("/successor"):
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "PATCH" and failure == "binding" and not failed:
+            failed = True
+            return httpx.Response(503)
+        if request.url.path.endswith("/transfer"):
+            if moved:
+                return httpx.Response(404)
+            moved = True
+        if request.url.path.endswith("/succession"):
+            targets.append(json.loads(request.content)["target_session_id"])
+            if failure == "succession" and not failed:
+                failed = True
+                return httpx.Response(200, json={"status": "pending"})
+            return httpx.Response(200, json={"status": "done"})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises((reader.AntigravityClearError, OSError)):
+            await reader.clear_session(
+                client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+            )
+        for _ in range(2):
+            assert (
+                await reader.clear_session(
+                    client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+                )
+                == "conv_new"
+            )
+    assert injected == ["/clear"]
+    assert set(targets) == {"conv_new"}
+    assert read_bridge_state(bridge_dir).session_id == "conv_new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted", [False, True])
+async def test_explicit_clear_retries_only_before_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, submitted: bool
+) -> None:
+    from omnigent.harnesses.antigravity_native import bridge, rpc
+
+    bridge_dir = _bridge_dir(tmp_path)
+    attempts = 0
+    accepted = False
+
+    def inject(_dir: Path, *, before_submit: Any, **_kwargs: Any) -> None:
+        nonlocal attempts, accepted
+        attempts += 1
+        if submitted or attempts > 1:
+            before_submit()
+        if attempts == 1:
+            raise RuntimeError("simulated injection failure")
+        accepted = True
+
+    monkeypatch.setattr(bridge, "inject_user_message_via_tui", inject)
+    monkeypatch.setattr(rpc, "resolve_language_server_port", lambda _id: 54321)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {
+                _CASCADE_ID: _summary(),
+                **({"new-root": _summary()} if accepted else {}),
+            }
+        },
+    )
+    async with _rotation_client(
+        monkeypatch, calls=[], snapshot={"runner_id": "runner_abc"}
+    ) as client:
+        with pytest.raises(RuntimeError, match="simulated injection"):
+            await reader.clear_session(
+                client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+            )
+        if submitted:
+            with pytest.raises(reader.AntigravityClearError, match="clear_no_new_root"):
+                await reader.clear_session(
+                    client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+                )
+        else:
+            assert (
+                await reader.clear_session(
+                    client=client, old_session_id=_SESSION_ID, bridge_dir=bridge_dir, timeout_s=0
+                )
+                == "conv_new"
+            )
+    assert attempts == (1 if submitted else 2)
+
+
+@pytest.mark.asyncio
+async def test_successor_clear_refreshes_binding_after_predecessor_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.antigravity_native import bridge, rpc
+
+    bridge_dir = _bridge_dir(tmp_path)
+    (bridge_dir / "clear-request.json").write_text(
+        json.dumps(
+            {
+                "source": _SESSION_ID,
+                "cascade": "root-b",
+                "successor": "conv_b",
+            }
+        )
+    )
+    injected: list[str] = []
+    discovered: list[str] = []
+    transfers: list[tuple[str, str]] = []
+
+    def discover(cascade: str) -> int:
+        discovered.append(cascade)
+        return 54321
+
+    def inject(_dir: Path, *, content: str, before_submit: Any, **_kwargs: Any) -> None:
+        before_submit()
+        injected.append(content)
+
+    monkeypatch.setattr(rpc, "resolve_language_server_port", discover)
+    monkeypatch.setattr(bridge, "inject_user_message_via_tui", inject)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {
+                _CASCADE_ID: _summary(),
+                "root-b": _summary(),
+                **({"root-c": _summary()} if injected else {}),
+            }
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"runner_id": "runner_abc"})
+        if request.url.path.endswith("/successor"):
+            return httpx.Response(
+                200, json={"id": "conv_c" if "/conv_b/" in request.url.path else "conv_b"}
+            )
+        if request.url.path.endswith("/transfer"):
+            transfers.append(
+                (request.url.path.split("/")[3], json.loads(request.content)["target_session_id"])
+            )
+        return httpx.Response(200, json={"status": "done"})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        successor = await reader.clear_session(
+            client=client, old_session_id="conv_b", bridge_dir=bridge_dir, timeout_s=0
+        )
+    assert successor == "conv_c"
+    assert injected == ["/clear"]
+    assert discovered == ["root-b"]
+    assert transfers == [(_SESSION_ID, "conv_b"), ("conv_b", "conv_c")]
+    state = read_bridge_state(bridge_dir)
+    assert state is not None and state.session_id == "conv_c" and state.conversation_id == "root-c"
+
+
+@pytest.mark.asyncio
+async def test_reader_resumes_tui_succession_before_rebinding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _bridge_dir(tmp_path)
+    attempts: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"runner_id": "runner_abc"})
+        if request.url.path.endswith("/successor"):
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.url.path.endswith("/succession"):
+            attempts.append(json.loads(request.content))
+            if len(attempts) == 1:
+                raise httpx.ConnectError("request never reached the server")
+            return httpx.Response(200, json={"status": "done"})
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    sessions: list[str] = []
+
+    async def supervise(
+        _dir: Path, session_id: str, *, committed_steps_out: list[int], **_kw: Any
+    ) -> str | None:
+        sessions.append(session_id)
+        committed_steps_out.append(2)
+        return "new-root" if len(sessions) == 1 else None
+
+    @contextlib.asynccontextmanager
+    async def open_client(*_args: Any, **_kwargs: Any) -> AsyncIterator[httpx.AsyncClient]:
+        async with httpx.AsyncClient(base_url="http://test", transport=transport) as client:
+            yield client
+
+    monkeypatch.setattr(reader, "supervise_reader", supervise)
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_client)
+    await reader.run_reader_with_bridge(
+        base_url="http://test",
+        headers={},
+        auth=None,
+        session_id=_SESSION_ID,
+        bridge_dir=bridge_dir,
+    )
+    assert attempts == [{"target_session_id": "conv_new", "allow_empty": True}] * 2
+    assert sessions == [_SESSION_ID, "conv_new"]
+    assert json.loads((bridge_dir / "clear-request.json").read_text())["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_rotation_watcher_follows_confirmed_empty_cascade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _bridge_dir(tmp_path)
+    write_bridge_state(
+        bridge_dir, AntigravityNativeBridgeState(session_id="conv_new", conversation_id="new-root")
+    )
+
+    async def no_sleep(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(reader, "_sleep", no_sleep)
+    observed: list[str] = []
+    await reader._watch_for_rotation(
+        port=54321,
+        bound_cascade_id=_CASCADE_ID,
+        interval_s=0,
+        skip_cascade_ids=frozenset(),
+        on_rotation=observed.append,
+        bridge_dir=bridge_dir,
+    )
+    assert observed == ["new-root"]
+
+
+@pytest.mark.asyncio
 async def test_run_reader_with_bridge_rebinds_after_rotation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4333,6 +4659,10 @@ async def test_run_reader_with_bridge_rebinds_after_rotation(
         bridge_dir: Path,
     ) -> str | None:
         rotate_calls.append((old_session_id, new_cascade_id))
+        write_bridge_state(
+            bridge_dir,
+            AntigravityNativeBridgeState(session_id=new_session, conversation_id=new_cascade_id),
+        )
         return new_session
 
     monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)

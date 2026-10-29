@@ -55,7 +55,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -65,7 +67,6 @@ import httpx
 
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
-    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
     is_placeholder_conversation_id,
     read_bridge_state,
@@ -102,6 +103,7 @@ from omnigent.harnesses.antigravity_native.steps import (
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.native._native_post_delivery import post_session_event_with_retry
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+from omnigent.util.atomic_json import atomic_write_json
 
 _logger = logging.getLogger(__name__)
 
@@ -847,6 +849,7 @@ async def _watch_for_rotation(
     skip_cascade_ids: frozenset[str],
     on_rotation: Callable[[str], None],
     on_quiescent: Callable[[], Awaitable[None]] | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Poll ``GetAllCascadeTrajectories`` for a ``/clear`` rotation, then signal once.
@@ -894,6 +897,11 @@ async def _watch_for_rotation(
     idle_ticks = 0
     while True:
         await _sleep(interval_s)
+        if bridge_dir is not None:
+            binding = read_bridge_state(bridge_dir)
+            if binding is not None and binding.conversation_id != bound_cascade_id:
+                on_rotation(binding.conversation_id)
+                return
         try:
             body = await asyncio.to_thread(get_all_cascade_trajectories, port)
         except httpx.ConnectError as exc:
@@ -1143,6 +1151,7 @@ async def supervise_reader(
             skip_cascade_ids=skip_cascade_ids,
             on_rotation=_on_rotation,
             on_quiescent=_close_turn_if_stranded,
+            bridge_dir=bridge_dir,
         ),
         name="antigravity-rotation-detector",
     )
@@ -2925,33 +2934,9 @@ async def _request_agy_elicitation(
         return None
 
 
-# ── Task T-G: /clear-rotation session rotation ───────────────────────────────
-#
-# A TUI ``/clear`` mints a NEW agy root cascade ON THE SAME live agy process and
-# leaves the bound one idle. The reader detects it via ``GetAllCascadeTrajectories``
-# (see :func:`_detect_rotated_cascade`) and then must move Omnigent ownership onto a
-# fresh conversation bound to the NEW cascade — otherwise web turns keep targeting
-# the old (now-dead) conversation and streaming appears to end. This mirrors the
-# claude forwarder's ``_create_clear_replacement_session`` session-rotation
-# sequence: agy, like claude, is a SINGLE long-lived process hosting many cascades,
-# so the rotation TRANSFERS the existing terminal onto the replacement session
-# (it does NOT re-spawn agy) and inherits the OLD session's bridge-id label (so the
-# replacement resolves to the SAME ``bridge_dir`` the reader is already using — agy's
-# bridge_dir is keyed off the launcher's bridge-id, not the session id), then
-# rewrites bridge state with the new conversation id so the reader rebinds.
-#
-# THE LOOP BUG this fixes (found by live e2e): the prior implementation also PATCHed
-# the replacement session's ``external_session_id=new_cascade``. But POST
-# /v1/sessions for an antigravity-native session makes the runner auto-cold-start a
-# brand-new agy (``_auto_create_antigravity_terminal`` fired for EVERY such session),
-# which minted its OWN cascade AND set the new session's external_session_id; the
-# rotation's external_session_id PATCH then hit that already-set, set-once-immutable
-# field → 400 → rotation aborted, but the cold-start had already rebound the reader
-# to its fresh cascade → the detector re-fired → an infinite session-spawn loop. The
-# fix: drop the external_session_id PATCH entirely (claude never does it) AND gate
-# the runner's antigravity auto-create on an inbound-transfer check (mirroring
-# claude's ``_terminal_inbound`` guard) so the cold-start is skipped for a rotation
-# target and the existing agy is transferred instead.
+# A clear keeps the same agy process and bridge. Bind the prepared successor
+# while bridge state still names the source, so terminal initialization detects
+# the incoming transfer instead of launching a second agy process.
 
 # Deterministic agy terminal resource id (matches
 # ``antigravity_native._TERMINAL_NAME`` / ``_TERMINAL_SESSION_KEY``). Single
@@ -2966,10 +2951,8 @@ async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) ->
     """
     Fetch an Omnigent session snapshot for agy ``/clear`` rotation.
 
-    Mirrors :func:`omnigent.harnesses.codex_native.forwarder._fetch_session_snapshot`: the
-    rotation needs the old session's ``agent_id`` (required to create the
-    replacement), ``runner_id`` (to re-bind it to the same runner), and ``labels``
-    (to inherit the bridge-id so the new session resolves to the same bridge_dir).
+    The server owns successor configuration; the reader needs source lifecycle
+    state and its runner binding before it transfers the terminal.
 
     :param client: Omnigent HTTP client (the reader's client).
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
@@ -3070,6 +3053,160 @@ async def _record_external_session_id(
         )
 
 
+_rotation_locks: weakref.WeakValueDictionary[Path, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+class AntigravityClearError(RuntimeError):
+    """A fixed, non-secret reason that can be shown in the session transcript."""
+
+
+def _rotation_lock(bridge_dir: Path) -> asyncio.Lock:
+    key = bridge_dir.resolve()
+    lock = _rotation_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _rotation_locks[key] = lock
+    return lock
+
+
+def _root_cascade_ids(body: dict[str, object]) -> set[str]:
+    summaries = body.get("trajectorySummaries")
+    if not isinstance(summaries, dict) or any(
+        not isinstance(summary, dict) for summary in summaries.values()
+    ):
+        raise AntigravityClearError("clear_unreadable: agy root summaries are unreadable")
+    return {
+        cascade_id
+        for cascade_id, summary in summaries.items()
+        if summary.get("trajectoryType") == _TRAJECTORY_TYPE_CASCADE
+        and not _summary_is_child_trajectory(cascade_id, summary)
+        and not is_placeholder_conversation_id(cascade_id)
+    }
+
+
+def _read_clear_request(bridge_dir: Path) -> dict[str, object]:
+    path = bridge_dir / "clear-request.json"
+    pending = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if not isinstance(pending, dict):
+        raise AntigravityClearError("clear_unreadable: clear request is malformed")
+    return pending
+
+
+async def clear_session(
+    *,
+    client: httpx.AsyncClient,
+    old_session_id: str,
+    bridge_dir: Path,
+    timeout_s: float = 5.0,
+) -> str:
+    """Confirm an explicit clear on the owned RPC port before handing over."""
+    from omnigent.harnesses.antigravity_native.bridge import inject_user_message_via_tui
+    from omnigent.harnesses.antigravity_native.rpc import resolve_language_server_port
+
+    async with _rotation_lock(bridge_dir):
+        binding = read_bridge_state(bridge_dir)
+        if binding is None or is_placeholder_conversation_id(binding.conversation_id):
+            raise AntigravityClearError("clear_unreadable: agy has no owned cascade binding")
+        pending = _read_clear_request(bridge_dir)
+        pending_source, pending_cascade = pending.get("source"), pending.get("cascade")
+        if (
+            pending.get("successor")
+            and not pending.get("done")
+            and isinstance(pending_source, str)
+            and isinstance(pending_cascade, str)
+            and pending_source != old_session_id
+        ):
+            await _complete_cascade_rotation(
+                client=client,
+                old_session_id=pending_source,
+                new_cascade_id=pending_cascade,
+                bridge_dir=bridge_dir,
+            )
+            binding = read_bridge_state(bridge_dir)
+            if binding is None or is_placeholder_conversation_id(binding.conversation_id):
+                raise AntigravityClearError("clear_unreadable: agy binding lost during recovery")
+        # A retry after transfer resumes succession without clearing the new mother.
+        if binding.session_id != old_session_id:
+            return await _complete_cascade_rotation(
+                client=client,
+                old_session_id=old_session_id,
+                new_cascade_id=binding.conversation_id,
+                bridge_dir=bridge_dir,
+            )
+        source = await _fetch_session_snapshot(client, old_session_id)
+        if source.get("parent_session_id") or source.get("archived"):
+            raise AntigravityClearError(
+                "clear_refused: only a live top-level agy session can clear"
+            )
+        port = await asyncio.to_thread(resolve_language_server_port, binding.conversation_id)
+        if port is None:
+            raise AntigravityClearError("clear_unreadable: agy owned RPC port is unavailable")
+        try:
+            request_path = bridge_dir / "clear-request.json"
+            pending = _read_clear_request(bridge_dir)
+            if pending.get("source") == old_session_id:
+                confirmed = pending.get("cascade")
+                if isinstance(confirmed, str) and confirmed:
+                    return await _complete_cascade_rotation(
+                        client=client,
+                        old_session_id=old_session_id,
+                        new_cascade_id=confirmed,
+                        bridge_dir=bridge_dir,
+                    )
+                roots = pending.get("roots")
+                if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
+                    raise AntigravityClearError(
+                        "clear_unreadable: clear root snapshot is malformed"
+                    )
+                before = set(roots)
+            else:
+                before = _root_cascade_ids(
+                    await asyncio.to_thread(get_all_cascade_trajectories, port)
+                )
+                if binding.conversation_id not in before:
+                    raise AntigravityClearError(
+                        "clear_unreadable: owned cascade is absent from agy roots"
+                    )
+                await asyncio.to_thread(
+                    inject_user_message_via_tui,
+                    bridge_dir,
+                    content="/clear",
+                    timeout_s=5.0,
+                    before_submit=lambda: atomic_write_json(
+                        request_path, {"source": old_session_id, "roots": sorted(before)}
+                    ),
+                )
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            while True:
+                after = _root_cascade_ids(
+                    await asyncio.to_thread(get_all_cascade_trajectories, port)
+                )
+                if binding.conversation_id not in after:
+                    raise AntigravityClearError("clear_unreadable: agy owned cascade disappeared")
+                candidates = after - before
+                if len(candidates) > 1:
+                    raise AntigravityClearError("clear_ambiguous: multiple new agy roots appeared")
+                if candidates:
+                    candidate = candidates.pop()
+                    atomic_write_json(
+                        request_path,
+                        {"source": old_session_id, "roots": sorted(before), "cascade": candidate},
+                    )
+                    return await _complete_cascade_rotation(
+                        client=client,
+                        old_session_id=old_session_id,
+                        new_cascade_id=candidate,
+                        bridge_dir=bridge_dir,
+                    )
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AntigravityClearError(
+                        "clear_no_new_root: no new agy root appeared after /clear"
+                    )
+                await asyncio.sleep(0.1)
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AntigravityClearError("clear_unreadable: agy clear confirmation failed") from exc
+
+
 async def _rotate_session_for_cascade(
     *,
     client: httpx.AsyncClient,
@@ -3077,152 +3214,102 @@ async def _rotate_session_for_cascade(
     new_cascade_id: str,
     bridge_dir: Path,
 ) -> str | None:
-    """
-    Create + activate a replacement Omnigent session bound to a new agy cascade.
-
-    The Task T-G rotation effect: after a TUI ``/clear`` mints ``new_cascade_id`` on
-    the SAME live agy process, this moves Omnigent ownership onto a fresh
-    conversation bound to that cascade, MIRRORING claude's
-    ``_create_clear_replacement_session`` (verified against
-    ``omnigent/claude_native_forwarder.py``). agy — like claude — is ONE long-lived
-    process hosting multiple cascades; a ``/clear`` mints a new cascade on that same
-    process, so the rotation TRANSFERS the existing terminal onto the new session
-    (it does NOT re-spawn agy) and rewrites bridge state so the reader rebinds to the
-    new cascade on the SAME process:
-
-    1. GET the old session snapshot (``agent_id`` / ``runner_id`` / ``labels``).
-    2. POST ``/v1/sessions`` with the old ``agent_id`` + inherited ``labels`` — the
-       labels carry agy's bridge-id (:data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY`),
-       so the NEW session resolves to the SAME ``bridge_dir`` the reader uses (agy's
-       bridge_dir is keyed off the launcher's bridge-id, NOT the session id — so we
-       inherit the old label, exactly as claude carries its ``BRIDGE_ID_LABEL_KEY``).
-    3. PATCH the new session's ``runner_id`` to the old runner (so the same runner
-       owns it), when the old session had one.
-    4. POST the terminal ``/transfer`` to move the live agy tmux pane old→new (the
-       pane — the SAME agy process — keeps running under the new conversation).
-       NO ``external_session_id`` PATCH is made: unlike a resume launch, the new
-       cascade ``new_cascade_id`` is ALREADY live on the existing agy and reached via
-       the rewritten bridge state below, not via a later ``--resume``. (The old code
-       PATCHed it, which 400'd on the auto-cold-started session's already-set,
-       set-once-immutable field and looped the rotation — see the module header.)
-    5. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
-       conversation id (the reader re-reads this on rebind to bind the new cascade).
-    6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
-       a failure is logged, not raised — the new session is already live).
-
-    Best-effort: ANY failure (snapshot, create, bind, transfer, state write) is
-    logged at WARNING and yields ``None``, and the caller keeps serving the OLD
-    binding rather than crashing or losing the reader. The bridge-state rewrite is
-    performed only AFTER the new session is created and bound, so a mid-sequence
-    failure never leaves bridge state pointing at a session that does not exist —
-    and, mirroring claude, it lands AFTER the transfer so the runner's auto-create
-    guard still sees the OLD session owning the terminal while the new session binds
-    (see :func:`omnigent.runner.app._antigravity_native_terminal_arrives_via_transfer`).
-
-    :param client: Omnigent HTTP client (the reader's client).
-    :param old_session_id: The Omnigent session being rotated away from.
-    :param new_cascade_id: agy's freshly ``/clear``-minted cascade/conversation id.
-    :param bridge_dir: The agy bridge directory the reader is using (rewritten in
-        place so the new session shares it).
-    :returns: The new Omnigent session id on success, or ``None`` on any failure
-        (the caller then stays on the old binding).
-    """
+    """Complete a detected TUI rotation through the shared succession engine."""
     try:
-        old = await _fetch_session_snapshot(client, old_session_id)
-        agent_id = old.get("agent_id")
-        if not isinstance(agent_id, str) or not agent_id:
-            raise RuntimeError(f"session {old_session_id!r} has no agent_id")
-        runner_id = old.get("runner_id")
-        raw_labels = old.get("labels")
-        labels = (
-            {str(key): str(value) for key, value in raw_labels.items()}
-            if isinstance(raw_labels, dict)
-            else {}
-        )
-        # Inherit the old session's bridge-id so the new session resolves to the
-        # SAME bridge_dir; only fall back to stamping the old session id when the
-        # label is somehow absent (keeps a deterministic, non-empty bridge id).
-        if ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
-            labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
-
-        create_resp = await client.post(
-            "/v1/sessions",
-            json={"agent_id": agent_id, "labels": labels},
-        )
-        create_resp.raise_for_status()
-        created = create_resp.json()
-        new_session_id = created.get("id") if isinstance(created, dict) else None
-        if not isinstance(new_session_id, str) or not new_session_id:
-            raise RuntimeError("Antigravity session replacement response did not include id")
-
-        if isinstance(runner_id, str) and runner_id:
-            bind_resp = await client.patch(
-                f"/v1/sessions/{url_component(new_session_id)}",
-                json={"runner_id": runner_id},
+        async with _rotation_lock(bridge_dir):
+            return await _complete_cascade_rotation(
+                client=client,
+                old_session_id=old_session_id,
+                new_cascade_id=new_cascade_id,
+                bridge_dir=bridge_dir,
             )
-            bind_resp.raise_for_status()
-
-        transfer_resp = await client.post(
-            (
-                f"/v1/sessions/{url_component(old_session_id)}"
-                f"/resources/terminals/{url_component(_AGY_TERMINAL_RESOURCE_ID)}/transfer"
-            ),
-            json={"target_session_id": new_session_id},
-        )
-        transfer_resp.raise_for_status()
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+    except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
         _logger.warning(
-            "agy /clear rotation failed to create the replacement session; staying on "
-            "the old binding (old_session=%s new_cascade=%s): %r",
+            "agy /clear succession incomplete (old_session=%s new_cascade=%s): %r",
             old_session_id,
             new_cascade_id,
             exc,
         )
         return None
 
-    # The new session is live + bound; commit bridge state so the reader's rebind
-    # discovers the new cascade. Done last so a mid-sequence failure above never
-    # points bridge state at a half-created session.
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=new_session_id,
-            conversation_id=new_cascade_id,
-        ),
-    )
 
-    # Release the old session's runner binding (best-effort): the new session is
-    # already serving, so a failure here is logged, not raised.
-    try:
-        clear_resp = await client.patch(
-            f"/v1/sessions/{url_component(old_session_id)}",
-            json={"runner_id": ""},
+async def _complete_cascade_rotation(
+    *,
+    client: httpx.AsyncClient,
+    old_session_id: str,
+    new_cascade_id: str,
+    bridge_dir: Path,
+) -> str:
+    binding = read_bridge_state(bridge_dir)
+    if binding is None:
+        raise AntigravityClearError("clear_unreadable: agy bridge binding is unavailable")
+    source = await _fetch_session_snapshot(client, old_session_id)
+    created = await client.post(f"/v1/sessions/{url_component(old_session_id)}/successor")
+    created.raise_for_status()
+    payload = created.json()
+    new_session_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(new_session_id, str) or not new_session_id:
+        raise AntigravityClearError("clear_unreadable: successor response has no session id")
+    if binding.session_id != old_session_id and (
+        binding.session_id != new_session_id or binding.conversation_id != new_cascade_id
+    ):
+        raise AntigravityClearError("clear_refused: agy bridge already moved to another cascade")
+    pending: dict[str, object] = {
+        "source": old_session_id,
+        "cascade": new_cascade_id,
+        "successor": new_session_id,
+    }
+    request_path = bridge_dir / "clear-request.json"
+    atomic_write_json(request_path, pending)
+    if binding.session_id == old_session_id:
+        runner_id = source.get("runner_id")
+        if not isinstance(runner_id, str) or not runner_id:
+            raise AntigravityClearError("clear_refused: agy source has no runner")
+        bound = await client.patch(
+            f"/v1/sessions/{url_component(new_session_id)}",
+            json={"runner_id": runner_id},
         )
-        if clear_resp.status_code >= 400:
-            _logger.warning(
-                "agy /clear rotation: failed to release old runner binding; "
-                "old_session=%s new_session=%s status=%s body=%s",
-                old_session_id,
-                new_session_id,
-                clear_resp.status_code,
-                clear_resp.text,
+        bound.raise_for_status()
+        transfer = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/resources/terminals/"
+            f"{url_component(_AGY_TERMINAL_RESOURCE_ID)}/transfer",
+            json={"target_session_id": new_session_id},
+        )
+        if transfer.status_code >= 400:
+            # Recover a transfer that committed before its response/state write.
+            target = await client.get(
+                f"/v1/sessions/{url_component(new_session_id)}/resources/terminals/"
+                f"{url_component(_AGY_TERMINAL_RESOURCE_ID)}"
             )
-    except httpx.HTTPError:
-        _logger.warning(
-            "agy /clear rotation: error releasing old runner binding; "
-            "old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
+            payload = target.json() if target.status_code == 200 else {}
+            if (
+                payload.get("id") != _AGY_TERMINAL_RESOURCE_ID
+                or payload.get("metadata", {}).get("running") is not True
+            ):
+                transfer.raise_for_status()
+        write_bridge_state(
+            bridge_dir,
+            AntigravityNativeBridgeState(
+                session_id=new_session_id, conversation_id=new_cascade_id
+            ),
         )
-
-    _logger.info(
-        "agy reader rotated Omnigent session after /clear: old_session=%s new_session=%s "
-        "new_cascade=%s",
-        old_session_id,
-        new_session_id,
-        new_cascade_id,
+    succession = await client.post(
+        f"/v1/sessions/{url_component(old_session_id)}/succession",
+        json={"target_session_id": new_session_id, "allow_empty": True},
     )
+    succession.raise_for_status()
+    status = succession.json().get("status")
+    if status in {"done", "retired"}:
+        pending["done"] = True
+        atomic_write_json(request_path, pending)
+    if status == "retired":
+        raise AntigravityClearError(
+            "clear_succession_retired: another succession owns the session"
+        )
+    if status != "done":
+        raise AntigravityClearError(
+            "clear_succession_pending: retry /clear to resume the handover"
+        )
     return new_session_id
 
 
@@ -3346,6 +3433,26 @@ async def run_reader_with_bridge(
         # so a persistent rotation failure does not hot-loop detect→fail→detect.
         failed_rotations: set[str] = set()
         while True:
+            pending = _read_clear_request(bridge_dir)
+            source, cascade = pending.get("source"), pending.get("cascade")
+            if (
+                pending.get("successor")
+                and not pending.get("done")
+                and isinstance(source, str)
+                and isinstance(cascade, str)
+            ):
+                resumed = await _rotate_session_for_cascade(
+                    client=client,
+                    old_session_id=source,
+                    new_cascade_id=cascade,
+                    bridge_dir=bridge_dir,
+                )
+                if resumed is None:
+                    await asyncio.sleep(_DEFAULT_ROTATION_INTERVAL_S)
+                    continue
+            binding = read_bridge_state(bridge_dir)
+            if binding is not None:
+                current["session_id"] = binding.session_id
             committed_steps_out: list[int] = []
             new_cascade_id = await supervise_reader(
                 bridge_dir,
@@ -3358,6 +3465,10 @@ async def run_reader_with_bridge(
             if new_cascade_id is None:
                 # The reader body ended on its own (cancelled / bounded stop): done.
                 return
+            binding = read_bridge_state(bridge_dir)
+            if binding is not None and binding.session_id != current["session_id"]:
+                current["session_id"] = binding.session_id
+                continue
             bound_committed_turns = committed_steps_out[0] if committed_steps_out else 0
             if bound_committed_turns == 0:
                 # FIRST-CASCADE ADOPTION (not a /clear): the bound cascade was the

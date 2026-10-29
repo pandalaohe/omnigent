@@ -1118,7 +1118,7 @@ describe("Composer slash-command menu", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it.each(["claude-native", "codex-native", "pi-native"])(
+  it.each(["claude-native", "codex-native", "pi-native", "antigravity-native"])(
     "%s executes the native clear command from the composer",
     async (sessionHarness) => {
       useChatStore.setState({ sessionHarness });
