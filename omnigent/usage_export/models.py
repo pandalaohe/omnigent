@@ -17,12 +17,23 @@ from pydantic import (
     model_validator,
 )
 
-Harness = Literal["codex-native", "codex-sdk", "claude-native", "claude-sdk", "pi-native", "pi"]
+Harness = Literal[
+    "codex-native",
+    "codex-sdk",
+    "claude-native",
+    "claude-sdk",
+    "pi-native",
+    "pi",
+    "antigravity-native",
+]
 ResponseNamespace = Literal[
     "claude-code/message-id/v1",
     "claude-code/request-id/v1",
     "codex-responses/response-id/v1",
     "pi/response-id/v1",
+    "antigravity/response-id/v1",
+    "antigravity/provider-message-id/v1",
+    "antigravity/message-id/v1",
 ]
 TerminalEvidence = Literal["terminal_record", "stop_hook", "executor_end", "writer_exit"]
 
@@ -111,7 +122,7 @@ class UsageObservation(BaseModel):
     upstream_thread_id: str | None = None
     turn_id: str | None = None
     thread_kind: Literal["main", "subagent", "internal", "guardian", "unknown"]
-    harness_family: Literal["claude", "codex", "pi"]
+    harness_family: Literal["claude", "codex", "pi", "antigravity"]
     identity_namespace: str = Field(min_length=1)
     physical_transcript_path: str | None = None
     physical_session_id: str | None = None
@@ -208,6 +219,7 @@ class UsageObservation(BaseModel):
             "codex": "codex/rollout/v1",
             "claude": "claude-code/transcript/v1",
             "pi": "pi/session/v1" if self.harness == "pi-native" else "pi/rpc/v1",
+            "antigravity": "antigravity/cascade/v1",
         }
         if self.identity_namespace != identity_namespaces[self.harness_family]:
             raise ValueError("identity_namespace conflicts with harness family")
@@ -215,6 +227,11 @@ class UsageObservation(BaseModel):
             "claude": ("claude-code/message-id/v1", "claude-code/request-id/v1"),
             "codex": ("codex-responses/response-id/v1",),
             "pi": ("pi/response-id/v1",),
+            "antigravity": (
+                "antigravity/response-id/v1",
+                "antigravity/provider-message-id/v1",
+                "antigravity/message-id/v1",
+            ),
         }[self.harness_family]
         if any(ref.namespace not in expected for ref in self.source_refs):
             raise ValueError("source ref namespace conflicts with harness family")

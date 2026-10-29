@@ -265,6 +265,7 @@ class UsageEventStore:
             "claude-sdk",
             "pi-native",
             "pi",
+            "antigravity-native",
         }:
             raise UsageExportError(400, "invalid_producer_binding")
         return result
@@ -322,6 +323,11 @@ class UsageEventStore:
             "claude": ("claude-code/message-id/v1", "claude-code/request-id/v1"),
             "codex": ("codex-responses/response-id/v1",),
             "pi": ("pi/response-id/v1",),
+            "antigravity": (
+                "antigravity/response-id/v1",
+                "antigravity/provider-message-id/v1",
+                "antigravity/message-id/v1",
+            ),
         }[observation.harness_family]
         namespace = next(
             namespace

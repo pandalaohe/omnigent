@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -141,6 +141,7 @@ async def prepare_capture(client: httpx.AsyncClient, session_id: str, harness: s
         "claude-native",
         "pi",
         "pi-native",
+        "antigravity-native",
     }:
         feed_harness = "codex-sdk" if harness == "codex" else harness
         await outbox().prepare(client, session_id, feed_harness)
@@ -154,6 +155,50 @@ async def prepare_capture(client: httpx.AsyncClient, session_id: str, harness: s
 def register_pi_native_sessions(directory: Path, session_id: str) -> None:
     if capture_enabled():
         outbox().register_pi_root(directory, session_id)
+
+
+def capture_antigravity_step(
+    session_id: str,
+    cascade_id: str,
+    step: Mapping[str, Any],
+    *,
+    thread_kind: Literal["main", "subagent"] = "main",
+) -> None:
+    """Spool native metering identities; no admission or account association is inferred."""
+    if not capture_enabled() or step.get("status") not in {
+        "CORTEX_STEP_STATUS_DONE",
+        "CORTEX_STEP_STATUS_ERROR",
+    }:
+        return
+    metadata = step.get("metadata")
+    if not isinstance(metadata, dict):
+        return
+    retries = metadata.get("retryInfos")
+    if not isinstance(metadata.get("modelUsage"), dict) and not isinstance(retries, list):
+        return
+    physical = {
+        "harness_family": "antigravity",
+        "identity_namespace": "antigravity/cascade/v1",
+        "physical_session_id": cascade_id,
+        "upstream_thread_id": cascade_id,
+        "thread_kind": thread_kind,
+    }
+    spool = outbox()
+    spool.append(session_id, "antigravity-native", physical, step)
+    if isinstance(retries, list):
+        for index, retry in enumerate(retries):
+            usage = retry.get("usage") if isinstance(retry, dict) else None
+            if isinstance(usage, dict):
+                spool.append(
+                    session_id,
+                    "antigravity-native",
+                    physical,
+                    {
+                        **step,
+                        "metadata": {**metadata, "modelUsage": usage},
+                        "usage_source": f"retry:{index}",
+                    },
+                )
 
 
 def capture_pi_rpc_message(session_id: str, message: Mapping[str, Any]) -> None:

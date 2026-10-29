@@ -1,9 +1,9 @@
 """Server-side usage cutover gate shared by every turn admission path.
 
 One predicate decides whether a session may start a new turn: while any domain
-of the session's host is held, the gate refuses and writes nothing. An allowed
-turn writes its admission before the input reaches the runner, so every call the
-turn produces starts at or after the recorded bound.
+of the session's host is held, the gate refuses and writes nothing. Correlated
+harnesses record admission before delivery; observation-only harnesses enforce
+the hold and leave admission association unknown.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ _FEED_HARNESS = {
     "claude-code-sdk": "claude-sdk",
     "pi-native": "pi-native",
     "pi": "pi",
+    "antigravity-native": "antigravity-native",
 }
 
 
@@ -70,8 +71,8 @@ def admit_turn(
 ) -> str | None:
     """Write the admission for an allowed turn, or refuse it with 409.
 
-    Returns the admission id (``None`` when the session has no host yet, which
-    no gate can evaluate). Raises :class:`OmnigentError` with
+    Returns the admission id, or ``None`` for a hostless session or an
+    observation-only harness. Raises :class:`OmnigentError` with
     ``usage_cutover_hold`` while the domain is held.
     """
     if not conv.host_id:
@@ -80,8 +81,8 @@ def admit_turn(
     harness = feed_harness(conv, resolve_harness)
     if harness == "unsupported":
         return None
-    if harness in {"pi", "pi-native"}:
-        # Pi has no admission/terminal correlation transport yet. Enforce
+    if harness in {"pi", "pi-native", "antigravity-native"}:
+        # These harnesses have no admission/terminal correlation transport. Enforce
         # the hold without creating an admission that cannot be completed.
         refuse_if_held(storage_location, conv, resolve_harness=resolve_harness)
         return None
