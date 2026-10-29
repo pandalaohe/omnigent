@@ -1349,6 +1349,209 @@ def _sed_script_writes(script: str) -> bool:
     return False
 
 
+def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str) -> list[str]:
+    """Exclude established data roles; unknown syntax keeps conservative candidates."""
+    if not tokens:
+        return []
+    conservative = [value for value in tokens if not value.startswith("-")]
+    dialect = ntpath.basename(shell).lower().removesuffix(".exe")
+    if dialect not in ("pwsh", "powershell", "cmd", "sh", "bash", "zsh") or any(
+        any(char in raw for char in "$`^!{}\r\n")
+        or (dialect == "cmd" and any(char in raw for char in "%'"))
+        or (dialect in _HEREDOC_SHELLS and "\\" in raw)
+        for raw in raw_tokens
+    ):
+        return conservative
+    command = tokens[0].lower().removesuffix(".exe")
+    if tokens[0].lower() in ("echo", "write-output"):
+        return conservative if any(value.startswith("-") for value in tokens[1:]) else tokens[:1]
+    if command == "git" and tokens[1:2] == ["commit"]:
+        start = 2
+        data_options = ("-m", "--message")
+        file_options = ("-F", "--file")
+        flags = (
+            "-a",
+            "--all",
+            "-s",
+            "--signoff",
+            "--amend",
+            "--no-edit",
+            "--no-verify",
+            "--allow-empty",
+            "--allow-empty-message",
+            "-q",
+            "--quiet",
+            "-v",
+            "--verbose",
+        )
+    elif command == "curl":
+        start = 1
+        data_options = ("--url",)
+        file_options = ("-o", "--output", "-T", "--upload-file", "-K", "--config")
+        flags = (
+            "-L",
+            "--location",
+            "-s",
+            "--silent",
+            "-S",
+            "--show-error",
+            "-f",
+            "--fail",
+            "-I",
+            "--head",
+            "-v",
+            "--verbose",
+        )
+    elif command == "find" and not any(
+        value in ("-exec", "-execdir", "-ok", "-okdir") for value in tokens[1:]
+    ):
+        start = 1
+        data_options = ("-printf",)
+        file_options = (
+            "-fprint",
+            "-fprint0",
+            "-fprintf",
+            "-fls",
+            "-name",
+            "-path",
+            "-type",
+            "-maxdepth",
+            "-mindepth",
+        )
+        flags = ("-print", "-print0", "-ls", "-a", "-and", "-o", "-or", "-not")
+    else:
+        return conservative
+    candidates = tokens.copy()
+    data = set()
+    files = set()
+    certain = True
+    options = True
+    index = start
+    while index < len(tokens):
+        value = tokens[index]
+        option, equals, attached = value.partition("=")
+        if options and value == "--":
+            options = False
+        elif options and option in (*data_options, *file_options):
+            if not equals:
+                index += 1
+                if index == len(tokens):
+                    certain = False
+                    break
+                attached = tokens[index]
+            if option in file_options:
+                candidates[index] = attached
+                files.add(index)
+            elif command != "curl" or (
+                urlsplit(attached).scheme in ("http", "https") and urlsplit(attached).hostname
+            ):
+                data.add(index)
+        elif options and any(
+            len(option) == 2 and value.startswith(option) and len(value) > 2
+            for option in file_options
+        ):
+            candidates[index] = value[2:]
+            files.add(index)
+        elif options and value.startswith("-"):
+            certain &= value in flags
+        elif command == "curl":
+            url = urlsplit(value)
+            if url.scheme in ("http", "https") and url.hostname:
+                data.add(index)
+        index += 1
+    return [
+        value
+        for index, value in enumerate(candidates)
+        if (not certain or index not in data) and (index in files or not value.startswith("-"))
+    ]
+
+
+def _windows_command_paths(
+    command: str, context: TrustedHostContext, depth: int
+) -> tuple[str, ...]:
+    raw_tokens = []
+    end = 0
+    pattern = (
+        r"&>>|&>|>>|>\||>&|<<<|<<|<&|<>|&&|\|\||[;&|<>()\n]|"
+        r"""(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+"""
+    )
+    for match in re.finditer(pattern, command):
+        if command[end : match.start()].strip():
+            raise ValueError("Uncheckable Windows shell quoting")
+        raw_tokens.append(match[0])
+        end = match.end()
+    if command[end:].strip():
+        raise ValueError("Uncheckable Windows shell quoting")
+    tokens = [
+        re.sub(
+            r""""([^"]*)"|'([^']*)'""",
+            lambda match: next(value for value in match.groups() if value is not None),
+            raw,
+        )
+        for raw in raw_tokens
+    ]
+    segments: list[list[str]] = [[]]
+    raw_segments: list[list[str]] = [[]]
+    candidates = []
+    index = 0
+    while index < len(tokens):
+        raw = raw_tokens[index]
+        if raw and all(char in ";&|()\n" for char in raw):
+            segments.append([])
+            raw_segments.append([])
+        elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>"):
+            index += 1
+            if index == len(tokens) or re.fullmatch(r"[;&|<>()\n]+", raw_tokens[index]):
+                raise ValueError("Missing shell redirection target")
+            candidates.append(tokens[index])
+        else:
+            segments[-1].append(tokens[index])
+            raw_segments[-1].append(raw)
+        index += 1
+    paths = []
+    for segment, raw_segment in zip(segments, raw_segments, strict=True):
+        if not segment:
+            continue
+        shell = segment[0].lower().removesuffix(".exe")
+        option_index = 1
+        allowed = (
+            ("/d", "/s")
+            if shell == "cmd"
+            else ("-noprofile", "-noninteractive", "-nologo")
+            if shell in ("powershell", "pwsh")
+            else ()
+        )
+        while option_index < len(segment) and segment[option_index].lower() in allowed:
+            option_index += 1
+        if option_index < len(segment) - 1 and (
+            (shell == "cmd" and segment[option_index].lower() == "/c")
+            or (
+                shell in ("powershell", "pwsh")
+                and segment[option_index].lower() in ("-command", "-c")
+            )
+            or (
+                shell in _HEREDOC_SHELLS and re.fullmatch(r"-[a-z]*c[a-z]*", segment[option_index])
+            )
+        ):
+            inner = (
+                " ".join(raw_segment[option_index + 1 :])
+                if shell in ("cmd", "powershell", "pwsh") and len(segment) > option_index + 2
+                else segment[option_index + 1]
+            )
+            paths.extend(_command_paths(inner, replace(context, shell=shell), depth=depth + 1))
+            candidates.extend(
+                value for value in segment[:option_index] if not value.startswith("-")
+            )
+            if shell in _HEREDOC_SHELLS:
+                candidates.extend(segment[option_index + 2 :])
+        else:
+            candidates.extend(_windows_path_operands(segment, raw_segment, context.shell))
+    for token in candidates:
+        if token:
+            paths.append(_resolve(token, context).path)
+    return tuple(paths)
+
+
 def _command_paths(
     command: str,
     context: TrustedHostContext,
@@ -1360,6 +1563,8 @@ def _command_paths(
     """Bind direct path operands; this does not interpret scripts or terminal state."""
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
+    if context.platform == "windows" and not writes_only:
+        return _windows_command_paths(command, context, depth)
     raw_tokens = []
     if writes_only:
         if context.platform == "windows" or powershell:

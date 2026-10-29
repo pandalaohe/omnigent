@@ -50,6 +50,29 @@ def posix_host(**changes: object) -> TrustedHostContext:
     return replace(base, **changes)
 
 
+def windows_host(**changes: object) -> TrustedHostContext:
+    def resolve(path: str) -> ResolvedPath:
+        return ResolvedPath(
+            path, "directory" if path.lower() == "c:\\work\\project" else "new-file"
+        )
+
+    return replace(
+        TrustedHostContext(
+            host_id="windows-host",
+            platform="windows",
+            cwd=r"C:\work\project",
+            workspace=r"C:\work\project",
+            home=r"C:\Users\sample",
+            shell="pwsh",
+            control_paths=(r"C:\work\control",),
+            resolver=resolve,
+            drive_cwds={"C:": r"C:\work\project"},
+            environment={"SystemRoot": r"C:\Windows"},
+        ),
+        **changes,
+    )
+
+
 def decision(tier: str, name: str, args: dict, host: TrustedHostContext | None = None):
     return decide_tier(tier, adapt_tool_call(name, args, host or posix_host()), RULES)
 
@@ -1217,23 +1240,7 @@ def test_supported_shell_wrappers_bind_inner_control_paths(command: str) -> None
     ],
 )
 def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: Verdict) -> None:
-    def resolve(path: str) -> ResolvedPath:
-        return ResolvedPath(
-            path, "directory" if path.lower() == "c:\\work\\project" else "new-file"
-        )
-
-    host = TrustedHostContext(
-        host_id="windows-host",
-        platform="windows",
-        cwd=r"C:\work\project",
-        workspace=r"C:\work\project",
-        home=r"C:\Users\sample",
-        shell="pwsh",
-        control_paths=(r"C:\work\control",),
-        resolver=resolve,
-        drive_cwds={"C:": r"C:\work\project"},
-        environment={"SystemRoot": r"C:\Windows"},
-    )
+    host = windows_host()
     assert (
         decision("accept-edits", "write", {"path": r"c:src\a.py", "content": "x"}, host).action
         == Verdict.ALLOW
@@ -1290,6 +1297,125 @@ def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: 
     assert (
         decision("auto", "run_command", {"CommandLine": option_command}, host).action == expected
     )
+
+
+@pytest.mark.parametrize("platform", ["windows", "linux", "darwin"])
+@pytest.mark.parametrize(
+    "tool,key", [("bash", "command"), ("sys_os_shell", "command"), ("run_command", "CommandLine")]
+)
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "task: probe"',
+        'git commit --message "100%: ready"',
+        'git commit -m "file.txt:stream"',
+        'git commit -m "task:"probe',
+        'echo "task: probe"',
+        'echo "file.txt:stream" "100%"',
+        'Write-Output "key: value"',
+        'echo "task: > literal | text"',
+        'curl "https://example.test/a%20b"',
+        'curl --url "https://example.test/resource" -o local.txt',
+        r'find . -printf "%s\t%p\n"',
+        'echo "task: probe" > local.txt',
+        'echo "task: probe"; echo "100%"',
+        'echo "task: probe" && echo "100%"',
+        'echo "task: probe" | Write-Output "100%"',
+        'echo "task: probe"\necho "100%"',
+        "pwsh -Command 'echo task: probe'",
+        'cmd /c "echo task: probe"',
+    ],
+)
+def test_windows_shell_data_roles_keep_normal_tier_policy(platform, tool, key, command):
+    host = windows_host() if platform == "windows" else posix_host(platform=platform)
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert (
+        tuple(decision(tier, tool, {key: command}, host).action for tier in PERMISSION_TIERS)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"Get-Content C:\x\file.txt:stream",
+        "Get-Content file.txt:stream",
+        r"Get-Content %MISSING%\file.txt",
+        "Get-Content 100%",
+        'git commit -m "task: probe" -F file.txt:stream',
+        'git commit --file "https://example.test/file" -m "task: probe"',
+        'git commit --file=file.txt:stream -m "task: probe"',
+        'git commit -F-file.txt:stream -m "task: probe"',
+        'git commit -F -file.txt:stream -m "task: probe"',
+        'curl -o file.txt:stream "https://example.test/resource"',
+        'curl --output "https://example.test/file" "https://example.test/resource"',
+        'curl -T %MISSING% "https://example.test/resource"',
+        'curl --config file.txt:stream "https://example.test/resource"',
+        'curl --output=file=%MISSING% "https://example.test/resource"',
+        'curl -ofile.txt:stream "https://example.test/resource"',
+        'find . -fprint file.txt:stream -printf "%p"',
+        'find . -fprintf file.txt:stream "%p"',
+        'echo "task: probe" > file.txt:stream',
+        'echo "task: probe" < file.txt:stream',
+        'echo "task: probe" > %MISSING%',
+        'echo "task: probe" > -file.txt:stream',
+        'echo "task: probe" > file=%MISSING%',
+        'echo "task: probe" > ; Get-Content file.txt:stream',
+        'echo "task: probe"; Get-Content file.txt:stream',
+        'echo "task: probe" && Get-Content file.txt:stream',
+        'echo "task: probe" | Get-Content file.txt:stream',
+        'echo "task: probe"\nGet-Content file.txt:stream',
+        'runner "https://example.test/resource"',
+        'echo.exe "file.txt:stream"',
+        'git log -m "task: probe"',
+        'git commit --unknown -m "task: probe"',
+        'curl --unknown "https://example.test/resource"',
+        "find . -exec other -printf file.txt:stream",
+        "pwsh -Command 'Get-Content file.txt:stream'",
+        'cmd /c "echo ok > file.txt:stream"',
+        'cmd /c "echo %MISSING%"',
+        "cmd /c \"echo 'task: & type file.txt:stream'\"",
+        "cmd /c cmd /c cmd /c cmd /c echo task: probe",
+    ],
+)
+def test_windows_shell_data_roles_do_not_exempt_file_operands(command):
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(tier, "sys_os_shell", {"command": command}, windows_host()).action
+            == Verdict.DENY
+        )
+
+
+@pytest.mark.parametrize(
+    "shell,command",
+    [
+        ("bash", "echo ok;>file.txt:stream"),
+        ("bash", "echo ok|<file.txt:stream cat"),
+        ("cmd", "echo ok&<file.txt:stream more"),
+        ("bash", "echo ok;>100%"),
+        ("pwsh", "echo ok;>-file.txt:stream"),
+        ("pwsh", "echo ok&&>%MISSING%"),
+        ("pwsh", "echo ok;>file=%MISSING%"),
+    ],
+)
+def test_windows_shell_adjacent_operators_preserve_redirection_paths(shell, command):
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(tier, "sys_os_shell", {"command": command}, windows_host(shell=shell)).action
+            == Verdict.DENY
+        )
+
+
+@pytest.mark.parametrize(
+    "command,rule",
+    [
+        (r'echo "task: probe" > C:\work\control\tier', "control-path"),
+        (r'echo "task: probe" > C:\Windows\report', "protected-path"),
+        (r'echo "task: probe" | Set-Content C:\Windows\report', "protected-path"),
+    ],
+)
+def test_windows_shell_data_roles_preserve_path_protections(command, rule):
+    assert decision("auto", "sys_os_shell", {"command": command}, windows_host()).rule_id == rule
 
 
 def test_terminal_and_malformed_calls_fail_closed() -> None:
