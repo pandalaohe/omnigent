@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 from dataclasses import replace
 from pathlib import Path
 
@@ -1338,3 +1339,343 @@ def test_rule_errors_deny_and_signature_errors_keep_rule_reason() -> None:
     assert result.action == Verdict.DENY
     assert result.rule_id == "disk-destroy"
     assert "Formats or wipes" in result.reason
+
+
+_SED_WRAPPERS = [
+    "{}",
+    "command {}",
+    "X=1 {}",
+    "env {}",
+    "env X=1 {}",
+    "sudo {}",
+    "sudo -u root {}",
+    "nohup {}",
+    "exec {}",
+    "nice {}",
+    "nice -n 5 {}",
+    "timeout 5 {}",
+    "xargs {}",
+    "xargs -0 {}",
+    "time {}",
+    "if true; then {}; fi",
+    "for f in a; do {}; done",
+    "! {}",
+    "find . -exec {} \\;",
+    "sh -c {q}",
+    "bash -c {q}",
+]
+_SED_CONTEXTS = [
+    "{}",
+    "cat in | {}",
+    "true; {}",
+    "true && {}",
+    "false || {}",
+    "echo `{}`",
+    "echo $({})",
+    'echo "$({})"',
+    "x=`{}`",
+    "( {} )",
+]
+
+
+@pytest.mark.parametrize(
+    "form,writing",
+    [
+        ("sed -n '1w /usr/local/x' in", True),
+        ("sed -n 'w out.txt' in", True),
+        ("sed 's/a/b/w /usr/local/x' in", True),
+        ("sed -n '/x/W /usr/local/x' in", True),
+        ("sed '1e id' in", True),
+        ("sed 's/a/b/e' in", True),
+        ("sed -f s.sed in", True),
+        ("sed -nf s.sed in", True),
+        ("sed --file=s.sed in", True),
+        ("sed --fi s.sed in", True),
+        ("sed -e p -e 'w o' in", True),
+        ("sed --expression='w o' in", True),
+        ("sed -i 's/a/b/;w o' f.txt", True),
+        ("gsed -n 'w o' in", True),
+        ("/usr/bin/sed -n 'w o' in", True),
+        ("sed -n -- 'w o' in", True),
+        ("sed 's/a/b/' f.txt", False),
+        ("sed -n '1,80p' f.txt", False),
+        ('sed -n "${s},${e}p" f.txt', False),
+        ("rg sed file.py", False),
+        ("cat sed", False),
+    ],
+)
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_sed_write_policy_across_wrappers_and_substitutions(
+    form: str, writing: bool, platform: str
+) -> None:
+    host = posix_host(platform=platform)
+    expected = (
+        (Verdict.DENY,) * 4 + (Verdict.ALLOW,)
+        if writing
+        else (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    )
+    for wrapper in _SED_WRAPPERS:
+        inner = wrapper.format(form, q=shlex.quote(form))
+        for context in _SED_CONTEXTS:
+            if "`" in context and "`" in inner:
+                continue
+            command = context.format(inner)
+            intent = adapt_tool_call("bash", {"command": command}, host)
+            for tier, action in zip(PERMISSION_TIERS, expected, strict=True):
+                result = decide_tier(tier, intent, RULES)
+                assert result.action == action, (command, tier, result)
+                if writing and tier != "full":
+                    assert result.rule_id == "unbound-write", (command, tier, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -exec cp a b \\; -exec sed -f s.sed in \\;",
+        "find . -exec rm x \\; -exec sed -n 'w /usr/local/x' in \\;",
+        "sed -n '\x0bw /usr/local/x' in",
+        "sed -n '1\x0cw /usr/local/x' in",
+        "sed 's/a/b/\x0bw /usr/local/x' in",
+        '# don\'t skip this\necho "$(sed -f s.sed in)"',
+        'echo "$(case x in x) sed -f s.sed in;; esac)"',
+        "echo \"$(sh <<'EOF'\nsed -n 'w /usr/local/x' in\nEOF\n)\"",
+        "bash <<'EOF'\necho \"$(sed -f s.sed in)\"\nEOF",
+        "sed -n \"# $TAG\n\"'${w /usr/local/x\n}' in",
+        "cat <<EOF\nit's $(sed -f s.sed in) it's\nEOF",
+        "sed $'p\\nw /usr/local/x' in",
+        r"sed $'\x77 /usr/local/x' in",
+        r"sed $'\167 /usr/local/x' in",
+        r"sed $'s/a/b/\145' in",
+        r"sed $'\u0077 /usr/local/x' in",
+        r"sed $'\U00000077 /usr/local/x' in",
+        r"sed $'\cKw /usr/local/x' in",
+        "echo \"$(<<'EOF' sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$('sh' <<'EOF'\nsed -f s.sed in\nEOF\n)\"",
+        'echo "$(/bin/"sh" <<\'EOF\'\nsed -f s.sed in\nEOF\n)"',
+        'echo "$(<<\'EOF\' /bin/"sh"\nsed -f s.sed in\nEOF\n)"',
+        "echo `echo \\`sed -f s.sed in\\``",
+        "sed -n '7210,${end}p' f",
+        "sed -n '${w /usr/local/x\n}' f",
+        'sed -n "1,5p;w $OUT" f',
+    ],
+)
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_sed_writes_are_never_approvable(command: str, platform: str) -> None:
+    host = posix_host(platform=platform)
+    for tier in NON_FULL_TIERS:
+        result = decision(tier, "bash", {"command": command}, host)
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "unbound-write"
+    assert decision("full", "bash", {"command": command}, host).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find sed -exec cp a /usr/local/x \\;",
+        "xargs -a sed cp a /usr/local/x",
+        "echo `cp a /usr/local/x`",
+        'echo "$(cp a /usr/local/x)"',
+        "x=`cp a /usr/local/x`",
+        "sed -Ei 's/a/b/' /usr/local/x",
+        "sed -ni 's/a/b/p' /usr/local/x",
+        "sed --in-pl 's/a/b/' /usr/local/x",
+    ],
+)
+def test_adjacent_shell_write_gaps_keep_existing_protected_path_policy(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}).rule_id == "protected-path"
+    assert decision("ask", "bash", {"command": command}).action == Verdict.ASK
+    assert decision("accept-edits", "bash", {"command": command}).action == Verdict.ASK
+    assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed 's/a/b/' f.txt",
+        "sed -n '1,80p' f.txt",
+        "sed -n '$p' f.txt",
+        "sed '$d' f.txt",
+        "sed '/^$/d' f.txt",
+        "sed -n '/a/,$p' f.txt",
+        'sed "s/a$/b/" f.txt',
+        "sed -e :a -e '$!N;ba' f",
+        "echo sed",
+        "cat sed",
+        "rg sed file.py",
+        "rg -n sed omnigent/permission_tiers",
+        "printf 'f\\n' | xargs grep sed",
+        "printf 'f\\n' | xargs grep cp",
+        "find . -name sed",
+        'sed -n p "$f"',
+        'for f in *.py; do sed -n 1p "$f"; done',
+        "git log --oneline | sed -n 1,5p",
+        "echo $(date) > out.txt",
+        'x=$(mktemp); sed -n p "$x"',
+        "cd /opt/work && sed -n 1p f",
+        "sed -E 's/(a)/\\1/' f",
+        "sed -n 's/a/b/p' f",
+        "sed 'y/abc/xyz/' f",
+        "sed '1i\\\\header' f",
+        "sed '$a footer w e' f",
+        'sed -n "7210,${end}p" f',
+        'sed -n "${wt},$((wt+28))p" f',
+        'sed -n "${start},${end}p" f',
+        'sed -n "$n,$((n+45))p" f',
+        'sed "s/^/$t rows: /" f',
+        'sed "s/a/$X/" f',
+        'sed "`cat s`" f',
+        "X=cp; $X a /usr/local/x",
+        "# $(sed -f s.sed in)\necho ok",
+        "# sed -f s.sed in\necho ok",
+        "x=$(grep -c case f.txt); echo $x",
+        "case $x in a) sed -n 1p f;; esac",
+        'echo "$(case $x in a) echo a;; esac)"',
+        "echo $'a\\tb' \"$(sed -n 1p f)\"",
+        "python3 - <<'EOF'\nx = '`<label>`'\nEOF",
+        "echo \"$(cat <<'sh'\nsed -f s.sed in\nsh\n)\"",
+        "echo \"$(cat <<'EOF' # sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$(cat <<'EOF' >&sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$(cat <<'EOF' &>sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$(cat <<'EOF'\n# a literal comment\nit's fine\nEOF\n)\"",
+        "echo \"$(cat <<'EOF'\n\n# a literal comment\nit's fine\nEOF\n)\"",
+        "git commit -m \"$(cat <<'EOF'\nfix: `install` to /usr/local\nEOF\n)\"",
+    ],
+)
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_read_only_sed_and_literal_shell_data_keep_existing_tiers(
+    command: str, platform: str
+) -> None:
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert (
+        tuple(
+            decision(tier, "bash", {"command": command}, posix_host(platform=platform)).action
+            for tier in PERMISSION_TIERS
+        )
+        == expected
+    )
+
+
+def test_sed_platform_option_readings_and_control_priority() -> None:
+    for command in ("sed -i '' 'w /usr/local/x' f", "sed -i 's/a/b/' web/x.ts"):
+        for tier in NON_FULL_TIERS:
+            assert (
+                decision(tier, "bash", {"command": command}, posix_host(platform="darwin")).rule_id
+                == "unbound-write"
+            )
+    assert (
+        decision("auto", "bash", {"command": "sed -i 's/a/b/' web/x.ts"}).action == Verdict.ALLOW
+    )
+    assert (
+        decision(
+            "auto",
+            "bash",
+            {"command": "sed -I '' 's/a/b/' /usr/local/x"},
+            posix_host(platform="darwin"),
+        ).rule_id
+        == "protected-path"
+    )
+    for tier in NON_FULL_TIERS:
+        assert (
+            decision(tier, "bash", {"command": "sed -n 'w /opt/work/control/x' in"}).rule_id
+            == "control-path"
+        )
+
+
+def test_sed_invalid_calls_and_existing_unbound_targets_stay_closed() -> None:
+    # The outer tokenizer already rejects this literal heredoc's unmatched apostrophe.
+    literal = "cat > notes.md <<'EOF'\nuse `sed -f s.sed` here, it's fine\nEOF"
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "bash", {"command": literal}).action == Verdict.DENY
+    # An unparseable substitution is skipped; it must not invalidate the outer call.
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    for command in ('echo "`a <b`"', "echo `sed -n 'w /x' in"):
+        assert (
+            tuple(decision(tier, "bash", {"command": command}).action for tier in PERMISSION_TIERS)
+            == expected
+        )
+    command = "echo x > `printf /usr/local/r`"
+    intent = adapt_tool_call("bash", {"command": command}, posix_host())
+    assert intent.status == "unknown"
+    assert "expansion" in intent.detail
+    assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
+
+    def failed_resolution(path: str) -> ResolvedPath:
+        raise OSError("Cannot resolve target")
+
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(
+                tier,
+                "bash",
+                {"command": "sed -f s.sed in"},
+                posix_host(resolver=failed_resolution),
+            ).action
+            == Verdict.DENY
+        )
+
+
+@pytest.mark.parametrize(
+    "script,writing",
+    [
+        ("s/a/b/", False),
+        ("s/a/b/g", False),
+        ("1,80p", False),
+        ("/a/,/b/p", False),
+        ("$d", False),
+        ("/^$/d", False),
+        ("$!N;s/\\n/ /", False),
+        ("y/abc/xyz/", False),
+        ("1i\\header", False),
+        ("$a footer with e and w", False),
+        ("s|a|b|w /x", True),
+        ("s/a/b/e", True),
+        ("1e touch x", True),
+        ("/x/W /x", True),
+        ("w /x", True),
+        ("1w /usr/local/x", True),
+        ("$!{N;w /x\n}", True),
+        ("s/[/]/x/w /y", True),
+        ("s/x/[/w /y", True),
+        (":a;N;$!ba;s/\\n/ /g", False),
+        ("file.py", False),
+        ("web", True),
+        ("web/", True),
+        ("src/", False),
+        ("docs", False),
+        ("pending", False),
+        ("tests/e2e", False),
+        ("eslint.config.js", True),
+        ("is", False),
+        ("0~3w f", True),
+        ("/a/I,+3 w f", True),
+        ("s/a/b/2gw f", True),
+        ("n;p", False),
+        ("=", False),
+        ("/x/{n;p}", False),
+        ("s/\\(.*\\)/[\\1]/", False),
+        ("1d;w f", True),
+        ("p # w x", False),
+        ("l 5;w f", True),
+        ("q5", False),
+        ("\x0bw f", True),
+        ("1\x0cw f", True),
+        ("s/a/b/\x0bw f", True),
+        ("p\x0bw f", False),
+        ("p\nw f", True),
+        ("}w f", True),
+        ("s/a/b/ ; w f", True),
+    ],
+)
+def test_sed_script_grammar_uses_public_tier_decisions(script: str, writing: bool) -> None:
+    command = "sed -n " + shlex.quote(script) + " in"
+    expected = (
+        (Verdict.DENY,) * 4 + (Verdict.ALLOW,)
+        if writing
+        else (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    )
+    for tier, action in zip(PERMISSION_TIERS, expected, strict=True):
+        result = decision(tier, "bash", {"command": command})
+        assert result.action == action
+        if writing and tier != "full":
+            assert result.rule_id == "unbound-write"

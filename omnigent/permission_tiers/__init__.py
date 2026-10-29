@@ -98,6 +98,7 @@ class ToolIntent:
     protected_prefix_paths: tuple[str, ...] = ()
     command_paths: tuple[str, ...] = ()
     command_write_paths: tuple[str, ...] = ()
+    unbound_write: bool = False
 
 
 @dataclass(frozen=True)
@@ -753,6 +754,8 @@ def adapt_tool_call(
                     else ()
                 ),
             )
+        except _UnboundSedWrite as exc:
+            return replace(bound, status="unknown", detail=str(exc), unbound_write=True)
         except _UnboundShellWrite as exc:
             return replace(bound, status="unknown", detail=str(exc))
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -794,6 +797,556 @@ class _UnboundShellWrite(ValueError):
             f"{reason}; write with absolute literal paths: no cd except a literal absolute "
             "cd /dir && prefix, no tee / redirect to $ targets"
         )
+
+
+class _UnboundSedWrite(_UnboundShellWrite):
+    """A sed script writes, executes or is read from a file."""
+
+    def __init__(self, reason: str) -> None:
+        ValueError.__init__(self, f"{reason}; use the edit or write tool, or the full tier")
+
+
+_HEREDOC = re.compile(r"<<(-?)[ \t]*([^\s;&|<>()]+)")
+# Same POSIX interpreter names the engine's existing `-c` recursion recognises.
+_HEREDOC_SHELLS = ("sh", "bash", "zsh")
+_COMMAND_LEADS = ("then", "do", "else", "elif", "{", "!", "time")
+
+
+def _word_at(text: str, index: int, word: str, start: int) -> bool:
+    """An unquoted `word` begins at index as a whole shell word."""
+    return (
+        text.startswith(word, index)
+        and (index == start or text[index - 1] in " \t\n;&|()")
+        and (index + len(word) == len(text) or text[index + len(word)] in " \t\n;&|()")
+    )
+
+
+def _command_position(text: str, index: int, start: int) -> bool:
+    before = text[start:index].rstrip(" \t")
+    if not before or before[-1] in ";&|()\n":
+        return True
+    return re.split(r"[\s;&|()]+", before)[-1] in _COMMAND_LEADS
+
+
+def _heredoc_substitutions(body: str) -> list[str]:
+    """Substitutions the shell expands in an unquoted heredoc body; quotes there are literal."""
+    bodies = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "`" or body.startswith("$(", index):
+            backtick = char == "`"
+            end, inner, _ = _shell_scan(
+                body, index + (1 if backtick else 2), "`" if backtick else ")"
+            )
+            if end >= len(body):
+                break
+            bodies.append(re.sub(r"\\([`$\\])", r"\1", inner) if backtick else inner)
+            index = end + 1
+            continue
+        index += 1
+    return bodies
+
+
+def _heredoc_runs_shell(text: str, start: int) -> bool:
+    """Recognize dequoted interpreter words across a simple command's redirections."""
+    stream = io.StringIO(text[start:])
+    lexer = shlex.shlex(stream, posix=True, punctuation_chars=";&|<>()\n")
+    lexer.whitespace_split = True
+    lexer.whitespace = " \t\r"
+    lookahead = getattr(lexer, "_pushback_chars", None)
+    if lookahead is None:
+        raise ValueError("Shell token positions unavailable")
+    redirect = False
+    while True:
+        position = stream.tell() - len(lookahead)
+        word = lexer.get_token()
+        end = stream.tell() - len(lookahead)
+        raw = text[start + position : start + end].strip(" \t\r")
+        if word is None or raw.startswith("#"):
+            return False
+        if word and raw.startswith(word) and all(char in ";&|()\n" for char in word):
+            return False
+        if redirect:
+            redirect = False
+        elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<-", "<<<", "<&", "<>"):
+            redirect = True
+        elif word.rsplit("/", 1)[-1] in _HEREDOC_SHELLS:
+            return True
+
+
+def _shell_scan(text: str, index: int = 0, closer: str = "") -> tuple[int, str, list[str]]:
+    """Return the end, executable shell text and direct substitution bodies.
+
+    Quoted heredoc data is omitted unless a shell interpreter reads it. Quotes in
+    unquoted heredoc bodies are literal; case patterns do not close substitutions.
+    """
+    kept: list[str] = []
+    bodies: list[str] = []
+    quote = ""
+    depth = 0
+    cases = 0
+    start = index
+    command_start = index
+    heredocs: list[tuple[str, bool, bool, bool]] = []
+    while index < len(text):
+        char = text[index]
+        if quote == "'":
+            quote = "" if char == "'" else quote
+            kept.append(char)
+            index += 1
+            continue
+        if quote == "$'":
+            width = 2 if char == "\\" else 1
+            quote = "" if char == "'" else quote
+            kept.append(text[index : index + width])
+            index += width
+            continue
+        if char == "\\":
+            kept.append(text[index : index + 2])
+            index += 2
+            continue
+        if char == "\n" and heredocs and not quote:
+            kept.append(char)
+            index += 1
+            for terminator, tabs, quoted, interpreter in heredocs:
+                body_start = body_end = index
+                while index < len(text):
+                    line_end = text.find("\n", index)
+                    line_end = len(text) if line_end < 0 else line_end
+                    line = text[index:line_end]
+                    body_end, index = index, line_end + 1
+                    if (line.lstrip("\t") if tabs else line) == terminator:
+                        break
+                    body_end = index
+                body = text[body_start:body_end]
+                if not quoted:
+                    bodies.extend(_heredoc_substitutions(body))
+                if interpreter:
+                    kept.append(body)
+                    bodies.extend(_shell_scan(body)[2])
+            heredocs = []
+            command_start = index
+            continue
+        if closer == "`" and char == "`":
+            return index, "".join(kept), bodies
+        if not quote and char == "#" and (index == start or text[index - 1] in " \t\n;&|()<>"):
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline
+            continue
+        if closer == ")" and not quote:
+            if _word_at(text, index, "case", start) and _command_position(text, index, start):
+                cases += 1
+            elif cases and _word_at(text, index, "esac", start):
+                cases -= 1
+            elif char in "()":
+                if char == ")" and not depth and not cases:
+                    return index, "".join(kept), bodies
+                if not (char == ")" and not depth):
+                    depth += 1 if char == "(" else -1
+        if not quote and char in ";&|()\n":
+            command_start = index + 1
+        if not quote and text.startswith("$'", index):
+            quote = "$'"
+            kept.append("$'")
+            index += 2
+            continue
+        if char == "'" and not quote:
+            quote = "'"
+        elif char == '"':
+            quote = "" if quote else '"'
+        elif not quote and text.startswith("<<", index) and not text.startswith("<<<", index):
+            match = _HEREDOC.match(text, index)
+            if match:
+                heredocs.append(
+                    (
+                        re.sub(r"['\"\\\\]", "", match[2]),
+                        bool(match[1]),
+                        any(c in match[2] for c in "'\"\\\\"),
+                        _heredoc_runs_shell(text, command_start),
+                    )
+                )
+                kept.append(match[0])
+                index = match.end()
+                continue
+        elif (char == "`" and closer != "`") or text.startswith("$(", index):
+            backtick = char == "`"
+            end, body, _ = _shell_scan(
+                text, index + (1 if backtick else 2), "`" if backtick else ")"
+            )
+            if end >= len(text):
+                break  # unterminated: the shell rejects the command
+            bodies.append(re.sub(r"\\([`$\\])", r"\1", body) if backtick else body)
+            kept.append(text[index : end + 1])
+            index = end + 1
+            continue
+        kept.append(char)
+        index += 1
+    return index, "".join(kept), bodies
+
+
+def _expansion_end(raw: str, index: int) -> int:
+    """End of a shell expansion starting at index, else 0."""
+    if raw[index] == "`":
+        return min(_shell_scan(raw, index + 1, "`")[0] + 1, len(raw))
+    if raw[index] != "$" or index + 1 >= len(raw):
+        return 0
+    following = raw[index + 1]
+    if following == "(":
+        return min(_shell_scan(raw, index + 2, ")")[0] + 1, len(raw))
+    if following == "{":
+        close = raw.find("}", index)
+        return len(raw) if close < 0 else close + 1
+    if following.isalpha() or following == "_":
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", raw[index + 1 :])
+        return index + 1 + (match.end() if match else 1)
+    return index + 2 if following in "0123456789@*#?$!-" else 0
+
+
+_ANSI_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "n": "\n",
+    "t": "\t",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+
+
+def _ansi_escape(raw: str, index: int) -> tuple[int, str]:
+    match = re.match(
+        r"\\([0-7]{1,3}|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|c.)", raw[index:]
+    )
+    if match:
+        value = match[1]
+        if value[0] == "c":
+            code = 127 if value[1] == "?" else ord(value[1].upper()) & 31
+        else:
+            code = int(value, 8) & 255 if value[0].isdigit() else int(value[1:], 16)
+        if code <= 0x10FFFF:
+            return index + match.end(), chr(code)
+    following = raw[index + 1]
+    return index + 2, _ANSI_ESCAPES.get(following, "\\" + following)
+
+
+def _script_word(raw: str) -> str:
+    """Dequote one raw shell word as the program receives it; each expansion becomes 0.
+
+    Literal text keeps its characters wherever it is quoted; only a real expansion (outside
+    single quotes) is replaced, since its value is not resolved.
+    """
+    out: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote == "'":
+            quote = "" if char == "'" else quote
+            out.append("" if char == "'" else char)
+            index += 1
+        elif quote == "$'":
+            if char == "\\" and index + 1 < len(raw):
+                index, value = _ansi_escape(raw, index)
+                out.append(value)
+            else:
+                quote = "" if char == "'" else quote
+                out.append("" if char == "'" else char)
+                index += 1
+        elif char == "\\":
+            following = raw[index + 1 : index + 2]
+            if quote == '"' and following not in '$`"\\\n':
+                out.append(char)
+                index += 1
+            else:
+                out.append("" if following == "\n" else following)
+                index += 2
+        elif not quote and raw.startswith("$'", index):
+            quote = "$'"
+            index += 2
+        elif char == "'" and not quote:
+            quote = "'"
+            index += 1
+        elif char == '"':
+            quote = "" if quote else '"'
+            index += 1
+        elif end := _expansion_end(raw, index):
+            out.append("0")
+            index = end
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+_SED_LONG = (
+    "debug",
+    "expression",
+    "file",
+    "follow-symlinks",
+    "help",
+    "in-place",
+    "line-length",
+    "null-data",
+    "zero-terminated",
+    "quiet",
+    "silent",
+    "posix",
+    "regexp-extended",
+    "sandbox",
+    "separate",
+    "unbuffered",
+    "binary",
+    "version",
+)
+
+
+def _sed_reading(args: list[str], *, bsd: bool) -> tuple[bool, list[tuple[int, str]], bool]:
+    """One implementation's option reading: (from_file, scripts, in_place)."""
+    scripts: list[tuple[int, str]] = []
+    operands: list[tuple[int, str]] = []
+    in_place = False
+    index = 0
+    finished = True
+    while index < len(args):
+        value = args[index]
+        if value == "--":
+            operands.extend((i, args[i]) for i in range(index + 1, len(args)))
+            break
+        if value.startswith("--") and len(value) > 2:
+            name, eq, rest = value[2:].partition("=")
+            if bsd:
+                finished = False
+                break
+            if "file".startswith(name):
+                return True, scripts, in_place
+            if "expression".startswith(name):
+                if not eq:
+                    index += 1
+                    if index >= len(args):
+                        finished = False
+                        break
+                    rest = args[index]
+                scripts.append((index, rest))
+            elif "in-place".startswith(name):
+                in_place = True
+            elif "line-length".startswith(name) and not eq:
+                index += 1
+            elif not any(option.startswith(name) for option in _SED_LONG):
+                finished = False
+                break
+            index += 1
+            continue
+        if value.startswith("-") and len(value) > 1:
+            flags = "EaHlnru" if bsd else "nrEsuzb"
+            position = 1
+            stop = False
+            while position < len(value):
+                char = value[position]
+                rest = value[position + 1 :]
+                if char == "f":
+                    return True, scripts, in_place
+                if char == "e":
+                    if not rest:
+                        index += 1
+                        if index >= len(args):
+                            stop = True
+                            break
+                        rest = args[index]
+                    scripts.append((index, rest))
+                    break
+                if char == "i" or (bsd and char == "I"):
+                    in_place = True
+                    if bsd and not rest:
+                        index += 1
+                    break
+                if char == "l" and not bsd:
+                    if not rest:
+                        index += 1
+                    break
+                if char not in flags:
+                    stop = True
+                    break
+                position += 1
+            if stop:
+                finished = False
+                break
+            index += 1
+            continue
+        if bsd:
+            operands.extend((i, args[i]) for i in range(index, len(args)))
+            break
+        operands.append((index, value))
+        index += 1
+    if finished and not scripts:
+        scripts = operands[:1]
+    return False, scripts, in_place
+
+
+# Whitespace sed skips at grammar boundaries: C isspace() without newline (BSD EATSPACE).
+_SED_BLANK = " \t\v\f\r"
+_SED_SINGLE = set("=dDgGhHnNpPxzF")
+_SED_NUMERIC = set("lLqQ")
+_SED_LABEL = set(":btT")
+_SED_TEXT = set("aic")
+_SED_FILE = set("rR")
+
+
+def _sed_delimited(script: str, index: int, delimiter: str, regex: bool) -> int:
+    """Return the index after the closing delimiter, or -1 when unterminated."""
+    while index < len(script):
+        char = script[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "\n" and delimiter != "\n":
+            return -1
+        if regex and char == "[":
+            # BSD skips bracket expressions; GNU-valid bodies split identically.
+            end = index + 1
+            if end < len(script) and script[end] == "^":
+                end += 1
+            if end < len(script) and script[end] == "]":
+                end += 1
+            while end < len(script) and script[end] != "]":
+                if script.startswith(("[:", "[.", "[="), end):
+                    close = script.find(script[end + 1] + "]", end + 2)
+                    end = close + 2 if close >= 0 else len(script)
+                else:
+                    end += 1
+            if end >= len(script):
+                return -1
+            index = end + 1
+            continue
+        if char == delimiter:
+            return index + 1
+        index += 1
+    return -1
+
+
+def _sed_address(script: str, index: int) -> int:
+    """Skip zero to two addresses; -1 when a regex address is unterminated."""
+    for part in range(2):
+        while index < len(script) and script[index] in _SED_BLANK:
+            index += 1
+        if index >= len(script):
+            return index
+        char = script[index]
+        if char.isdigit():
+            while index < len(script) and script[index].isdigit():
+                index += 1
+            if index < len(script) and script[index] == "~":
+                index += 1
+                while index < len(script) and script[index].isdigit():
+                    index += 1
+        elif char == "$":
+            index += 1
+        elif char in "/\\":
+            delimiter = "/"
+            if char == "\\":
+                if index + 1 >= len(script):
+                    return -1
+                delimiter = script[index + 1]
+                index += 1
+            index = _sed_delimited(script, index + 1, delimiter, True)
+            if index < 0:
+                return -1
+            while index < len(script) and script[index] in "IM":
+                index += 1
+        elif part == 1 and char in "+~":
+            index += 1
+            while index < len(script) and script[index].isdigit():
+                index += 1
+        elif part == 1:
+            return -1
+        else:
+            return index
+        while index < len(script) and script[index] in _SED_BLANK:
+            index += 1
+        if part == 0 and index < len(script) and script[index] == ",":
+            index += 1
+            continue
+        return index
+    return index
+
+
+def _sed_script_writes(script: str) -> bool:
+    """Find a writing command before both GNU and BSD sed would reject the script."""
+    index = 0
+    length = len(script)
+    while index < length:
+        char = script[index]
+        if char in _SED_BLANK + "\n;":
+            index += 1
+            continue
+        index = _sed_address(script, index)
+        if index < 0:
+            return False
+        while index < length and script[index] in _SED_BLANK + "!":
+            index += 1
+        if index >= length:
+            return False
+        command = script[index]
+        index += 1
+        if command in "wWe":
+            return True
+        if command == "#":
+            newline = script.find("\n", index)
+            index = length if newline < 0 else newline
+            continue
+        if command in "{}":
+            continue
+        if command in _SED_TEXT or command in _SED_FILE:
+            # Text and file names run to the end of the line (backslash-newline continues).
+            while index < length and script[index] != "\n":
+                index += 2 if script[index] == "\\" else 1
+            continue
+        if command in _SED_LABEL:
+            while index < length and script[index] not in ";\n":
+                index += 1
+            continue
+        if command == "v":
+            while index < length and script[index] not in ";\n}":
+                index += 1
+            continue
+        if command in ("s", "y"):
+            if index >= length or script[index] in "\\\n":
+                return False
+            delimiter = script[index]
+            index = _sed_delimited(script, index + 1, delimiter, command == "s")
+            if index < 0:
+                return False
+            index = _sed_delimited(script, index, delimiter, False)
+            if index < 0:
+                return False
+            if command == "s":
+                while index < length and (
+                    script[index] in "gpiImMe" + _SED_BLANK or script[index].isdigit()
+                ):
+                    if script[index] == "e":
+                        return True
+                    index += 1
+                if index < length and script[index] == "w":
+                    return True
+        elif command in _SED_NUMERIC:
+            while index < length and (script[index] in _SED_BLANK or script[index].isdigit()):
+                index += 1
+        elif command not in _SED_SINGLE:
+            return False
+        while index < length and script[index] in _SED_BLANK:
+            index += 1
+        if index < length and script[index] not in ";\n}#":
+            return False
+    return False
 
 
 def _command_paths(
@@ -870,6 +1423,14 @@ def _command_paths(
             raise _UnboundShellWrite("Shell cwd changes outside an && chain cannot be bound")
         return paths
     paths = []
+    if writes_only and context.platform != "windows" and not powershell:
+        for body in _shell_scan(command)[2]:
+            try:
+                paths.extend(_command_paths(body, context, depth=depth + 1, writes_only=True))
+            except _UnboundShellWrite:
+                raise
+            except ValueError:
+                continue
     for index, token in enumerate(tokens):
         shell = token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
         if shell not in ("sh", "bash", "zsh", "cmd", "powershell", "pwsh"):
@@ -909,12 +1470,16 @@ def _command_paths(
         candidates = []
         segments = []
         segment = []
+        raw_segments = []
+        raw_segment = []
         index = 0
         while index < len(tokens):
             raw = raw_tokens[index]
             if raw.startswith("#") and "\n" in raw:
                 segments.append(segment)
                 segment = []
+                raw_segments.append(raw_segment)
+                raw_segment = []
                 raw = raw.rsplit("\n", 1)[-1]
             if (
                 raw.startswith(tokens[index])
@@ -925,6 +1490,8 @@ def _command_paths(
             if raw and all(char in ";|&()\n" for char in raw):
                 segments.append(segment)
                 segment = []
+                raw_segments.append(raw_segment)
+                raw_segment = []
             elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>"):
                 if index + 1 >= len(tokens):
                     raise ValueError("Missing shell redirection target")
@@ -937,13 +1504,18 @@ def _command_paths(
                         candidates.append(destination)
             else:
                 segment.append(tokens[index])
+                raw_segment.append(raw)
             index += 1
         segments.append(segment)
+        raw_segments.append(raw_segment)
         cwd_changed = False
-        for segment in segments:
+        for segment, raw_segment in zip(segments, raw_segments, strict=True):
             candidates.extend(
                 _write_operands(
-                    segment, posix_shell=context.platform != "windows" and not powershell
+                    segment,
+                    raw_segment,
+                    posix_shell=context.platform != "windows" and not powershell,
+                    bsd_sed=context.platform == "darwin",
                 )
             )
             prefix = 0
@@ -990,8 +1562,19 @@ def _command_paths(
     return tuple(paths)
 
 
-def _write_operands(tokens: list[str], *, posix_shell: bool) -> list[str]:
+def _write_operands(
+    tokens: list[str], raw_tokens: list[str], *, posix_shell: bool, bsd_sed: bool
+) -> list[str]:
     """Select reliable direct targets; retain all locations for unbound mutations."""
+    # Every sed token first: operand selection below returns at the first write command.
+    for offset, token in enumerate(tokens):
+        name = token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+        if name in ("sed", "gsed"):
+            words = [_script_word(raw) for raw in raw_tokens[offset + 1 :]]
+            for bsd in (False, True) if bsd_sed and name == "sed" else (False,):
+                from_file, scripts, _ = _sed_reading(words, bsd=bsd)
+                if from_file or any(_sed_script_writes(text) for _, text in scripts):
+                    raise _UnboundSedWrite("Sed script writes, executes or is read from a file")
     conservative = [
         value.split(":" if ":" in value else "=", 1)[1]
         if value.startswith("-") and (":" in value or "=" in value)
@@ -1047,12 +1630,13 @@ def _write_operands(tokens: list[str], *, posix_shell: bool) -> list[str]:
             return (
                 conservative if any(value.startswith("-") for value in arguments) else operands[:1]
             )
-        if command == "sed":
-            return (
-                conservative
-                if any(value.startswith(("-i", "--in-place")) for value in arguments)
-                else []
-            )
+        if command in ("sed", "gsed"):
+            if any(value.startswith(("-i", "--in-place")) for value in arguments) or any(
+                _sed_reading(arguments, bsd=bsd)[2]
+                for bsd in ((False, True) if bsd_sed and command == "sed" else (False,))
+            ):
+                return conservative
+            continue
         if command == "tee":
             if offset or not posix_shell:
                 return conservative
@@ -1285,6 +1869,8 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 for candidate in (*intent.command_paths, *intent.command_write_paths)
             ):
                 return TierDecision(Verdict.DENY, control_reason, "control-path")
+        if intent.unbound_write:
+            return TierDecision(Verdict.DENY, intent.detail, "unbound-write")
         if intent.kind == ToolKind.EDIT and target is not None:
             is_protected = target.path in intent.protected_exact_paths or any(
                 _under(target.path, value, windows) for value in intent.protected_prefix_paths
