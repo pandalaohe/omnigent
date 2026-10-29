@@ -535,8 +535,27 @@ def test_context_labels_from_turn_usage_shapes() -> None:
     assert no_model == {"omnigent.last_context_tokens": "42"}
 
 
+@pytest.mark.parametrize("window", [550_000, None, 0, -1, True, "550000"])
+def test_context_labels_prefer_valid_reported_window(
+    monkeypatch: pytest.MonkeyPatch, window: object
+) -> None:
+    from omnigent.server.routes.sessions import _context_labels_from_turn_usage
+
+    monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
+    labels = _context_labels_from_turn_usage(
+        {"context_tokens": 42, "model": "uncatalogued-model", "context_window": window}
+    )
+    assert labels == {
+        "omnigent.last_context_tokens": "42",
+        "omnigent.last_context_window": "550000" if window == 550_000 else "128000",
+    }
+
+
 @pytest.mark.asyncio
-async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: str) -> None:
+@pytest.mark.parametrize("reported_window", [None, 550_000])
+async def test_relay_persists_context_window_labels_for_inprocess_turn(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, reported_window: int | None
+) -> None:
     """
     An in-process turn's usage fills the context-window indicator.
 
@@ -549,7 +568,6 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     this, only the claude-native external_session_usage POST wrote those
     labels, leaving a model-unpinned claude-sdk session with no ring.
     """
-    from omnigent.llms.context_window import get_model_context_window
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -558,10 +576,8 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     conv = store.create_conversation()
     session_id = conv.id
 
-    # Denominator is the observed model's catalog window, computed the same way
-    # the relay does (the resolved value varies with catalog availability, so
-    # derive it rather than hard-coding a token count).
-    expected_window = get_model_context_window("claude-sonnet-5")
+    monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
+    expected_window = reported_window or 128_000
 
     response_id = "resp_ctx_ring_1"
     # The observed model (a full id, not a bare alias) is what the SDK reports.
@@ -578,6 +594,7 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
                     "total_tokens": 1200,
                     "context_tokens": 45678,
                     "model": "claude-sonnet-5",
+                    **({"context_window": reported_window} if reported_window is not None else {}),
                 },
             },
         },

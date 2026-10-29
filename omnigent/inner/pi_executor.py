@@ -288,6 +288,7 @@ class _PiMessageUsage(TypedDict):
 
 class _PiTurnUsage(_PiMessageUsage):
     context_tokens: int
+    context_window: NotRequired[int]
 
 
 # ---------------------------------------------------------------------------
@@ -2337,6 +2338,7 @@ class _PiSessionState:
     system_prompt: str | None = None
     model: str | None = None
     model_selection: str | None = None
+    context_window: int | None = None
     tool_names: tuple[str, ...] = ()
     # Thinking level (Pi vocabulary) this process is known to be running at,
     # so an unchanged effort costs no RPC and a changed one is applied live.
@@ -2736,6 +2738,7 @@ def _extract_pi_turn_usage(
 def _aggregate_pi_turn_usage(
     message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
+    context_window: int | None = None,
 ) -> _PiTurnUsage | None:
     """Aggregate per-message Pi usage into one turn-level usage dict.
 
@@ -2787,7 +2790,7 @@ def _aggregate_pi_turn_usage(
     # message-model-else-fallback precedence, so the last entry's model is
     # the authoritative one to price the turn with.
     model = last["model"] if last["model"] else fallback_model
-    return {
+    usage: _PiTurnUsage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens or (input_tokens + output_tokens),
@@ -2796,6 +2799,9 @@ def _aggregate_pi_turn_usage(
         "context_tokens": context_tokens,
         "model": model,
     }
+    if context_window is not None:
+        usage["context_window"] = context_window
+    return usage
 
 
 def _pi_thinking_from_config(config: ExecutorConfig | None) -> str | None:
@@ -3444,7 +3450,9 @@ class PiExecutor(Executor):
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
         self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
-        self._tool_server._pi_session_event = self._pi_session_event
+        self._tool_server._pi_session_event = (
+            self._report_pi_session_usage if self._pi_session_event is not None else None
+        )
         if self._permission_controlled and self._permission_session_id:
             self._tool_server._permission_bridge_dir = bridge_dir_for_session_id(
                 self._permission_session_id
@@ -3452,6 +3460,25 @@ class PiExecutor(Executor):
             self._tool_server._permission_session_id = self._permission_session_id
             self._tool_server._permission_finish = self._finish_native_permission_lease
         return self._tool_server.port
+
+    def _report_pi_session_usage(  # type: ignore[explicit-any]
+        self, session_id: str, data: dict[str, Any]
+    ) -> Awaitable[dict[str, Any] | None] | dict[str, Any] | None:
+        """Retain the process's measured window for its terminal usage event."""
+        state = self._session_states.get(session_id)
+        window = data.get("context_window")
+        if (
+            state is not None
+            and isinstance(window, int)
+            and not isinstance(window, bool)
+            and window > 0
+        ):
+            state.context_window = window
+        return (
+            self._pi_session_event(session_id, data)
+            if self._pi_session_event is not None
+            else None
+        )
 
     async def _get_gateway_token(self) -> str:
         """Refresh expired credentials under a lock; never fall back after failure."""
@@ -3976,6 +4003,8 @@ class PiExecutor(Executor):
         if previous_rpc is not None:
             await previous_rpc.close()
 
+        # A replacement process may use a different model; its own report wins.
+        state.context_window = None
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server = self._tool_server
         tool_server_token = tool_server.token if tool_server is not None else None
@@ -4277,7 +4306,9 @@ class PiExecutor(Executor):
                         message=f"Pi process ended without response.{stderr_suffix}"
                     )
                 else:
-                    turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                    turn_usage = _aggregate_pi_turn_usage(
+                        message_usages, model, turn_state.context_window if turn_state else None
+                    )
                     _notify_usage_from_dict(model=model, usage=turn_usage)
                     yield TurnComplete(
                         response=response_text,
@@ -4461,7 +4492,9 @@ class PiExecutor(Executor):
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                turn_usage = _aggregate_pi_turn_usage(
+                    message_usages, model, turn_state.context_window if turn_state else None
+                )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 yield TurnComplete(
                     response=response_text,
@@ -4475,7 +4508,9 @@ class PiExecutor(Executor):
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                turn_usage = _aggregate_pi_turn_usage(
+                    message_usages, model, turn_state.context_window if turn_state else None
+                )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 yield TurnComplete(
                     response=response_text,
