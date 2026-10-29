@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import replace
@@ -19,6 +20,40 @@ from omnigent.permission_tiers import (
     _native_digest,
 )
 from tests.harnesses.test_permission_tiers import decision, posix_host
+
+ACTION_CASES = json.loads(Path(__file__).with_name("pi_native_action_cases.json").read_text())
+
+
+def assert_package_action_domain(package_root: Path) -> None:
+    source = (package_root / "src/shared/types.js").read_text()
+    declaration = re.search(r"export const SUBAGENT_ACTIONS = (\[[^;]+\]);", source)
+    assert declaration, "Package action declaration needs review"
+    assert set(json.loads(declaration[1])) == {
+        row["action"] for row in ACTION_CASES if row["public"]
+    }, "Package public action domain changed"
+    dispatcher = (package_root / "src/runs/foreground/subagent-executor.js").read_text()
+    literals = set(re.findall(r'(?<![\w.])action\s*===?\s*"([^"\n]+)"', dispatcher))
+    assert literals <= {row["action"] for row in ACTION_CASES}, "Unclassified dispatcher action"
+
+
+@pytest.mark.parametrize("surface", ["public", "dispatcher"])
+def test_package_action_domain_guard_rejects_unclassified_action(tmp_path, surface):
+    declarations = tmp_path / "src/shared/types.js"
+    dispatcher = tmp_path / "src/runs/foreground/subagent-executor.js"
+    declarations.parent.mkdir(parents=True)
+    dispatcher.parent.mkdir(parents=True)
+    actions = [row["action"] for row in ACTION_CASES if row["public"]]
+    declarations.write_text("export const SUBAGENT_ACTIONS = " + json.dumps(actions) + ";")
+    dispatcher.write_text('if (action === "append-step") {}')
+    assert_package_action_domain(tmp_path)
+    if surface == "public":
+        declarations.write_text(
+            "export const SUBAGENT_ACTIONS = " + json.dumps([*actions, "new-launch"]) + ";"
+        )
+    else:
+        dispatcher.write_text('if (action === "new-launch") {}')
+    with pytest.raises(AssertionError):
+        assert_package_action_domain(tmp_path)
 
 
 def test_native_canonical_digest_keeps_authorization_lease_serialization():
@@ -76,6 +111,7 @@ def test_native_support_node_consumers(tmp_path):
                 ],
                 ensure_ascii=False,
             ),
+            "OMNIGENT_NATIVE_ACTION_CASES": json.dumps(ACTION_CASES),
         },
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -105,6 +141,42 @@ def _host(name, arguments, status=NativeSupportStatus.ATTESTED, action="ordinary
         semantics_digest=binding.arguments_digest,
     )
     return posix_host(native_binding=binding, native_support=support, **changes)
+
+
+@pytest.mark.parametrize(
+    "sharing",
+    [
+        {"options": {"share": False}},
+        {"share": False},
+        {"share": False, "options": {"share": False}},
+    ],
+)
+def test_false_sharing_normalization_reaches_python_tier_without_rebinding(sharing):
+    arguments = {"agent": "reader", "task": "read", "async": False, **sharing}
+    host = _host("subagent", arguments, action="delegate", native_tools={"subagent": ""})
+    for tier in ("auto", "ask", "accept-edits", "plan"):
+        result = decision(tier, "subagent", arguments, host)
+        assert result.action == Verdict.ALLOW
+        assert result.rule_id != "native-proof"
+    changed = {**arguments, "task": "changed"}
+    assert decision("auto", "subagent", changed, host).rule_id == "native-proof"
+    omitted = {key: value for key, value in arguments.items() if key not in ("share", "options")}
+    assert decision("auto", "subagent", omitted, host).rule_id == "native-proof"
+    assert host.native_binding.arguments_digest == _native_digest(arguments)
+
+
+@pytest.mark.parametrize(
+    "sharing",
+    [
+        {"options": {"share": True}},
+        {"share": False, "options": {"share": True}},
+        {"options": {"share": None}},
+    ],
+)
+def test_native_sharing_normalization_rejects_true_conflicts_and_malformed_values(sharing):
+    arguments = {"agent": "reader", "task": "read", "async": False, **sharing}
+    host = _host("subagent", arguments, action="delegate", native_tools={"subagent": ""})
+    assert decision("auto", "subagent", arguments, host).rule_id == "native-proof"
 
 
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])

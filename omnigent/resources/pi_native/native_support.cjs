@@ -50,6 +50,8 @@ function rules() {
   const value = require("../../permission_tiers/native_support_rules.json");
   if (value.version !== 1 || !Object.entries(value).every(([name, entries]) => name === "version" || Array.isArray(entries) && entries.every(text)))
     throw new Error("Unsupported native support rules");
+  const actions=[...value.read_actions,...value.control_actions,...value.launch_actions,...value.outside_actions];
+  if(new Set(actions).size!==actions.length) throw new Error("Ambiguous native action classification");
   return value;
 }
 function inside(file, root) {
@@ -285,18 +287,11 @@ function outsideAction(name,input,record) {
     const native={...input};delete native.share;
     return semanticAction(name,native,record)==="delegate"?"gist":null;
   }
-  const actions=["create","update","delete","eject","disable","enable","reset",
-    "mission.create","mission.list","mission.show","mission.update","mission.resolve-decision","mission.attach-run","mission.close",
-    "worktree.discard","worktree.cleanup","lane.status","lane.recordMerge","lane.recordSupersession",
-    "refine","refine.show","refine.rollback","inspector.open","inspector.command","inspector.close",
-    "project.open","project.status","project.close","debug.run","grant-spawn-budget","command.status",
-    "watchdog.status","watchdog.check","watchdog.configure","watchdog.recommend-model",
-    "schedule.create","schedule.list","schedule.show","schedule.history","schedule.pause","schedule.resume","schedule.run","schedule.run-due","schedule.delete"];
   const fields=["action","agent","task","name","id","runId","cwd","dir","handoffPath","repo","planId","laneId","merge","supersession",
     "index","childId","toolCallId","view","lines","topic","message","mode","steeringRecovery","additional","scope","target","focus","thinking",
     "at","every","sessionOnly","quiet","on","timezone","overlap","catchUp","missionId","mission","missionUpdate","missionStatus","missionScope",
     "runMode","runStatus","summary","config","workflow","args","async","options"];
-  if(!actions.includes(input.action)||!allowed(input,fields)) return null;
+  if(!rules().outside_actions.includes(input.action)||!allowed(input,fields)) return null;
   // Resume needs retained-launch evidence; a tool action name does not identify its target.
   const options=input.options===undefined?{}:input.options;
   const topOnly=["action","agent","task","id","cwd","message","async","workflow","args","options"];
@@ -336,6 +331,13 @@ async function classifyNativeCall(event, ctx, state) {
       return {binding: bound, status:"attested_native", action:"ordinary", inputs};
     }
     const normalized=event.toolName==="subagent"?normalizeSharing(event.input):event.input;
+    if(event.toolName==="subagent" && "action" in normalized) {
+      const r=rules();
+      // Management names that may launch (including retained or deferred work) need launch proof.
+      if(r.launch_actions.includes(normalized.action) ||
+          ![...r.read_actions,...r.control_actions,...r.outside_actions].includes(normalized.action))
+        return failed(bound,"Native launching action requires its effective launch proof");
+    }
     const unsupported=outsideAction(event.toolName,normalized,record);
     if(unsupported&&unsupported!=="gist") return {binding:bound,status:"outside_native_support",action:"ordinary",outside_kind:unsupported,
       reason:"Established package action outside native support",inputs,semantics_digest:digest(event.input)};

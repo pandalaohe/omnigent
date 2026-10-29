@@ -834,6 +834,64 @@ def test_wrapped_sed_writes_keep_unapprovable_script_guard(prefix: str) -> None:
         assert decision(tier, "bash", {"command": command}).action == Verdict.DENY
 
 
+SHELL_WRAPPER_CASES = {
+    "command": "command -p -- {command}",
+    "builtin": "builtin {command}",
+    "env": "env -u FLAG X=1 {command}",
+    "sudo": "sudo -u root {command}",
+    "nohup": "nohup {command}",
+    "exec": "exec -a fixture {command}",
+    "nice": "nice -n 5 {command}",
+    "timeout": "timeout 5 {command}",
+    "xargs": "xargs {command}",
+    "sh": "sh -c '{command}'",
+    "bash": "bash -lc '{command}'",
+    "zsh": "zsh -c '{command}'",
+    "cmd": 'cmd /c "{command}"',
+    "powershell": 'powershell -Command "{command}"',
+    "pwsh": 'pwsh -Command "{command}"',
+}
+
+
+def test_shared_write_wrapper_matrix_covers_engine_domain():
+    from omnigent.permission_tiers import _SHELL_INTERPRETERS, _SHELL_WRAPPERS
+
+    assert set(SHELL_WRAPPER_CASES) == set(_SHELL_INTERPRETERS) | set(_SHELL_WRAPPERS)
+
+
+@pytest.mark.parametrize("wrapper", SHELL_WRAPPER_CASES)
+@pytest.mark.parametrize(
+    "join", ["{command}", "printf file | {command}", "true; {command}", "true && {command}"]
+)
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "sed -f script.sed input.txt",
+        "cp source /usr/local/report",
+        "mv source /usr/local/report",
+        "tee /usr/local/report",
+    ],
+)
+def test_shared_write_position_gate_covers_every_wrapper_and_separator(wrapper, join, operation):
+    command = join.format(command=SHELL_WRAPPER_CASES[wrapper].format(command=operation))
+    for tier in NON_FULL_TIERS:
+        expected = (
+            Verdict.DENY
+            if operation.startswith("sed ") or wrapper == "xargs" or tier in ("auto", "plan")
+            else Verdict.ASK
+        )
+        assert decision(tier, "bash", {"command": command}).action == expected
+
+
+@pytest.mark.parametrize("operation", ["sed -f script.sed input.txt", "cp a b", "mv a b", "tee b"])
+@pytest.mark.parametrize("wrapper", ["unknown-wrapper", "env --unknown", "xargs"])
+def test_unresolved_wrapper_fails_closed_for_all_write_commands(wrapper, operation):
+    for tier in NON_FULL_TIERS:
+        result = decision(tier, "bash", {"command": wrapper + " " + operation})
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "unbound-write"
+
+
 def test_shell_continued_write_target_does_not_bind_as_workspace_file() -> None:
     command = "echo x > " + "\\\n" + "/usr/local/probe"
     assert decision("auto", "bash", {"command": command}).action == Verdict.DENY

@@ -32,6 +32,8 @@ def _native_rules() -> dict[str, frozenset[str]]:
         "chain_step_keys",
         "read_actions",
         "control_actions",
+        "launch_actions",
+        "outside_actions",
         "read_keys",
         "control_keys",
         "outside_kinds",
@@ -96,6 +98,19 @@ def _native_action(
         return "control" if not arguments else None
     if name != "subagent":
         return None
+    options = arguments.get("options", {})
+    sharing = [arguments["share"]] if "share" in arguments else []
+    if isinstance(options, Mapping) and "share" in options:
+        sharing.append(options["share"])
+    if sharing:
+        if any(type(value) is not bool or value for value in sharing):
+            return None
+        arguments = {key: value for key, value in arguments.items() if key != "share"}
+        if isinstance(options, Mapping):
+            arguments = {
+                **arguments,
+                "options": {key: value for key, value in options.items() if key != "share"},
+            }
     action = arguments.get("action")
     if isinstance(action, str) and (
         action in rules["read_actions"] or action in rules["control_actions"]

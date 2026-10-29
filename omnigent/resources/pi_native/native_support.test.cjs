@@ -257,8 +257,7 @@ test("effective placement keeps valid local and remote projections",async t=>{
 });
 test("known outside actions and Gist produce explicit outside facts",async t=>{
   const cases=[
-    ...["schedule.list","schedule.show","schedule.history","schedule.pause","schedule.resume","schedule.run","schedule.run-due","schedule.delete"].map(action=>({action,...action==="schedule.list"||action==="schedule.run-due"?{}:{id:"schedule"}})),
-    {action:"schedule.create",name:"fixture",agent:"reader",task:"read",at:"+10m"},
+    ...["schedule.list","schedule.show","schedule.history","schedule.pause","schedule.delete"].map(action=>({action,...action==="schedule.list"?{}:{id:"schedule"}})),
     {action:"mission.list"},{action:"project.status"},
     {action:"schedule.list",options:{topic:"fixture",agentScope:"both"}},
     {action:"create",agent:"reader",config:{description:"fixture"}},
@@ -277,6 +276,21 @@ test("known outside actions and Gist produce explicit outside facts",async t=>{
     const f=await fixture(t);
     assert.equal((await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state)).status,"failed_native");
   }
+});
+test("the whole package action domain follows the non-launching or native-proof gate",async t=>{
+  const cases=JSON.parse(process.env.OMNIGENT_NATIVE_ACTION_CASES||"[]");
+  assert.equal(cases.length,61,"Explicit reviewed package action domain required");
+  for(const {action,policy} of cases) await t.test(action,async t=>{
+    const f=await fixture(t);
+    const input={action};
+    const fact=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state);
+    assert.equal(fact.status,policy==="launch"?"failed_native":policy==="outside"?"outside_native_support":"attested_native");
+    if(policy==="launch") {
+      assert.equal((await f.run("subagent",input))?.block,true);
+      assert.equal(f.policyCalls(),0);
+      assert.equal(f.backendStarts(),0);
+    } else if(policy!=="outside") assert.equal(fact.action,policy);
+  });
 });
 test("resume and unknown outside options cannot bypass retained launch proof",async t=>{
   for(const definition of [{name:"reader"},{launcher:"retained-broker"},{machine:"host"}]) await t.test(JSON.stringify(definition),async t=>{
