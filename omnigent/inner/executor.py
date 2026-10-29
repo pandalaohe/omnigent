@@ -761,6 +761,13 @@ class Executor:
         """Send a new user message to a live session without interrupting it, if supported."""
         return False
 
+    async def prepare_peer_turn(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> bool:
+        """Return True when initial peer input requires an explicit consumption receipt."""
+        del session_key, delivery, report
+        return False
+
     async def submit_peer_message(
         self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
     ) -> None:

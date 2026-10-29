@@ -2390,6 +2390,7 @@ def create_runner_app(
         OrderedDict()
     )
     app.state.sdk_peer_attempts = _sdk_peer_attempts
+    _pi_peer_turns: dict[str, dict[str, str]] = {}
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
     _author_attribution_sessions: set[str] = set()
@@ -4501,7 +4502,9 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if harness_name in {"claude-sdk", "codex"} and _trailing_sdk_peer_item(raw_history):
+            if harness_name in {"claude-sdk", "codex", "pi"} and _trailing_sdk_peer_item(
+                raw_history
+            ):
                 needs_turn = False
             if (
                 needs_turn
@@ -4548,7 +4551,7 @@ def create_runner_app(
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
                 and not (
-                    harness_name in {"claude-sdk", "codex"}
+                    harness_name in {"claude-sdk", "codex", "pi"}
                     and _trailing_sdk_peer_item(raw_history)
                 )
                 and await admit_recovery_turn()
@@ -6301,7 +6304,17 @@ def create_runner_app(
                     for c in children
                 )
                 _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
-        if was_interrupted:
+        pi_peer_turn = _pi_peer_turns.pop(conv_id, None)
+        if pi_peer_turn is not None:
+            _post_untracked_subagent_terminal_soon(
+                conv_id,
+                status="cancelled" if was_interrupted else "failed" if error else "completed",
+                output=_extract_last_assistant_text(conv_id),
+                require_parent=True,
+                sdk_peer_delivery=pi_peer_turn,
+                response_id=owner_response_id,
+            )
+        elif was_interrupted:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
                 # interrupt marker to unwind the harness), NOT by a user
@@ -7064,7 +7077,13 @@ def create_runner_app(
         _background_tasks.add(_retry_task)
 
     async def _post_untracked_subagent_terminal(
-        child_session_id: str, *, status: str, output: str | None, require_parent: bool = False
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        require_parent: bool = False,
+        sdk_peer_delivery: dict[str, str] | None = None,
+        response_id: str | None = None,
     ) -> None:
         """Report a terminal edge for a sub-agent whose work is not tracked here.
 
@@ -7091,12 +7110,27 @@ def create_runner_app(
             if not snapshot.parent_session_id:
                 return
         try:
-            await post_external_session_status(
-                server_client,
-                session_id=child_session_id,
-                status=status,
-                output=output,
-            )
+            if sdk_peer_delivery is not None:
+                response = await server_client.post(
+                    f"/v1/sessions/{child_session_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {
+                            "status": status,
+                            "output": output,
+                            "response_id": response_id,
+                            "sdk_peer_delivery": sdk_peer_delivery,
+                        },
+                    },
+                )
+                response.raise_for_status()
+            else:
+                await post_external_session_status(
+                    server_client,
+                    session_id=child_session_id,
+                    status=status,
+                    output=output,
+                )
         except Exception:  # noqa: BLE001 — the polling backstop re-delivers
             _logger.warning(
                 "Failed to report an untracked sub-agent terminal status for %s",
@@ -7106,7 +7140,13 @@ def create_runner_app(
             )
 
     def _post_untracked_subagent_terminal_soon(
-        child_session_id: str, *, status: str, output: str | None, require_parent: bool = False
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        require_parent: bool = False,
+        sdk_peer_delivery: dict[str, str] | None = None,
+        response_id: str | None = None,
     ) -> None:
         """Schedule :func:`_post_untracked_subagent_terminal` on the loop.
 
@@ -7123,7 +7163,12 @@ def create_runner_app(
             return
         task = loop.create_task(
             _post_untracked_subagent_terminal(
-                child_session_id, status=reported, output=output, require_parent=require_parent
+                child_session_id,
+                status=reported,
+                output=output,
+                require_parent=require_parent,
+                sdk_peer_delivery=sdk_peer_delivery,
+                response_id=response_id,
             )
         )
         task.add_done_callback(_background_tasks.discard)
@@ -9813,8 +9858,11 @@ def create_runner_app(
                         )
                     _peer_harness = _session_harness_name(conversation_id)
                     if (
-                        _peer_harness not in {"claude-sdk", "codex"}
-                        or conversation_id in _child_session_parents
+                        _peer_harness not in {"claude-sdk", "codex", "pi"}
+                        or (
+                            conversation_id in _child_session_parents
+                            and (_peer_harness != "pi" or conversation_id in _active_turns)
+                        )
                         or pending_approvals.has_pending(conversation_id)
                         or not _peer_delivery.text
                     ):
@@ -10043,6 +10091,8 @@ def create_runner_app(
                 _begin_turn_slot(conversation_id)
                 if _peer_delivery is not None:
                     _track_sdk_peer(conversation_id, _peer_delivery)
+                    if _session_harness_name(conversation_id) == "pi":
+                        _pi_peer_turns[conversation_id] = _peer_delivery.metadata()
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -10139,21 +10189,17 @@ def create_runner_app(
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
             peer_turn = data.get("peer_turn") if isinstance(data, dict) else None
+            sdk_peer_turn = isinstance(data, dict) and data.get("sdk_peer_turn") is True
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
-            # A peer turn is a child turn the server attributed to a peer message
-            # from a session other than this child's mother. It is kept as a
-            # silent copy on the mother's runner only when the child has no
-            # mother-owned open entry — none, a terminal one, or a recovered one.
-            # The decision is taken here, before any await: the server attributed
-            # the turn from the child's transcript, so a mother dispatch
-            # registered during the awaits that follow belongs to a later turn
-            # and keeps its own open entry.
+            # Native peer turns are copies only without a mother-owned open entry.
+            # An SDK peer turn started idle; an open entry now belongs to a later dispatch.
             _peer_entry = get_subagent_work(conversation_id)
             peer_copy = (
                 isinstance(peer_turn, dict)
                 and status in ("idle", "completed", "failed", "stopped", "killed")
                 and (
-                    _peer_entry is None
+                    sdk_peer_turn
+                    or _peer_entry is None
                     or _peer_entry.status in _SUBAGENT_TERMINAL_STATUSES
                     or _peer_entry.recovered
                 )
@@ -11988,7 +12034,7 @@ def create_runner_app(
                     and new_items
                     and new_items[-1].get("role") == "user"
                     and not (
-                        _session_harness_name(session_id) in {"claude-sdk", "codex"}
+                        _session_harness_name(session_id) in {"claude-sdk", "codex", "pi"}
                         and _trailing_sdk_peer_item(all_new)
                     )
                 ):

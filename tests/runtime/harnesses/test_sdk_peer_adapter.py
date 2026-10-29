@@ -2,14 +2,17 @@
 
 import asyncio
 import contextlib
+import json
 
 import pytest
 
 from omnigent.inner.executor import Executor, ExecutorError, TurnComplete
+from omnigent.inner.pi_executor import _PiSessionState
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.sdk_peer_delivery import SDKPeerOutcome
 from omnigent.server.schemas import CreateResponseRequest, SDKPeerReceiptEvent
+from tests.inner.test_pi_executor import _executor_with_scripted_rpc
 from tests.runtime.harnesses.test_executor_adapter import _OneInjectionCtx
 
 _METADATA = {"peer_id": "a" * 32, "attempt_id": "b" * 32}
@@ -88,3 +91,40 @@ async def test_idle_peer_needs_actual_executor_evidence(events, outcome):
             receipts.append(event)
     assert len(receipts) == 1
     assert receipts[0].outcome == outcome
+
+
+@pytest.mark.parametrize("consumed", [False, True])
+async def test_idle_pi_peer_requires_final_user_consumption(consumed):
+    wire = [
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "reply"},
+        },
+        *(
+            [{"type": "message_end", "message": {"role": "user", "content": "peer"}}]
+            if consumed
+            else []
+        ),
+        {"type": "agent_end", "messages": []},
+    ]
+    executor = _executor_with_scripted_rpc([json.dumps(event) for event in wire])
+    adapter = ExecutorAdapter(lambda: executor)
+    rpc = await executor._ensure_rpc(adapter._session_key, "", None, [])
+    executor._session_states[adapter._session_key] = _PiSessionState(rpc=rpc)
+    queue = asyncio.Queue()
+    ctx = TurnContext(response_id="response", event_queue=queue, cancelled=asyncio.Event())
+    request = CreateResponseRequest(
+        model="test", input="peer", peer_delivery=_METADATA, peer_delivery_start=True
+    )
+    try:
+        await adapter.run_turn(request, ctx)
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        receipts = [event for event in events if isinstance(event, SDKPeerReceiptEvent)]
+        assert len(receipts) == 1
+        assert receipts[0].outcome == ("accepted" if consumed else "unknown")
+        if consumed:
+            assert receipts[0].proof_source == "pi_user_message_end"
+    finally:
+        await executor.close()

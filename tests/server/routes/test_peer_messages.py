@@ -1666,7 +1666,7 @@ async def test_pi_rpc_idle_delivers_and_busy_queues(
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pi RPC has no live peer-steer capability; its idle turn still starts."""
+    """Without SDK peer opt-in Pi RPC delivers idle and queues busy."""
     sender = peer_env["sender"]
     receiver = peer_env["receiver"]
     peer_env["conv_store"].update_conversation(receiver.id, harness_override="pi")
@@ -1696,8 +1696,20 @@ async def test_pi_rpc_idle_delivers_and_busy_queues(
     assert len(fake.calls) == 1
 
 
-@pytest.mark.parametrize("harness", ["codex", "claude-sdk"])
-@pytest.mark.parametrize("gate", ["ready", "missing_capability", "flag_off", "approval", "child"])
+@pytest.mark.parametrize("harness", ["codex", "claude-sdk", "pi"])
+@pytest.mark.parametrize(
+    "gate",
+    [
+        "ready",
+        "missing_capability",
+        "missing_pi_capability",
+        "flag_off",
+        "approval",
+        "child",
+        "idle_child",
+        "busy_child",
+    ],
+)
 async def test_sdk_peer_steering_requires_live_capability_and_input_gate(
     peer_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, harness: str, gate: str
 ) -> None:
@@ -1707,19 +1719,28 @@ async def test_sdk_peer_steering_requires_live_capability_and_input_gate(
     receiver, sender = peer_env["receiver"], peer_env["sender"]
     conv_store = peer_env["conv_store"]
     conv_store.update_conversation(receiver.id, harness_override=harness)
-    if gate == "child":
+    if gate in {"child", "idle_child", "busy_child"}:
         receiver = conv_store.create_conversation(
             title="child",
             agent_id=AGENT_ID,
             runner_id=receiver.runner_id,
             parent_conversation_id=sender.id,
-            kind="default",
+            kind="sub_agent",
             harness_override=harness,
+            labels={WRAPPER_LABEL_KEY: "claude-code-native-ui-subagent"}
+            if gate == "child"
+            else {},
         )
-    monkeypatch.setitem(cast(Any, sessions_module._session_status_cache), receiver.id, "running")
+    monkeypatch.setitem(
+        cast(Any, sessions_module._session_status_cache),
+        receiver.id,
+        "idle" if gate == "idle_child" else "running",
+    )
 
     class Router:
         def runner_has_capability(self, runner_id: str, capability: str) -> bool:
+            if gate == "missing_pi_capability" and capability == "pi_rpc_peer_receipts_v1":
+                return False
             return gate != "missing_capability" or capability != SDK_PEER_CAPABILITY
 
     app = _build_peer_app(
@@ -1758,13 +1779,15 @@ async def test_sdk_peer_steering_requires_live_capability_and_input_gate(
                 headers=_headers(ALICE, peer_env["sender_token"]),
             )
         assert response.status_code == 200, response.text
-        if gate == "child":
+        if gate == "child" or (gate in {"idle_child", "busy_child"} and harness != "pi"):
             assert response.json()["disposition"] == "refused"
             assert peer_env["fake"].calls == []
             return
         record = peer_env["peer_store"].get(response.json()["peer_id"])
         assert response.json()["disposition"] == "queued"
-        if gate == "ready":
+        if gate in {"ready", "idle_child"} or (
+            gate == "missing_pi_capability" and harness != "pi"
+        ):
             assert record.state == "delivering"
             assert sdk_attempt(record.reason)[1] == "wait"
             assert peer_env["fake"].calls[0]["data"]["peer_delivery"] == {

@@ -390,6 +390,14 @@ class ExecutorAdapter(HarnessApp):
             )
             initial_peer = None
 
+        async def report_initial_peer(outcome: SDKPeerOutcome) -> None:
+            if initial_peer is not None and (
+                outcome.peer_id == initial_peer.peer_id
+                and outcome.attempt_id == initial_peer.attempt_id
+            ):
+                initial_peer_receipt(outcome.outcome, outcome.proof_source)
+
+        explicit_initial_receipt = False
         # Watcher forwards mid-turn steering injections into the in-flight executor session.
         injection_watcher = asyncio.create_task(
             self._watch_injections(ctx, executor),
@@ -426,6 +434,10 @@ class ExecutorAdapter(HarnessApp):
                         model=request.model_override or request.model,
                     )
 
+                if initial_peer is not None:
+                    explicit_initial_receipt = await executor.prepare_peer_turn(
+                        self._session_key, initial_peer, report_initial_peer
+                    )
                 response_text: str | None = None
                 async for event in executor.run_turn(
                     messages=messages,
@@ -436,7 +448,8 @@ class ExecutorAdapter(HarnessApp):
                     if isinstance(
                         event, (TextChunk, ReasoningChunk, ToolCallRequest, TurnComplete)
                     ):
-                        initial_peer_receipt("accepted", "sdk_turn_response")
+                        if not explicit_initial_receipt:
+                            initial_peer_receipt("accepted", "sdk_turn_response")
                     elif isinstance(event, ExecutorError) and event.undelivered:
                         initial_peer_receipt("refused", "sdk_turn_not_started")
                     if ctx.cancelled.is_set():

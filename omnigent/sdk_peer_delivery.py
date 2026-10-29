@@ -9,6 +9,7 @@ from typing import Literal
 
 SDK_PEER_CAPABILITY = "sdk_peer_receipts_v1"
 CLAUDE_SDK_PEER_CAPABILITY = "claude_sdk_hook_receipts_v1"
+PI_RPC_PEER_CAPABILITY = "pi_rpc_peer_receipts_v1"
 SDK_PEER_RECEIPT_EVENT = "sdk_peer_delivery_receipt"
 SDK_PEER_STREAM_EVENT = "sdk.peer.receipt"
 

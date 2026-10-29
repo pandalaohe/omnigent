@@ -50,7 +50,11 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     _websocket_http_status,
     serve_tunnel,
 )
-from omnigent.sdk_peer_delivery import CLAUDE_SDK_PEER_CAPABILITY, SDK_PEER_CAPABILITY
+from omnigent.sdk_peer_delivery import (
+    CLAUDE_SDK_PEER_CAPABILITY,
+    PI_RPC_PEER_CAPABILITY,
+    SDK_PEER_CAPABILITY,
+)
 from omnigent.startup_protocol import CONTEXT_INVENTORY_V2
 
 
@@ -91,6 +95,7 @@ async def test_hello_advertises_only_available_sdk_peer_receipts(
     hello = decode_frame(sent[0])
     assert isinstance(hello, HelloFrame)
     assert SDK_PEER_CAPABILITY in hello.capabilities
+    assert PI_RPC_PEER_CAPABILITY in hello.capabilities
     assert (CLAUDE_SDK_PEER_CAPABILITY in hello.capabilities) is claude_supported
 
 

@@ -1908,6 +1908,14 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
         nested_item = body.data.get("item_data")
+        if "sdk_peer_delivery" in body.data and (
+            body.type != _EXTERNAL_SESSION_STATUS_TYPE
+            or not _has_bound_runner_authority(request, conv)
+        ):
+            raise OmnigentError(
+                "SDK peer terminal metadata requires the current bound runner",
+                code=ErrorCode.FORBIDDEN,
+            )
         if any(key in body.data for key in ("startup_attempt", "startup_required")):
             raise OmnigentError("Startup metadata is server-owned", code=ErrorCode.FORBIDDEN)
         if not trusted_peer and (
@@ -3308,6 +3316,67 @@ def register_events_routes(
                     f"{body.type} data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            sdk_peer_terminal = "sdk_peer_delivery" in body.data
+            sdk_peer_turn = None
+            if sdk_peer_terminal:
+                from omnigent.server.routes.sessions.peer_child_turn import wait_for_sdk_peer_turn
+                from omnigent.server.routes.sessions.routes_peer import (
+                    peer_thread_origin_is_receiver,
+                )
+
+                try:
+                    sdk_delivery = SDKPeerInput.from_metadata(body.data["sdk_peer_delivery"], "")
+                except ValueError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+                output = body.data.get("output")
+                active_response = _session_active_response_cache.get(session_id)
+                if (
+                    conv.kind != "sub_agent"
+                    or conv.parent_conversation_id is None
+                    or peer_message_store is None
+                    or not isinstance(response_id, str)
+                    or not isinstance(output, str)
+                    or (active_response is not None and active_response != response_id)
+                    or await asyncio.to_thread(
+                        _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                    )
+                    != "pi"
+                    or not await wait_for_sdk_peer_turn(
+                        conversation_store,
+                        peer_message_store,
+                        conv,
+                        sdk_delivery,
+                        response_id,
+                        output,
+                    )
+                ):
+                    return {"queued": False}
+                record = await asyncio.to_thread(peer_message_store.get, sdk_delivery.peer_id)
+                if record is None:
+                    return {"queued": False}
+                if (
+                    record.sender_session_id != conv.parent_conversation_id
+                    and not await asyncio.to_thread(
+                        peer_thread_origin_is_receiver, peer_message_store, record
+                    )
+                ):
+                    flags = feature_flags if feature_flags is not None else resolve_feature_flags()
+                    if not flags.enabled(Feature.SESSION_PEER_MESSAGING):
+                        return {"queued": False}
+                    sdk_peer_turn = await asyncio.to_thread(
+                        classify_child_turn,
+                        conversation_store,
+                        peer_message_store,
+                        conv,
+                        output,
+                        sdk_delivery=sdk_delivery,
+                        response_id=response_id,
+                    )
+                    if sdk_peer_turn is None:
+                        return {"queued": False}
+                active_response = _session_active_response_cache.get(session_id)
+                if active_response is not None and active_response != response_id:
+                    return {"queued": False}
             force_native_child_fanout = False
             if status == "activity_unverified":
                 from omnigent.server.routes._sessions.subagent_reconciliation import (
@@ -3413,6 +3482,10 @@ def register_events_routes(
             data = await _enrich_terminal_status_with_subagent_output(
                 body.data, status, session_id, conversation_store
             )
+            if sdk_peer_terminal:
+                active_response = _session_active_response_cache.get(session_id)
+                if active_response is not None and active_response != response_id:
+                    return {"queued": False}
             # Forward only the same bounded, typed display detail that the
             # Server accepted. The Runner retains this across reconnects, so
             # raw/nested/oversized task objects must not become resident there.
@@ -3537,6 +3610,10 @@ def register_events_routes(
                 # recovered terminal state. The replay was validated above and
                 # returns before Runner delivery, so this cannot wake work.
                 _session_status_cache.pop(session_id, None)
+            if sdk_peer_terminal:
+                active_response = _session_active_response_cache.get(session_id)
+                if active_response is not None and active_response != response_id:
+                    return {"queued": False}
             _publish_status(
                 session_id,
                 public_status,
@@ -3614,6 +3691,7 @@ def register_events_routes(
             # ``peer_turn`` from the edge data before classification, then set
             # it only from the server's own classifier hit.
             data.pop("peer_turn", None)
+            data.pop("sdk_peer_turn", None)
             # Attribute a dispatched child's settling turn to a peer sender so
             # the parent's runner can keep a silent copy instead of a result.
             # Stateless and best-effort: any error, including one before the
@@ -3627,13 +3705,15 @@ def register_events_routes(
                 flags = feature_flags if feature_flags is not None else resolve_feature_flags()
                 if flags.enabled(Feature.SESSION_PEER_MESSAGING):
                     try:
-                        peer_turn = await asyncio.to_thread(
-                            classify_child_turn,
-                            conversation_store,
-                            peer_message_store,
-                            conv,
-                            data.get("output"),
-                        )
+                        peer_turn = sdk_peer_turn
+                        if not sdk_peer_terminal:
+                            peer_turn = await asyncio.to_thread(
+                                classify_child_turn,
+                                conversation_store,
+                                peer_message_store,
+                                conv,
+                                data.get("output"),
+                            )
                     except Exception:
                         _logger.warning(
                             "Peer turn classification dispatch failed (%s)",
@@ -3643,6 +3723,8 @@ def register_events_routes(
                         peer_turn = None
                     if peer_turn is not None:
                         data["peer_turn"] = peer_turn.as_dict()
+                        if sdk_peer_terminal:
+                            data["sdk_peer_turn"] = True
             if (
                 conv.kind == "sub_agent"
                 and status in {"idle", "completed", "failed", "stopped", "killed"}
