@@ -8148,6 +8148,17 @@ def start_tool_relay(
     async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
         return await relay._tool_executor(name, arguments)
 
+    def _current_tool_names() -> set[str]:
+        raw = relay._relay_info.get("tools")
+        if not isinstance(raw, list):
+            return set()
+        return {
+            name
+            for item in raw
+            if isinstance(item, dict)
+            if isinstance(name := item.get("name"), str)
+        }
+
     handler_cls = _tool_relay_handler_factory(
         token,
         _execute_current_tool,
@@ -8158,6 +8169,7 @@ def start_tool_relay(
         file_change_observer=file_change_observer,
         permission_tier_control=permission_tier_control,
         pi_scope_relay=pi_scope_relay,
+        scoped_tool_names=_current_tool_names,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     if pi_scope_relay is not None:
@@ -8469,6 +8481,7 @@ def _tool_relay_handler_factory(
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
     permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
     pi_scope_relay: PiScopeRelay | None = None,
+    scoped_tool_names: Callable[[], set[str]] | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -8569,6 +8582,44 @@ def _tool_relay_handler_factory(
                 return
             self._send_json(response)
 
+        def _handle_pi_rpc(self) -> None:
+            authorization = self.headers.get("Authorization")
+
+            async def authenticate() -> None:
+                if pi_scope_relay is None:
+                    raise ValueError("Pi RPC unavailable")
+                record = pi_scope_relay.authenticate(authorization, "/pi/rpc")
+                if record.status != "ready":
+                    raise ValueError("Pi RPC unavailable")
+
+            future = asyncio.run_coroutine_threadsafe(authenticate(), loop)
+            try:
+                future.result(timeout=5.0)
+            except Exception:  # noqa: BLE001 - no untrusted body decoding or fallback
+                future.cancel()
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            payload = self._read_json_body()
+            if payload is None or set(payload) != {"payload"} or pi_scope_relay is None:
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            result = asyncio.run_coroutine_threadsafe(
+                pi_scope_relay.execute_rpc(
+                    authorization,
+                    payload["payload"],
+                    tool_executor,
+                    scoped_tool_names() if scoped_tool_names is not None else set(),
+                ),
+                loop,
+            )
+            try:
+                response = result.result(timeout=_TOOL_CALL_TIMEOUT_S)
+                self._send_json(response)
+            except Exception:  # noqa: BLE001 - scoped transport errors contain no raw tool exception
+                result.cancel()
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+
         def do_POST(self) -> None:
             """
             Accept one MCP tool call or policy evaluation from the Claude helper process.
@@ -8577,6 +8628,9 @@ def _tool_relay_handler_factory(
             """
             if self.path == "/pi/bootstrap" and pi_scope_relay is not None:
                 self._handle_bootstrap()
+                return
+            if self.path == "/pi/rpc":
+                self._handle_pi_rpc()
                 return
             if self.path not in (
                 "/tool",

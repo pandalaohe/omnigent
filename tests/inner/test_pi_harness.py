@@ -197,6 +197,41 @@ def test_permission_bootstrap_requires_harness_auth() -> None:
     assert response.status_code == 401
 
 
+def test_scoped_prepare_uses_authenticated_harness_route_without_returning_capability(
+    tmp_path, monkeypatch
+):
+    from omnigent.inner.pi_executor import PiExecutor
+
+    executor = PiExecutor(pi_path="/opt/bin/pi", permission_controlled=True)
+    calls = []
+
+    async def prepare(session_id, locator):
+        calls.append((session_id, locator))
+        return {"pid": 123, "started_at": 10.0, "handoff": str(locator)}
+
+    monkeypatch.setattr(executor, "prepare_scoped_bootstrap", prepare)
+    monkeypatch.setattr(pi_harness, "_build_pi_executor", lambda: executor)
+    app = pi_harness.create_app()
+    app.state.conversation_id = "test-session"
+    app.state.harness_auth_token = "test-token"
+    locator = tmp_path / ("a" * 32 + ".json")
+    with TestClient(app) as client:
+        denied = client.post(
+            "/v1/permission-tier/bootstrap",
+            json={"session_id": "test-session", "phase": "prepare", "handoff": str(locator)},
+        )
+        assert denied.status_code == 401
+        assert calls == []
+        response = client.post(
+            "/v1/permission-tier/bootstrap",
+            headers={"Authorization": "Bearer test-token"},
+            json={"session_id": "test-session", "phase": "prepare", "handoff": str(locator)},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"pid": 123, "started_at": 10.0, "handoff": str(locator)}
+    assert calls == [("test-session", locator)]
+
+
 @pytest.mark.parametrize("sdk_missing", [True, False])
 def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch, sdk_missing):
     from omnigent.inner.pi_executor import PiExecutor

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import start_tool_relay
+from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.permission_tiers import NativeCallBinding
 from omnigent.permission_tiers import _native_digest as native_digest
 from omnigent.runner.pi_bootstrap import process_identity
@@ -94,6 +96,12 @@ async def test_bootstrap_rejects_scope_and_forged_authority_before_payload_decod
             )
             assert response.status_code in (401, 403)
         assert decoded == []
+        for value in ["invalid", relay._relay_info["token"]]:
+            response = await client.post(
+                "/pi/rpc", content=b"not JSON", headers={"Authorization": "Bearer " + value}
+            )
+            assert response.status_code == 403
+        assert decoded == []
         malformed = await client.post(
             "/pi/bootstrap",
             content=b"not JSON",
@@ -108,6 +116,63 @@ async def test_bootstrap_rejects_scope_and_forged_authority_before_payload_decod
         )
         assert unknown.status_code == 403
     assert runtime.pi_scopes.record(admission.principal).status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_runner_adapter_uses_minted_execution_kind_and_tcp_rejects_parent_token(
+    attestor_relay,
+):
+    from omnigent.inner.pi_executor import _ToolServer
+
+    runtime, broker, relay, _source, _registry = attestor_relay
+    _actor, admission = await bind_ready(runtime, broker, relay)
+    for local in [True, False]:
+        receipt = runtime.pi_origin_receipt(
+            "session-a",
+            admission.credential,
+            call_id=f"placement-{local}",
+            name="read",
+            arguments={"path": "notes.txt"},
+            local_execution=local,
+        )
+        assert (
+            runtime.pi_execution_kind("session-a", receipt.token, legacy_local_execution=not local)
+            is local
+        )
+    with pytest.raises(ValueError):
+        runtime.pi_execution_kind("session-a", None, legacy_local_execution=True)
+    server = _ToolServer()
+    server._permission_bridge_dir = runtime.path("session-a").parent
+    server.scoped_required = True
+    await server.start()
+    try:
+        for frame in [
+            {
+                "id": "forged",
+                "kind": "pi_scoped",
+                "credential": server.token,
+                "payload": "not JSON",
+            },
+            {
+                "id": "parent",
+                "kind": "tool_call",
+                "token": server.token,
+                "tool": "read",
+                "args": {},
+            },
+        ]:
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            try:
+                writer.write(json.dumps(frame).encode() + b"\n")
+                await writer.drain()
+                response = json.loads(await asyncio.wait_for(reader.readline(), 5))
+                assert "error" in response
+                assert "result" not in response
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        await server.stop()
 
 
 @pytest.mark.asyncio
@@ -231,6 +296,87 @@ lines.once('line', async line => {
         assert result["posts"] == 0
         assert actor.token.encode() not in output + error
         assert admission.credential.encode() not in output + error
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_private_handoff_reaches_only_registered_node_and_is_consumed_once(attestor_relay):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for private handoff proof")
+    _runtime, broker, _relay, _source, _registry = attestor_relay
+    locator = broker.reserve_handoff()
+    module = Path(__file__).resolve().parents[2] / "omnigent/resources/pi_native/scoped_client.cjs"
+    script = """
+require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection}) => {
+  connection.close(); console.log('consumed');
+}).catch(() => {console.log('handoff refused');process.exitCode=1;});
+"""
+    process = await asyncio.create_subprocess_exec(
+        node,
+        "-e",
+        script,
+        str(module),
+        str(locator),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        identity = process_identity(process.pid)
+        assert identity is not None
+        actor = broker.register_process(process.pid, expected_identity=identity, root=True)
+        broker.publish_handoff(actor, locator)
+        output, error = await asyncio.wait_for(process.communicate(), 5)
+        assert process.returncode == 0, error.decode()
+        assert output == b"consumed\n"
+        assert actor.token.encode() not in output + error
+        assert not locator.exists()
+        with pytest.raises(ValueError):
+            broker.publish_handoff(actor, locator)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["normal", "loss", "replacement"])
+async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mode):
+    node, pi = shutil.which("node"), shutil.which("pi")
+    if not node or not pi:
+        pytest.skip("installed Pi SDK and Node required")
+    sdk = next(
+        (
+            parent
+            for parent in Path(pi_cli_argv(pi)[-1]).resolve().parents
+            if (parent / "package.json").is_file() and (parent / "dist/index.js").is_file()
+        ),
+        None,
+    )
+    if sdk is None or json.loads((sdk / "package.json").read_text()).get("version") != "1.3.0":
+        pytest.skip("the pinned Pi SDK 1.3.0 is required")
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(Path(__file__).with_name("pi_scoped_sdk_consumer.py")),
+        node,
+        str(sdk),
+        mode,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        output, error = await asyncio.wait_for(process.communicate(), 30)
+        assert process.returncode == 0, (output + error).decode()
+        assert b'"receiptExcluded":true' in output
+        expected = (
+            b'"evaluate": 3, "execute": 3, "finish": 3'
+            if mode == "normal"
+            else b'"evaluate": 1, "execute": 1, "finish": 0'
+        )
+        assert expected in output
     finally:
         if process.returncode is None:
             process.kill()

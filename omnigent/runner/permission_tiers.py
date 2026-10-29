@@ -264,7 +264,17 @@ class PermissionTierRuntime:
             session_id
         )
 
-    def begin_pi_scope_launch(self, session_id: str) -> PiScopeAdmission:
+    def pi_execution_kind(
+        self, session_id: str, receipt: object, *, legacy_local_execution: bool
+    ) -> bool:
+        """Adapters derive v2 execution placement from the minted receipt."""
+        if not self.pi_scope_protocol_active(session_id):
+            return legacy_local_execution
+        return self.pi_scopes.resolve(session_id, receipt).local_execution
+
+    def begin_pi_scope_launch(
+        self, session_id: str, *, native_guard: bool = False
+    ) -> PiScopeAdmission:
         """Called by the trusted bootstrap, never by a tool/event payload."""
         state = self.state(session_id)
         if (
@@ -278,7 +288,7 @@ class PermissionTierRuntime:
         self.pi_scopes.begin_launch(session_id)
         self._inspected.pop(session_id, None)
         self._finished.pop(session_id, None)
-        return self._open_pi_scope(session_id, origin="parent")
+        return self._open_pi_scope(session_id, origin="parent", native_guard=native_guard)
 
     def open_pi_child_scope(self, session_id: str) -> PiScopeAdmission:
         """Allocate an independent loader installation from the host bootstrap."""
@@ -289,7 +299,7 @@ class PermissionTierRuntime:
         session_id: str,
         *,
         origin: Literal["parent", "child"],
-        native_child_guard: bool = False,
+        native_guard: bool = False,
     ) -> PiScopeAdmission:
         state = self.state(session_id)
         if state is None or self._harnesses.get(session_id) not in ("pi", "pi-native"):
@@ -302,9 +312,7 @@ class PermissionTierRuntime:
             or expected.get("harness") != self._harnesses[session_id]
         ):
             raise ValueError("Pi enforcement belongs to another launch")
-        if native_child_guard:
-            if origin != "child":
-                raise ValueError("Pi child guard requires a child installation")
+        if native_guard:
             guard = (
                 Path(__file__).resolve().parent.parent
                 / "resources/pi_native/omnigent_pi_child_extension.js"

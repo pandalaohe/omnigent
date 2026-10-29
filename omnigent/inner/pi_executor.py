@@ -59,6 +59,8 @@ from typing import Any, Literal, NotRequired, Protocol, TypeAlias, TypedDict, ca
 from urllib.parse import urlparse as _urlparse
 from uuid import uuid4
 
+import httpx
+
 from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
 from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
 from omnigent.debug_logging import debug_event
@@ -381,6 +383,7 @@ class _ToolServer:
         ) = None
         self._pi_session_event: PiSessionEventReporter | None = None
         self._clients: set[asyncio.Task[None]] = set()
+        self.scoped_required = False
 
     async def start(self) -> int:
         """Start listening on a random port. Returns the port number."""
@@ -456,6 +459,27 @@ class _ToolServer:
                 # Authenticate before any dispatch; close the connection on
                 # failure (unlike the malformed-frame ``continue`` below).
                 kind = request.get("kind")
+                if kind == "pi_scoped":
+                    response = await self._forward_scoped_rpc(
+                        request.get("credential"), request.get("payload")
+                    )
+                    response["id"] = request.get("id")
+                    writer.write(
+                        (
+                            _safe_dumps(cast(dict[str, Any], public_pi_value(response)), None)
+                            + "\n"
+                        ).encode()
+                    )
+                    await writer.drain()
+                    continue
+                if self.scoped_required and kind not in {
+                    "gateway_auth",
+                    "pi_usage_event",
+                    "pi_warm_probe",
+                }:
+                    writer.write(b'{"error":"scoped Pi transport required"}\n')
+                    await writer.drain()
+                    break
                 authenticated = (
                     self._pi_usage_token_ok(request.get("session_id"), request.get("token"))
                     if kind in {"pi_usage_event", "pi_warm_probe"}
@@ -683,6 +707,50 @@ class _ToolServer:
             :attr:`token`, compared in constant time.
         """
         return isinstance(presented, str) and hmac.compare_digest(presented, self.token)
+
+    async def _forward_scoped_rpc(self, credential: object, payload: object) -> dict[str, Any]:
+        """Forward opaque inner frames to the runner's existing principal validator."""
+        if (
+            not isinstance(credential, str)
+            or not isinstance(payload, str)
+            or self._permission_bridge_dir is None
+        ):
+            return {"error": "scoped Pi transport unavailable"}
+        try:
+            relay = json.loads((self._permission_bridge_dir / "tool_relay.json").read_text())
+            endpoint = relay.get("url") if isinstance(relay, dict) else None
+            if not isinstance(endpoint, str):
+                return {"error": "scoped Pi transport unavailable"}
+            parsed = _urlparse(endpoint)
+            if (
+                parsed is None
+                or parsed.scheme != "http"
+                or parsed.hostname not in ("127.0.0.1", "::1")
+                or not parsed.port
+                or parsed.username
+                or parsed.password
+                or parsed.path not in ("", "/")
+                or parsed.query
+                or parsed.fragment
+            ):
+                return {"error": "scoped Pi transport unavailable"}
+            async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+                response = await client.post(
+                    endpoint.rstrip("/") + "/pi/rpc",
+                    headers={"Authorization": "Bearer " + credential},
+                    json={"payload": payload},
+                    timeout=_NATIVE_POLICY_APPROVAL_TIMEOUT_S,
+                )
+            if response.status_code != 200:
+                return {"error": "scoped Pi transport unavailable"}
+            result = response.json()
+            return (
+                cast(dict[str, Any], public_pi_value(result))
+                if isinstance(result, dict)
+                else {"error": "scoped Pi transport unavailable"}
+            )
+        except Exception:  # noqa: BLE001 - do not export private frames or proxy exceptions
+            return {"error": "scoped Pi transport unavailable"}
 
     def issue_pi_usage_token(self, session_id: str) -> str:
         token = secrets.token_urlsafe(32)
@@ -1220,6 +1288,7 @@ def _generate_extension_js(
     session_id: str | None = None,
     usage_session_id: str | None = None,
     usage_token: str | None = None,
+    scoped_bootstrap: bool = False,
 ) -> str:
     """Generate a JavaScript Pi extension that registers Omnigent tools.
 
@@ -1313,6 +1382,9 @@ def _generate_extension_js(
     )
     usage_hook = "installUsageHooks(pi);" if usage_setup else ""
 
+    scoped_support = (
+        pathlib.Path(__file__).resolve().parent.parent / "resources/pi_native/native_support.cjs"
+    )
     return f"""\
 // Auto-generated Omnigent tool bridge extension for Pi.
 // Connects to the Omnigent TCP tool server on port {port}.
@@ -1323,11 +1395,20 @@ const BRIDGED = new Set();
 const PI_NATIVE_TOOLS = new Set(["read", "bash", "write", "edit"]);
 const PORT = {port};
 const TOKEN = {token_json};
+const SCOPED_BOOTSTRAP = {json.dumps(scoped_bootstrap)};
 {permission_setup}
 {usage_setup}
 
 /** Send a tool call request over TCP and return the result. */
-function callTool(toolName, args, callId) {{
+function callTool(toolName, args, callId, ctx) {{
+  if (SCOPED_BOOTSTRAP) {{
+    const support = require({json.dumps(str(scoped_support))});
+    const event = {{toolCallId:callId, toolName, input:args}};
+    return support.callScopedBridge(event, ctx, PORT).then(response => {{
+      const value = response.error ? {{error:"Scoped Pi bridge unavailable"}} : response.result;
+      return {{content:[{{type:"text",text:JSON.stringify(value)}}],isError:!!response.error}};
+    }});
+  }}
   return new Promise((resolve) => {{
     // Idempotent settle: a tool call must resolve exactly once. Route every
     // resolve through finish() so a late "close" after a real "data" response
@@ -1445,6 +1526,7 @@ module.exports = function(pi) {{
   // escape all guardrails. Bridged tools ARE evaluated server-side at /mcp,
   // so skip them here to avoid double-evaluation (and double ASK prompts).
   pi.on("tool_call", async (event) => {{
+    if (SCOPED_BOOTSTRAP) return;
     if (!event || typeof event.toolName !== "string" || !event.toolName) {{
       return {{ block: true, reason: "invalid tool call" }};
     }}
@@ -1472,7 +1554,7 @@ module.exports = function(pi) {{
       promptSnippet: tool.promptSnippet || tool.description,
       parameters: tool.parameters || {{ type: "object", properties: {{}} }},
       async execute(toolCallId, _params, _signal, _onUpdate, _ctx) {{
-        return callTool(tool.name, _params, toolCallId);
+        return callTool(tool.name, _params, toolCallId, _ctx);
       }},
     }});
     BRIDGED.add(tool.name);
@@ -3331,6 +3413,7 @@ class PiExecutor(Executor):
 
         self._session_states: dict[str, _PiSessionState] = {}
         self._peer_initial: dict[str, _PiPeerPending] = {}
+        self._scoped_handoffs: dict[str, pathlib.Path] = {}
         self._context_incarnation = uuid4().hex
         self._context_records: dict[str, ContextRecordV2] = {}
         self._context_bindings: dict[str, tuple[str, int]] = {}
@@ -3769,6 +3852,7 @@ class PiExecutor(Executor):
             await self._tool_server.start()
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
+        self._tool_server.scoped_required = bool(self._scoped_handoffs)
         self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
         self._tool_server._pi_session_event = (
             self._report_pi_session_usage if self._pi_session_event is not None else None
@@ -4046,6 +4130,7 @@ class PiExecutor(Executor):
                         session_id=permission_session_id,
                         usage_session_id=usage_session_id,
                         usage_token=usage_token,
+                        scoped_bootstrap=permission_session_id in self._scoped_handoffs,
                     )
                 )
             if permission_bridge_dir is not None and permission_session_id is not None:
@@ -4067,6 +4152,9 @@ class PiExecutor(Executor):
                         self._pi_path,
                         extra_args,
                         extension=pathlib.Path(ext_path),
+                        scoped_handoff=self._scoped_handoffs.get(permission_session_id)
+                        if permission_session_id is not None
+                        else None,
                     )
                     sandbox_launch = _try_sandbox_pi(
                         launcher,
@@ -4285,6 +4373,7 @@ class PiExecutor(Executor):
         thinking: str | None = None,
         *,
         permission_bootstrap: bool = False,
+        scoped_prepare: bool = False,
     ) -> _PiRpcSession:
         """Get or create a Pi RPC subprocess for the given session.
 
@@ -4312,7 +4401,7 @@ class PiExecutor(Executor):
             and state.model == effective_model
             and state.tool_names == effective_tool_names
         ):
-            if self._permission_controlled:
+            if self._permission_controlled and not scoped_prepare:
                 await self._await_permission_installation(session_key, state.rpc)
             return state.rpc
 
@@ -4402,7 +4491,7 @@ class PiExecutor(Executor):
                 extra_args=extra_args or None,
                 launcher_args=subprocess_config.launcher_args,
             )
-            if self._permission_controlled:
+            if self._permission_controlled and not scoped_prepare:
                 await self._await_permission_installation(session_key, rpc)
             if self._session_states.get(session_key) is not state or state.rpc is not previous_rpc:
                 raise RuntimeError("Pi RPC owner changed during startup")
@@ -4456,6 +4545,42 @@ class PiExecutor(Executor):
         self._permission_session_id = session_id
         await self._ensure_rpc(session_id, "", None, [], permission_bootstrap=True)
         return True
+
+    async def prepare_scoped_bootstrap(
+        self, session_id: str, locator: pathlib.Path
+    ) -> dict[str, object]:
+        """Authenticated runner-only prepare phase; Node waits before SDK loading."""
+        from omnigent.runner.pi_bootstrap import process_identity
+
+        bridge = bridge_dir_for_session_id(session_id).resolve()
+        try:
+            permission = read_host_permission_state(bridge / HOST_PERMISSION_STATE_FILE)
+        except (OSError, TypeError, ValueError):
+            raise PiPermissionBootstrapError("Pi scoped process preparation unavailable") from None
+        if (
+            not self._permission_controlled
+            or self._sandboxed
+            or permission.session_id != session_id
+            or permission.status != "ready"
+            or permission.tier == "full"
+            or locator.parent != bridge / "pi-bootstrap"
+            or not re.fullmatch(r"[0-9a-f]{32}\.json", locator.name)
+            or locator.exists()
+            or locator.is_symlink()
+            or self._session_states.get(session_id, _PiSessionState()).rpc is not None
+        ):
+            raise PiPermissionBootstrapError("Pi scoped process preparation unavailable")
+        self._scoped_handoffs[session_id] = locator
+        if self._tool_server is not None:
+            self._tool_server.scoped_required = True
+        rpc = await self._ensure_rpc(
+            session_id, "", None, [], permission_bootstrap=True, scoped_prepare=True
+        )
+        identity = process_identity(rpc.process.pid) if rpc.process is not None else None
+        if identity is None:
+            await rpc.close()
+            raise PiPermissionBootstrapError("Pi scoped process identity unavailable")
+        return {"pid": identity[0], "started_at": identity[1], "handoff": str(locator)}
 
     async def run_turn(
         self,

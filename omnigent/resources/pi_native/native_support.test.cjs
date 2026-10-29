@@ -7,7 +7,7 @@ const {pathToFileURL} = require("node:url");
 const support = require("./native_support.cjs");
 const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
 
-async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false} = {}) {
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
   t.after(() => fs.rmSync(root, {recursive:true, force:true}));
   const workspace = path.join(root, "workspace");
@@ -62,7 +62,7 @@ export async function resolveSubagentLaunchContract(input) {
       const extensions=[];
       for (const item of this.extensionFactories) {
         const extension={path:`<inline:${item.name}>`,handlers:new Map()};
-        await item.factory({on(name, handler) { const handlers=extension.handlers.get(name)||[]; handlers.push(handler); extension.handlers.set(name,handlers); }});
+        await item.factory({on(name, handler) { const handlers=extension.handlers.get(name)||[]; handlers.push((...args)=>handler(...args)); extension.handlers.set(name,handlers); }});
         extensions.push(extension);
       }
       return {extensions,errors:[],runtime};
@@ -83,7 +83,7 @@ export async function resolveSubagentLaunchContract(input) {
   const dispose = installNativeSupportBootstrap(sdk, {
     sdkVersion:"1.3.0",
     prepareLoader:() => ({getState:()=>state,checkInput(file){assert.ok(path.isAbsolute(file));}}),
-    describeSession:() => ({scope,api,getState:()=>state,workspace,bridgeDir:root,parentSession:actual,
+    describeSession:() => (asyncDescriptor ? value=>Promise.resolve(value) : value=>value)({scope,api,getState:()=>state,workspace,bridgeDir:root,parentSession:actual,scopedClient,
       requiredIdentities:[support.snapshot(guard)],configInputs:[],settingsPaths:[],
       beforeClose:async()=>({revoked:true,scope_id:scope.scope_id,installation_id:scope.installation_id})}),
     evaluate:noEvaluator ? undefined : async (_event, _ctx, fact) => {policyCalls++;facts.push(fact);return {block:false};},
@@ -119,6 +119,31 @@ test("verified native source still requires admitted sync/async and action seman
       assert.equal(f.facts[0].binding.arguments_digest.length,64);
     });
   }
+});
+
+test("acknowledged async binding wraps root definitions and keeps receipts private", async t => {
+  const seen=[];
+  const client={
+    evaluate:async()=>({block:false}),
+    execute:async(event,ctx,start)=>{seen.push([event.toolCallId,ctx.cwd]);return start();},
+    finish:async event=>{seen.push(["finish",event.toolCallId]);return true;},
+    seal(){seen.push(["seal"]);},close:async()=>{seen.push(["close"]);},
+    project:value=>value,
+  };
+  const f=await fixture(t,{scopedClient:client,asyncDescriptor:true});
+  const event={toolCallId:"scoped-read",toolName:"read",input:{path:"notes"}};
+  assert.equal(await f.final(event,f.ctx),undefined);
+  await f.actual.getToolDefinition("read").execute(event.toolCallId,event.input);
+  assert.deepEqual(seen,[["scoped-read",f.workspace],["finish","scoped-read"]]);
+  assert.equal(f.backendStarts(),1);
+  const originalDefinition=f.actual.getToolDefinition;
+  f.actual.getToolDefinition=()=>({execute:()=>{throw new Error("replacement must not run");}});
+  const changed=await f.final({...event,toolCallId:"replacement"},f.ctx);
+  assert.equal(changed.block,true);
+  f.actual.getToolDefinition=originalDefinition;
+  await support.closeNativeSession(f.actual.sessionManager);
+  await assert.rejects(async()=>f.actual.getToolDefinition("read").execute("late",{}),/sealed/);
+  assert.equal(f.backendStarts(),1);
 });
 test("source proof cannot bypass workflow/machine/cwd/output or extra fields", async t => {
   const additions=[{workflow:"unknown"},{machine:"unknown"},{worktree:true},{cwd:"child"},{options:{output:"other"}}, {options:{sessionDir:"other"}}, {options:{acceptance:{run:"echo changed"}}}, {options:null}];

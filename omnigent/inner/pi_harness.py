@@ -427,6 +427,15 @@ def create_app() -> FastAPI:
         adapter._session_key = session_id
         try:
             executor = adapter._ensure_executor()
+            if payload.get("phase") == "prepare":
+                locator = payload.get("handoff")
+                if not isinstance(executor, PiExecutor) or not isinstance(locator, str):
+                    return JSONResponse({"installed": False}, status_code=400)
+                return JSONResponse(
+                    await executor.prepare_scoped_bootstrap(session_id, Path(locator))
+                )
+            if payload.get("phase") not in (None, "confirm"):
+                return JSONResponse({"installed": False}, status_code=400)
             installed = isinstance(
                 executor, PiExecutor
             ) and await executor.bootstrap_permission_tier(session_id)

@@ -6,10 +6,14 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
+import re
 import secrets
+import stat
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -57,6 +61,7 @@ class PiAttestorProcess:
     previous_digest: str = ""
     previous_reply: dict[str, object] = field(default_factory=dict, repr=False)
     closed: bool = False
+    handoff: Path | None = field(default=None, repr=False)
 
 
 class PiBootstrapBroker:
@@ -128,7 +133,7 @@ class PiBootstrapBroker:
         admission: PiScopeAdmission | None = None
         if root:
             self.invalidate()
-            admission = self.runtime.begin_pi_scope_launch(self.session_id)
+            admission = self.runtime.begin_pi_scope_launch(self.session_id, native_guard=True)
             epoch = admission.principal.launch_epoch
         else:
             epochs = {a.launch_epoch for a in self._actors.values() if a.root and not a.closed}
@@ -143,6 +148,48 @@ class PiBootstrapBroker:
         )
         self._actors[hashlib.sha256(token.encode()).hexdigest()] = actor
         return actor
+
+    def reserve_handoff(self) -> Path:
+        """Private launcher locator, allocated before the Node process exists."""
+        directory = self.runtime.path(self.session_id).parent.resolve() / "pi-bootstrap"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+        ):
+            raise ValueError("Pi bootstrap handoff directory unavailable")
+        return directory / (uuid4().hex + ".json")
+
+    def publish_handoff(self, actor: PiAttestorProcess, destination: Path) -> None:
+        """Deliver directly to the independent preload, never through tool results."""
+        directory = self.runtime.path(self.session_id).parent.resolve() / "pi-bootstrap"
+        if (
+            not self.live(actor)
+            or actor.handoff is not None
+            or destination.parent != directory
+            or destination.exists()
+            or destination.is_symlink()
+            or not re.fullmatch(r"[0-9a-f]{32}\.json", destination.name)
+        ):
+            raise ValueError("Pi bootstrap handoff unavailable")
+        # Revalidate ownership and no-follow posture at publication as well as reservation.
+        self.reserve_handoff()
+        atomic_write_json(
+            destination,
+            {
+                "protocol": 1,
+                "pid": actor.pid,
+                "endpoint": self.endpoint,
+                "credential": actor.token,
+                "brokerIncarnation": self.incarnation,
+                "launchEpoch": actor.launch_epoch,
+                "statePath": str(self.runtime.path(self.session_id)),
+                "bridgeDir": str(directory.parent),
+            },
+        )
+        actor.handoff = destination
 
     def authenticate(self, authorization: str | None) -> PiAttestorProcess:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -167,6 +214,9 @@ class PiBootstrapBroker:
         if actor.closed:
             return
         actor.closed = True
+        if actor.handoff is not None:
+            with suppress(FileNotFoundError):
+                actor.handoff.unlink()
         admissions = list(actor.installations.values())
         if actor.initial_root is not None:
             admissions.append(actor.initial_root)
@@ -256,7 +306,7 @@ class PiBootstrapBroker:
                 admission, actor.initial_root = actor.initial_root, None
             else:
                 admission = self.runtime._open_pi_scope(
-                    self.session_id, origin=origin, native_child_guard=origin == "child"
+                    self.session_id, origin=origin, native_guard=True
                 )
             if admission.principal.launch_epoch != actor.launch_epoch:
                 raise ValueError("Pi bootstrap launch changed")

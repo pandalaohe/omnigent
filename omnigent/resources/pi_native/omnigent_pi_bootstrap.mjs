@@ -37,7 +37,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
   };
   wraps.reload = async function (...args) {
     const previous = store.loaders.get(this);
-    if (previous?.manager) nativeSupport.closeNativeSession(previous.manager);
+    if (previous?.manager) await nativeSupport.closeNativeSession(previous.manager);
     const profile = prepareLoader(this);
     if (!profile || typeof profile.getState !== "function")
       throw new Error("Native loader profile is unavailable");
@@ -55,7 +55,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
     const final = await this.loadExtensionFactories.call({cwd:this.cwd, eventBus:this.eventBus,
       extensionFactories:[{name:"omnigent-native-final", factory(api) {
         state.finalHook = async (event, ctx) => {
-          state.bind(store.sessions.get(ctx.sessionManager));
+          await state.bind(store.sessions.get(ctx.sessionManager));
           const current = profile.getState();
           if (!current || current.status !== "ready") return {block:true, reason:"Native permission state is unavailable"};
           if (current.tier === "full") return evaluate ? nativeSupport.policyVerdict(await evaluate(event, ctx, null)) : undefined;
@@ -68,18 +68,27 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
       }}]}, result.runtime);
     if (final.errors.length || final.extensions.length !== 1) throw new Error("Native final hook could not be installed");
     state.finalExtension = final.extensions[0];
+    const registered = state.finalExtension.handlers.get("tool_call");
+    if (!Array.isArray(registered) || registered.length !== 1 || typeof registered[0] !== "function")
+      throw new Error("Native SDK final handler identity is unavailable");
+    state.finalHook = registered[0];
     result.extensions.push(state.finalExtension);
     if (before.some((entry, index) => result.extensions[index] !== entry)) throw new Error("Native bootstrap changed SDK extension order");
-    state.bind = actual => {
+    state.bind = async actual => {
       if (!actual || actual.resourceLoader !== this) throw new Error("Native SDK session/loader identity is missing");
       if (state.manager === actual.sessionManager) return;
-      const descriptor = describeSession(actual, state);
-      nativeSupport.bindNativeSession(actual, {...descriptor, sources:state.sources,
-        getState:profile.getState, bridgeDir:profile.bridgeDir || descriptor.bridgeDir,
-        isInstalled:() => installation.active,
-        evaluateScope:evaluate || descriptor.evaluateScope,
-        finalExtension:state.finalExtension, finalHook:state.finalHook});
-      state.manager = actual.sessionManager;
+      if (!state.binding) state.binding = (async () => {
+        const descriptor = await describeSession(actual, state);
+        if (!installation.active || store.loaders.get(this) !== state)
+          throw new Error("Native installation changed while binding");
+        nativeSupport.bindNativeSession(actual, {...descriptor, sources:state.sources,
+          getState:profile.getState, bridgeDir:profile.bridgeDir || descriptor.bridgeDir,
+          isInstalled:() => installation.active,
+          evaluateScope:evaluate || descriptor.evaluateScope,
+          finalExtension:state.finalExtension, finalHook:state.finalHook});
+        state.manager = actual.sessionManager;
+      })();
+      await state.binding;
     };
   };
   for (const [name, implementation] of Object.entries(wraps)) loader[name] = implementation;
@@ -88,7 +97,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
     const state = store.loaders.get(this.resourceLoader);
     if (!state) throw new Error("Native SDK session was created without independent bootstrap");
     const result = await bind.apply(this, args);
-    if (state.profile.getState().tier !== "full") state.bind(this);
+    if (state.profile.getState().tier !== "full") await state.bind(this);
     return result;
   };
   session.bindExtensions = bindWrapped;

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
+from omnigent.permission_tiers.pi_private import public_pi_value
+from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
 from omnigent.runner.pi_bootstrap import PiBootstrapBroker
 from omnigent.runner.pi_scopes import PiScopeRecord
 from omnigent.server.permission_tiers import BoundToolCall
@@ -29,6 +33,7 @@ class PiScopeRelay:
             "/policies/evaluate",
             "/permission-tiers/control",
             "/permission-tiers/state",
+            "/pi/rpc",
         ):
             raise ValueError("Pi scope cannot access this relay operation")
         if not authorization or not authorization.startswith("Bearer "):
@@ -75,19 +80,79 @@ class PiScopeRelay:
             or not isinstance(call_id, str)
         ):
             raise ValueError("Malformed scoped Pi tool call")
+        state = self.runtime.state(self.session_id)
+        if state is None:
+            raise ValueError("Pi scope state unavailable")
+        registry = read_pi_tool_registry(
+            record.admission.registry_dir, state, expected_binding=record.expected
+        )
         receipt = self.runtime.pi_origin_receipt(
             self.session_id,
             record.admission.credential,
             call_id=call_id,
             name=name,
             arguments=arguments,
-            local_execution=True,
+            local_execution=name not in registry.bridge_tools,
         )
         return {
             **payload,
             "pi_origin_receipt": receipt.token,
             "event": {**event, "data": {**data, "call_id": receipt.binding.call_id}},
         }
+
+    async def execute_rpc(
+        self,
+        authorization: str | None,
+        opaque_payload: object,
+        tool_executor: Callable[[str, dict[str, object]], Awaitable[object]],
+        tool_names: set[str],
+    ) -> dict[str, object]:
+        """Shared native/TCP entry; authentication precedes inner JSON decoding."""
+        record = self.authenticate(authorization, "/pi/rpc")
+        if (
+            record.status != "ready"
+            or not isinstance(opaque_payload, str)
+            or len(opaque_payload) > 1024 * 1024
+        ):
+            raise ValueError("Pi RPC payload unavailable")
+        payload = json.loads(opaque_payload)
+        if not isinstance(payload, dict) or set(payload) - {
+            "call_id",
+            "expected_revision",
+            "pi_origin_receipt",
+            "arguments_digest",
+            "name",
+            "arguments",
+            "operation_id",
+            "step",
+        }:
+            raise ValueError("Pi RPC binding unavailable")
+        self._bound_call(record, payload, settlement=False)
+        receipt = self.runtime.pi_scopes.resolve(self.session_id, payload.get("pi_origin_receipt"))
+        name, arguments = payload.get("name"), payload.get("arguments")
+        if (
+            receipt.local_execution
+            or not isinstance(name, str)
+            or name not in tool_names
+            or not isinstance(arguments, dict)
+        ):
+            raise ValueError("Pi RPC tool unavailable")
+        if not self.runtime.verify_execute(
+            self.session_id,
+            call_id=payload.get("call_id"),
+            revision=payload.get("expected_revision"),
+            arguments_digest=payload.get("arguments_digest"),
+            name=name,
+            arguments=arguments,
+            operation_id=payload.get("operation_id"),
+            step="rpc",
+            origin_receipt=payload.get("pi_origin_receipt"),
+        ):
+            raise ValueError("Pi RPC execution unavailable")
+        # No scheduling point between the live execution fence and dispatch entry.
+        result = await tool_executor(name, arguments)
+        projected = public_pi_value(result)
+        return {"result": projected}
 
     def _bound_call(
         self, record: PiScopeRecord, payload: dict[str, object], *, settlement: bool

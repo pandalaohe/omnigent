@@ -1,5 +1,8 @@
 const crypto = require("node:crypto");
 const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+const net = require("node:net");
 
 const privateKeys = new Set(["pi_origin_receipt","permission_tier_binding","scope_credential","attestor_credential","process_capability"]);
 function publicValue(value) {
@@ -88,7 +91,14 @@ function createScopedClient({scope, transport, readState, recheck}) {
       throw new Error("Scoped Pi revocation was not acknowledged");
     return reply;
   }
-  return Object.freeze({evaluate,execute,finish,close,seal});
+  async function bridge(event, port) {
+    const call=calls.get(event.toolCallId);
+    if(!call || call.phase!=="executing" || call.signature!==fingerprint(event) || !current(call.revision))
+      return {error:"Scoped Pi bridge unavailable"};
+    try {return publicValue(await transport.rpc(port,metadata(call)));}
+    catch (_) {return {error:"Scoped Pi bridge unavailable"};}
+  }
+  return Object.freeze({evaluate,execute,finish,close,seal,bridge,project:publicValue});
 }
 
 /** A pinned, loopback-only control/continuity channel; capabilities stay in this closure. */
@@ -159,9 +169,54 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       execute:(metadata,onResponse)=>request("/permission-tiers/control",{type:"permission_tier_execute",...metadata},scopeCredential,onResponse),
       finish:metadata=>request("/permission-tiers/control",{type:"permission_tier_finish",...metadata},scopeCredential),
       revoke:()=>control("revoke",{handle}),
+      rpc:(port,metadata)=>new Promise((resolve,reject)=>{
+        if(!Number.isInteger(port)||port<1||port>65535){reject(new Error("Scoped Pi bridge unavailable"));return;}
+        const id=crypto.randomUUID();let text="",settled=false;
+        const socket=net.createConnection({port,host:"127.0.0.1"});
+        const fail=()=>{if(!settled){settled=true;reject(new Error("Scoped Pi bridge unavailable"));}socket.destroy();};
+        socket.on("connect",()=>socket.write(JSON.stringify({id,kind:"pi_scoped",credential:scopeCredential,payload:JSON.stringify(metadata)})+"\n"));
+        socket.on("data",chunk=>{
+          text+=chunk;
+          if(text.length>1024*1024){fail();return;}
+          const end=text.indexOf("\n");if(end<0)return;
+          try {const reply=JSON.parse(text.slice(0,end));if(reply.id!==id){fail();return;}settled=true;resolve(reply);socket.destroy();}
+          catch(_){fail();}
+        });
+        socket.on("error",fail);socket.on("close",()=>{if(!settled)fail();});
+        socket.setTimeout(86400000,fail);
+      }),
     }});
   }
   return Object.freeze({bind:values=>control("bind",values),client,close:()=>{lose();watch.destroy();}});
 }
 
-module.exports={createScopedClient,connectAttestor,publicValue};
+async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
+  if(typeof locator!=="string" || !path.isAbsolute(locator) || !/^[a-f0-9]{32}\.json$/.test(path.basename(locator)))
+    throw new Error("Scoped Pi handoff locator unavailable");
+  const directory=path.dirname(locator), info=fs.lstatSync(directory);
+  if(!info.isDirectory() || info.mode&0o077 || process.getuid&&info.uid!==process.getuid() || fs.realpathSync(directory)!==directory)
+    throw new Error("Scoped Pi handoff directory unavailable");
+  const deadline=Date.now()+timeoutMs;
+  while(!fs.existsSync(locator) && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,10));
+  let descriptor;
+  const fd=fs.openSync(locator,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
+  try {
+    const opened=fs.fstatSync(fd), before=fs.lstatSync(locator);
+    if(!opened.isFile() || !fs.constants.O_NOFOLLOW || opened.mode&0o077 ||
+      process.getuid&&opened.uid!==process.getuid() || before.ino!==opened.ino || before.dev!==opened.dev || opened.size>16384)
+      throw new Error("Scoped Pi handoff identity unavailable");
+    descriptor=JSON.parse(fs.readFileSync(fd,"utf8"));
+    const after=fs.lstatSync(locator);
+    if(after.ino!==opened.ino || after.dev!==opened.dev || after.size!==opened.size || after.mtimeMs!==opened.mtimeMs)
+      throw new Error("Scoped Pi handoff changed");
+    fs.unlinkSync(locator);
+  } finally {fs.closeSync(fd);}
+  if(descriptor?.protocol!==1 || descriptor.pid!==process.pid ||
+    !/^pi_attestor_[A-Za-z0-9_-]{43}$/.test(descriptor.credential||"") ||
+    descriptor.bridgeDir!==path.dirname(directory) || !path.isAbsolute(descriptor.statePath||""))
+    throw new Error("Scoped Pi handoff binding unavailable");
+  const connection=await connectAttestor(descriptor);
+  return Object.freeze({connection,bridgeDir:descriptor.bridgeDir,statePath:descriptor.statePath});
+}
+
+module.exports={createScopedClient,connectAttestor,connectFromHandoff,publicValue};

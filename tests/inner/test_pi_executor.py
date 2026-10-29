@@ -3775,6 +3775,33 @@ class TestResolveModel(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tier", "status"), [("full", "ready"), ("auto", "blocked")])
+async def test_scoped_prepare_requires_ready_restricted_state_before_spawn(
+    tmp_path, monkeypatch, tier, status
+):
+    from omnigent.inner.pi_executor import PiPermissionBootstrapError
+
+    monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/opt/bin/pi")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 3, 0))
+    monkeypatch.setattr("omnigent.inner.pi_executor.bridge_dir_for_session_id", lambda _: tmp_path)
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState("session", "host", str(tmp_path), tier, 3, status),
+    )
+    executor = PiExecutor(cwd=str(tmp_path), permission_controlled=True)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("scoped preparation must refuse before spawn")
+
+    monkeypatch.setattr(executor, "_ensure_rpc", forbidden)
+    with pytest.raises(PiPermissionBootstrapError):
+        await executor.prepare_scoped_bootstrap(
+            "session", tmp_path / "pi-bootstrap" / ("a" * 32 + ".json")
+        )
+    assert executor._scoped_handoffs == {}
+
+
 @pytest.mark.parametrize("permission_tier", ["ask", "full"])
 def test_controlled_rpc_launch_orders_user_extensions_before_guard(
     tmp_path, monkeypatch, permission_tier
@@ -3792,7 +3819,8 @@ def test_controlled_rpc_launch_orders_user_extensions_before_guard(
     monkeypatch.setattr("omnigent.inner.pi_executor.prepare_bridge_dir", lambda _: bridge)
     observed = []
 
-    def ordered(executable, args, *, extension):
+    def ordered(executable, args, *, extension, scoped_handoff=None):
+        assert scoped_handoff is None
         observed.append(executable)
         return "/opt/launchers/permission-pi", ["--approve", "--model", "demo"]
 

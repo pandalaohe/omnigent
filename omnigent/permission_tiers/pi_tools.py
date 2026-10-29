@@ -23,6 +23,7 @@ class PiToolRegistry:
     tool_names: frozenset[str] = frozenset()
     registration_digest: str | None = None
     native_tools: dict[str, str] = field(default_factory=dict)
+    bridge_tools: frozenset[str] = frozenset()
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, ...]:
@@ -160,6 +161,7 @@ def read_pi_tool_registry(
         names: set[str] = set()
         invalid: set[str] = set()
         native_tools: dict[str, str] = {}
+        bridge_tools: set[str] = set()
         native_packages: dict[str, str] = {}
         for tool in tools:
             if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
@@ -183,6 +185,7 @@ def read_pi_tool_registry(
                 if source.get("source") == "builtin" and path == f"builtin:{name}":
                     continue
                 if path in (str(guard), "<inline:omnigent-permission>"):
+                    bridge_tools.add(name)
                     continue
             if scoped and (
                 not isinstance(source, dict)
@@ -315,6 +318,7 @@ def read_pi_tool_registry(
                 else None
             ),
             native_tools=native_tools,
+            bridge_tools=frozenset(bridge_tools),
         )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return PiToolRegistry(

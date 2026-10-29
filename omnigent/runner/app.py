@@ -7880,7 +7880,11 @@ def create_runner_app(
                         name=cast(str, event.get("name")),
                         arguments=arguments,
                         expected_revision=cast(int, event.get("expected_revision")),
-                        local_execution=True,
+                        local_execution=permission_tiers.pi_execution_kind(
+                            _captured_session_id,
+                            event.get("pi_origin_receipt"),
+                            legacy_local_execution=True,
+                        ),
                         origin_receipt=event.get("pi_origin_receipt"),
                     )
                     return {
@@ -10929,7 +10933,11 @@ def create_runner_app(
                     name=body["name"],
                     arguments=body["arguments"],
                     expected_revision=body["expected_revision"],
-                    local_execution=local_execution,
+                    local_execution=permission_tiers.pi_execution_kind(
+                        conversation_id,
+                        body.get("pi_origin_receipt"),
+                        legacy_local_execution=local_execution,
+                    ),
                     origin_receipt=body.get("pi_origin_receipt"),
                 )
             except (KeyError, OSError, TypeError, ValueError):

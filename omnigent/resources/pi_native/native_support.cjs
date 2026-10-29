@@ -7,6 +7,7 @@ const { pathToFileURL } = require("node:url");
 const key = Symbol.for("omnigent.pi.native-support.v2");
 const store = globalThis[key] ||= { bindings: new WeakMap(), loaders: new WeakMap(), sessions: new WeakMap() };
 store.apiRecords ||= new WeakMap();
+store.definitionOwners ||= new WeakMap();
 const plain = value => value && typeof value === "object" && !Array.isArray(value);
 const text = value => typeof value === "string" && value.trim().length > 0;
 const integer = (value, minimum = 1) => Number.isSafeInteger(value) && value >= minimum;
@@ -316,6 +317,9 @@ async function classifyNativeCall(event, ctx, state) {
     if (current.length !== record.loaded.length || current.some((entry, index) => entry !== record.loaded[index]) || current.at(-1) !== record.finalExtension ||
         current.at(-1).handlers.get("tool_call").at(-1) !== record.finalHook || digest(toolSnapshot(record.session)) !== record.registrationDigest)
       return failed(bound, "Native loader, final hook or registrations changed");
+    if (record.definitions && ([...record.definitions].some(([definition, wrapper]) => definition.execute !== wrapper) ||
+        [...record.definitionNames].some(([name, definition]) => record.session.getToolDefinition(name) !== definition)))
+      return failed(bound, "Native SDK execution boundary changed");
     const inputs = [];
     for (const expected of record.inputs) {
       const actual = protectedInput(record, expected.path, expected.sha256 === null);
@@ -413,6 +417,9 @@ function bindNativeSession(session, descriptor) {
       !["parent", "child"].includes(descriptor.scope.origin) || typeof descriptor.isInstalled !== "function" ||
       !Array.isArray(descriptor.sources) || !descriptor.sources.length || !Array.isArray(descriptor.requiredIdentities) || !descriptor.requiredIdentities.length)
     throw new Error("Native bootstrap binding is incomplete");
+  const client = descriptor.scopedClient;
+  if (client && ["evaluate", "execute", "finish", "seal", "close", "project"].some(name => typeof client[name] !== "function"))
+    throw new Error("Native scoped client is incomplete");
   const loaded = session.resourceLoader.getExtensions().extensions;
   if (loaded.at(-1) !== descriptor.finalExtension || loaded.at(-1).handlers.get("tool_call").at(-1) !== descriptor.finalHook)
     throw new Error("Native final hook is not installed");
@@ -460,9 +467,52 @@ function bindNativeSession(session, descriptor) {
   for (const file of settingsPaths) record.inputs.push(protectedInput(record,file,true));
   const previous = store.bindings.get(session.sessionManager);
   if (previous && !previous.closed) throw new Error("Native loader already has an installation");
+  if (client) {
+    if (typeof session.getToolDefinition !== "function") throw new Error("Native execution boundary is unavailable");
+    record.contexts = new Map();
+    record.definitions = new Map();
+    record.definitionNames = new Map();
+    record.scopedClient = client;
+    record.evaluateScope = async (event, ctx, support) => {
+      const verdict = await client.evaluate(event, ctx, support);
+      if (verdict?.block === false && !record.closed) record.contexts.set(event.toolCallId, ctx);
+      return verdict;
+    };
+    for (const tool of session.getAllTools()) {
+      const definition = session.getToolDefinition(tool.name);
+      if (!definition || typeof definition.execute !== "function") throw new Error("Native tool definition is unavailable");
+      const owner = store.definitionOwners.get(definition);
+      if (owner && !owner.record.closed) throw new Error("Native tool definition is shared by active installations");
+      const original = owner?.original || definition.execute;
+      const wrapper = async function (...args) {
+        if (record.closed || !record.isInstalled()) throw new Error("Native execution is sealed");
+        const event = {toolCallId:args[0], toolName:tool.name, input:args[1]};
+        const ctx = record.contexts.get(event.toolCallId);
+        if (!ctx) throw new Error("Native execution has no scoped policy context");
+        try {
+          return await client.execute(event, ctx, () => {
+            if (record.closed || !record.isInstalled()) throw new Error("Native execution is sealed");
+            const input = [...args];
+            if (typeof input[3] === "function") {
+              const update = input[3];
+              input[3] = value => update(client.project(value));
+            }
+            return original.apply(this, input);
+          });
+        } finally {
+          record.contexts.delete(event.toolCallId);
+          if (!await client.finish(event)) throw new Error("Native execution settlement was not acknowledged");
+        }
+      };
+      definition.execute = wrapper;
+      record.definitions.set(definition, wrapper);
+      record.definitionNames.set(tool.name, definition);
+      store.definitionOwners.set(definition, {record, original});
+    }
+  }
   if (lifecycle) {
     if (typeof session.getToolDefinition !== "function") throw new Error("Native execution boundary is unavailable");
-    for (const tool of session.getAllTools()) {
+    for (const tool of client ? [] : session.getAllTools()) {
       const definition = session.getToolDefinition(tool.name);
       if (!definition || typeof definition.execute !== "function") throw new Error("Native tool definition is unavailable");
       const execute = definition.execute;
@@ -471,9 +521,10 @@ function bindNativeSession(session, descriptor) {
         return execute.apply(this, args);
       };
     }
-    lifecycle.closingSignal.addEventListener("abort", () => {record.closed = true;}, {once:true});
+    lifecycle.closingSignal.addEventListener("abort", () => {record.closed = true;client?.seal();}, {once:true});
     lifecycle.bindHost({id:`omnigent:${record.scope.scope_id}`, async beforeClose(event) {
       record.closed = true;
+      client?.seal();
       const ack = await descriptor.beforeClose(event);
       if (!ack || ack.revoked !== true || ack.scope_id !== record.scope.scope_id || ack.installation_id !== record.scope.installation_id)
         throw new Error("Native child revocation acknowledgement was rejected");
@@ -487,8 +538,10 @@ function requireNativeSession(ctx) {
   const loader = session && store.loaders.get(session.resourceLoader);
   if (loader?.profile.getState().tier === "full") return;
   if (!loader || typeof loader.bind !== "function") throw new Error("Independent native bootstrap is missing");
-  loader.bind(session);
-  if (!store.bindings.has(ctx.sessionManager)) throw new Error("Native bootstrap did not bind this SDK session");
+  const ready = loader.bind(session);
+  const check = () => {if (!store.bindings.has(ctx.sessionManager)) throw new Error("Native bootstrap did not bind this SDK session");};
+  if (ready && typeof ready.then === "function") return ready.then(check);
+  check();
 }
 async function loadPackageApi(directory, sdk) {
   const manifest = snapshot(path.join(directory, "package.json"));
@@ -517,7 +570,13 @@ function getNativeState(ctx) {
   const session = store.sessions.get(ctx?.sessionManager);
   return record?.getState() || (session && store.loaders.get(session.resourceLoader)?.profile.getState()) || null;
 }
-function closeNativeSession(manager) { const record = store.bindings.get(manager); if (record) record.closed = true; }
+function closeNativeSession(manager) {
+  const record = store.bindings.get(manager);
+  if (!record) return;
+  record.closed = true;
+  record.scopedClient?.seal();
+  return record.scopedClient?.close();
+}
 function hasScopedEvaluator(ctx) { return typeof store.bindings.get(ctx?.sessionManager)?.evaluateScope === "function"; }
 function policyVerdict(value) {
   if (!plain(value) || typeof value.block !== "boolean") return {block:true, reason:"Native scoped policy returned no usable verdict"};
@@ -529,4 +588,10 @@ async function evaluateNativeCall(event, ctx, support) {
   try { return policyVerdict(await record.evaluateScope(event, ctx, support)); }
   catch (_error) { return {block:true, reason:"Scoped native policy could not be evaluated"}; }
 }
-module.exports = {bindNativeSession, classifyNativeCall, requireNativeSession, semanticAction, snapshot, loadPackageApi, getNativeState, closeNativeSession, hasScopedEvaluator, evaluateNativeCall, policyVerdict, createInputGuard};
+function callScopedBridge(event, ctx, port) {
+  const record=store.bindings.get(ctx?.sessionManager);
+  if(!record || record.closed || !record.isInstalled() || typeof record.scopedClient?.bridge!=="function")
+    return Promise.resolve({error:"Scoped Pi bridge unavailable"});
+  return record.scopedClient.bridge(event,port);
+}
+module.exports = {bindNativeSession, classifyNativeCall, requireNativeSession, semanticAction, snapshot, loadPackageApi, getNativeState, closeNativeSession, hasScopedEvaluator, evaluateNativeCall, policyVerdict, createInputGuard, callScopedBridge};
