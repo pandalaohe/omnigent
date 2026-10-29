@@ -87,6 +87,7 @@ def test_arclet_first_prompt_uses_connected_arca_skills(
             "harness": [harness],
             "path": ["~"],
             "agent_id": [chat.agent_id],
+            "allow_pending": ["true"],
         }
     ]
     assert creates == []

@@ -60,6 +60,15 @@ class _Terminal:
         bridge.write_tmux_target(
             self.directory, socket_path=tmp_path / "socket", tmux_target="main"
         )
+        bridge._write_json_file(
+            self.directory / bridge._STATE_FILE,
+            {
+                "accepted_input_tmux": {
+                    "socket_path": str(tmp_path / "socket"),
+                    "tmux_target": "main",
+                }
+            },
+        )
 
     @property
     def pending(self) -> bool:

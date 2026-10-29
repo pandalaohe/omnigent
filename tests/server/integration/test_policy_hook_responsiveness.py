@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Iterator
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any
@@ -35,6 +36,26 @@ from tests.server.helpers import create_test_agent, policy_tool_call_request
 
 pytestmark = pytest.mark.asyncio
 _request_context: ContextVar[str | None] = ContextVar("policy_hook_test_context", default=None)
+POLICY_REGISTRY = [
+    {"handler": f"{__name__}.{name}", "kind": "callable"}
+    for name in (
+        "_allow",
+        "_write_label",
+        "_deny_with_label",
+        "_allow_with_state",
+        "_deny_with_state",
+        "_ask_with_state",
+    )
+]
+
+
+@pytest.fixture(autouse=True)
+def _register_test_policy_handlers() -> Iterator[None]:
+    from omnigent.policies.registry import load_registry
+
+    load_registry([__name__])
+    yield
+    load_registry()
 
 
 def _allow(event: dict[str, Any]) -> PolicyResult:

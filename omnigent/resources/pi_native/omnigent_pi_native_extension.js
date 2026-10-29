@@ -2135,7 +2135,6 @@ module.exports = function (pi) {
   process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
   const history = createHistoryQueue(config);
-  pi.on("session_shutdown", () => history.close());
   pi.on("session_compact", async (_event, ctx) => {
     const manager = ctx?.sessionManager;
     if (typeof manager?.buildSessionProjection !== "function") return;
@@ -2227,7 +2226,7 @@ module.exports = function (pi) {
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
-  const postedAssistantMessages = new Set();
+  const postedMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   let toolCallBytes = 0;
@@ -3077,6 +3076,7 @@ module.exports = function (pi) {
     clearTimeout(pi.__omnigentRotationRetry);
     clearInterval(pi.__omnigentInboxPoller);
     pi.__omnigentInboxPoller = null;
+    await history.close();
   });
 
   pi.on("session_start", async (event, ctx) => {
@@ -3338,7 +3338,7 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
-    postedAssistantMessages.clear();
+    postedMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
     toolCallBytes = 0;
@@ -3583,17 +3583,22 @@ module.exports = function (pi) {
       // message_end is the first durable signal that it consumed the prompt.
       const text = textFromMessage(message).trim();
       if (!text) return;
-      await postEvent(config, {
-        type: "external_conversation_item",
-        data: {
-          response_id: `pi-consumed-user-${Date.now()}-${++sequence}`,
+      const identity = typeof message.timestamp === "number"
+        ? `timestamp:${message.timestamp}` : `callback:${++sequence}`;
+      const sourceId = boundedSourceId(`pi:user:${identity}:${fingerprint(text)}`);
+      if (postedMessages.has(sourceId)) return;
+      history.enqueue(
+        {
+          response_id: `pi-consumed-user-${identity}:${fingerprint(text)}`,
           item_type: "message",
           item_data: {
             role: "user",
             content: [{ type: "input_text", text }],
           },
         },
-      });
+        sourceId,
+        { onAccepted: () => postedMessages.add(sourceId) },
+      );
       return;
     }
     if (role !== "assistant") return;
@@ -3655,7 +3660,7 @@ module.exports = function (pi) {
       return;
     }
     const sourceId = assistantMessageSourceId(message, responseId, text);
-    if (postedAssistantMessages.has(sourceId)) return;
+    if (postedMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
@@ -3672,7 +3677,7 @@ module.exports = function (pi) {
       },
       sourceId,
       {
-        onAccepted: () => postedAssistantMessages.add(sourceId),
+        onAccepted: () => postedMessages.add(sourceId),
         onFailure: () => ctx?.ui?.notify?.(
           "Omnigent could not save the assistant response; see host logs.", "error",
         ),

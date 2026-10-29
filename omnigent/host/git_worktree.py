@@ -237,11 +237,14 @@ def _run_git(
             message += "; " + "; ".join(notes)
         raise WorktreeError(message) from exc
     except subprocess.TimeoutExpired as exc:
-        if create_deadline is not None and cut_by_deadline:
-            raise WorktreeError(
-                f"worktree creation timed out after {create_deadline[1]:.0f}s"
-            ) from exc
-        raise WorktreeError(f"git command timed out after {bound:.0f}s") from exc
+        message = (
+            f"worktree creation timed out after {create_deadline[1]:.0f}s"
+            if create_deadline is not None and cut_by_deadline
+            else f"git command timed out after {bound:.0f}s"
+        )
+        if notes := getattr(exc, "__notes__", None):
+            message += "; " + "; ".join(notes)
+        raise WorktreeError(message) from exc
 
 
 def _run_git_within_budget(

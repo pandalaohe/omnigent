@@ -654,6 +654,7 @@ async def test_offline_sweep_rechecks_runner_after_status_read(
     def rebind_during_read(session_id):
         row = lookup(session_id)
         if rebound:
+            monkeypatch.setattr(store, "get_conversation", lookup)
             store.replace_runner_id(session_id, "runner-replacement")
         return row
 

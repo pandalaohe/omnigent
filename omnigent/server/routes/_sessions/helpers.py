@@ -1350,7 +1350,10 @@ def _signal_harness_elicitation_resolved_by_id(
             "Elicitation does not belong to this session.",
             code=ErrorCode.INVALID_INPUT,
         )
-    if parked is None:
+    entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+    native_delivery = entry is not None and entry[1].get("params", {}).get("native_delivery")
+    # A native receipt confirms delivery, so a re-park must not replay its web verdict.
+    if parked is None or native_delivery:
         # A timed-out record is a refusal, not a tombstone: replacing it
         # with an ordinary one would let a late answer through. Only its
         # own session may leave it alone; a foreign signal is vetoed as
@@ -1368,8 +1371,8 @@ def _signal_harness_elicitation_resolved_by_id(
             created_at=time.time(),
         )
         _prune_pre_resolved_harness_elicitations()
-        return
-    parked.resolved_elsewhere.set()
+    if parked is not None:
+        parked.resolved_elsewhere.set()
 
 
 def _format_sse(event_type: str, data: dict[str, Any]) -> str:

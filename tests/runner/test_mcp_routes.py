@@ -25,6 +25,7 @@ from omnigent.runner import mcp_routes
 from omnigent.runner.mcp_execution_registry import McpExecutionRegistry
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.native.orchestration import ResolvedSpec
+from omnigent.runner.permission_tiers import PermissionTierRuntime
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.harnesses.process_manager import NoLiveHarnessError
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
@@ -166,6 +167,7 @@ class Harness:
             _session_spec_cache=self.spec_cache,
             filesystem_registry=None,
             mcp_execution_registry=self.registry,
+            permission_tiers=PermissionTierRuntime(),
             mcp_manager=mcp_manager,  # type: ignore[arg-type]
             process_manager=process_manager,  # type: ignore[arg-type]
             resource_registry=SessionResourceRegistry(),

@@ -263,9 +263,28 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
             return result
         return await asyncio.sleep(delay, result)
 
+    async def controlled_wait_for(awaitable, timeout=None):
+        if timeout != sessions._HARNESS_ELICITATION_REPARK_GRACE_S:
+            return await asyncio.wait_for(awaitable, timeout)
+        resolved = asyncio.ensure_future(awaitable)
+        expired = asyncio.create_task(grace_expired.wait())
+        try:
+            done, _ = await asyncio.wait({resolved, expired}, return_when=asyncio.FIRST_COMPLETED)
+            if resolved in done:
+                return await resolved
+            raise TimeoutError
+        finally:
+            resolved.cancel()
+            expired.cancel()
+            await asyncio.gather(resolved, expired, return_exceptions=True)
+
     # Hold abandonment cleanup until the pending-card and receipt checks finish.
     monkeypatch.setattr(
-        orchestration, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": controlled_sleep})
+        orchestration,
+        "asyncio",
+        SimpleNamespace(
+            **{**vars(asyncio), "sleep": controlled_sleep, "wait_for": controlled_wait_for}
+        ),
     )
     agent = await create_test_agent(client, "kiro-child-delivery")
     parent = await create_session_for_agent(client, agent["id"])

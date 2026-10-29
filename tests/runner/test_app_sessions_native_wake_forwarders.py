@@ -1807,8 +1807,12 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
 
+        workspace_profile = None
+        agent_pid = None
+
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -1858,6 +1862,9 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        permission_profile: str | None = None,
+        agent_pid: int | None = None,
+        session_id: str | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,

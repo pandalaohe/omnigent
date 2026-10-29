@@ -259,7 +259,7 @@ def test_refreshes_are_noops_outside_an_event_loop() -> None:
 def test_only_a_completed_turn_notifies_the_refresher(monkeypatch: pytest.MonkeyPatch) -> None:
     notified: list[str] = []
     monkeypatch.setattr(server_prs, "notify_turn_end", notified.append)
-    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *_: None)
+    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *_, **__: None)
     session = "c0ffee00c0ffee00c0ffee00c0ffee00"
     monkeypatch.delitem(helpers._session_status_cache, session, raising=False)
 

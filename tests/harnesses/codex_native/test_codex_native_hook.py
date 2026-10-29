@@ -632,7 +632,9 @@ def test_answer_for_a_switched_session_opens_no_window(
     """
     write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:9", ap_auth_headers={})
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_verdict_client(_NO_POLICY_ALLOW))
-    read_state = codex_native_hook.read_bridge_state
+    from omnigent.harnesses.codex_native import bridge
+
+    read_state = bridge.read_bridge_state
 
     def read_then_switch(path: Path) -> CodexNativeBridgeState | None:
         state = read_state(path)
@@ -647,7 +649,7 @@ def test_answer_for_a_switched_session_opens_no_window(
         )
         return state
 
-    monkeypatch.setattr(codex_native_hook, "read_bridge_state", read_then_switch)
+    monkeypatch.setattr(bridge, "read_bridge_state", read_then_switch)
     payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
 
     assert _run_hook(bridge_dir, payload, monkeypatch) == 0

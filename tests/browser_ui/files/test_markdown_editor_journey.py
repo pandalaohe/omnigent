@@ -126,7 +126,10 @@ def test_markdown_comment_boundary_save_reload(
     viewer.get_by_role("button", name="Add Comment", exact=True).click()
     expect(editor.locator('[data-comment-id="boundary-comment"]').first).to_be_visible()
     saved = seeded_session.comments[0]
-    assert [saved["start_index"], saved["end_index"]] == expected_raw
+    assert saved["anchor_content"].startswith("__text__")
+    anchor = json.loads(saved["anchor_content"].removeprefix("__text__"))
+    assert [anchor["source"]["start_index"], anchor["source"]["end_index"]] == expected_raw
+    assert saved["end_index"] - saved["start_index"] == len(anchor["text"])
     assert _highlights(editor) == expected_highlight
     page.reload()
     expect(editor.locator('[data-comment-id="boundary-comment"]').first).to_be_visible(

@@ -519,6 +519,7 @@ async function testPeerReceiptRequiresConsumedUserMessage() {
     { message: { role: "user", content: [{ type: "text", text: envelope }] } },
     {},
   );
+  await new Promise(setImmediate);
   const consumed = userItems();
   assert("consumed steer mirrors once", consumed.length === 1, JSON.stringify(consumed));
   assert(
