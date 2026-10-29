@@ -109,11 +109,15 @@ PEER_HOLD_LIFETIME = 24 * 3600
 # an identical resend is still a duplicate while the earlier copy sits here.
 _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 
-_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
+_STEERABLE_NATIVE_HARNESSES = frozenset(
+    {"claude-native", "codex-native", "pi-native", "antigravity-native"}
+)
 
 # A dispatched child runs its own terminal turn, so a peer message reaches it;
 # native mirrors and SDK children without a result key remain refused.
-_PEER_REACHABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
+_PEER_REACHABLE_NATIVE_HARNESSES = frozenset(
+    {"claude-native", "codex-native", "pi-native", "antigravity-native"}
+)
 
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
@@ -431,7 +435,11 @@ def _is_steerable_harness(conv: Conversation) -> bool:
 
 def _needs_native_peer_receipt(conv: Conversation) -> bool:
     try:
-        return _native_terminal_runtime(conv)[2] in {"codex-native", "pi-native"}
+        return _native_terminal_runtime(conv)[2] in {
+            "codex-native",
+            "pi-native",
+            "antigravity-native",
+        }
     except OmnigentError:
         return False
 
@@ -439,8 +447,8 @@ def _needs_native_peer_receipt(conv: Conversation) -> bool:
 def _peer_reachable_child(conv: Conversation) -> bool:
     """Whether a child session may receive peer messages.
 
-    A dispatched Claude Code / Codex / Pi child runs its own terminal turn on the
-    envelope. Native mirrors route input through their parent's runtime, and
+    A dispatched Claude Code / Codex / Pi / Antigravity child runs its own terminal
+    turn on the envelope. Native mirrors route input through their parent's runtime, and
     SDK / other harnesses have no result key, so both stay refused. A read
     error refuses rather than admitting an unreachable child.
 

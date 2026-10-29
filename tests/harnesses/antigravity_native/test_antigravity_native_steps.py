@@ -110,8 +110,35 @@ class TestUserInputCommitted:
         assert ev.data["item_data"]["content"] == [
             {"type": "input_text", "text": "Say hello in one short sentence."}
         ]
-        # A user turn carries no response_id (not an assistant response).
-        assert "response_id" not in ev.data
+        assert ev.data["response_id"].startswith("agy-consumed-user-")
+        assert len(ev.data["response_id"]) <= 64
+
+    def test_user_input_receipt_follows_native_turn_identity(self) -> None:
+        step = _load("user_input")
+        first = map_step_to_events(step, conversation_id=_CID)[0]
+        assert map_step_to_events(step, conversation_id=_CID)[0] == first
+        step["metadata"]["executionId"] = "another-turn"
+        second = map_step_to_events(step, conversation_id=_CID)[0]
+        assert second.data["response_id"] != first.data["response_id"]
+        other_cascade = map_step_to_events(step, conversation_id="another-cascade")[0]
+        assert other_cascade.data["response_id"] != second.data["response_id"]
+
+    def test_user_input_receipt_fits_storage_with_native_uuid_or_timestamp(self) -> None:
+        cascade = "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+        step = _load("user_input")
+        with_execution = map_step_to_events(step, conversation_id=cascade)[0]
+        del step["metadata"]["executionId"]
+        with_timestamp = map_step_to_events(step, conversation_id=cascade)[0]
+        for event in (with_execution, with_timestamp):
+            assert event.data["response_id"].startswith("agy-consumed-user-")
+            assert len(event.data["response_id"]) <= 64
+        assert with_execution.data["response_id"] != with_timestamp.data["response_id"]
+        assert map_step_to_events(step, conversation_id=cascade)[0] == with_timestamp
+
+    def test_user_input_without_native_identity_has_no_receipt(self) -> None:
+        step = {"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {"userResponse": "hi"}}
+        event = map_step_to_events(step, conversation_id=_CID)[0]
+        assert "response_id" not in event.data
 
     def test_user_input_no_delta(self) -> None:
         """USER_INPUT commits a message but emits no streaming delta events."""

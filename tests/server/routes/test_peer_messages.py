@@ -656,9 +656,10 @@ async def test_is_subagent_same_owner(
         ("claude-native", "delivered"),
         ("codex-native", "queued"),
         ("pi-native", "queued"),
+        ("antigravity-native", "queued"),
         ("sdk", "is_subagent"),
     ],
-    ids=["claude-native", "codex-native", "pi-native", "sdk"],
+    ids=["claude-native", "codex-native", "pi-native", "antigravity-native", "sdk"],
 )
 async def test_dispatched_child_harness_gate(
     peer_client: httpx.AsyncClient,
@@ -802,7 +803,7 @@ async def test_reply_to_a_child_thread_is_delivered(
     assert replied.replied_at is not None
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "pi-native"])
+@pytest.mark.parametrize("harness", ["claude-native", "pi-native", "antigravity-native"])
 async def test_busy_steerable_child_receiver_queues(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
@@ -1384,15 +1385,17 @@ async def test_steerable_claude_native_receiver_delivers_inline(
     assert stored is not None and stored.state == "delivered"
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "antigravity-native"])
 async def test_steerable_receiver_queues_behind_older_same_sender_record(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
 ) -> None:
     """Per-pair FIFO: this sender's older undelivered record wins."""
     sender = peer_env["sender"]
     fake: _FakePostEvent = peer_env["fake"]
-    receiver = _steerable_receiver(monkeypatch, peer_env)
+    receiver = _steerable_receiver(monkeypatch, peer_env, harness=harness)
     _queued_record(peer_env, sender_id=sender.id, receiver_id=receiver.id)
     resp = await peer_client.post(
         f"/v1/sessions/{receiver.id}/peer-messages",
@@ -1528,15 +1531,17 @@ async def test_older_delivering_record_blocks_steering(
     assert fake.calls == []
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "antigravity-native"])
 async def test_blocking_pending_elicitation_keeps_receiver_queued(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
 ) -> None:
     """A dialog / approval owns the input: the receiver stays busy."""
     sender = peer_env["sender"]
     fake: _FakePostEvent = peer_env["fake"]
-    receiver = _steerable_receiver(monkeypatch, peer_env)
+    receiver = _steerable_receiver(monkeypatch, peer_env, harness=harness)
     pending_elicitations.record_publish(
         receiver.id,
         {
@@ -1605,17 +1610,21 @@ async def test_persisted_elicitation_count_above_local_keeps_receiver_queued(
     assert fake.calls == []
 
 
-@pytest.mark.parametrize("harness", ["codex-native", "pi-native"])
+@pytest.mark.parametrize("harness", ["codex-native", "pi-native", "antigravity-native"])
+@pytest.mark.parametrize("cached_status", ["idle", "running"])
 async def test_native_running_receiver_waits_for_native_receipt(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
+    cached_status: str,
 ) -> None:
     """The runner gets the peer input while the native receipt stays durable."""
     sender = peer_env["sender"]
     fake: _FakePostEvent = peer_env["fake"]
-    receiver = _steerable_receiver(monkeypatch, peer_env, harness=harness)
+    receiver = _steerable_receiver(
+        monkeypatch, peer_env, harness=harness, cached_status=cached_status
+    )
     resp = await peer_client.post(
         f"/v1/sessions/{receiver.id}/peer-messages",
         json={"sender_session_id": sender.id, "text": f"cx-{uuid.uuid4().hex}"},

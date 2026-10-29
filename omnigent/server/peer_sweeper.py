@@ -777,7 +777,9 @@ class PeerSweeper:
                     not native_attempt
                     or (
                         isinstance(match.response_id, str)
-                        and match.response_id.startswith(("codex_", "pi-consumed-user-"))
+                        and match.response_id.startswith(
+                            ("codex_", "pi-consumed-user-", "agy-consumed-user-")
+                        )
                     )
                 )
                 for match in matches
