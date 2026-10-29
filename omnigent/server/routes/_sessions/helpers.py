@@ -13279,6 +13279,7 @@ def _child_session_summary_from_conversation(
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    from omnigent.server.child_keep_warm import warm_state_reason_for_harness
     from omnigent.server.native_subagent_watchdog import native_subagent_activity_unverified
 
     placement = _effective_placement(conv, inherited or Placement(None, None, None))
@@ -13326,6 +13327,7 @@ def _child_session_summary_from_conversation(
         warm_state=_warm_state_for_child(
             conv, harness=harness, busy=busy, cold_after_s=cold_after_s
         ),
+        warm_state_reason=warm_state_reason_for_harness(harness),
     )
 
 

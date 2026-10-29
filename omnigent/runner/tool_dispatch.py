@@ -8213,6 +8213,7 @@ async def _session_info_item(
         "archived_at": snap.get("archived_at"),
         # Keep-warm state plus why an auto-archived row was retired.
         "warm_state": snap.get("warm_state"),
+        "warm_state_reason": snap.get("warm_state_reason"),
         "keep_warm": snap.get("keep_warm"),
         "archive_reason": snap.get("archive_reason"),
         "total_cost_usd": snap.get("total_cost_usd"),

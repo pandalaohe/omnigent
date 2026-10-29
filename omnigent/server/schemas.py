@@ -1110,6 +1110,7 @@ class ChildSessionSummary(BaseModel):
         ``omnigent.keep_warm`` label without a settings read. ``None`` when
         the child has no label, is archived, or runs an unsupported
         harness.
+    :param warm_state_reason: Explanation when cache warmth is unsupported.
     """
 
     id: str
@@ -1144,6 +1145,7 @@ class ChildSessionSummary(BaseModel):
     archived_at: int | None = None
     sub_agent_name: str | None = None
     warm_state: Literal["warm", "cold"] | None = None
+    warm_state_reason: str | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -2661,6 +2663,7 @@ class SessionResponse(BaseModel):
         ``omnigent.keep_warm`` label without a harness lookup. ``None`` when
         the session has no keep-warm label, is archived, or carries a label
         written before the family stamp existed.
+    :param warm_state_reason: Explanation when cache warmth is unsupported.
     :param keep_warm: Keep-warm episode status object (state, stop reason,
         pings, cost, last return), or ``None`` when the session has no
         keep-warm label or is archived.
@@ -2756,6 +2759,7 @@ class SessionResponse(BaseModel):
     last_message_preview: str | None = None
     last_message_tail: str | None = None
     warm_state: Literal["warm", "cold"] | None = None
+    warm_state_reason: str | None = None
     keep_warm: KeepWarmStatus | None = None
     archive_reason: str | None = None
 
@@ -3516,6 +3520,7 @@ class SessionListItem(BaseModel):
         ``omnigent.keep_warm`` label without a harness lookup. ``None`` when
         the session has no keep-warm label, is archived, or carries a label
         written before the family stamp existed.
+    :param warm_state_reason: Explanation when cache warmth is unsupported.
     :param keep_warm: Keep-warm episode status object (state, stop reason,
         pings, cost, last return), or ``None`` when the session has no
         keep-warm label or is archived.
@@ -3568,6 +3573,7 @@ class SessionListItem(BaseModel):
     # peer by recent work without opening each transcript.
     last_message_preview: str | None = None
     warm_state: Literal["warm", "cold"] | None = None
+    warm_state_reason: str | None = None
     keep_warm: KeepWarmStatus | None = None
 
 

@@ -171,6 +171,7 @@ from omnigent.server.child_keep_warm import (
     keep_warm_status_from_labels,
     pi_cache_label,
     warm_state_for_labels,
+    warm_state_reason_for_harness,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import FeatureFlags
@@ -2432,10 +2433,8 @@ def _build_session_list_item(
     activity_unverified_child_ids: set[str] | None = None,
     agent_template_ids: Mapping[str, str] | None = None,
     last_message_preview: str | None = None,
-    keep_warm_families: (
-        Mapping[tuple[str | None, str | None, str | None], Literal["claude", "codex", "pi"] | None]
-        | None
-    ) = None,
+    keep_warm_harnesses: Mapping[tuple[str | None, str | None, str | None], str | None]
+    | None = None,
     cold_after_by_session: Mapping[str, int | None] | None = None,
 ) -> SessionListItem:
     """
@@ -2489,10 +2488,10 @@ def _build_session_list_item(
     :param last_message_preview: Single-line excerpt of the newest
         visible message, or ``None`` when the list request did not ask
         for previews.
-    :param keep_warm_families: Optional lookup from ``(agent_id,
-        harness_override, sub_agent_name)`` to the keep-warm family
-        resolved from that harness, used when the keep-warm label carries
-        no ``y`` stamp. ``None`` skips the fallback.
+    :param keep_warm_harnesses: Optional lookup from ``(agent_id,
+        harness_override, sub_agent_name)`` to the resolved harness, used
+        for cache state and unsupported-source reasons. ``None`` skips
+        the harness lookup.
     :param cold_after_by_session: Optional map from conversation id to the
         agent's idle seconds to cold (``0`` = never cold); rows missing from
         it keep the per-family rule. ``None`` skips the lookup entirely.
@@ -2530,11 +2529,13 @@ def _build_session_list_item(
     # activity rolls up into ``status`` but must not read as busy here.
     busy = own_status in ("running", "waiting")
     now = now_epoch()
-    warm_family = (
-        keep_warm_families.get((conv.agent_id, conv.harness_override, conv.sub_agent_name))
-        if keep_warm_families is not None
+    warm_harness = (
+        keep_warm_harnesses.get((conv.agent_id, conv.harness_override, conv.sub_agent_name))
+        if keep_warm_harnesses is not None
         else None
     )
+    warm_family = keep_warm_family_for_harness(warm_harness)
+    warm_reason = warm_state_reason_for_harness(warm_harness)
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2613,7 +2614,9 @@ def _build_session_list_item(
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
         last_message_preview=last_message_preview,
-        warm_state=warm_state_for_labels(
+        warm_state=None
+        if warm_reason
+        else warm_state_for_labels(
             conv.labels,
             archived=bool(conv.archived),
             busy=busy,
@@ -2623,6 +2626,7 @@ def _build_session_list_item(
                 cold_after_by_session.get(conv.id) if cold_after_by_session is not None else None
             ),
         ),
+        warm_state_reason=warm_reason,
         keep_warm=keep_warm_status_from_labels(conv.labels, archived=bool(conv.archived), now=now),
     )
 
@@ -2848,6 +2852,7 @@ def _build_session_response(
         labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     busy = status in ("running", "waiting")
     now = now_epoch()
+    warm_reason = warm_state_reason_for_harness(harness)
     permission_tier = None
     permission_tier_revision = None
     permission_tier_state = None
@@ -2988,7 +2993,9 @@ def _build_session_response(
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
-        warm_state=warm_state_for_labels(
+        warm_state=None
+        if warm_reason
+        else warm_state_for_labels(
             conv.labels,
             archived=bool(conv.archived),
             busy=busy,
@@ -2996,6 +3003,7 @@ def _build_session_response(
             family=keep_warm_family_for_harness(harness),
             cold_after_s=cold_after_s,
         ),
+        warm_state_reason=warm_reason,
         keep_warm=keep_warm_status_from_labels(conv.labels, archived=bool(conv.archived), now=now),
         archive_reason=conv.labels.get(ARCHIVE_REASON_LABEL),
     )
