@@ -196,7 +196,7 @@ async def test_reconnect_initialization_recovers_a_verified_attempt_without_disp
         runtime_id="runtime",
         host_generation="generation",
     )
-    recovery = AsyncMock(return_value=attempt)
+    recovery = AsyncMock(return_value=(True, attempt))
     initializer = RunnerSessionInitializer(
         registry,
         server_version="0.6.0.dev0",
@@ -207,6 +207,37 @@ async def test_reconnect_initialization_recovers_a_verified_attempt_without_disp
     await initializer.initialize(conversation, client, timeout=10)
     assert client.calls[0]["startup_attempt"] == attempt.model_dump()
     recovery.assert_awaited_once_with(conversation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_attempt", [False, True])
+async def test_startup_rejection_supports_raise_for_status(missing_attempt):
+    registry, client = _Registry(), _Client()
+    registry.connection.hello = SimpleNamespace(capabilities=[])
+    attempt = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="runtime",
+        host_generation="generation",
+        mode="startup_only",
+    )
+    initializer = RunnerSessionInitializer(
+        registry,
+        server_version="test",
+        startup_control_resolver=lambda _conversation: (
+            True,
+            None if missing_attempt else attempt,
+        ),
+    )
+    response = await initializer.initialize(_conversation(), client, timeout=2)
+    assert response.status_code == 503
+    assert response.json()["error"] == (
+        "startup_not_admitted" if missing_attempt else "startup_host_update_required"
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        response.raise_for_status()
+    assert client.calls == []
 
 
 @pytest.mark.asyncio

@@ -1788,10 +1788,12 @@ def create_app(
     from omnigent.server.startup_admission import active_startup_attempt
     from omnigent.startup_protocol import StartupAttemptRef
 
-    async def _startup_recovery_attempt(conversation: Conversation) -> StartupAttemptRef | None:
+    async def _startup_recovery_control(
+        conversation: Conversation,
+    ) -> tuple[bool, StartupAttemptRef | None]:
         if startup_admission is None:
-            return None
-        return await startup_admission.initialization_attempt(conversation)
+            return False, None
+        return await startup_admission.initialization_control(conversation)
 
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -1810,7 +1812,7 @@ def create_app(
             startup_policy is not None,
             active_startup_attempt(conversation.id) if startup_policy is not None else None,
         ),
-        startup_recovery_resolver=_startup_recovery_attempt,
+        startup_recovery_resolver=_startup_recovery_control,
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
