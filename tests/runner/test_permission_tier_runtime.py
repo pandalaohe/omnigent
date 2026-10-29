@@ -13,7 +13,12 @@ from fastapi import FastAPI
 
 import omnigent.permission_tiers
 import omnigent.runner.permission_tiers
-from omnigent.permission_tiers import PermissionTier
+from omnigent.permission_tiers import (
+    NativeInputSnapshot,
+    NativeSupport,
+    NativeSupportStatus,
+    PermissionTier,
+)
 from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runner.mcp_execution_registry import McpExecutionRegistry
 from omnigent.runner.mcp_routes import register_mcp_routes
@@ -186,6 +191,150 @@ def _publish_scope(runtime, admission, tools):
     _write_scope_registry(admission, tools)
     ready = runtime.acknowledge_pi_scope("session-a", admission.credential)
     assert ready
+    record = runtime.pi_scopes.record(admission.principal)
+    if record.native_classifier is None:
+        expected = record.expected
+        guard = Path(expected["extension_path"])
+        snapshot = NativeInputSnapshot(
+            str(guard), str(guard.resolve()), expected["extension_sha256"]
+        )
+        runtime.install_pi_native_classifier(
+            admission.principal,
+            lambda binding, _arguments: NativeSupport(
+                binding, NativeSupportStatus.ATTESTED, inputs=(snapshot,)
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "name", ["read", "write", "bash", "sys_read_inbox", "sys_os_read", "subagent"]
+)
+def test_pi_scope_without_native_bootstrap_fact_denies_every_call(tmp_path, name):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path)
+    child = runtime.open_pi_child_scope("session-a")
+    guard = runtime.pi_scopes.record(child.principal).expected["extension_path"]
+    _write_scope_registry(child, [{"name": name, "sourceInfo": {"path": guard}}])
+    assert runtime.acknowledge_pi_scope("session-a", child.credential)
+    arguments = {
+        "path": "notes.txt",
+        "content": "x",
+        "command": "cat notes.txt",
+        "agent": "reader",
+        "task": "read",
+        "async": False,
+        "native_support": {"status": "attested_native"},
+        "pi_delegation": True,
+    }
+    receipt, binding, result = _scope_call(runtime, child, name=name, arguments=arguments)
+    assert result.action.value == "DENY"
+    assert result.rule_id == "native-proof"
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+
+
+@pytest.mark.parametrize("fault", ["agent", "absent-settings"])
+def test_native_semantics_and_input_snapshot_refresh_at_authorize_and_execute(tmp_path, fault):
+    runtime, _parent, _child, source, registry = _scoped_runtime(tmp_path, "ask")
+    manifest = source.parent / "package.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "name": "pi-subagents",
+                "version": "0.80.0",
+                "exports": {
+                    "./preflight": "./index.js",
+                    "./required-child-extensions": "./index.js",
+                    "./native-child-lifecycle": "./index.js",
+                },
+            }
+        )
+    )
+    child = runtime.open_pi_child_scope("session-a")
+    tool = {**registry["tools"][0], "name": "subagent"}
+    _write_scope_registry(child, [tool])
+    assert runtime.acknowledge_pi_scope("session-a", child.credential)
+    agent = tmp_path / "workspace/.pi/agents/reader.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("read-only fixture")
+    snapshot = NativeInputSnapshot(
+        str(agent), str(agent.resolve()), hashlib.sha256(agent.read_bytes()).hexdigest()
+    )
+    settings = agent.parents[1] / "settings.json"
+    runtime.install_pi_native_classifier(
+        child.principal,
+        lambda binding, _args: NativeSupport(
+            binding,
+            NativeSupportStatus.ATTESTED,
+            "delegate",
+            inputs=(snapshot, NativeInputSnapshot(str(settings), None, None)),
+            semantics_digest=binding.arguments_digest,
+        ),
+    )
+    arguments = {"agent": "reader", "task": "read", "async": False}
+    receipt, binding, decision = _scope_call(runtime, child, name="subagent", arguments=arguments)
+    assert decision.action.value == "ALLOW"
+    changed = agent if fault == "agent" else settings
+    changed.write_text("changed fixture")
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name="subagent",
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+    if fault == "agent":
+        agent.write_text("read-only fixture")
+    else:
+        settings.unlink()
+    receipt, binding, _ = _scope_call(
+        runtime, child, call_id="fresh", name="subagent", arguments=arguments
+    )
+    assert runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name="subagent",
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+    changed.write_text("changed before backend")
+    assert not runtime.verify_execute(
+        "session-a",
+        call_id=binding.call_id,
+        name="subagent",
+        arguments=arguments,
+        arguments_digest=binding.arguments_digest,
+        revision=3,
+        operation_id="native-launch",
+        step="initial",
+        origin_receipt=receipt.token,
+    )
+
+
+def test_pi_native_semantic_and_bootstrap_modules_are_control_paths(tmp_path):
+    runtime, _source, _registry = _extension_runtime(tmp_path, "auto")
+    root = Path(omnigent.permission_tiers.__file__).resolve().parent.parent
+    for index, filename in enumerate(
+        ("native_support.cjs", "omnigent_pi_child_extension.js", "omnigent_pi_bootstrap.mjs")
+    ):
+        target = root / "resources/pi_native" / filename
+        assert target.is_file()
+        _binding, decision = runtime.inspect(
+            "session-a",
+            call_id=f"native-control-{index}",
+            name="sys_os_write",
+            arguments={"path": str(target), "content": "changed"},
+            expected_revision=3,
+        )
+        assert decision.action.value == "DENY"
+        assert decision.rule_id == "control-path"
 
 
 def _scoped_runtime(tmp_path, tier="auto", runtime=None):
@@ -241,7 +390,8 @@ def test_pi_v2_local_call_requires_runner_receipt(tmp_path, untrusted):
         )
 
 
-def test_pi_scope_owns_registry_and_namespaces_duplicate_call_ids(tmp_path):
+@pytest.mark.parametrize("arguments", [{"path": "notes.txt"}, {"path": "笔记.txt"}])
+def test_pi_scope_owns_registry_and_namespaces_duplicate_call_ids(tmp_path, arguments):
     runtime, parent, child, _source, _registry = _scoped_runtime(tmp_path)
     _p_receipt, parent_binding, parent_decision = _scope_call(
         runtime,
@@ -249,7 +399,7 @@ def test_pi_scope_owns_registry_and_namespaces_duplicate_call_ids(tmp_path):
         name="google_search",
         arguments={},
     )
-    receipt, binding, decision = _scope_call(runtime, child)
+    receipt, binding, decision = _scope_call(runtime, child, arguments=arguments)
     assert parent_decision.action.value == "ALLOW"
     assert decision.action.value == "ALLOW"
     assert parent_binding.call_id != binding.call_id
@@ -1736,9 +1886,13 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
         if token is not None:
             request["_omnigent_permission"]["pi_origin_receipt"] = token
         if scoped:
-            for fault in ("registry-replacement", "malformed-registration"):
+            for fault in ("registry-replacement", "malformed-registration", "missing-bootstrap"):
                 rejected_child = runtime.open_pi_child_scope("session-a")
-                _publish_scope(runtime, rejected_child, bridge_tools)
+                if fault == "missing-bootstrap":
+                    _write_scope_registry(rejected_child, bridge_tools)
+                    assert runtime.acknowledge_pi_scope("session-a", rejected_child.credential)
+                else:
+                    _publish_scope(runtime, rejected_child, bridge_tools)
                 rejected_receipt = runtime.pi_origin_receipt(
                     "session-a",
                     rejected_child.credential,
@@ -1758,12 +1912,13 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
                 )
                 path = rejected_child.registry_dir / "permission_tools.json"
                 payload = json.loads(path.read_text())
-                payload["tools"][0]["sourceInfo"] = (
-                    {"path": "<inline:omnigent-permission>"}
-                    if fault == "registry-replacement"
-                    else "broken"
-                )
-                path.write_text(json.dumps(payload))
+                if fault != "missing-bootstrap":
+                    payload["tools"][0]["sourceInfo"] = (
+                        {"path": "<inline:omnigent-permission>"}
+                        if fault == "registry-replacement"
+                        else "broken"
+                    )
+                    path.write_text(json.dumps(payload))
                 allowed = runtime.authorize(
                     "session-a",
                     call_id=rejected_binding.call_id,

@@ -3756,7 +3756,9 @@ async function runToolCall() {
 """
 
 
-def _run_policy_node_script(extension_path: Path, tmp_path: Path, body: str) -> None:
+def _run_policy_node_script(
+    extension_path: Path, tmp_path: Path, body: str, *, native_support_required: bool = False
+) -> None:
     """Run the extension's tool_call policy path under Node with a scripted fetch.
 
     :param extension_path: Path to the generated extension JS.
@@ -3769,7 +3771,13 @@ def _run_policy_node_script(extension_path: Path, tmp_path: Path, body: str) -> 
         pytest.skip("node is required for the pi-native extension policy test")
 
     _ready_permission_state(tmp_path, "session-1")
-    script = _POLICY_HARNESS_PREAMBLE + "\n" + body
+    preamble = _POLICY_HARNESS_PREAMBLE.replace(
+        'sessionId: "session-1",',
+        'sessionId: "session-1", nativeSupportRequired: '
+        + str(native_support_required).lower()
+        + ",",
+    )
+    script = preamble + "\n" + body
     result = subprocess.run(
         [node, "-e", script, str(extension_path), str(tmp_path)],
         capture_output=True,
@@ -3799,6 +3807,25 @@ def test_policy_allow_proceeds(tmp_path: Path) -> None:
 });
 """
     _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+@pytest.mark.parametrize("name", ["read", "sys_read_inbox", "sys_os_read", "subagent"])
+def test_upgraded_native_missing_bootstrap_blocks_before_policy_or_backend(
+    tmp_path: Path, name: str
+) -> None:
+    body = r"""
+(async () => {
+  const toolName = __TOOL_NAME__;
+  let backendStarts = 0;
+  const outcome = await handlers.tool_call({toolCallId: "missing-proof", toolName,
+    input: toolName === "subagent"
+      ? {agent:"reader",task:"read",async:false} : {path:"notes.txt"}}, ctx);
+  if (!outcome || !outcome.block) backendStarts++;
+  assert.equal(backendStarts, 0, "failed native proof must not invoke the backend");
+  assert.equal(evalBodies.length, 0, "ordinary approval cannot waive missing native proof");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""".replace("__TOOL_NAME__", json.dumps(name))
+    _run_policy_node_script(_extension_path(), tmp_path, body, native_support_required=True)
 
 
 def test_native_permission_finish_requires_matching_ack(tmp_path: Path) -> None:

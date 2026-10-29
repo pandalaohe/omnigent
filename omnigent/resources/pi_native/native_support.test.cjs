@@ -1,0 +1,208 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const {pathToFileURL} = require("node:url");
+const support = require("./native_support.cjs");
+const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
+
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings} = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
+  t.after(() => fs.rmSync(root, {recursive:true, force:true}));
+  const workspace = path.join(root, "workspace");
+  const packageRoot = path.join(root, "package");
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(packageRoot);
+  const agentPath = path.join(root, "reader.md");
+  const guard = path.join(root, "guard.cjs");
+  const entry = path.join(packageRoot, "index.js");
+  fs.writeFileSync(agentPath, JSON.stringify(definition));
+  fs.writeFileSync(guard, "// independent host guard\n");
+  fs.writeFileSync(entry, "// registered fixture extension\n");
+  if (settings) fs.writeFileSync(path.join(root,"settings.json"),JSON.stringify(settings));
+  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({name:"pi-subagents",version:"0.80.0",type:"module",exports:{
+    "./preflight":"./preflight.js", "./native-child-lifecycle":"./lifecycle.js", "./required-child-extensions":"./required.js"}}));
+  fs.writeFileSync(path.join(packageRoot, "preflight.js"), `export const SUBAGENT_LAUNCH_CONTRACT_VERSION=3;
+export async function resolveSubagentLaunchContract(input) {
+ if (${refuseNativeAdmission} && input.parentSessionId) return {ok:false,code:"unsupported_mode"};
+ return {ok:true,contract:{version:3,
+ agent:{name:input.agent,source:"user",filePath:${JSON.stringify(agentPath)}}, launchContractDigest:"${"0".repeat(64)}", roots:{cwd:input.cwd},
+ protocol:{packageVersion:"0.80.0"}, tools:{disableAmbientExtensions:true,requiredExtensionIds:["omnigent.permission"],
+ extensionArgs:[],configuredExtensions:[],runtimeExtensions:[],toolExtensionPaths:[]}, diagnostics:[]}}; }`);
+  fs.writeFileSync(path.join(packageRoot, "lifecycle.js"), "export function getNativeChildLifecycle(manager) { return globalThis[Symbol.for('fixture.native-lifecycles')].get(manager); }");
+  globalThis[Symbol.for("fixture.native-lifecycles")] ||= new WeakMap();
+  const api = await support.loadPackageApi(packageRoot, {parseFrontmatter:text=>({frontmatter:JSON.parse(text)}),getAgentDir:()=>root});
+  const state = {tier,revision:3,status:"ready",workspace};
+  let backendStarts = 0, policyCalls = 0;
+  const facts = [];
+  const scope = {scope_id:"scope",installation_id:"installation",registry_generation:"generation",origin,canonical_cwd:fs.realpathSync(workspace)};
+  const toolRows = [
+    {name:"subagent",sourceInfo:{path:entry,scope:"user",source:"npm:pi-subagents@0.80.0",origin:"package",baseDir:root}},
+    {name:"read",sourceInfo:{source:"builtin",path:"builtin:read"}},
+    {name:"sys_os_read",sourceInfo:{path:guard}},
+    {name:"sys_read_inbox",sourceInfo:{path:guard}},
+  ];
+  const definitions = new Map(toolRows.map(tool => [tool.name, {execute:async () => {backendStarts++; return "fixture result";}}]));
+  const sourceExtension = {path:entry,resolvedPath:entry,handlers:new Map()};
+  const guardExtension = {path:guard,resolvedPath:guard,handlers:new Map()};
+  const initial = duplicate ? [sourceExtension, sourceExtension, guardExtension] : [sourceExtension, guardExtension];
+  class Loader {
+    constructor() { this.cwd=workspace; this.eventBus={}; this.result={extensions:[],errors:[],runtime:{}}; this.resolveCalls=[]; }
+    resolveExtensionLoadPath(value) { this.resolveCalls.push(value); return value; }
+    async loadExtensionPaths() {}
+    async loadCurrentExtensionSet() {}
+    async reload() { await this.loadExtensionPaths([entry, guard], {}); this.result.extensions=[...initial]; }
+    getExtensions() { return this.result; }
+    async loadExtensionFactories(runtime) {
+      const extensions=[];
+      for (const item of this.extensionFactories) {
+        const extension={path:`<inline:${item.name}>`,handlers:new Map()};
+        await item.factory({on(name, handler) { const handlers=extension.handlers.get(name)||[]; handlers.push(handler); extension.handlers.set(name,handlers); }});
+        extensions.push(extension);
+      }
+      return {extensions,errors:[],runtime};
+    }
+  }
+  class Session {
+    constructor(loader) {this.resourceLoader=loader; this.sessionManager={getSessionId:()=>"session",getSessionDir:()=>root,getSessionFile:()=>null,getLeafId:()=>null};}
+    getAllTools() {return toolRows;}
+    getToolDefinition(name) {return definitions.get(name);}
+    async bindExtensions() {}
+  }
+  const controller = new AbortController();
+  let participant;
+  const lifecycle = {state:"open",closingSignal:controller.signal,bindHost(value){participant=value; return {};},async close(){this.state="closing";controller.abort();await participant.beforeClose({generation:"lifecycle"});}};
+  const sdk = {DefaultResourceLoader:Loader,AgentSession:Session};
+  const {installNativeSupportBootstrap} = await import(pathToFileURL(path.join(__dirname, "omnigent_pi_bootstrap.mjs")).href);
+  let actual;
+  const dispose = installNativeSupportBootstrap(sdk, {
+    sdkVersion:"1.3.0",
+    prepareLoader:() => ({getState:()=>state,checkInput(file){assert.ok(path.isAbsolute(file));}}),
+    describeSession:() => ({scope,api,getState:()=>state,workspace,bridgeDir:root,parentSession:actual,
+      requiredIdentities:[support.snapshot(guard)],configInputs:[],settingsPaths:[],
+      beforeClose:async()=>({revoked:true,scope_id:scope.scope_id,installation_id:scope.installation_id})}),
+    evaluate:noEvaluator ? undefined : async (_event, _ctx, fact) => {policyCalls++;facts.push(fact);return {block:false};},
+  });
+  t.after(dispose);
+  const loader = new Loader();
+  await loader.reload();
+  actual = new Session(loader);
+  if (origin === "child") globalThis[Symbol.for("fixture.native-lifecycles")].set(actual.sessionManager, lifecycle);
+  await actual.bindExtensions();
+  const ctx = {cwd:workspace,sessionManager:actual.sessionManager,isProjectTrusted:()=>false,
+    modelRegistry:{getAvailable:()=>[]},model:{provider:"fixture",id:"local"},scopedModels:[]};
+  const final = loader.getExtensions().extensions.at(-1).handlers.get("tool_call").at(-1);
+  async function run(name, input) {
+    const event={toolCallId:"call",toolName:name,input};
+    const result=await final(event,ctx);
+    if (!result?.block) await actual.getToolDefinition(name).execute();
+    return result;
+  }
+  return {root,workspace,agentPath,guard,entry,packageRoot,scope,api,state,loader,actual,ctx,final,run,dispose,lifecycle,
+    backendStarts:()=>backendStarts,policyCalls:()=>policyCalls,facts};
+}
+
+test("verified native source still requires admitted sync/async and action semantics", async t => {
+  for (const [input, action] of [[{agent:"reader",task:"read",async:false},"delegate"], [{agent:"reader",task:"read",async:true},"delegate"], [{action:"list"},"read"], [{action:"stop",id:"child"},"control"]]) {
+    await t.test(action+JSON.stringify(input), async t => {
+      const f=await fixture(t);
+      assert.equal(await f.run("subagent",input),undefined);
+      assert.equal(f.backendStarts(),1);
+      assert.equal(f.policyCalls(),1);
+      assert.equal(f.facts[0].status,"attested_native");
+      assert.equal(f.facts[0].action,action);
+      assert.equal(f.facts[0].binding.arguments_digest.length,64);
+    });
+  }
+});
+test("source proof cannot bypass workflow/machine/cwd/output or extra fields", async t => {
+  const additions=[{workflow:"unknown"},{machine:"unknown"},{worktree:true},{cwd:"child"},{options:{output:"other"}}, {options:{sessionDir:"other"}}, {options:{acceptance:{run:"echo changed"}}}, {options:null}];
+  for (const extra of additions) await t.test(JSON.stringify(extra), async t => {
+    const f=await fixture(t);
+    const result=await f.run("subagent",{agent:"reader",task:"read",async:false,...extra});
+    assert.equal(result.block,true);
+    assert.equal(f.backendStarts(),0);
+    assert.equal(f.policyCalls(),0);
+  });
+});
+test("missing native origin/bootstrap blocks reads, control, bridge and delegation", async t => {
+  for (const name of ["read","sys_read_inbox","sys_os_read","subagent"]) {
+    let policyCalls=0;
+    const gate=createChildNativeGate({readState:()=>({tier:"auto",status:"ready",revision:3}),evaluate:async()=>{policyCalls++;return {block:false};}});
+    const result=await gate({toolName:name,toolCallId:"call",input:{path:"file"}},{sessionManager:{}});
+    assert.equal(result.block,true);
+    assert.equal(policyCalls,0);
+  }
+});
+test("positive remote/external configuration is outside-native rather than failed proof", async t => {
+  for (const [definition, kind] of [[{machine:"registered-host"},"remote"],[{runner:{type:"external-cli",command:"external"}},"external_cli"],[{runner:{type:"external-job",provider:"known"}},"unsupported_runner"]]) {
+    await t.test(kind, async t => {
+      const f=await fixture(t,{definition});
+      const result=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input:{agent:"reader",task:"read",async:false}},f.ctx,f.state);
+      assert.equal(result.status,"outside_native_support");
+      assert.equal(result.outside_kind,kind);
+    });
+  }
+});
+test("unknown runner, changed input, displaced final hook and closed bootstrap all refuse", async t => {
+  for (const fault of ["runner","input","settings","final","disposed"]) await t.test(fault, async t => {
+    const f=await fixture(t,{definition:fault==="runner"?{runner:{type:"future"}}:{name:"reader"}});
+    if (fault==="input") fs.writeFileSync(f.guard,"changed");
+    if (fault==="settings") fs.writeFileSync(path.join(f.root,"settings.json"),"{}");
+    if (fault==="final") f.loader.getExtensions().extensions.push({path:"late",handlers:new Map()});
+    if (fault==="disposed") f.dispose();
+    assert.equal((await f.run("subagent",{agent:"reader",task:"read",async:false})).block,true);
+    assert.equal(f.backendStarts(),0);
+    assert.equal(f.policyCalls(),0);
+  });
+});
+test("native admission rejection permits only positively proven outside metadata", async t => {
+  for (const outside of [true,false]) await t.test(String(outside), async t => {
+    const f=await fixture(t,{refuseNativeAdmission:true,definition:outside?{runner:{type:"external-cli",command:"external"}}:{name:"reader"}});
+    const result=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input:{agent:"reader",task:"read",async:false}},f.ctx,f.state);
+    assert.equal(result.status,outside?"outside_native_support":"failed_native");
+    assert.equal(f.backendStarts(),0);
+    assert.equal(f.policyCalls(),0);
+  });
+});
+test("unreviewed discovery roots refuse and unused provider overrides do not change placement", async t => {
+  const roots=await fixture(t,{settings:{subagents:{agentScanDirs:["/opt/unreviewed/agents"]}}});
+  const event={toolName:"subagent",toolCallId:"call",input:{agent:"reader",task:"read",async:false}};
+  assert.equal((await support.classifyNativeCall(event,roots.ctx,roots.state)).status,"failed_native");
+  const provider=await fixture(t,{settings:{subagents:{agentOverridesByProvider:{other:{reader:{machine:"other-host"}}}}}});
+  assert.equal((await support.classifyNativeCall(event,provider.ctx,provider.state)).status,"attested_native");
+});
+test("SDK order/repeated entries remain, pre-trust entry is rejected", async t => {
+  const f=await fixture(t,{duplicate:true});
+  const entries=f.loader.getExtensions().extensions;
+  assert.equal(entries[0],entries[1]);
+  assert.equal(entries.length,4);
+  assert.throws(()=>f.loader.loadCurrentExtensionSet(),/not admitted/);
+  assert.equal(await f.run("read",{path:"notes"}),undefined);
+});
+test("actual child definition fence seals before the close acknowledgement", async t => {
+  const f=await fixture(t,{origin:"child"});
+  const allowed=await f.final({toolName:"read",toolCallId:"call",input:{path:"notes"}},f.ctx);
+  assert.equal(allowed,undefined);
+  const close=f.lifecycle.close();
+  assert.throws(()=>f.actual.getToolDefinition("read").execute(),/sealed/);
+  await close;
+  assert.equal(f.backendStarts(),0);
+});
+test("full keeps the existing path; native policy callback cannot leak private fields", async () => {
+  const full=createChildNativeGate({readState:()=>({tier:"full",status:"ready"}),evaluate:async()=>({block:false,permission_tier_binding:{pi_origin_receipt:"private-fixture-receipt"}})});
+  assert.equal(await full({toolName:"read",input:{}},{sessionManager:{}}),undefined);
+  assert.deepEqual(support.policyVerdict({block:true,reason:"denied",permission_tier_binding:{pi_origin_receipt:"private-fixture-receipt"}}),{block:true,reason:"denied"});
+  assert.equal(JSON.stringify(support.snapshot(__filename)).includes("const test"),false);
+});
+test("an admitted loader without a scoped policy consumer never falls back", async t => {
+  const f=await fixture(t,{noEvaluator:true});
+  assert.equal((await f.run("read",{path:"notes"})).block,true);
+  assert.equal(f.backendStarts(),0);
+});
+test("full does not depend on a provable new SDK layout", async () => {
+  const {installNativeSupportBootstrap}=await import(pathToFileURL(path.join(__dirname,"omnigent_pi_bootstrap.mjs")).href);
+  assert.doesNotThrow(()=>installNativeSupportBootstrap({}, {getRootState:()=>({tier:"full"})})());
+  assert.throws(()=>installNativeSupportBootstrap({}, {getRootState:()=>({tier:"auto"})}), /Unsupported/);
+});

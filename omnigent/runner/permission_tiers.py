@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from omnigent.permission_tiers import PermissionTier, TierDecision, Verdict, load_rules
+from omnigent.permission_tiers import (
+    NativeCallBinding,
+    NativeInputSnapshot,
+    NativeSupport,
+    NativeSupportStatus,
+    PermissionTier,
+    TierDecision,
+    Verdict,
+    load_rules,
+)
 from omnigent.permission_tiers.host import (
     HOST_PERMISSION_STATE_FILE,
     HostPermissionState,
@@ -349,6 +358,87 @@ class PermissionTierRuntime:
             local_execution=local_execution,
         )
 
+    def install_pi_native_classifier(
+        self,
+        principal: PiScopePrincipal,
+        classifier: Callable[[NativeCallBinding, Mapping[str, object]], NativeSupport],
+    ) -> None:
+        """Trusted bootstrap API; a tool or event cannot install a native attestor."""
+        record = self.pi_scopes.record(principal)
+        if record.status == "revoked" or not callable(classifier):
+            raise ValueError("Native bootstrap is unavailable")
+        if record.native_classifier is not None and record.native_classifier is not classifier:
+            self.revoke_pi_scope(principal)
+            raise ValueError("Native bootstrap changed; relaunch required")
+        record.native_classifier = classifier
+
+    def _native_support(
+        self,
+        session_id: str,
+        token: object,
+        arguments: Mapping[str, object],
+    ) -> tuple[NativeCallBinding, NativeSupport] | None:
+        if token is None:
+            return None
+        receipt = self.pi_scopes.resolve(session_id, token)
+        record = self.pi_scopes.record(receipt.principal)
+        support = self.pi_scopes.classify_native(record, receipt.native_binding, arguments)
+        try:
+            if support != receipt.native_support:
+                raise ValueError("Native support changed")
+            if support.status != NativeSupportStatus.FAILED:
+                self._verify_native_inputs(session_id, support)
+        except (OSError, ValueError, TypeError, RuntimeError):
+            support = NativeSupport(
+                receipt.native_binding,
+                NativeSupportStatus.FAILED,
+                reason="Native launch inputs or bootstrap changed; re-prove the call",
+            )
+        return receipt.native_binding, support
+
+    def _verify_native_inputs(self, session_id: str, support: NativeSupport) -> None:
+        from omnigent.permission_tiers.pi_tools import _read_file
+
+        state = self.state(session_id)
+        if state is None or not isinstance(support.inputs, tuple) or not support.inputs:
+            raise ValueError("Native input proof unavailable")
+        workspace = Path(state.workspace).resolve(strict=True)
+        roots = [Path.home() / ".pi", Path.home() / ".agents", self.path(session_id).parent]
+        for parent in (workspace, *workspace.parents):
+            roots.extend((parent / ".pi", parent / ".agents"))
+        protected = self._pi_control_paths.setdefault(session_id, set())
+        for item in support.inputs:
+            if not isinstance(item, NativeInputSnapshot):
+                raise ValueError("Malformed native input proof")
+            path = Path(item.path)
+            if not path.is_absolute() or ".." in path.parts:
+                raise ValueError("Native input path is not canonical")
+            if path.is_relative_to(workspace) and not any(
+                path.is_relative_to(root) for root in roots
+            ):
+                raise ValueError("Native input is model-writable")
+            if item.sha256 is None:
+                if item.resolved_path is not None:
+                    raise ValueError("Malformed absent input proof")
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    protected.add(str(path))
+                    continue
+                raise ValueError("Native input appeared")
+            resolved = Path(item.resolved_path) if isinstance(item.resolved_path, str) else None
+            if resolved is None or not resolved.is_absolute():
+                raise ValueError("Native input target is missing")
+            for candidate in (path, resolved):
+                if candidate.is_relative_to(workspace) and not any(
+                    candidate.is_relative_to(root) for root in roots
+                ):
+                    raise ValueError("Native input is model-writable")
+            contents = _read_file(path, resolved_target=resolved, require_nofollow=True)
+            if hashlib.sha256(contents).hexdigest() != item.sha256:
+                raise ValueError("Native input changed")
+            protected.update((str(path), str(resolved)))
+
     def revoke_pi_scope(self, principal: PiScopePrincipal) -> None:
         """Seal before acknowledgement; a delayed approval cannot recreate a lease."""
         for call_id in self.pi_scopes.revoke(principal):
@@ -461,6 +551,9 @@ class PermissionTierRuntime:
                     package_root / "harnesses" / "pi_native" / "bridge.py",
                     package_root / "resources" / "pi_native" / "omnigent_pi_native_extension.js",
                     package_root / "resources" / "pi_native" / "permission_tool_registry.cjs",
+                    package_root / "resources" / "pi_native" / "native_support.cjs",
+                    package_root / "resources" / "pi_native" / "omnigent_pi_child_extension.js",
+                    package_root / "resources" / "pi_native" / "omnigent_pi_bootstrap.mjs",
                     package_root / "inner" / "pi_executor.py",
                     package_root / "inner" / "pi_harness.py",
                     Path.home() / ".pi",
@@ -516,11 +609,13 @@ class PermissionTierRuntime:
         arguments: Mapping[str, object],
         local_execution: bool,
         pi_scope: PiScopeRecord | None = None,
+        native: tuple[NativeCallBinding, NativeSupport] | None = None,
     ) -> TierDecision:
         if pi_scope:
             state = replace(state, workspace=pi_scope.admission.principal.canonical_cwd)
         control_paths = self._control_paths(session_id, state)
         extensions = {}
+        native_tools = {}
         if (
             state.tier != "full"
             and (local_execution or pi_scope is not None)
@@ -535,6 +630,7 @@ class PermissionTierRuntime:
                 bridge, state, expected_binding=pi_scope.expected if pi_scope else None
             )
             if pi_scope:
+                native_tools = registry.native_tools
                 protected = self._pi_control_paths.setdefault(session_id, set())
                 protected.update(registry.control_paths)
                 control_paths = tuple(dict.fromkeys((*control_paths, *protected)))
@@ -567,10 +663,14 @@ class PermissionTierRuntime:
             extensions = registry.extensions
         return evaluate_host_tool(
             state,
-            name if local_execution else "__omnigent_remote_tool__",
+            name,
             arguments,
             control_paths=control_paths,
             extension_tools=extensions,
+            native_tools=native_tools,
+            native_binding=native[0] if native is not None else None,
+            native_support=native[1] if native is not None else None,
+            local_execution=local_execution,
         )
 
     def inspect(
@@ -605,7 +705,10 @@ class PermissionTierRuntime:
         saved_arguments = json.loads(
             json.dumps(dict(arguments), sort_keys=True, separators=(",", ":"), allow_nan=False)
         )
-        decision = self._evaluate(session_id, state, name, arguments, local_execution, pi_scope)
+        native = self._native_support(session_id, origin_receipt, arguments)
+        decision = self._evaluate(
+            session_id, state, name, arguments, local_execution, pi_scope, native
+        )
         inspected = self._inspected.setdefault(session_id, {})
         prior = inspected.get(call_id)
         if prior is not None and prior[0] != binding:
@@ -663,7 +766,13 @@ class PermissionTierRuntime:
                 session_id, origin_receipt, binding, local_execution=inspected[2]
             )
             refreshed = self._evaluate(
-                session_id, state, name, inspected[1], inspected[2], pi_scope
+                session_id,
+                state,
+                name,
+                inspected[1],
+                inspected[2],
+                pi_scope,
+                self._native_support(session_id, origin_receipt, inspected[1]),
             )
         except (OSError, ValueError, TypeError, KeyError):
             return False
@@ -724,6 +833,13 @@ class PermissionTierRuntime:
             if inspected is None or inspected[0] != actual:
                 return False
             self._pi_receipt(session_id, origin_receipt, actual, local_execution=inspected[2])
+            native = self._native_support(session_id, origin_receipt, arguments)
+            if (
+                state.tier != "full"
+                and native is not None
+                and native[1].status == NativeSupportStatus.FAILED
+            ):
+                return False
         except ValueError:
             return False
         if lease.operation_id is not None and lease.operation_id != operation_id:
@@ -777,6 +893,13 @@ class PermissionTierRuntime:
             if inspected is None or inspected[0] != actual:
                 return False
             self._pi_receipt(session_id, origin_receipt, actual, local_execution=inspected[2])
+            native = self._native_support(session_id, origin_receipt, arguments)
+            if (
+                state.tier != "full"
+                and native is not None
+                and native[1].status == NativeSupportStatus.FAILED
+            ):
+                return False
         except ValueError:
             return False
         return actual == lease.binding

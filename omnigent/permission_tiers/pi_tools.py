@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ class PiToolRegistry:
     invalid_tools: frozenset[str] = frozenset()
     tool_names: frozenset[str] = frozenset()
     registration_digest: str | None = None
+    native_tools: dict[str, str] = field(default_factory=dict)
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, ...]:
@@ -157,6 +159,8 @@ def read_pi_tool_registry(
         controls: list[str] = []
         names: set[str] = set()
         invalid: set[str] = set()
+        native_tools: dict[str, str] = {}
+        native_packages: dict[str, str] = {}
         for tool in tools:
             if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
                 raise ValueError("malformed tool registration")
@@ -167,6 +171,13 @@ def read_pi_tool_registry(
                 raise ValueError("duplicate tool registration")
             names.add(name)
             source = tool.get("sourceInfo")
+            native_marker = (
+                isinstance(source, dict)
+                and isinstance(source.get("source"), str)
+                and re.fullmatch(r"npm:pi-subagents(?:@[^/]+)?", source["source"])
+            )
+            if native_marker:
+                native_tools[name] = "Native helper package source is not verified"
             if isinstance(source, dict):
                 path = source.get("path")
                 if source.get("source") == "builtin" and path == f"builtin:{name}":
@@ -245,6 +256,40 @@ def read_pi_tool_registry(
                     raise ValueError("source configuration target changed")
                 if source.get("scope") == "user":
                     extensions[name] = ""
+                manifest_path = real_root / "package.json"
+                try:
+                    manifest_raw = _read_file(manifest_path, require_nofollow=scoped)
+                    manifest = json.loads(manifest_raw)
+                except (OSError, ValueError, TypeError):
+                    if native_marker:
+                        raise
+                    manifest = {}
+                    manifest_raw = b""
+                if native_marker or (
+                    isinstance(manifest, dict) and manifest.get("name") == "pi-subagents"
+                ):
+                    native_tools[name] = "Native helper package compatibility is not verified"
+                    if (
+                        not isinstance(manifest, dict)
+                        or manifest.get("name") != "pi-subagents"
+                        or not isinstance(manifest.get("version"), str)
+                        or not re.fullmatch(r"0\.80\.\d+", manifest["version"])
+                        or source.get("scope") != "user"
+                    ):
+                        raise ValueError("Unreviewed native helper package")
+                    exports = manifest.get("exports")
+                    if not isinstance(exports, dict) or not all(
+                        key in exports
+                        for key in (
+                            "./preflight",
+                            "./required-child-extensions",
+                            "./native-child-lifecycle",
+                        )
+                    ):
+                        raise ValueError("Native helper public contract is unavailable")
+                    native_tools[name] = ""
+                    native_packages[str(manifest_path)] = hashlib.sha256(manifest_raw).hexdigest()
+                    controls.append(str(manifest_path))
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 invalid.add(name)
                 extensions[name] = (
@@ -258,12 +303,16 @@ def read_pi_tool_registry(
             registration_digest=(
                 hashlib.sha256(
                     json.dumps(
-                        registry, sort_keys=True, separators=(",", ":"), allow_nan=False
+                        {"registry": registry, "native_packages": native_packages},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
                     ).encode()
                 ).hexdigest()
                 if scoped
                 else None
             ),
+            native_tools=native_tools,
         )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return PiToolRegistry(

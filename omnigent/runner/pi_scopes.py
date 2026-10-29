@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from omnigent.permission_tiers import NativeCallBinding, NativeSupport, NativeSupportStatus
+from omnigent.permission_tiers import _digest as native_arguments_digest
 from omnigent.permission_tiers.host import HostPermissionState
 from omnigent.server.permission_tiers import BoundToolCall
 from omnigent.util.atomic_json import atomic_write_json
@@ -50,6 +53,9 @@ class PiScopeRecord:
     expected: dict[str, object]
     status: Literal["pending", "ready", "revoked"] = "pending"
     registration_digest: str | None = None
+    native_classifier: (
+        Callable[[NativeCallBinding, Mapping[str, object]], NativeSupport] | None
+    ) = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,8 @@ class PiOriginReceipt:
     principal: PiScopePrincipal
     binding: BoundToolCall
     local_execution: bool
+    native_binding: NativeCallBinding
+    native_support: NativeSupport = field(repr=False)
     token: str = field(repr=False)
 
 
@@ -224,10 +232,45 @@ class PiScopeRegistry:
             arguments=arguments,
             tier_revision=state.revision,
         )
-        receipt = PiOriginReceipt(principal, binding, local_execution, secrets.token_urlsafe(32))
+        native_binding = NativeCallBinding(
+            principal.scope_id,
+            principal.installation_id,
+            principal.registry_generation,
+            name,
+            native_arguments_digest(arguments),
+            state.revision,
+        )
+        native_support = self.classify_native(record, native_binding, arguments)
+        receipt = PiOriginReceipt(
+            principal,
+            binding,
+            local_execution,
+            native_binding,
+            native_support,
+            secrets.token_urlsafe(32),
+        )
         self._receipts[self._digest(receipt.token)] = receipt
         self._receipt_counts[state.session_id] = self._receipt_counts.get(state.session_id, 0) + 1
         return receipt
+
+    def classify_native(
+        self, record: PiScopeRecord, binding: NativeCallBinding, arguments: Mapping[str, object]
+    ) -> NativeSupport:
+        """Only a bootstrap-installed adapter supplies facts; event fields never do."""
+        self.record(record.admission.principal)
+        try:
+            if record.status != "ready" or record.native_classifier is None:
+                raise ValueError("Native bootstrap is unavailable")
+            support = record.native_classifier(binding, arguments)
+            if not isinstance(support, NativeSupport) or support.binding != binding:
+                raise ValueError("Native support binding mismatch")
+            return support
+        except Exception:  # noqa: BLE001 - adapter failure is an explicit denial
+            return NativeSupport(
+                binding,
+                NativeSupportStatus.FAILED,
+                reason="Native bootstrap support is missing, malformed or stale",
+            )
 
     def resolve(
         self, root_session_id: str, token: object, *, settlement: bool = False
