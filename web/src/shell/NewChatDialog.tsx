@@ -8677,10 +8677,12 @@ export function NewChatLandingScreen() {
               }}
             />
           </form>
-          {/* The notices' 4px top gap completes the 32px session status slot. */}
+          {/* The notices' 4px top gap completes the 32px session status slot.
+              Sized, not display-toggled: a display flip in this fieldset on resize
+              leaves the action row's children unrendered (Chromium). */}
           <div
             aria-hidden="true"
-            className="h-7 shrink-0 md:hidden"
+            className="h-7 shrink-0 md:h-0"
             data-testid="new-chat-landing-status-space"
           />
           <WorkspacePickerDialog
