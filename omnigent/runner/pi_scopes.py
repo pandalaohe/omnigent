@@ -12,7 +12,7 @@ from typing import Literal
 from uuid import uuid4
 
 from omnigent.permission_tiers import NativeCallBinding, NativeSupport, NativeSupportStatus
-from omnigent.permission_tiers import _digest as native_arguments_digest
+from omnigent.permission_tiers import _native_digest as native_arguments_digest
 from omnigent.permission_tiers.host import HostPermissionState
 from omnigent.server.permission_tiers import BoundToolCall
 from omnigent.util.atomic_json import atomic_write_json

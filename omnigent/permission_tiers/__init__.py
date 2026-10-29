@@ -11,6 +11,7 @@ import binascii
 import hashlib
 import io
 import json
+import math
 import ntpath
 import os
 import re
@@ -427,6 +428,48 @@ def load_rules() -> RelaxedRules:
     except (OSError, ValueError):
         signatures = None
     return RelaxedRules(rules, signatures)
+
+
+def _canonical_json(value: object) -> str:
+    """Code-point keys, scalar UTF-8 strings and exact finite binary64 decimals.
+
+    Keep this native proof format paired with native_support.cjs. Authorization
+    leases retain BoundToolCall's separate serialization.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        value.encode("utf-8", errors="strict")
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ValueError("Native number is not finite binary64") from exc
+        if not math.isfinite(number) or (isinstance(value, int) and int(number) != value):
+            raise ValueError("Native number is not exact binary64")
+        numerator, denominator = number.as_integer_ratio()
+        if denominator == 1:
+            return str(numerator)
+        places = denominator.bit_length() - 1
+        digits = str(abs(numerator) * 5**places).zfill(places + 1)
+        return ("-" if numerator < 0 else "") + digits[:-places] + "." + digits[-places:]
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canonical_json(item) for item in value) + "]"
+    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
+        return (
+            "{"
+            + ",".join(
+                _canonical_json(key) + ":" + _canonical_json(value[key]) for key in sorted(value)
+            )
+            + "}"
+        )
+    raise ValueError("Native proof requires JSON values")
+
+def _native_digest(arguments: Mapping[str, object]) -> str:
+    return hashlib.sha256(_canonical_json(arguments).encode("utf-8")).hexdigest()
 
 
 def _digest(arguments: Mapping[str, object]) -> str:

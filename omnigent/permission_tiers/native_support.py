@@ -18,6 +18,7 @@ from omnigent.permission_tiers import (
     ToolKind,
     TrustedHostContext,
     _absolute,
+    _native_digest,
     _resolve,
 )
 
@@ -202,7 +203,7 @@ def adapt_native_call(
         or not isinstance(support, NativeSupport)
         or support.binding != binding
         or binding.name != name
-        or binding.arguments_digest != digest
+        or binding.arguments_digest != _native_digest(arguments)
         or type(binding.tier_revision) is not int
         or binding.tier_revision < 1
         or not all(

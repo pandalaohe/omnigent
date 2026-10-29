@@ -8,5 +8,5 @@
   "control_actions": ["stop", "interrupt", "steer", "dismiss", "command.yield", "command.cancel"],
   "read_keys": ["action", "cwd", "options", "agent", "id", "runId", "index", "view", "lines", "capabilities"],
   "control_keys": ["action", "cwd", "options", "id", "runId", "message", "mode", "childId", "toolCallId"],
-  "outside_kinds": ["external_cli", "remote", "gist", "schedule", "unsupported_runner"]
+  "outside_kinds": ["external_cli", "remote", "gist", "schedule", "management", "unsupported_runner"]
 }

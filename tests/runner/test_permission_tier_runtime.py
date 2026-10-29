@@ -1299,6 +1299,51 @@ def test_extension_scope_cannot_claim_builtin_read_permissions(tmp_path, scope):
 
 
 @pytest.mark.parametrize(
+    ("tier", "expected"),
+    [
+        ("auto", "ALLOW"),
+        ("ask", "ASK"),
+        ("accept-edits", "ASK"),
+        ("plan", "DENY"),
+        ("full", "ALLOW"),
+    ],
+)
+def test_legacy_pi_subagents_registry_keeps_provenance_without_native_exports(
+    tmp_path, tier, expected
+):
+    runtime, source, registry = _extension_runtime(tmp_path, tier, name="subagent")
+    (source.parent / "package.json").write_text(
+        json.dumps({"name": "pi-subagents", "version": "0.79.0"})
+    )
+    registry["tools"][0]["sourceInfo"]["source"] = "npm:pi-subagents@0.79.0"
+    (runtime.path("session-a").parent / "permission_tools.json").write_text(json.dumps(registry))
+    binding, result = runtime.inspect(
+        "session-a", call_id="legacy-subagent", name="subagent", arguments={}, expected_revision=3
+    )
+    assert result.action.value == expected, result.reason
+    if expected != "DENY":
+        assert runtime.authorize(
+            "session-a",
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments_digest=binding.arguments_digest,
+            expected_revision=3,
+        )
+
+
+@pytest.mark.parametrize("version", ["0.79.0", "0.80.0"])
+def test_scoped_pi_subagents_registry_still_requires_native_exports(tmp_path, version):
+    runtime, source, registry = _extension_runtime(tmp_path, "auto", name="subagent")
+    (source.parent / "package.json").write_text(
+        json.dumps({"name": "pi-subagents", "version": version})
+    )
+    registry["tools"][0]["sourceInfo"]["source"] = "npm:pi-subagents@" + version
+    parent = runtime.begin_pi_scope_launch("session-a")
+    _write_scope_registry(parent, registry["tools"])
+    assert not runtime.acknowledge_pi_scope("session-a", parent.credential)
+
+
+@pytest.mark.parametrize(
     "fault", ["missing", "stale", "changed-source", "symlink-source", "symlink-registry"]
 )
 @pytest.mark.parametrize("tier", ["auto", "ask", "accept-edits"])

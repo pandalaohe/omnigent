@@ -770,6 +770,27 @@ def test_unbound_mutation_structure_does_not_allow_protected_writes(command: str
     assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
 
 
+@pytest.mark.parametrize("tier", NON_FULL_TIERS)
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -n '1w /usr/local/report' input.txt",
+        "sed -n '1W local.txt' input.txt",
+        "sed 'e touch /usr/local/report' input.txt",
+        "sed 's/a/b/e' input.txt",
+        "sed -f script.sed input.txt",
+        "sed -nE -fscript.sed input.txt",
+        "sed --file=script.sed input.txt",
+        "sed 's/a/b/' -f script.sed input.txt",
+        "sed -i '' -f script.sed input.txt",
+        "sed -i '' '1w local.txt' input.txt",
+    ],
+)
+def test_unparsed_sed_writes_are_unapprovable_below_full(tier, command):
+    assert decision(tier, "bash", {"command": command}).action == Verdict.DENY
+    assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
+
+
 def test_shell_continued_write_target_does_not_bind_as_workspace_file() -> None:
     command = "echo x > " + "\\\n" + "/usr/local/probe"
     assert decision("auto", "bash", {"command": command}).action == Verdict.DENY

@@ -176,7 +176,7 @@ def read_pi_tool_registry(
                 and isinstance(source.get("source"), str)
                 and re.fullmatch(r"npm:pi-subagents(?:@[^/]+)?", source["source"])
             )
-            if native_marker:
+            if scoped and native_marker:
                 native_tools[name] = "Native helper package source is not verified"
             if isinstance(source, dict):
                 path = source.get("path")
@@ -256,6 +256,8 @@ def read_pi_tool_registry(
                     raise ValueError("source configuration target changed")
                 if source.get("scope") == "user":
                     extensions[name] = ""
+                if not scoped:
+                    continue
                 manifest_path = real_root / "package.json"
                 try:
                     manifest_raw = _read_file(manifest_path, require_nofollow=scoped)

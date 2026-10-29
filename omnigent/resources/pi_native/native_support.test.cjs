@@ -7,7 +7,7 @@ const {pathToFileURL} = require("node:url");
 const support = require("./native_support.cjs");
 const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
 
-async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings} = {}) {
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
   t.after(() => fs.rmSync(root, {recursive:true, force:true}));
   const workspace = path.join(root, "workspace");
@@ -21,18 +21,22 @@ async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, 
   fs.writeFileSync(guard, "// independent host guard\n");
   fs.writeFileSync(entry, "// registered fixture extension\n");
   if (settings) fs.writeFileSync(path.join(root,"settings.json"),JSON.stringify(settings));
+  if (projectSettings) {
+    fs.mkdirSync(path.join(workspace,".pi"));
+    fs.writeFileSync(path.join(workspace,".pi/settings.json"),JSON.stringify(projectSettings));
+  }
   fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({name:"pi-subagents",version:"0.80.0",type:"module",exports:{
     "./preflight":"./preflight.js", "./native-child-lifecycle":"./lifecycle.js", "./required-child-extensions":"./required.js"}}));
   fs.writeFileSync(path.join(packageRoot, "preflight.js"), `export const SUBAGENT_LAUNCH_CONTRACT_VERSION=3;
 export async function resolveSubagentLaunchContract(input) {
  if (${refuseNativeAdmission} && input.parentSessionId) return {ok:false,code:"unsupported_mode"};
  return {ok:true,contract:{version:3,
- agent:{name:input.agent,source:"user",filePath:${JSON.stringify(agentPath)}}, launchContractDigest:"${"0".repeat(64)}", roots:{cwd:input.cwd},
- protocol:{packageVersion:"0.80.0"}, tools:{disableAmbientExtensions:true,requiredExtensionIds:["omnigent.permission"],
+ agent:{name:input.agent,source:${JSON.stringify(definitionSource)},filePath:${JSON.stringify(agentPath)}}, launchContractDigest:"${"0".repeat(64)}", roots:{cwd:input.cwd},
+ protocol:{packageVersion:"0.80.0"}, tools:{disableAmbientExtensions:true,requiredExtensionIds:${JSON.stringify(missingRequired?[]:["omnigent.permission"])},
  extensionArgs:[],configuredExtensions:[],runtimeExtensions:[],toolExtensionPaths:[]}, diagnostics:[]}}; }`);
   fs.writeFileSync(path.join(packageRoot, "lifecycle.js"), "export function getNativeChildLifecycle(manager) { return globalThis[Symbol.for('fixture.native-lifecycles')].get(manager); }");
   globalThis[Symbol.for("fixture.native-lifecycles")] ||= new WeakMap();
-  const api = await support.loadPackageApi(packageRoot, {parseFrontmatter:text=>({frontmatter:JSON.parse(text)}),getAgentDir:()=>root});
+  const api = await support.loadPackageApi(packageRoot, {parseFrontmatter:text=>({frontmatter:JSON.parse(text)}),getAgentDir:()=>root,CONFIG_DIR_NAME:".pi"});
   const state = {tier,revision:3,status:"ready",workspace};
   let backendStarts = 0, policyCalls = 0;
   const facts = [];
@@ -90,7 +94,7 @@ export async function resolveSubagentLaunchContract(input) {
   actual = new Session(loader);
   if (origin === "child") globalThis[Symbol.for("fixture.native-lifecycles")].set(actual.sessionManager, lifecycle);
   await actual.bindExtensions();
-  const ctx = {cwd:workspace,sessionManager:actual.sessionManager,isProjectTrusted:()=>false,
+  const ctx = {cwd:workspace,sessionManager:actual.sessionManager,isProjectTrusted:()=>projectTrusted,
     modelRegistry:{getAvailable:()=>[]},model:{provider:"fixture",id:"local"},scopedModels:[]};
   const final = loader.getExtensions().extensions.at(-1).handlers.get("tool_call").at(-1);
   async function run(name, input) {
@@ -205,4 +209,79 @@ test("full does not depend on a provable new SDK layout", async () => {
   const {installNativeSupportBootstrap}=await import(pathToFileURL(path.join(__dirname,"omnigent_pi_bootstrap.mjs")).href);
   assert.doesNotThrow(()=>installNativeSupportBootstrap({}, {getRootState:()=>({tier:"full"})})());
   assert.throws(()=>installNativeSupportBootstrap({}, {getRootState:()=>({tier:"auto"})}), /Unsupported/);
+});
+
+test("effective placement never downgrades failed local admission to outside", async t => {
+  const machineOverride=machine=>({subagents:{agentOverrides:{reader:{machine}}}});
+  const cases=[
+    {name:"provider false wins",settings:{subagents:{agentOverrides:{reader:{machine:"host"}},agentOverridesByProvider:{fixture:{reader:{machine:false}}}}}},
+    {name:"untrusted project excluded",projectSettings:machineOverride("host")},
+    {name:"user scope excludes project",projectTrusted:true,projectSettings:machineOverride("host"),agentScope:"user"},
+    {name:"project scope excludes user",projectTrusted:true,settings:machineOverride("host"),definitionSource:"project",agentScope:"project"},
+    {name:"project false wins user",projectTrusted:true,settings:machineOverride("host"),projectSettings:machineOverride(false)},
+    {name:"builtin project override replaces user",projectTrusted:true,definitionSource:"builtin",settings:machineOverride("host"),projectSettings:{subagents:{agentOverrides:{reader:{description:"local"}}}}},
+    {name:"ambiguous root policy",projectTrusted:true,projectSettings:{subagents:{projectRootResolution:"git-root",agentOverrides:{reader:{machine:"host"}}}}},
+    {name:"prototype key is not placement",definition:JSON.parse('{"__proto__":{"machine":"host"}}')},
+  ];
+  for (const {name,agentScope,...options} of cases) await t.test(name,async t=>{
+    const f=await fixture(t,{...options,missingRequired:true});
+    const input={agent:"reader",task:"read",async:false,...agentScope?{options:{agentScope}}:{}};
+    const result=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state);
+    assert.equal(result.status,"failed_native");
+    assert.equal((await f.run("subagent",input)).block,true);
+    assert.equal(f.policyCalls(),0);
+    assert.equal(f.backendStarts(),0);
+  });
+});
+test("uncertified launcher recipe is never native or outside attestation",async t=>{
+  for(const definition of [{launcher:"broker"},{launcher:"broker",machine:"host"},{launcher:"broker",runner:{type:"external-cli"}}]) for(const share of [false,true]) await t.test(JSON.stringify({definition,share}),async t=>{
+    const f=await fixture(t,{definition});
+    assert.equal((await f.run("subagent",{agent:"reader",task:"read",async:false,...share?{share:true}:{}}))?.block,true);
+    assert.equal(f.policyCalls(),0);
+    assert.equal(f.backendStarts(),0);
+  });
+});
+test("effective placement keeps valid local and remote projections",async t=>{
+  const settings={subagents:{agentOverrides:{reader:{machine:"host"}}}};
+  for(const [name,options,input,expected] of [
+    ["user remote",{settings},{},"outside_native_support"],
+    ["provider clears remote",{settings:{subagents:{...settings.subagents,agentOverridesByProvider:{fixture:{reader:{machine:false}}}}}},{},"attested_native"],
+    ["untrusted project ignored",{projectSettings:settings},{},"attested_native"],
+    ["trusted project remote",{projectSettings:settings,projectTrusted:true},{},"outside_native_support"],
+    ["project-only ignores user",{settings,projectTrusted:true,definitionSource:"project"},{options:{agentScope:"project"}},"attested_native"],
+  ]) await t.test(name,async t=>{
+    const f=await fixture(t,options);
+    const result=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input:{agent:"reader",task:"read",async:false,...input}},f.ctx,f.state);
+    assert.equal(result.status,expected);
+  });
+});
+test("known outside actions and Gist produce explicit outside facts",async t=>{
+  const cases=[
+    ...["schedule.list","schedule.show","schedule.history","schedule.pause","schedule.resume","schedule.run","schedule.run-due","schedule.delete"].map(action=>({action,...action==="schedule.list"||action==="schedule.run-due"?{}:{id:"schedule"}})),
+    {action:"schedule.create",name:"fixture",agent:"reader",task:"read",at:"+10m"},
+    {action:"mission.list"},{action:"project.status"},{action:"resume",id:"run"},
+    {action:"create",agent:"reader",config:{description:"fixture"}},
+    {action:"worktree.cleanup",mode:"plan"},
+    {agent:"reader",task:"read",async:false,share:true},
+  ];
+  for(const input of cases) await t.test(JSON.stringify(input),async t=>{
+    const f=await fixture(t);
+    const fact=await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state);
+    assert.equal(fact.status,"outside_native_support");
+    assert.equal(fact.outside_kind,input.share?"gist":input.action.startsWith("schedule.")?"schedule":"management");
+  });
+  for(const input of [{action:"schedule.future"},{action:"schedule.list",unknown:true},{agent:"reader",task:"read",async:false,share:"yes"}]) {
+    const f=await fixture(t);
+    assert.equal((await support.classifyNativeCall({toolName:"subagent",toolCallId:"call",input},f.ctx,f.state)).status,"failed_native");
+  }
+});
+test("native argument digests conform to Python over legal JSON shapes",async t=>{
+  const cases=JSON.parse(process.env.OMNIGENT_NATIVE_DIGEST_CASES||"[]");
+  assert.ok(cases.length>=6,"Python supplies cross-language canonical vectors");
+  for(const {name,input,expected} of cases) await t.test(name,async t=>{
+    const f=await fixture(t);
+    const fact=await support.classifyNativeCall({toolName:"read",toolCallId:"call",input},f.ctx,f.state);
+    assert.equal(fact.status,"attested_native");
+    assert.equal(fact.binding.arguments_digest,expected);
+  });
 });

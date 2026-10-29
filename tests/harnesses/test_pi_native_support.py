@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -15,11 +16,29 @@ from omnigent.permission_tiers import (
     NativeSupport,
     NativeSupportStatus,
     Verdict,
+    _native_digest,
 )
 from tests.harnesses.test_permission_tiers import decision, posix_host
 
 
-def test_native_support_node_consumers():
+def test_native_canonical_digest_keeps_authorization_lease_serialization():
+    from omnigent.server.permission_tiers import BoundToolCall
+
+    arguments = {"translations": {"10": "十", "2": "二"}, "value": 1.0}
+    binding = BoundToolCall.bind(
+        session_id="fixture",
+        host_id="fixture",
+        call_id="fixture",
+        name="read",
+        arguments=arguments,
+        tier_revision=3,
+    )
+    lease_json = b'{"translations":{"10":"\\u5341","2":"\\u4e8c"},"value":1.0}'
+    assert binding.arguments_digest == hashlib.sha256(lease_json).hexdigest()
+    assert _native_digest(arguments) != binding.arguments_digest
+
+
+def test_native_support_node_consumers(tmp_path):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for native support consumer tests")
@@ -28,7 +47,36 @@ def test_native_support_node_consumers():
         / "omnigent/resources/pi_native/native_support.test.cjs"
     )
     result = subprocess.run(
-        [node, "--test", str(script)], capture_output=True, text=True, timeout=45
+        [node, "--test", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "TMPDIR": str(tmp_path),
+            "OMNIGENT_NATIVE_DIGEST_CASES": json.dumps(
+                [
+                    {"name": name, "input": value, "expected": _native_digest(value)}
+                    for name, value in [
+                        ("integer-like keys", {"translations": {"10": "十", "2": "二"}}),
+                        (
+                            "code-point key order",
+                            {"\ue000": "private-use", "😀": "astral", "中文": "内容"},
+                        ),
+                        (
+                            "nested integer keys",
+                            {"items": [{"20": True, "3": False}, None, "\n\t"]},
+                        ),
+                        ("integral float", {"number": 1.0, "zero": -0.0}),
+                        ("fraction and exponent", {"decimal": 0.1, "small": 1e-7, "large": 1e20}),
+                        ("exact subnormal", {"number": float.fromhex("0x0.0000000000001p-1022")}),
+                        ("large integer-like name", {"4294967295": [], "0": {}, "01": None}),
+                    ]
+                ],
+                ensure_ascii=False,
+            ),
+        },
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -166,7 +214,7 @@ def test_verified_subagent_source_cannot_skip_input_and_cwd_semantics(tier, argu
 
 
 @pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
-@pytest.mark.parametrize("kind", ["external_cli", "remote", "gist", "schedule"])
+@pytest.mark.parametrize("kind", ["external_cli", "remote", "gist", "schedule", "management"])
 def test_positive_outside_native_support_keeps_unknown_tool_policy(tier, kind):
     arguments = {"agent": "other", "async": False}
     host = _host(

@@ -12,13 +12,40 @@ const text = value => typeof value === "string" && value.trim().length > 0;
 const integer = (value, minimum = 1) => Number.isSafeInteger(value) && value >= minimum;
 const allowed = (value, keys) => plain(value) && Object.keys(value).every(key => keys.includes(key));
 const hash = value => crypto.createHash("sha256").update(value).digest("hex");
-function stable(value) {
-  if (Array.isArray(value)) return value.map(stable);
-  if (plain(value)) return Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])]));
-  if (typeof value === "number" && !Number.isFinite(value)) throw new Error("Non-JSON native input");
-  return value;
+function codePointOrder(left, right) {
+  const a=Array.from(left, item=>item.codePointAt(0)), b=Array.from(right, item=>item.codePointAt(0));
+  for(let index=0;index<Math.min(a.length,b.length);index++)
+    if(a[index]!==b[index]) return a[index]-b[index];
+  return a.length-b.length;
 }
-const digest = value => hash(JSON.stringify(stable(value)));
+function numberDecimal(value) {
+  if (!Number.isFinite(value)) throw new Error("Non-finite native number");
+  if (Number.isInteger(value)) return BigInt(value).toString();
+  const bytes=Buffer.alloc(8);
+  bytes.writeDoubleBE(value);
+  const bits=bytes.readBigUInt64BE();
+  const exponent=Number((bits>>52n)&2047n);
+  let numerator=(bits&((1n<<52n)-1n))+(exponent===0?0n:1n<<52n);
+  let places=exponent===0?1074:1075-exponent;
+  while(numerator%2n===0n) {numerator/=2n;places--;}
+  const digits=(numerator*5n**BigInt(places)).toString().padStart(places+1,"0");
+  return (value<0?"-":"")+digits.slice(0,-places)+"."+digits.slice(-places);
+}
+function canonicalJson(value) {
+  // Paired with Python _canonical_json: scalar UTF-8, code-point keys, exact binary64 decimals.
+  if(value===null || value===undefined) return "null";
+  if(typeof value==="string") {
+    if(Array.from(value).some(item=>item.codePointAt(0)>=0xd800&&item.codePointAt(0)<=0xdfff)) throw new Error("Invalid Unicode scalar");
+    return JSON.stringify(value);
+  }
+  if(typeof value==="boolean") return value?"true":"false";
+  if(typeof value==="number") return numberDecimal(value);
+  if(Array.isArray(value)) return "["+value.map(canonicalJson).join(",")+"]";
+  if(plain(value)) return "{"+Object.keys(value).filter(name=>value[name]!==undefined).sort(codePointOrder)
+    .map(name=>canonicalJson(name)+":"+canonicalJson(value[name])).join(",")+"}";
+  throw new Error("Native proof requires JSON values");
+}
+const digest = value => hash(canonicalJson(value));
 function rules() {
   const value = require("../../permission_tiers/native_support_rules.json");
   if (value.version !== 1 || !Object.entries(value).every(([name, entries]) => name === "version" || Array.isArray(entries) && entries.every(text)))
@@ -155,7 +182,7 @@ function packageForTool(record, tool, inputs) {
 }
 function overrides(settings, name, provider) {
   if (!plain(settings)) throw new Error("Invalid native settings");
-  if (settings.subagents === undefined) return [];
+  if (settings.subagents === undefined) return null;
   if (!plain(settings.subagents)) throw new Error("Invalid native settings");
   if (["agentRoots", "agentDirs", "agentsDir", "agentScanDirs", "agentExcludeDirs"].some(key => key in settings.subagents)) throw new Error("Unreviewed native agent roots");
   const groups = [settings.subagents.agentOverrides];
@@ -163,14 +190,60 @@ function overrides(settings, name, provider) {
     if (!plain(settings.subagents.agentOverridesByProvider)) throw new Error("Invalid provider overrides");
     if (text(provider)) groups.push(settings.subagents.agentOverridesByProvider[provider]);
   }
-  return groups.filter(group => group !== undefined).map(group => {
+  const selected=groups.filter(group => group !== undefined).map(group => {
     if (!plain(group) || name in group && !plain(group[name])) throw new Error("Invalid native agent override");
-    return group[name] || {};
+    return group[name];
   });
+  const merged=Object.assign(Object.create(null),...selected.filter(value=>value!==undefined));
+  if("runner" in merged || "launcher" in merged) throw new Error("Unreviewed runner/launcher override");
+  return selected.some(value=>value!==undefined)?merged:null;
 }
-function placement(values) {
+function effectiveDefinition(record, parsed, agent, request, inputs) {
+  if(typeof request.projectTrusted!=="boolean") throw new Error("Project trust is unresolved");
+  const scope=request.projectTrusted?(request.agentScope||"both"):"user";
+  if(!["user","project","both"].includes(scope) || (!request.projectTrusted&&request.agentScope==="project"))
+    throw new Error("Agent scope is unresolved");
+  if((scope==="user"&&agent.source==="project")||(scope==="project"&&agent.source==="user"))
+    throw new Error("Agent source differs from effective scope");
+  const captured=new Map();
+  const read=file=>{
+    if(captured.has(file)) return captured.get(file);
+    const entry=protectedInput(record,file,true);inputs.push(entry);
+    const value=entry.sha256===null?{}:JSON.parse(entry.bytes.toString("utf8"));
+    if(!plain(value)||value.subagents!==undefined&&!plain(value.subagents)) throw new Error("Invalid native settings");
+    captured.set(file,value);return value;
+  };
+  let user=null,project=null;
+  if(scope!=="project") user=overrides(read(path.join(record.api.getAgentDir(),"settings.json")),agent.name,request.parentModel?.provider);
+  if(scope!=="user") {
+    const directoryExists=file=>{
+      try {return fs.statSync(file).isDirectory();}
+      catch(error) {if(["ENOENT","ENOTDIR"].includes(error.code)) return false;throw error;}
+    };
+    const homes=[require("node:os").homedir(),process.env.HOME,process.env.USERPROFILE,
+      process.env.HOMEDRIVE&&process.env.HOMEPATH?process.env.HOMEDRIVE+process.env.HOMEPATH:null]
+      .filter(text).filter(directoryExists).map(file=>fs.realpathSync(file));
+    let nearest=null;
+    for(let directory=record.workspace;;directory=path.dirname(directory)) {
+      if(homes.includes(fs.realpathSync(directory))) break;
+      if(directoryExists(path.join(directory,".pi"))||directoryExists(path.join(directory,".agents"))) {
+        const file=path.join(directory,".pi/settings.json");
+        nearest ||= file;
+        const mode=read(file).subagents?.projectRootResolution;
+        if(mode!==undefined&&mode!=="nearest") throw new Error("Uncertified project root policy");
+        if(mode==="nearest") break;
+      }
+      if(directory===path.dirname(directory)) break;
+    }
+    if(nearest) project=overrides(read(nearest),agent.name,request.parentModel?.provider);
+  }
+  // Builtins choose the project override wholesale; custom agents merge user then project.
+  const applied=agent.source==="builtin"?[project||user]:[user,project];
+  return Object.assign(Object.create(null),parsed,...applied.filter(Boolean));
+}
+function placement(value) {
   let outside = null;
-  for (const value of values) {
+  if("launcher" in value) throw new Error("Uncertified native launcher");
     if ("machine" in value && value.machine !== false) {
       if (!text(value.machine)) throw new Error("Unresolved machine placement");
       outside = "remote";
@@ -182,8 +255,30 @@ function placement(values) {
     }
     if (["worktree", "output", "sessionDir", "artifactDir", "artifactsDir", "acceptance", "shellHooks"].some(key => key in value && value[key] !== false))
       throw new Error("Unreviewed native launch configuration");
-  }
   return outside;
+}
+
+function outsideAction(name,input,record) {
+  if(name!=="subagent") return null;
+  if(input.share===true) {
+    const native={...input};delete native.share;
+    return semanticAction(name,native,record)==="delegate"?"gist":null;
+  }
+  const actions=["create","update","delete","eject","disable","enable","reset",
+    "mission.create","mission.list","mission.show","mission.update","mission.resolve-decision","mission.attach-run","mission.close",
+    "worktree.discard","worktree.cleanup","lane.status","lane.recordMerge","lane.recordSupersession",
+    "refine","refine.show","refine.rollback","inspector.open","inspector.command","inspector.close",
+    "project.open","project.status","project.close","debug.run","grant-spawn-budget","resume","command.status",
+    "watchdog.status","watchdog.check","watchdog.configure","watchdog.recommend-model",
+    "schedule.create","schedule.list","schedule.show","schedule.history","schedule.pause","schedule.resume","schedule.run","schedule.run-due","schedule.delete"];
+  const fields=["action","agent","task","name","id","runId","cwd","dir","handoffPath","repo","planId","laneId","merge","supersession",
+    "index","childId","toolCallId","view","lines","topic","message","mode","steeringRecovery","additional","scope","target","focus","thinking",
+    "at","every","sessionOnly","quiet","on","timezone","overlap","catchUp","missionId","mission","missionUpdate","missionStatus","missionScope",
+    "runMode","runStatus","summary","config","workflow","args","async","options"];
+  if(!actions.includes(input.action)||!allowed(input,fields)) return null;
+  if("cwd" in input&&(!text(input.cwd)||path.resolve(record.workspace,input.cwd)!==record.workspace)) return null;
+  if(Object.entries(input).some(([key,value])=>["agent","task","name","id","runId","cwd","at","every","message","mode"].includes(key)&&!text(value))) return null;
+  return input.action.startsWith("schedule.")?"schedule":"management";
 }
 async function classifyNativeCall(event, ctx, state) {
   let bound = null;
@@ -213,12 +308,17 @@ async function classifyNativeCall(event, ctx, state) {
       if (/^(?:npm:)?pi-subagents(?:@|$)/.test(tool.sourceInfo?.source || "")) return failed(bound, "Native helper source is unavailable");
       return {binding: bound, status:"attested_native", action:"ordinary", inputs};
     }
-    const action = semanticAction(event.toolName, event.input, record);
+    const unsupported=outsideAction(event.toolName,event.input,record);
+    if(unsupported&&unsupported!=="gist") return {binding:bound,status:"outside_native_support",action:"ordinary",outside_kind:unsupported,
+      reason:"Established package action outside native support",inputs,semantics_digest:digest(event.input)};
+    const executionInput={...event.input};
+    if(unsupported==="gist") delete executionInput.share;
+    const action = semanticAction(event.toolName, executionInput, record);
     if (!action) return failed(bound, "Native helper input, action or cwd is outside the admitted subset");
     if (action !== "delegate") return {binding:bound, status:"attested_native", action, inputs, semantics_digest:digest({action, bound, inputs})};
     if (typeof ctx.isProjectTrusted !== "function" || typeof ctx.modelRegistry?.getAvailable !== "function")
       return failed(bound, "Native preflight context is unavailable");
-    const source = {...event.input, ...event.input.options};
+    const source = {...executionInput, ...executionInput.options};
     const steps = source.agent ? [source] : source.tasks || source.chain;
     const contracts = [];
     let outside = null;
@@ -251,13 +351,8 @@ async function classifyNativeCall(event, ctx, state) {
       inputs.push(definition);
       const parsed = record.api.parseFrontmatter(definition.bytes.toString("utf8")).frontmatter;
       if (!plain(parsed)) return failed(bound, "Native agent definition is malformed");
-      const settings = [];
-      for (const settingsPath of record.settingsPaths) {
-        const entry = protectedInput(record, settingsPath, true);
-        inputs.push(entry);
-        if (entry.sha256 !== null) settings.push(...overrides(JSON.parse(entry.bytes.toString("utf8")), contract.agent.name, ctx.model?.provider));
-      }
-      const stepOutside = placement([parsed, ...settings]);
+      const effective=effectiveDefinition(record,parsed,contract.agent,request,inputs);
+      const stepOutside = placement(effective)||(unsupported==="gist"?"gist":null);
       outside ||= stepOutside;
       if (!stepOutside) {
         if (preflight !== admitted) return failed(bound, "Native scoped admission did not prove the selected request");
@@ -308,6 +403,7 @@ function bindNativeSession(session, descriptor) {
   }
   for (const start of new Set([workspace,fs.realpathSync(workspace)]))
     for (let directory=start;;directory=path.dirname(directory)) {
+      if(fs.realpathSync(directory)===fs.realpathSync(require("node:os").homedir())) break;
       settingsPaths.add(path.join(directory,".pi/settings.json"));
       if (directory===path.dirname(directory)) break;
     }
@@ -367,7 +463,7 @@ function requireNativeSession(ctx) {
 async function loadPackageApi(directory, sdk) {
   const manifest = snapshot(path.join(directory, "package.json"));
   const pkg = JSON.parse(manifest.bytes.toString("utf8"));
-  if (pkg.name !== "pi-subagents" || !/^0\.80\.\d+$/.test(pkg.version || "") || typeof sdk?.parseFrontmatter !== "function" || typeof sdk.getAgentDir !== "function")
+  if (pkg.name !== "pi-subagents" || !/^0\.80\.\d+$/.test(pkg.version || "") || typeof sdk?.parseFrontmatter !== "function" || typeof sdk.getAgentDir !== "function" || sdk.CONFIG_DIR_NAME!==".pi")
     throw new Error("Unreviewed native package or SDK");
   const inputs = [manifest];
   const modules = [];
