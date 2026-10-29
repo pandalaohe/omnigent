@@ -64,7 +64,9 @@ class PermissionTierRuntime:
         self._paths: dict[str, Path] = {}
         self._harnesses: dict[str, str] = {}
         self._leases: dict[str, dict[str, PermissionLease]] = {}
-        self._inspected: dict[str, dict[str, tuple[BoundToolCall, dict[str, object], bool]]] = {}
+        self._inspected: dict[
+            str, dict[str, tuple[BoundToolCall, dict[str, object], bool, TierDecision]]
+        ] = {}
         self._finished: dict[str, set[str]] = {}
         self._pi_control_paths: dict[str, set[str]] = {}
         self.pi_scopes = PiScopeRegistry(PERMISSION_RUNTIME_ID)
@@ -307,10 +309,19 @@ class PermissionTierRuntime:
         registry = read_pi_tool_registry(
             record.admission.registry_dir, state, expected_binding=record.expected
         )
-        if registry.reason or registry.invalid_tools:
+        if (
+            registry.reason
+            or registry.invalid_tools
+            or not registry.registration_digest
+            or (
+                record.registration_digest is not None
+                and record.registration_digest != registry.registration_digest
+            )
+        ):
             if record.status == "ready":
                 self.revoke_pi_scope(record.admission.principal)
             return False
+        record.registration_digest = registry.registration_digest
         record.status = "ready"
         return True
 
@@ -527,7 +538,11 @@ class PermissionTierRuntime:
                 protected = self._pi_control_paths.setdefault(session_id, set())
                 protected.update(registry.control_paths)
                 control_paths = tuple(dict.fromkeys((*control_paths, *protected)))
-                if registry.reason or registry.invalid_tools:
+                if (
+                    registry.reason
+                    or registry.invalid_tools
+                    or registry.registration_digest != pi_scope.registration_digest
+                ):
                     self.revoke_pi_scope(pi_scope.admission.principal)
                     return TierDecision(
                         Verdict.DENY, "Pi scope registry changed; relaunch required"
@@ -596,7 +611,7 @@ class PermissionTierRuntime:
         if prior is not None and prior[0] != binding:
             raise ValueError("Tool call binding changed")
         if decision.action != Verdict.DENY:
-            inspected[call_id] = (binding, saved_arguments, local_execution)
+            inspected[call_id] = (binding, saved_arguments, local_execution, decision)
         else:
             inspected.pop(call_id, None)
         return binding, decision
@@ -652,7 +667,7 @@ class PermissionTierRuntime:
             )
         except (OSError, ValueError, TypeError, KeyError):
             return False
-        if refreshed.action == Verdict.DENY:
+        if refreshed.action == Verdict.DENY or refreshed != inspected[3]:
             self._inspected.get(session_id, {}).pop(call_id, None)
             return False
         prior = leases.get(call_id)
@@ -851,6 +866,8 @@ class PermissionTierRuntime:
             transaction_id=None if status == "ready" else transaction_id,
         )
         write_host_permission_state(self._paths[session_id], settled)
+        if state.tier == "full" and tier != "full" and self.pi_scope_protocol_active(session_id):
+            self.pi_scopes.invalidate(session_id)
         self._states[session_id] = settled
         self._inspected.pop(session_id, None)
         return settled

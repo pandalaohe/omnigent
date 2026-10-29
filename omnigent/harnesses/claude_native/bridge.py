@@ -37,6 +37,7 @@ import base64
 import contextlib
 import functools
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -8515,9 +8516,9 @@ def _tool_relay_handler_factory(
                 return
             authorization = self.headers.get("Authorization")
             scoped = None
-            legacy = authorization == f"Bearer {token}" and (
-                pi_scope_relay is None or pi_scope_relay.legacy_allowed()
-            )
+            legacy = hmac.compare_digest(
+                (authorization or "").encode(), f"Bearer {token}".encode()
+            ) and (pi_scope_relay is None or pi_scope_relay.legacy_allowed())
             if not legacy:
                 if pi_scope_relay is None:
                     self.send_error(HTTPStatus.UNAUTHORIZED)

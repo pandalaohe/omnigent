@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,12 +20,57 @@ class PiToolRegistry:
     reason: str = ""
     invalid_tools: frozenset[str] = frozenset()
     tool_names: frozenset[str] = frozenset()
+    registration_digest: str | None = None
 
 
-def _object(path: Path) -> dict:
-    if path.is_symlink():
-        raise ValueError("symlinked registry")
-    value = json.loads(path.read_text(encoding="utf-8"))
+def _file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _read_file(
+    path: Path,
+    *,
+    resolved_target: Path | None = None,
+    require_nofollow: bool = False,
+) -> bytes:
+    """Read one stable file identity; an admitted entry alias must retain its target."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if require_nofollow and not nofollow:
+        raise ValueError("No-follow file validation is unavailable")
+    before = path.lstat()
+    if resolved_target is None and not stat.S_ISREG(before.st_mode):
+        raise ValueError("Registration file is not regular")
+    resolved = path.resolve(strict=True)
+    if resolved_target is not None and resolved != resolved_target:
+        raise ValueError("Registration target changed")
+    target_before = resolved.lstat()
+    if not stat.S_ISREG(target_before.st_mode):
+        raise ValueError("Registration target is not regular")
+    fd = os.open(
+        resolved if resolved_target is not None else path,
+        os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        opened = os.fstat(fd)
+        if _file_identity(opened) != _file_identity(target_before):
+            raise ValueError("Registration changed before open")
+        chunks = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        if (
+            _file_identity(os.fstat(fd)) != _file_identity(opened)
+            or _file_identity(path.lstat()) != _file_identity(before)
+            or _file_identity(resolved.lstat()) != _file_identity(opened)
+            or path.resolve(strict=True) != resolved
+        ):
+            raise ValueError("Registration changed during read")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _object(path: Path, *, require_nofollow: bool = False) -> dict:
+    value = json.loads(_read_file(path, require_nofollow=require_nofollow))
     if not isinstance(value, dict):
         raise ValueError("malformed registry")
     return value
@@ -31,7 +78,7 @@ def _object(path: Path) -> dict:
 
 def read_pi_tool_expectation(bridge: Path) -> dict[str, object]:
     """Read the launcher's protected enforcement identity before allocating a scope."""
-    expected = _object(bridge / "permission_expected.json")
+    expected = _object(bridge / "permission_expected.json", require_nofollow=True)
     if expected.get("version") != 1 or expected.get("harness") not in ("pi", "pi-native"):
         raise ValueError("Invalid Pi permission expectation")
     guard = Path(expected["extension_path"])
@@ -41,7 +88,7 @@ def read_pi_tool_expectation(bridge: Path) -> dict[str, object]:
         or not expected["installation_id"]
     ):
         raise ValueError("Incomplete Pi permission expectation")
-    if guard.is_symlink() or hashlib.sha256(guard.read_bytes()).hexdigest() != expected.get(
+    if hashlib.sha256(_read_file(guard, require_nofollow=True)).hexdigest() != expected.get(
         "extension_sha256"
     ):
         raise ValueError("Changed Pi enforcement source")
@@ -56,8 +103,9 @@ def read_pi_tool_registry(
 ) -> PiToolRegistry:
     """Never consume provenance sent in tool arguments or policy event data."""
     try:
-        expected = _object(bridge / "permission_expected.json")
-        registry = _object(bridge / "permission_tools.json")
+        scoped = expected_binding is not None
+        expected = _object(bridge / "permission_expected.json", require_nofollow=scoped)
+        registry = _object(bridge / "permission_tools.json", require_nofollow=scoped)
         loaded: dict[str, dict] = {}
         if expected_binding is not None:
             if expected != dict(expected_binding) or expected.get("scope_protocol_version") != 2:
@@ -98,7 +146,7 @@ def read_pi_tool_registry(
         ):
             raise ValueError("unbound registry")
         guard = Path(expected["extension_path"])
-        if guard.is_symlink() or hashlib.sha256(guard.read_bytes()).hexdigest() != expected.get(
+        if hashlib.sha256(_read_file(guard, require_nofollow=scoped)).hexdigest() != expected.get(
             "extension_sha256"
         ):
             raise ValueError("changed bridge")
@@ -113,6 +161,8 @@ def read_pi_tool_registry(
             if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
                 raise ValueError("malformed tool registration")
             name = tool["name"]
+            if scoped and not name:
+                raise ValueError("empty scoped tool name")
             if name in names:
                 raise ValueError("duplicate tool registration")
             names.add(name)
@@ -123,8 +173,27 @@ def read_pi_tool_registry(
                     continue
                 if path in (str(guard), "<inline:omnigent-permission>"):
                     continue
+            if scoped and (
+                not isinstance(source, dict)
+                or not all(
+                    isinstance(source.get(key), str) and source[key]
+                    for key in ("path", "source", "scope", "origin", "baseDir")
+                )
+                or source.get("origin") not in ("package", "top-level")
+                or source.get("source") in ("sdk", "builtin", "inline", "temporary")
+                or not all(
+                    isinstance(tool.get(key), str) and tool[key]
+                    for key in (
+                        "real_path",
+                        "real_base_dir",
+                        "implementation_root",
+                        "source_sha256",
+                    )
+                )
+            ):
+                raise ValueError("incomplete scoped registration proof")
             extensions[name] = "Pi extension source is not a verified user installation"
-            if not isinstance(source, dict) or source.get("scope") != "user":
+            if not isinstance(source, dict) or (not scoped and source.get("scope") != "user"):
                 continue
             if not all(
                 isinstance(tool.get(key), str) and tool[key]
@@ -165,11 +234,17 @@ def read_pi_tool_registry(
                 ):
                     raise ValueError("unprotected source location")
                 controls.extend(str(path) for path in (entry, base, real_root, real_base))
-                if hashlib.sha256(real_entry.read_bytes()).hexdigest() != tool.get(
-                    "source_sha256"
-                ):
+                if hashlib.sha256(
+                    _read_file(entry, resolved_target=real_entry, require_nofollow=scoped)
+                ).hexdigest() != tool.get("source_sha256"):
                     raise ValueError("source changed since Pi loaded it")
-                extensions[name] = ""
+                if (
+                    base.resolve(strict=True) != real_base
+                    or root.resolve(strict=True) != real_root
+                ):
+                    raise ValueError("source configuration target changed")
+                if source.get("scope") == "user":
+                    extensions[name] = ""
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 invalid.add(name)
                 extensions[name] = (
@@ -180,6 +255,15 @@ def read_pi_tool_registry(
             tuple(dict.fromkeys(controls)),
             invalid_tools=frozenset(invalid),
             tool_names=frozenset(names),
+            registration_digest=(
+                hashlib.sha256(
+                    json.dumps(
+                        registry, sort_keys=True, separators=(",", ":"), allow_nan=False
+                    ).encode()
+                ).hexdigest()
+                if scoped
+                else None
+            ),
         )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return PiToolRegistry(

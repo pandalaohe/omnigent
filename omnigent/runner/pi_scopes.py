@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,7 @@ class PiScopeRecord:
     admission: PiScopeAdmission
     expected: dict[str, object]
     status: Literal["pending", "ready", "revoked"] = "pending"
+    registration_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ class PiScopeRegistry:
 
     def __init__(self, runner_epoch: str) -> None:
         self.runner_epoch = runner_epoch
-        self._launches: dict[str, str] = {}
+        self._launches: dict[str, str | None] = {}
         self._scopes: dict[str, PiScopeRecord] = {}
         self._credentials: dict[str, str] = {}
         self._receipts: dict[str, PiOriginReceipt] = {}
@@ -105,7 +107,7 @@ class PiScopeRegistry:
                 record.status = "revoked"
         # Keep the v2 requirement latched during a blocked/rebinding launch.
         if root_session_id in self._launches:
-            self._launches[root_session_id] = uuid4().hex
+            self._launches[root_session_id] = None
 
     def open_scope(
         self,
@@ -164,10 +166,7 @@ class PiScopeRegistry:
     def authenticate(
         self, root_session_id: str, credential: object, *, settlement: bool = False
     ) -> PiScopeRecord:
-        scope_id = self._credentials.get(self._digest(credential))
-        record = self._scopes.get(scope_id) if scope_id is not None else None
-        if record is None:
-            raise ValueError("Pi scope credential unavailable")
+        record = self._credential_record(credential)
         principal = record.admission.principal
         if principal.root_session_id != root_session_id:
             raise ValueError("Pi scope belongs to another root")
@@ -176,10 +175,18 @@ class PiScopeRegistry:
             raise ValueError("Pi scope is not ready")
         return record
 
-    def pending(self, root_session_id: str, credential: object) -> PiScopeRecord:
-        scope_id = self._credentials.get(self._digest(credential))
+    def _credential_record(self, credential: object) -> PiScopeRecord:
+        candidate = self._digest(credential)
+        scope_id = self._credentials.get(candidate)
         record = self._scopes.get(scope_id) if scope_id is not None else None
-        if record is None or record.admission.principal.root_session_id != root_session_id:
+        expected = self._digest(record.admission.credential) if record is not None else "0" * 64
+        if not hmac.compare_digest(candidate, expected) or record is None:
+            raise ValueError("Pi scope credential unavailable")
+        return record
+
+    def pending(self, root_session_id: str, credential: object) -> PiScopeRecord:
+        record = self._credential_record(credential)
+        if record.admission.principal.root_session_id != root_session_id:
             raise ValueError("Pi scope credential unavailable")
         self.record(record.admission.principal)
         if record.status == "revoked":

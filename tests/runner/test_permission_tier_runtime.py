@@ -152,7 +152,7 @@ def _extension_runtime(
     return runtime, source, registry
 
 
-def _publish_scope(runtime, admission, tools):
+def _write_scope_registry(admission, tools):
     from omnigent.util.atomic_json import atomic_write_json
 
     expected = json.loads((admission.registry_dir / "permission_expected.json").read_text())
@@ -180,6 +180,10 @@ def _publish_scope(runtime, admission, tools):
             "loaded_extensions": loaded,
         },
     )
+
+
+def _publish_scope(runtime, admission, tools):
+    _write_scope_registry(admission, tools)
     ready = runtime.acknowledge_pi_scope("session-a", admission.credential)
     assert ready
 
@@ -261,7 +265,8 @@ def test_pi_scope_owns_registry_and_namespaces_duplicate_call_ids(tmp_path):
 
 @pytest.mark.parametrize("fault", ["source", "registry", "generation", "expectation"])
 def test_pi_child_registry_refreshes_at_authorize(tmp_path, fault):
-    runtime, _parent, child, source, registry = _scoped_runtime(tmp_path)
+    runtime, _parent, _child, source, registry = _scoped_runtime(tmp_path)
+    child = runtime.open_pi_child_scope("session-a")
     _publish_scope(runtime, child, registry["tools"])
     receipt, binding, decision = _scope_call(
         runtime,
@@ -271,6 +276,10 @@ def test_pi_child_registry_refreshes_at_authorize(tmp_path, fault):
     )
     assert decision.action.value == "ALLOW"
     registry_path = child.registry_dir / "permission_tools.json"
+    original = {
+        path: path.read_bytes()
+        for path in (source, registry_path, child.registry_dir / "permission_expected.json")
+    }
     if fault == "source":
         source.write_text("// changed after inspection\n")
     elif fault == "registry":
@@ -292,6 +301,196 @@ def test_pi_child_registry_refreshes_at_authorize(tmp_path, fault):
         expected_revision=3,
         origin_receipt=receipt.token,
     )
+    for path, contents in original.items():
+        path.write_bytes(contents)
+    with pytest.raises(ValueError):
+        runtime.acknowledge_pi_scope("session-a", child.credential)
+    with pytest.raises(ValueError):
+        _scope_call(runtime, child, call_id="after-restore")
+
+
+@pytest.mark.parametrize("check", ["acknowledge", "authorize"])
+def test_pi_ready_registry_replacement_revokes_same_generation(tmp_path, check):
+    runtime, _parent, child, _source, registry = _scoped_runtime(tmp_path, "ask")
+    receipt, binding, decision = _scope_call(runtime, child)
+    assert decision.action.value == "ALLOW"
+    changed = {**registry["tools"][0], "name": "read"}
+    _write_scope_registry(child, [changed])
+    if check == "acknowledge":
+        assert not runtime.acknowledge_pi_scope("session-a", child.credential)
+    else:
+        assert not runtime.authorize(
+            "session-a",
+            call_id=binding.call_id,
+            name=binding.name,
+            arguments_digest=binding.arguments_digest,
+            expected_revision=3,
+            origin_receipt=receipt.token,
+        )
+    with pytest.raises(ValueError):
+        _scope_call(runtime, child, call_id="after-replacement")
+
+
+@pytest.mark.parametrize("refreshed", ["ASK", "changed-ALLOW"])
+def test_pi_authorize_refuses_a_different_inspected_verdict(tmp_path, monkeypatch, refreshed):
+    from omnigent.permission_tiers import TierDecision, Verdict
+
+    runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path, "ask")
+    receipt, binding, decision = _scope_call(runtime, child)
+    assert decision.action.value == "ALLOW"
+    changed = (
+        TierDecision(Verdict.ASK, "changed tool classification")
+        if refreshed == "ASK"
+        else TierDecision(Verdict.ALLOW, "different policy", "different-rule")
+    )
+    monkeypatch.setattr(runtime, "_evaluate", lambda *_args: changed)
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+        origin_receipt=receipt.token,
+    )
+    assert not runtime.verify_execute(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments={"path": "notes.txt"},
+        arguments_digest=binding.arguments_digest,
+        revision=3,
+        operation_id="changed-verdict",
+        step="initial",
+        origin_receipt=receipt.token,
+    )
+
+
+@pytest.mark.parametrize("tier", ["ask", "accept-edits"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing-source",
+        "invalid-source",
+        "missing-provenance",
+        "invalid-provenance",
+        "project-provenance",
+    ],
+)
+def test_pi_malformed_v2_registration_is_not_approvable(tmp_path, tier, fault):
+    runtime, _parent, _child, _source, registry = _scoped_runtime(tmp_path, tier)
+    child = runtime.open_pi_child_scope("session-a")
+    _write_scope_registry(child, registry["tools"])
+    path = child.registry_dir / "permission_tools.json"
+    payload = json.loads(path.read_text())
+    row = payload["tools"][0]
+    if fault == "missing-source":
+        row.pop("sourceInfo")
+    elif fault == "invalid-source":
+        row["sourceInfo"] = "broken"
+    elif fault == "missing-provenance":
+        row.pop("real_path")
+    elif fault == "invalid-provenance":
+        row["source_sha256"] = 7
+    else:
+        row["sourceInfo"]["scope"] = "project"
+        row.pop("implementation_root")
+    path.write_text(json.dumps(payload))
+    assert not runtime.acknowledge_pi_scope("session-a", child.credential)
+    with pytest.raises(ValueError):
+        _scope_call(runtime, child, name="google_search", arguments={})
+
+
+@pytest.mark.parametrize(
+    "fault", ["registry-symlink", "guard-symlink", "entry-retarget", "registry-replaced-fd"]
+)
+def test_pi_registration_file_races_refuse_readiness(tmp_path, monkeypatch, fault):
+    import os
+
+    runtime, _parent, _child, source, registry = _scoped_runtime(tmp_path)
+    child = runtime.open_pi_child_scope("session-a")
+    _write_scope_registry(child, registry["tools"])
+    path = child.registry_dir / "permission_tools.json"
+    target = (
+        path
+        if fault != "guard-symlink"
+        else runtime.path("session-a").parent / "omnigent_pi_native_extension.js"
+    )
+    changed = False
+    if fault == "entry-retarget":
+        alias = source.with_name("loaded-alias.js")
+        alias.symlink_to(source)
+        other = source.with_name("other-entry.js")
+        other.write_bytes(source.read_bytes())
+        payload = json.loads(path.read_text())
+        payload["loaded_extensions"][1]["resolved_path"] = str(alias)
+        path.write_text(json.dumps(payload))
+        resolve = Path.resolve
+
+        def retarget(candidate, *args, **kwargs):
+            nonlocal changed
+            resolved = resolve(candidate, *args, **kwargs)
+            if candidate == alias and not changed:
+                changed = True
+                alias.unlink()
+                alias.symlink_to(other)
+            return resolved
+
+        monkeypatch.setattr(Path, "resolve", retarget)
+    else:
+        other = target.with_name("replacement-" + target.name)
+        other.write_bytes(target.read_bytes())
+        if fault == "registry-replaced-fd":
+            open_file = os.open
+
+            def replace_after_open(candidate, *args, **kwargs):
+                nonlocal changed
+                fd = open_file(candidate, *args, **kwargs)
+                if Path(candidate) == target and not changed:
+                    changed = True
+                    os.replace(other, target)
+                return fd
+
+            monkeypatch.setattr(os, "open", replace_after_open)
+        else:
+            lstat = Path.lstat
+
+            def replace_after_stat(candidate, *args, **kwargs):
+                nonlocal changed
+                info = lstat(candidate, *args, **kwargs)
+                if candidate == target and not changed:
+                    changed = True
+                    target.unlink()
+                    target.symlink_to(other)
+                return info
+
+            monkeypatch.setattr(Path, "lstat", replace_after_stat)
+    assert not runtime.acknowledge_pi_scope("session-a", child.credential)
+    assert changed, "race must occur at the actual file-validation boundary"
+
+
+def test_pi_scope_credential_lookup_verifies_secret_in_constant_time(tmp_path, monkeypatch):
+    import hmac
+
+    runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path)
+    compare = hmac.compare_digest
+    comparisons = []
+
+    def compare_secret(candidate, expected):
+        comparisons.append((len(candidate), len(expected)))
+        return compare(candidate, expected)
+
+    monkeypatch.setattr(hmac, "compare_digest", compare_secret)
+    assert runtime.pi_scopes.authenticate("session-a", child.credential).admission == child
+    assert comparisons
+    comparisons.clear()
+    # An indexed candidate still has to prove the associated secret.
+    candidate = "not-a-scope-credential"
+    runtime.pi_scopes._credentials[hashlib.sha256(candidate.encode()).hexdigest()] = (
+        child.principal.scope_id
+    )
+    with pytest.raises(ValueError):
+        runtime.pi_scopes.authenticate("session-a", candidate)
+    assert comparisons
 
 
 def test_pi_expected_file_does_not_short_circuit_incomplete_publication(tmp_path):
@@ -400,7 +599,8 @@ def test_pi_revoked_scope_can_only_finish_its_own_already_executing_call(tmp_pat
 
 
 def test_pi_sdk_resolved_identity_is_used_instead_of_a_guessed_display_path(tmp_path):
-    runtime, _parent, child, source, registry = _scoped_runtime(tmp_path)
+    runtime, _parent, _child, source, registry = _scoped_runtime(tmp_path)
+    child = runtime.open_pi_child_scope("session-a")
     registry["tools"][0]["sourceInfo"]["path"] = str(source.parent / "index\u00a0alias.js")
     _publish_scope(runtime, child, registry["tools"])
     assert (
@@ -452,7 +652,7 @@ def test_pi_scope_cannot_invoke_unregistered_builtin_or_switch_execution_class(t
 
 
 def test_pi_full_to_restricted_does_not_restore_unscoped_parent_fallback(tmp_path):
-    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, "full")
+    runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path, "full")
     assert (
         runtime.inspect(
             "session-a",
@@ -466,9 +666,43 @@ def test_pi_full_to_restricted_does_not_restore_unscoped_parent_fallback(tmp_pat
     runtime.prepare("session-a", expected_revision=3, transaction_id="switch")
     runtime.settle("session-a", transaction_id="switch", tier="auto", revision=4)
     with pytest.raises(ValueError):
+        runtime.pi_origin_receipt(
+            "session-a",
+            child.credential,
+            call_id="old-full-scope",
+            name="read",
+            arguments={"path": "notes.txt"},
+            local_execution=True,
+        )
+    with pytest.raises(ValueError):
+        runtime.open_pi_child_scope("session-a")
+    with pytest.raises(ValueError):
         runtime.inspect(
             "session-a", call_id="legacy", name="read", arguments={}, expected_revision=4
         )
+    fresh = runtime.begin_pi_scope_launch("session-a")
+    _publish_scope(
+        runtime,
+        fresh,
+        [{"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}}],
+    )
+    receipt = runtime.pi_origin_receipt(
+        "session-a",
+        fresh.credential,
+        call_id="reinstalled",
+        name="read",
+        arguments={"path": "notes.txt"},
+        local_execution=True,
+    )
+    _, decision = runtime.inspect(
+        "session-a",
+        call_id=receipt.binding.call_id,
+        name="read",
+        arguments={"path": "notes.txt"},
+        expected_revision=4,
+        origin_receipt=receipt.token,
+    )
+    assert decision.action.value == "ALLOW"
 
 
 @pytest.mark.parametrize("harness", ["antigravity-native", "codex-native"])
@@ -521,6 +755,7 @@ def test_trusted_harness_rebind_retires_pi_authority_without_blocking_other_harn
 
 @pytest.mark.asyncio
 async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path, monkeypatch):
+    import hmac
     from types import SimpleNamespace
 
     from fastapi import APIRouter
@@ -538,13 +773,19 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
     from tests.runner.native_helpers import _harness_spec
 
     runner, _pm = await _build_app_for_spec(_harness_spec("pi-native"))
-    runtime, parent, child, _source, registry = _scoped_runtime(
-        tmp_path,
-        runtime=runner.state.permission_tiers,
+    runtime, _source, registry = _extension_runtime(
+        tmp_path, "auto", runtime=runner.state.permission_tiers
     )
+    parent = runtime.begin_pi_scope_launch("session-a")
     parent_read = {**registry["tools"][0], "name": "read"}
     parent_read["sourceInfo"] = {**parent_read["sourceInfo"], "scope": "project"}
     _publish_scope(runtime, parent, [parent_read])
+    child = runtime.open_pi_child_scope("session-a")
+    _publish_scope(
+        runtime,
+        child,
+        [{"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}}],
+    )
     conv = Conversation(
         id="session-a",
         created_at=1,
@@ -601,6 +842,14 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                 pi_scope_relay=PiScopeRelay(runtime, "session-a"),
             )
             info = json.loads((runtime.path("session-a").parent / "tool_relay.json").read_text())
+            comparisons = []
+            compare = hmac.compare_digest
+
+            def compare_secret(candidate, expected):
+                comparisons.append((len(candidate), len(expected)))
+                return compare(candidate, expected)
+
+            monkeypatch.setattr(hmac, "compare_digest", compare_secret)
             try:
                 async with httpx.AsyncClient(base_url=info["url"], trust_env=False) as client:
                     bad = await client.post(
@@ -615,6 +864,10 @@ async def test_scoped_native_http_policy_runs_through_server_and_runner(tmp_path
                         headers={"Authorization": "Bearer " + info["token"]},
                     )
                     assert legacy.status_code == 401
+                    assert any(
+                        expected == len("Bearer " + info["token"])
+                        for _candidate, expected in comparisons
+                    )
                     child_headers = {"Authorization": "Bearer " + child.credential}
                     event = {
                         "event": {
@@ -719,11 +972,12 @@ async def test_pi_ask_reply_after_child_close_is_denied_by_actual_runner(
     from tests.runner.native_helpers import _harness_spec
 
     app, _pm = await _build_app_for_spec(_harness_spec("pi-native"))
-    runtime, _parent, child, _source, _registry = _scoped_runtime(
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(
         tmp_path,
         "ask",
         app.state.permission_tiers,
     )
+    child = runtime.open_pi_child_scope("session-a")
     _publish_scope(
         runtime,
         child,
@@ -1377,7 +1631,8 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
 
     token = None
     if scoped:
-        runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path, "ask")
+        runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, "ask")
+        child = runtime.open_pi_child_scope("session-a")
         bridge_tools = [
             {
                 "name": "sys_os_read",
@@ -1480,6 +1735,58 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
         }
         if token is not None:
             request["_omnigent_permission"]["pi_origin_receipt"] = token
+        if scoped:
+            for fault in ("registry-replacement", "malformed-registration"):
+                rejected_child = runtime.open_pi_child_scope("session-a")
+                _publish_scope(runtime, rejected_child, bridge_tools)
+                rejected_receipt = runtime.pi_origin_receipt(
+                    "session-a",
+                    rejected_child.credential,
+                    call_id="rejected-call",
+                    name="sys_os_read",
+                    arguments=arguments,
+                    local_execution=False,
+                )
+                rejected_binding, _ = runtime.inspect(
+                    "session-a",
+                    call_id=rejected_receipt.binding.call_id,
+                    name="sys_os_read",
+                    arguments=arguments,
+                    expected_revision=3,
+                    local_execution=False,
+                    origin_receipt=rejected_receipt.token,
+                )
+                path = rejected_child.registry_dir / "permission_tools.json"
+                payload = json.loads(path.read_text())
+                payload["tools"][0]["sourceInfo"] = (
+                    {"path": "<inline:omnigent-permission>"}
+                    if fault == "registry-replacement"
+                    else "broken"
+                )
+                path.write_text(json.dumps(payload))
+                allowed = runtime.authorize(
+                    "session-a",
+                    call_id=rejected_binding.call_id,
+                    name=rejected_binding.name,
+                    arguments_digest=rejected_binding.arguments_digest,
+                    expected_revision=3,
+                    origin_receipt=rejected_receipt.token,
+                )
+                rejected = await client.post(
+                    "/v1/sessions/session-a/mcp/execute",
+                    json={
+                        **request,
+                        "_omnigent_permission": {
+                            "call_id": rejected_binding.call_id,
+                            "revision": 3,
+                            "arguments_digest": rejected_binding.arguments_digest,
+                            "pi_origin_receipt": rejected_receipt.token,
+                        },
+                    },
+                )
+                assert calls == 0, "invalid registration must never reach the tool backend"
+                assert not allowed
+                assert "error" in rejected.json()
         if with_operation:
             request["_omnigent_operation"] = {"id": "operation-a", "step": "initial"}
         else:
