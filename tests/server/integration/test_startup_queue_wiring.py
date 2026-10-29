@@ -1,7 +1,9 @@
 """The production app owns local-host queue recovery even after create returns."""
 
+import json
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from tests.server.integration.test_multipart_create_host_launch import (
@@ -42,6 +44,44 @@ def test_enabled_app_installs_admission_and_saved_input_worker(app):
     assert app.state.startup_admission is not None
     assert app.state.startup_inputs is not None
     assert app.state.host_registry.startup_admitter is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_interrupted_turn", [False, True])
+@pytest.mark.parametrize("pending", [None, "registration", "create_preparation"])
+async def test_pre_queue_session_initializes_without_startup_attempt(
+    app, client, conv_store, resume_interrupted_turn, pending
+):
+    created = await _multipart_create(client, {})
+    session_id = created.json()["session_id"]
+    conv_store.set_runner_id(session_id, "existing-runner")
+    if pending is not None:
+        conv_store.set_labels(session_id, {f"omnigent.startup.{pending}": "pending"})
+    conversation = conv_store.get_conversation(session_id)
+    assert app.state.startup_store.for_session(session_id) is None
+    posted = []
+
+    def respond(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(201, json={"status": "initialized"})
+
+    async with httpx.AsyncClient(
+        base_url="http://runner.test", transport=httpx.MockTransport(respond)
+    ) as runner:
+        response = await app.state.runner_session_initializer.initialize(
+            conversation, runner, timeout=2, resume_interrupted_turn=resume_interrupted_turn
+        )
+    if pending is not None:
+        assert response.status_code == 503, response.text
+        assert response.json()["error"] == "startup_not_admitted"
+        assert posted == []
+        return
+    assert response.status_code == 201, response.text
+    assert len(posted) == 1
+    assert posted[0]["startup_policy_enabled"] is True
+    assert not posted[0].get("startup_required")
+    assert "startup_attempt" not in posted[0]
+    assert app.state.startup_store.for_session(session_id) is None
 
 
 @pytest.mark.asyncio

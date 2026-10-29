@@ -2078,15 +2078,20 @@ def create_runner_app(
     if process_manager is not None and hasattr(process_manager, "set_startup_admitter"):
         process_manager.set_startup_admitter(startup_admission.admit_harness)
 
-    def _register_startup_control(session_id: str, body: Mapping[str, object]) -> None:
+    def _register_startup_control(
+        session_id: str, body: Mapping[str, object], *, initialization: bool = False
+    ) -> None:
         raw_attempt = body.get("startup_attempt")
-        if body.get("startup_required") is not True and raw_attempt is None:
+        required = body.get("startup_required") is True or raw_attempt is not None
+        if initialization and type(body.get("startup_policy_enabled")) is bool:
+            startup_admission.set_policy(body.get("startup_policy_enabled") is True or required)
+        elif not required:
             return
         attempt = None
         if raw_attempt is not None:
             with contextlib.suppress(ValueError):
                 attempt = StartupAttemptRef.model_validate(raw_attempt)
-        startup_admission.register(session_id, attempt)
+        startup_admission.register(session_id, attempt, required=required)
 
     from omnigent.usage_export.runtime import usage_capture_router
 
@@ -4690,7 +4695,7 @@ def create_runner_app(
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
         if isinstance(session_id, str):
-            _register_startup_control(session_id, body)
+            _register_startup_control(session_id, body, initialization=True)
         if not isinstance(session_id, str) or not isinstance(agent_id, str):
             return await _initialize_session(body)
         sub_agent_name = body.get("sub_agent_name")

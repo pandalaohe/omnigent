@@ -569,12 +569,25 @@ class StartupAdmission:
         # notifications and uses a bounded idle poll instead of a busy loop.
         return False
 
-    async def initialization_attempt(self, conversation: Conversation) -> StartupAttemptRef | None:
-        """Keep a verified owned attempt observable across runner tunnel reconnects."""
+    async def initialization_control(
+        self, conversation: Conversation
+    ) -> tuple[bool, StartupAttemptRef | None]:
+        """Recover owned attempts while exempting sessions that predate admission."""
         current = await asyncio.to_thread(self.startups.for_session, conversation.id)
+        if current is None:
+            live = await asyncio.to_thread(self.conversations.get_conversation, conversation.id)
+            required = (
+                live is None
+                or live.archived
+                or not live.runner_id
+                or (live.host_id, live.runner_id) != (conversation.host_id, conversation.runner_id)
+                or live.labels.get(STARTUP_REGISTRATION_LABEL_KEY) == STARTUP_REGISTRATION_PENDING
+                or live.labels.get(STARTUP_CREATE_PREPARATION_LABEL_KEY)
+                == STARTUP_CREATE_PREPARATION_PENDING
+            )
+            return required, None
         if (
-            current is None
-            or current.state
+            current.state
             not in ("starting", "verifying", "uncertain", "working", "opened", "ready_empty")
             or current.attempt_id is None
             or current.runtime_id is None
@@ -583,7 +596,7 @@ class StartupAdmission:
             or not conversation.runner_id
             or conversation.host_id != current.host_id
         ):
-            return None
+            return True, None
         conn = self.hosts.get(current.host_id)
         live = await asyncio.to_thread(self.conversations.get_conversation, conversation.id)
         if (
@@ -597,8 +610,8 @@ class StartupAdmission:
             or live.archived
             or (live.host_id, live.runner_id) != (current.host_id, conversation.runner_id)
         ):
-            return None
-        return StartupAttemptRef(
+            return True, None
+        return True, StartupAttemptRef(
             startup_id=current.id,
             attempt_id=current.attempt_id,
             input_id=current.input_id,

@@ -201,7 +201,7 @@ class RunnerSessionInitializer:
             Callable[[Conversation], tuple[bool, StartupAttemptRef | None]] | None
         ) = None,
         startup_recovery_resolver: (
-            Callable[[Conversation], Awaitable[StartupAttemptRef | None]] | None
+            Callable[[Conversation], Awaitable[tuple[bool, StartupAttemptRef | None]]] | None
         ) = None,
         quota_resolver: Callable[[Conversation], str] | None = None,
         standing_pass_resolver: Callable[[Conversation], str] | None = None,
@@ -959,14 +959,23 @@ class RunnerSessionInitializer:
             )
             try:
                 required, attempt = self._startup_control(conversation)
+                payload["startup_policy_enabled"] = required
                 if required and attempt is None and self._startup_recovery_resolver is not None:
-                    attempt = await self._startup_recovery_resolver(conversation)
+                    required, attempt = await self._startup_recovery_resolver(conversation)
                 if required and attempt is None:
-                    return httpx.Response(503, json={"error": "startup_not_admitted"})
+                    return httpx.Response(
+                        503,
+                        json={"error": "startup_not_admitted"},
+                        request=httpx.Request("POST", "/v1/sessions"),
+                    )
                 if attempt is not None and attempt.mode == "startup_only":
                     connection = self._registry.get(runner_id)
                     if connection is None or STARTUP_QUEUE_V1 not in connection.hello.capabilities:
-                        return httpx.Response(503, json={"error": "startup_host_update_required"})
+                        return httpx.Response(
+                            503,
+                            json={"error": "startup_host_update_required"},
+                            request=httpx.Request("POST", "/v1/sessions"),
+                        )
                 if required:
                     payload["startup_required"] = True
                     if attempt is not None:
