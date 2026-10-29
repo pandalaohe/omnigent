@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from omnigent.runner.pi_bootstrap import PiBootstrapBroker
 from omnigent.runner.pi_scopes import PiScopeRecord
 from omnigent.server.permission_tiers import BoundToolCall
 
@@ -15,6 +16,7 @@ class PiScopeRelay:
     def __init__(self, runtime: PermissionTierRuntime, session_id: str) -> None:
         self.runtime = runtime
         self.session_id = session_id
+        self.bootstrap = PiBootstrapBroker(runtime, session_id)
 
     def legacy_allowed(self) -> bool:
         if not self.runtime.pi_scope_protocol_active(self.session_id):

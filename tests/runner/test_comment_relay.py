@@ -864,9 +864,12 @@ async def test_relay_policy_evaluate_rejects_wrong_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("private_authority", [False, True])
 async def test_relay_policy_evaluate_surfaces_upstream_error_in_502_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    private_authority: bool,
 ) -> None:
     """Relay /policies/evaluate returns a 502 whose body names the upstream failure.
 
@@ -889,7 +892,11 @@ async def test_relay_policy_evaluate_surfaces_upstream_error_in_502_body(
         """Fake server_client whose policy POST fails like a lapsed token."""
 
         async def post(self, *a: object, **kw: object) -> object:
-            raise httpx.RequestError("Databricks token refresh returned no token")
+            raise httpx.RequestError(
+                "pi_origin_receipt=fixture-private-receipt"
+                if private_authority
+                else "Databricks token refresh returned no token"
+            )
 
     loop = asyncio.get_running_loop()
     relay = start_tool_relay(
@@ -916,7 +923,12 @@ async def test_relay_policy_evaluate_surfaces_upstream_error_in_502_body(
         assert resp.status_code == 502
         # The body must name the upstream cause, not the generic HTML page, so
         # the hook's fail-closed reason is actionable.
-        assert "Databricks token refresh returned no token" in resp.text
+        if private_authority:
+            recorded = resp.text + caplog.text
+            (tmp_path / "policy-failure-record.txt").write_text(recorded)
+            assert "fixture-private-receipt" not in recorded
+        else:
+            assert "Databricks token refresh returned no token" in resp.text
         assert "<html" not in resp.text.lower()
     finally:
         relay.close()

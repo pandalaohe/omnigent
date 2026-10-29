@@ -98,6 +98,7 @@ from omnigent.models.pi_model_compatibility import (
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.permission_tiers import plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
+from omnigent.permission_tiers.pi_private import public_pi_value, redact_pi_authority
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
@@ -734,9 +735,9 @@ class _ToolServer:
             resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
             if not isinstance(resolved, dict):
                 resolved = {"result": resolved}
-            return {"result": resolved}
+            return {"result": public_pi_value(resolved)}
         except Exception as exc:  # noqa: BLE001 — tool errors are surfaced via the JSON response envelope
-            return {"error": str(exc)}
+            return {"error": redact_pi_authority(str(exc))}
 
     async def _evaluate_policy(  # type: ignore[explicit-any]
         self,
@@ -782,7 +783,7 @@ class _ToolServer:
             ):
                 return {
                     "block": resolved["block"],
-                    "reason": resolved.get("reason")
+                    "reason": redact_pi_authority(resolved["reason"])
                     if isinstance(resolved.get("reason"), str)
                     else "",
                 }
@@ -2111,7 +2112,9 @@ class _PiRpcSession:
         process, generation = self.process, self._start_generation
         try:
             async for raw_line in self._iter_stream_lines(self.process.stdout):
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                line = redact_pi_authority(
+                    raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                )
                 if line:
                     try:
                         event = json.loads(line)
@@ -2141,7 +2144,7 @@ class _PiRpcSession:
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error
-            logger.debug("PiExecutor reader error: %s", exc)
+            logger.debug("PiExecutor reader error: %s", redact_pi_authority(str(exc)))
         finally:
             if self.process is process and self._start_generation == generation:
                 self._observe_context("unknown")
@@ -2211,7 +2214,9 @@ class _PiRpcSession:
             return
         try:
             async for raw_line in self._iter_stream_lines(self.process.stderr):
-                text = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                text = redact_pi_authority(
+                    raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                )
                 if text:
                     logger.debug("pi stderr: %s", text)
                     self._stderr_lines.append(text)
@@ -4637,7 +4642,9 @@ class PiExecutor(Executor):
                     )
                     return
                 # EOF: pi exited mid-turn.
-                stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
+                stderr = (
+                    redact_pi_authority("\n".join(rpc._stderr_lines)) if rpc._stderr_lines else ""
+                )
                 stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                 if settled_boundary:
                     await self._evict_rpc(session_key, rpc)

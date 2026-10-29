@@ -82,7 +82,7 @@ def test_native_support_node_consumers(tmp_path):
         / "omnigent/resources/pi_native/native_support.test.cjs"
     )
     result = subprocess.run(
-        [node, "--test", str(script)],
+        [node, "--test", str(script), str(script.with_name("scoped_client.test.cjs"))],
         capture_output=True,
         text=True,
         timeout=45,

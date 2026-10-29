@@ -2231,6 +2231,51 @@ async def test_rpc_pi_usage_bridge_requires_session_token_and_fails_closed() -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_pi_private_authority_is_excluded_before_rpc_error_return():
+    server = _ToolServer()
+
+    async def failing(_name, _arguments):
+        raise RuntimeError("pi_origin_receipt=fixture-private-receipt")
+
+    server._tool_executor = failing
+    response = await server._execute("read", {})
+    assert "fixture-private-receipt" not in json.dumps(response)
+    assert "error" in response
+
+
+@pytest.mark.asyncio
+async def test_pi_private_stderr_never_reaches_logs_errors_or_saved_records(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG, logger="omnigent.inner.pi_executor")
+    rpc = _PiRpcSession()
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"pi_origin_receipt=fixture-private-receipt\n")
+    stream.feed_eof()
+    rpc.process = MagicMock()
+    rpc.process.stderr = stream
+    rpc.process.returncode = None
+    rpc.process.stdin = _FakeStreamWriter()
+    await rpc._stderr_reader()
+    assert "fixture-private-receipt" not in caplog.text
+    assert "fixture-private-receipt" not in json.dumps(rpc._stderr_lines)
+    # Exercise the independent EOF/error sink even if a producer bypasses the drainer.
+    rpc._stderr_lines = ["pi_origin_receipt=fixture-private-receipt"]
+    rpc._line_queue.put_nowait(None)
+    executor = TestRunTurn()._make_executor()
+    monkeypatch.setattr(executor, "_ensure_rpc", AsyncMock(return_value=rpc))
+    events = [
+        event
+        async for event in executor.run_turn([{"role": "user", "content": "read"}], [], "system")
+    ]
+    errors = [event.message for event in events if isinstance(event, ExecutorError)]
+    assert errors
+    record = tmp_path / "public-errors.json"
+    record.write_text(json.dumps(errors))
+    assert "fixture-private-receipt" not in record.read_text()
+
+
 class TestToolServer(unittest.TestCase):
     def setUp(self):
         try:

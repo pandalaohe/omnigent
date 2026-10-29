@@ -105,6 +105,7 @@ from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.permission_tiers.pi_private import redact_pi_authority
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -1582,6 +1583,7 @@ class ClaudeNativeToolRelay:
         advertised_url: str,
         relay_info: _JsonObject,
         tool_executor: ToolExecutor,
+        on_close: Callable[[], None] | None = None,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1599,6 +1601,7 @@ class ClaudeNativeToolRelay:
         self._advertised_url = advertised_url
         self._relay_info = relay_info
         self._tool_executor = tool_executor
+        self._on_close = on_close
 
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
@@ -1630,6 +1633,9 @@ class ClaudeNativeToolRelay:
 
         :returns: None.
         """
+        if self._on_close is not None:
+            self._on_close()
+            self._on_close = None
         relay_file = self._bridge_dir / _TOOL_RELAY_FILE
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
@@ -8154,6 +8160,10 @@ def start_tool_relay(
         pi_scope_relay=pi_scope_relay,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
+    if pi_scope_relay is not None:
+        # Existing wildcard/LAN relays retain their legacy surface only.
+        with contextlib.suppress(ValueError):
+            pi_scope_relay.bootstrap.attach_listener(httpd, advertised_url)
     relay_info: _JsonObject = {
         "url": advertised_url,
         "token": token,
@@ -8181,6 +8191,7 @@ def start_tool_relay(
         advertised_url=advertised_url,
         relay_info=relay_info,
         tool_executor=tool_executor,
+        on_close=pi_scope_relay.bootstrap.close if pi_scope_relay is not None else None,
     )
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -8481,6 +8492,15 @@ def _tool_relay_handler_factory(
     # Remember a cancellation that races ahead of its /tool request.
     cancelled_ids: deque[str] = deque(maxlen=_MAX_CONCURRENT_MCP_REQUESTS * 2)
 
+    async def _bootstrap_request(
+        authorization: str | None, payload: _JsonObject | None = None
+    ) -> _JsonObject:
+        if pi_scope_relay is None:
+            raise ValueError("Pi bootstrap unavailable")
+        broker = pi_scope_relay.bootstrap
+        actor = broker.authenticate(authorization)
+        return broker.frame(actor) if payload is None else broker.handle(actor, payload)
+
     class _ToolRelayHandler(BaseHTTPRequestHandler):
         """HTTP handler for active Omnigent tool relay calls."""
 
@@ -8495,12 +8515,69 @@ def _tool_relay_handler_factory(
             """
             del format, args
 
+        def do_GET(self) -> None:
+            if self.path != "/pi/bootstrap/watch" or pi_scope_relay is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            authorization = self.headers.get("Authorization")
+            future = asyncio.run_coroutine_threadsafe(_bootstrap_request(authorization), loop)
+            try:
+                frame = future.result(timeout=5.0)
+            except Exception:  # noqa: BLE001 - fixed failure before any private frame
+                future.cancel()
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.connection.settimeout(2.0)
+            while True:
+                try:
+                    self.wfile.write(json.dumps(frame).encode() + b"\n")
+                    self.wfile.flush()
+                    time.sleep(0.1)
+                    future = asyncio.run_coroutine_threadsafe(
+                        _bootstrap_request(authorization), loop
+                    )
+                    frame = future.result(timeout=2.0)
+                except Exception:  # noqa: BLE001 - EOF/error seals the private client
+                    future.cancel()
+                    return
+
+        def _handle_bootstrap(self) -> None:
+            authorization = self.headers.get("Authorization")
+            future = asyncio.run_coroutine_threadsafe(_bootstrap_request(authorization), loop)
+            try:
+                future.result(timeout=5.0)
+            except Exception:  # noqa: BLE001 - authenticate before body decoding
+                future.cancel()
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            future = asyncio.run_coroutine_threadsafe(
+                _bootstrap_request(authorization, payload), loop
+            )
+            try:
+                response = future.result(timeout=5.0)
+            except Exception:  # noqa: BLE001 - no exception or authority in public diagnostics
+                future.cancel()
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            self._send_json(response)
+
         def do_POST(self) -> None:
             """
             Accept one MCP tool call or policy evaluation from the Claude helper process.
 
             :returns: None.
             """
+            if self.path == "/pi/bootstrap" and pi_scope_relay is not None:
+                self._handle_bootstrap()
+                return
             if self.path not in (
                 "/tool",
                 "/tool/cancel",
@@ -8959,7 +9036,9 @@ def _tool_relay_handler_factory(
             :returns: None.
             """
             reason = str(exc).strip()
-            detail = f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
+            raw_detail = f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
+            detail = redact_pi_authority(raw_detail)
+            private = detail != raw_detail
             # Truncate the detail (not the composed message) so the leading
             # cause always survives intact instead of being cut mid-reason once
             # the fixed prefix is prepended.
@@ -8968,7 +9047,9 @@ def _tool_relay_handler_factory(
             message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
             # Keep the full exception (with traceback) in the runner log; the
             # user-facing body is capped and can drop a diagnostically useful tail.
-            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
+            _logger.warning(
+                "policy-eval proxy forward failed: %s", detail, exc_info=None if private else exc
+            )
             body = message.encode("utf-8", "replace")
             self.send_response(HTTPStatus.BAD_GATEWAY)
             self.send_header("Content-Type", "text/plain; charset=utf-8")

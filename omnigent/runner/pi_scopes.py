@@ -54,7 +54,7 @@ class PiScopeRecord:
     status: Literal["pending", "ready", "revoked"] = "pending"
     registration_digest: str | None = None
     native_classifier: (
-        Callable[[NativeCallBinding, Mapping[str, object]], NativeSupport] | None
+        Callable[[str, NativeCallBinding, Mapping[str, object]], NativeSupport] | None
     ) = field(default=None, repr=False)
 
 
@@ -79,6 +79,11 @@ class PiScopeRegistry:
         self._receipts: dict[str, PiOriginReceipt] = {}
         self._scope_counts: dict[str, int] = {}
         self._receipt_counts: dict[str, int] = {}
+        self._launch_observers: set[Callable[[str], None]] = set()
+
+    def observe_launch_invalidation(self, callback: Callable[[str], None]) -> Callable[[], None]:
+        self._launch_observers.add(callback)
+        return lambda: self._launch_observers.discard(callback)
 
     @staticmethod
     def _digest(value: object) -> str:
@@ -116,6 +121,8 @@ class PiScopeRegistry:
         # Keep the v2 requirement latched during a blocked/rebinding launch.
         if root_session_id in self._launches:
             self._launches[root_session_id] = None
+        for callback in tuple(self._launch_observers):
+            callback(root_session_id)
 
     def open_scope(
         self,
@@ -154,7 +161,7 @@ class PiScopeRegistry:
         }
         directory.mkdir(mode=0o700, parents=True)
         atomic_write_json(directory / "permission_expected.json", expectation)
-        admission = PiScopeAdmission(principal, directory, secrets.token_urlsafe(32))
+        admission = PiScopeAdmission(principal, directory, "pi_scope_" + secrets.token_urlsafe(32))
         self._scopes[principal.scope_id] = PiScopeRecord(admission, expectation)
         self._credentials[self._digest(admission.credential)] = principal.scope_id
         self._scope_counts[state.session_id] = self._scope_counts.get(state.session_id, 0) + 1
@@ -240,28 +247,32 @@ class PiScopeRegistry:
             native_arguments_digest(arguments),
             state.revision,
         )
-        native_support = self.classify_native(record, native_binding, arguments)
+        native_support = self.classify_native(record, canonical_id, native_binding, arguments)
         receipt = PiOriginReceipt(
             principal,
             binding,
             local_execution,
             native_binding,
             native_support,
-            secrets.token_urlsafe(32),
+            "pi_receipt_" + secrets.token_urlsafe(32),
         )
         self._receipts[self._digest(receipt.token)] = receipt
         self._receipt_counts[state.session_id] = self._receipt_counts.get(state.session_id, 0) + 1
         return receipt
 
     def classify_native(
-        self, record: PiScopeRecord, binding: NativeCallBinding, arguments: Mapping[str, object]
+        self,
+        record: PiScopeRecord,
+        canonical_call_id: str,
+        binding: NativeCallBinding,
+        arguments: Mapping[str, object],
     ) -> NativeSupport:
         """Only a bootstrap-installed adapter supplies facts; event fields never do."""
         self.record(record.admission.principal)
         try:
             if record.status != "ready" or record.native_classifier is None:
                 raise ValueError("Native bootstrap is unavailable")
-            support = record.native_classifier(binding, arguments)
+            support = record.native_classifier(canonical_call_id, binding, arguments)
             if not isinstance(support, NativeSupport) or support.binding != binding:
                 raise ValueError("Native support binding mismatch")
             return support

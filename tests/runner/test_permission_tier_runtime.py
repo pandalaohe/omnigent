@@ -200,7 +200,7 @@ def _publish_scope(runtime, admission, tools):
         )
         runtime.install_pi_native_classifier(
             admission.principal,
-            lambda binding, _arguments: NativeSupport(
+            lambda _call_id, binding, _arguments: NativeSupport(
                 binding, NativeSupportStatus.ATTESTED, inputs=(snapshot,)
             ),
         )
@@ -268,7 +268,7 @@ def test_native_semantics_and_input_snapshot_refresh_at_authorize_and_execute(tm
     settings = agent.parents[1] / "settings.json"
     runtime.install_pi_native_classifier(
         child.principal,
-        lambda binding, _args: NativeSupport(
+        lambda _call_id, binding, _args: NativeSupport(
             binding,
             NativeSupportStatus.ATTESTED,
             "delegate",
@@ -374,6 +374,55 @@ def _scope_call(runtime, admission, *, call_id="same-call", name="read", argumen
         origin_receipt=receipt.token,
     )
     return receipt, binding, decision
+
+
+def test_pi_native_attestation_keeps_identical_calls_and_refreshes_distinct(tmp_path):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path)
+    child = runtime.open_pi_child_scope("session-a")
+    tools = [{"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}}]
+    _write_scope_registry(child, tools)
+    assert runtime.acknowledge_pi_scope("session-a", child.credential)
+    record = runtime.pi_scopes.record(child.principal)
+    expected = record.expected
+    guard = Path(expected["extension_path"])
+    snapshot = NativeInputSnapshot(str(guard), str(guard.resolve()), expected["extension_sha256"])
+    seen = []
+    allowed = {"pi:" + hashlib.sha256((child.principal.scope_id + "\0A").encode()).hexdigest()}
+
+    def classify(canonical_call_id, binding, _arguments):
+        seen.append(canonical_call_id)
+        return NativeSupport(
+            binding,
+            NativeSupportStatus.ATTESTED
+            if canonical_call_id in allowed
+            else NativeSupportStatus.FAILED,
+            inputs=(snapshot,),
+        )
+
+    runtime.install_pi_native_classifier(child.principal, classify)
+    a, binding_a, decision_a = _scope_call(runtime, child, call_id="A")
+    b, binding_b, decision_b = _scope_call(runtime, child, call_id="B")
+    assert decision_a.action.value == "ALLOW"
+    assert decision_b.action.value == "DENY"
+    assert binding_a.call_id != binding_b.call_id
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding_b.call_id,
+        name="read",
+        arguments_digest=binding_b.arguments_digest,
+        expected_revision=3,
+        origin_receipt=b.token,
+    )
+    assert runtime.authorize(
+        "session-a",
+        call_id=binding_a.call_id,
+        name="read",
+        arguments_digest=binding_a.arguments_digest,
+        expected_revision=3,
+        origin_receipt=a.token,
+    )
+    assert seen.count(binding_a.call_id) >= 3
+    assert seen.count(binding_b.call_id) >= 2
 
 
 @pytest.mark.parametrize("untrusted", [None, "", "forged", {}, {"origin": "parent"}])

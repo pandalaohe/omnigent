@@ -285,7 +285,11 @@ class PermissionTierRuntime:
         return self._open_pi_scope(session_id, origin="child")
 
     def _open_pi_scope(
-        self, session_id: str, *, origin: Literal["parent", "child"]
+        self,
+        session_id: str,
+        *,
+        origin: Literal["parent", "child"],
+        native_child_guard: bool = False,
     ) -> PiScopeAdmission:
         state = self.state(session_id)
         if state is None or self._harnesses.get(session_id) not in ("pi", "pi-native"):
@@ -298,6 +302,18 @@ class PermissionTierRuntime:
             or expected.get("harness") != self._harnesses[session_id]
         ):
             raise ValueError("Pi enforcement belongs to another launch")
+        if native_child_guard:
+            if origin != "child":
+                raise ValueError("Pi child guard requires a child installation")
+            guard = (
+                Path(__file__).resolve().parent.parent
+                / "resources/pi_native/omnigent_pi_child_extension.js"
+            )
+            expected = {
+                **expected,
+                "extension_path": str(guard),
+                "extension_sha256": hashlib.sha256(guard.read_bytes()).hexdigest(),
+            }
         return self.pi_scopes.open_scope(
             state,
             self.path(session_id).parent,
@@ -361,7 +377,7 @@ class PermissionTierRuntime:
     def install_pi_native_classifier(
         self,
         principal: PiScopePrincipal,
-        classifier: Callable[[NativeCallBinding, Mapping[str, object]], NativeSupport],
+        classifier: Callable[[str, NativeCallBinding, Mapping[str, object]], NativeSupport],
     ) -> None:
         """Trusted bootstrap API; a tool or event cannot install a native attestor."""
         record = self.pi_scopes.record(principal)
@@ -382,7 +398,9 @@ class PermissionTierRuntime:
             return None
         receipt = self.pi_scopes.resolve(session_id, token)
         record = self.pi_scopes.record(receipt.principal)
-        support = self.pi_scopes.classify_native(record, receipt.native_binding, arguments)
+        support = self.pi_scopes.classify_native(
+            record, receipt.binding.call_id, receipt.native_binding, arguments
+        )
         try:
             if support != receipt.native_support:
                 raise ValueError("Native support changed")
