@@ -155,17 +155,35 @@ def test_canonical_call_allocation_and_unit_conflicts(tmp_path: Path) -> None:
     assert len(store.page("alice")["events"]) == 3
 
 
-def test_pi_response_identity_counts_once_and_unknown_call_stays_null(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("harness", "family", "identity_namespace", "response_namespace"),
+    [
+        ("pi-native", "pi", "pi/session/v1", "pi/response-id/v1"),
+        (
+            "antigravity-native",
+            "antigravity",
+            "antigravity/cascade/v1",
+            "antigravity/response-id/v1",
+        ),
+    ],
+)
+def test_native_response_identity_counts_once_and_unknown_call_stays_null(
+    tmp_path: Path,
+    harness: str,
+    family: str,
+    identity_namespace: str,
+    response_namespace: str,
+) -> None:
     store = _store(tmp_path)
     shared = {
-        "harness": "pi-native",
-        "harness_family": "pi",
-        "identity_namespace": "pi/session/v1",
+        "harness": harness,
+        "harness_family": family,
+        "identity_namespace": identity_namespace,
         "measurement_kind": "request",
         "logical_call_id": "pi-response-1",
         "call_identity_coverage": "complete",
         "source_refs": [
-            {"kind": "response", "namespace": "pi/response-id/v1", "id": "pi-response-1"}
+            {"kind": "response", "namespace": response_namespace, "id": "pi-response-1"}
         ],
     }
     first = store.append("alice", _observation(**shared))
@@ -174,9 +192,9 @@ def test_pi_response_identity_counts_once_and_unknown_call_stays_null(tmp_path: 
         "alice",
         _observation(
             producer_unit_id="warm-1",
-            harness="pi-native",
-            harness_family="pi",
-            identity_namespace="pi/session/v1",
+            harness=harness,
+            harness_family=family,
+            identity_namespace=identity_namespace,
             measurement_kind="increment",
             input_tokens=0,
             cached_input_tokens=8,

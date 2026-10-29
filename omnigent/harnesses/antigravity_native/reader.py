@@ -56,10 +56,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -102,6 +104,7 @@ from omnigent.harnesses.antigravity_native.steps import (
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.native._native_post_delivery import post_session_event_with_retry
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+from omnigent.usage_export.runtime import capture_antigravity_step, capture_enabled
 
 _logger = logging.getLogger(__name__)
 
@@ -1302,6 +1305,10 @@ class _ReaderState:
     surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
     interaction_rescans: set[asyncio.Task[None]] = field(default_factory=set)
     subagent_mirrors: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    last_context_usage: dict[str, object] | None = None
+    usage_thread_kind: Literal["main", "subagent"] = "main"
+    metered_steps: set[_StepKey] = field(default_factory=set)
+    pending_metering: set[_StepKey] = field(default_factory=set)
 
 
 async def _poll_loop(
@@ -1431,6 +1438,25 @@ async def _stream_loop(
     """
     while not stop():
         async for frame in stream_agent_state_updates(port, cascade_id):
+            context = frame.get("contextWindowUsage")
+            if isinstance(context, dict):
+                payload: dict[str, object] = {}
+                for source, target, minimum in (
+                    ("estimatedTokensUsed", "context_tokens", 0),
+                    ("maxContextTokens", "context_window", 1),
+                ):
+                    value = context.get(source)
+                    if type(value) is int and value >= minimum:
+                        payload[target] = value
+                if payload and payload != state.last_context_usage:
+                    await _post_event(
+                        client,
+                        session_id,
+                        OutboundEvent(
+                            event_type=_EXTERNAL_SESSION_USAGE, data=payload, step_index=0
+                        ),
+                    )
+                    state.last_context_usage = payload
             # NOTE on /clear rotation: this stream is bound to ONE cascade and only
             # ever reports THAT cascade's id, so it can NEVER observe a sibling
             # conversation — a per-frame "did the conversation change?" guard here
@@ -1514,6 +1540,21 @@ async def _process_committed_step(
     :returns: None.
     """
     key = _step_key(step)
+    if capture_enabled() and _is_settled(step) and key not in state.metered_steps:
+        try:
+            await asyncio.to_thread(
+                capture_antigravity_step,
+                session_id,
+                cascade_id,
+                step,
+                thread_kind=state.usage_thread_kind,
+            )
+        except (OSError, sqlite3.Error):
+            state.pending_metering.add(key)
+            _logger.warning("agy usage capture deferred until native replay", exc_info=True)
+        else:
+            state.metered_steps.add(key)
+            state.pending_metering.discard(key)
     if key not in state.seen:
         if _is_settled(step):
             state.seen.add(key)
@@ -1749,7 +1790,9 @@ async def _mirror_subagent_cascade(
         """A sub-agent has no terminal to prompt in; nothing to bridge."""
         return
 
-    child_state = _ReaderState(seen=set(), interacted=set(), port=port)
+    child_state = _ReaderState(
+        seen=set(), interacted=set(), port=port, usage_thread_kind="subagent"
+    )
     turn_opened = False
     quiet_polls = 0
     quiescent_window = _SUBAGENT_QUIESCENT_POLLS
@@ -1783,7 +1826,10 @@ async def _mirror_subagent_cascade(
                 if child_state.turn_active:
                     turn_opened = True
             if turn_opened and not child_state.turn_active:
-                return
+                if not child_state.pending_metering:
+                    return
+                await _sleep(_SUBAGENT_POLL_INTERVAL_S)
+                continue
             if len(child_state.seen) != mirrored_before:
                 quiet_polls = 0
                 quiescent_window = _SUBAGENT_QUIESCENT_POLLS
@@ -1798,7 +1844,9 @@ async def _mirror_subagent_cascade(
                         child_session_id,
                     )
                     await _post_event(client, child_session_id, _status_event(_STATUS_IDLE))
-                    return
+                    if not child_state.pending_metering:
+                        return
+                    child_state.turn_active = False
                 # agy says it is still working, so keep mirroring — but a child
                 # that never reports idle would otherwise re-ask every window for
                 # the life of the session, so widen it geometrically.

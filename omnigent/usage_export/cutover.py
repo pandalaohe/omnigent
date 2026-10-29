@@ -45,7 +45,15 @@ from omnigent.usage_export.models import AccountHint, thread_key
 from omnigent.usage_export.store import UsageExportError
 
 FEED_HARNESSES = frozenset(
-    {"claude-native", "claude-sdk", "codex-native", "codex-sdk", "pi-native", "pi"}
+    {
+        "claude-native",
+        "claude-sdk",
+        "codex-native",
+        "codex-sdk",
+        "pi-native",
+        "pi",
+        "antigravity-native",
+    }
 )
 ACTIVE_HOLD_STATES = frozenset({"held", "drained", "invalidated"})
 HOLD_STATES = frozenset({"none", "held", "drained", "released", "invalidated", "abandoned"})

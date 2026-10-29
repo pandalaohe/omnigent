@@ -2990,6 +2990,96 @@ async def _run_with_telemetry(
 
 
 @pytest.mark.asyncio
+async def test_agy_context_stream_uses_native_snapshot_and_accepts_compaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    first = {"contextWindowUsage": {"estimatedTokensUsed": 3400, "maxContextTokens": 200000}}
+    compacted = {
+        "contextWindowUsage": {
+            "estimatedTokensUsed": 1200,
+            "maxContextTokens": 200000,
+            "estimatedAfterCompaction": True,
+        }
+    }
+    sink = _PostSink()
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript([first, first, compacted]),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+    assert [data for kind, data in sink.posts if kind == "external_session_usage"] == [
+        {"context_tokens": 3400, "context_window": 200000},
+        {"context_tokens": 1200, "context_window": 200000},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "context", [None, {}, {"estimatedTokensUsed": True, "maxContextTokens": -1}]
+)
+async def test_agy_context_unknown_never_uses_billing_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+    context: object,
+) -> None:
+    frame = _frame([_planner_with_model_usage(input_tokens="99999")])
+    if context is not None:
+        frame["contextWindowUsage"] = context
+    sink = _PostSink()
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript([frame]),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+    usage = [data for kind, data in sink.posts if kind == "external_session_usage"]
+    assert usage and usage[0]["cumulative_input_tokens"] == 99999
+    assert all("context_tokens" not in data and "context_window" not in data for data in usage)
+
+
+@pytest.mark.asyncio
+async def test_agy_capture_failure_retries_replay_without_duplicate_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def capture(*_args: object, **_kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary spool failure")
+
+    async def no_interaction(*_args: object) -> None:
+        return
+
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "capture_enabled", lambda: True)
+    monkeypatch.setattr(reader, "capture_antigravity_step", capture)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    state = reader._ReaderState(seen=set(), interacted=set(), model_catalog={})
+    async with httpx.AsyncClient(base_url="http://test") as client:
+        for _ in range(2):
+            await reader._process_committed_step(
+                _load("planner_response_text"),
+                client=client,
+                session_id=_SESSION_ID,
+                cascade_id=_CASCADE_ID,
+                state=state,
+                on_pending_interaction=no_interaction,
+            )
+    assert attempts == 2
+    assert sink.message_roles() == ["assistant"]
+
+
+@pytest.mark.asyncio
 async def test_planner_done_emits_session_usage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

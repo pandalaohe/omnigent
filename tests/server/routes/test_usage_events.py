@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -288,7 +289,7 @@ def _drain_body(**changes: object) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["codex-native", "pi-native", "pi"])
+@pytest.mark.parametrize("harness", ["codex-native", "pi-native", "pi", "antigravity-native"])
 async def test_cutover_gate_refuses_a_held_domain_and_records_nothing(
     tmp_path: Path,
     harness: str,
@@ -477,7 +478,12 @@ async def test_receipts_route_serves_the_r4_page_shape_and_errors(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("actual_harness", "registered_harness"),
-    [("claude-code-native", "claude-native"), ("pi-native", "pi-native"), ("pi", "pi")],
+    [
+        ("claude-code-native", "claude-native"),
+        ("pi-native", "pi-native"),
+        ("pi", "pi"),
+        ("antigravity-native", "antigravity-native"),
+    ],
 )
 async def test_registration_requires_exact_owner_and_harness(
     tmp_path: Path, actual_harness: str, registered_harness: str
@@ -505,6 +511,157 @@ async def test_registration_requires_exact_owner_and_harness(
             )
         ).status_code == 409
         assert (await client.post("/v1/usage-producers", json=registration)).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capture_enabled", "id_field", "namespace", "step_name", "fail_append"),
+    [
+        (False, "responseId", "antigravity/response-id/v1", "planner_response_text", None),
+        (True, "responseId", "antigravity/response-id/v1", "planner_response_text", None),
+        (
+            True,
+            "providerAssignedMessageId",
+            "antigravity/provider-message-id/v1",
+            "planner_response_text",
+            None,
+        ),
+        (True, "messageId", "antigravity/message-id/v1", "planner_response_text", None),
+        (True, "responseId", "antigravity/response-id/v1", "checkpoint", None),
+        (True, "responseId", "antigravity/response-id/v1", "planner_response_text", 1),
+        (True, "responseId", "antigravity/response-id/v1", "planner_response_text", 2),
+    ],
+)
+async def test_agy_reader_usage_replay_exports_linked_native_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capture_enabled: bool,
+    id_field: str,
+    namespace: str,
+    step_name: str,
+    fail_append: int | None,
+) -> None:
+    from omnigent.harnesses.antigravity_native import reader
+    from omnigent.usage_export import runtime
+
+    uri = f"sqlite:///{tmp_path / 'server.db'}"
+    conversations = SqlAlchemyConversationStore(uri)
+    conv = conversations.create_conversation(
+        agent_id="a" * 32, host_id="b" * 32, workspace="/opt/work"
+    )
+    SqlAlchemyPermissionStore(uri).grant("alice", conv.id, LEVEL_OWNER)
+    spool = UsageOutbox(tmp_path / "usage")
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1" if capture_enabled else "0")
+    monkeypatch.setattr(runtime, "outbox", lambda: spool)
+
+    message_roles = []
+
+    async def accepted_native_event(**kwargs: object) -> httpx.Response:
+        payload = kwargs["payload"]
+        if (
+            payload["type"] == "external_conversation_item"
+            and payload["data"]["item_type"] == "message"
+        ):
+            message_roles.append(payload["data"]["item_data"]["role"])
+        return httpx.Response(200)
+
+    monkeypatch.setattr(reader, "post_session_event_with_retry", accepted_native_event)
+    fixtures = Path(__file__).parents[2] / "fixtures/antigravity/steps"
+    step = json.loads((fixtures / f"{step_name}.json").read_text())
+    usage = step["metadata"]["modelUsage"]
+    usage["responseHeader"] = {"x-source": "must-not-be-retained"}
+    if step_name == "planner_response_text":
+        usage.pop("responseId", None)
+        usage.update(
+            inputTokens="1000",
+            outputTokens="100",
+            thinkingOutputTokens="40",
+            cacheReadTokens="200",
+            cacheWriteTokens="0",
+        )
+        usage[id_field] = "agy-response-1"
+        step["plannerResponse"]["modifiedResponse"] = "must-not-be-retained"
+    if fail_append is not None:
+        step["metadata"]["retryInfos"] = [{"usage": {**usage, "responseId": "agy-retry"}}]
+        append = spool.append
+        attempts = 0
+
+        def interrupted_append(*args: object, **kwargs: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == fail_append:
+                raise OSError("temporary spool failure")
+            append(*args, **kwargs)
+
+        async def no_delay(_seconds: float) -> None:
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(spool, "append", interrupted_append)
+        monkeypatch.setattr(reader, "_sleep", no_delay)
+        monkeypatch.setattr(reader, "get_available_models", lambda _port: {})
+        user = json.loads((fixtures / "user_input.json").read_text())
+        monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade: [user, step])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app(conversations, "antigravity-native")),
+        base_url="https://omni.example.test",
+        headers={"X-Forwarded-Email": "alice"},
+    ) as server:
+        await runtime.prepare_capture(server, conv.id, "antigravity-native")
+        spool.begin_admission(conv.id, "antigravity-native", {"admission_id": "not-proof"})
+        if fail_append is not None:
+            await asyncio.wait_for(
+                reader._mirror_subagent_cascade(
+                    port=4242,
+                    child_cascade_id="native-cascade",
+                    client=server,
+                    child_session_id=conv.id,
+                ),
+                timeout=60,
+            )
+            assert attempts > fail_append
+            assert message_roles == ["user", "assistant"]
+        else:
+            for _ in range(2):
+                await reader._process_committed_step(
+                    step,
+                    client=server,
+                    session_id=conv.id,
+                    cascade_id="native-cascade",
+                    state=reader._ReaderState(seen=set(), interacted=set(), model_catalog={}),
+                    on_pending_interaction=accepted_native_event,
+                )
+        assert (
+            spool.pending_admission(conv.id, "antigravity-native")["admission_id"] == "not-proof"
+        )
+        spool.finish_admission(conv.id, "antigravity-native")
+        await spool.drain(server)
+        await spool.drain(server)
+        page = (await server.get("/v1/usage-events")).json()
+    if not capture_enabled:
+        assert page["events"] == []
+        return
+    assert len(page["events"]) == (2 if fail_append is not None else 1)
+    event = page["events"][0]
+    assert (event["harness"], event["harness_family"]) == ("antigravity-native", "antigravity")
+    assert (event["session_id"], event["physical_session_id"]) == (conv.id, "native-cascade")
+    assert event["turn_id"] == step["metadata"]["executionId"]
+    assert (
+        event["input_tokens"],
+        event["cached_input_tokens"],
+        event["output_tokens"],
+        event["reasoning_tokens"],
+    ) == ((None, None, 3, None) if step_name == "checkpoint" else (800, 200, 100, 40))
+    assert event["logical_call_id"] == usage[id_field] and event["request_count"] == 1
+    assert event["source_refs"] == [
+        {"kind": "response", "namespace": namespace, "id": usage[id_field]}
+    ]
+    if fail_append is not None:
+        assert page["events"][1]["logical_call_id"] == "agy-retry"
+        assert page["events"][1]["request_count"] == 1
+        assert all(row["thread_kind"] == "subagent" for row in page["events"])
+    assert event["account_hint"] is None and event["call_started_not_before"] is None
+    assert "must-not-be-retained" not in json.dumps(page)
+    assert b"must-not-be-retained" not in spool.path.read_bytes()
 
 
 @pytest.mark.asyncio
