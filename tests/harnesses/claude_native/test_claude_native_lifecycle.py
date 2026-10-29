@@ -26,6 +26,33 @@ from omnigent.inner.terminal_lifecycle import (
 _INSTANCE_ID = "a" * 32
 
 
+def test_prompt_and_failure_keep_distinct_durable_turn_receipts(
+    launch: tuple[Path, TerminalLifecycleTrace],
+) -> None:
+    directory, _ = launch
+    for _ in range(2):
+        bridge.record_hook_event(
+            directory, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-a"}
+        )
+        bridge.record_hook_event(
+            directory,
+            {
+                "hook_event_name": "StopFailure",
+                "session_id": "claude-a",
+                "error_details": "same provider error",
+            },
+        )
+    records = bridge.read_hook_events_since_with_position(directory, 0).records
+    first, failed_first, second, failed_second = records
+    assert first.terminal_turn_id == failed_first.terminal_turn_id
+    assert second.terminal_turn_id == failed_second.terminal_turn_id
+    assert first.terminal_turn_id != second.terminal_turn_id
+    assert first.terminal_input_id == failed_first.terminal_input_id
+    assert second.terminal_input_id == failed_second.terminal_input_id
+    assert first.terminal_input_id != second.terminal_input_id
+    assert all(record.terminal_input_id is not None for record in records)
+
+
 @pytest.fixture
 def launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, TerminalLifecycleTrace]:
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)

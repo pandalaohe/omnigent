@@ -429,7 +429,13 @@ async def _start_codex_turn(
         await asyncio.to_thread(
             link_codex_turn, state.session_id, "codex-native", state.thread_id, turn_id
         )
-        update_active_turn_id(bridge_dir, turn_id)
+        from omnigent.native.input_diagnostics import current_input_attributes
+
+        input_attributes = current_input_attributes()
+        input_id = input_attributes.get("input_stable_id") or input_attributes.get("pending_id")
+        update_active_turn_id(
+            bridge_dir, turn_id, input_id=input_id if isinstance(input_id, str) else None
+        )
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
         return replace(state, active_turn_id=turn_id)
     return None
@@ -458,7 +464,13 @@ async def _steer_codex_turn(
     result = _json_object(response.get("result"))
     turn_id = result.get("turnId") if result is not None else None
     if isinstance(turn_id, str) and turn_id:
-        update_active_turn_id(bridge_dir, turn_id)
+        from omnigent.native.input_diagnostics import current_input_attributes
+
+        input_attributes = current_input_attributes()
+        input_id = input_attributes.get("input_stable_id") or input_attributes.get("pending_id")
+        update_active_turn_id(
+            bridge_dir, turn_id, input_id=input_id if isinstance(input_id, str) else None
+        )
         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
 
 

@@ -1760,7 +1760,12 @@ async def _session_turn_actor(
 
 
 async def _patch_subagent_label(
-    server_client: httpx.AsyncClient, child_session_id: str, key: str, value: str
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    key: str,
+    value: str,
+    *,
+    extra_labels: dict[str, str] | None = None,
 ) -> str | None:
     """
     Write one runner-owned sub-agent label on a child session.
@@ -1774,7 +1779,7 @@ async def _patch_subagent_label(
     try:
         resp = await server_client.patch(
             f"{_session_url(child_session_id)}",
-            json={"labels": {key: value}},
+            json={"labels": {**(extra_labels or {}), key: value}},
             timeout=30.0,
         )
     except (httpx.HTTPError, ValueError) as exc:
@@ -5627,12 +5632,26 @@ async def _complete_created_session(
                 )
             )
             if post_error is not None:
+                from omnigent.entities.subagent_terminal import TerminalEnvelope
+
                 _subagent_work.mark_subagent_work_terminal(
                     child_id,
                     status="failed",
                     output=(
                         f"Error: child session {child_id} was created but its first "
                         f"message could not be delivered: {post_error}"
+                    ),
+                    terminal=TerminalEnvelope(
+                        child_id=child_id,
+                        parent_id=conversation_id,
+                        event_kind="dispatch_failed",
+                        status="failed",
+                        error={
+                            "code": "child_registration_failed"
+                            if registration_error is not None
+                            else "child_not_ready",
+                            "message": post_error,
+                        },
                     ),
                 )
                 initial_message = {
@@ -11743,6 +11762,9 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         agent = payload.get("agent") or payload.get("tool_name", "sub_agent")
         title = payload.get("title", "")
         target = f"{agent}:{title}" if title else str(agent)
+        diagnostic = payload.get("identity_diagnostic")
+        if isinstance(diagnostic, str) and diagnostic:
+            target = f"{target} ({diagnostic})"
         placement_label = payload.get("placement_label")
         if isinstance(placement_label, str) and placement_label:
             target = f"{target} [{placement_label}]"

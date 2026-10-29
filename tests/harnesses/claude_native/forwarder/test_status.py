@@ -14,6 +14,7 @@ import pytest
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeHookRecord,
+    read_hook_events_since_with_position,
     record_hook_event,
 )
 from tests.harnesses.claude_native.forwarder._support import (
@@ -212,9 +213,24 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     assert request["path"] == "/v1/sessions/conv_abc/events"
     # The Stop hook carries its authoritative background-shell count (0 here,
     # no background tasks) so a finished shell clears the indicator.
+    [prompt, stop] = [
+        record
+        for record in read_hook_events_since_with_position(bridge_dir, 0).records
+        if record.claude_session_id == "claude-session"
+        and record.event_name in {"UserPromptSubmit", "Stop"}
+    ]
+    assert stop.terminal_turn_id == prompt.terminal_turn_id
+    assert stop.terminal_input_id == prompt.terminal_input_id
+    assert stop.terminal_input_id is not None
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
+        "data": {
+            "status": "idle",
+            "background_task_count": 0,
+            "turn_completed": True,
+            "turn_id": stop.terminal_turn_id,
+            "input_id": stop.terminal_input_id,
+        },
     }
 
     submitted = [

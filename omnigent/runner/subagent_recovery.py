@@ -14,11 +14,13 @@ if TYPE_CHECKING:
 import httpx
 from fastapi import FastAPI
 
+from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.runner.subagent_work import (
     _SUBAGENT_TERMINAL_STATUSES,
     _deliver_subagent_completion,
     _drained_delivered_subagent_results,
     _recover_subagent_results_from_server,
+    _seen_subagent_terminal_ids,
     _subagent_recovery_done,
     _subagent_recovery_locks,
     _subagent_work_by_child,
@@ -60,7 +62,11 @@ class _ScheduleSubagentWakeFn(Protocol):
 
 class _EnsureSubagentWorkEntryFn(Protocol):
     def __call__(
-        self, conv_id: str, *, result_key: str | None = None
+        self,
+        conv_id: str,
+        *,
+        result_key: str | None = None,
+        terminal: TerminalEnvelope | None = None,
     ) -> Coroutine[Any, Any, _SubagentWorkEntry | None]: ...
 
 
@@ -111,6 +117,7 @@ def build_subagent_recovery(
         conv_id: str,
         *,
         result_key: str | None = None,
+        terminal: TerminalEnvelope | None = None,
     ) -> _SubagentWorkEntry | None:
         """
         Rebuild a lost work entry for a child, or return the existing one.
@@ -130,7 +137,11 @@ def build_subagent_recovery(
             return existing
         if conv_id in _drained_delivered_subagent_results:
             drained_key = _drained_delivered_subagent_results[conv_id]
-            if result_key is None or result_key == drained_key:
+            identity_key = terminal.identity_key if terminal is not None else None
+            if identity_key is not None:
+                if identity_key in _seen_subagent_terminal_ids.get(conv_id, set()):
+                    return None
+            elif result_key is None or result_key == drained_key:
                 return None
         try:
             snapshot = await _session_snapshot(conv_id)

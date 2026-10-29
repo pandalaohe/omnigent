@@ -209,6 +209,8 @@ class CodexNativeBridgeState:
     usage_admission_id: str | None = None
     usage_turn_id: str | None = None
     permission_profile: str | None = None
+    input_id: str | None = None
+    input_turn_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1362,6 +1364,11 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "active_turn_id": state.active_turn_id,
                     "cwd": state.cwd,
                     **(
+                        {"input_id": state.input_id, "input_turn_id": state.input_turn_id}
+                        if state.input_id is not None
+                        else {}
+                    ),
+                    **(
                         {
                             "usage_admission_id": state.usage_admission_id,
                             "usage_turn_id": state.usage_turn_id,
@@ -1880,6 +1887,10 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             thread_id=thread_id,
             codex_home=codex_home,
             active_turn_id=parsed_active_turn_id,
+            input_id=raw.get("input_id") if isinstance(raw.get("input_id"), str) else None,
+            input_turn_id=raw.get("input_turn_id")
+            if isinstance(raw.get("input_turn_id"), str)
+            else None,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             usage_admission_id=raw.get("usage_admission_id")
             if isinstance(raw.get("usage_admission_id"), str)
@@ -1914,7 +1925,9 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return state is not None and state.session_id == session_id
 
 
-def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
+def update_active_turn_id(
+    bridge_dir: Path, active_turn_id: str | None, *, input_id: str | None = None
+) -> None:
     """
     Update the active Codex turn id in bridge state.
 
@@ -1929,7 +1942,12 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
             return
         _write_bridge_state_unlocked(
             bridge_dir,
-            replace(state, active_turn_id=active_turn_id),
+            replace(
+                state,
+                active_turn_id=active_turn_id,
+                input_id=input_id if input_id is not None else state.input_id,
+                input_turn_id=active_turn_id if input_id is not None else state.input_turn_id,
+            ),
         )
 
 

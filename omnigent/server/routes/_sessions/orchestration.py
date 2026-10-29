@@ -52,6 +52,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
+from omnigent.entities.subagent_terminal import TurnIdentity
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -9035,6 +9036,17 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    runner_body.pop("recovered", None)
+    runner_body.pop("input_generation", None)
+    if conv.parent_conversation_id is not None:
+        runner_body.update(
+            turn_id="turn_" + persisted_items[0].id,
+            input_id=persisted_items[0].id,
+        )
+        identity = TurnIdentity.from_data(runner_body)
+        await asyncio.to_thread(
+            conversation_store.set_labels, session_id, identity.identity_labels()
+        )
     runner_body.pop("startup_attempt", None)
     runner_body.pop("startup_required", None)
     if startup_required or startup_attempt is not None:

@@ -55,6 +55,11 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
+from omnigent.entities.subagent_terminal import (
+    RESULT_IDENTITY_LABEL_PREFIX,
+    TerminalEnvelope,
+    TurnIdentity,
+)
 from omnigent.errors import (
     SESSION_AGENT_MISSING_MESSAGE,
     ErrorCategory,
@@ -2142,6 +2147,8 @@ def create_runner_app(
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
     app.state.live_response_id = _live_response_id
+    _turn_identities: dict[str, dict[str, object]] = {}
+    app.state.turn_identities = _turn_identities
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
     # session_id → the harness the session actually runs, when it differs from
@@ -4511,15 +4518,21 @@ def create_runner_app(
                 and await admit_recovery_turn()
             ):
                 recovery_turn = "history_resume"
-                _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
+                recovery_input_id = _trailing_user_item_id(raw_history)
                 msg_body = {
                     "usage_admission": recovery_usage_admission,
+                    "input_id": recovery_input_id,
+                    "turn_id": "turn_" + recovery_input_id
+                    if recovery_input_id is not None
+                    else None,
+                    "recovered": True,
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                     # Recovery has no live server dispatch carrying renderer state.
                     "browser_renderer_available": False,
                 }
+                _begin_turn_slot(session_id, msg_body)
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(
                         msg_body,
@@ -4556,10 +4569,12 @@ def create_runner_app(
                 recovery_turn = "recovery_prompt"
                 if is_native_harness(harness_name):
                     _session_histories[session_id] = []
-                _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 recovery_body: _JsonObject = {
                     "usage_admission": recovery_usage_admission,
+                    "input_id": recovery_id,
+                    "turn_id": "recovery_turn_" + recovery_id,
+                    "recovered": True,
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                     "browser_renderer_available": False,
@@ -4578,6 +4593,7 @@ def create_runner_app(
                     _session_histories.setdefault(session_id, []).append(
                         {"type": "message", "role": "user", "content": recovery_body["content"]}
                     )
+                _begin_turn_slot(session_id, recovery_body)
                 recovery_task = asyncio.create_task(
                     _run_turn_bg(
                         recovery_body,
@@ -5008,6 +5024,7 @@ def create_runner_app(
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
+        _turn_identities.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
         _replay_started_item_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
@@ -5923,7 +5940,7 @@ def create_runner_app(
     _native_pane_names = _sign_in_watch.native_pane_names
     _start_sign_in_watch = _sign_in_watch.start_sign_in_watch
 
-    def _begin_turn_slot(conv_id: str) -> None:
+    def _begin_turn_slot(conv_id: str, body: Mapping[str, object] | None = None) -> None:
         """Bind the ``None`` sentinel and stamp a fresh epoch for the new turn.
 
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
@@ -5932,6 +5949,13 @@ def create_runner_app(
         _unknown_sdk_peers(conv_id, "runner_turn_rebound")
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
+        source = body or {}
+        identity = TurnIdentity.from_data(source).model_dump()
+        if identity["turn_id"] is None:
+            identity["turn_id"] = f"runner_turn_{uuid.uuid4().hex}"
+        if source.get("recovered") is True:
+            identity["recovered"] = True
+        _turn_identities[conv_id] = identity
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -6252,6 +6276,10 @@ def create_runner_app(
             )
             return
 
+        terminal_data = dict(_turn_identities.get(conv_id, {}))
+        response_id = owner_response_id or _live_response_id.get(conv_id)
+        if response_id is not None and terminal_data.get("turn_id") is None:
+            terminal_data["turn_id"] = response_id
         _unknown_sdk_peers(conv_id, "runner_turn_ended")
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
@@ -6310,24 +6338,32 @@ def create_runner_app(
                 # ``failed``, rather than a contradictory ``cancelled``.
                 _mark_subagent_terminal_and_wake(
                     conv_id,
+                    terminal_data=terminal_data,
+                    error=error,
                     status="failed",
                     output="Error: sub-agent turn failed: runner turn-context desync.",
                 )
             else:
                 _mark_subagent_terminal_and_wake(
                     conv_id,
+                    terminal_data=terminal_data,
+                    error=error,
                     status="cancelled",
                     output=None,
                 )
         elif error is not None:
             _mark_subagent_terminal_and_wake(
                 conv_id,
+                terminal_data=terminal_data,
+                error=error,
                 status="failed",
                 output=f"Error: sub-agent turn failed: {error.get('message', 'unknown')}",
             )
         elif not _is_native_harness(conv_id) and not has_buffered:
             _mark_subagent_terminal_and_wake(
                 conv_id,
+                terminal_data=terminal_data,
+                error=error,
                 status="completed",
                 output=_extract_last_assistant_text(conv_id),
             )
@@ -6805,7 +6841,7 @@ def create_runner_app(
                     {"type": "response.compaction.in_progress", "task_id": session_id},
                 )
                 _sdk_compact_inprogress.add(session_id)
-            _begin_turn_slot(session_id)
+            _begin_turn_slot(session_id, next_body)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
                 _run_turn_bg(
@@ -7064,7 +7100,12 @@ def create_runner_app(
         _background_tasks.add(_retry_task)
 
     async def _post_untracked_subagent_terminal(
-        child_session_id: str, *, status: str, output: str | None, require_parent: bool = False
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        require_parent: bool = False,
+        terminal: TerminalEnvelope | None = None,
     ) -> None:
         """Report a terminal edge for a sub-agent whose work is not tracked here.
 
@@ -7096,6 +7137,7 @@ def create_runner_app(
                 session_id=child_session_id,
                 status=status,
                 output=output,
+                terminal=terminal,
             )
         except Exception:  # noqa: BLE001 — the polling backstop re-delivers
             _logger.warning(
@@ -7106,7 +7148,12 @@ def create_runner_app(
             )
 
     def _post_untracked_subagent_terminal_soon(
-        child_session_id: str, *, status: str, output: str | None, require_parent: bool = False
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        require_parent: bool = False,
+        terminal: TerminalEnvelope | None = None,
     ) -> None:
         """Schedule :func:`_post_untracked_subagent_terminal` on the loop.
 
@@ -7123,7 +7170,11 @@ def create_runner_app(
             return
         task = loop.create_task(
             _post_untracked_subagent_terminal(
-                child_session_id, status=reported, output=output, require_parent=require_parent
+                child_session_id,
+                status=reported,
+                output=output,
+                require_parent=require_parent,
+                terminal=terminal,
             )
         )
         task.add_done_callback(_background_tasks.discard)
@@ -7137,13 +7188,37 @@ def create_runner_app(
         result_key: str | None = None,
         reported_by_server: bool = False,
         only_if_work_id: str | None = None,
+        terminal_data: Mapping[str, object] | None = None,
+        error: Mapping[str, object] | None = None,
+        recovered: bool = False,
+        terminal: TerminalEnvelope | None = None,
     ) -> _SubagentDeliveryAck:
+        entry = get_subagent_work(child_session_id)
+        terminal_error = terminal_data.get("terminal_error") if terminal_data is not None else None
+        if error is None and isinstance(terminal_error, dict):
+            error = terminal_error
+        if error is None and status == "failed" and output:
+            error = {"message": output}
+        identity_data = (
+            terminal_data if terminal_data is not None else _turn_identities.get(child_session_id)
+        )
+        if terminal is None:
+            terminal = TerminalEnvelope.from_data(
+                child_session_id,
+                parent_id=entry.parent_session_id if entry is not None else None,
+                status=status,
+                data=identity_data,
+                error=error,
+                recovered=recovered
+                or (identity_data is not None and identity_data.get("recovered") is True),
+            )
         ack = mark_subagent_work_terminal(
             child_session_id,
             status=status,
             output=output,
             result_key=result_key,
             only_if_work_id=only_if_work_id,
+            terminal=terminal,
         )
         if ack.entry is not None and ack.delivered_now:
             _wake_for_delivered_result(ack.entry)
@@ -7158,7 +7233,9 @@ def create_runner_app(
             # lives on the parent's runner (cross-host) or was lost (restart):
             # hand the terminal edge back to the server, whose sub-agent path
             # forwards it to the parent runner that owns the inbox.
-            _post_untracked_subagent_terminal_soon(child_session_id, status=status, output=output)
+            _post_untracked_subagent_terminal_soon(
+                child_session_id, status=status, output=output, terminal=terminal
+            )
         elif (
             not ack.delivered
             and ack.entry is None
@@ -7171,7 +7248,11 @@ def create_runner_app(
             # child reports through its forwarder, and a server-routed edge
             # must not loop back.
             _post_untracked_subagent_terminal_soon(
-                child_session_id, status=status, output=output, require_parent=True
+                child_session_id,
+                status=status,
+                output=output,
+                require_parent=True,
+                terminal=terminal,
             )
         return ack
 
@@ -7247,6 +7328,7 @@ def create_runner_app(
             ):
                 return
         snapshot_output = entry.output if result_key is None else None
+        snapshot_terminal = entry.terminal
         entry.recovery_result = (status, result_key, snapshot_output)
         lock = _subagent_work.in_flight_send_lock(child_session_id)
         tracked_entry: _SubagentWorkEntry = entry
@@ -7316,6 +7398,9 @@ def create_runner_app(
                     child_session_id,
                     _subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY,
                     f"{work_id}:{pinned_status}:{pinned_key}",
+                    extra_labels=snapshot_terminal.identity_labels(RESULT_IDENTITY_LABEL_PREFIX)
+                    if snapshot_terminal is not None
+                    else None,
                 )
             if error is not None:
                 _logger.warning(
@@ -8147,7 +8232,16 @@ def create_runner_app(
                 _model_override,
                 extra={"session_id": conv},
             )
+        if msg_body.get("recovered") is True:
+            harness_body["recovered"] = True
         harness_body.update(input_attributes(msg_body))
+        for identity_field in ("turn_id", "input_id"):
+            if isinstance(msg_body.get(identity_field), str):
+                harness_body[identity_field] = msg_body[identity_field]
+        if isinstance(msg_body.get("persisted_item_id"), str):
+            harness_body["persisted_item_id"] = msg_body["persisted_item_id"]
+        if msg_body.get("input_generation") is not None:
+            harness_body["input_generation"] = msg_body["input_generation"]
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union
@@ -8482,6 +8576,16 @@ def create_runner_app(
         dispatch: TurnDispatch | None = None,
     ) -> Response:
         stream_epoch = _turn_bind_epoch.get(conv_id)
+        turn_identity = _turn_identities.setdefault(
+            conv_id, {"turn_id": f"runner_turn_{uuid.uuid4().hex}"}
+        )
+        if body.get("recovered") is True:
+            turn_identity["recovered"] = True
+        input_id = body.get("input_id") or _input_stable_id(body) or body.get("persisted_item_id")
+        if input_id is not None:
+            turn_identity["input_id"] = input_id
+        if body.get("input_generation") is not None:
+            turn_identity["input_generation"] = body["input_generation"]
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
@@ -9028,6 +9132,9 @@ def create_runner_app(
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
                                         _live_response_id[conv_id] = _response_id
+                                        _turn_identities.setdefault(conv_id, {})["response_id"] = (
+                                            _response_id
+                                        )
                                         manager.mark_in_flight(conv_id, _response_id)
 
                                 _overflow = _is_context_overflow_error(event)
@@ -10040,7 +10147,7 @@ def create_runner_app(
                         ),
                     )
                     return JSONResponse(status_code=202, content={"status": "refused"})
-                _begin_turn_slot(conversation_id)
+                _begin_turn_slot(conversation_id, message_body)
                 if _peer_delivery is not None:
                     _track_sdk_peer(conversation_id, _peer_delivery)
                 _logger.info(
@@ -10136,6 +10243,8 @@ def create_runner_app(
         if body_type == "external_session_status":
             data = body.get("data") if isinstance(body, dict) else None
             status = data.get("status") if isinstance(data, dict) else None
+            if status == "running" and isinstance(data, dict):
+                _turn_identities[conversation_id] = TurnIdentity.from_data(data).model_dump()
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
             peer_turn = data.get("peer_turn") if isinstance(data, dict) else None
@@ -10162,6 +10271,18 @@ def create_runner_app(
             recovered_entry: _SubagentWorkEntry | None = None
             result_key: str | None = None
             terminal_status = None
+            raw_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
+            identity_status = (
+                raw_outcome
+                if raw_outcome in _SUBAGENT_TERMINAL_STATUSES
+                else (status if status in _SUBAGENT_TERMINAL_STATUSES else "completed")
+            )
+            external_terminal = TerminalEnvelope.from_data(
+                conversation_id,
+                parent_id=None,
+                status=str(identity_status),
+                data=data if isinstance(data, dict) else None,
+            )
 
             if status in ("idle", "failed"):
                 recovered_entry = get_subagent_work(conversation_id)
@@ -10169,7 +10290,9 @@ def create_runner_app(
                 if turn_outcome in ("completed", "cancelled", "failed"):
                     terminal_status = turn_outcome
                     if not peer_copy:
-                        recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                        recovered_entry = await _ensure_subagent_work_entry(
+                            conversation_id, terminal=external_terminal
+                        )
                         if turn_outcome == "cancelled" and recovered_entry is not None:
                             recovered_entry.cancellation_confirmed = True
                 elif (
@@ -10296,7 +10419,7 @@ def create_runner_app(
                     # recovery or wake, the pre-existing duplicate handling.
                     return Response(status_code=204)
                 recovered_entry = await _ensure_subagent_work_entry(
-                    conversation_id, result_key=result_key
+                    conversation_id, result_key=result_key, terminal=external_terminal
                 )
             interrupt_pending = False
             interrupt_work_id: str | None = None
@@ -10335,6 +10458,7 @@ def create_runner_app(
                     output=output if output is not None else "",
                     result_key=result_key,
                     reported_by_server=True,
+                    terminal_data=data if isinstance(data, dict) else None,
                 )
             elif ambiguous_idle:
                 # This harness's forwarder marks genuine turn completions
@@ -10364,11 +10488,12 @@ def create_runner_app(
                     or f"Sub-agent {status} before producing a reliable final result.",
                     result_key=result_key,
                     reported_by_server=True,
+                    terminal_data=data if isinstance(data, dict) else None,
                 )
             else:
                 if status in ("idle", "failed"):
                     recovered_entry = await _ensure_subagent_work_entry(
-                        conversation_id, result_key=result_key
+                        conversation_id, result_key=result_key, terminal=external_terminal
                     )
                 if status == "idle" and interrupt_pending:
                     # Interrupt with no confirming edge, resolved to the CURRENT
@@ -10381,6 +10506,7 @@ def create_runner_app(
                         output=output,
                         result_key=result_key,
                         reported_by_server=True,
+                        terminal_data=data if isinstance(data, dict) else None,
                         only_if_work_id=interrupt_work_id,
                     )
                 elif status in ("idle", "completed"):
@@ -10391,6 +10517,7 @@ def create_runner_app(
                         output=output if output is not None else "",
                         result_key=result_key,
                         reported_by_server=True,
+                        terminal_data=data if isinstance(data, dict) else None,
                     )
                 elif status == "failed":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
@@ -10400,6 +10527,7 @@ def create_runner_app(
                         output=output or "Error: native sub-agent turn failed",
                         result_key=result_key,
                         reported_by_server=True,
+                        terminal_data=data if isinstance(data, dict) else None,
                     )
             if delivery_ack is not None:
                 if (

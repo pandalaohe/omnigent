@@ -7266,19 +7266,36 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         forwarded.clear()
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
-            json={"type": "external_session_status", "data": {"status": "idle"}},
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": "resp_native_done",
+                    "input_id": "native-input",
+                    "input_generation": 999,
+                },
+            },
         )
 
     assert status_resp.status_code == 202, status_resp.text
     child_snapshot = await client.get(f"/v1/sessions/{child['id']}")
     assert child_snapshot.status_code == 200, child_snapshot.text
     assert child_snapshot.json()["labels"]["omnigent.subagent.terminal_status"] == "completed"
+    labels = child_snapshot.json()["labels"]
+    assert labels["omnigent.subagent.identity.turn_id"] == "resp_native_done"
+    assert labels["omnigent.subagent.identity.input_id"] == "native-input"
+    assert labels["omnigent.subagent.identity.input_generation"] == ""
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "data": {
+                    "status": "idle",
+                    "output": "AP_NATIVE_DONE",
+                    "response_id": "resp_native_done",
+                    "input_id": "native-input",
+                },
                 "model_override": None,
                 "tools": None,
                 "created_by": None,

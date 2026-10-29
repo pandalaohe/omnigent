@@ -54,6 +54,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -1220,6 +1221,8 @@ class ClaudeHookRecord:
     failure_message: str | None = None
     failure_context: FailureContext | None = None
     usage_admission_id: str | None = None
+    terminal_turn_id: str | None = None
+    terminal_input_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3175,6 +3178,14 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
             state["usage_admission_id"] = payload.get("admission_id")
         if is_parent and event_name in {"Stop", "StopFailure"}:
             payload = {**payload, "admission_id": state.get("usage_admission_id")}
+        if is_parent and event_name == "UserPromptSubmit" and "admission_id" not in payload:
+            receipt_id = uuid.uuid4().hex
+            state["terminal_identity"] = {
+                "turn_id": f"claude_turn_{receipt_id}",
+                "input_id": receipt_id,
+            }
+        if is_parent and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}:
+            payload = {**payload, "terminal_identity": state.get("terminal_identity")}
         envelope = {
             "recorded_at": time.time(),
             "payload": payload,
@@ -4352,7 +4363,18 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_message = (
             _display_text(raw_details, is_api_error=True) if raw_details is not None else None
         )
+    identity = payload.get("terminal_identity") if isinstance(payload, dict) else None
     return ClaudeHookRecord(
+        terminal_turn_id=(
+            identity.get("turn_id")
+            if isinstance(identity, dict) and isinstance(identity.get("turn_id"), str)
+            else None
+        ),
+        terminal_input_id=(
+            identity.get("input_id")
+            if isinstance(identity, dict) and isinstance(identity.get("input_id"), str)
+            else None
+        ),
         usage_admission_id=payload.get("admission_id")
         if isinstance(payload, dict) and isinstance(payload.get("admission_id"), str)
         else None,

@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 from fastapi.responses import JSONResponse, Response
 
+from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.native.orchestration import (
     _cancel_auto_forwarder_task,
@@ -81,6 +82,7 @@ class MarkSubagentTerminalAndWake(Protocol):
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        terminal: TerminalEnvelope | None = None,
     ) -> SubagentDeliveryAck:
         raise NotImplementedError
 

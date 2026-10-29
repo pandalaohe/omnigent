@@ -1536,6 +1536,8 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
   assert.equal(terminal.turn_completed, !failed && !aborted);
   const expectedOutcome = failed ? 'failed' : aborted ? 'cancelled' : 'completed';
   assert.equal(terminal.turn_outcome, expectedOutcome);
+  assert.equal(terminal.turn_id, terminal.response_id);
+  assert.equal(terminal.input_id, null);
   assert.equal(terminal.output, ['empty', 'early-abort'].includes(mode) ? ''
     : mode === 'no-response'
     ? 'Pi turn ended without a final response.' : mode === 'model-error'

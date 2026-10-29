@@ -23,6 +23,38 @@ _ITEMS_PATH = f"/v1/sessions/{_CHILD}/items"
 _ResponseHandler = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
 
 
+@pytest.mark.parametrize("has_identity", [False, True])
+async def test_recovery_preserves_source_identity_without_allocating_a_new_turn(
+    has_identity: bool,
+) -> None:
+    from omnigent.entities.subagent_terminal import TERMINAL_IDENTITY_LABEL_PREFIX
+
+    child = _child(status="failed", last_task_error={"code": "capacity", "message": "same error"})
+    if has_identity:
+        child["labels"].update(
+            {
+                TERMINAL_IDENTITY_LABEL_PREFIX + "turn_id": "admitted-turn",
+                TERMINAL_IDENTITY_LABEL_PREFIX + "input_id": "admitted-input",
+                TERMINAL_IDENTITY_LABEL_PREFIX + "input_generation": "7",
+            }
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == _CHILDREN_PATH
+        return httpx.Response(200, json=_page(child))
+
+    async with _recovery_harness(handler) as harness:
+        await harness.recovery.recover_undrained_subagent_results(_PARENT)
+        [payload] = harness.drain()
+        terminal = payload["terminal"]
+        assert terminal["recovered"] is True
+        assert terminal["turn_id"] == ("admitted-turn" if has_identity else None)
+        assert terminal["input_id"] == ("admitted-input" if has_identity else None)
+        assert terminal["input_generation"] == (7 if has_identity else None)
+        assert terminal["error"] == {"code": "capacity", "message": "same error"}
+        assert ("identity_diagnostic" in payload) is not has_identity
+
+
 @pytest.fixture(autouse=True)
 def _isolated_work_registries(monkeypatch: pytest.MonkeyPatch) -> None:
     # The recovery builder and work module share aliases to process-local state.

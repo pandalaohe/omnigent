@@ -114,7 +114,10 @@ def test_public_caller_cannot_supply_peer_control_metadata(payload):
 async def test_forwarded_sdk_peer_is_not_recoverable_conversation_input(result, monkeypatch):
     conv = _make_conv()
     conv.harness_override = "codex"
+    conv.parent_conversation_id = "parent"
     store = _RecordingStore(conv)
+    labels = MagicMock()
+    monkeypatch.setattr(store, "set_labels", labels, raising=False)
     forwarded = []
 
     async def archive_states(*args):
@@ -126,6 +129,15 @@ async def test_forwarded_sdk_peer_is_not_recoverable_conversation_input(result, 
         import json
 
         forwarded.append(json.loads(request.content))
+        labels.assert_called_once_with(
+            _SESSION_ID,
+            {
+                "omnigent.subagent.identity.turn_id": "turn_" + "b" * 32,
+                "omnigent.subagent.identity.input_id": "b" * 32,
+                "omnigent.subagent.identity.input_generation": "",
+                "omnigent.subagent.identity.event_kind": "turn_terminal",
+            },
+        )
         if result == "lost_response":
             raise httpx.ReadError("response lost", request=request)
         return httpx.Response(202 if result == "accepted_transport" else 500)
@@ -138,6 +150,10 @@ async def test_forwarded_sdk_peer_is_not_recoverable_conversation_input(result, 
             "peer_message_id": "a" * 32,
             "stable_id": "b" * 32,
             "peer_delivery": {"peer_id": "a" * 32, "attempt_id": "b" * 32},
+            "input_generation": 999,
+            "turn_id": "forged-turn",
+            "input_id": "forged-input",
+            "recovered": True,
         },
     )
     async with httpx.AsyncClient(
@@ -153,6 +169,10 @@ async def test_forwarded_sdk_peer_is_not_recoverable_conversation_input(result, 
     assert store.append_calls == []
     assert forwarded[0]["peer_delivery"] == body.data["peer_delivery"]
     assert "persisted_item_id" not in forwarded[0]
+    assert "input_generation" not in forwarded[0]
+    assert "recovered" not in forwarded[0]
+    assert forwarded[0]["turn_id"] == "turn_" + "b" * 32
+    assert forwarded[0]["input_id"] == "b" * 32
 
 
 def test_legacy_peer_input_keeps_normal_restart_recovery():

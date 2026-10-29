@@ -1842,6 +1842,7 @@ module.exports = function (pi) {
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
+  let turnInputId = null;
   let turnResult = null;
   let turnOutcomeController = new AbortController();
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
@@ -2921,6 +2922,7 @@ module.exports = function (pi) {
     streamingMessageOrdinal = 0;
     // Pin the status response_id for this agent loop through agent_end.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
+    turnInputId = null;
     await postEvent(config, {
       type: "external_session_status",
       data: {
@@ -2936,6 +2938,7 @@ module.exports = function (pi) {
     const outcomeSignal = turnOutcomeController.signal;
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    const endInputId = turnInputId;
     const result = turnResult;
     const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
     clearPendingInterrupt();
@@ -2982,6 +2985,7 @@ module.exports = function (pi) {
         type: "external_session_status",
         data: {
           status, response_id: endResponseId,
+          turn_id: endResponseId, input_id: endInputId,
           turn_completed: finalOutcome === "completed",
           turn_outcome: finalOutcome,
           output,
@@ -3142,6 +3146,7 @@ module.exports = function (pi) {
       const text = textFromMessage(message).trim();
       if (!text) return;
       const responseId = `pi-consumed-user-${Date.now()}-${++sequence}`;
+      turnInputId = `pi:user:${responseId}`;
       history.enqueue(
         {
           response_id: responseId,

@@ -5556,7 +5556,10 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
             subagent_work._session_inboxes_ref.pop("conv_parent_inbox", None)
 
     assert "sub-agent task conv_child_inbox completed" in inbox_output
-    assert "worker:phase-a returned: CHILD_MARKER" in inbox_output
+    assert (
+        "worker:phase-a (terminal_identity_unavailable: turn_id, input_id) returned: CHILD_MARKER"
+        in inbox_output
+    )
     # The dispatch id rides along with child creation, and the drain writes
     # it back as the delivered-id receipt a runner restart checks.
     dispatch_id = create_bodies[0]["labels"][subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY]
@@ -5686,9 +5689,15 @@ async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
             subagent_work.unregister_subagent_work(child_id)
             subagent_work._session_inboxes_ref.pop(parent_id, None)
 
-    assert "worker:repeat returned: FIRST_RESULT" in first_drain
+    assert (
+        "worker:repeat (terminal_identity_unavailable: turn_id, input_id) returned: FIRST_RESULT"
+        in first_drain
+    )
     assert "SECOND_RESULT" not in first_drain
-    assert "worker:repeat returned: SECOND_RESULT" in second_drain
+    assert (
+        "worker:repeat (terminal_identity_unavailable: turn_id, input_id) returned: SECOND_RESULT"
+        in second_drain
+    )
 
 
 def _sse_text_turn(text: str) -> list[str]:
@@ -6217,7 +6226,10 @@ async def test_sys_read_inbox_requeues_subagent_output_on_transient_policy_failu
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert policy_attempts == 2
-    assert "worker:retry-policy returned: SECRET_RETRY_MARKER" in second_drain
+    assert (
+        "worker:retry-policy (terminal_identity_unavailable: turn_id, input_id) "
+        "returned: SECRET_RETRY_MARKER" in second_drain
+    )
     assert work_after_second_drain is None
 
 
@@ -6343,7 +6355,8 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
         "status": "cancelled",
     }
     assert inbox_output == (
-        "[System: sub-agent task conv_child_cancel cancelled — runner:phase-c]"
+        "[System: sub-agent task conv_child_cancel cancelled — runner:phase-c "
+        "(terminal_identity_unavailable: turn_id, input_id)]"
     ), "Cancelled sub-agent work must produce exactly one cancelled inbox item."
 
 
@@ -12553,6 +12566,55 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "desync", "pre-response"])
+async def test_sdk_terminal_retains_owner_response_before_marker_cleanup(outcome: str) -> None:
+    child, parent = "child-owner-identity", "parent-owner-identity"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    app = create_runner_app(
+        process_manager=_RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([])),
+        server_client=NullServerClient(),
+    )
+    subagent_work._session_inboxes_ref[parent] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=parent, child_session_id=child, agent="worker", title="identity"
+    )
+    try:
+        app.state.begin_turn_slot(
+            child, {"turn_id": "admitted-turn", "input_id": "admitted-input"}
+        )
+        if outcome != "pre-response":
+            app.state.live_response_id[child] = "response-owner"
+        else:
+            app.state.turn_identities[child]["input_generation"] = 2
+        if outcome in {"failed", "cancelled"}:
+            app.state.turn_identities.pop(child)
+        if outcome == "cancelled":
+            app.state.interrupted_sessions.add(child)
+        app.state.on_proxy_stream_end(
+            child,
+            owner_response_id="response-owner" if outcome != "pre-response" else None,
+            error={
+                "code": "runner_turn_context_desync" if outcome == "desync" else "provider_error",
+                "message": "failed",
+            }
+            if outcome != "cancelled"
+            else None,
+        )
+        result = inbox.get_nowait()
+        assert result["status"] == ("cancelled" if outcome == "cancelled" else "failed")
+        assert result["terminal"]["turn_id"] == (
+            "response-owner" if outcome in {"failed", "cancelled"} else "admitted-turn"
+        )
+        if outcome in {"desync", "pre-response"}:
+            assert result["terminal"]["input_id"] == "admitted-input"
+        assert result["terminal"]["event_kind"] == "turn_terminal"
+        assert child not in app.state.live_response_id
+    finally:
+        subagent_work.unregister_subagent_work_for_session(child)
+        subagent_work._session_inboxes_ref.pop(parent, None)
+
+
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
 @pytest.mark.asyncio
 async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:
@@ -15970,6 +16032,12 @@ async def test_sys_session_create_waits_for_child_registration(registration_stat
                 server_client=server_client,
                 conversation_id="conv_caller",
             )
+            terminal = subagent_work.get_subagent_work("conv_register_child")
+            if registration_status != 200:
+                assert terminal is not None
+                assert terminal.terminal.event_kind == "dispatch_failed"
+                assert terminal.terminal.turn_id is None
+                assert terminal.terminal.error["code"] == "child_registration_failed"
         finally:
             subagent_work.unregister_subagent_work("conv_register_child")
 

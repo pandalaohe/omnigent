@@ -23,6 +23,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -6159,6 +6160,15 @@ async def _forward_available_status_events(
                 # never on an interrupt, so its ``idle`` edge is a confirmed
                 # turn completion, unlike quiescence-derived idles.
                 turn_completed=True if status == "idle" else None,
+                terminal=TerminalEnvelope.from_data(
+                    session_id,
+                    parent_id=None,
+                    status="completed" if status == "idle" else "failed",
+                    data={
+                        "turn_id": record.terminal_turn_id or response_id,
+                        "input_id": record.terminal_input_id,
+                    },
+                ),
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # This is the one thing the status file cannot report: its

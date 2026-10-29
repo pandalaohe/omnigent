@@ -43,6 +43,10 @@ from omnigent.entities.conversation import (
     MessageData,
     parse_item_data,
 )
+from omnigent.entities.subagent_terminal import (
+    TERMINAL_IDENTITY_LABEL_PREFIX,
+    TurnIdentity,
+)
 from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import (
@@ -3413,6 +3417,8 @@ def register_events_routes(
             data = await _enrich_terminal_status_with_subagent_output(
                 body.data, status, session_id, conversation_store
             )
+            # Input generations come from server admission, not native status producers.
+            data.pop("input_generation", None)
             # Forward only the same bounded, typed display detail that the
             # Server accepted. The Runner retains this across reconnects, so
             # raw/nested/oversized task objects must not become resident there.
@@ -3537,6 +3543,14 @@ def register_events_routes(
                 # recovered terminal state. The replay was validated above and
                 # returns before Runner delivery, so this cannot wake work.
                 _session_status_cache.pop(session_id, None)
+            if conv.parent_conversation_id is not None:
+                identity = TurnIdentity.from_data(data)
+                identity_labels = identity.identity_labels()
+                if data.get("event_kind") == "dispatch_failed":
+                    identity_labels[TERMINAL_IDENTITY_LABEL_PREFIX + "event_kind"] = (
+                        "dispatch_failed"
+                    )
+                await asyncio.to_thread(conversation_store.set_labels, session_id, identity_labels)
             _publish_status(
                 session_id,
                 public_status,

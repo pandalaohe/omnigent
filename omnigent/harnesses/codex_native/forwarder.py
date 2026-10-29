@@ -863,6 +863,7 @@ class _CodexForwarderState:
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
+    input_ids_by_turn: dict[str, str] = field(default_factory=dict)
     posted_tool_calls: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
@@ -1166,7 +1167,7 @@ class _CodexForwarderState:
         """
         self.subscribed_child_threads.add(thread_id)
 
-    def note_user_message_posted(self, turn_id: str) -> None:
+    def note_user_message_posted(self, turn_id: str, input_id: str | None = None) -> None:
         """
         Record that a turn's user message has been posted to AP.
 
@@ -1174,6 +1175,8 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.posted_user_turns.add(turn_id)
+        if input_id is not None:
+            self.input_ids_by_turn[turn_id] = input_id
 
     def has_posted_user_message(self, turn_id: str) -> bool:
         """
@@ -3591,7 +3594,14 @@ async def _post_resume_terminal_status(
     if thread_id is None:
         return
     edge = _resume_terminal_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
-    await _post_turn_status_edge(client, session_id, edge)
+    input_id = None
+    if edge is not None and edge.turn_id is not None:
+        user_item = _find_turn_user_message({"result": {"thread": {"turns": turns}}}, edge.turn_id)
+        if user_item is not None:
+            input_id = _source_id({"threadId": thread_id, "turnId": edge.turn_id}, user_item)
+    await _post_turn_status_edge(
+        client, session_id, edge, input_id=input_id, recovered=True, bridge_dir=bridge_dir
+    )
 
 
 def _resume_terminal_status_edge_for_latest_turn(
@@ -4629,6 +4639,8 @@ async def _maybe_fail_turn_on_certificate_failure(
                     kind=_CODEX_ERROR_KIND_GENERIC,
                 ),
             ),
+            forwarder_state=forwarder_state,
+            bridge_dir=bridge_dir,
         )
         await usage_coalescer.flush()
     return True
@@ -4731,6 +4743,7 @@ async def _maybe_handle_turn_event(
                     )
                 except Exception:  # noqa: BLE001 - the failure still posts, undiagnosed.
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
+            await _ensure_user_message_posted(client, session_id, params, forwarder_state)
             await _post_turn_status_edge(
                 client,
                 session_id,
@@ -4742,6 +4755,8 @@ async def _maybe_handle_turn_event(
                     compaction_model=compaction_model,
                     selected_model=selected_model if compaction_model else None,
                 ),
+                forwarder_state=forwarder_state,
+                bridge_dir=bridge_dir,
             )
             await usage_coalescer.flush()
         return True
@@ -5059,7 +5074,14 @@ async def _handle_terminal_turn_boundary_inner(
     )
     handled = terminal.handled
     if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
+        await _ensure_user_message_posted(client, session_id, params, forwarder_state)
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            terminal.edge,
+            forwarder_state=forwarder_state,
+            bridge_dir=bridge_dir,
+        )
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -6345,7 +6367,7 @@ async def _handle_turn_started(
     :returns: None.
     """
     edge = _turn_started_status_edge(bridge_dir, params)
-    await _post_turn_status_edge(client, session_id, edge)
+    await _post_turn_status_edge(client, session_id, edge, bridge_dir=bridge_dir)
 
 
 def _turn_started_status_edge(
@@ -6703,7 +6725,7 @@ async def _handle_completed_item_inner(
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
-                forwarder_state.note_user_message_posted(turn_id)
+                forwarder_state.note_user_message_posted(turn_id, source_id)
         return
     if item_type == "agentMessage":
         # User-before-assistant ordering guarantee. On a fresh thread the
@@ -7638,7 +7660,9 @@ async def _handle_agent_message_delta(
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
-            await _post_turn_status_edge(client, session_id, edge)
+            await _post_turn_status_edge(
+                client, session_id, edge, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+            )
             _record_partial_text_delta(
                 forwarder_state,
                 turn_id=turn_id,
@@ -7705,7 +7729,9 @@ async def _handle_plan_delta(
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
-            await _post_turn_status_edge(client, session_id, edge)
+            await _post_turn_status_edge(
+                client, session_id, edge, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+            )
             _record_partial_text_delta(
                 forwarder_state,
                 turn_id=turn_id,
@@ -7805,7 +7831,7 @@ async def _ensure_user_message_posted(
         user_item,
         source_id=source_id,
     ):
-        forwarder_state.note_user_message_posted(turn_id)
+        forwarder_state.note_user_message_posted(turn_id, source_id)
 
 
 def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
@@ -8481,6 +8507,9 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    turn_id: str | None = None,
+    input_id: str | None = None,
+    recovered: bool = False,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -8502,6 +8531,12 @@ async def _post_status(
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if turn_id is not None and turn_id != response_id:
+        data["turn_id"] = turn_id
+    if input_id is not None:
+        data["input_id"] = input_id
+    if recovered:
+        data["recovered"] = True
     if response_id is not None:
         data["response_id"] = response_id
     if output is not None:
@@ -8524,6 +8559,11 @@ async def _post_turn_status_edge(
     client: httpx.AsyncClient,
     session_id: str,
     edge: _CodexTurnStatusEdge | None,
+    *,
+    forwarder_state: _CodexForwarderState | None = None,
+    recovered: bool = False,
+    input_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
@@ -8565,6 +8605,10 @@ async def _post_turn_status_edge(
             ),
         ),
     )
+    if bridge_dir is not None and edge.turn_id is not None:
+        bridge_state = read_bridge_state(bridge_dir)
+        if bridge_state is not None and bridge_state.input_turn_id == edge.turn_id:
+            input_id = bridge_state.input_id
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None
     reauth_required = False
@@ -8582,6 +8626,14 @@ async def _post_turn_status_edge(
         reauth_required=reauth_required,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
+        turn_id=response_id,
+        input_id=input_id
+        or (
+            forwarder_state.input_ids_by_turn.get(edge.turn_id)
+            if forwarder_state is not None and edge.turn_id is not None
+            else None
+        ),
+        recovered=recovered,
     )
 
 
